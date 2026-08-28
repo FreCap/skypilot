@@ -32,6 +32,7 @@ from sky.serve import constants
 from sky.serve import demand_state
 from sky.serve import demand_state_schema
 from sky.serve import kueue_lane_capacity
+from sky.serve import paid_capacity as serve_paid_capacity
 from sky.serve import route_projection
 from sky.serve import route_projection_schema
 from sky.serve import serve_state_schema
@@ -902,6 +903,7 @@ class PaidLaunchAuthority:
     reserved_fill_authority: ReservedFillPlanAuthority
     capacity_unit: capacity_planning.CapacityUnit
     physical_gpu_width_by_accelerator: tuple[tuple[str, int], ...]
+    backend_num_nodes: int = 1
 
     def economic_residual(self) -> dict[str, int]:
         return dict(self.paid_residual_by_accelerator)
@@ -909,24 +911,40 @@ class PaidLaunchAuthority:
     def remaining_launch_capacity(self) -> dict[str, int]:
         return dict(self.paid_launch_target_by_accelerator)
 
-    def backend_claim_shape(self, accelerator: str) -> tuple[int, int]:
-        """Return physical GPU width and plan units debited per backend."""
+    def backend_shape(
+            self, accelerator: str) -> serve_paid_capacity.PhysicalBackendShape:
+        """Return the immutable physical shape authorized for one backend."""
         card = accelerator.casefold()
         widths = {
             raw_card.casefold(): width
             for raw_card, width in self.physical_gpu_width_by_accelerator
         }
         physical_width = widths.get(card)
-        if (type(physical_width) is not int or physical_width <= 0 or
-                self.capacity_unit
+        if (type(physical_width) is not int or physical_width < 1 or  # pylint: disable=unidiomatic-typecheck
+                type(self.backend_num_nodes) is not int or  # pylint: disable=unidiomatic-typecheck
+                self.backend_num_nodes < 1 or self.capacity_unit
                 not in (capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
-                        capacity_planning.CapacityUnit.LOGICAL_GPU)):
+                        capacity_planning.CapacityUnit.LOGICAL_GPU) or
+            (self.capacity_unit is capacity_planning.CapacityUnit.LOGICAL_GPU
+             and self.backend_num_nodes != 1)):
             raise CapacityAdmissionConflict(
                 f'Capacity plan has no exact backend claim shape for {card!r}.')
-        claim_units = (1 if self.capacity_unit
-                       is capacity_planning.CapacityUnit.PHYSICAL_BACKEND else
-                       physical_width)
-        return physical_width, claim_units
+        try:
+            return serve_paid_capacity.PhysicalBackendShape(
+                accelerator=card,
+                gpu_units_per_node=physical_width,
+                num_nodes=self.backend_num_nodes)
+        except serve_paid_capacity.PaidGPUAttributionError as error:
+            raise CapacityAdmissionConflict(
+                f'Capacity plan has no exact backend claim shape for {card!r}.'
+            ) from error
+
+    def claim_units_per_backend(self, accelerator: str) -> int:
+        """Return immutable plan units debited by one backend claim."""
+        shape = self.backend_shape(accelerator)
+        if self.capacity_unit is capacity_planning.CapacityUnit.PHYSICAL_BACKEND:
+            return 1
+        return shape.gpu_units_per_node
 
     def claim_values(self, accelerator: str, units: int = 1) -> dict[str, Any]:
         card = accelerator.casefold()
@@ -1538,6 +1556,7 @@ def _authority(
         paid_launch_target_by_accelerator=tuple(paid_launch.items()),
         reserved_fill_authority=reserved_fill_authority,
         capacity_unit=candidate.capacity_unit,
+        backend_num_nodes=candidate.backend_num_nodes,
         physical_gpu_width_by_accelerator=tuple(
             candidate.physical_gpu_width_by_accelerator.entries))
 
@@ -1853,6 +1872,17 @@ def _validated_replica_attribution(
             bool(status['is_scale_down']))
 
 
+def _cleanup_proven_from_locked_row(row: Mapping[str, Any],
+                                    state: Mapping[str, Any]) -> bool:
+    """Apply the shared relational/JSON cleanup proof to one locked row."""
+    try:
+        return serve_paid_capacity.paid_replica_cleanup_proven(
+            state, sky_down_status_value=row['sky_down_status'])
+    except serve_paid_capacity.PaidGPUAttributionError as error:
+        raise CapacityAdmissionConflict(
+            'Committed replica cleanup attribution is malformed.') from error
+
+
 @dataclasses.dataclass(frozen=True)
 class _LockedCapacityRows:
     """Intent/replica graph locked before its Kueue admission rows."""
@@ -1892,6 +1922,7 @@ def _lock_capacity_rows(
         sqlalchemy.select(
             _REPLICAS.c.replica_id, _REPLICAS.c.status, _REPLICAS.c.version,
             _REPLICAS.c.reserved_fill_intent_idempotency_key,
+            _REPLICAS.c.paid_capacity_pool_key, _REPLICAS.c.sky_down_status,
             _REPLICAS.c.replica_state_version, _REPLICAS.c.replica_state,
             replica_state_sha256).where(
                 _REPLICAS.c.service_name == service_name).order_by(
@@ -2131,22 +2162,50 @@ def _project_capacity_inventory(
         raw_state = row['replica_state']
         if (terminal and isinstance(raw_state, Mapping) and
                 raw_state.get('is_zero_cost') is True):
+            cleanup_proven = _cleanup_proven_from_locked_row(row, raw_state)
+            if cleanup_proven:
+                continue
+            try:
+                serve_paid_capacity.validate_paid_replica_relational_copies(
+                    raw_state, pool_key_value=row['paid_capacity_pool_key'])
+            except serve_paid_capacity.PaidGPUAttributionError as error:
+                raise CapacityAdmissionConflict(
+                    'Committed replica pool contradicts zero-cost attribution.'
+                ) from error
             # Terminal reserved rows are neither usable nor billable. Keep
             # the prior tolerance for retained legacy reserved tombstones;
             # their provider cleanup is owned by the separate exact fence.
             continue
         state, planned_capacity, is_zero_cost, is_scale_down = (
             _validated_replica_attribution(row))
-        status = state['status_property']
-        cleanup_proven = status.get('sky_down_status') == 'SUCCEEDED'
+        cleanup_proven = _cleanup_proven_from_locked_row(row, state)
+        if cleanup_proven:
+            continue
+        try:
+            relationally_paid = (
+                serve_paid_capacity.validate_paid_replica_relational_copies(
+                    state, pool_key_value=row['paid_capacity_pool_key']))
+        except serve_paid_capacity.PaidGPUAttributionError as error:
+            raise CapacityAdmissionConflict(
+                'Committed replica pool contradicts zero-cost attribution.'
+            ) from error
+        if relationally_paid == is_zero_cost:
+            raise CapacityAdmissionConflict(
+                'Committed replica capacity class is contradictory.')
         if not is_zero_cost:
-            if cleanup_proven:
-                continue
-            # planned_capacity is the immutable physical GPU debit persisted
-            # for every paid backend. Charge every service version: an old
-            # worker may be unusable for current demand while its provider VM
-            # still exists or bills.
-            charged_paid_gpu_units += planned_capacity
+            # planned_capacity remains the service's logical/physical target
+            # unit. The paid provider pool separately persists the exact
+            # per-node shape and num_nodes needed for billing. Charge every
+            # service version: an old worker may be unusable for current
+            # demand while its provider allocation still exists or bills.
+            try:
+                charged_paid_gpu_units += (
+                    serve_paid_capacity.paid_replica_gpu_units(
+                        state, pool_key_value=row['paid_capacity_pool_key']))
+            except serve_paid_capacity.PaidGPUAttributionError as error:
+                raise CapacityAdmissionConflict(
+                    'Committed paid replica physical GPU attribution is '
+                    'malformed.') from error
             if row['version'] != service_version:
                 continue
         # A controller lifecycle label is not provider-cleanup evidence.  A
@@ -2156,7 +2215,7 @@ def _project_capacity_inventory(
         # stop contributing once terminal because they are no longer usable
         # demand supply; their provider ownership remains protected by the
         # separate cleanup/quiescence protocol.
-        if terminal and (is_zero_cost or cleanup_proven):
+        if terminal and is_zero_cost:
             continue
         # A reserved row stops contributing once its scheduler capacity is
         # being yielded.  A paid row is different: until its exact claim and
@@ -2406,10 +2465,8 @@ def _replica_service_ceiling_capacity(
 ) -> int:
     """Project one cleanup-unproven row into the service's configured unit."""
     state = row['replica_state']
-    status = (state.get('status_property')
-              if isinstance(state, Mapping) else None)
-    if (isinstance(status, Mapping) and
-            status.get('sky_down_status') == 'SUCCEEDED'):
+    if (isinstance(state, Mapping) and
+            _cleanup_proven_from_locked_row(row, state)):
         return 0
     try:
         return zero_cost_actuation.replica_capacity_for_unit(
@@ -2552,22 +2609,61 @@ def _project_allocation_reserved_capacity(
     return {card: exact.get(card, 0) for card in sorted(accounting_cards)}
 
 
-def _claim_units_for_plan(
+@dataclasses.dataclass(frozen=True)
+class _PlanClaimProjection:
+    units_by_accelerator: Mapping[str, int]
+    physical_gpu_units: int
+
+
+def _planner_bound_pool_shape(
+    pool_key: Any,
+    candidate: capacity_planning.CapacityPlanCandidate,
+    debit_accelerator: str,
+) -> serve_paid_capacity.PhysicalBackendShape:
+    """Decode and bind one relational pool to immutable planner shape."""
+    try:
+        pool_shape = serve_paid_capacity.paid_pool_gpu_shape(pool_key)
+        pool_card = pool_shape.accelerator
+        if pool_card is None:
+            raise serve_paid_capacity.PaidGPUAttributionError(
+                'Planner-bound claims require an exact GPU accelerator.')
+        expected_card = (pool_card if debit_accelerator == AGGREGATE_ACCELERATOR
+                         else debit_accelerator.casefold())
+        expected_shape = serve_paid_capacity.PhysicalBackendShape(
+            accelerator=expected_card,
+            gpu_units_per_node=(
+                candidate.physical_gpu_width_by_accelerator.get(expected_card)),
+            num_nodes=candidate.backend_num_nodes)
+    except serve_paid_capacity.PaidGPUAttributionError as error:
+        raise CapacityAdmissionConflict(
+            'Planner-bound paid claim provider pool is malformed.') from error
+    if pool_shape != expected_shape:
+        raise CapacityAdmissionConflict(
+            'Paid claim provider pool contradicts its immutable backend shape.')
+    return pool_shape
+
+
+def _plan_claim_projection(
     connection: sqlalchemy.engine.Connection,
     *,
     service_name: str,
     service_hash: str,
     generation: int,
     accounting_cards: set[str],
-) -> dict[str, int]:
+    capacity_unit: capacity_planning.CapacityUnit | None,
+    candidate: capacity_planning.CapacityPlanCandidate | None = None,
+) -> _PlanClaimProjection:
+    """Read one locked typed claim projection for units and physical debit."""
     units = {card: 0 for card in accounting_cards}
     rows = connection.execute(
         sqlalchemy.select(_CLAIMS.c.capacity_plan_accelerator,
-                          _CLAIMS.c.capacity_plan_units).where(
+                          _CLAIMS.c.capacity_plan_units,
+                          _CLAIMS.c.pool_key).where(
                               _CLAIMS.c.service_name == service_name,
                               _CLAIMS.c.service_hash == service_hash,
                               _CLAIMS.c.capacity_plan_generation ==
                               generation).with_for_update()).mappings().all()
+    physical_gpu_units = 0
     for row in rows:
         card = row['capacity_plan_accelerator']
         count = row['capacity_plan_units']
@@ -2576,7 +2672,55 @@ def _claim_units_for_plan(
             raise CapacityAdmissionConflict(
                 'Planner-bound claim accounting is malformed.')
         units[card] += count
-    return units
+        if capacity_unit in (capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
+                             capacity_planning.CapacityUnit.LOGICAL_GPU):
+            try:
+                if candidate is None:
+                    pool_shape = serve_paid_capacity.paid_pool_gpu_shape(
+                        row['pool_key'])
+                    exact_card_matches = (card == AGGREGATE_ACCELERATOR or
+                                          pool_shape.accelerator
+                                          == card.casefold())
+                else:
+                    pool_shape = _planner_bound_pool_shape(
+                        row['pool_key'], candidate, card)
+                    exact_card_matches = True
+            except (serve_paid_capacity.PaidGPUAttributionError,
+                    CapacityAdmissionConflict) as error:
+                raise CapacityAdmissionConflict(
+                    'Planner-bound claim attribution is malformed.') from error
+            if not exact_card_matches:
+                raise CapacityAdmissionConflict(
+                    'Planner-bound claim attribution is malformed.')
+            if (capacity_unit is capacity_planning.CapacityUnit.PHYSICAL_BACKEND
+                    and count != 1):
+                raise CapacityAdmissionConflict(
+                    'Physical-backend claim attribution is malformed.')
+            if (capacity_unit is capacity_planning.CapacityUnit.LOGICAL_GPU and
+                (pool_shape.num_nodes != 1 or
+                 count != pool_shape.gpu_units_per_node)):
+                raise CapacityAdmissionConflict(
+                    'Logical-GPU claim attribution is malformed.')
+            physical_gpu_units += pool_shape.total_gpu_units
+    return _PlanClaimProjection(units_by_accelerator=units,
+                                physical_gpu_units=physical_gpu_units)
+
+
+def _claim_units_for_plan(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    service_hash: str,
+    generation: int,
+    accounting_cards: set[str],
+) -> dict[str, int]:
+    return dict(
+        _plan_claim_projection(connection,
+                               service_name=service_name,
+                               service_hash=service_hash,
+                               generation=generation,
+                               accounting_cards=accounting_cards,
+                               capacity_unit=None).units_by_accelerator)
 
 
 def _subtract_counts(total: Mapping[str, int],
@@ -3882,6 +4026,7 @@ def _validate_committed_paid_claim_in_connection(
     claim_source_epoch: int,
     claim_accelerator: str,
     claim_units: int,
+    planner_candidate: capacity_planning.CapacityPlanCandidate,
     now: datetime.datetime,
 ) -> datetime.datetime:
     """Validate immutable post-admission authority against current routing.
@@ -3968,12 +4113,15 @@ def _validate_committed_paid_claim_in_connection(
             authorized_paid[claim_accelerator] < claim_units):
         raise CapacityAdmissionConflict(
             'Committed paid claim exceeds its immutable plan debit.')
-    claimed_units = _claim_units_for_plan(connection,
-                                          service_name=str(service['name']),
-                                          service_hash=str(service['hash']),
-                                          generation=int(
-                                              claim_plan['generation']),
-                                          accounting_cards=accounting_cards)
+    claim_projection = _plan_claim_projection(
+        connection,
+        service_name=str(service['name']),
+        service_hash=str(service['hash']),
+        generation=int(claim_plan['generation']),
+        accounting_cards=accounting_cards,
+        capacity_unit=planner_candidate.capacity_unit,
+        candidate=planner_candidate)
+    claimed_units = claim_projection.units_by_accelerator
     if (claimed_units.get(claim_accelerator, 0) < claim_units or
             any(claimed_units[card] > authorized_paid[card]
                 for card in accounting_cards)):
@@ -3989,6 +4137,26 @@ def _validate_committed_paid_claim_in_connection(
     return paid_fresh_until
 
 
+def _validate_planner_claim_pool_shape(
+    claim: Mapping[str, Any],
+    candidate: capacity_planning.CapacityPlanCandidate,
+    accelerator: str,
+) -> None:
+    """Bind one claim's relational pool identity to immutable task shape."""
+    relational_pool_key = claim.get('paid_capacity_pool_key')
+    claim_pool_key = claim.get('pool_key')
+    if (relational_pool_key is not None and claim_pool_key is not None and
+            relational_pool_key != claim_pool_key):
+        raise CapacityAdmissionConflict(
+            'Paid claim row and replica name different provider pools.')
+    pool_key = (relational_pool_key
+                if relational_pool_key is not None else claim_pool_key)
+    if not isinstance(pool_key, str) or not pool_key:
+        raise CapacityAdmissionConflict(
+            'Planner-bound paid claim has no exact provider pool identity.')
+    _planner_bound_pool_shape(pool_key, candidate, accelerator)
+
+
 def validate_paid_claim_in_connection(
     connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
@@ -3998,6 +4166,7 @@ def validate_paid_claim_in_connection(
     require_planner: bool = True,
     protocol_and_service_prelocked: bool = False,
     _batch_member_units: tuple[int, ...] | None = None,
+    _batch_member_pool_keys: tuple[str, ...] | None = None,
 ) -> datetime.datetime | None:
     """Revalidate one planner-bound claim before provider I/O."""
     fields = ('capacity_plan_generation', 'capacity_plan_sha256',
@@ -4052,6 +4221,19 @@ def validate_paid_claim_in_connection(
             _sha256(claim_plan_payload) != claim_sha256):
         raise CapacityAdmissionConflict(
             'Capacity plan digest no longer matches its payload.')
+    try:
+        _, planner_candidate = _decode_planner_payload(
+            claim_plan_payload.get('planner'))
+    except ValueError as error:
+        raise CapacityAdmissionConflict(
+            'Capacity plan has no immutable backend claim shape.') from error
+    if _batch_member_pool_keys is None:
+        _validate_planner_claim_pool_shape(claim, planner_candidate,
+                                           accelerator)
+    else:
+        for member_pool_key in _batch_member_pool_keys:
+            _planner_bound_pool_shape(member_pool_key, planner_candidate,
+                                      accelerator)
     if not prospective:
         return _validate_committed_paid_claim_in_connection(
             connection,
@@ -4061,6 +4243,7 @@ def validate_paid_claim_in_connection(
             claim_source_epoch=claim_source_epoch,
             claim_accelerator=accelerator,
             claim_units=claim_units,
+            planner_candidate=planner_candidate,
             now=now)
     head = connection.execute(
         sqlalchemy.select(_HEADS).where(
@@ -4391,12 +4574,16 @@ def validate_paid_claim_in_connection(
         raise CapacityAdmissionConflict(
             'Committed reservation debit exceeds the current locked eligible '
             'envelope.')
-    claim_units_by_card = _claim_units_for_plan(
+    claim_projection = _plan_claim_projection(
         connection,
         service_name=service['name'],
         service_hash=service['hash'],
         generation=validation_generation,
-        accounting_cards=accounting_cards)
+        accounting_cards=accounting_cards,
+        capacity_unit=planner_candidate.capacity_unit,
+        candidate=planner_candidate)
+    claim_units_by_card = claim_projection.units_by_accelerator
+    claimed_paid_gpu_units = claim_projection.physical_gpu_units
     expected_paid = {
         card: baseline_paid.get(card, 0) + claim_units_by_card.get(card, 0)
         for card in accounting_cards
@@ -4405,7 +4592,7 @@ def validate_paid_claim_in_connection(
             current_pending_zero != baseline_pending_zero or
             current_paid != expected_paid or current_charged_paid
             != planner_snapshot.reservation.charged_paid_gpu_units +
-            sum(claim_units_by_card.values())):
+            claimed_paid_gpu_units):
         raise CapacityAdmissionConflict(
             'Committed capacity changed after the ordered plan snapshot.')
     authorized = paid_launch.get(accelerator, 0)
@@ -4465,6 +4652,7 @@ def validate_prospective_paid_claim_batch_in_connection(
     units_by_card: dict[str, int] = {}
     member_units_by_card: dict[str, list[int]] = {}
     representative_by_card: dict[str, Mapping[str, Any]] = {}
+    pool_keys_by_card: dict[str, list[str]] = {}
     for claim in claims:
         if not isinstance(claim, Mapping):
             raise CapacityAdmissionConflict(
@@ -4479,6 +4667,23 @@ def validate_prospective_paid_claim_batch_in_connection(
                 units <= 0):
             raise CapacityAdmissionConflict(
                 'Paid claim batch contains a malformed planner debit.')
+        relational_pool_key = claim.get('paid_capacity_pool_key')
+        persisted_pool_key = claim.get('pool_key')
+        if (relational_pool_key is not None and
+                persisted_pool_key is not None and
+                relational_pool_key != persisted_pool_key):
+            raise CapacityAdmissionConflict(
+                'Paid claim batch contains contradictory provider pools.')
+        pool_key = (relational_pool_key
+                    if relational_pool_key is not None else persisted_pool_key)
+        try:
+            serve_paid_capacity.paid_pool_gpu_shape(pool_key)
+        except serve_paid_capacity.PaidGPUAttributionError as error:
+            raise CapacityAdmissionConflict(
+                'Paid claim batch contains a malformed provider pool.'
+            ) from error
+        assert isinstance(pool_key, str)
+        pool_keys_by_card.setdefault(card, []).append(pool_key)
         representative_by_card.setdefault(card, claim)
         units_by_card[card] = units_by_card.get(card, 0) + units
         member_units_by_card.setdefault(card, []).append(units)
@@ -4494,7 +4699,8 @@ def validate_prospective_paid_claim_batch_in_connection(
             prospective=True,
             require_planner=True,
             protocol_and_service_prelocked=protocol_and_service_prelocked,
-            _batch_member_units=tuple(member_units_by_card[card]))
+            _batch_member_units=tuple(member_units_by_card[card]),
+            _batch_member_pool_keys=tuple(pool_keys_by_card[card]))
         if paid_fresh_until is None:
             raise CapacityAdmissionConflict(
                 'Paid claim batch has no exact planner authority.')

@@ -67,6 +67,7 @@ def _paid_launch_authority(
     widths: dict[str, int] | None = None,
     capacity_unit: capacity_planning.CapacityUnit = (
         capacity_planning.CapacityUnit.LOGICAL_GPU),
+    backend_num_nodes: int = 1,
 ) -> capacity_admission.PaidLaunchAuthority:
     canonical = tuple(
         sorted((card.casefold(), units) for card, units in targets.items()))
@@ -84,6 +85,7 @@ def _paid_launch_authority(
         reserved_fill_authority=(
             capacity_admission.ReservedFillPlanAuthority.not_applicable()),
         capacity_unit=capacity_unit,
+        backend_num_nodes=backend_num_nodes,
         physical_gpu_width_by_accelerator=tuple(
             sorted((card.casefold(), width) for card, width in widths.items())))
 
@@ -656,11 +658,13 @@ def _plan_bound_budget(
         target,
         widths,
         capacity_unit=(capacity_planning.CapacityUnit.LOGICAL_GPU),
+        backend_num_nodes=1,
         claimed=None,
         infos=None):
     authority = _paid_launch_authority(target,
                                        widths=widths,
-                                       capacity_unit=capacity_unit)
+                                       capacity_unit=capacity_unit,
+                                       backend_num_nodes=backend_num_nodes)
     with mock.patch.object(paid_capacity,
                            'central_authority_available',
                            return_value=True), mock.patch.object(
@@ -848,6 +852,55 @@ def test_physical_backend_plan_debits_one_unit_on_eight_gpu_locations():
                                                frontier_limit=25),)
     assert budget.service_remaining == 100
     assert budget.frontier_limit_overrides == {('a100',): 25}
+
+
+def test_plan_bound_multinode_shape_requires_per_node_width_and_node_count():
+    matching = make_location('matching', {'L4': 8}, cloud_name='GCP')
+    wrong_nodes = make_location('wrong-nodes', {'L4': 8}, cloud_name='GCP')
+    wrong_width = make_location('wrong-width', {'L4': 4}, cloud_name='GCP')
+    authority = _paid_launch_authority(
+        {'l4': 1},
+        widths={'l4': 8},
+        capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
+        backend_num_nodes=2)
+    locations = (matching, wrong_nodes, wrong_width)
+    pool_keys = {
+        matching: paid_capacity.pool_key(matching, workspace='w', num_nodes=2),
+        wrong_nodes: paid_capacity.pool_key(wrong_nodes,
+                                            workspace='w',
+                                            num_nodes=1),
+        wrong_width: paid_capacity.pool_key(wrong_width,
+                                            workspace='w',
+                                            num_nodes=2),
+    }
+
+    def _cohort(candidates):
+        return paid_capacity._plan_bound_admission_cohort(
+            authority=authority,
+            service_name='svc',
+            service_hash='hash',
+            paid_locations=candidates,
+            remaining_by_location={location: 1 for location in candidates},
+            pool_key_by_location={
+                location: pool_keys[location] for location in candidates
+            },
+            frontier_key_by_location={
+                location: ('l4',) for location in candidates
+            },
+            owned_pool_keys_by_frontier={},
+            unknown_owned_pool_keys=set(),
+            requested_frontier_keys={('l4',)},
+            claimed_plan_units_by_accelerator={})
+
+    cohort = _cohort(locations)
+    assert cohort.targets == (paid_capacity.PlanBoundAdmissionTarget(
+        frontier_key=('l4',),
+        remaining_plan_units=1,
+        physical_backend_width=16,
+        claim_units_per_backend=1,
+        backend_claim_count=1,
+        frontier_limit=2),)
+    assert _cohort((wrong_nodes, wrong_width)).targets == ()
 
 
 def test_plan_cohort_subtracts_same_generation_debits_before_preparation():
@@ -1394,29 +1447,38 @@ def test_global_budget_caps_paid_selection_across_exact_pools(monkeypatch):
     assert paid_capacity.select_location(placer, budget) is None
 
 
-def test_paid_gpu_cap_counts_width_and_cleanup_provenance_conservatively():
-    one_gpu = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
-    eight_gpu = make_location('us-west-2', {'L4': 8}, cloud_name='GCP')
-    placer = make_placer({one_gpu: 1.0, eight_gpu: 2.0})
-    paid = _pending_info(1, one_gpu)
-    paid.planned_capacity = 2
-    missing_width = _pending_info(2, one_gpu)
-    del missing_width.planned_capacity
-    malformed_width = _pending_info(3, one_gpu)
-    malformed_width.planned_capacity = '8'
-    unknown_provenance = _pending_info(4, one_gpu)
-    unknown_provenance.is_zero_cost = None
-    zero_cost = _pending_info(5, one_gpu)
+def test_paid_gpu_cap_charges_logical_and_physical_backend_widths():
+    logical_four = make_location('us-east-1', {'L4': 4}, cloud_name='AWS')
+    physical_eight = make_location('us-west-2', {'L4': 8}, cloud_name='GCP')
+    zero_cost_location = make_location('research', {'L4': 8},
+                                       cloud_name='Kubernetes')
+    placer = make_placer({
+        logical_four: 1.0,
+        physical_eight: 2.0,
+        zero_cost_location: 0,
+    })
+    logical = _pending_info(1, logical_four)
+    logical.planned_capacity = 4
+    logical.paid_capacity_pool_key = paid_capacity.pool_key(logical_four,
+                                                            workspace='w',
+                                                            num_nodes=1)
+    physical = _pending_info(2, physical_eight)
+    # Physical-backend target accounting deliberately persists one unit.
+    physical.planned_capacity = 1
+    physical.paid_capacity_pool_key = paid_capacity.pool_key(physical_eight,
+                                                             workspace='w',
+                                                             num_nodes=1)
+    zero_cost = _pending_info(3, physical_eight)
     zero_cost.is_zero_cost = True
     zero_cost.planned_capacity = 100
-    cleaned_paid = _pending_info(6, one_gpu)
+    cleaned_paid = _pending_info(4, physical_eight)
     cleaned_paid.planned_capacity = 100
     cleaned_paid.status_property.sky_down_status = (
         common_utils.ProcessStatus.SUCCEEDED)
     states = {
         paid_capacity.pool_key(location, workspace='w', num_nodes=1): {
             'remaining': 16
-        } for location in (one_gpu, eight_gpu)
+        } for location in (logical_four, physical_eight)
     }
 
     with mock.patch.object(paid_capacity,
@@ -1425,31 +1487,178 @@ def test_paid_gpu_cap_counts_width_and_cleanup_provenance_conservatively():
                                paid_capacity.serve_state,
                                'get_paid_capacity_pool_states',
                                return_value=states):
-        budget = paid_capacity.build_launch_budget(placer,
-                                                   workspace='w',
-                                                   existing_replica_infos=[
-                                                       paid, missing_width,
-                                                       malformed_width,
-                                                       unknown_provenance,
-                                                       zero_cost, cleaned_paid
-                                                   ],
-                                                   globally_managed=True,
-                                                   max_live_paid_gpu_units=7)
+        budget = paid_capacity.build_launch_budget(
+            placer,
+            workspace='w',
+            existing_replica_infos=[logical, physical, zero_cost, cleaned_paid],
+            globally_managed=True,
+            max_live_paid_gpu_units=16)
 
-    # 2 + three conservative one-unit rows. Exact true and durable teardown
-    # success do not debit the cap, regardless of their retained width.
-    assert budget.live_paid_gpu_units == 5
-    assert budget.paid_gpu_units_remaining == 2
-    assert budget.service_remaining == 16
-    assert paid_capacity.select_location(placer, budget) == one_gpu
-    paid_capacity.debit(budget, one_gpu)
-    assert budget.paid_gpu_units_remaining == 1
+    # Logical width four and physical-backend width eight both charge the
+    # physical cards they can bill. Zero-cost and cleanup-proven rows do not.
+    assert budget.live_paid_gpu_units == 12
+    assert budget.paid_gpu_units_remaining == 4
+    assert budget.service_remaining == 14
+    assert paid_capacity.select_location(placer, budget) == zero_cost_location
+    assert paid_capacity.select_location(
+        placer, budget, skip_zero_cost_preference=True) == logical_four
     assert paid_capacity.select_location(placer,
                                          budget,
                                          skip_zero_cost_preference=True,
-                                         allowed_locations={eight_gpu}) is None
+                                         allowed_locations={physical_eight
+                                                           }) is None
+
+
+def test_paid_gpu_cap_uses_pool_node_count_and_malformed_rows_fail_closed():
+    paid_location = make_location('us-west-2', {'L4': 8}, cloud_name='GCP')
+    zero_cost_location = make_location('research', {'L4': 8},
+                                       cloud_name='Kubernetes')
+    placer = make_placer({paid_location: 1.0, zero_cost_location: 0})
+    malformed = _pending_info(1, paid_location)
+    malformed.planned_capacity = 1
+    malformed.paid_capacity_pool_key = paid_capacity.pool_key(paid_location,
+                                                              workspace='w',
+                                                              num_nodes=2)
+    assert paid_capacity.paid_replica_gpu_units(malformed) == 16
+    # The exact pool says two width-eight nodes, while a corrupted duplicate
+    # claims a different per-node shape. Never guess between them.
+    malformed.resources_override['accelerators'] = {'L4': 4}
+    states = {
+        paid_capacity.pool_key(paid_location, workspace='w', num_nodes=1): {
+            'remaining': 16
+        }
+    }
+
+    with pytest.raises(paid_capacity.PaidGPUAttributionError):
+        paid_capacity._live_paid_gpu_units([malformed])
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'get_paid_capacity_pool_states',
+                               return_value=states):
+        budget = paid_capacity.build_launch_budget(
+            placer,
+            workspace='w',
+            existing_replica_infos=[malformed],
+            globally_managed=True,
+            max_live_paid_gpu_units=32)
+
+    assert budget.live_paid_gpu_units is None
+    assert budget.paid_gpu_units_remaining == 0
+    assert budget.service_remaining == 0
+    # Paid attribution failure does not suppress an independent zero-cost path.
+    assert paid_capacity.select_location(placer, budget) == zero_cost_location
+    assert paid_capacity.select_location(placer,
+                                         budget,
+                                         skip_zero_cost_preference=True) is None
+
+
+def test_multinode_paid_gpu_headroom_and_debit_use_total_backend_width():
+    location = make_location('us-west-2', {'L4': 8}, cloud_name='GCP')
+    zero_cost = make_location('research', {'L4': 8}, cloud_name='Kubernetes')
+    placer = make_placer({location: 1.0, zero_cost: 0})
+    placer.num_nodes = 2
+    key = paid_capacity.pool_key(location, workspace='w', num_nodes=2)
+    states = {key: {'remaining': 2}}
+
+    def _budget(cap):
+        with mock.patch.object(paid_capacity,
+                               'central_authority_available',
+                               return_value=True), mock.patch.object(
+                                   paid_capacity.serve_state,
+                                   'get_paid_capacity_pool_states',
+                                   return_value=states):
+            return paid_capacity.build_launch_budget(
+                placer,
+                workspace='w',
+                existing_replica_infos=[],
+                globally_managed=True,
+                max_live_paid_gpu_units=cap)
+
+    insufficient = _budget(15)
+    assert paid_capacity.select_location(placer,
+                                         insufficient,
+                                         skip_zero_cost_preference=True,
+                                         allowed_locations={location}) is None
+    assert paid_capacity.select_location(placer, insufficient) == zero_cost
+
+    exact = _budget(16)
+    assert paid_capacity.select_location(placer,
+                                         exact,
+                                         skip_zero_cost_preference=True,
+                                         allowed_locations={location
+                                                           }) == location
+    paid_capacity.debit(exact, location)
+    assert exact.paid_gpu_units_remaining == 0
+
+
+def test_cpu_paid_pool_has_typed_zero_gpu_debit_without_cap():
+    location = make_location('cpu-spot', None, cloud_name='GCP')
+    placer = make_placer({location: 1.0})
+    key = paid_capacity.pool_key(location, workspace='w', num_nodes=3)
+    placer.num_nodes = 3
+    states = {key: {'remaining': 1}}
+    info = _pending_info(1, location)
+    info.paid_capacity_pool_key = key
+
+    assert paid_capacity.paid_replica_gpu_units(info) == 0
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'get_paid_capacity_pool_states',
+                               return_value=states):
+        budget = paid_capacity.build_launch_budget(
+            placer,
+            workspace='w',
+            existing_replica_infos=[info],
+            globally_managed=True,
+            max_live_paid_gpu_units=None)
+
     assert paid_capacity.select_location(
-        placer, budget, skip_zero_cost_preference=True) == one_gpu
+        placer, budget, skip_zero_cost_preference=True) == location
+
+
+def test_paid_pool_shape_is_one_typed_per_node_authority():
+    location = make_location('multi-node', {'L4': 8}, cloud_name='GCP')
+    key = paid_capacity.pool_key(location, workspace='w', num_nodes=2)
+
+    shape = paid_capacity.paid_pool_gpu_shape(key)
+
+    assert shape == paid_capacity.PhysicalBackendShape(accelerator='l4',
+                                                       gpu_units_per_node=8,
+                                                       num_nodes=2)
+    assert shape.total_gpu_units == 16
+
+
+def test_huge_json_gpu_count_fails_with_typed_attribution_error():
+    location = make_location('huge', {'L4': 1}, cloud_name='GCP')
+    payload = json.loads(
+        paid_capacity.pool_key(location, workspace='w', num_nodes=1))
+    payload['accelerators'][0][1] = 10**1000
+    malformed = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+
+    with pytest.raises(paid_capacity.PaidGPUAttributionError):
+        paid_capacity.paid_pool_gpu_units(malformed)
+
+
+def test_physical_shape_product_overflow_fails_closed():
+    max_exact = (1 << 63) - 1
+    location = make_location('overflow', {'L4': max_exact}, cloud_name='GCP')
+    key = paid_capacity.pool_key(location, workspace='w', num_nodes=2)
+
+    with pytest.raises(paid_capacity.PaidGPUAttributionError,
+                       match='exact accounting range'):
+        paid_capacity.paid_pool_gpu_shape(key)
+    authority = _paid_launch_authority(
+        {'l4': 1},
+        widths={'l4': max_exact},
+        capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
+        backend_num_nodes=2)
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='no exact backend claim shape'):
+        authority.backend_shape('l4')
 
 
 def test_paid_gpu_cap_zero_and_postgres_unavailable_fail_closed():

@@ -71,10 +71,12 @@ _LEGACY_POOL_KEY_VERSION = 1
 _POOL_KEY_VERSION = 2
 _AWS_ACCOUNT_ID_RE = re.compile(r'[0-9]{12}')
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
+_MAX_EXACT_SHAPE_INTEGER = (1 << 63) - 1
 _UNRESOLVED_STATUS_VALUES = frozenset({'PENDING', 'PROVISIONING'})
 _admission_summary_log_lock = threading.Lock()
 _admission_summary_log_signature: tuple[Any, ...] | None = None
 _admission_summary_logged_at = 0.0
+_UNSET_POOL_KEY = object()
 FrontierKey = tuple[str, ...]
 
 
@@ -88,6 +90,41 @@ class ClaimResult(enum.Enum):
     HIGHER_PRIORITY_WAITING = 'higher_priority_waiting'
     OWNERSHIP_LOST = 'ownership_lost'
     LEGACY_LOCAL = 'legacy_local'
+
+
+class PaidGPUAttributionError(ValueError):
+    """A paid replica has no exact, self-consistent physical GPU width."""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PhysicalBackendShape:
+    """Exact provider shape shared by pool identity and planner authority."""
+
+    accelerator: str | None
+    gpu_units_per_node: int
+    num_nodes: int
+
+    def __post_init__(self) -> None:
+        cpu = self.accelerator is None
+        if ((not cpu and
+             (not isinstance(self.accelerator, str) or not self.accelerator or
+              self.accelerator != self.accelerator.casefold())) or
+                type(self.gpu_units_per_node) is not int or  # pylint: disable=unidiomatic-typecheck
+                self.gpu_units_per_node < 0
+                or self.gpu_units_per_node > _MAX_EXACT_SHAPE_INTEGER or
+            (cpu != (self.gpu_units_per_node == 0))
+                or type(self.num_nodes) is not int or  # pylint: disable=unidiomatic-typecheck
+                not 1 <= self.num_nodes <= _MAX_EXACT_SHAPE_INTEGER):
+            raise PaidGPUAttributionError(
+                'Physical backend shape is malformed.')
+        if (self.gpu_units_per_node > 0 and self.gpu_units_per_node
+                > _MAX_EXACT_SHAPE_INTEGER // self.num_nodes):
+            raise PaidGPUAttributionError(
+                'Physical backend shape exceeds exact accounting range.')
+
+    @property
+    def total_gpu_units(self) -> int:
+        return self.gpu_units_per_node * self.num_nodes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -751,6 +788,7 @@ def _pool_key_payload(key: str) -> dict[str, Any] | None:
             or type(payload.get('use_spot')) is not bool or  # pylint: disable=unidiomatic-typecheck
             type(payload.get('num_nodes')) is not int or  # pylint: disable=unidiomatic-typecheck
             payload['num_nodes'] <= 0
+            or payload['num_nodes'] > _MAX_EXACT_SHAPE_INTEGER
             or not isinstance(payload.get('accelerators'), list)):
         return None
     if payload['version'] == _POOL_KEY_VERSION:
@@ -764,12 +802,16 @@ def _pool_key_payload(key: str) -> dict[str, Any] | None:
             return None
     names = []
     for accelerator in payload['accelerators']:
-        if (not isinstance(accelerator, list) or len(accelerator) != 2 or
-                not isinstance(accelerator[0], str) or not accelerator[0] or
+        if not isinstance(accelerator, list) or len(accelerator) != 2:
+            return None
+        count = accelerator[1]
+        finite_count = type(count) is int  # pylint: disable=unidiomatic-typecheck
+        if isinstance(count, float):
+            finite_count = math.isfinite(count)
+        if (not isinstance(accelerator[0], str) or not accelerator[0] or
                 accelerator[0] != accelerator[0].casefold() or
-                not isinstance(accelerator[1], (int, float)) or
-                isinstance(accelerator[1], bool) or
-                not math.isfinite(accelerator[1]) or accelerator[1] <= 0):
+                not finite_count or count <= 0 or
+                count > _MAX_EXACT_SHAPE_INTEGER):
             return None
         names.append(accelerator[0])
     if len(names) != len(set(names)) or names != sorted(names,
@@ -905,6 +947,180 @@ def _service_claim_count(
                for info in existing_replica_infos)
 
 
+def _exact_whole_gpu_shape(
+    accelerators: Any,
+    *,
+    field: str,
+) -> tuple[str, int]:
+    """Decode one exact whole-GPU accelerator shape."""
+    if not isinstance(accelerators, Mapping) or len(accelerators) != 1:
+        raise PaidGPUAttributionError(
+            f'{field} must contain one exact accelerator shape.')
+    card, count = next(iter(accelerators.items()))
+    valid_count = (
+        type(count) is int and 1 <= count <=  # pylint: disable=unidiomatic-typecheck
+        _MAX_EXACT_SHAPE_INTEGER)
+    if isinstance(count, float):
+        valid_count = (math.isfinite(count) and
+                       1 <= count <= _MAX_EXACT_SHAPE_INTEGER and
+                       count.is_integer())
+    if not isinstance(card, str) or not card or not valid_count:
+        raise PaidGPUAttributionError(
+            f'{field} must contain one positive whole-GPU shape.')
+    return card.casefold(), int(count)
+
+
+def _paid_pool_gpu_shape(pool_key_value: Any) -> PhysicalBackendShape:
+    """Decode the billing shape from one canonical exact paid pool."""
+    if not isinstance(pool_key_value, str):
+        raise PaidGPUAttributionError(
+            'Paid replica has no exact provider pool identity.')
+    try:
+        payload = _pool_key_payload(pool_key_value)
+    except (OverflowError, ValueError) as error:
+        raise PaidGPUAttributionError(
+            'Paid replica provider pool identity is malformed.') from error
+    if payload is None or len(payload['accelerators']) > 1:
+        raise PaidGPUAttributionError(
+            'Paid replica provider pool identity is malformed.')
+    card = None
+    count = 0
+    if payload['accelerators']:
+        raw_card, raw_count = payload['accelerators'][0]
+        card, count = _exact_whole_gpu_shape({raw_card: raw_count},
+                                             field='paid provider pool')
+    num_nodes = payload['num_nodes']
+    # _pool_key_payload() already requires an exact positive integer. Keep the
+    # check local so this function remains fail-closed if that codec changes.
+    if type(num_nodes) is not int or num_nodes < 1:  # pylint: disable=unidiomatic-typecheck
+        raise PaidGPUAttributionError(
+            'Paid replica provider pool has malformed node cardinality.')
+    return PhysicalBackendShape(accelerator=card,
+                                gpu_units_per_node=count,
+                                num_nodes=num_nodes)
+
+
+def _cross_check_replica_gpu_shape(resource: Any, *, field: str,
+                                   expected: tuple[str, int] | None) -> None:
+    """Require any persisted duplicate shape to match the paid pool."""
+    if resource is None:
+        return
+    if not isinstance(resource, Mapping):
+        raise PaidGPUAttributionError(f'Paid replica {field} is malformed.')
+    if 'accelerators' not in resource:
+        return
+    if expected is None:
+        accelerators = resource.get('accelerators')
+        if accelerators is None or accelerators == {}:
+            return
+        raise PaidGPUAttributionError(
+            f'Paid replica {field} disagrees with its CPU-only provider pool.')
+    observed = _exact_whole_gpu_shape(resource.get('accelerators'),
+                                      field=f'paid replica {field}')
+    if observed != expected:
+        raise PaidGPUAttributionError(
+            f'Paid replica {field} disagrees with its provider pool.')
+
+
+def paid_replica_cleanup_proven(
+    replica: Any,
+    *,
+    sky_down_status_value: Any,
+) -> bool:
+    """Cross-check the JSON cleanup copy against its relational authority."""
+    if not isinstance(replica, Mapping):
+        raise PaidGPUAttributionError('Paid replica state is malformed.')
+    status = replica.get('status_property')
+    if not isinstance(status, Mapping):
+        raise PaidGPUAttributionError(
+            'Paid replica cleanup attribution is malformed.')
+    if status.get('sky_down_status') != sky_down_status_value:
+        raise PaidGPUAttributionError(
+            'Paid replica cleanup scalar contradicts ReplicaInfo state.')
+    return (sky_down_status_value == common_utils.ProcessStatus.SUCCEEDED.value)
+
+
+def validate_paid_replica_relational_copies(
+    replica: Any,
+    *,
+    pool_key_value: Any,
+) -> bool:
+    """Validate paid/zero-cost JSON copies after cleanup remains unproven.
+
+    Returns whether the authoritative relational pool scalar classifies this
+    row as paid. A matched durable cleanup proof should be checked first: once
+    provider cleanup is complete, stale historical billing-shape copies do not
+    retain phantom paid capacity.
+    """
+    if not isinstance(replica, Mapping):
+        raise PaidGPUAttributionError('Paid replica state is malformed.')
+    persisted_pool_key = replica.get('paid_capacity_pool_key')
+    is_zero_cost = replica.get('is_zero_cost')
+    if persisted_pool_key != pool_key_value:
+        raise PaidGPUAttributionError(
+            'Paid replica row and JSON name different provider pools.')
+    relationally_paid = pool_key_value is not None
+    if ((relationally_paid and is_zero_cost is True) or
+        (not relationally_paid and is_zero_cost is False)):
+        raise PaidGPUAttributionError(
+            'Paid replica pool contradicts zero-cost attribution.')
+    return relationally_paid
+
+
+def paid_replica_gpu_units(
+    replica: Any,
+    *,
+    pool_key_value: Any = _UNSET_POOL_KEY,
+) -> int:
+    """Return one paid replica's exact physical GPU debit.
+
+    ``planned_capacity`` deliberately remains the service's capacity unit: it
+    is one for a physical-backend service and the logical slot width for a
+    logical service. Billing width instead comes from the canonical paid pool,
+    whose ``num_nodes`` is not duplicated by ReplicaInfo location overrides.
+    The duplicated per-node shapes are consistency checks only.
+    """
+    if isinstance(replica, Mapping):
+        persisted_pool_key = replica.get('paid_capacity_pool_key')
+        location = replica.get('location')
+        resources_override = replica.get('resources_override')
+        is_zero_cost = replica.get('is_zero_cost')
+    else:
+        persisted_pool_key = getattr(replica, 'paid_capacity_pool_key', None)
+        location = getattr(replica, 'location', None)
+        resources_override = getattr(replica, 'resources_override', None)
+        is_zero_cost = getattr(replica, 'is_zero_cost', None)
+    if is_zero_cost is True:
+        raise PaidGPUAttributionError(
+            'Paid provider pool contradicts zero-cost replica attribution.')
+    if pool_key_value is _UNSET_POOL_KEY:
+        pool_key_value = persisted_pool_key
+    elif (persisted_pool_key is not None and
+          persisted_pool_key != pool_key_value):
+        raise PaidGPUAttributionError(
+            'Paid replica row and claim name different provider pools.')
+    shape = _paid_pool_gpu_shape(pool_key_value)
+    expected = (None if shape.accelerator is None else
+                (shape.accelerator, shape.gpu_units_per_node))
+    _cross_check_replica_gpu_shape(location,
+                                   field='location',
+                                   expected=expected)
+    _cross_check_replica_gpu_shape(resources_override,
+                                   field='resources_override',
+                                   expected=expected)
+    return shape.total_gpu_units
+
+
+def paid_pool_gpu_units(pool_key_value: Any) -> int:
+    """Return the exact total GPU debit for one canonical provider pool."""
+    return _paid_pool_gpu_shape(pool_key_value).total_gpu_units
+
+
+def paid_pool_gpu_shape(pool_key_value: Any) -> PhysicalBackendShape:
+    """Return the canonical typed physical shape of one provider pool."""
+    return _paid_pool_gpu_shape(pool_key_value)
+
+
 def _live_paid_gpu_units(
         existing_replica_infos: Iterable['replica_managers.ReplicaInfo']
 ) -> int:
@@ -915,24 +1131,20 @@ def _live_paid_gpu_units(
         down_status_value = getattr(down_status, 'value', down_status)
         if (info.is_zero_cost is not True and down_status_value
                 != common_utils.ProcessStatus.SUCCEEDED.value):
-            planned_capacity = getattr(info, 'planned_capacity', None)
-            if (type(planned_capacity) is not int or  # pylint: disable=unidiomatic-typecheck
-                    planned_capacity < 1):
-                planned_capacity = 1
-            total += planned_capacity
+            total += paid_replica_gpu_units(info)
     return total
 
 
-def _location_gpu_units(location: spot_placer.Location) -> int:
-    """Return one logical placer's exact whole-GPU backend width."""
-    accelerators = location.accelerators
-    if not isinstance(accelerators, Mapping) or len(accelerators) != 1:
-        return 1
-    count = next(iter(accelerators.values()))
-    if (isinstance(count, bool) or not isinstance(count, (int, float)) or
-            count < 1 or not float(count).is_integer()):
-        return 1
-    return int(count)
+def _budget_location_gpu_units(budget: LaunchBudget,
+                               location: spot_placer.Location) -> int | None:
+    """Resolve one advisory location's exact total-backend GPU debit."""
+    pool = budget.pool_key_by_location.get(location)
+    if pool is None:
+        return None
+    try:
+        return paid_pool_gpu_units(pool)
+    except PaidGPUAttributionError:
+        return None
 
 
 def _evidence_aware_service_limit(
@@ -1079,16 +1291,17 @@ def _plan_bound_admission_cohort(
             location, frontier_key(location))
         if location_frontier not in targets_by_frontier:
             continue
+        pool = pool_key_by_location.get(location)
+        if pool is None:
+            continue
         try:
-            physical_width, _ = authority.backend_claim_shape(
-                location_frontier[0])
+            authority_shape = authority.backend_shape(location_frontier[0])
+            pool_shape = paid_pool_gpu_shape(pool)
         except Exception:  # pylint: disable=broad-except
             continue
-        if _location_gpu_units(location) != physical_width:
+        if pool_shape != authority_shape:
             continue
-        pool = pool_key_by_location.get(location)
-        if (pool is None or
-                pool in seen_pool_keys_by_frontier[location_frontier]):
+        if pool in seen_pool_keys_by_frontier[location_frontier]:
             continue
         seen_pool_keys_by_frontier[location_frontier].add(pool)
         distinct_locations_by_frontier[location_frontier].append(location)
@@ -1098,8 +1311,8 @@ def _plan_bound_admission_cohort(
     for target_frontier, target_units in sorted(targets_by_frontier.items()):
         locations = distinct_locations_by_frontier.get(target_frontier, [])
         try:
-            physical_width, claim_units = authority.backend_claim_shape(
-                target_frontier[0])
+            backend_shape = authority.backend_shape(target_frontier[0])
+            claim_units = authority.claim_units_per_backend(target_frontier[0])
         except Exception as error:  # pylint: disable=broad-except
             logger.warning('Deferring malformed plan-bound paid card %s: %s',
                            target_frontier[0],
@@ -1109,7 +1322,7 @@ def _plan_bound_admission_cohort(
             logger.info(
                 'Deferring plan-bound paid card %s: no Spot candidate '
                 'has physical backend width %d.', target_frontier[0],
-                physical_width)
+                backend_shape.total_gpu_units)
             continue
         if target_units % claim_units != 0:
             logger.warning(
@@ -1147,14 +1360,14 @@ def _plan_bound_admission_cohort(
             remaining_claims = max(0, remaining_claims - remaining)
 
         targets.append(
-            PlanBoundAdmissionTarget(frontier_key=target_frontier,
-                                     remaining_plan_units=target_units,
-                                     physical_backend_width=physical_width,
-                                     claim_units_per_backend=claim_units,
-                                     backend_claim_count=target_claims,
-                                     frontier_limit=max(
-                                         default_frontier,
-                                         len(owned) + new_pool_count)))
+            PlanBoundAdmissionTarget(
+                frontier_key=target_frontier,
+                remaining_plan_units=target_units,
+                physical_backend_width=(backend_shape.total_gpu_units),
+                claim_units_per_backend=claim_units,
+                backend_claim_count=target_claims,
+                frontier_limit=max(default_frontier,
+                                   len(owned) + new_pool_count)))
 
     return PlanBoundAdmissionCohort(
         capacity_plan_generation=authority.generation,
@@ -1193,7 +1406,15 @@ def build_launch_budget(
         paid_locations = [
             location for location in paid_locations if location.use_spot is True
         ]
-    live_paid_gpu_units = _live_paid_gpu_units(existing_replica_infos)
+    paid_gpu_attribution_complete = True
+    try:
+        live_paid_gpu_units = _live_paid_gpu_units(existing_replica_infos)
+    except PaidGPUAttributionError as error:
+        paid_gpu_attribution_complete = False
+        live_paid_gpu_units = None
+        logger.warning('Disabling fresh paid capacity because a live replica '
+                       'has no exact physical GPU debit: '
+                       f'{common_utils.format_exception(error)}')
     central_available = globally_managed and central_authority_available()
     if paid_launch_authority is not None:
         identity_matches = (
@@ -1388,6 +1609,17 @@ def build_launch_budget(
                 unknown_owned_pool_keys=unknown_owned_pool_keys,
                 requested_frontier_keys=requested_frontier_keys,
                 claimed_plan_units_by_accelerator=claimed_units)
+            target_width_by_frontier = {
+                target.frontier_key: target.physical_backend_width
+                for target in cohort.targets
+            }
+            filtered_remaining = {
+                location: (
+                    location_remaining if target_width_by_frontier.get(
+                        frontier_keys[location]) == paid_pool_gpu_units(
+                            keys[location]) else 0
+                ) for location, location_remaining in remaining.items()
+            }
         except Exception as error:  # pylint: disable=broad-except
             # The immutable plan, exact physical width, and durable debit
             # ledger must agree before even preparing provider candidates.
@@ -1400,24 +1632,22 @@ def build_launch_budget(
             service_remaining = cohort.backend_claim_count
             service_claim_limit = max(1, service_claims + service_remaining)
             frontier_limit_overrides = cohort.frontier_limits()
-            target_width_by_frontier = {
-                target.frontier_key: target.physical_backend_width
-                for target in cohort.targets
-            }
-            remaining = {
-                location: (
-                    location_remaining
-                    if target_width_by_frontier.get(frontier_keys[location])
-                    == _location_gpu_units(location) else 0
-                ) for location, location_remaining in remaining.items()
-            }
+            remaining = filtered_remaining
             if frontier_limit_overrides:
                 configured_max_frontier = max(
                     configured_frontier, *frontier_limit_overrides.values())
-    paid_gpu_units_remaining = (None
-                                if max_live_paid_gpu_units is None else max(
-                                    0, max_live_paid_gpu_units -
-                                    live_paid_gpu_units))
+    paid_gpu_units_remaining = None
+    if max_live_paid_gpu_units is not None:
+        if paid_gpu_attribution_complete:
+            assert live_paid_gpu_units is not None
+            paid_gpu_units_remaining = max(
+                0, max_live_paid_gpu_units - live_paid_gpu_units)
+        else:
+            # Advisory reads must not guess a legacy/malformed row's node
+            # cardinality. Preserve zero-cost placement, but close the paid
+            # service envelope until exact attribution is repaired.
+            paid_gpu_units_remaining = 0
+            service_remaining = 0
     _log_admission_summary(states,
                            service_claims=service_claims,
                            service_claim_limit=service_claim_limit,
@@ -1560,13 +1790,18 @@ def select_location(
         return selected
     zero_cost = set(placer.zero_cost_locations())
     active_paid = [location for location in active if location not in zero_cost]
-    available_paid = {
-        location for location in active_paid
-        if budget.remaining_by_location.get(location, 0) > 0 and
-        (budget.service_remaining is None or budget.service_remaining > 0) and
-        (budget.paid_gpu_units_remaining is None or
-         budget.paid_gpu_units_remaining >= _location_gpu_units(location))
-    }
+    available_paid = set()
+    for location in active_paid:
+        if (budget.remaining_by_location.get(location, 0) <= 0 or
+            (budget.service_remaining is not None and
+             budget.service_remaining <= 0)):
+            continue
+        if budget.paid_gpu_units_remaining is not None:
+            gpu_units = _budget_location_gpu_units(budget, location)
+            if (gpu_units is None or
+                    budget.paid_gpu_units_remaining < gpu_units):
+                continue
+        available_paid.add(location)
     eligible_paid = available_paid
     expansion_candidates: set[spot_placer.Location] = set()
     if budget.frontier_limit is not None:
@@ -1754,8 +1989,9 @@ def debit(budget: LaunchBudget | None,
         budget.service_remaining -= 1
     if (budget.paid_gpu_units_remaining is not None and
             budget.paid_gpu_units_remaining > 0):
-        budget.paid_gpu_units_remaining = max(
-            0, budget.paid_gpu_units_remaining - _location_gpu_units(location))
+        gpu_units = _budget_location_gpu_units(budget, location)
+        budget.paid_gpu_units_remaining = (0 if gpu_units is None else max(
+            0, budget.paid_gpu_units_remaining - gpu_units))
     if budget.frontier_limit is not None and key is not None:
         frontier = budget.frontier_key_by_location.get(location,
                                                        frontier_key(location))

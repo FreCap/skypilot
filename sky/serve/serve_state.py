@@ -5866,6 +5866,24 @@ def try_add_replicas_with_paid_capacity_claims(
                 != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
             session.rollback()
             return ['service_saturated'] * len(persistence_specs)
+        paid_gpu_units_by_index = {
+            index: 0 for index in range(len(persistence_specs))
+        }
+        if max_live_paid_gpu_units is not None:
+            try:
+                paid_gpu_units_by_index = {
+                    index: paid_capacity.paid_replica_gpu_units(
+                        spec.candidate.replica_info,
+                        pool_key_value=spec.pool_key)
+                    for index, spec in enumerate(persistence_specs)
+                }
+            except paid_capacity.PaidGPUAttributionError as error:
+                logger.warning(
+                    'Rejecting fresh paid capacity because a candidate has '
+                    'no exact physical GPU debit: %s',
+                    common_utils.format_exception(error))
+                session.rollback()
+                return ['service_saturated'] * len(persistence_specs)
 
         service_claims, _ = (_valid_paid_capacity_service_claims_in_session(
             session, service_name, service_hash))
@@ -5883,36 +5901,59 @@ def try_add_replicas_with_paid_capacity_claims(
         live_paid_gpu_units = 0
         if max_live_paid_gpu_units is not None:
             live_paid_rows = session.execute(
-                sqlalchemy.select(
-                    replicas_table.c.replica_state,
-                    replicas_table.c.sky_down_status).where(
-                        replicas_table.c.service_name == service_name)).all()
-            for replica_state, sky_down_status in live_paid_rows:
-                is_paid = (not isinstance(replica_state, Mapping) or
-                           replica_state.get('is_zero_cost') is not True)
-                if (not is_paid or sky_down_status
-                        == common_utils.ProcessStatus.SUCCEEDED.value):
+                sqlalchemy.select(replicas_table.c.replica_state,
+                                  replicas_table.c.paid_capacity_pool_key,
+                                  replicas_table.c.sky_down_status).where(
+                                      replicas_table.c.service_name ==
+                                      service_name)).mappings().all()
+            for row in live_paid_rows:
+                replica_state = row['replica_state']
+                try:
+                    cleanup_proven = paid_capacity.paid_replica_cleanup_proven(
+                        replica_state,
+                        sky_down_status_value=row['sky_down_status'])
+                    if cleanup_proven:
+                        # Durable provider cleanup dominates stale historical
+                        # billing-shape copies and prevents phantom capacity.
+                        continue
+                    is_paid = (
+                        paid_capacity.validate_paid_replica_relational_copies(
+                            replica_state,
+                            pool_key_value=row['paid_capacity_pool_key']))
+                except paid_capacity.PaidGPUAttributionError as error:
+                    logger.warning(
+                        'Rejecting fresh paid capacity because a locked '
+                        'replica has contradictory relational attribution: %s',
+                        common_utils.format_exception(error))
+                    session.rollback()
+                    return ['service_saturated'] * len(persistence_specs)
+                if not is_paid:
                     continue
-                planned_capacity = (replica_state.get('planned_capacity')
-                                    if isinstance(replica_state, Mapping) else
-                                    None)
-                if (type(planned_capacity) is not int or  # pylint: disable=unidiomatic-typecheck
-                        planned_capacity < 1):
-                    planned_capacity = 1
-                live_paid_gpu_units += planned_capacity
+                try:
+                    live_paid_gpu_units += (
+                        paid_capacity.paid_replica_gpu_units(
+                            replica_state,
+                            pool_key_value=row['paid_capacity_pool_key']))
+                except paid_capacity.PaidGPUAttributionError as error:
+                    logger.warning(
+                        'Rejecting fresh paid capacity because a locked live '
+                        'replica has no exact physical GPU debit: %s',
+                        common_utils.format_exception(error))
+                    session.rollback()
+                    return ['service_saturated'] * len(persistence_specs)
 
-        first_new_spec = next(
-            (spec for spec in persistence_specs
+        first_new_index = next(
+            (index for index, spec in enumerate(persistence_specs)
              if spec.candidate.replica_id not in existing_replica_ids_at_start),
             None)
         has_existing_candidate = any(
             spec.candidate.replica_id in existing_replica_ids_at_start
             for spec in persistence_specs)
-        if (not has_existing_candidate and first_new_spec is not None and
+        if (not has_existing_candidate and first_new_index is not None and
             ((service_limit is not None and
               len(service_claims) >= service_limit) or
-             (max_live_paid_gpu_units is not None and live_paid_gpu_units +
-              first_new_spec.candidate.replica_info.planned_capacity
+             (max_live_paid_gpu_units is not None and
+              live_paid_gpu_units + paid_gpu_units_by_index[first_new_index]
               > max_live_paid_gpu_units))):
             _withdraw_all_paid_capacity_waiters_in_session(
                 session, service_name, service_hash)
@@ -6047,7 +6088,7 @@ def try_add_replicas_with_paid_capacity_claims(
                 results[index] = 'service_saturated'
                 continue
 
-            width = candidate.replica_info.planned_capacity
+            paid_gpu_units = paid_gpu_units_by_index[index]
             if (service_limit is not None and
                     service_claim_count >= service_limit):
                 service_stopped = True
@@ -6055,7 +6096,8 @@ def try_add_replicas_with_paid_capacity_claims(
                 results[index] = 'service_saturated'
                 continue
             if (max_live_paid_gpu_units is not None and
-                    live_paid_gpu_units + width > max_live_paid_gpu_units):
+                    live_paid_gpu_units + paid_gpu_units
+                    > max_live_paid_gpu_units):
                 service_stopped = True
                 reconcile_waiters = True
                 results[index] = 'service_saturated'
@@ -6118,7 +6160,7 @@ def try_add_replicas_with_paid_capacity_claims(
             service_claim_by_replica_id[replica_id] = spec.pool_key
             service_claims.append((replica_id, spec.pool_key))
             service_claim_count += 1
-            live_paid_gpu_units += width
+            live_paid_gpu_units += paid_gpu_units
             owned_by_frontier[spec.frontier_key].add(spec.pool_key)
             accepted_indices.append(index)
             results[index] = 'acquired'
@@ -6149,7 +6191,8 @@ def try_add_replicas_with_paid_capacity_claims(
             prospective_claim = dict(candidate.capacity_plan_claim or {})
             prospective_claim.update(service_name=service_name,
                                      service_hash=service_hash,
-                                     replica_id=candidate.replica_id)
+                                     replica_id=candidate.replica_id,
+                                     paid_capacity_pool_key=spec.pool_key)
             require_planner = not bool(
                 candidate.replica_info.cost_rebalance_for_replica_id is not None
                 or candidate.replica_info.system_recovery_launch_intent

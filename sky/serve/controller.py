@@ -3909,14 +3909,24 @@ class SkyServeController:
     def _configured_accelerator_shapes(self,
                                        service_spec: Any) -> dict[str, int]:
         """Return canonical exact-card GPU counts from active task resources."""
+        shapes, _ = self._configured_backend_shape(service_spec)
+        return shapes
+
+    def _configured_backend_shape(
+            self, service_spec: Any) -> tuple[dict[str, int], int]:
+        """Return the exact per-node GPU catalog and task node count."""
         configured = self._configured_accelerators(service_spec)
         if not configured:
-            return {}
+            return {}, 1
         yaml_content = self._replica_manager.yaml_content
         if not isinstance(yaml_content, str):
-            return {}
+            return {}, 1
         task = replica_managers.load_task_with_service_spec(
             yaml_content, service_spec)
+        num_nodes = task.num_nodes
+        if (not isinstance(num_nodes, int) or isinstance(num_nodes, bool) or
+                num_nodes < 1):
+            return {}, 1
         exact_shapes = replica_managers.exact_accelerator_shapes_from_resources(
             task.resources)
         exact_shapes_by_name = {
@@ -3924,10 +3934,10 @@ class SkyServeController:
         }
         if any(card.casefold() not in exact_shapes_by_name
                for card in configured):
-            return {}
-        return {
+            return {}, 1
+        return ({
             card: exact_shapes_by_name[card.casefold()] for card in configured
-        }
+        }, num_nodes)
 
     def _configure_instance_aware_accelerators(self, service_spec: Any) -> None:
         """Feed task-authoritative exact shapes to the compatible autoscaler."""
@@ -3936,23 +3946,32 @@ class SkyServeController:
                           (autoscalers.InstanceAwareRequestRateAutoscaler,
                            autoscalers.ConcurrencyAutoscaler)):
             return
-        shapes = self._accelerator_shapes_for_compatibility(
+        shapes, backend_num_nodes = self._accelerator_catalog_for_compatibility(
             compatible_autoscaler, service_spec)
         # Empty is an explicit policy downgrade, not a no-op. It clears an
         # in-place ConcurrencyAutoscaler's prior card catalog before the next
         # decision tick can act on stale compatibility state.
-        compatible_autoscaler.set_configured_accelerator_shapes(shapes)
+        compatible_autoscaler.set_configured_accelerator_shapes(
+            shapes, backend_num_nodes=backend_num_nodes)
 
     def _accelerator_shapes_for_compatibility(
             self, candidate_autoscaler: autoscalers.Autoscaler,
             service_spec: Any) -> dict[str, int]:
         """Resolve the exact catalog for one autoscaler/spec transition."""
+        shapes, _ = self._accelerator_catalog_for_compatibility(
+            candidate_autoscaler, service_spec)
+        return shapes
+
+    def _accelerator_catalog_for_compatibility(
+            self, candidate_autoscaler: autoscalers.Autoscaler,
+            service_spec: Any) -> tuple[dict[str, int], int]:
+        """Resolve exact per-node shapes and node count for one transition."""
         if (service_spec.load_balancing_policy != 'instance_aware_least_load' or
                 not isinstance(candidate_autoscaler,
                                (autoscalers.InstanceAwareRequestRateAutoscaler,
                                 autoscalers.ConcurrencyAutoscaler))):
-            return {}
-        return self._configured_accelerator_shapes(service_spec)
+            return {}, 1
+        return self._configured_backend_shape(service_spec)
 
     def _supports_exact_accelerator_compatibility(
             self,
@@ -5440,8 +5459,9 @@ class SkyServeController:
                     install_config=_install_matching_config)
             new_autoscaler = autoscalers.Autoscaler.from_spec(
                 self._service_name, service)
-            accelerator_shapes = self._accelerator_shapes_for_compatibility(
-                new_autoscaler, service)
+            accelerator_shapes, backend_num_nodes = (
+                self._accelerator_catalog_for_compatibility(
+                    new_autoscaler, service))
             replace_autoscaler = not isinstance(self._autoscaler,
                                                 type(new_autoscaler))
             if replace_autoscaler:
@@ -5469,7 +5489,11 @@ class SkyServeController:
                         (autoscalers.InstanceAwareRequestRateAutoscaler,
                          autoscalers.ConcurrencyAutoscaler)):
                         new_autoscaler.update_version_and_accelerator_shapes(
-                            version, service, update_mode, accelerator_shapes)
+                            version,
+                            service,
+                            update_mode,
+                            accelerator_shapes,
+                            backend_num_nodes=backend_num_nodes)
                     else:
                         new_autoscaler.update_version(version,
                                                       service,
@@ -5484,7 +5508,11 @@ class SkyServeController:
                         (autoscalers.InstanceAwareRequestRateAutoscaler,
                          autoscalers.ConcurrencyAutoscaler)):
                         self._autoscaler.update_version_and_accelerator_shapes(
-                            version, service, update_mode, accelerator_shapes)
+                            version,
+                            service,
+                            update_mode,
+                            accelerator_shapes,
+                            backend_num_nodes=backend_num_nodes)
                     else:
                         self._autoscaler.update_version(version,
                                                         service,

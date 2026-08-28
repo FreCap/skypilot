@@ -810,7 +810,7 @@ class TestGetRoutingSpec:
         configured_accelerators.assert_not_called()
         ctrl._configure_instance_aware_accelerators(spec)  # pylint: disable=protected-access
         ctrl._autoscaler.set_configured_accelerator_shapes.assert_called_once_with(  # pylint: disable=line-too-long
-            {})
+            {}, backend_num_nodes=1)
 
     def test_compatibility_report_requires_applied_routing_version(self):
         ctrl = _make_controller()
@@ -864,7 +864,8 @@ class TestGetRoutingSpec:
         task = types.SimpleNamespace(resources=[
             types.SimpleNamespace(accelerators={'A100': 8}),
             types.SimpleNamespace(accelerators={'A100-80GB': 1}),
-        ])
+        ],
+                                     num_nodes=2)
         spec = types.SimpleNamespace(
             min_replicas_by_accelerator={},
             load_balancing_policy='instance_aware_least_load')
@@ -877,7 +878,8 @@ class TestGetRoutingSpec:
             {
                 'A100': 8,
                 'A100-80GB': 1,
-            })
+            },
+            backend_num_nodes=2)
 
     def test_unordered_any_of_without_placer_withholds_compatibility(self):
         ctrl = _make_controller()
@@ -886,7 +888,7 @@ class TestGetRoutingSpec:
             spot_placer=None)
         l4 = mock.Mock(accelerators={'L4': 1})
         a100 = mock.Mock(accelerators={'A100': 1})
-        task = types.SimpleNamespace(resources={l4, a100})
+        task = types.SimpleNamespace(resources={l4, a100}, num_nodes=1)
         spec = types.SimpleNamespace(min_replicas_by_accelerator={},
                                      target_qps_per_replica={
                                          'L4': 1.0,
@@ -916,7 +918,8 @@ class TestGetRoutingSpec:
         task = types.SimpleNamespace(resources=[
             types.SimpleNamespace(accelerators={'L4': 1}),
             types.SimpleNamespace(accelerators={'A100': 1}),
-        ])
+        ],
+                                     num_nodes=1)
         spec = types.SimpleNamespace(min_replicas_by_accelerator={},
                                      target_qps_per_replica={
                                          'L4': 1.0,
@@ -947,7 +950,8 @@ class TestGetRoutingSpec:
         task = types.SimpleNamespace(resources=[
             types.SimpleNamespace(accelerators={'L4': 1}),
             types.SimpleNamespace(accelerators={'A100': 1}),
-        ])
+        ],
+                                     num_nodes=1)
         spec = types.SimpleNamespace(min_replicas_by_accelerator={},
                                      target_qps_per_replica={
                                          'L4': 1.0,
@@ -980,7 +984,8 @@ class TestGetRoutingSpec:
         task = types.SimpleNamespace(resources=[
             types.SimpleNamespace(accelerators={'L4': 1}),
             types.SimpleNamespace(accelerators={'A100': 1}),
-        ])
+        ],
+                                     num_nodes=1)
         spec = types.SimpleNamespace(min_replicas_by_accelerator={},
                                      target_qps_per_replica={
                                          'L4': 1.0,
@@ -1014,7 +1019,8 @@ class TestGetRoutingSpec:
         task = types.SimpleNamespace(resources=[
             types.SimpleNamespace(accelerators={'L4': 1}),
             types.SimpleNamespace(accelerators={'A100': 1}),
-        ])
+        ],
+                                     num_nodes=1)
         spec = _FakeSpec(load_balancing_policy='instance_aware_least_load',
                          target_qps_per_replica=None,
                          target_concurrency_per_replica=1,

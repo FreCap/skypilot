@@ -988,10 +988,10 @@ class TestInstanceAwareUpdateVersion(unittest.TestCase):
         errors = []
         original_setter = (autoscaler._set_configured_accelerator_shapes_locked)
 
-        def _blocking_setter(shapes):
+        def _blocking_setter(shapes, *, backend_num_nodes=1):
             entered_catalog_transition.set()
             assert resume_catalog_transition.wait(timeout=5)
-            original_setter(shapes)
+            original_setter(shapes, backend_num_nodes=backend_num_nodes)
 
         def _update():
             try:
@@ -1027,6 +1027,7 @@ class TestInstanceAwareUpdateVersion(unittest.TestCase):
         self.assertFalse(errors)
         self.assertEqual(autoscaler.latest_version, 2)
         self.assertEqual(autoscaler.configured_accelerator_shapes, {'H100': 1})
+        self.assertEqual(autoscaler.backend_num_nodes, 1)
         self.assertFalse(
             any(decision.target == {'accelerators': {
                 'A100': 1
