@@ -5275,6 +5275,49 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(autoscaler._deadline_infeasible_by_priority, {})
         self.assertEqual(_scale_ups(decisions), [])
 
+    def test_capacity_time_short_sla_adds_only_paid_residual(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=2000,
+            replica_unit='logical',
+            target_utilization_percentage=95,
+            expected_request_duration_seconds=10,
+            initial_provision_lead_time_seconds=0,
+            lb_request_queue={
+                'timeout_seconds': 600,
+                'timeout_seconds_by_priority': [{
+                    'min_priority': 50,
+                    'timeout_seconds': 60,
+                }],
+            },
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
+        replicas = [_replica(replica_id) for replica_id in range(1, 51)]
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1000,
+                queue_depth_by_priority={50: 1000},
+                queued_profiles=[self._profile(50, ['L4'], 1000)],
+                deadline_profiles=[{
+                    'priority': 50,
+                    'compatible_accelerators': ['L4'],
+                    'remaining_seconds': 60,
+                    'count': 1000,
+                }],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 176)
+        self.assertEqual(autoscaler._deadline_target_by_accelerator,
+                         {'L4': 176})
+        self.assertEqual(autoscaler._deadline_infeasible_by_priority, {})
+        self.assertEqual(len(_scale_ups(decisions)), 1)
+        self.assertEqual(
+            dict(
+                _scale_ups(decisions)
+                [0].target.cold_launch_authority_by_accelerator), {'L4': 126})
+
     def test_capacity_time_queue_reports_unrescuable_deadline(self):
         autoscaler = _make_autoscaler(
             knob=1,
