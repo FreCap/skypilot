@@ -1,5 +1,7 @@
 # SkyServe demand, capacity, and telemetry convergence
 
+_Last updated: 2026-08-28_
+
 Current status (2026-08-26): SkyPilot release `1.1.1513`, PR #1744, is deployed
 at Helm revision 635 and the independent paid Spot provider-lifecycle gate is
 complete. A bounded fixed-120 wave atomically committed all 120 PostgreSQL
@@ -16,6 +18,10 @@ demand and reserved-capacity gates remain open. The older phase account below
 is historical chronology and is not an executable runbook. The compact
 immutable record is the
 [Spot lifecycle evidence bundle](evidence/skyserve-gcp-spot-lifecycle-2026-08-26/README.md).
+
+The 2026-08-28 retained-route semantic-equivalence correction described below
+is source-complete and under qualification; it is not included in that earlier
+production proof.
 
 All PHX lane names in that historical chronology are audit facts, not current
 operator instructions. The current source contract is policy-bundle schema v7
@@ -732,8 +738,21 @@ five-second reporting cadence.
 
 Every promoted reconcile follows one ordered path:
 
+Freshness still requires the exact current ACTIVE load-balancer slot and HA
+cutover generation. Route-projection generation is a distinct immutable
+fence: each report may reference the current head or a retained generation
+only when its full digest is exact and PostgreSQL proves current owner,
+lifecycle, service version, producer protocol, and an identical demand-report
+route context for that retained snapshot. Capacity-only successors satisfy
+that proof; route, identity, routing-policy, async-occupancy, or
+queue-compatibility-mode changes fail closed. Translation, the plan, and every
+prospective effect bind the fresh current head rather than the retained
+generation. Ordinary and route-only LB syncs install queue-attribution mode
+coherently with the route fence; a malformed response installs neither, while
+response-only history acknowledgements remain outside this semantic context.
+
 ```text
-fresh protocol-v2 demand + exact fresh route
+fresh protocol-v2 demand + exact HA authority + proven current route context
   -> autoscaler target
   -> supply-aware exact-card capacity target
   -> attempt ordinary/reserved zero-cost-only intent admission

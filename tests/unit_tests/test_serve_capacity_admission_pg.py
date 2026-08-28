@@ -892,14 +892,13 @@ def _route_record_id(engine) -> str:
     return str(identity_payload[_URL]['replica_record_id'])
 
 
-def _publish_successor_route(
+def _publish_route_snapshot(
     engine: sqlalchemy.engine.Engine,
     incarnation: uuid.UUID,
-    marker: int,
+    response: dict,
+    identities: dict,
+    current_record_ids: set[str],
 ) -> route_projection.RoutePublicationReceipt:
-    response = _route_response()
-    response['capacity_hint']['test_route_marker'] = marker
-    record_id = _route_record_id(engine)
     identity = route_projection.RoutePublisherIdentity(
         service_name='svc',
         service_hash='svc-hash',
@@ -909,11 +908,19 @@ def _publish_successor_route(
         controller_pid=123,
         controller_ip='10.0.0.5')
     return route_projection.RouteProjectionRepository(engine).publish(
-        identity,
-        1,
-        response,
-        _route_identities(record_id), {record_id},
-        ttl_seconds=60)
+        identity, 1, response, identities, current_record_ids, ttl_seconds=60)
+
+
+def _publish_successor_route(
+    engine: sqlalchemy.engine.Engine,
+    incarnation: uuid.UUID,
+    marker: int,
+) -> route_projection.RoutePublicationReceipt:
+    response = _route_response()
+    response['capacity_hint']['test_route_marker'] = marker
+    record_id = _route_record_id(engine)
+    return _publish_route_snapshot(engine, incarnation, response,
+                                   _route_identities(record_id), {record_id})
 
 
 def _validate_committed_claim(engine: sqlalchemy.engine.Engine,
@@ -2912,6 +2919,20 @@ def test_logical_retirement_preserves_global_sql_lock_order(capacity_database):
     assert ordered_locks == list(relevant_tables)
 
 
+def test_logical_retirement_accepts_equivalent_retained_report(
+        capacity_database):
+    engine, incarnation, reported_route = capacity_database
+    current_route = _publish_successor_route(engine, incarnation, 2)
+    info, authority, _ = _prepare_logical_retirement(capacity_database)
+
+    result = _commit_logical(info, authority)
+
+    assert reported_route.generation < current_route.generation
+    assert authority.route_generation == current_route.generation
+    assert authority.route_sha256 == current_route.content_sha256
+    assert result.state is serve_state.LogicalRetirementCommitState.COMMITTED
+
+
 def test_logical_retirement_rejects_allocation_successor(
         capacity_database, monkeypatch):
     """A successor map observed at the final commit fence preserves routing."""
@@ -2976,6 +2997,34 @@ def test_logical_retirement_resamples_clock_after_allocation_wait(
         'read_current_in_connection', _delayed_current)
 
     result = _commit_logical(info, authority, identity)
+
+    assert result.state is serve_state.LogicalRetirementCommitState.REJECTED
+    durable = serve_state.get_replica_info_from_id('svc', 1)
+    assert durable is not None
+    assert durable.status_property.logical_retirement_committed is False
+
+
+def test_logical_retirement_resamples_clock_after_route_context_hashing(
+        capacity_database, monkeypatch):
+    """Retained-route validation cannot run after the final expiry clock."""
+    engine, incarnation, _ = capacity_database
+    _publish_successor_route(engine, incarnation, 2)
+    info, authority, _ = _prepare_logical_retirement(capacity_database)
+    authority = dataclasses.replace(
+        authority,
+        valid_until=(datetime.datetime.now(datetime.timezone.utc) +
+                     datetime.timedelta(milliseconds=50)))
+    validate = demand_state.validate_report_route_contexts
+
+    def _delayed_validation(*args, **kwargs):
+        result = validate(*args, **kwargs)
+        time.sleep(0.1)
+        return result
+
+    monkeypatch.setattr(demand_state, 'validate_report_route_contexts',
+                        _delayed_validation)
+
+    result = _commit_logical(info, authority)
 
     assert result.state is serve_state.LogicalRetirementCommitState.REJECTED
     durable = serve_state.get_replica_info_from_id('svc', 1)
@@ -3847,7 +3896,220 @@ def test_atomic_hundred_claim_batch_rejects_fresh_zero_without_rows(
                     table)).scalar_one() == 0
 
 
-def test_committed_claim_ignores_mixed_report_routes_only_postcommit(
+def test_capacity_hint_only_route_successor_accepts_retained_report(
+        capacity_database):
+    engine, incarnation, reported_route = capacity_database
+    current_route = _publish_successor_route(engine, incarnation, 2)
+
+    snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+
+    assert snapshot is not None
+    assert snapshot.route_generation == current_route.generation
+    assert snapshot.route_sha256 == current_route.content_sha256
+    assert snapshot.reconcile_authority.route_generation == (
+        current_route.generation)
+    assert snapshot.reconcile_authority.route_sha256 == (
+        current_route.content_sha256)
+    assert snapshot.receipt_watermark
+    assert reported_route.generation < snapshot.route_generation
+
+
+def test_protocol_two_retained_report_publishes_and_commits_current_plan(
+        capacity_database):
+    engine, incarnation, reported_route = capacity_database
+    current_route = _publish_successor_route(engine, incarnation, 2)
+    with engine.begin() as connection:
+        # Model the production incremental writer after its one-way promotion.
+        # The wire snapshot remains protocol 1; both retained generations and
+        # the elected producer cohort are protocol 2.
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_snapshots_table).values(
+                    producer_protocol_version=2))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_projection_protocol_version=2,
+                    route_projection_controller_incarnation=incarnation))
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+
+    authority = repository.publish(_plan(1))
+    claim = _insert_claim(engine, authority, 10)
+
+    assert reported_route.generation < current_route.generation
+    with engine.connect() as connection:
+        plan = connection.execute(
+            sqlalchemy.select(
+                capacity_admission_schema.serve_capacity_plans_table).where(
+                    capacity_admission_schema.serve_capacity_plans_table.c.
+                    service_name == 'svc',
+                    capacity_admission_schema.serve_capacity_plans_table.c.
+                    generation == authority.generation)).mappings().one()
+    assert plan['route_generation'] == current_route.generation
+    assert plan['route_sha256'] == current_route.content_sha256
+    assert claim['capacity_plan_generation'] == authority.generation
+
+
+def test_promotion_accepts_equivalent_retained_report(capacity_database):
+    engine, incarnation, reported_route = capacity_database
+    with engine.begin() as connection:
+        demoted_epoch = capacity_admission.demote_service_in_connection(
+            connection,
+            service_name='svc',
+            controller_incarnation=incarnation,
+            expected_source_epoch=1)
+    current_route = _publish_successor_route(engine, incarnation, 2)
+
+    with engine.begin() as connection:
+        promoted_epoch = capacity_admission.promote_service_in_connection(
+            connection,
+            service_name='svc',
+            controller_incarnation=incarnation,
+            participant_barrier_passed=lambda _connection: True)
+
+    assert demoted_epoch == 2
+    assert promoted_epoch == 3
+    assert reported_route.generation < current_route.generation
+    snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+    assert snapshot is not None
+    assert snapshot.route_generation == current_route.generation
+
+
+@pytest.mark.parametrize('semantic_change', [
+    'replica_route', 'route_expansion', 'route_contraction', 'routing_spec',
+    'queue_compatibility_mode', 'identity'
+])
+def test_retained_report_rejects_changed_demand_report_route_context(
+        capacity_database, semantic_change):
+    engine, incarnation, _ = capacity_database
+    response = _route_response()
+    record_id = _route_record_id(engine)
+    identities = _route_identities(record_id)
+    current_record_ids = {record_id}
+    if semantic_change == 'replica_route':
+        response['replica_info'][_URL]['async_occupancy'] = 'true'
+    elif semantic_change == 'route_expansion':
+        added_url = 'http://replica-two:8000'
+        added_record_id = str(uuid.uuid4())
+        response['replica_info'][added_url] = {
+            'gpu_type': 'L4',
+            'gpu_count': '1',
+        }
+        identities[added_url] = {
+            **identities[_URL],
+            'replica_id': 2,
+            'replica_record_id': added_record_id,
+        }
+        current_record_ids.add(added_record_id)
+    elif semantic_change == 'route_contraction':
+        response['replica_info'] = {}
+        response['num_ready_replicas'] = 0
+        identities = {}
+        current_record_ids = set()
+    elif semantic_change == 'routing_spec':
+        response['routing_spec'][
+            'request_accelerator_compatibility_version'] = 1
+    elif semantic_change == 'queue_compatibility_mode':
+        response['queued_compatibility_demand_supported'] = False
+    else:
+        record_id = str(uuid.uuid4())
+        identities = _route_identities(record_id)
+        current_record_ids = {record_id}
+    _publish_route_snapshot(engine, incarnation, response, identities,
+                            current_record_ids)
+
+    assert demand_state.get_autoscaling_snapshot('svc', 'svc-hash') is None
+
+
+def test_missing_retained_report_route_snapshot_fails_closed(capacity_database):
+    engine, incarnation, reported_route = capacity_database
+    current_route = _publish_successor_route(engine, incarnation, 2)
+    assert current_route.generation > reported_route.generation
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(
+                route_projection_schema.serve_route_snapshots_table).where(
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    service_name == 'svc',
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    generation == reported_route.generation))
+
+    assert demand_state.get_autoscaling_snapshot('svc', 'svc-hash') is None
+
+
+@pytest.mark.parametrize('retained_corruption', ['content_digest', 'owner'])
+def test_corrupt_retained_report_route_fails_snapshot_and_claim(
+        capacity_database, retained_corruption):
+    engine, incarnation, reported_route = capacity_database
+    _publish_successor_route(engine, incarnation, 2)
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    values = ({
+        'content_sha256': '0' * 64
+    } if retained_corruption == 'content_digest' else {
+        'controller_owner_epoch': 5
+    })
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_snapshots_table).where(
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    service_name == 'svc',
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    generation == reported_route.generation).values(**values))
+
+    assert demand_state.get_autoscaling_snapshot('svc', 'svc-hash') is None
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='fresh route context'):
+        _insert_claim(engine, authority, 10)
+
+
+def test_semantically_changed_retained_report_blocks_prospective_claim(
+        capacity_database):
+    engine, incarnation, reported_route = capacity_database
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    lb_ha_enabled=1,
+                    lb_active_slot='a',
+                    lb_cutover_generation=1))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    spec=pickle.dumps(_capacity_service_spec(
+                        False, lb_high_availability=True),
+                                      protocol=4)))
+    response = _route_response()
+    response['queued_compatibility_demand_supported'] = False
+    record_id = _route_record_id(engine)
+    current_route = _publish_route_snapshot(engine, incarnation, response,
+                                            _route_identities(record_id),
+                                            {record_id})
+    demand_state.ingest_report(
+        'svc', 'svc-hash', _demand_report(time.time(),
+                                          current_route,
+                                          sequence=2))
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(),
+                       reported_route,
+                       reporter_session_id='process-b',
+                       lb_session_id='pod-b',
+                       lb_slot='b',
+                       applied_role='DRAINING'))
+
+    assert demand_state.get_autoscaling_snapshot('svc', 'svc-hash') is None
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='fresh route context'):
+        _insert_claim(engine, authority, 10)
+
+
+def test_mixed_equivalent_report_routes_bind_current_plan_authority(
         capacity_database):
     engine, incarnation, admitted_route = capacity_database
     with engine.begin() as connection:
@@ -3882,9 +4144,19 @@ def test_committed_claim_ignores_mixed_report_routes_only_postcommit(
                        lb_slot='b',
                        applied_role='DRAINING'))
 
-    # Mixed route snapshots remain unusable as aggregate demand or as fresh
-    # prospective admission authority.
-    assert demand_state.get_autoscaling_snapshot('svc', 'svc-hash') is None
+    # Both immutable routes have the same demand-report route context, so
+    # their reports compose while returned translation and authority bind the
+    # successor.
+    snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+    assert snapshot is not None
+    assert snapshot.route_generation == successor_route.generation
+    assert snapshot.route_sha256 == successor_route.content_sha256
+    assert snapshot.reconcile_authority.route_generation == (
+        successor_route.generation)
+    assert len(snapshot.receipt_watermark) == 2
+
+    # A plan admitted under the predecessor remains stale.  Semantic report
+    # compatibility does not make old plan authority current.
     with engine.begin() as connection:
         service = connection.execute(
             sqlalchemy.select(serve_state_schema.services_table).where(

@@ -4183,6 +4183,7 @@ class SkyServeLoadBalancer:
         route_occupancy_context_sha256: str | None = None
         route_source_epoch: int | None = None
         async_request_ledger_protocol_version: int | None = None
+        queued_compatibility_demand_supported = False
 
         # Read the purpose-specific ring fresh for every sync. The primary is
         # tried first; overlap credentials are replayed only after a 401.
@@ -4311,11 +4312,11 @@ class SkyServeLoadBalancer:
                         # conservatively over-counting.
                         request_batch_accepted = True
                         response_json = await response.json()
+                        queued_compatibility_demand_supported = (
+                            response_json.get(
+                                'queued_compatibility_demand_supported')
+                            is True)
                         if not route_only:
-                            self._set_queued_compatibility_demand_support(
-                                response_json.get(
-                                    'queued_compatibility_demand_supported') is
-                                True)
                             if response_json.get(
                                     'request_history_accepted') is True:
                                 (self._request_aggregator.
@@ -4595,8 +4596,12 @@ class SkyServeLoadBalancer:
                                                           []).append(client)
                     # Echo a version and durable projection fence only after
                     # atomically applying that same response's routing spec,
-                    # route set, and drain overlay.  Role and demand reports
-                    # capture all of these fields under this lock too.
+                    # route set, drain overlay, and queue-attribution mode.
+                    # Role and demand reports capture the same state under this
+                    # lock. A route-only refresh must apply the mode too, while
+                    # a malformed response must apply neither it nor the fence.
+                    self._set_queued_compatibility_demand_support(
+                        queued_compatibility_demand_supported)
                     self._routing_version = service_version
                     self._route_projection_generation = (
                         route_projection_generation)

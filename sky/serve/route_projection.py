@@ -617,6 +617,24 @@ def _content_sha256(response: object, identities: object) -> str:
         })).hexdigest()
 
 
+def _route_observation_context_payload(
+    response: Mapping[str, Any],
+    identities: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the canonical route fields shared by observation fences."""
+    return {
+        'service_version': response.get('service_version'),
+        'routing_spec': response.get('routing_spec'),
+        'replica_info': response.get('replica_info'),
+        # Observation-only retired routes participate in both contexts even
+        # though they can never participate in selection. A cold LB must
+        # discard evidence if the exact set it was asked to observe changes.
+        constants.LB_DRAINING_REPLICA_INFO_KEY: response.get(
+            constants.LB_DRAINING_REPLICA_INFO_KEY, {}),
+        'identities': identities,
+    }
+
+
 def _occupancy_context_sha256(response: Mapping[str, Any],
                               identities: Mapping[str, Any]) -> str:
     """Digest only route state that can invalidate occupancy evidence.
@@ -629,18 +647,27 @@ def _occupancy_context_sha256(response: Mapping[str, Any],
     reuses the same URL still advances this narrower fence.
     """
     return hashlib.sha256(
-        _canonical_json({
-            'service_version': response.get('service_version'),
-            'routing_spec': response.get('routing_spec'),
-            'replica_info': response.get('replica_info'),
-            # Observation-only retired routes participate in the occupancy
-            # fence even though they can never participate in selection.  A
-            # cold LB must discard a sample if the exact set it was asked to
-            # observe changes while that sample is in flight.
-            constants.LB_DRAINING_REPLICA_INFO_KEY: response.get(
-                constants.LB_DRAINING_REPLICA_INFO_KEY, {}),
-            'identities': identities,
-        })).hexdigest()
+        _canonical_json(_route_observation_context_payload(
+            response, identities))).hexdigest()
+
+
+def demand_report_route_context_sha256(
+    response: Mapping[str, Any],
+    identities: Mapping[str, Any],
+) -> str:
+    """Digest immutable route state that defines demand-report semantics.
+
+    Capacity hints, ready counts, and response-only history acknowledgements
+    may change without changing how an already-applied route attributes
+    demand. Queue-compatibility negotiation is different: it selects live
+    queue gauges versus legacy arrival recording and performs rollback
+    backfill, so it must fence retained-report equivalence even though it does
+    not invalidate an in-flight occupancy probe.
+    """
+    payload = _route_observation_context_payload(response, identities)
+    payload['queued_compatibility_demand_supported'] = response.get(
+        'queued_compatibility_demand_supported')
+    return hashlib.sha256(_canonical_json(payload)).hexdigest()
 
 
 def selected_route_context_sha256(response: Mapping[str, Any],
