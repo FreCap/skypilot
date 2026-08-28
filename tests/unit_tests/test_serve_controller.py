@@ -4897,6 +4897,7 @@ class TestAutoscalerRuntimeSnapshot:
         def _plan_current(**kwargs):
             snapshot = next(snapshot_iterator)
             decision = kwargs['planner'](snapshot, supply)
+            decision.canonical_target(set(kwargs['accounting_cards']))
             planner_snapshot, candidate = decision.decode_planner()
             current_authority = authority
             if use_planner_authority:
@@ -5492,7 +5493,12 @@ class TestAutoscalerRuntimeSnapshot:
         scaler = self._logical_durable_autoscaler(target=1, emit_scale_up=True)
         scaler.reserved_capacity_fill = True
         scaler.reserved_fill_utilization_gate = True
-        scaler.configured_accelerator_shapes = {'A100': 8}
+        scaler.configured_accelerator_shapes = {
+            'L4': 1,
+            'A100': 8,
+            'A100-80GB': 1,
+            'H200': 1,
+        }
         scaler.target_num_replicas_by_accelerator = {'A100': 1}
         scaler.capacity_target_by_accelerator = {'A100': 1}
         scaler.info.return_value = {'demand_target_by_accelerator': {'A100': 1}}
@@ -5727,20 +5733,30 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
         scaler = self._logical_durable_autoscaler(target=0)
-        scaler.max_replicas = 3
+        scaler.max_replicas = 1
         scaler.reserved_capacity_fill = True
         scaler.reserved_fill_utilization_gate = False
+        scaler.configured_accelerator_shapes = {
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+            'H200': 1,
+        }
+        scaler.capacity_target_by_accelerator = {}
+        scaler.target_num_replicas_by_accelerator = {}
+        scaler.info.return_value = {'demand_target_by_accelerator': {}}
         ctrl._autoscaler = scaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
-        allocation, _ = self._reserved_fill_allocation(grant=3)
+        allocation, _ = self._reserved_fill_allocation(grant=1,
+                                                       accelerator='H200')
         supply = self._reserved_supply_projection(
             policy=(controller.capacity_admission.ReservedSupplyPolicy.
                     STATIC_PREFILL),
             evidence_state=(controller.capacity_admission.
                             ReservedSupplyEvidenceState.AUTHENTICATED_SETTLED),
-            authenticated={'L4': 3},
-            eligible={'L4': 3},
+            authenticated={'H200': 1},
+            eligible={'H200': 1},
             allocation=allocation)
 
         with mock.patch.object(
@@ -5753,7 +5769,7 @@ class TestAutoscalerRuntimeSnapshot:
 
         repository.plan_and_publish_current.assert_called_once()
         accept_reserved.assert_called_once_with(allocation, scaler, 1, 0,
-                                                {'L4': 3})
+                                                {'H200': 1})
         ctrl._replica_manager.scale_up_batch.assert_not_called()
         ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()
         notify.assert_called_once_with()
