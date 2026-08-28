@@ -132,7 +132,13 @@ def bind_locked_kueue_capacity_snapshot(
                            kueue_lane_capacity.KueueReplicaCapacitySnapshot)):
         raise TypeError('Locked Kueue capacity binding is malformed.')
     replica_ids = tuple(info.replica_id for info in replica_infos)
-    if decision_inputs.replica_ids != replica_ids:
+    prepared_replica_ids = decision_inputs.replica_ids
+    if (not isinstance(prepared_replica_ids, tuple) or
+            any(type(replica_id) is not int or replica_id < 1
+                for replica_id in (*prepared_replica_ids, *replica_ids)) or
+            len(set(prepared_replica_ids)) != len(prepared_replica_ids) or
+            len(set(replica_ids)) != len(replica_ids) or
+            set(prepared_replica_ids) != set(replica_ids)):
         raise ValueError('Locked Kueue capacity names a different replica '
                          'snapshot.')
     replica_id_set = set(replica_ids)
@@ -216,6 +222,7 @@ def bind_locked_kueue_capacity_snapshot(
 
     return dataclasses.replace(
         decision_inputs,
+        replica_ids=replica_ids,
         kueue_capacity_by_replica_id=classes,
         kueue_blocked_retirement_shapes=frozenset(blocked_shapes),
         kueue_transition_replica_ids=frozenset(transition_ids),
