@@ -21,6 +21,10 @@ def test_malaysia_region_is_fetched() -> None:
     assert 'ap-southeast-5' in fetch_aws.ALL_REGIONS
 
 
+def test_hyderabad_region_is_fetched() -> None:
+    assert 'ap-south-2' in fetch_aws.ALL_REGIONS
+
+
 def test_malaysia_region_is_a_curated_image_copy_target(monkeypatch) -> None:
     image_gen_path = (Path(__file__).parents[2] / 'sky' / 'catalog' / 'images' /
                       'aws_utils' / 'image_gen.py')
