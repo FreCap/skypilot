@@ -456,11 +456,6 @@ _GPU_DESC_UBUNTU_DATE = [
     ('neuron', '/aws/service/neuron/dlami/multi-framework', '22.04'),
 ]
 
-_CUSTOM_GPU_CUDA13_TAG = 'skypilot:custom-gpu-ubuntu-cuda13'
-_AWS_GPU_FALLBACK_IMAGE_NAME = (
-    'Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) *')
-_ImageRow = tuple[str, str, str, str, str, str | None, str]
-
 
 def _fetch_image_creation_date(region: str, image_id: str | None) -> str | None:
     if image_id is None:
@@ -535,83 +530,16 @@ def get_all_regions_images_df(regions: set[str]) -> 'pd.DataFrame':
     return result_df
 
 
-def _get_aws_gpu_fallback_image_row(region: str) -> _ImageRow | None:
-    """Returns the latest AWS-maintained GPU AMI for a region.
-
-    SkyPilot's curated AMIs do not always reach a newly supported AWS region
-    at the same time as GPU instance types. AWS's public DLAMI is a safe
-    fallback for containerized workloads: it uses Ubuntu 22.04 and supports
-    the current NVIDIA open driver / CUDA 13 stack. The image ID is also used
-    as BaseImageId so subsequent refreshes can identify and replace fallback
-    rows without overwriting curated SkyPilot AMIs.
-    """
-    print(f'Getting AWS GPU fallback image for {region}')
-    client = aws.client('ec2', region_name=region)
-    response = client.describe_images(
-        Owners=['amazon'],
-        Filters=[
-            {
-                'Name': 'name',
-                'Values': [_AWS_GPU_FALLBACK_IMAGE_NAME],
-            },
-            {
-                'Name': 'state',
-                'Values': ['available'],
-            },
-            {
-                'Name': 'architecture',
-                'Values': ['x86_64'],
-            },
-        ],
-    )
-    images = response['Images']
-    if not images:
-        print(f'No AWS GPU fallback image found for {region}')
-        return None
-    latest = max(images, key=lambda image: image['CreationDate'])
-    image_id = latest['ImageId']
-    match = re.search(r'(\d+)$', latest['Name'])
-    creation_date = match.group(1) if match else None
-    return (_CUSTOM_GPU_CUDA13_TAG, region, 'ubuntu', '22.04', image_id,
-            creation_date, image_id)
-
-
-def get_all_regions_gpu_fallback_images_df(regions: set[str]) -> 'pd.DataFrame':
-    """Fetches AWS-maintained fallback GPU AMIs for all requested regions."""
-    with mp_pool.Pool() as pool:
-        rows = pool.map(_get_aws_gpu_fallback_image_row, regions)
-    rows = [row for row in rows if row is not None]
-    result_df = pd.DataFrame(rows,
-                             columns=[
-                                 'Tag', 'Region', 'OS', 'OSVersion', 'ImageId',
-                                 'CreationDate', 'BaseImageId'
-                             ])
-    result_df.sort_values(['Tag', 'Region'], inplace=True)
-    return result_df
-
-
 def merge_generated_images(existing_df: 'pd.DataFrame',
-                           generated_df: 'pd.DataFrame',
-                           fallback_df: 'pd.DataFrame') -> 'pd.DataFrame':
-    """Merges refreshed images while preferring curated SkyPilot GPU AMIs."""
+                           generated_df: 'pd.DataFrame') -> 'pd.DataFrame':
+    """Refreshes generated images while preserving curated image rows.
+
+    Curated CPU and GPU images are published only after image qualification.
+    Provider-maintained ``latest`` images must not be substituted here.
+    """
     existing_df = existing_df[~existing_df['Tag'].
                               eq('skypilot:neuron-ubuntu-2204')].copy()
-
-    # Fallback rows use their own image ID as BaseImageId. Remove the previous
-    # refresh's rows so the AWS-maintained image advances automatically.
-    if 'BaseImageId' in existing_df.columns:
-        fallback_rows = (existing_df['Tag'].eq(_CUSTOM_GPU_CUDA13_TAG) &
-                         existing_df['BaseImageId'].notna() &
-                         existing_df['BaseImageId'].eq(existing_df['ImageId']))
-        existing_df = existing_df[~fallback_rows]
-
-    existing_keys = set(zip(existing_df['Tag'], existing_df['Region']))
-    fallback_keys = list(zip(fallback_df['Tag'], fallback_df['Region']))
-    fallback_df = fallback_df[[
-        key not in existing_keys for key in fallback_keys
-    ]]
-    return pd.concat([existing_df, generated_df, fallback_df],
-                     ignore_index=True)
+    return pd.concat([existing_df, generated_df], ignore_index=True)
 
 
 def fetch_availability_zone_mappings() -> 'pd.DataFrame':
@@ -720,16 +648,11 @@ if __name__ == '__main__':
     _check_regions_integrity(image_df, 'images')
     # filter out rows where ImageId is None
     image_df = image_df[image_df['ImageId'].notna()]
-    fallback_image_df = get_all_regions_gpu_fallback_images_df(user_regions)
-
     # check if aws/images.csv exists
     if os.path.exists('aws/images.csv'):
         # load the data from aws/images.csv
         existing_image_df = pd.read_csv('aws/images.csv')
-        image_df = merge_generated_images(existing_image_df, image_df,
-                                          fallback_image_df)
-    else:
-        image_df = pd.concat([image_df, fallback_image_df], ignore_index=True)
+        image_df = merge_generated_images(existing_image_df, image_df)
 
     image_df.to_csv('aws/images.csv', index=False)
     print('AWS Images saved to aws/images.csv')
