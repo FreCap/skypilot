@@ -12,6 +12,7 @@ import concurrent.futures
 import contextlib
 import copy
 import dataclasses
+import datetime
 import functools
 import os
 import pathlib
@@ -33,6 +34,8 @@ from sky import clouds
 from sky import exceptions
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.serve import autoscalers
+from sky.serve import capacity_admission
+from sky.serve import capacity_planning
 from sky.serve import constants
 from sky.serve import ordinary_launch_binding
 from sky.serve import placement_policy
@@ -41,6 +44,7 @@ from sky.serve import provider_phase
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
+from sky.serve import reserved_fill_planner
 from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import scale_reconciliation
 from sky.serve import serve_state
@@ -4655,7 +4659,7 @@ class TestZeroCostSelection(unittest.TestCase):
         self.placer.location2cost.pop(self.paid)
         self.placer.location2status.update({
             _make_location(f'paid-region-{index}', 'paid', use_spot=True):
-            spot_placer.LocationStatus.ACTIVE for index in range(1058)
+                spot_placer.LocationStatus.ACTIVE for index in range(1058)
         })
         self.assertEqual(self.placer.zero_cost_locations(), [self.k8s])
 
@@ -6665,6 +6669,241 @@ class TestQueryFreeSlots(unittest.TestCase):
                 0, 2), reserved_capacity.FillPoolBudgetInput(0, 1)))
         self.assertEqual([budget.edge_cap for budget in budgets], [2, 1])
         self.assertEqual(sum(budget.edge_cap for budget in budgets), 3)
+
+    def _fill_witness(
+        self,
+        target: capacity_planning.AcceleratorCapacity | None,
+    ) -> capacity_admission.CommittedFillDemandWitness:
+        return capacity_admission.CommittedFillDemandWitness(
+            service_name='svc',
+            service_hash='service-hash',
+            service_lifecycle_epoch=1,
+            service_version=1,
+            demand_source_epoch=1,
+            demand_feed_generation=1,
+            route_generation=1,
+            route_sha256='a' * 64,
+            route_source_epoch=1,
+            capacity_plan_generation=1,
+            capacity_plan_sha256='b' * 64,
+            target_capacity=1,
+            reservation_acquisition_target_by_accelerator=target,
+            semantic_sha256='c' * 64,
+            refreshed_at=datetime.datetime.now(datetime.timezone.utc))
+
+    def test_flexible_witness_cannot_settle_or_unlock_paid_residual(self):
+        authority = reserved_capacity.demand_scoped_fill_pool_authority(
+            self._fill_witness(None))
+
+        self.assertIs(authority.mode,
+                      reserved_capacity.FillPoolBudgetMode.HOLDINGS_ONLY)
+        self.assertIsNone(authority.demonstrated_need)
+        self.assertIsNone(authority.demand_witness_sha256)
+        self.assertIsNone(authority.exact_demand_target_by_accelerator)
+
+    def test_exact_witness_authorizes_only_its_card_target(self):
+        authority = reserved_capacity.demand_scoped_fill_pool_authority(
+            self._fill_witness(
+                capacity_planning.AcceleratorCapacity.from_mapping({'A100': 1
+                                                                   })))
+
+        self.assertIs(authority.mode,
+                      reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON)
+        self.assertEqual(authority.demand_target_capacity, 1)
+        self.assertEqual(authority.demonstrated_need, 1)
+        self.assertEqual(authority.demand_witness_sha256, 'c' * 64)
+        self.assertEqual(
+            authority.exact_demand_target_by_accelerator,
+            capacity_planning.AcceleratorCapacity.from_mapping({'A100': 1}))
+
+    def _exact_pool_snapshot(
+        self,
+        edge_cap: int,
+        *,
+        context: str = 'research-ctx',
+        physical_uid: str = 'research-uid',
+    ) -> reserved_fill_planner.PoolFillSnapshot:
+        pool_key = reserved_capacity_broker.make_pool_key(
+            context,
+            'a100',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid=physical_uid)
+        return reserved_fill_planner.PoolFillSnapshot.from_mapping({
+            'protocol_version': reserved_capacity_broker.PROTOCOL_V2,
+            'pool_key': pool_key,
+            'physical_cluster_uid': physical_uid,
+            'service_generation': 1,
+            'worker_projection_sha256_by_accelerator': {
+                'a100': 'a' * 64
+            },
+            'edge_cap': edge_cap,
+            'broker_slot_width': 1,
+            'free_slots': 0,
+            'free_slots_by_accelerator': {},
+            'grant': 0,
+            'grant_epoch': None,
+            'observation_generation': 1,
+            'observation_sequence': 1,
+            'ordinary_zero_cost_admission_sequence': 1,
+            'valid_until': time.time() + 60,
+            'zero_cost_location_keys': [{
+                'cloud': 'Kubernetes',
+                'region': context,
+                'zone': None,
+                'accelerators': {
+                    'A100': 1
+                },
+                'use_spot': False,
+                'image_id': None,
+                'container_image': None,
+                'disk_tier': None,
+                'ephemeral_storage': None,
+                'instance_type': None,
+            }],
+        })
+
+    def test_discovery_cap_must_cover_fresh_spendable_capacity(self):
+        snapshot = self._exact_pool_snapshot(1)
+        rounds = {
+            snapshot.pool_key: {
+                'sum_holdings': 0,
+                'last_observed_free': 100,
+            }
+        }
+
+        self.assertFalse(
+            reserved_capacity.reserved_fill_allocation.
+            ReservedFillAllocationRepository.
+            _reservation_acquisition_is_complete({'a100': 100}, (snapshot,),
+                                                 rounds))
+
+    def test_discovery_cap_settles_at_target_or_observed_maximum(self):
+        for edge_cap, observed in ((100, 100), (47, 47)):
+            snapshot = self._exact_pool_snapshot(edge_cap)
+            rounds = {
+                snapshot.pool_key: {
+                    'sum_holdings': 0,
+                    'last_observed_free': observed,
+                }
+            }
+
+            self.assertTrue(
+                reserved_capacity.reserved_fill_allocation.
+                ReservedFillAllocationRepository.
+                _reservation_acquisition_is_complete({'a100': 100}, (snapshot,),
+                                                     rounds))
+
+    def test_discovery_caps_cannot_transfer_between_same_card_pools(self):
+        east = self._exact_pool_snapshot(100,
+                                         context='east',
+                                         physical_uid='east-uid')
+        phx = self._exact_pool_snapshot(0,
+                                        context='phx',
+                                        physical_uid='phx-uid')
+        rounds = {
+            east.pool_key: {
+                'sum_holdings': 0,
+                'last_observed_free': 0,
+            },
+            phx.pool_key: {
+                'sum_holdings': 0,
+                'last_observed_free': 100,
+            },
+        }
+
+        self.assertFalse(
+            reserved_capacity.reserved_fill_allocation.
+            ReservedFillAllocationRepository.
+            _reservation_acquisition_is_complete({'a100': 100}, (east, phx),
+                                                 rounds))
+
+    def test_demand_budget_funds_exact_card_before_pool_order(self):
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            2,
+            0, (
+                reserved_capacity.FillPoolBudgetInput(0, 10, ('h200',)),
+                reserved_capacity.FillPoolBudgetInput(0, 10, ('a100-80gb',)),
+                reserved_capacity.FillPoolBudgetInput(0, 10, ('a100',)),
+            ),
+            mode=reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON,
+            demand_target_capacity=1,
+            exact_demand_target_by_accelerator={'A100': 1})
+        self.assertEqual([budget.edge_cap for budget in budgets], [0, 0, 1])
+
+    def test_holdings_only_never_acquires_a_new_pool(self):
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            2,
+            0, (
+                reserved_capacity.FillPoolBudgetInput(1, 10, ('h200',)),
+                reserved_capacity.FillPoolBudgetInput(0, 10, ('a100',)),
+            ),
+            mode=reserved_capacity.FillPoolBudgetMode.HOLDINGS_ONLY)
+        self.assertEqual([budget.edge_cap for budget in budgets], [1, 0])
+
+    def test_exact_budget_drops_incompatible_holding_before_acquisition(self):
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            1,
+            0, (
+                reserved_capacity.FillPoolBudgetInput(1, 10, ('h200',)),
+                reserved_capacity.FillPoolBudgetInput(0, 10, ('a100',)),
+            ),
+            mode=reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON,
+            demand_target_capacity=1,
+            exact_demand_target_by_accelerator={'A100': 1})
+        self.assertEqual([budget.edge_cap for budget in budgets], [0, 1])
+
+    def test_exact_budget_ignores_headroom_for_paid_only_demand(self):
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            127,
+            0, (
+                reserved_capacity.FillPoolBudgetInput(0, 200, ('h200',)),
+                reserved_capacity.FillPoolBudgetInput(0, 200, ('a100',)),
+            ),
+            mode=reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON,
+            demand_target_capacity=101,
+            exact_demand_target_by_accelerator={'A100': 1})
+        self.assertEqual([budget.edge_cap for budget in budgets], [0, 1])
+
+    def test_exact_budget_does_not_transfer_unavailable_card_target(self):
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            2,
+            0, (
+                reserved_capacity.FillPoolBudgetInput(0, 0, ('a100',)),
+                reserved_capacity.FillPoolBudgetInput(0, 2, ('h200',)),
+            ),
+            mode=reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON,
+            demand_target_capacity=2,
+            exact_demand_target_by_accelerator={
+                'A100': 1,
+                'H200': 1
+            })
+        self.assertEqual([budget.edge_cap for budget in budgets], [0, 1])
+
+    def test_exact_budget_clips_holdings_per_card_before_filling_peer(self):
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            3,
+            0, (
+                reserved_capacity.FillPoolBudgetInput(3, 3, ('a100',)),
+                reserved_capacity.FillPoolBudgetInput(0, 2, ('h200',)),
+            ),
+            mode=reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON,
+            demand_target_capacity=3,
+            exact_demand_target_by_accelerator={
+                'A100': 1,
+                'H200': 2
+            })
+        self.assertEqual([budget.edge_cap for budget in budgets], [1, 2])
+
+    def test_exact_budget_rejects_multi_card_pool(self):
+        with self.assertRaisesRegex(ValueError, 'one exact accelerator'):
+            reserved_capacity.allocate_fill_pool_budgets(
+                1,
+                0,
+                (reserved_capacity.FillPoolBudgetInput(0, 1,
+                                                       ('a100', 'h200')),),
+                mode=reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON,
+                demand_target_capacity=1,
+                exact_demand_target_by_accelerator={'A100': 1})
 
     def test_context_groups_keep_first_position_and_canonical_shapes(self):
         locations = [

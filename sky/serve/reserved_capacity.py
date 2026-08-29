@@ -45,6 +45,7 @@ from sky import skypilot_config
 from sky.adaptors import kubernetes
 from sky.catalog import kubernetes_catalog
 from sky.serve import capacity_admission
+from sky.serve import capacity_planning
 from sky.serve import constants
 from sky.serve import pool_capacity_observation
 from sky.serve import pool_capacity_observer
@@ -254,6 +255,47 @@ class FillPoolBudgetInput:
 
     holdings: int
     capacity_hint: int
+    accelerator_names: tuple[str, ...] = ()
+
+
+class FillPoolBudgetMode(enum.Enum):
+    """Authority available to the service-global pool partition."""
+
+    LEGACY = 'legacy'
+    HOLDINGS_ONLY = 'holdings_only'
+    EXACT_SINGLETON = 'exact_singleton'
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class FillPoolDemandAuthority:
+    """Demand evidence that may causally authorize physical pool caps."""
+
+    mode: FillPoolBudgetMode
+    demand_target_capacity: int
+    exact_demand_target_by_accelerator: (capacity_planning.AcceleratorCapacity |
+                                         None)
+    demonstrated_need: int | None
+    demand_witness_sha256: str | None
+
+
+def demand_scoped_fill_pool_authority(
+    witness: capacity_admission.CommittedFillDemandWitness | None,
+) -> FillPoolDemandAuthority:
+    """Fail closed unless a witness proves a positive exact-card target."""
+    target = (None if witness is None else
+              witness.reservation_acquisition_target_by_accelerator)
+    if witness is None or target is None or target.total() <= 0:
+        return FillPoolDemandAuthority(mode=FillPoolBudgetMode.HOLDINGS_ONLY,
+                                       demand_target_capacity=0,
+                                       exact_demand_target_by_accelerator=None,
+                                       demonstrated_need=None,
+                                       demand_witness_sha256=None)
+    return FillPoolDemandAuthority(
+        mode=FillPoolBudgetMode.EXACT_SINGLETON,
+        demand_target_capacity=witness.target_capacity,
+        exact_demand_target_by_accelerator=target,
+        demonstrated_need=witness.target_capacity,
+        demand_witness_sha256=witness.semantic_sha256)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1383,13 +1425,22 @@ def allocate_fill_pool_budgets(
     global_budget: int,
     service_floor: int,
     pools: tuple[FillPoolBudgetInput, ...],
+    *,
+    mode: FillPoolBudgetMode = FillPoolBudgetMode.LEGACY,
+    demand_target_capacity: int = 0,
+    exact_demand_target_by_accelerator: Mapping[str, int] | None = None,
 ) -> tuple[FillPoolBudget, ...]:
     """Partition one service budget over ordered physical pool edges.
 
-    Existing holdings are retained first, clipped by the hard global budget.
-    Residual budget is equal-weight water-filled up to each pool's capacity
-    hint; integer remainder follows stable input order.  The service floor is
-    then assigned in that same order without exceeding an edge cap.
+    Legacy/ungated callers retain existing holdings first and water-fill the
+    remainder over every pool.  A demand-scoped caller partitions its budget
+    only over exact singleton-card demand.  Flexible demand receives no new
+    pool cap until the broker supports request-class matching; treating its
+    cheapest cold attribution as an exact requirement would be incorrect.
+
+    Protocol-v2 pool specs are one exact card each.  Demand-scoped allocation
+    enforces that invariant rather than letting an aggregate cap imply a card
+    choice inside a legacy multi-card pool.
     """
     if (isinstance(global_budget, bool) or not isinstance(global_budget, int) or
             global_budget < 0):
@@ -1397,6 +1448,15 @@ def allocate_fill_pool_budgets(
     if (isinstance(service_floor, bool) or not isinstance(service_floor, int) or
             service_floor < 0):
         raise ValueError('service_floor must be a nonnegative integer.')
+    if not isinstance(mode, FillPoolBudgetMode):
+        raise ValueError('Pool budget mode is malformed.')
+    if (isinstance(demand_target_capacity, bool) or
+            not isinstance(demand_target_capacity, int) or
+            demand_target_capacity < 0):
+        raise ValueError('Demand target capacity must be a nonnegative '
+                         'integer.')
+
+    normalized_pool_cards: list[tuple[str, ...]] = []
     for pool in pools:
         if (isinstance(pool.holdings, bool) or
                 not isinstance(pool.holdings, int) or pool.holdings < 0 or
@@ -1405,34 +1465,109 @@ def allocate_fill_pool_budgets(
                 pool.capacity_hint < 0):
             raise ValueError('Pool holdings and capacity hints must be '
                              'nonnegative integers.')
+        if (not isinstance(pool.accelerator_names, tuple) or
+                any(not isinstance(card, str) or not card
+                    for card in pool.accelerator_names)):
+            raise ValueError('Pool accelerator names are malformed.')
+        canonical_cards = tuple(
+            sorted({card.casefold() for card in pool.accelerator_names}))
+        if len(canonical_cards) != len(pool.accelerator_names):
+            raise ValueError('Pool accelerator names are malformed.')
+        if (mode is FillPoolBudgetMode.EXACT_SINGLETON and
+                len(canonical_cards) != 1):
+            raise ValueError('Demand-scoped pool budgets require one exact '
+                             'accelerator per pool.')
+        normalized_pool_cards.append(canonical_cards)
 
-    caps: list[int] = []
-    remaining = global_budget
-    for pool in pools:
-        retained = min(pool.holdings, remaining)
-        caps.append(retained)
-        remaining -= retained
+    raw_target = ({} if exact_demand_target_by_accelerator is None else
+                  exact_demand_target_by_accelerator)
+    if not isinstance(raw_target, Mapping):
+        raise ValueError('Demand target must be an accelerator mapping.')
+    target_by_card: dict[str, int] = {}
+    seen_target_cards: set[str] = set()
+    for raw_card, count in raw_target.items():
+        folded = raw_card.casefold() if isinstance(raw_card, str) else ''
+        if (not isinstance(raw_card, str) or not raw_card or
+                isinstance(count, bool) or not isinstance(count, int) or
+                count < 0 or folded in seen_target_cards):
+            raise ValueError('Demand target accelerator state is malformed.')
+        seen_target_cards.add(folded)
+        if count > 0:
+            target_by_card[folded] = count
+    target_total = sum(target_by_card.values())
+    if target_total > demand_target_capacity:
+        raise ValueError('Exact demand exceeds aggregate demand.')
+    if (mode is FillPoolBudgetMode.EXACT_SINGLETON and
+        (demand_target_capacity == 0 or target_total == 0)):
+        raise ValueError('Exact pool budgets require positive exact demand.')
+    if (mode is not FillPoolBudgetMode.EXACT_SINGLETON and target_total != 0):
+        raise ValueError('Only exact pool budgets accept card targets.')
 
-    while remaining > 0:
-        eligible = [
-            index for index, pool in enumerate(pools)
-            if caps[index] < max(pool.holdings, pool.capacity_hint)
-        ]
-        if not eligible:
-            break
-        share, remainder = divmod(remaining, len(eligible))
-        allocated = 0
-        for position, index in enumerate(eligible):
-            requested = share + int(position < remainder)
-            if requested == 0:
-                continue
-            limit = max(pools[index].holdings, pools[index].capacity_hint)
-            give = min(requested, limit - caps[index])
-            caps[index] += give
-            allocated += give
-        if allocated == 0:
-            break
-        remaining -= allocated
+    caps = [0] * len(pools)
+    limits = [max(pool.holdings, pool.capacity_hint) for pool in pools]
+
+    def water_fill(indices: Sequence[int], amount: int) -> int:
+        allocated_total = 0
+        while amount > 0:
+            eligible = [
+                index for index in indices if caps[index] < limits[index]
+            ]
+            if not eligible:
+                break
+            share, remainder = divmod(amount, len(eligible))
+            allocated = 0
+            for position, index in enumerate(eligible):
+                requested = share + int(position < remainder)
+                if requested == 0:
+                    continue
+                give = min(requested, limits[index] - caps[index])
+                caps[index] += give
+                allocated += give
+            if allocated == 0:
+                break
+            amount -= allocated
+            allocated_total += allocated
+        return allocated_total
+
+    if mode is FillPoolBudgetMode.EXACT_SINGLETON:
+        if target_total > 0:
+            # The immutable exact-card projection is already the full demand
+            # that these pools may satisfy.  Aggregate utilization headroom
+            # must not be reinterpreted as additional card-specific demand.
+            exact_budget = min(global_budget, target_total)
+            card_budgets = {
+                card: exact_budget * count // target_total
+                for card, count in target_by_card.items()
+            }
+            remainder = exact_budget - sum(card_budgets.values())
+            remainder_order = sorted(
+                target_by_card,
+                key=lambda card:
+                (-(exact_budget * target_by_card[card] % target_total), card))
+            for card in remainder_order[:remainder]:
+                card_budgets[card] += 1
+
+            for card in sorted(card_budgets):
+                remaining = card_budgets[card]
+                matching = [
+                    index
+                    for index, pool_cards in enumerate(normalized_pool_cards)
+                    if pool_cards == (card,)
+                ]
+                for index in matching:
+                    retained = min(pools[index].holdings, remaining)
+                    caps[index] = retained
+                    remaining -= retained
+                if remaining > 0:
+                    water_fill(matching, remaining)
+    else:
+        remaining = global_budget
+        for index, pool in enumerate(pools):
+            retained = min(pool.holdings, remaining)
+            caps[index] = retained
+            remaining -= retained
+        if (mode is FillPoolBudgetMode.LEGACY and remaining > 0):
+            water_fill(tuple(range(len(pools))), remaining)
 
     floor_remaining = min(service_floor, global_budget)
     floors: list[int] = []
@@ -3565,9 +3700,16 @@ def _broker_cycle_v2(
             autoscaler.get_final_target_num_replicas())
     total_fill_holdings = sum(
         holdings_by_pool.get(spec.pool_key, (0, 0))[0] for spec in specs)
+    budget_mode = FillPoolBudgetMode.LEGACY
+    demand_target_capacity = 0
+    exact_demand_target_by_accelerator: Mapping[str, int] | None = None
     if autoscaler.reserved_fill_utilization_gate:
         demand_witness_sha256 = None
         if durable_feed:
+            # A durable gated controller may retain what it can observe, but
+            # it never widens to legacy all-pool acquisition when the current
+            # PostgreSQL witness is absent, stale, or flexibly attributed.
+            budget_mode = FillPoolBudgetMode.HOLDINGS_ONLY
             witness = None
             if (expected_service_hash is not None and
                     expected_controller_owner is not None):
@@ -3582,10 +3724,19 @@ def _broker_cycle_v2(
                     logger.warning(
                         'Reserved-fill durable demand witness is unavailable: '
                         f'{common_utils.format_exception(error)}')
-            demonstrated_need = (None if witness is None else
-                                 witness.target_capacity)
-            demand_witness_sha256 = (None if witness is None else
-                                     witness.semantic_sha256)
+            # An aggregate/flexible witness is not yet enough authority to
+            # select a physical pool.  Keeping it out of the causal
+            # allocation fence also prevents a settled zero grant from
+            # unlocking paid residual while compatible free GPUs exist.
+            demand_authority = demand_scoped_fill_pool_authority(witness)
+            budget_mode = demand_authority.mode
+            demand_target_capacity = (demand_authority.demand_target_capacity)
+            exact_demand_target_by_accelerator = (
+                None if demand_authority.exact_demand_target_by_accelerator
+                is None else
+                demand_authority.exact_demand_target_by_accelerator.as_dict())
+            demonstrated_need = demand_authority.demonstrated_need
+            demand_witness_sha256 = demand_authority.demand_witness_sha256
             pre_ready_statuses = (
                 serve_state.ReplicaStatus.PENDING,
                 serve_state.ReplicaStatus.PROVISIONING,
@@ -3622,6 +3773,9 @@ def _broker_cycle_v2(
         utilization_state.update({
             'demonstrated_need': demonstrated_need,
             'demand_witness_sha256': demand_witness_sha256,
+            'reservation_acquisition_target_by_accelerator':
+                (None if exact_demand_target_by_accelerator is None else
+                 dict(exact_demand_target_by_accelerator)),
             'boot_hold': boot_hold,
             'blind': demonstrated_need is None,
         })
@@ -3665,10 +3819,15 @@ def _broker_cycle_v2(
                     previous_cap,
                     now,
                     round_row=round_rows[spec.pool_key],
-                    observation_repository=(observation_repository))))
+                    observation_repository=(observation_repository)),
+                accelerator_names=spec.accelerator_names))
     budgets = allocate_fill_pool_budgets(
-        global_budget, autoscaler.reserved_fill_floor_replicas,
-        tuple(budget_inputs))
+        global_budget,
+        autoscaler.reserved_fill_floor_replicas,
+        tuple(budget_inputs),
+        mode=budget_mode,
+        demand_target_capacity=demand_target_capacity,
+        exact_demand_target_by_accelerator=(exact_demand_target_by_accelerator))
 
     edges: list[dict[str, Any]] = []
     for spec, budget in zip(specs, budgets):

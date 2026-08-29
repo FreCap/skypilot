@@ -12,6 +12,7 @@ durable adapter between committed broker evidence and the pure
 ``ReservedFillPlanner``.
 """
 
+from collections.abc import Mapping
 import json
 import math
 import re
@@ -135,7 +136,8 @@ def _exact_nonnegative_counts(value: Any, subject: str) -> dict[str, int]:
 
 
 def _claim_utilization_authority(
-    set_row: RowMapping,) -> tuple[bool, int | None, str | None, bool, int]:
+    set_row: RowMapping,
+) -> tuple[bool, int | None, str | None, bool, int, dict[str, int] | None]:
     """Decode the exact service-wide utilization witness for one map."""
     ceiling = set_row['utilization_ceiling']
     headroom = set_row['global_headroom']
@@ -148,19 +150,27 @@ def _claim_utilization_authority(
         if ceiling != headroom:
             raise ReservedFillAllocationCorruptionError(
                 'An ungated reserved-fill claim has a reduced ceiling.')
-        return False, None, None, False, ceiling
+        return False, None, None, False, ceiling, None
     state = _decode_json_object(raw_state, 'Claim utilization state')
     previous_fields = {
         'cap', 'hot_until', 'stepped_at', 'blind_since', 'demonstrated_need',
         'boot_hold', 'blind'
     }
     current_fields = previous_fields | {'demand_witness_sha256'}
-    if set(state) not in (previous_fields, current_fields):
+    acquisition_fields = current_fields | {
+        'reservation_acquisition_target_by_accelerator'
+    }
+    if set(state) not in (previous_fields, current_fields, acquisition_fields):
         raise ReservedFillAllocationCorruptionError(
             'Claim utilization state has an unsupported shape.')
     cap = state['cap']
     need = state['demonstrated_need']
     demand_witness_sha256 = state.get('demand_witness_sha256')
+    raw_acquisition_target = state.get(
+        'reservation_acquisition_target_by_accelerator')
+    acquisition_target = (
+        None if raw_acquisition_target is None else _exact_nonnegative_counts(
+            raw_acquisition_target, 'Reservation acquisition target'))
     boot_hold = state['boot_hold']
     blind = state['blind']
     times = (state['hot_until'], state['stepped_at'])
@@ -178,11 +188,17 @@ def _claim_utilization_authority(
         (demand_witness_sha256 is not None and
          (type(demand_witness_sha256) is not str or
           _SHA256_PATTERN.fullmatch(demand_witness_sha256) is None)) or
+        (acquisition_target is not None and
+         (not acquisition_target or
+          any(count <= 0 for count in acquisition_target.values()) or
+          need is None or demand_witness_sha256 is None or
+          sum(acquisition_target.values()) > need)) or
         (blind and
          (need is not None or boot_hold)) or (not blind and need is None)):
         raise ReservedFillAllocationCorruptionError(
             'Claim utilization witness is malformed.')
-    return True, need, demand_witness_sha256, boot_hold, ceiling
+    return (True, need, demand_witness_sha256, boot_hold, ceiling,
+            acquisition_target)
 
 
 def _decode_accelerator_names(value: Any) -> tuple[str, ...]:
@@ -670,6 +686,49 @@ class ReservedFillAllocationRepository:
         return raw <= snapshot.grant
 
     @staticmethod
+    def _reservation_acquisition_is_complete(
+        target_by_accelerator: dict[str, int],
+        pool_snapshots: tuple[reserved_fill_planner.PoolFillSnapshot, ...],
+        locked_rounds: Mapping[str, RowMapping],
+    ) -> bool:
+        """Whether exact caps cover demand or all freshly observed supply."""
+        caps: dict[str, int] = {}
+        spendable: dict[str, int] = {}
+        seen: set[str] = set()
+        for snapshot in pool_snapshots:
+            identity = reserved_capacity_broker.parse_pool_identity(
+                snapshot.pool_key)
+            if len(identity.gpu_names) != 1:
+                return False
+            card = identity.gpu_names[0].casefold()
+            if card not in target_by_accelerator:
+                continue
+            # Cross-pool redistribution needs a joint service-by-pool
+            # augmenting matcher.  The current qualification topology has one
+            # physical pool per target card; fail closed rather than letting a
+            # cap on an empty sibling masquerade as coverage for a full one.
+            if card in seen:
+                return False
+            round_row = locked_rounds.get(snapshot.pool_key)
+            if round_row is None:
+                return False
+            holdings = round_row['sum_holdings']
+            observed = round_row['last_observed_free']
+            if (type(holdings) is not int or holdings < 0 or
+                    type(observed) is not int or observed < 0):
+                raise ReservedFillAllocationCorruptionError(
+                    'Reserved-fill discovery capacity is malformed.')
+            seen.add(card)
+            pool_spendable = holdings + observed
+            caps[card] = min(snapshot.edge_cap, pool_spendable)
+            spendable[card] = pool_spendable
+        for card, target in target_by_accelerator.items():
+            if card not in seen or caps.get(card, 0) < min(
+                    target, spendable.get(card, 0)):
+                return False
+        return True
+
+    @staticmethod
     def _read_allocation_columns(
         connection: sqlalchemy.engine.Connection,
         service_name: str,
@@ -799,7 +858,8 @@ class ReservedFillAllocationRepository:
                 return None
             (utilization_gate_armed, utilization_demonstrated_need,
              utilization_demand_witness_sha256, utilization_boot_hold,
-             utilization_ceiling) = _claim_utilization_authority(set_row)
+             utilization_ceiling, reservation_acquisition_target) = (
+                 _claim_utilization_authority(set_row))
             if (service_row['current_version'] != set_row['service_version'] or
                     not self._lock_projection_source(
                         connection, name, set_row['service_version'], edges)):
@@ -818,6 +878,14 @@ class ReservedFillAllocationRepository:
                 upward_grants_settled = (upward_grants_settled and
                                          self._upward_grant_is_settled(
                                              name, snapshot, round_row))
+            if (utilization_gate_armed and
+                    utilization_demand_witness_sha256 is not None):
+                upward_grants_settled = (
+                    upward_grants_settled and
+                    reservation_acquisition_target is not None and
+                    self._reservation_acquisition_is_complete(
+                        reservation_acquisition_target, pool_snapshots,
+                        locked_rounds))
 
             allocation_columns = self._read_allocation_columns(connection, name)
             if allocation_columns is None:
@@ -982,7 +1050,8 @@ class ReservedFillAllocationRepository:
         set_row, edges = claim_state
         (utilization_gate_armed, utilization_demonstrated_need,
          utilization_demand_witness_sha256, utilization_boot_hold,
-         utilization_ceiling) = _claim_utilization_authority(set_row)
+         utilization_ceiling,
+         reservation_acquisition_target) = _claim_utilization_authority(set_row)
         if (service_row['current_version'] != set_row['service_version'] or
                 not self._lock_projection_source(
                     connection, name, set_row['service_version'], edges)):
@@ -1054,6 +1123,14 @@ class ReservedFillAllocationRepository:
             upward_grants_settled = (upward_grants_settled and
                                      self._upward_grant_is_settled(
                                          name, snapshot, round_row))
+        if (utilization_gate_armed and
+                utilization_demand_witness_sha256 is not None):
+            upward_grants_settled = (
+                upward_grants_settled and
+                reservation_acquisition_target is not None and
+                self._reservation_acquisition_is_complete(
+                    reservation_acquisition_target, allocation.pool_snapshots,
+                    locked_rounds))
         if allocation.upward_grants_settled != upward_grants_settled:
             return None
         return allocation

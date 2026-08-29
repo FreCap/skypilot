@@ -991,6 +991,8 @@ class CommittedFillDemandWitness:
     capacity_plan_generation: int
     capacity_plan_sha256: str
     target_capacity: int
+    reservation_acquisition_target_by_accelerator: (
+        capacity_planning.AcceleratorCapacity | None)
     semantic_sha256: str
     refreshed_at: datetime.datetime
 
@@ -1010,6 +1012,11 @@ class CommittedFillDemandWitness:
                 any(type(value) is not int or value < 1 for value in positive)
                 or type(self.target_capacity) is not int or
                 self.target_capacity < 0 or
+            (self.reservation_acquisition_target_by_accelerator is not None and
+             (not isinstance(self.reservation_acquisition_target_by_accelerator,
+                             capacity_planning.AcceleratorCapacity) or
+              self.reservation_acquisition_target_by_accelerator.total()
+              > self.target_capacity)) or
                 _SHA256_RE.fullmatch(self.route_sha256) is None or
                 _SHA256_RE.fullmatch(self.capacity_plan_sha256) is None or
                 _SHA256_RE.fullmatch(self.semantic_sha256) is None or
@@ -1761,10 +1768,64 @@ def _reservation_evidence_sha256(
     })
 
 
+def _allocation_grants_are_represented(
+    config: _ReservedFillServiceConfig,
+    allocation: AuthenticatedAllocationMap,
+    *,
+    existing_zero_cost: Mapping[str, int],
+    pending_zero_cost: Mapping[str, int],
+    allocation_reserved: Mapping[str, int],
+) -> bool:
+    """Whether locked inventory can realize every authenticated pool grant.
+
+    A broker grant is entitlement, not supply.  Claim heartbeats may lag a
+    provider or scheduler transition, so they cannot prove that a service
+    still owns the holdings used to satisfy a grant.  The final capacity-plan
+    lock instead requires each granted unit to be represented by a usable
+    zero-cost replica, a live pending zero-cost intent, or currently feedable
+    allocation tail before compatible paid capacity may be admitted.
+    """
+    if not isinstance(allocation,
+                      reserved_fill_planner.AuthenticatedAllocationMap):
+        return False
+    granted: dict[str, int] = {}
+    for snapshot in allocation.pool_snapshots:
+        if snapshot.grant == 0:
+            continue
+        shapes = {(location.accelerator.casefold(), location.accelerator_count)
+                  for location in snapshot.locations}
+        if len(shapes) != 1:
+            # A scalar grant over multiple cards has no exact-card meaning.
+            return False
+        card, accelerator_count = next(iter(shapes))
+        granted[card] = (granted.get(card, 0) + snapshot.grant *
+                         config.capacity_unit.intent_cost(accelerator_count))
+
+    existing = _canonical_counts(existing_zero_cost,
+                                 'existing_zero_cost_capacity')
+    pending = _canonical_counts(pending_zero_cost, 'pending_zero_cost_capacity')
+    feedable = _canonical_counts(allocation_reserved,
+                                 'allocation_reserved_capacity')
+    accounting_cards = set(existing) | set(pending) | set(feedable)
+    if accounting_cards == {AGGREGATE_ACCELERATOR}:
+        return sum(
+            granted.values()) <= (existing.get(AGGREGATE_ACCELERATOR, 0) +
+                                  pending.get(AGGREGATE_ACCELERATOR, 0) +
+                                  feedable.get(AGGREGATE_ACCELERATOR, 0))
+    if AGGREGATE_ACCELERATOR in accounting_cards:
+        return False
+    return all(units <= (existing.get(card, 0) + pending.get(card, 0) +
+                         feedable.get(card, 0))
+               for card, units in granted.items())
+
+
 def _reserved_supply_policy_and_evidence(
     config: _ReservedFillServiceConfig,
     allocation: AuthenticatedAllocationMap | None,
     allocation_reserved: Mapping[str, int],
+    *,
+    existing_zero_cost: Mapping[str, int],
+    pending_zero_cost: Mapping[str, int],
 ) -> tuple[ReservedSupplyPolicy, ReservedSupplyEvidenceState, dict[str, int],
            dict[str, int]]:
     """Classify locked reservation evidence without erasing paid demand."""
@@ -1778,12 +1839,19 @@ def _reserved_supply_policy_and_evidence(
         return (policy, ReservedSupplyEvidenceState.UNAVAILABLE, {}, {})
     authenticated = _canonical_counts(allocation_reserved,
                                       'authenticated_capacity_by_accelerator')
+    grants_settled = bool(allocation.upward_grants_settled and
+                          _allocation_grants_are_represented(
+                              config,
+                              allocation,
+                              existing_zero_cost=existing_zero_cost,
+                              pending_zero_cost=pending_zero_cost,
+                              allocation_reserved=allocation_reserved))
     gate_settled = bool(
-        policy is ReservedSupplyPolicy.STATIC_PREFILL or
-        (allocation.utilization_gate_armed and
-         allocation.utilization_demonstrated_need is not None and
-         allocation.utilization_demand_witness_sha256 is not None and
-         allocation.upward_grants_settled))
+        grants_settled and
+        (policy is ReservedSupplyPolicy.STATIC_PREFILL or
+         (allocation.utilization_gate_armed and
+          allocation.utilization_demonstrated_need is not None and
+          allocation.utilization_demand_witness_sha256 is not None)))
     if not gate_settled:
         return (policy, ReservedSupplyEvidenceState.AUTHENTICATED_UNSETTLED,
                 authenticated, {})
@@ -3121,6 +3189,22 @@ class CapacityAdmissionRepository:
                 semantic_sha256 = candidate.demand_witness_sha256
                 if semantic_sha256 is None:
                     return None
+                reservation_compatible = (
+                    candidate.reservation_demand_relation
+                    is capacity_planning.ReservationDemandRelation.COMPATIBLE)
+                if reservation_compatible:
+                    reservation_acquisition_target = (
+                        capacity_planning.
+                        demand_witness_exact_reservation_target(
+                            planner_snapshot,
+                            candidate.demand_attribution,
+                            aggregate_demand_target=(
+                                candidate.aggregate_demand_target),
+                            raw_demand_target=candidate.raw_demand_target))
+                    target_capacity = candidate.aggregate_demand_target
+                else:
+                    reservation_acquisition_target = None
+                    target_capacity = 0
                 return CommittedFillDemandWitness(
                     service_name=service_name,
                     service_hash=str(service['hash']),
@@ -3133,11 +3217,9 @@ class CapacityAdmissionRepository:
                     route_source_epoch=int(service['route_source_epoch']),
                     capacity_plan_generation=int(plan['generation']),
                     capacity_plan_sha256=str(content_sha256),
-                    target_capacity=(
-                        candidate.aggregate_demand_target
-                        if candidate.reservation_demand_relation is
-                        capacity_planning.ReservationDemandRelation.COMPATIBLE
-                        else 0),
+                    target_capacity=target_capacity,
+                    reservation_acquisition_target_by_accelerator=(
+                        reservation_acquisition_target),
                     semantic_sha256=semantic_sha256,
                     refreshed_at=refreshed_at)
             except (KeyError, TypeError, ValueError,
@@ -3343,7 +3425,12 @@ class CapacityAdmissionRepository:
                 _economic_capacity_graph_snapshot(
                     locked, lane_projection, service_version=service_version))
             policy, evidence_state, authenticated, eligible = (
-                _reserved_supply_policy_and_evidence(config, allocation, tail))
+                _reserved_supply_policy_and_evidence(
+                    config,
+                    allocation,
+                    tail,
+                    existing_zero_cost=full_zero_cost,
+                    pending_zero_cost=pending))
             reservation_enabled = policy is not ReservedSupplyPolicy.DISABLED
             reservation_catalog = (() if not reservation_enabled else tuple(
                 sorted(config.reserved_accelerators or cards)))
@@ -3687,9 +3774,12 @@ class CapacityAdmissionRepository:
                     lane_projection,
                     service_version=service_version))
             policy, evidence_state, authenticated, eligible = (
-                _reserved_supply_policy_and_evidence(fill_config,
-                                                     validated_allocation,
-                                                     allocation_reserved))
+                _reserved_supply_policy_and_evidence(
+                    fill_config,
+                    validated_allocation,
+                    allocation_reserved,
+                    existing_zero_cost=(full_zero_cost),
+                    pending_zero_cost=(pending_zero_cost)))
             reservation_enabled = policy is not ReservedSupplyPolicy.DISABLED
             reservation_catalog = (() if not reservation_enabled else tuple(
                 sorted(fill_config.reserved_accelerators or card_set)))
@@ -4583,7 +4673,11 @@ def validate_paid_claim_in_connection(
     (current_reservation_policy, current_reservation_evidence,
      current_authenticated_reserved,
      current_eligible_reserved) = _reserved_supply_policy_and_evidence(
-         fill_config, validated_allocation, current_allocation_reserved)
+         fill_config,
+         validated_allocation,
+         current_allocation_reserved,
+         existing_zero_cost=current_zero,
+         pending_zero_cost=current_pending_zero)
     _validate_prospective_reservation_evidence(
         planner_snapshot,
         planner_candidate,

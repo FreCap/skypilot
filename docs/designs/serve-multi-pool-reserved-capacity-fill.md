@@ -1,16 +1,16 @@
 # SkyServe multi-pool reserved-capacity admission
 
-Last updated: 2026-08-28
+Last updated: 2026-08-29
 
 Status: **in progress**. The single PostgreSQL-authoritative reserved-capacity
 path has proved full East occupancy, reclaim, synchronized post-fix East/PHX
-convergence, and a complete paid Spot lifecycle. PR #1786 merged the
-schema-3 physical paid-width amendment at
-`3088071b0c64000893cbd228d9ca56a3ad987a76`. Release `1.1.1557` is deployed
-homogeneously at Helm revision 674 and public API 93, with image digest
-`sha256:9a5fdfe5e109d6f50ff43f065872ea45e5c0c3ce7ea828322a119e51bb6f3437`
+convergence, and a complete paid Spot lifecycle. PR #1792 merged the stable-v3
+demand witness at `0c2dfa3c6a780073635e30abe4bcbff83eae1143`. Release
+`1.1.1561` is deployed homogeneously at Helm revision 675 and public API 93,
+with image digest
+`sha256:12179be463ceed190898a19c0ece886b242a6970ec003ab17cfb53deb8f24b5a`
 and chart digest
-`sha256:9351c6f7701c0249422a8e5b1fabf2653e0da2c3081db83ae4957461f8758f36`.
+`sha256:6c7df416d90254906a82a6c6deeb5af1e088cc739eaef6c062b6ca43fff8833b`.
 The hard schema-3 cutover occurred with no Serve rows, Helm storage disabled,
 and no SkyPilot PVC or EFS. Full idle occupancy is no longer a steady-state
 goal:
@@ -47,15 +47,25 @@ comparing normalized demand and exact route context in one PostgreSQL
 snapshot. Fresh zero, changed normalized demand, a route change, expiry, or an
 ownership/version change still returns no witness. Provider authority is not
 relaxed: only a later current plan bound to the matching settled allocation can
-commit an intent or paid claim. Source and PostgreSQL regression tests precede
-deployment; lifecycle-138 replacement and mixed production qualification
-remain open.
+commit an intent or paid claim. Source and PostgreSQL regression tests preceded
+deployment. Lifecycle 139 then proved that the stable witness reaches the
+broker, but exposed a separate card-budget defect: H200 and A100-80GB consumed
+the aggregate budget's two discovery units while an exact A100 request received
+an A100 edge cap of zero. No provider launch, intent, or paid claim was created.
+The exact-card pool-budget correction advances that stable semantic domain to
+v4 by binding the typed reservation-acquisition projection itself. Production
+qualification remains open.
 
-V2 and v3 witnesses intentionally have no mixed-binary compatibility path.
-Lifecycle 138 must first reach exact zero and be removed; API, controller, and
-executor roles must then deploy the v3 image homogeneously before the service
-is recreated. A mixed cohort fails closed as underfill, but is not an accepted
-rollout state.
+V2, v3, and v4 witnesses intentionally have no mixed-binary compatibility path.
+Lifecycle 138 reached exact zero before API, controller, and executor roles
+deployed the v3 image homogeneously and lifecycle 139 was recreated. The v4
+successor uses the same exact-zero, homogeneous-image rollout contract. A
+mixed cohort fails closed as underfill, but is not an accepted rollout state.
+The allocation reader still recognizes the two retained pre-v4 JSON field
+sets for teardown and diagnosis. That is read-only compatibility: neither
+shape contains the exact acquisition projection, so it cannot settle a v4
+demand gate or authorize a new reserved or paid provider effect. A current v4
+writer replaces it on the next homogeneous reconciliation.
 
 Immediately before that cutover, release `1.1.1554` lifecycle 137 reached
 exactly 100 provider-`RUNNING` GCP Spot one-L4 workers with zero ordinary
@@ -739,6 +749,56 @@ that budget in physical-pool order before reading the request compatibility
 classes. The campaign was stopped and the service was taken down immediately.
 No scheduler policy was changed.
 
+Lifecycle 139 reproduced the remaining implementation form after the v3
+witness itself stabilized. The sequenced protocol already atomizes every pool
+by `(physical cluster UID, exact accelerator card)`, but its service-global
+budget still ignored the witness's card semantics. With an exact A100 target
+of one and aggregate ceiling two, stable pool order assigned caps to H200 and
+A100-80GB and left A100 at zero.
+
+The bounded correction carries one typed immutable exact-reservation
+projection inside the committed v4 witness and makes budget authority
+explicit:
+
+- `LEGACY` is available only to an explicit non-durable/transition caller and
+  preserves historical all-pool water-fill.
+- `HOLDINGS_ONLY` retains bounded existing fill but cannot acquire a new pool.
+  Missing, stale, flexible, mixed, configured-minimum, floor/fixed-inflated,
+  or otherwise incomplete durable evidence always selects this mode.
+- `EXACT_SINGLETON` is permitted only when the adopted positive target is no
+  greater than raw demand and is explained by singleton request classes
+  already bound by the v4 digest. A normal rate-limited upscale wave may use a
+  smaller adopted prefix of that raw target; downscale retention above current
+  raw demand is not acquisition authority. Each pool must prove one exact
+  card. Holdings and new cap on a card are bounded by that card's proven
+  target, incompatible holdings receive cap zero, and unused
+  aggregate/headroom budget is not transferred to a sibling card.
+
+The bounded exact path currently requires one physical pool per positive
+target card. Two pools for the same target card, or a composite physical pool,
+remain `HOLDINGS_ONLY`/unsettled until the joint service-by-pool matcher is the
+canonical writer. Logical-GPU targets additionally require physical worker
+width one; physical-backend targets already count whole workers and may use a
+multi-GPU worker. These are explicit fail-closed scope guards, not silent
+underfill heuristics.
+
+Demand attribution for a flexible class remains a cheapest-compatible
+explanation, not exact-card acquisition authority. General flexible reserved
+acquisition therefore remains fail-closed until a single planner result carries
+class cardinality into an atomic exact-card matching/grant protocol. A card-set
+union or pool-order fallback is not an accepted substitute. An unmatchable
+flexible witness publishes neither demonstrated need nor a causal digest, so a
+settled zero grant cannot unlock paid residual. For a proven exact-card
+witness, partial or zero reserved grants may settle the aggregate/digest gate
+only after fresh locked pool observations prove that the per-card discovery
+cap covers the target or all spendable supply. Grant settlement alone is not
+enough: at final capacity admission, every granted unit must be represented in
+the same PostgreSQL lock by usable zero-cost replicas, live pending zero-cost
+intents, or currently feedable allocation tail. Only the remainder after that
+reserved commitment is genuine paid residual. This final-row fence prevents a
+stale-high claim heartbeat from turning peer holdings that are still being
+reclaimed into premature Spot authority.
+
 The canonical correction is deliberately smaller than adding a second
 per-accelerator entitlement protocol. A service with
 ``utilization_gate: true`` admits only the exact-card reservation commitment
@@ -1021,18 +1081,18 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` at PR #1790 merge `95e33e007a5390b9fbc35d3608c53f28cdccec4e` (release `1.1.1557` runtime plus documentation/test-only planner audits). It includes PR #1765's capacity-time SLA planner, PR #1777's immutable planner, PR #1778's complete sparse target, PR #1779's locked-capacity ordering, PR #1781's retained-route demand correction, PR #1783's processing/in-flight telemetry, PR #1784's plan-authoritative paid cohort, and PR #1786's schema-3 multi-node physical debit. PR #1787 locks the intentional four-per-clean-pool cold frontier in a regression; PR #1788 excludes regionless AWS offerings until their exact default AMI exists; PR #1789 proves that process-local Kueue and warm-retention state cannot influence or be mutated by durable planning; PR #1790 records and tests the deployed capacity-time SLA behavior. |
+| Source base | `origin/improvements` at PR #1793 merge `65268391a7a6a726cac0288d696ea48f5074f837` (release `1.1.1562`). It includes PR #1765's capacity-time SLA planner, PR #1777's immutable planner, PR #1778's complete sparse target, PR #1779's locked-capacity ordering, PR #1781's retained-route demand correction, PR #1783's processing/in-flight telemetry, PR #1784's plan-authoritative paid cohort, PR #1786's schema-3 multi-node physical debit, PR #1792's stable v3 acquisition witness, and PR #1793's Zurich opt-in S3 endpoint fallback. The source-under-test correction binds the exact acquisition projection in witness v4, budgets exact cards rather than pool order, proves discovery completeness, and rechecks grant realization from final locked service rows. It is not yet merged or deployed. |
 | Immutable planner correction | **Merged and deployed homogeneously.** One keyword-only frozen snapshot feeds one pure durable logical planner invocation. Its typed candidate separately records cold demand attribution, supply-aware actuation, warm/transition retention, reservation commitments and whole-backend padding, genuine paid residual and cap-bounded cold-launch authority, completeness/infeasibility, source generation, and snapshot/candidate fingerprints. Policy state installs only after the PostgreSQL commit through a generation-and-fingerprint compare-and-swap. PR #1786 extends the same closed envelope to exact per-node width times task-authoritative node count for physical backends. |
-| Deployed control plane | SkyPilot `1.1.1557`, Helm revision 674, public API 93, homogeneous image `sha256:9a5fdfe5e109d6f50ff43f065872ea45e5c0c3ce7ea828322a119e51bb6f3437`, chart `sha256:9351c6f7701c0249422a8e5b1fabf2653e0da2c3081db83ae4957461f8758f36`. All two API, two controller, and three executor replicas were Ready on that exact digest; `/api/health` returned HTTP 200. PostgreSQL remains the sole central store; Helm storage is disabled; no SkyPilot PVC or EFS is present. |
-| Schema-3 activation | **Complete from an empty Serve state.** The cutover inventory contained no Serve rows, so no schema-1/2 capacity plan, claim, or provider effect crossed the strict-current decoder boundary. API, controller, and executor roles first moved to homogeneous `1.1.1555` and are now homogeneous on `1.1.1557`. There was no row rewrite, compatibility decoder, storage migration, or infrastructure change. |
+| Deployed control plane | SkyPilot `1.1.1561`, Helm revision 675, public API 93, homogeneous image `sha256:12179be463ceed190898a19c0ece886b242a6970ec003ab17cfb53deb8f24b5a`, chart `sha256:6c7df416d90254906a82a6c6deeb5af1e088cc739eaef6c062b6ca43fff8833b`. All two API, two controller, and three executor replicas were Ready on that exact digest; `/api/health` returned HTTP 200. PostgreSQL remains the sole central store; Helm storage is disabled; no SkyPilot PVC or EFS is present. |
+| Schema-3 activation | **Complete from an empty Serve state.** The cutover inventory contained no Serve rows, so no schema-1/2 capacity plan, claim, or provider effect crossed the strict-current decoder boundary. API, controller, and executor roles first moved to homogeneous `1.1.1555` and are now homogeneous on `1.1.1561`. There was no row rewrite, compatibility decoder, storage migration, or infrastructure change. |
 | Lifecycle-137 evidence | Release `1.1.1554` reached exactly 100 provider-`RUNNING` GCP Spot one-L4 workers with zero ordinary on-demand and zero wrong-shape capacity. All 10,000 authenticated warm requests returned first-attempt HTTP 200. Normal down converged service, replica, claim, waiter, VM, and disk state to exact zero before the schema-3 cutover. |
 | Lifecycle-136 evidence | Run `9462207b-e026-4c5e-b610-acaba61e9b0a` on `1.1.1550` reached exactly 100 provider-`RUNNING` GCP Spot L4 VMs, with zero on-demand and zero non-L4 VMs. It accepted the 10,000-ID continuation and subsequent 5,000-ID extension. Normal teardown reached provider zero in about 3 minutes 16 seconds and full PostgreSQL/provider/disk zero in about 3 minutes 45 seconds. The immutable bundle records SHA-256 `audit.jsonl` `51807331f170d1352e9001324bd2e66f169a8a04867b7ca9bf94d8c4b953a8d7`, `arm.json` `92542d925ad50f0916cd8dcdc3977d27aa7f6a5e27b269445e03b70eadc36e70`, and `guard.json` `54a503e1f83eaa4899bce38bcc254591f885587ba87e81241fe3332a4188a649`. |
 | Cold-scale timing | **Count is proven; the 3--5 minute performance objective remains open.** Lifecycle 137 took roughly 9.5 minutes to reach 100 because durable recent-failure/cooldown evidence limited many pools. Clean pools did use the configured base launch window of four. The follow-up must distinguish a clean-frontier benchmark from correctly fenced recently failed pools; it must not erase durable cooldown evidence to improve the number. |
 | Telemetry | PR #1783 is deployed in the current source lineage. Lifecycle 137 proves 10,000/10,000 authenticated warm HTTP successes, but no separate current-schema nonzero queued/processing/in-flight/completed UI proof is recorded here. |
 | Writer protocol | Public API 93, worker projection 10, deployed and source non-pool capability cohort 13, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. The schema-3 cutover added no database migration. |
-| Service activation | **Active for qualification, not production-proven.** Lifecycle 138 was recreated from local provider-only commit `988931e25`: two catalog-driven paid templates (`aws` and `gcp`), the three reviewed reserved cards, `min_replicas: 0`, fill floor 0, `utilization_gate: true`, production paid cap 100 physical GPUs, and test paid cap 0. Its first exact-A100 qualification exposed the v2 witness livelock described above and created zero intents or replicas despite settled compatible grants. The v3 correction must deploy before this lifecycle is replaced and qualification resumes. |
-| Paid-location catalog | The two regionless paid templates expand into exact immutable cloud/region/zone/shape pools and remain Spot-only. The hosted v8 catalog currently has G6/L4 Spot rows in 14 commercial AWS regions; the only four additional commercial AWS G6 regions are Zurich, Sao Paulo, Malaysia, and Hyderabad. Draft upstream PRs #10587, #10589, #10590, and #10594 contain the exhaustive source additions but remain gated on publisher-account enablement, exact CUDA13 AMIs, generated nonempty Spot rows, and GitHub/S3 checksum convergence. Apparent local exclusion of `eu-south-2` and `me-central-1` was an unrelated account-specific AZ-map artifact; both already have hosted VM and image rows and must not be duplicated. |
+| Service activation | **Active for qualification, not production-proven.** Lifecycle 139, hash `8a3412b2-206a-41d0-8095-12e1135aab75`, was recreated from local provider-only commit `988931e25`: two catalog-driven paid templates (`aws` and `gcp`), the three reviewed reserved cards, `min_replicas: 0`, fill floor 0, `utilization_gate: true`, and paid cap 100 physical GPUs. Its first exact-A100 qualification proved the v3 witness stable but exposed pool-order budget assignment: H200 and A100-80GB received caps while A100 received zero. The attempt left no provider launch, intent, replica, or paid claim. Qualification resumes after the exact-card correction deploys. |
+| Paid-location catalog | The two regionless paid templates expand into exact immutable cloud/region/zone/shape pools and remain Spot-only. Zurich (`eu-central-2`) is the only missing commercial AWS G6 region that currently passes the strict publication gate: live L4 Spot offers and prices, a public curated CUDA13 AMI, a successful real Spot boot/workdir/CUDA smoke, and exact teardown are proven. Upstream source PR #10587 and catalog PR #191 carry the surgical source support and 1,127-row v8 slice; publication remains blocked on the hidden catalog-publisher account attesting Zurich opt-in, source release preceding the shared catalog, and identical GitHub/S3 hashes. The Boltz storage-refactor prerequisite is complete in PR #1793/release `1.1.1562`; activation still waits for the canonical public catalog rather than adding a private catalog override. Sao Paulo has live G6 Spot but no supported curated GPU image; Hyderabad has a hosted image but no available opted-in account; Malaysia has neither opted-in-account nor image/launch proof. PRs #10589, #10590, and #10594 therefore remain draft. Apparent local exclusion of `eu-south-2` and `me-central-1` was an unrelated account-specific AZ-map artifact; both already have hosted VM and image rows and must not be duplicated. |
 | Reserved occupancy | At 2026-08-26 23:09--23:13 UTC, East had 328 healthy compatible GPUs on 41 nodes: research requested 45 and 283 `boltz-l4-fleet` Pods requested the exact remainder; all 283 were Running and Ready, with zero free compatible GPU and zero pending research or fleet GPU Pod. PHX had 512 healthy H200 GPUs: research held 482 and the unchanged Kueue policy admitted 30/30 fleet Workloads; all 30 Pods were Running/Ready and PostgreSQL `READY`, with zero pending research GPU Workload. PostgreSQL independently reported exactly 63 A100, 220 A100-80GB, and 30 H200 reserved replicas `READY`, with zero durable intent pending. Thus the same lifecycle occupied East 328/328 and PHX 512/512 without changing scheduler policy. |
 | Reserved readiness projection | For the final PHX replica, PostgreSQL committed the intent at 22:43:32, the Pod appeared at 22:43:55, Kueue admitted it at 22:43:56, and the Pod became Ready at 22:44:32. PostgreSQL projected it `READY` only between 22:52:25 and 22:52:40, exposing a separate roughly eight-minute status-freshness lag rather than a capacity/admission failure. The post-Helm 23:13 UTC census retained the exact 30/30 admission and readiness with no churn. |
 | Claim-heartbeat convergence defect | Resolved in source, deployed, and dark-verified in production. Lifecycle 117 had logged successful exact reclaim-policy proofs followed 7--15 seconds later by rejected claim-set heartbeats because the broker minted the five-second ticket before entering the PostgreSQL replacement and its protocol/lifecycle locks. PR #1750 passes an authorization callback into the state transaction, locks protocol, owner, immutable version/projection, claim-set/edge rows and the legacy projection, reconstructs exact scope, and only then reads already-renewed PostgreSQL proof receipts. Proof logging completes before the ticket timestamp; the ticket is then immediately validated and written. Ordinary drained boundary failures remain fail-closed and boundary ambiguity remains controller-terminal. The correction changes neither Kueue nor TTL/batch/quantum limits. Real-PostgreSQL tests cover waits beyond the ticket lifetime on the affected lock paths. Release `1.1.1519` then produced eight consecutive observed successful claim/publish rounds after controller takeover with no rejected heartbeat. |
@@ -1044,7 +1104,7 @@ it has merged or been deployed.
 | GCP Spot lifecycle proof | **Count, no-spill, warm-request, and teardown evidence exists; cold-scale performance remains open.** Lifecycle 137 on `1.1.1554` reached exactly 100 concurrently provider-`RUNNING` one-L4 GCP Spot VMs with zero ordinary on-demand/wrong-shape capacity, served 10,000/10,000 authenticated warm requests with first-attempt HTTP 200, and completed normal exact-zero teardown. Its roughly 9.5-minute cold run does not meet the 3--5 minute objective. |
 | Final load proof | **Warm paid transport is complete; the broader mixed reservation-plus-paid terminal-ledger proof is not.** Lifecycle 137 completed 10,000/10,000 authenticated warm requests at first-attempt HTTP 200. It does not by itself prove the final utilization-gated reserved-first matrix, mixed reserved/Spot execution, current-schema UI telemetry, terminal artifact receipts, or HA takeover. Historical run `final10k-1524-20260827-0246` remains immutable incident evidence and is not rebound to the new schema or service lifecycle. |
 | Demand/publication ordering | PRs #1777, #1778, #1779, #1781, and #1784 are merged; lifecycle 137 proves the `1.1.1554` plan-authoritative writer can create an exact 100-L4 Spot cohort, serve the complete warm request set, and tear down without on-demand spill. PR #1786 is merged and carried by the strict schema-3 `1.1.1557` cohort; its live provider-effect qualification remains open. |
-| Utilization/allocation causality | **Live v2 defect reproduced; v3 source correction awaiting deployment.** Lifecycle 138 proved that broker grants settled but the five-second deadline countdown continuously changed the acquisition witness, leaving zero intents. V3 uses a typed decision-equivalent witness and heartbeat-only PostgreSQL rebind without weakening provider-effect fences. The operating objective remains demand-driven reserved fill with `utilization_gate: true`; idle full reservation occupancy is not restored. Remaining proof is the corrected reservation/gate matrix, current-schema nonzero telemetry, mixed reserved-plus-Spot execution, terminal receipts, multi-node provider accounting, and HA takeover. |
+| Utilization/allocation causality | **V3 is deployed; the v4 exact-card correction is under test.** Lifecycle 138 reproduced the countdown witness livelock; PR #1792/release `1.1.1561` stabilized and rebound decision-equivalent witnesses. Lifecycle 139 then exposed the independent pool-order budget defect with a stable exact-A100 target. The correction uses explicit legacy/holdings-only/exact-singleton modes, refuses flexible cold attribution or aggregate headroom as card authority, requires complete per-card discovery, and keeps paid closed until the locked service inventory can realize every broker grant. Remaining proof is exact A100 reservation admission, the corrected reservation/gate matrix, current-schema nonzero telemetry, mixed reserved-plus-Spot execution, terminal receipts, multi-node provider accounting, and HA takeover. |
 
 The completed paid-gate post-rollout census was green after Helm revision 635:
 the service, replicas, claims, waiters, request associations, queue rows,

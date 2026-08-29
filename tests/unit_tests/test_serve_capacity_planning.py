@@ -991,10 +991,14 @@ def test_gate_witness_survives_equivalent_deadline_bucket_merge() -> None:
     merged = dataclasses.replace(split, deadline=merged_deadline)
 
     assert capacity_planning.demand_witness_semantic_sha256(
-        split, aggregate_demand_target=2, demand_attribution=_capacity(
+        split,
+        aggregate_demand_target=2,
+        raw_demand_target=2,
+        demand_attribution=_capacity(
             A100=2)) == (capacity_planning.demand_witness_semantic_sha256(
                 merged,
                 aggregate_demand_target=2,
+                raw_demand_target=2,
                 demand_attribution=_capacity(A100=2)))
 
 
@@ -1013,6 +1017,7 @@ def test_gate_witness_changes_with_request_class_target_or_card() -> None:
     baseline = capacity_planning.demand_witness_semantic_sha256(
         snapshot,
         aggregate_demand_target=1,
+        raw_demand_target=1,
         demand_attribution=_capacity(A100=1))
 
     priority_demand = (_demand(20, ('A100',), 1),)
@@ -1033,18 +1038,208 @@ def test_gate_witness_changes_with_request_class_target_or_card() -> None:
     assert capacity_planning.demand_witness_semantic_sha256(
         priority_snapshot,
         aggregate_demand_target=1,
+        raw_demand_target=1,
         demand_attribution=_capacity(A100=1)) != baseline
     assert capacity_planning.demand_witness_semantic_sha256(
         compatibility_snapshot,
         aggregate_demand_target=1,
+        raw_demand_target=1,
         demand_attribution=_capacity(A100=1)) != baseline
     assert capacity_planning.demand_witness_semantic_sha256(
         snapshot,
         aggregate_demand_target=2,
+        raw_demand_target=2,
         demand_attribution=_capacity(A100=2)) != baseline
     assert capacity_planning.demand_witness_semantic_sha256(
-        snapshot, aggregate_demand_target=1,
+        snapshot,
+        aggregate_demand_target=1,
+        raw_demand_target=1,
         demand_attribution=_capacity(L4=1)) != baseline
+
+
+def test_gate_witness_binds_exact_acquisition_proof_mode() -> None:
+    demand = (_demand(50, ('A100',), 2),)
+    snapshot = _snapshot(
+        configured_accelerators=('A100',),
+        configured_reservation_accelerators=('A100',),
+        physical_gpu_width_by_accelerator=_capacity(A100=1),
+        capacity_per_accelerator=_work(A100=1),
+        demand_profiles=demand,
+        explicit_demand_profiles=(),
+        paid_demand_profiles=(),
+        reservation=_reservation(
+            gate_policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence_state=(capacity_planning.ReservationEvidenceState.
+                            AUTHENTICATED_UNSETTLED)),
+        cold_accelerator_order=('A100',),
+        prospective_paid_accelerator_order=())
+
+    exact = capacity_planning.demand_witness_semantic_sha256(
+        snapshot,
+        aggregate_demand_target=2,
+        raw_demand_target=2,
+        demand_attribution=_capacity(A100=2))
+    retained = capacity_planning.demand_witness_semantic_sha256(
+        snapshot,
+        aggregate_demand_target=2,
+        raw_demand_target=1,
+        demand_attribution=_capacity(A100=2))
+
+    assert exact != retained
+
+
+@pytest.mark.parametrize(
+    ('compatible_cards', 'raw_target', 'expected'),
+    ((('A100',), 1, _capacity(A100=1)), (('A100', 'A100-80GB'), 1, None),
+     (('A100',), 0, None)))
+def test_demand_witness_exact_reservation_target_fails_closed_for_flexible(
+        compatible_cards, raw_target, expected) -> None:
+    configured = ('L4', 'A100', 'A100-80GB', 'H200')
+    shapes = capacity_planning.AcceleratorCapacity.from_mapping(
+        {card: 1 for card in configured})
+    throughput = capacity_planning.AcceleratorWork.from_mapping(
+        {card: 1 for card in configured})
+    demand = (_demand(20, compatible_cards, 1),)
+    snapshot = _snapshot(
+        configured_accelerators=configured,
+        configured_reservation_accelerators=('A100', 'A100-80GB', 'H200'),
+        physical_gpu_width_by_accelerator=shapes,
+        capacity_per_accelerator=throughput,
+        demand_profiles=demand,
+        explicit_demand_profiles=(),
+        paid_demand_profiles=(),
+        reservation=_reservation(
+            gate_policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence_state=(capacity_planning.ReservationEvidenceState.
+                            AUTHENTICATED_UNSETTLED)),
+        cold_accelerator_order=configured,
+        prospective_paid_accelerator_order=('L4',))
+
+    assert capacity_planning.demand_witness_exact_reservation_target(
+        snapshot,
+        _capacity(A100=1),
+        aggregate_demand_target=1,
+        raw_demand_target=raw_target) == expected
+
+
+def test_demand_witness_exact_reservation_target_rejects_mixed_classes(
+) -> None:
+    configured = ('A100', 'A100-80GB')
+    shapes = capacity_planning.AcceleratorCapacity.from_mapping(
+        {card: 1 for card in configured})
+    throughput = capacity_planning.AcceleratorWork.from_mapping(
+        {card: 1 for card in configured})
+    snapshot = _snapshot(
+        configured_accelerators=configured,
+        configured_reservation_accelerators=configured,
+        physical_gpu_width_by_accelerator=shapes,
+        capacity_per_accelerator=throughput,
+        demand_profiles=(_demand(20, ('A100',),
+                                 1), _demand(10, configured, 1, sequence=1)),
+        explicit_demand_profiles=(),
+        paid_demand_profiles=(),
+        reservation=_reservation(
+            gate_policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence_state=(capacity_planning.ReservationEvidenceState.
+                            AUTHENTICATED_UNSETTLED)),
+        cold_accelerator_order=configured,
+        prospective_paid_accelerator_order=())
+
+    assert capacity_planning.demand_witness_exact_reservation_target(
+        snapshot,
+        _capacity(A100=2),
+        aggregate_demand_target=2,
+        raw_demand_target=2) is None
+
+
+def test_demand_witness_exact_reservation_target_accepts_live_minimum_and_wave(
+) -> None:
+    demand = (_demand(20, ('A100',), 100),)
+    snapshot = _snapshot(
+        configured_accelerators=('A100',),
+        configured_reservation_accelerators=('A100',),
+        physical_gpu_width_by_accelerator=_capacity(A100=1),
+        capacity_per_accelerator=_work(A100=1),
+        minimum_capacity=100,
+        actuation_minimum_capacity=100,
+        maximum_capacity=100,
+        demand_profiles=demand,
+        explicit_demand_profiles=(),
+        paid_demand_profiles=(),
+        reservation=_reservation(
+            gate_policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence_state=(capacity_planning.ReservationEvidenceState.
+                            AUTHENTICATED_UNSETTLED)),
+        cold_accelerator_order=('A100',),
+        prospective_paid_accelerator_order=())
+
+    assert capacity_planning.demand_witness_exact_reservation_target(
+        snapshot,
+        _capacity(A100=10),
+        aggregate_demand_target=10,
+        raw_demand_target=100) == _capacity(A100=10)
+
+
+def test_demand_witness_exact_reservation_target_rejects_policy_floor() -> None:
+    demand = (_demand(20, ('A100',), 1),)
+    snapshot = _snapshot(
+        configured_accelerators=('A100',),
+        configured_reservation_accelerators=('A100',),
+        physical_gpu_width_by_accelerator=_capacity(A100=1),
+        capacity_per_accelerator=_work(A100=1),
+        minimum_capacity=1,
+        paid_minimum_capacity=1,
+        actuation_minimum_capacity=1,
+        demand_profiles=demand,
+        explicit_demand_profiles=(),
+        paid_demand_profiles=(),
+        reservation=_reservation(
+            gate_policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence_state=(capacity_planning.ReservationEvidenceState.
+                            AUTHENTICATED_UNSETTLED)),
+        cold_accelerator_order=('A100',),
+        prospective_paid_accelerator_order=())
+
+    assert capacity_planning.demand_witness_exact_reservation_target(
+        snapshot,
+        _capacity(A100=1),
+        aggregate_demand_target=1,
+        raw_demand_target=1) is None
+
+
+def test_demand_witness_exact_reservation_target_guards_capacity_units(
+) -> None:
+    demand = (_demand(20, ('A100',), 8),)
+    logical = _snapshot(
+        configured_accelerators=('A100',),
+        configured_reservation_accelerators=('A100',),
+        physical_gpu_width_by_accelerator=_capacity(A100=8),
+        capacity_per_accelerator=_work(A100=1),
+        demand_profiles=demand,
+        explicit_demand_profiles=(),
+        paid_demand_profiles=(),
+        reservation=_reservation(
+            gate_policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence_state=(capacity_planning.ReservationEvidenceState.
+                            AUTHENTICATED_UNSETTLED)),
+        cold_accelerator_order=('A100',),
+        prospective_paid_accelerator_order=())
+
+    assert capacity_planning.demand_witness_exact_reservation_target(
+        logical,
+        _capacity(A100=8),
+        aggregate_demand_target=8,
+        raw_demand_target=8) is None
+
+    physical = dataclasses.replace(
+        logical,
+        capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
+        demand_profiles=(_demand(20, ('A100',), 1),))
+    assert capacity_planning.demand_witness_exact_reservation_target(
+        physical,
+        _capacity(A100=1),
+        aggregate_demand_target=1,
+        raw_demand_target=1) == _capacity(A100=1)
 
 
 def test_stale_gate_witness_with_large_numeric_ceiling_has_no_effect() -> None:

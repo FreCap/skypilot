@@ -107,7 +107,7 @@ _WORKER_PROJECTIONS = [
 ]
 _PROJECTION_MAP = {
     projection['accelerator_name'].casefold():
-    kubernetes_identity.worker_projection_sha256(projection)
+        kubernetes_identity.worker_projection_sha256(projection)
     for projection in _WORKER_PROJECTIONS
 }
 
@@ -399,32 +399,47 @@ def _commit_evidence(
     broker_slot_width: int = 1,
     observation_context: str = _CONTEXT,
     placement_context: str = _CONTEXT,
+    accelerator_names: tuple[str, ...] = ('a100-80gb', 'h200'),
+    edge_cap: int = 8,
+    grant: int = 8,
+    raw_grant: int | None = None,
 ) -> tuple[pool_capacity_observation.PoolCapacityObservation,
            reserved_fill_planner.PoolFillSnapshot]:
+    display_names = {
+        'a100': 'A100',
+        'a100-80gb': 'A100-80GB',
+        'h200': 'H200',
+    }
     worker_projections = [
-        _worker_projection('A100-80GB', 'kubernetes-0000', placement_context,
-                           broker_slot_width),
-        _worker_projection('H200', 'kubernetes-0001', placement_context,
-                           broker_slot_width),
+        _worker_projection(display_names[name], f'kubernetes-{index:04d}',
+                           placement_context, broker_slot_width)
+        for index, name in enumerate(accelerator_names)
     ]
     projection_map = {
         projection['accelerator_name'].casefold():
-        kubernetes_identity.worker_projection_sha256(projection)
+            kubernetes_identity.worker_projection_sha256(projection)
         for projection in worker_projections
     }
     repository = pool_capacity_observation.PoolCapacityObservationRepository(
         engine)
-    lease = repository.begin_observation(pool_key=_POOL_KEY,
+    pool_key = reserved_capacity_broker.make_pool_key(
+        placement_context,
+        accelerator_names,
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid=_UID)
+    lease = repository.begin_observation(pool_key=pool_key,
                                          physical_cluster_uid=_UID,
-                                         accelerator_names=('a100-80gb',
-                                                            'h200'),
+                                         accelerator_names=accelerator_names,
                                          access_context=observation_context,
                                          lease_duration_seconds=60,
                                          authority_horizon_seconds=600)
-    observed_gpu_counts = {
-        'a100-80gb': min(1, free_slots),
-        'h200': max(0, free_slots - 1),
-    }
+    remaining = free_slots
+    observed_gpu_counts: dict[str, int] = {}
+    for index, name in enumerate(accelerator_names):
+        count = remaining if index == len(accelerator_names) - 1 else min(
+            1, remaining)
+        observed_gpu_counts[name] = count
+        remaining -= count
     observation = repository.complete_success(
         lease,
         pool_capacity_observation.PoolCapacitySuccess.from_counts(
@@ -449,8 +464,14 @@ def _commit_evidence(
                 serve_state_schema.reserved_fill_pool_claims_table).where(
                     serve_state_schema.reserved_fill_pool_claims_table.c.
                     service_name == _SERVICE).values(
+                        pool_key=pool_key,
+                        legacy_pool_key=json.dumps(
+                            [placement_context,
+                             list(accelerator_names)]),
                         access_context=placement_context,
+                        accelerator_names=json.dumps(list(accelerator_names)),
                         gpus_per_replica=broker_slot_width,
+                        effective_cap=edge_cap,
                         worker_projection_sha256_by_accelerator=(
                             projection_map)))
         connection.execute(
@@ -479,13 +500,14 @@ def _commit_evidence(
                      :observation_materialization_sequence,
                      :observation_payload_sha256)
             """), {
-                'pool_key': _POOL_KEY,
+                'pool_key': pool_key,
                 'snapshot_time': observation.observed_at,
                 'claim_generations': json.dumps({_SERVICE: 11}),
-                'grants': json.dumps({_SERVICE: 8}),
+                'grants': json.dumps({_SERVICE: grant}),
                 'feeds': json.dumps({_SERVICE: feed}),
                 'feed_by_accelerator': json.dumps(exact_feed),
-                'raw_grants': json.dumps({_SERVICE: 8}),
+                'raw_grants': json.dumps(
+                    {_SERVICE: grant if raw_grant is None else raw_grant}),
                 'last_observed_free': sum(observed_slot_counts.values()),
                 'last_observed_free_ts': observation.observed_at,
                 'observation_generation': observation.observation_generation,
@@ -496,24 +518,25 @@ def _commit_evidence(
             })
     snapshot = reserved_fill_planner.PoolFillSnapshot(
         protocol_version=reserved_capacity_broker.PROTOCOL_V2,
-        pool_key=_POOL_KEY,
+        pool_key=pool_key,
         physical_cluster_uid=_UID,
         service_generation=11,
         worker_projection_sha256_by_accelerator=tuple(
             sorted(projection_map.items())),
-        edge_cap=8,
+        edge_cap=edge_cap,
         broker_slot_width=broker_slot_width,
         free_slots=feed,
         free_slots_by_accelerator=tuple(service_counts.items()),
-        grant=8,
+        grant=grant,
         grant_epoch=23,
         observation_generation=observation.observation_generation,
         observation_sequence=observation.observation_sequence,
         ordinary_zero_cost_admission_sequence=(
             observation.ordinary_admission_sequence),
         valid_until=observation.valid_until,
-        locations=(_location('A100-80GB', placement_context, broker_slot_width),
-                   _location('H200', placement_context, broker_slot_width)))
+        locations=tuple(
+            _location(display_names[name], placement_context, broker_slot_width)
+            for name in accelerator_names))
     return observation, snapshot
 
 
@@ -1696,8 +1719,8 @@ def test_durable_intent_handoff_survives_successor_pool_epoch(
         expected_gate_generation=1,
         pool_snapshots=(successor_snapshot,))
     assert successor_allocation is not None
-    assert (successor_allocation.allocation_generation >
-            allocation.allocation_generation)
+    assert (successor_allocation.allocation_generation
+            > allocation.allocation_generation)
 
     assert _stage_durable_fill(allocation_engine, _SERVICE, 1, info, lease)
     with allocation_engine.connect() as connection:
@@ -2116,6 +2139,18 @@ def _utilization_state(*, cap: int, demonstrated_need: int,
     }
 
 
+def _exact_utilization_state(*, cap: int, demonstrated_need: int,
+                             accelerator: str) -> dict[str, object]:
+    state = _utilization_state(cap=cap,
+                               demonstrated_need=demonstrated_need,
+                               stepped_at=1.0)
+    state['demand_witness_sha256'] = 'd' * 64
+    state['reservation_acquisition_target_by_accelerator'] = {
+        accelerator: demonstrated_need
+    }
+    return state
+
+
 def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
         allocation_engine, monkeypatch) -> None:
     monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)
@@ -2273,6 +2308,83 @@ def test_publication_records_unsettled_upward_grant(allocation_engine,
     assert not allocation.upward_grants_settled
     assert repository.read_current(_SERVICE, _SERVICE_HASH,
                                    _OWNER) == allocation
+
+
+def test_exact_acquisition_waits_for_complete_discovery_round(
+        allocation_engine, monkeypatch) -> None:
+    monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)
+    _, snapshot = _commit_evidence(allocation_engine,
+                                   accelerator_names=('a100',),
+                                   free_slots=47,
+                                   feed_by_accelerator={'a100': 1},
+                                   edge_cap=1,
+                                   grant=1)
+    utilization_state = _exact_utilization_state(cap=47,
+                                                 demonstrated_need=47,
+                                                 accelerator='a100')
+    with allocation_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.reserved_fill_service_claim_sets_table).
+            where(serve_state_schema.reserved_fill_service_claim_sets_table.c.
+                  service_name == _SERVICE).values(
+                      global_headroom=47,
+                      utilization_ceiling=47,
+                      utilization_state=json.dumps(utilization_state)))
+    repository = _repository(allocation_engine)
+
+    first = repository.publish(_SERVICE,
+                               expected_service_hash=_SERVICE_HASH,
+                               expected_controller_owner=_OWNER,
+                               expected_claim_generation=11,
+                               expected_gate_generation=1,
+                               pool_snapshots=(snapshot,))
+
+    assert first is not None
+    assert not first.upward_grants_settled
+    assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) == first
+
+    exact_feed = {
+        _SERVICE: {
+            'a100': 47
+        },
+        reserved_capacity_broker.OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'a100': 47
+        },
+        reserved_capacity_broker.BROKER_SLOT_WIDTH_KEY: 1,
+    }
+    with allocation_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.reserved_fill_pool_claims_table).where(
+                    serve_state_schema.reserved_fill_pool_claims_table.c.
+                    service_name == _SERVICE).values(effective_cap=47))
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.reserved_fill_rounds_table).where(
+                    serve_state_schema.reserved_fill_rounds_table.c.pool_key ==
+                    snapshot.pool_key).values(
+                        grants=json.dumps({_SERVICE: 47}),
+                        raw_grants=json.dumps({_SERVICE: 47}),
+                        feeds=json.dumps({_SERVICE: 47}),
+                        feed_by_accelerator=json.dumps(exact_feed)))
+    complete_snapshot = dataclasses.replace(snapshot,
+                                            edge_cap=47,
+                                            free_slots=47,
+                                            free_slots_by_accelerator=(('a100',
+                                                                        47),),
+                                            grant=47)
+
+    complete = repository.publish(_SERVICE,
+                                  expected_service_hash=_SERVICE_HASH,
+                                  expected_controller_owner=_OWNER,
+                                  expected_claim_generation=11,
+                                  expected_gate_generation=1,
+                                  pool_snapshots=(complete_snapshot,))
+
+    assert complete is not None
+    assert complete.upward_grants_settled
+    assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) == complete
 
 
 @pytest.mark.parametrize('lock_target', ['protocol', 'legacy-projection'])

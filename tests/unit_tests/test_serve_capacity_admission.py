@@ -735,7 +735,10 @@ def test_configured_usage_gate_requires_current_armed_evidence(
         allocation, evidence_state):
     policy, evidence, authenticated, eligible = (
         capacity_admission._reserved_supply_policy_and_evidence(
-            _fill_config(utilization_gate=True), allocation, {'l4': 2}))
+            _fill_config(utilization_gate=True),
+            allocation, {'l4': 2},
+            existing_zero_cost={},
+            pending_zero_cost={}))
 
     assert policy is capacity_admission.ReservedSupplyPolicy.DEMAND_GATED
     assert evidence is evidence_state
@@ -746,7 +749,10 @@ def test_configured_usage_gate_requires_current_armed_evidence(
 def test_ungated_observer_blackout_grants_no_fill_supply():
     policy, evidence, authenticated, eligible = (
         capacity_admission._reserved_supply_policy_and_evidence(
-            _fill_config(utilization_gate=False), None, {'l4': 2}))
+            _fill_config(utilization_gate=False),
+            None, {'l4': 2},
+            existing_zero_cost={},
+            pending_zero_cost={}))
 
     assert policy is capacity_admission.ReservedSupplyPolicy.STATIC_PREFILL
     assert evidence is capacity_admission.ReservedSupplyEvidenceState.UNAVAILABLE
@@ -754,11 +760,29 @@ def test_ungated_observer_blackout_grants_no_fill_supply():
     assert eligible == {}
 
 
+def test_ungated_unsettled_grant_grants_no_fill_supply():
+    policy, evidence, authenticated, eligible = (
+        capacity_admission._reserved_supply_policy_and_evidence(
+            _fill_config(utilization_gate=False),
+            _gate_allocation(armed=False, settled=False), {'l4': 2},
+            existing_zero_cost={},
+            pending_zero_cost={}))
+
+    assert policy is capacity_admission.ReservedSupplyPolicy.STATIC_PREFILL
+    assert evidence is (
+        capacity_admission.ReservedSupplyEvidenceState.AUTHENTICATED_UNSETTLED)
+    assert authenticated == {'l4': 2}
+    assert eligible == {}
+
+
 def test_disabled_reservation_projection_keeps_committed_inventory():
     config = _fill_config(binding_required=False, utilization_gate=True)
     policy, evidence, authenticated, eligible = (
         capacity_admission._reserved_supply_policy_and_evidence(
-            config, None, {'l4': 0}))
+            config,
+            None, {'l4': 0},
+            existing_zero_cost={},
+            pending_zero_cost={}))
     projection = capacity_admission.ReservedSupplyProjection(
         pending_zero_cost_capacity_by_accelerator={'l4': 3},
         allocation_reserved_capacity_by_accelerator={},

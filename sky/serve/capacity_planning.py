@@ -1209,11 +1209,12 @@ class _DemandWitnessSemantics:
     request_classes: tuple[_DemandWitnessClass, ...]
     aggregate_demand_target: int
     demand_attribution: AcceleratorCapacity
+    reservation_acquisition_target: AcceleratorCapacity | None
 
     @property
     def sha256(self) -> str:
         payload = dataclasses.asdict(self)
-        payload['protocol'] = 'serve-fill-demand-witness-v3'
+        payload['protocol'] = 'serve-fill-demand-witness-v4'
         return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 
@@ -1235,35 +1236,100 @@ def _demand_witness_classes(
                 source=source,
                 priority=profile.priority,
                 compatible_accelerators=profile.compatible_accelerators)
-            key = (
+            class_key = (
                 item.source, item.priority,
                 tuple(card.casefold() for card in item.compatible_accelerators),
                 item.count)
-            classes[key] = item
+            classes[class_key] = item
     if snapshot.deadline is not None:
         deadline_counts: dict[tuple[int, tuple[str, ...]], int] = {}
         for demand in snapshot.deadline.demand:
             if demand.count <= 0:
                 continue
-            key = (demand.priority, demand.compatible_cards)
-            deadline_counts[key] = deadline_counts.get(key, 0) + demand.count
+            deadline_key = (demand.priority, demand.compatible_cards)
+            deadline_counts[deadline_key] = (
+                deadline_counts.get(deadline_key, 0) + demand.count)
         for (priority, cards), count in deadline_counts.items():
             item = _DemandWitnessClass(source='deadline',
                                        priority=priority,
                                        compatible_accelerators=cards,
                                        count=count)
-            key = (
+            class_key = (
                 item.source, item.priority,
                 tuple(card.casefold() for card in item.compatible_accelerators),
                 item.count)
-            classes[key] = item
+            classes[class_key] = item
     return tuple(classes[key] for key in sorted(classes))
+
+
+def demand_witness_exact_reservation_target(
+    snapshot: CapacityPlanningSnapshot,
+    demand_attribution: AcceleratorCapacity,
+    *,
+    aggregate_demand_target: int,
+    raw_demand_target: int,
+) -> AcceleratorCapacity | None:
+    """Return the exact-card portion safe for pool-budget acquisition.
+
+    Demand attribution is a cheapest-compatible explanation for flexible
+    request classes, not authority to reserve that particular card.  Until
+    the broker carries request-class cardinality and performs exact-card
+    matching, only an entirely singleton-card witness may steer pool budgets.
+    Mixed, flexible, and classless demand therefore fails closed here.
+
+    The result is derived exclusively from inputs bound by the v4
+    witness semantic digest.
+    """
+    if (not isinstance(snapshot, CapacityPlanningSnapshot) or
+            not isinstance(demand_attribution, AcceleratorCapacity) or
+            type(aggregate_demand_target) is not int or
+            aggregate_demand_target < 0 or type(raw_demand_target) is not int or
+            raw_demand_target < 0 or
+            demand_attribution.total() != aggregate_demand_target):
+        raise ValueError('Demand witness reservation inputs are malformed.')
+    reserved = {
+        card.casefold(): card
+        for card in snapshot.configured_reservation_accelerators
+    }
+    demand_classes = _demand_witness_classes(snapshot)
+    unproven_capacity = (
+        aggregate_demand_target > raw_demand_target or
+        snapshot.paid_minimum_capacity > 0 or
+        any(count > 0 for _, count in snapshot.floors.entries) or
+        any(work > 0
+            for fixed in (snapshot.fixed_work, snapshot.explicit_fixed_work,
+                          snapshot.paid_fixed_work)
+            for _, work in fixed.entries))
+    if (unproven_capacity or not demand_classes or any(
+            len(item.compatible_accelerators) != 1 for item in demand_classes)):
+        return None
+    exact_cards = {
+        item.compatible_accelerators[0].casefold() for item in demand_classes
+    }
+    attributed_cards = {
+        card.casefold()
+        for card, count in demand_attribution.entries
+        if count > 0
+    }
+    if not attributed_cards.issubset(exact_cards):
+        return None
+    exact_reserved: dict[str, int] = {}
+    widths = snapshot.physical_gpu_width_by_accelerator.as_dict()
+    for card, count in demand_attribution.entries:
+        key = card.casefold()
+        if count > 0 and key in reserved and key in exact_cards:
+            if (snapshot.capacity_unit is CapacityUnit.LOGICAL_GPU and
+                    widths.get(card) != 1):
+                return None
+            exact_reserved[reserved[key]] = count
+    return AcceleratorCapacity.from_mapping(exact_reserved)
 
 
 def demand_witness_semantic_sha256(
     snapshot: CapacityPlanningSnapshot,
     *,
     aggregate_demand_target: int,
+    raw_demand_target: int,
     demand_attribution: AcceleratorCapacity,
 ) -> str:
     """Hash only stable demand/config semantics used by gate acquisition.
@@ -1274,7 +1340,8 @@ def demand_witness_semantic_sha256(
     """
     if (not isinstance(snapshot, CapacityPlanningSnapshot) or
             type(aggregate_demand_target) is not int or
-            aggregate_demand_target < 0 or
+            aggregate_demand_target < 0 or type(raw_demand_target) is not int or
+            raw_demand_target < 0 or
             not isinstance(demand_attribution, AcceleratorCapacity) or
             demand_attribution.total() != aggregate_demand_target):
         raise ValueError('Demand witness semantics are malformed.')
@@ -1289,7 +1356,12 @@ def demand_witness_semantic_sha256(
             snapshot.physical_gpu_width_by_accelerator),
         request_classes=_demand_witness_classes(snapshot),
         aggregate_demand_target=aggregate_demand_target,
-        demand_attribution=demand_attribution)
+        demand_attribution=demand_attribution,
+        reservation_acquisition_target=(demand_witness_exact_reservation_target(
+            snapshot,
+            demand_attribution,
+            aggregate_demand_target=aggregate_demand_target,
+            raw_demand_target=raw_demand_target)))
     return semantics.sha256
 
 
@@ -2362,6 +2434,7 @@ class CapacityPlanningEnvelope:
                 self.snapshot,
                 aggregate_demand_target=(
                     self.candidate.aggregate_demand_target),
+                raw_demand_target=self.candidate.raw_demand_target,
                 demand_attribution=self.candidate.demand_attribution)
             if self.candidate.demand_witness_sha256 != expected_witness:
                 raise ValueError('Capacity candidate changes demand witness.')
@@ -3334,6 +3407,7 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
     demand_witness_sha256 = demand_witness_semantic_sha256(
         snapshot,
         aggregate_demand_target=demand.total(),
+        raw_demand_target=raw_demand.total(),
         demand_attribution=demand)
     reservation_demand_relation, statically_disjoint_cards = (
         _classify_reservation_demand(snapshot,
