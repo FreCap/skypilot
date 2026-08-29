@@ -3895,8 +3895,10 @@ class CapacityAdmissionRepository:
                 positive_cards = tuple(
                     sorted(card for card, count in capacity_target.items()
                            if count > 0))
-                if (candidate.statically_disjoint_demand_accelerators
-                        != positive_cards or
+                candidate_disjoint_cards = tuple(
+                    sorted(card.casefold() for card in
+                           candidate.statically_disjoint_demand_accelerators))
+                if (candidate_disjoint_cards != positive_cards or
                         fill_config.worker_projection_sha256 is None):
                     raise CapacityAdmissionConflict(
                         'Pure planner static incompatibility no longer matches '

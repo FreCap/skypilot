@@ -2587,7 +2587,7 @@ def test_exact_paid_plan_ignores_only_statically_incompatible_reserved_cards(
             },
             sequenced_reserved_fill=True,
             planner=lambda snapshot, supply:
-            (_current_decision(snapshot, supply, 1)
+            (_current_decision(snapshot, supply, 1, accelerator='L4')
              if supply is not None else pytest.fail(
                  'static authority still requires the locked projection'))))
     authority = committed.authority
@@ -2599,7 +2599,10 @@ def test_exact_paid_plan_ignores_only_statically_incompatible_reserved_cards(
         'l4',)
     assert (authority.reserved_fill_authority.worker_projection_sha256 ==
             projection_digest)
-    _validate_prospective_claim(engine, authority.claim_values('l4'))
+    _validate_prospective_claim(engine, {
+        **authority.claim_values('l4'),
+        'pool_key': _paid_pool_key(),
+    })
 
     # The worker projection is immutable in production. Simulate corruption to
     # prove a previously issued claim fails closed if that fence ever changes.
@@ -2611,7 +2614,10 @@ def test_exact_paid_plan_ignores_only_statically_incompatible_reserved_cards(
                     worker_placement_projections=[_CAPACITY_KUEUE_PROJECTION]))
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
                        match='no longer proves static incompatibility'):
-        _validate_prospective_claim(engine, authority.claim_values('l4'))
+        _validate_prospective_claim(engine, {
+            **authority.claim_values('l4'),
+            'pool_key': _paid_pool_key(),
+        })
 
 
 def test_flexible_demand_cannot_bypass_reserved_allocation_by_landing_on_l4(
