@@ -2559,10 +2559,14 @@ def test_usage_gate_publishes_no_effect_acquisition_for_noncausal_evidence(
                 serve_state_schema.replicas_table)).scalar_one() == 0
 
 
+@pytest.mark.parametrize('utilization_gate', [False, True])
 def test_exact_paid_plan_ignores_only_statically_incompatible_reserved_cards(
-        capacity_database):
+        capacity_database, monkeypatch, utilization_gate):
     engine, incarnation, _ = capacity_database
-    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=True)
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=True,
+                           utilization_gate=utilization_gate)
     h200_projection = copy.deepcopy(_CAPACITY_KUEUE_PROJECTION)
     h200_projection['accelerator_name'] = 'H200'
     h200_projection['accelerator_scheduling']['label_values'] = ['NVIDIA-H200']
@@ -2574,6 +2578,11 @@ def test_exact_paid_plan_ignores_only_statically_incompatible_reserved_cards(
                 serve_state_schema.version_specs_table.c.service_name == 'svc',
                 serve_state_schema.version_specs_table.c.version == 1).values(
                     worker_placement_projections=projections))
+
+    current_allocation = [_allocation_map({
+        'H200': 0,
+    }, grant=0, edge_cap=0)]
+    _mock_current_allocation(monkeypatch, lambda: current_allocation[0])
 
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_publish_current(
@@ -2599,6 +2608,16 @@ def test_exact_paid_plan_ignores_only_statically_incompatible_reserved_cards(
         'l4',)
     assert (authority.reserved_fill_authority.worker_projection_sha256 ==
             projection_digest)
+    assert committed.planner_snapshot.reservation.evidence_state is (
+        capacity_planning.ReservationEvidenceState.AUTHENTICATED_UNSETTLED
+        if utilization_gate else
+        capacity_planning.ReservationEvidenceState.AUTHENTICATED_SETTLED)
+
+    # Static incompatibility is projection-bound, not allocation-bound.  An
+    # unrelated H200 broker generation may change before the paid L4 claim.
+    current_allocation[0] = _allocation_map({
+        'H200': 2,
+    }, grant=2, edge_cap=2)
     _validate_prospective_claim(engine, {
         **authority.claim_values('l4'),
         'pool_key': _paid_pool_key(),

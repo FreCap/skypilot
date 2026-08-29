@@ -347,6 +347,30 @@ def _validate_prospective_planner_candidate(
     return planner_snapshot, candidate
 
 
+def _planner_reservation_gate_policy(
+    policy: ReservedSupplyPolicy,) -> capacity_planning.ReservationGatePolicy:
+    """Return the planner spelling of one immutable reservation policy."""
+    return {
+        ReservedSupplyPolicy.DISABLED:
+            capacity_planning.ReservationGatePolicy.NOT_CONFIGURED,
+        ReservedSupplyPolicy.STATIC_PREFILL:
+            capacity_planning.ReservationGatePolicy.UNGATED,
+        ReservedSupplyPolicy.DEMAND_GATED:
+            capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+    }[policy]
+
+
+def _validate_prospective_reservation_policy(
+    planner_snapshot: capacity_planning.CapacityPlanningSnapshot,
+    policy: ReservedSupplyPolicy,
+) -> None:
+    """Keep immutable fill policy changes fail-closed for every authority."""
+    if (planner_snapshot.reservation.gate_policy
+            is not _planner_reservation_gate_policy(policy)):
+        raise CapacityAdmissionConflict(
+            'Paid claim reservation policy changed.')
+
+
 def _validate_prospective_reservation_evidence(
     planner_snapshot: capacity_planning.CapacityPlanningSnapshot,
     candidate: capacity_planning.CapacityPlanCandidate,
@@ -359,14 +383,7 @@ def _validate_prospective_reservation_evidence(
     reservation_evidence_sha256: str,
 ) -> None:
     """Bind the persisted candidate to current reservation/gate evidence."""
-    expected_policy = {
-        ReservedSupplyPolicy.DISABLED:
-            capacity_planning.ReservationGatePolicy.NOT_CONFIGURED,
-        ReservedSupplyPolicy.STATIC_PREFILL:
-            capacity_planning.ReservationGatePolicy.UNGATED,
-        ReservedSupplyPolicy.DEMAND_GATED:
-            capacity_planning.ReservationGatePolicy.DEMAND_GATED,
-    }[policy]
+    _validate_prospective_reservation_policy(planner_snapshot, policy)
     expected_evidence_state = {
         ReservedSupplyEvidenceState.NOT_APPLICABLE:
             capacity_planning.ReservationEvidenceState.NOT_APPLICABLE,
@@ -402,8 +419,7 @@ def _validate_prospective_reservation_evidence(
     expected_eligible = {
         card: expected_eligible.get(card, 0) for card in sorted(accounting_cards)
     }
-    if (reservation.gate_policy is not expected_policy or
-            reservation.evidence_state is not expected_evidence_state or
+    if (reservation.evidence_state is not expected_evidence_state or
             reservation.evidence_fingerprint != reservation_evidence_sha256 or
             authenticated != expected_authenticated or
             eligible != expected_eligible or any(
@@ -411,6 +427,64 @@ def _validate_prospective_reservation_evidence(
                 for card in accounting_cards)):
         raise CapacityAdmissionConflict(
             'Paid claim reservation or usage-gate evidence changed.')
+
+
+def _validate_static_disjoint_prospective_authority(
+    planner_snapshot: capacity_planning.CapacityPlanningSnapshot,
+    candidate: capacity_planning.CapacityPlanCandidate,
+    authority: ReservedFillPlanAuthority,
+    *,
+    accounting_cards: set[str],
+    capacity_target: Mapping[str, int],
+    fill_config: _ReservedFillServiceConfig,
+    policy: ReservedSupplyPolicy,
+) -> None:
+    """Validate allocation-independent authority for exact disjoint demand."""
+    positive_target_cards = tuple(
+        sorted(card for card, count in capacity_target.items() if count > 0))
+    try:
+        candidate_disjoint_cards = tuple(
+            sorted(
+                card.casefold()
+                for card in candidate.statically_disjoint_demand_accelerators))
+        candidate_commitment = _capacity_for_accounting_cards(
+            candidate.new_reserved_capacity_committed, accounting_cards,
+            'planner candidate reservation commitment')
+        candidate_reserved_launch = _capacity_for_accounting_cards(
+            candidate.reserved_launch_target, accounting_cards,
+            'planner candidate reserved launch target')
+        candidate_static_fill = _capacity_for_accounting_cards(
+            candidate.static_prefill_target, accounting_cards,
+            'planner candidate static fill target')
+        planner_reserved_cards = {
+            card.casefold()
+            for card in planner_snapshot.configured_reservation_accelerators
+        }
+    except (AttributeError, TypeError, ValueError) as error:
+        raise CapacityAdmissionConflict(
+            'Paid claim static incompatibility evidence is malformed.'
+        ) from error
+    expected_capacity_unit = (
+        capacity_planning.CapacityUnit.LOGICAL_GPU if fill_config.capacity_unit
+        is reserved_fill_planner.FillCapacityUnit.LOGICAL else
+        capacity_planning.CapacityUnit.PHYSICAL_BACKEND)
+    current_reserved_cards = set(fill_config.reserved_accelerators or ())
+    if (authority.mode
+            is not ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE or
+            candidate.reservation_demand_relation is not capacity_planning.
+            ReservationDemandRelation.STATICALLY_DISJOINT or
+            authority.incompatible_accelerators != positive_target_cards or
+            candidate_disjoint_cards != positive_target_cards or
+            any(candidate_commitment.values()) or
+            any(candidate_reserved_launch.values()) or
+            any(candidate_static_fill.values()) or
+            planner_snapshot.maximum_capacity != fill_config.max_capacity or
+            planner_snapshot.capacity_unit is not expected_capacity_unit or
+            planner_reserved_cards != current_reserved_cards):
+        raise CapacityAdmissionConflict(
+            'Paid claim no longer proves exact static reservation '
+            'incompatibility.')
+    _validate_prospective_reservation_policy(planner_snapshot, policy)
 
 
 def _canonical_watermark(value: Any) -> list[dict[str, Any]]:
@@ -1360,14 +1434,8 @@ def _validate_planner_against_locked_supply(
                            'existing_paid_capacity')
         }
     else:
-        expected_policy = {
-            ReservedSupplyPolicy.DISABLED:
-                capacity_planning.ReservationGatePolicy.NOT_CONFIGURED,
-            ReservedSupplyPolicy.STATIC_PREFILL:
-                capacity_planning.ReservationGatePolicy.UNGATED,
-            ReservedSupplyPolicy.DEMAND_GATED:
-                capacity_planning.ReservationGatePolicy.DEMAND_GATED,
-        }[supply_projection.policy]
+        expected_policy = _planner_reservation_gate_policy(
+            supply_projection.policy)
         expected_evidence = {
             ReservedSupplyEvidenceState.NOT_APPLICABLE:
                 capacity_planning.ReservationEvidenceState.NOT_APPLICABLE,
@@ -4680,16 +4748,32 @@ def validate_paid_claim_in_connection(
          current_allocation_reserved,
          existing_zero_cost=current_zero,
          pending_zero_cost=current_pending_zero)
-    _validate_prospective_reservation_evidence(
-        planner_snapshot,
-        planner_candidate,
-        accounting_cards=accounting_cards,
-        policy=current_reservation_policy,
-        evidence_state=current_reservation_evidence,
-        authenticated_capacity=current_authenticated_reserved,
-        eligible_capacity=current_eligible_reserved,
-        reservation_evidence_sha256=_reservation_evidence_sha256(
-            fill_config, validated_allocation))
+    if (plan_reserved_fill_authority.mode
+            is ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE):
+        # Exact disjoint demand is bound to the immutable worker projection,
+        # not to unrelated broker allocation generations or usage-gate
+        # evidence for other cards.  The helper still validates every stable
+        # planner/policy dimension before this allocation-dependent check is
+        # omitted.
+        _validate_static_disjoint_prospective_authority(
+            planner_snapshot,
+            planner_candidate,
+            plan_reserved_fill_authority,
+            accounting_cards=accounting_cards,
+            capacity_target=capacity_target,
+            fill_config=fill_config,
+            policy=current_reservation_policy)
+    else:
+        _validate_prospective_reservation_evidence(
+            planner_snapshot,
+            planner_candidate,
+            accounting_cards=accounting_cards,
+            policy=current_reservation_policy,
+            evidence_state=current_reservation_evidence,
+            authenticated_capacity=current_authenticated_reserved,
+            eligible_capacity=current_eligible_reserved,
+            reservation_evidence_sha256=_reservation_evidence_sha256(
+                fill_config, validated_allocation))
     if any(
             baseline_allocation_reserved.get(card, 0) >
             current_eligible_reserved.get(card, 0)
