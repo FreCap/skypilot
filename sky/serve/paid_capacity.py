@@ -74,6 +74,7 @@ _POOL_KEY_VERSION = 2
 _AWS_ACCOUNT_ID_RE = re.compile(r'[0-9]{12}')
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
 _MAX_EXACT_SHAPE_INTEGER = (1 << 63) - 1
+MAX_PREPARED_LAUNCH_SPECS = 512
 _UNRESOLVED_STATUS_VALUES = frozenset({'PENDING', 'PROVISIONING'})
 _admission_summary_log_lock = threading.Lock()
 _admission_summary_log_signature: tuple[Any, ...] | None = None
@@ -184,7 +185,7 @@ class PaidLaunchSpec:
     workspace: str
     region: str
     zone: str | None
-    instance_type: str
+    instance_type: str | None
     pool_key: str
     frontier_key: FrontierKey
     accelerator: str
@@ -200,7 +201,6 @@ class PaidLaunchSpec:
             self.cloud,
             self.workspace,
             self.region,
-            self.instance_type,
             self.pool_key,
             self.accelerator,
         )
@@ -310,6 +310,7 @@ class PaidLaunchReceiptMember:
     replica_id: int
     replica_record_id: str
     pool_key: str
+    priority: int
     accelerator: str
     plan_units: int
     physical_gpu_units: int
@@ -319,6 +320,9 @@ class PaidLaunchReceiptMember:
                 type(self.replica_record_id) is not str
                 or type(self.pool_key) is not str
                 or pool_key_payload(self.pool_key) is None
+                or type(self.priority) is not int  # pylint: disable=unidiomatic-typecheck
+                or not constants.LB_REQUEST_PRIORITY_MIN <= self.priority <=
+                constants.LB_REQUEST_PRIORITY_MAX
                 or type(self.accelerator) is not str or not self.accelerator
                 or self.accelerator != self.accelerator.casefold()
                 or type(self.plan_units) is not int or self.plan_units < 1 or  # pylint: disable=unidiomatic-typecheck
@@ -2296,6 +2300,10 @@ def try_persist_claim_batch(
 
     identities = []
     for candidate in candidates:
+        if (type(candidate.priority) is not int or  # pylint: disable=unidiomatic-typecheck
+                not constants.LB_REQUEST_PRIORITY_MIN <= candidate.priority <=
+                constants.LB_REQUEST_PRIORITY_MAX):
+            raise ValueError('Paid claim priority must be exact and in range.')
         identities.append(
             (candidate.replica_id, candidate.replica_info.replica_record_id))
     if len(set(identities)) != len(identities):
@@ -2331,13 +2339,8 @@ def try_persist_claim_batch(
                                                        candidate_frontier)
         if effective_frontier is None:
             effective_frontier = exploration_frontier()
-        bounded_candidate = dataclasses.replace(
-            candidate,
-            priority=max(
-                constants.LB_REQUEST_PRIORITY_MIN,
-                min(constants.LB_REQUEST_PRIORITY_MAX, candidate.priority)))
         persistence_specs.append(
-            PaidClaimPersistenceSpec(candidate=bounded_candidate,
+            PaidClaimPersistenceSpec(candidate=candidate,
                                      pool_key=key,
                                      frontier_key=candidate_frontier,
                                      frontier_limit=effective_frontier))

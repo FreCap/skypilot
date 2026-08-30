@@ -1907,6 +1907,7 @@ def test_materialize_paid_launch_receipt_builds_only_sparse_members():
         replica_id=selected.replica_id,
         replica_record_id=selected.replica_record_id,
         pool_key=selected.pool_key,
+        priority=50,
         accelerator=selected.accelerator,
         plan_units=1,
         physical_gpu_units=1)

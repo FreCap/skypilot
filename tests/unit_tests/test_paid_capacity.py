@@ -150,6 +150,7 @@ def test_paid_launch_receipt_is_sparse_accepted_identity_only():
         replica_id=spec.replica_id,
         replica_record_id=spec.replica_record_id,
         pool_key=spec.pool_key,
+        priority=50,
         accelerator='l4',
         plan_units=1,
         physical_gpu_units=1)
@@ -2014,7 +2015,7 @@ def test_local_window_debits_ambiguous_legacy_row_from_cheapest_type(
     }
 
 
-def test_claim_clamps_priority_and_returns_typed_result():
+def test_claim_rejects_out_of_range_priority():
     location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     location.instance_type = 'g6.xlarge'
     budget = paid_capacity.LaunchBudget(
@@ -2035,32 +2036,15 @@ def test_claim_clamps_priority_and_returns_typed_result():
         frontier_key_by_location={location: ('l4',)},
         frontier_limit_overrides={('l4',): 3})
     info = _pending_info(1, location)
-    with mock.patch.object(paid_capacity.serve_state,
-                           'try_add_replicas_with_paid_capacity_claims',
-                           return_value=['acquired']) as claim:
-        result = paid_capacity.try_persist_claim(service_name='svc',
-                                                 service_hash='hash',
-                                                 controller_owner=(1,
-                                                                   '10.0.0.1'),
-                                                 replica_id=1,
-                                                 replica_info=info,
-                                                 location=location,
-                                                 budget=budget,
-                                                 priority=1000)
-
-    assert result is paid_capacity.ClaimResult.ACQUIRED
-    persistence_specs = claim.call_args.args[2]
-    assert len(persistence_specs) == 1
-    assert persistence_specs[0].candidate.priority == (
-        constants.LB_REQUEST_PRIORITY_MAX)
-    assert persistence_specs[0].pool_key == budget.pool_key_by_location[
-        location]
-    assert claim.call_args.kwargs['service_limit'] == 24
-    assert claim.call_args.kwargs['max_live_paid_gpu_units'] == 8
-    assert persistence_specs[0].frontier_key == ('l4',)
-    assert persistence_specs[0].frontier_limit == 3
-    assert claim.call_args.kwargs['frontier_default_limit'] == 2
-    assert claim.call_args.kwargs['frontier_limits_by_key'] == {('l4',): 3}
+    with pytest.raises(ValueError, match='priority must be exact'):
+        paid_capacity.try_persist_claim(service_name='svc',
+                                        service_hash='hash',
+                                        controller_owner=(1, '10.0.0.1'),
+                                        replica_id=1,
+                                        replica_info=info,
+                                        location=location,
+                                        budget=budget,
+                                        priority=1000)
 
 
 def test_claim_batch_returns_exact_typed_members_and_publishes_only_committed():
