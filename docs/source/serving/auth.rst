@@ -59,6 +59,11 @@ To deploy the service, run the following command:
 
   HF_TOKEN=xxx AUTH_TOKEN=yyy sky serve up auth.yaml -n auth --secret HF_TOKEN --secret AUTH_TOKEN
 
+SkyServe rejects inline secrets whose final value is empty after applying CLI
+overrides. This prevents a service from provisioning replicas with missing
+credentials. Use ``null`` for required placeholders, as above, and provide each
+value with ``--secret`` or directly in the task YAML.
+
 To send a request to the service endpoint, a service client need to include the static API key in a request's header:
 
 .. code-block:: bash

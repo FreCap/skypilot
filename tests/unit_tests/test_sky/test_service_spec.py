@@ -42,6 +42,52 @@ def test_zero_replica_default_is_documented_in_both_references():
     assert expected_markdown in skill_reference
 
 
+def _service_task_with_secrets(
+        secrets: dict[str, str],
+        secrets_overrides: list[tuple[str, str]] | None = None) -> sky.Task:
+    return sky.Task.from_yaml_config(
+        {
+            'service': {
+                'ports': 8080,
+                'replica_policy': {
+                    'min_replicas': 0,
+                },
+            },
+            'resources': {
+                'ports': 8080,
+            },
+            'secrets': secrets,
+            'run': 'python -m http.server 8080',
+        },
+        secrets_overrides=secrets_overrides)
+
+
+def test_service_rejects_empty_secrets_after_yaml_cli_merge():
+    task = _service_task_with_secrets({
+        'Z_EMPTY': '',
+        'NON_EMPTY': 'must-not-appear-in-error',
+        'A_EMPTY': '',
+    })
+
+    with pytest.raises(ValueError) as exc_info:
+        serve_utils.validate_service_task(task, pool=False)
+
+    error = str(exc_info.value)
+    assert 'A_EMPTY, Z_EMPTY' in error
+    assert 'must-not-appear-in-error' not in error
+
+
+def test_service_accepts_cli_overrides_for_empty_yaml_secrets():
+    overrides = [('API_KEY', 'api-value'), ('AUTH_TOKEN', 'auth-value')]
+    secrets = {
+        'API_KEY': '',
+        'AUTH_TOKEN': '',
+    }
+    task = _service_task_with_secrets(secrets, secrets_overrides=overrides)
+
+    serve_utils.validate_service_task(task, pool=False)
+
+
 @pytest.mark.parametrize(
     ('config', 'expected_min', 'expected_max'),
     [

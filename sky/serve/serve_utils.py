@@ -1754,6 +1754,20 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                              f'file does not match the pool argument. '
                              f'To fix, add a valid `{field_name}` field.')
 
+    # Empty secrets are supported for ordinary tasks, but a long-lived service
+    # must not provision replicas with credentials that are guaranteed to
+    # fail.  This runs after YAML and CLI overrides have been merged.
+    if not pool:
+        empty_secret_names = sorted(
+            name for name, value in task.secrets.items()
+            if value.get_secret_value() == '')
+        if empty_secret_names:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'SkyServe secret values must be non-empty. Provide a '
+                    'value in the task YAML or with --secret for: '
+                    f'{", ".join(empty_secret_names)}.')
+
     validate_logical_replica_task(task)
 
     # Validate that pools do not use ordered resources
