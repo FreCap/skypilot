@@ -745,7 +745,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         self.assertEqual(candidate.paid_residual.as_dict(), {})
         self.assertEqual(candidate.paid_launch_target.as_dict(), {})
 
-    def test_saturated_arrival_tail_beyond_fixed_work_launches(self):
+    def test_saturated_fixed_overlap_waits_for_exact_rejection(self):
         autoscaler = _durable_autoscaler(max_replicas=100,
                                          expected_request_duration_seconds=60)
         replica = _replica(1, card='L4')
@@ -776,11 +776,50 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
 
         assert result is not None
         candidate = result.envelope.candidate
-        self.assertEqual(candidate.aggregate_demand_target, 2)
+        self.assertEqual(candidate.aggregate_demand_target, 1)
         self.assertEqual(candidate.supply_aware_demand_target.as_dict(),
-                         {'L4': 2})
-        self.assertEqual(candidate.paid_residual.as_dict(), {'L4': 1})
-        self.assertEqual(candidate.paid_launch_target.as_dict(), {'L4': 1})
+                         {'L4': 1})
+        self.assertEqual(candidate.paid_residual.as_dict(), {})
+        self.assertEqual(candidate.paid_launch_target.as_dict(), {})
+
+        rejected_report = _durable_report(
+            rejected=1,
+            in_flight={1: 1},
+            observed_slots={1: 1},
+            compatibility_profiles=[{
+                'priority': 50,
+                'compatible_accelerators': ['L4'],
+                'count': 2,
+                'timestamp': self._INSTANT.wall_time,
+            }],
+            rejected_profiles=[{
+                'priority': 50,
+                'compatible_accelerators': ['L4'],
+                'count': 1,
+                'recent_count': 1,
+            }])
+        rejected_report.update(
+            rejected_in_recent_window=1,
+            unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
+            unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
+            headerless_arrivals_60s=0,
+            headerless_arrivals_300s=0,
+            offered_arrival_tracking_saturated=True)
+
+        successor = self._plan(autoscaler,
+                               report=rejected_report,
+                               replicas=(replica,),
+                               reservation=reservation,
+                               decision_inputs=_durable_inputs((replica,)))
+
+        assert successor is not None
+        successor_candidate = successor.envelope.candidate
+        self.assertEqual(successor_candidate.aggregate_demand_target, 2)
+        self.assertEqual(
+            successor_candidate.supply_aware_demand_target.as_dict(), {'L4': 2})
+        self.assertEqual(successor_candidate.paid_residual.as_dict(), {'L4': 1})
+        self.assertEqual(successor_candidate.paid_launch_target.as_dict(),
+                         {'L4': 1})
 
     def test_ambiguous_fixed_overlap_shelters_when_scalar_gap_is_zero(self):
         duration = 60 / constants.LB_OFFERED_ARRIVAL_CAP
@@ -847,6 +886,73 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             'L4': 100,
             'A100': 50,
         })
+
+    def test_fixed_overlap_shelter_excludes_incompatible_committed_card(self):
+        duration = 60 / constants.LB_OFFERED_ARRIVAL_CAP
+        autoscaler = _durable_autoscaler(
+            max_replicas=200, expected_request_duration_seconds=duration)
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+            'H200': 1,
+        })
+        a100 = _replica(1, card='A100', planned_capacity=1)
+        l4 = _replica(2, card='L4', planned_capacity=50)
+        replicas = (a100, l4)
+        report = _durable_report(queue_depth=100,
+                                 in_flight={
+                                     1: 1,
+                                     2: 0,
+                                 },
+                                 observed_slots={
+                                     1: 1,
+                                     2: 50,
+                                 },
+                                 queued_profiles=[{
+                                     'priority': 20,
+                                     'compatible_accelerators': ['H200'],
+                                     'count': 100,
+                                 }],
+                                 compatibility_profiles=[{
+                                     'priority': 50,
+                                     'compatible_accelerators': ['A100'],
+                                     'count': 1,
+                                     'timestamp': self._INSTANT.wall_time,
+                                 }])
+        report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
+                      unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
+                      headerless_arrivals_60s=0,
+                      headerless_arrivals_300s=0,
+                      offered_arrival_tracking_saturated=True)
+        reservation = dataclasses.replace(
+            _durable_reservation(),
+            existing_paid_capacity=(
+                capacity_planning.AcceleratorCapacity.from_mapping({
+                    'A100': 1,
+                    'L4': 50,
+                })),
+            charged_paid_gpu_units=51)
+        inputs = dataclasses.replace(
+            _durable_inputs(replicas),
+            cold_paid_accelerator_order=('H200', 'A100', 'L4'),
+            prospective_paid_accelerator_order=('H200', 'A100', 'L4'))
+
+        result = self._plan(autoscaler,
+                            report=report,
+                            replicas=replicas,
+                            reservation=reservation,
+                            decision_inputs=inputs)
+
+        assert result is not None
+        snapshot = result.envelope.snapshot
+        candidate = result.envelope.candidate
+        self.assertEqual(snapshot.retirement_shelter_target.as_dict(),
+                         {'A100': 1})
+        self.assertEqual(candidate.retirement_floor_target.as_dict(), {
+            'A100': 1,
+            'H200': 100,
+        })
+        self.assertNotIn('L4', candidate.retirement_floor_target.as_dict())
 
     def test_saturated_arrival_and_terminal_rejection_are_one_request(self):
         autoscaler = _durable_autoscaler(max_replicas=100,

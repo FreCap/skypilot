@@ -7069,13 +7069,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                                sum(exact_fixed_work.values()))
             arrival_gap = max(0.0, arrival_work - attributed_work)
             unattributed_saturated_work = False
+            saturated_shelter_cards: set[str] | None = set()
             if saturated:
                 # Queue, rejection, in-flight, and arrival telemetry are
                 # projections of one request stream. Reduce them to one
-                # typed reconciliation before capacity allocation. Only an
-                # unmatched measured-arrival class that is also disjoint from
-                # lossy fixed work is incremental. The unclassified aggregate
-                # saturation gap remains shelter-only.
+                # typed reconciliation before capacity allocation. Classified
+                # tails beyond the shared fixed-work bound remain incremental;
+                # unresolved identity and the unclassified aggregate
+                # saturation gap remain shelter-only.
                 if (work_profiles != explicit_profiles or
                         work_profiles != paid_profiles):
                     return None
@@ -7117,13 +7118,20 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 attributed_work = (sum(item[2] for item in work_profiles) +
                                    sum(exact_fixed_work.values()))
                 arrival_gap = max(0.0, arrival_work - attributed_work)
-                unattributed_saturated_work = (
+                global_saturated_uncertainty = (
                     duration is None or
                     arrival_gap > _SLOT_CONVERSION_EPSILON or
-                    observation_reconciliation.ambiguous_fixed_arrival_work
-                    > _SLOT_CONVERSION_EPSILON or
                     flexible_fixed > _SLOT_CONVERSION_EPSILON or
                     has_unattributed_fixed_work)
+                fixed_overlap_uncertainty = (
+                    observation_reconciliation.ambiguous_fixed_arrival_work
+                    > _SLOT_CONVERSION_EPSILON)
+                unattributed_saturated_work = (global_saturated_uncertainty or
+                                               fixed_overlap_uncertainty)
+                saturated_shelter_cards = (
+                    None if global_saturated_uncertainty else set(
+                        observation_reconciliation.
+                        ambiguous_fixed_shelter_accelerators))
                 if attributed_work <= _SLOT_CONVERSION_EPSILON:
                     return None
                 outstanding_work = attributed_work
@@ -7338,7 +7346,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     for card, count in retirement_shelter_target.entries
                     if count > 0
                 }
-                for card in configured_cards:
+                cards_to_shelter = (configured_cards if saturated_shelter_cards
+                                    is None else tuple(
+                                        card for card in configured_cards
+                                        if card in saturated_shelter_cards))
+                for card in cards_to_shelter:
                     committed = (latest_committed.get(card, 0) +
                                  old_committed.get(card, 0))
                     if committed > 0:

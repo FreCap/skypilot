@@ -98,12 +98,13 @@ projections; different tuples remain distinct instead of being coupled by an
 arbitrary maximum-flow tie-break. Exact fixed in-flight work has lost request
 priority and compatibility. It therefore cannot be paired with one of several
 arrival classes without inventing request identity and potentially selecting
-the wrong paid card. For each residual arrival class, the full compatible
-fixed-work mass is a conservative overlap upper bound. Any tail beyond that
-bound is provably incremental and retains its original priority and
-compatibility tuple. The bounded overlap remains attribution-ambiguous and can
-only shelter already committed capacity; reusing the full upper bound for
-several classes deliberately avoids choosing which class owns fixed work.
+the wrong paid card. A residual arrival class that intersects lossy fixed work
+therefore grants no provider authority until current queue or rejection
+telemetry establishes authoritative outstanding work. It may shelter only
+committed cards compatible with that class, never an unrelated accelerator
+fleet. Classes disjoint from every fixed card remain immediately incremental.
+This explicit information boundary avoids recreating a second subset-rank
+allocator merely to infer request identity from aggregate observations.
 Fixed-only capacity carries the minimum request priority unless typed work is
 copacked into its slot, so an unrelated high-priority arrival cannot upgrade
 its reservation entitlement. This reconciliation is linear in classified
@@ -117,11 +118,12 @@ when no exact shelter identity exists. It cannot borrow a partial arrival
 sample's card.
 
 The adapter preserves an `unattributed_saturated_work` boundary when request
-duration is unknown or from the raw arrival gap and flexible fixed work before
-reducing the gap to the retained classified sample. Only while that boundary
-is true does the canonical typed retirement shelter retain current committed
-positive capacity on every exact card. A fully attributed saturated report
-therefore follows normal downscale
+duration is unknown, the raw arrival gap remains positive, fixed work lacks an
+exact card, or classified arrival identity still overlaps lossy fixed work.
+The first three are global attribution failures and may retain committed
+positive capacity on every exact card. Fixed-overlap ambiguity carries an
+explicit compatible-card set and shelters only committed capacity on those
+cards. A fully attributed saturated report therefore follows normal downscale
 policy instead of sheltering unrelated idle supply. The same boundary removes
 prior demand targets, ownership, actuation maps, and cold authority from the
 planning projection so stale hysteresis cannot resurrect unattributed paid or
@@ -2448,11 +2450,14 @@ on-demand spill.
   mixed retained L4/A100 arrivals, prove the unknown remainder of the 100,000
   saturation bound is never extrapolated onto those cards. Prove identical
   classified pressure/arrival tuples overlap by magnitude, different immutable
-  tuples remain distinct, the portion bounded by compatible lossy fixed-card
-  work remains shelter-only, and any typed tail beyond that bound retains its
-  original paid authority. Prove disjoint high-priority arrivals do not upgrade
-  fixed-only reservation classes. Exercise all 255 compatibility subsets across
-  multiple priorities without a pairwise graph. With both current
+  tuples remain distinct, arrivals intersecting compatible lossy fixed-card
+  work remain shelter-only, and disjoint typed arrivals retain their original
+  paid authority. Prove a subsequent exact queue or rejection class authorizes
+  missing scale-up without borrowing identity from the arrival sample, and the
+  ambiguity shelter excludes unrelated committed cards. Prove disjoint
+  high-priority arrivals do not upgrade fixed-only reservation classes.
+  Exercise all 255 compatibility subsets across multiple priorities without a
+  pairwise graph. With both current
   A100 work plus idle L4 supply and old/retiring A100 work plus one L4 arrival,
   prove fixed work does not inherit the L4 sample's paid authority. Seed the
   latter case with a stale inflated L4 target and prove the planning projection

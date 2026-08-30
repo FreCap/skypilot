@@ -55,6 +55,7 @@ def test_demand_observation_union_keeps_different_typed_classes_distinct(
     assert result.incremental_arrival_work == pytest.approx(2)
     assert result.withheld_arrival_work == pytest.approx(0)
     assert result.ambiguous_fixed_arrival_work == pytest.approx(0)
+    assert result.ambiguous_fixed_shelter_accelerators == ()
     assert _profile_work(result) == {
         (50, ('A100', 'L4')): 1,
         (50, ('L4',)): 2,
@@ -102,26 +103,45 @@ def test_demand_observation_reconciliation_withholds_lossy_fixed_priority(
             _demand(50, ('L4',), 0.5, sequence=1),
         ))
 
-    # Fixed work has no request priority.  Selecting either arrival class as
-    # its overlap would invent priority, so neither can authorize a provider
-    # launch.  Fixed work remains represented by the separate exact-card map.
+    # Fixed work has no request priority. Choosing either arrival class as its
+    # overlap would invent priority, so neither can authorize a provider
+    # launch. Current queue/rejection evidence will supply that authority.
     assert result.incremental_arrival_work == pytest.approx(0)
     assert result.withheld_arrival_work == pytest.approx(1)
     assert result.ambiguous_fixed_arrival_work == pytest.approx(1)
+    assert result.ambiguous_fixed_shelter_accelerators == ('L4',)
     assert _profile_work(result) == {}
 
 
-def test_demand_observation_reconciliation_emits_tail_beyond_fixed_bound(
+def test_demand_observation_reconciliation_withholds_fixed_intersection(
 ) -> None:
     result = capacity_planning.reconcile_demand_observations(
         primary_profiles=(),
         fixed_work=_work(L4=1),
         arrival_profiles=(_demand(50, ('L4',), 2),))
 
-    assert result.incremental_arrival_work == pytest.approx(1)
-    assert result.withheld_arrival_work == pytest.approx(1)
-    assert result.ambiguous_fixed_arrival_work == pytest.approx(1)
-    assert _profile_work(result) == {(50, ('L4',)): 1}
+    assert result.incremental_arrival_work == pytest.approx(0)
+    assert result.withheld_arrival_work == pytest.approx(2)
+    assert result.ambiguous_fixed_arrival_work == pytest.approx(2)
+    assert result.ambiguous_fixed_shelter_accelerators == ('L4',)
+    assert _profile_work(result) == {}
+
+
+def test_demand_observation_reconciliation_does_not_assign_fixed_priority(
+) -> None:
+    result = capacity_planning.reconcile_demand_observations(
+        primary_profiles=(),
+        fixed_work=_work(L4=1),
+        arrival_profiles=(
+            _demand(20, ('L4',), 1),
+            _demand(50, ('L4',), 1, sequence=1),
+        ))
+
+    assert result.incremental_arrival_work == pytest.approx(0)
+    assert result.withheld_arrival_work == pytest.approx(2)
+    assert result.ambiguous_fixed_arrival_work == pytest.approx(2)
+    assert result.ambiguous_fixed_shelter_accelerators == ('L4',)
+    assert _profile_work(result) == {}
 
 
 def test_demand_observation_reconciliation_keeps_immutable_classes_distinct(
@@ -139,6 +159,7 @@ def test_demand_observation_reconciliation_keeps_immutable_classes_distinct(
 
     assert result.incremental_arrival_work == pytest.approx(1)
     assert result.withheld_arrival_work == pytest.approx(0)
+    assert result.ambiguous_fixed_shelter_accelerators == ()
     assert result.ambiguous_fixed_arrival_work == pytest.approx(0)
     assert _profile_work(result) == {
         (50, ('A100', 'L4')): 0.5,
@@ -169,13 +190,37 @@ def test_demand_observation_reconciliation_does_not_guess_flexible_identity(
             _demand(50, ('A100', 'H200'), 1, sequence=1),
         ))
 
-    # The fixed A100 request could belong to either flexible class.  Choosing
-    # one would change whether L4 or H200 gains paid authority.  Both arrival
-    # observations therefore remain shelter-only until queue/rejection
-    # telemetry supplies the immutable class identity.
+    # Choosing either original class would invent identity and paid economics.
+    # Both remain provider-ineligible until queue/rejection evidence arrives.
     assert result.incremental_arrival_work == pytest.approx(0)
     assert result.withheld_arrival_work == pytest.approx(2)
     assert result.ambiguous_fixed_arrival_work == pytest.approx(2)
+    assert result.ambiguous_fixed_shelter_accelerators == (
+        'A100',
+        'H200',
+        'L4',
+    )
+    assert _profile_work(result) == {}
+
+
+def test_demand_observation_reconciliation_withholds_tail_without_safe_card(
+) -> None:
+    result = capacity_planning.reconcile_demand_observations(
+        primary_profiles=(),
+        fixed_work=_work(A=1, B=1),
+        arrival_profiles=(
+            _demand(50, ('A', 'C'), 1),
+            _demand(50, ('B', 'D'), 1, sequence=1),
+            _demand(50, ('A', 'B'), 1, sequence=2),
+        ))
+
+    # The component has one guaranteed new request, but no accelerator common
+    # to every possible owning class. It may shelter compatible existing cards
+    # but cannot authorize a provider choice.
+    assert result.incremental_arrival_work == pytest.approx(0)
+    assert result.withheld_arrival_work == pytest.approx(3)
+    assert result.ambiguous_fixed_arrival_work == pytest.approx(3)
+    assert result.ambiguous_fixed_shelter_accelerators == ('A', 'B', 'C', 'D')
     assert _profile_work(result) == {}
 
 
