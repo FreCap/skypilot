@@ -36,7 +36,6 @@ from sky import exceptions
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.serve import autoscalers
 from sky.serve import capacity_admission
-from sky.serve import capacity_planning
 from sky.serve import compatibility_matching
 from sky.serve import constants
 from sky.serve import ordinary_launch_binding
@@ -6686,6 +6685,7 @@ class TestQueryFreeSlots(unittest.TestCase):
             service_version=1,
             demand_source_epoch=1,
             demand_feed_generation=1,
+            observed_demand_feed_generation=1,
             route_generation=1,
             route_sha256='a' * 64,
             route_source_epoch=1,

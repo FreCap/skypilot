@@ -5,6 +5,7 @@ import math
 import typing
 
 from sky.serve import compatibility_matching
+from sky.serve import constants
 
 if typing.TYPE_CHECKING:
     from sky.serve import replica_managers
@@ -431,9 +432,12 @@ def _plan_compatibility_target(
         for card in configured_cards
     }
     ownership_supported = True
-    fixed_priority = max((priority for priority, _, work in demand_profiles
-                          if work > demand_epsilon),
-                         default=0)
+    # Fixed work has lost its originating request priority. It must not inherit
+    # the maximum priority of an unrelated queued/rejected class: that would
+    # let existing work consume another request's strict-priority reservation
+    # entitlement. Copacked typed work may still raise the resulting slot's
+    # priority through consume_owned_slot().
+    fixed_priority = constants.LB_REQUEST_PRIORITY_MIN
     owned_slots: list[_DemandOwnedSlot] = []
 
     def add_slot(card: str) -> _DemandOwnedSlot:

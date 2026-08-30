@@ -317,13 +317,26 @@ def test_validate_report_rejects_partial_queue_deadline_buckets():
         demand_state._validate_report(report)
 
 
-def test_validate_report_never_promotes_saturated_offered_arrivals():
+def test_validate_report_preserves_complete_saturated_offered_arrivals():
     report = copy.deepcopy(_report())
     report['offered_arrival_tracking_saturated'] = True
 
-    _, _, complete = demand_state._validate_report(report)
+    normalized, _, complete = demand_state._validate_report(report)
+
+    assert complete is True
+    assert normalized['offered_arrival_tracking_saturated'] is True
+
+
+def test_validate_report_saturation_does_not_hide_partial_compatibility():
+    report = copy.deepcopy(_report())
+    report['offered_arrival_tracking_saturated'] = True
+    report['demand_window']['compatibility_complete'] = False
+    report['demand_window']['buckets'][0]['compatibility_profiles'] = []
+
+    normalized, _, complete = demand_state._validate_report(report)
 
     assert complete is False
+    assert normalized['offered_arrival_tracking_saturated'] is True
 
 
 def test_validate_report_rejects_incomplete_profiles_claimed_complete():

@@ -585,12 +585,15 @@ def _validate_report(raw: Any) -> tuple[dict[str, Any], str, bool]:
     if not isinstance(offered_saturated, bool):
         raise DemandReportError(
             'offered_arrival_tracking_saturated must be boolean.')
+    # Saturation bounds the offered-arrival magnitude; it does not make exact
+    # compatibility profiles incomplete.  Preserve the bit for the planner's
+    # conservative floor while continuing to fail closed on partial profiles.
     compatibility_complete = bool(
         compatibility_complete and
         queued_profile_count == counts['queue_depth'] and
         rejected_profile_count == counts['rejected_in_window'] and
         recent_rejected_profile_count == counts['rejected_in_recent_window'] and
-        complete_priority_totals and not offered_saturated)
+        complete_priority_totals)
 
     request_history = raw.get('request_history')
     if request_history is not None:
@@ -1603,6 +1606,8 @@ def get_autoscaling_snapshot(
         'queue_depth': queue_depth,
         'rejected_in_window': rejected,
         'recent_rejected_in_window': recent_rejected,
+        **optional_counts,
+        'offered_arrival_tracking_saturated': offered_arrival_tracking_saturated,
         'fresh_aggregate_zero': fresh_aggregate_zero,
         'queue_deadline_profiles_complete': deadline_profiles_complete,
         # Exclude translated event timestamps: receipt time corrects reporter

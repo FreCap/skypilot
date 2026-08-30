@@ -264,6 +264,154 @@ class CompatibilityDemand:
         object.__setattr__(self, 'work', float(self.work))
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class DemandObservationReconciliation:
+    """Conservative reconciliation of primary and arrival observations."""
+
+    reconciled_profiles: tuple[CompatibilityDemand, ...]
+    incremental_arrival_work: float
+    withheld_arrival_work: float
+    ambiguous_fixed_arrival_work: float
+    ambiguous_fixed_shelter_accelerators: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.reconciled_profiles, tuple) or
+                any(not isinstance(item, CompatibilityDemand)
+                    for item in self.reconciled_profiles) or
+                len({item.sequence for item in self.reconciled_profiles
+                    }) != len(self.reconciled_profiles)):
+            raise ValueError('Reconciled demand profiles are malformed.')
+        for field in ('incremental_arrival_work', 'withheld_arrival_work',
+                      'ambiguous_fixed_arrival_work'):
+            value = getattr(self, field)
+            if (not isinstance(value,
+                               (int, float)) or isinstance(value, bool) or
+                    not math.isfinite(float(value)) or value < 0):
+                raise ValueError('Demand observation reconciliation is '
+                                 'malformed.')
+            object.__setattr__(self, field, float(value))
+        raw_shelter = self.ambiguous_fixed_shelter_accelerators
+        if (not isinstance(raw_shelter, tuple) or any(
+                not isinstance(card, str) or not card for card in raw_shelter)):
+            raise ValueError('Demand observation shelter is malformed.')
+        shelter = tuple(
+            sorted({card.casefold(): card for card in raw_shelter}.values(),
+                   key=str.casefold))
+        object.__setattr__(self, 'ambiguous_fixed_shelter_accelerators',
+                           shelter)
+
+
+def reconcile_demand_observations(
+    *,
+    primary_profiles: tuple[CompatibilityDemand, ...],
+    fixed_work: AcceleratorWork,
+    arrival_profiles: tuple[CompatibilityDemand, ...],
+) -> DemandObservationReconciliation:
+    """Reconcile measured arrivals without inventing compatibility authority.
+
+    The primary pressure and arrival sample are two observations of one stream.
+    A request's priority and compatibility attributes are immutable across its
+    arrival, queue, and rejection projections, so only an identical typed class
+    can overlap. Fixed in-flight work has lost those attributes. A residual
+    arrival that could describe fixed work is withheld from provider authority
+    instead of being assigned an invented identity. Its compatible cards may
+    shelter existing capacity until queue or rejection telemetry supplies a
+    current authoritative class.
+
+    Runtime is linear in the classified profiles and bounded accelerator
+    catalog. Requests and profile pairs are never expanded.
+    """
+    if (not isinstance(primary_profiles, tuple) or
+            any(not isinstance(item, CompatibilityDemand)
+                for item in primary_profiles) or
+            not isinstance(arrival_profiles, tuple) or
+            any(not isinstance(item, CompatibilityDemand)
+                for item in arrival_profiles) or
+            not isinstance(fixed_work, AcceleratorWork)):
+        raise ValueError('Demand observations are malformed.')
+
+    names_by_folded: dict[str, set[str]] = {}
+    for profile in primary_profiles + arrival_profiles:
+        for card in profile.compatible_accelerators:
+            names_by_folded.setdefault(card.casefold(), set()).add(card)
+    for card, _ in fixed_work.entries:
+        names_by_folded.setdefault(card.casefold(), set()).add(card)
+    if len(names_by_folded) > 8:
+        raise ValueError('Demand observations exceed the eight-card catalog.')
+    canonical = {folded: min(names) for folded, names in names_by_folded.items()}
+
+    def compatibility(profile: CompatibilityDemand) -> tuple[str, ...]:
+        return tuple(canonical[card.casefold()]
+                     for card in sorted(profile.compatible_accelerators,
+                                        key=str.casefold))
+
+    def aggregate(
+        profiles: tuple[CompatibilityDemand, ...]
+    ) -> dict[tuple[int, tuple[str, ...]], float]:
+        values_by_class: dict[tuple[int, tuple[str, ...]], list[float]] = {}
+        for profile in profiles:
+            if profile.work <= 0:
+                continue
+            profile_cards = compatibility(profile)
+            key = profile.priority, profile_cards
+            values_by_class.setdefault(key, []).append(profile.work)
+        return {
+            key: math.fsum(sorted(values))
+            for key, values in values_by_class.items()
+        }
+
+    primary = aggregate(primary_profiles)
+    arrivals = aggregate(arrival_profiles)
+
+    def class_key(
+        item: tuple[tuple[int, tuple[str, ...]], float]
+    ) -> tuple[int, int, tuple[str, ...]]:
+        (priority, compatible), _ = item
+        return -priority, len(compatible), tuple(map(str.casefold, compatible))
+
+    fixed_cards = {
+        canonical[card.casefold()]
+        for card, work in fixed_work.entries
+        if work > 1e-12
+    }
+    reconciled = dict(primary)
+    incremental_arrival_work = 0.0
+    ambiguous_fixed_arrival_work = 0.0
+    ambiguous_shelter_cards: set[str] = set()
+    for key, work in sorted(arrivals.items(), key=class_key):
+        exact_overlap = min(work, primary.get(key, 0.0))
+        residual = work - exact_overlap
+        if residual <= 1e-12:
+            continue
+        _, compatible = key
+        if fixed_cards.intersection(compatible):
+            ambiguous_fixed_arrival_work += residual
+            ambiguous_shelter_cards.update(compatible)
+            continue
+        reconciled[key] = math.fsum((reconciled.get(key, 0.0), residual))
+        incremental_arrival_work += residual
+
+    total_arrival_work = math.fsum(arrivals.values())
+    withheld_arrival_work = max(0.0,
+                                total_arrival_work - incremental_arrival_work)
+
+    ordered_profiles = sorted(reconciled.items(), key=class_key)
+    profiles = tuple(
+        CompatibilityDemand(sequence=sequence,
+                            priority=priority,
+                            compatible_accelerators=compatible,
+                            work=work)
+        for sequence, ((priority, compatible),
+                       work) in enumerate(ordered_profiles))
+    return DemandObservationReconciliation(
+        reconciled_profiles=profiles,
+        incremental_arrival_work=max(0.0, incremental_arrival_work),
+        withheld_arrival_work=max(0.0, withheld_arrival_work),
+        ambiguous_fixed_arrival_work=max(0.0, ambiguous_fixed_arrival_work),
+        ambiguous_fixed_shelter_accelerators=tuple(
+            sorted(ambiguous_shelter_cards, key=str.casefold)))
+
+
 class ActuationSupplyPolicy(enum.Enum):
     """Which finite supply the local actuation projection may reuse."""
 
