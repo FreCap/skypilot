@@ -407,6 +407,11 @@ class TestOrphanFillRowDebitPG(sqlite_suite.TestOrphanFillRowDebit):
     pass
 
 
+class TestConnectionLocalPaidAdmissionPG(
+        sqlite_suite.TestConnectionLocalPaidAdmission):
+    pass
+
+
 class TestReplicaSnapshotDebitPG(sqlite_suite.TestReplicaSnapshotDebit):
     pass
 
