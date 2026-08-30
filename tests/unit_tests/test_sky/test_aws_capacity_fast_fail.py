@@ -329,8 +329,8 @@ def test_create_instances_tags_all_resources_and_reserves_managed_marker():
 def test_instance_request_helpers_keep_instance_facade():
     assert (aws_instance._create_instances
             is not instance_requests.create_instances)
-    assert (aws_instance._is_single_zone_request is
-            instance_requests._is_single_zone_request)
+    assert (aws_instance._is_single_zone_request
+            is instance_requests._is_single_zone_request)
 
 
 @pytest.mark.parametrize('name',
@@ -423,6 +423,124 @@ def test_run_instances_passes_single_zone_signal(monkeypatch):
     # Successful launches retain only the existing post-create EC2/STS
     # identity capture; negative-ack identity/subnet reads are lazy.
     assert request_session.client_calls == ['ec2', 'sts']
+
+
+def _fresh_instance_ec2(create_tags):
+    created = SimpleNamespace(id='i-fresh',
+                              tags=[],
+                              placement={'AvailabilityZone': 'us-east-1a'})
+    ec2 = _RunInstancesEC2(lambda **_: [created])
+    ec2.meta.client.create_tags = create_tags
+    return ec2
+
+
+def test_fresh_instance_node_tag_retries_eventual_not_found(monkeypatch):
+    calls = []
+    sleeps = []
+
+    def _create_tags(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise _client_error('InvalidInstanceID.NotFound',
+                                operation_name='CreateTags')
+
+    ec2 = _fresh_instance_ec2(_create_tags)
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+    monkeypatch.setattr(instance_requests.time, 'sleep', sleeps.append)
+
+    record = aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                        _run_config())
+
+    assert record.created_instance_ids == ['i-fresh']
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert len(sleeps) == 1
+    assert sleeps[0] > 0
+
+
+def test_fresh_instance_node_tag_does_not_retry_other_client_error(monkeypatch):
+    calls = 0
+
+    def _create_tags(**kwargs):
+        nonlocal calls
+        del kwargs
+        calls += 1
+        raise _client_error('UnauthorizedOperation',
+                            operation_name='CreateTags')
+
+    ec2 = _fresh_instance_ec2(_create_tags)
+    _install_run_instances_fakes(monkeypatch, ec2, session=_RequestSession())
+    monkeypatch.setattr(
+        instance_requests.time, 'sleep',
+        lambda _: pytest.fail('Non-eventual-consistency errors must not retry'))
+
+    with pytest.raises(botocore.exceptions.ClientError) as exc_info:
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                   _run_config())
+
+    assert exc_info.value.response['Error']['Code'] == 'UnauthorizedOperation'
+    assert calls == 1
+
+
+def test_existing_instance_node_tag_does_not_use_fresh_visibility_retry(
+        monkeypatch):
+    calls = 0
+
+    def _create_tags(**kwargs):
+        nonlocal calls
+        del kwargs
+        calls += 1
+        raise _client_error('InvalidInstanceID.NotFound',
+                            operation_name='CreateTags')
+
+    existing = SimpleNamespace(id='i-existing',
+                               state={'Name': 'pending'},
+                               tags=[],
+                               placement={'AvailabilityZone': 'us-east-1a'})
+    ec2 = _RunInstancesEC2(
+        lambda **_: pytest.fail('No fresh instance should be requested.'),
+        initial_instances=[existing])
+    ec2.meta.client.create_tags = _create_tags
+    _install_run_instances_fakes(monkeypatch, ec2, session=_RequestSession())
+    monkeypatch.setattr(
+        instance_requests.time, 'sleep',
+        lambda _: pytest.fail('Existing instances must not use this retry'))
+
+    with pytest.raises(botocore.exceptions.ClientError) as exc_info:
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                   _run_config())
+
+    assert exc_info.value.response['Error']['Code'] == (
+        'InvalidInstanceID.NotFound')
+    assert calls == 1
+
+
+def test_fresh_instance_node_tag_eventual_not_found_retry_is_bounded(
+        monkeypatch):
+    calls = 0
+    sleeps = []
+
+    def _create_tags(**kwargs):
+        nonlocal calls
+        del kwargs
+        calls += 1
+        raise _client_error('InvalidInstanceID.NotFound',
+                            operation_name='CreateTags')
+
+    ec2 = _fresh_instance_ec2(_create_tags)
+    _install_run_instances_fakes(monkeypatch, ec2, session=_RequestSession())
+    monkeypatch.setattr(instance_requests.time, 'sleep', sleeps.append)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                   _run_config())
+
+    assert calls == aws_instance._FRESH_INSTANCE_TAG_MAX_ATTEMPTS
+    assert len(sleeps) == calls - 1
+    assert isinstance(exc_info.value.__cause__, botocore.exceptions.ClientError)
+    assert exc_info.value.__cause__.response['Error']['Code'] == (
+        'InvalidInstanceID.NotFound')
 
 
 def test_fresh_spot_rejection_attaches_complete_provider_negative_ack(
