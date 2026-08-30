@@ -134,6 +134,18 @@ def _paid_authority(residual=None, launch=None, **identity):
                                  remaining_launch_capacity=lambda: dict(launch))
 
 
+def _paid_launch_version_authority(
+) -> controller.paid_capacity.PaidLaunchVersionAuthority:
+    service_spec = b'immutable-service-spec'
+    controller_config = b'active_workspace: default\n'
+    return controller.paid_capacity.PaidLaunchVersionAuthority(
+        service_spec=service_spec,
+        service_spec_sha256=hashlib.sha256(service_spec).hexdigest(),
+        controller_config=controller_config,
+        controller_config_digest=hashlib.sha256(controller_config).hexdigest(),
+        controller_config_snapshot_id='c' * 64)
+
+
 def test_logical_capacity_target_has_one_internal_representation():
     forbidden_markers = (
         'LogicalTargetState =',
@@ -4978,6 +4990,7 @@ class TestAutoscalerRuntimeSnapshot:
     def test_paid_spec_preparation_is_card_fair_and_resolves_aws_first(self):
         ctrl = _make_controller()
         call_order = []
+        authority = _paid_launch_version_authority()
         manager = mock.Mock()
         manager.spot_placer.ranked_active_locations.return_value = [object()]
         manager.workspace = 'default'
@@ -4992,6 +5005,7 @@ class TestAutoscalerRuntimeSnapshot:
                 'H200': 170,
             }
             assert tuple(kwargs['occupied_replica_ids']) == (7, 9)
+            assert kwargs['version_authority'] == authority
             return ()
 
         manager.prepare_paid_launch_specs.side_effect = _prepare
@@ -5010,17 +5024,24 @@ class TestAutoscalerRuntimeSnapshot:
             call_order.append('resolve')
             return '210987654321'
 
-        with mock.patch.object(controller.paid_capacity,
-                               'resolve_aws_account_id_for_locations',
-                               side_effect=_resolve) as resolve:
+        with mock.patch.object(
+                controller.serve_state,
+                'get_paid_launch_version_authority',
+                return_value=authority) as get_authority, mock.patch.object(
+                    controller.serve_utils,
+                    'parse_and_validate_version_controller_config'
+                ), mock.patch.object(controller.paid_capacity,
+                                     'resolve_aws_account_id_for_locations',
+                                     side_effect=_resolve) as resolve:
             prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
-                scaler, [
+                scaler, 1, [
                     types.SimpleNamespace(replica_id=7),
                     types.SimpleNamespace(replica_id=9)
                 ], None)
 
         assert prepared == ()
         assert call_order == ['resolve', 'prepare']
+        get_authority.assert_called_once_with('svc', 1)
         resolve.assert_called_once()
 
     def test_paid_spec_preparation_converts_logical_and_physical_caps(self):
@@ -5029,13 +5050,20 @@ class TestAutoscalerRuntimeSnapshot:
         manager.spot_placer = None
         manager.prepare_paid_launch_specs.return_value = ()
         ctrl._replica_manager = manager  # pylint: disable=protected-access
+        authority = _paid_launch_version_authority()
         scaler = types.SimpleNamespace(
             max_replicas=100,
             backend_num_nodes=2,
             configured_accelerator_shapes={'A100': 8})
 
-        prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
-            scaler, [], 120)
+        with mock.patch.object(
+                controller.serve_state,
+                'get_paid_launch_version_authority',
+                return_value=authority), mock.patch.object(
+                    controller.serve_utils,
+                    'parse_and_validate_version_controller_config'):
+            prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
+                scaler, 1, [], 120)
 
         assert prepared == ()
         manager.prepare_paid_launch_specs.assert_called_once_with(
@@ -5043,6 +5071,7 @@ class TestAutoscalerRuntimeSnapshot:
             max_gpu_units_by_accelerator={'A100': 112},
             max_candidates=7,
             occupied_replica_ids=mock.ANY,
+            version_authority=authority,
             aws_account_id=None)
         assert tuple(manager.prepare_paid_launch_specs.call_args.
                      kwargs['occupied_replica_ids']) == ()
@@ -5055,21 +5084,63 @@ class TestAutoscalerRuntimeSnapshot:
         manager.workspace = 'default'
         manager.prepare_paid_launch_specs.return_value = ()
         ctrl._replica_manager = manager  # pylint: disable=protected-access
+        authority = _paid_launch_version_authority()
         scaler = types.SimpleNamespace(max_replicas=10,
                                        backend_num_nodes=1,
                                        configured_accelerator_shapes={'L4': 1})
 
-        with mock.patch.object(controller.paid_capacity,
-                               'resolve_aws_account_id_for_locations',
-                               side_effect=ValueError('AWS session expired')):
+        with mock.patch.object(
+                controller.serve_state,
+                'get_paid_launch_version_authority',
+                return_value=authority), mock.patch.object(
+                    controller.serve_utils,
+                    'parse_and_validate_version_controller_config'
+                ), mock.patch.object(
+                    controller.paid_capacity,
+                    'resolve_aws_account_id_for_locations',
+                    side_effect=ValueError('AWS session expired')):
             prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
-                scaler, [], None)
+                scaler, 1, [], None)
 
         assert prepared == ()
         manager.prepare_paid_launch_specs.assert_called_once()
         assert (
             manager.prepare_paid_launch_specs.call_args.kwargs['aws_account_id']
             is None)
+        assert (manager.prepare_paid_launch_specs.call_args.
+                kwargs['version_authority'] == authority)
+
+    @pytest.mark.parametrize('corrupt', [False, True])
+    def test_paid_spec_preparation_requires_immutable_version_authority(
+            self, corrupt):
+        ctrl = _make_controller()
+        manager = mock.Mock()
+        manager.spot_placer.ranked_active_locations.return_value = [object()]
+        manager.workspace = 'default'
+        ctrl._replica_manager = manager  # pylint: disable=protected-access
+        scaler = types.SimpleNamespace(max_replicas=10,
+                                       backend_num_nodes=1,
+                                       configured_accelerator_shapes={'L4': 1})
+        authority_read = (
+            serve_state.ControllerConfigCorruptionError('corrupt authority')
+            if corrupt else None)
+        patch_kwargs = ({
+            'side_effect': authority_read
+        } if corrupt else {
+            'return_value': None
+        })
+
+        with mock.patch.object(
+                controller.serve_state, 'get_paid_launch_version_authority',
+                **patch_kwargs), mock.patch.object(
+                    controller.paid_capacity,
+                    'resolve_aws_account_id_for_locations') as resolve:
+            prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
+                scaler, 1, [], None)
+
+        assert prepared == ()
+        resolve.assert_not_called()
+        manager.prepare_paid_launch_specs.assert_not_called()
 
     def test_locked_supply_translation_preserves_retiring_paid_capacity(self):
         projection = self._reserved_supply_projection(existing_paid={'L4': 7})

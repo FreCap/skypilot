@@ -22,10 +22,12 @@ import copy
 import dataclasses
 import datetime
 import functools
+import hashlib
 import json
 import logging
 import math
 import os
+import pickle
 import queue
 import threading
 import time
@@ -1832,14 +1834,46 @@ def _provider_free_paid_manager(next_replica_id=1):
         binding_epoch=2,
         generic=True)
     manager.yaml_content = 'resources: {}'
-    manager._version_specs = {1: mock.Mock()}
+    manager._version_specs = {
+        1: service_spec.SkyServiceSpec(readiness_path='/health',
+                                       initial_delay_seconds=0,
+                                       readiness_timeout_seconds=5,
+                                       endpoint_probe_interval_seconds=1,
+                                       lb_stream_timeout_seconds=10,
+                                       min_replicas=0,
+                                       max_replicas=100,
+                                       target_concurrency_per_replica=1,
+                                       spot_placer='dynamic_fallback')
+    }
     cheap = make_location('us-central1-a', {'L4': 1}, cloud_name='GCP')
     expensive = make_location('us-central1-b', {'L4': 1}, cloud_name='GCP')
     cheap.instance_type = 'g2-standard-4'
     expensive.instance_type = 'g2-standard-8'
-    manager._spot_placer = make_placer({cheap: 0.1, expensive: 0.2})
-    manager._spot_placer.num_nodes = 1
+    _set_paid_placer(manager, {cheap: 0.1, expensive: 0.2})
     return manager, cheap, expensive
+
+
+def _set_paid_placer(manager, costs, *, num_nodes=1):
+    placer = make_placer(costs)
+    placer.num_nodes = num_nodes
+    placer.placement_catalog = dataclasses.replace(placer.placement_catalog,
+                                                   num_nodes=num_nodes)
+    placer._ranked_catalog_entries = (  # pylint: disable=protected-access
+        placer.placement_catalog.ranked_entries(placer._placement_contract))
+    manager._spot_placer = placer
+
+
+def _paid_version_authority(
+        manager) -> paid_capacity.PaidLaunchVersionAuthority:
+    serialized_spec = pickle.dumps(manager._version_specs[1], protocol=4)
+    controller_config = serve_utils.sanitize_ha_recovery_config_bytes(
+        b'active_workspace: default\n')
+    return paid_capacity.PaidLaunchVersionAuthority(
+        service_spec=serialized_spec,
+        service_spec_sha256=hashlib.sha256(serialized_spec).hexdigest(),
+        controller_config=controller_config,
+        controller_config_digest=hashlib.sha256(controller_config).hexdigest(),
+        controller_config_snapshot_id='c' * 64)
 
 
 def test_prepare_paid_launch_specs_is_bounded_cost_ordered_and_io_free():
@@ -1864,7 +1898,8 @@ def test_prepare_paid_launch_specs_is_bounded_cost_ordered_and_io_free():
             accelerator_shapes={'L4': 1},
             max_gpu_units_by_accelerator={'l4': 6},
             max_candidates=10,
-            occupied_replica_ids={1})
+            occupied_replica_ids={1},
+            version_authority=_paid_version_authority(manager))
 
     assert len(specs) == 6
     assert [spec.replica_id for spec in specs] == [2, 3, 4, 5, 6, 7]
@@ -1889,8 +1924,7 @@ def test_prepare_paid_launch_specs_honors_multinode_physical_cap():
     manager, _, _ = _provider_free_paid_manager()
     location = make_location('us-central1-a', {'A100': 8}, cloud_name='GCP')
     location.instance_type = 'a2-highgpu-8g'
-    manager._spot_placer = make_placer({location: 1.0})
-    manager._spot_placer.num_nodes = 2
+    _set_paid_placer(manager, {location: 1.0}, num_nodes=2)
 
     with mock.patch.object(manager,
                            '_task_template_for_version',
@@ -1905,7 +1939,8 @@ def test_prepare_paid_launch_specs_honors_multinode_physical_cap():
             accelerator_shapes={'A100': 8},
             max_gpu_units_by_accelerator={'A100': 120},
             max_candidates=13,
-            occupied_replica_ids=())
+            occupied_replica_ids=(),
+            version_authority=_paid_version_authority(manager))
 
     assert len(specs) == 7
     assert all(
@@ -1916,8 +1951,7 @@ def test_prepare_paid_launch_specs_freezes_resolved_aws_account():
     manager, _, _ = _provider_free_paid_manager()
     aws = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     aws.instance_type = 'g6.xlarge'
-    manager._spot_placer = make_placer({aws: 0.1})
-    manager._spot_placer.num_nodes = 1
+    _set_paid_placer(manager, {aws: 0.1})
 
     with mock.patch.object(manager,
                            '_task_template_for_version',
@@ -1933,6 +1967,7 @@ def test_prepare_paid_launch_specs_freezes_resolved_aws_account():
             max_gpu_units_by_accelerator={'L4': 1},
             max_candidates=1,
             occupied_replica_ids=(),
+            version_authority=_paid_version_authority(manager),
             aws_account_id='210987654321')
 
     assert len(specs) == 1
@@ -1947,8 +1982,7 @@ def test_prepare_paid_launch_specs_without_aws_identity_keeps_gcp():
     manager, gcp, _ = _provider_free_paid_manager()
     aws = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     aws.instance_type = 'g6.xlarge'
-    manager._spot_placer = make_placer({aws: 0.1, gcp: 0.2})
-    manager._spot_placer.num_nodes = 1
+    _set_paid_placer(manager, {aws: 0.1, gcp: 0.2})
     account_scoped_pool_key = paid_capacity.pool_key
 
     def _pool_key_without_aws_identity(location, **kwargs):
@@ -1974,6 +2008,7 @@ def test_prepare_paid_launch_specs_without_aws_identity_keeps_gcp():
             max_gpu_units_by_accelerator={'L4': 2},
             max_candidates=2,
             occupied_replica_ids=(),
+            version_authority=_paid_version_authority(manager),
             aws_account_id=None)
 
     assert len(specs) == 2
@@ -1997,7 +2032,8 @@ def test_materialize_paid_launch_receipt_builds_only_sparse_members():
             accelerator_shapes={'l4': 1},
             max_gpu_units_by_accelerator={'l4': 2},
             max_candidates=2,
-            occupied_replica_ids=())
+            occupied_replica_ids=(),
+            version_authority=_paid_version_authority(manager))
     selected = specs[1]
     member = paid_capacity.PaidLaunchReceiptMember(
         replica_id=selected.replica_id,

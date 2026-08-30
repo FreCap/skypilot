@@ -4,6 +4,7 @@
 import copy
 import dataclasses
 import datetime
+import hashlib
 import json
 import math
 import pickle
@@ -43,7 +44,9 @@ from sky.serve import route_projection
 from sky.serve import route_projection_schema
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
+from sky.serve import serve_utils
 from sky.serve import service_spec
+from sky.serve import spot_placer
 from sky.serve import zero_cost_actuation_schema
 from sky.server.requests import postgres as request_postgres
 from sky.utils import common_utils
@@ -53,6 +56,15 @@ pytestmark = pytest.mark.xdist_group(
     name='serve_capacity_admission_schema_052_pg')
 
 _URL = 'http://replica:8000'
+_PAID_LAUNCH_YAML = 'resources: {}\n'
+_PAID_CONTROLLER_CONFIG_SOURCE = b'''\
+active_workspace: workspace-a
+workspaces:
+  workspace-a:
+    gcp:
+      project_id: test-project
+'''
+_PAID_CONTROLLER_CONFIG_SNAPSHOT_ID = 'c' * 64
 _CAPACITY_KUEUE_PROJECTION = {
     'projection_version':
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION,
@@ -99,6 +111,61 @@ _CAPACITY_EAST_PROJECTION_SHA256 = (
     kubernetes_identity.worker_projection_sha256(_CAPACITY_EAST_PROJECTION))
 
 
+def _paid_controller_config_snapshot() -> tuple[bytes, str, str]:
+    config = serve_utils.sanitize_ha_recovery_config_bytes(
+        _PAID_CONTROLLER_CONFIG_SOURCE)
+    return (config, hashlib.sha256(config).hexdigest(),
+            _PAID_CONTROLLER_CONFIG_SNAPSHOT_ID)
+
+
+def _paid_location(accelerator_count: int = 1) -> spot_placer.Location:
+    location = make_location('us-central1', {'L4': accelerator_count},
+                             cloud_name='GCP',
+                             instance_type=f'test-l4-{accelerator_count}')
+    # The catalog must preserve a region-independent image key as Python None;
+    # JSON's string "null" would change the exact launch authority.
+    location.image_id = {None: 'skypilot:test-regionless-image'}
+    return location
+
+
+def _paid_placement_catalog(num_nodes: int = 1) -> dict:
+    entries = [(_paid_location(1), 0.10), (_paid_location(8), 0.80)]
+    entries.sort(key=lambda item: item[0].sort_key())
+    return spot_placer.PlacementCatalog(tuple(entries),
+                                        num_nodes=num_nodes).to_dict()
+
+
+def _current_owner_kwargs(
+    engine: sqlalchemy.engine.Engine,) -> dict[str, object]:
+    """Return the exact mandatory controller fence for one test call."""
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.services_table.c.controller_incarnation,
+                serve_state_schema.services_table.c.controller_owner_epoch).
+            where(serve_state_schema.services_table.c.name == 'svc')).one()
+    return {
+        'expected_controller_incarnation': row[0],
+        'expected_controller_owner_epoch': row[1],
+    }
+
+
+def _paid_write_counts(
+    engine: sqlalchemy.engine.Engine,) -> tuple[int, int, int, int]:
+    """Count every durable row a fused paid admission may create."""
+    tables = (
+        capacity_admission_schema.serve_capacity_plans_table,
+        capacity_admission_schema.serve_capacity_plan_heads_table,
+        serve_state_schema.paid_capacity_claims_table,
+        serve_state_schema.replicas_table,
+    )
+    with engine.connect() as connection:
+        return tuple(
+            connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    table)).scalar_one() for table in tables)
+
+
 def _capacity_service_spec(
     reserved_fill_enabled: bool,
     *,
@@ -119,7 +186,7 @@ def _capacity_service_spec(
         max_replicas=max_replicas,
         target_concurrency_per_replica=1,
         spot_placer=('dynamic_fallback_per_gpu'
-                     if replica_unit == 'logical' else None),
+                     if replica_unit == 'logical' else 'dynamic_fallback'),
         max_live_paid_gpu_units=max_live_paid_gpu_units,
         graceful_drain_async_occupancy=(True
                                         if replica_unit == 'logical' else None),
@@ -285,6 +352,7 @@ def capacity_database(empty_postgres, monkeypatch):
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
     incarnation = uuid.uuid4()
+    controller_config = _paid_controller_config_snapshot()
     with empty_postgres.begin() as connection:
         connection.execute(
             sqlalchemy.insert(
@@ -296,6 +364,7 @@ def capacity_database(empty_postgres, monkeypatch):
                 workspace='workspace-a',
                 status='READY',
                 hash='svc-hash',
+                resource_scope='svc-hash',
                 current_version=1,
                 active_versions='[1]',
                 pool=0,
@@ -312,7 +381,11 @@ def capacity_database(empty_postgres, monkeypatch):
                 service_name='svc',
                 version=1,
                 spec=pickle.dumps(_capacity_service_spec(False), protocol=4),
-                yaml_content='service: {}\n'))
+                yaml_content=_PAID_LAUNCH_YAML,
+                placement_catalog=_paid_placement_catalog(),
+                controller_config=controller_config[0],
+                controller_config_digest=controller_config[1],
+                controller_config_snapshot_id=controller_config[2]))
         ordinary_launch_binding.promote_non_pool_launch_service_in_connection(
             connection,
             service_name='svc',
@@ -507,6 +580,7 @@ def _plan_and_admit_target(
     """Commit a simple target through the sole production plan writer."""
     return capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
             service_name='svc',
             service_hash='svc-hash',
             service_lifecycle_epoch=3,
@@ -787,6 +861,7 @@ def _paid_pool_key(accelerator: str = 'L4',
 
 
 def _paid_launch_spec(
+    engine: sqlalchemy.engine.Engine,
     ordinal: int,
     replica_id: int,
     *,
@@ -796,21 +871,52 @@ def _paid_launch_spec(
     planned_capacity: int = 1,
 ) -> paid_capacity.PaidLaunchSpec:
     """Build one deeply immutable, provider-free paid launch candidate."""
-    instance_type = f'test-{accelerator.casefold()}-{accelerator_count}'
-    location = make_location('us-central1', {accelerator: accelerator_count},
-                             cloud_name='GCP',
-                             instance_type=instance_type)
+    assert accelerator.casefold() == 'l4'
+    with engine.connect() as connection:
+        version_row = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.version_specs_table.c.spec,
+                serve_state_schema.version_specs_table.c.yaml_content,
+                serve_state_schema.version_specs_table.c.placement_catalog,
+                serve_state_schema.version_specs_table.c.controller_config,
+                serve_state_schema.version_specs_table.c.
+                controller_config_digest, serve_state_schema.
+                version_specs_table.c.controller_config_snapshot_id).
+            where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1)).one()
+    serialized_spec = version_row[0]
+    controller_config = version_row[3]
+    if isinstance(serialized_spec, memoryview):
+        serialized_spec = serialized_spec.tobytes()
+    if isinstance(controller_config, memoryview):
+        controller_config = controller_config.tobytes()
+    assert isinstance(serialized_spec, bytes)
+    assert isinstance(controller_config, bytes)
+    placement_catalog = version_row[2]
+    assert isinstance(placement_catalog, dict)
+    persisted_spec = pickle.loads(serialized_spec)
+    catalog = spot_placer.PlacementCatalog.from_dict(placement_catalog)
+    catalog_entry = next(
+        entry
+        for entry in catalog.ranked_entries(persisted_spec.placement_contract)
+        if entry.location.instance_type == f'test-l4-{accelerator_count}')
+    location = catalog_entry.location
+    instance_type = location.instance_type
+    assert instance_type is not None
     exact_pool_key = paid_capacity.pool_key(location,
                                             workspace='workspace-a',
                                             num_nodes=num_nodes)
-    info = replica_managers.ReplicaInfo(replica_id=replica_id,
-                                        cluster_name=f'svc-{replica_id}',
-                                        replica_port='8000',
-                                        is_spot=True,
-                                        location=location,
-                                        version=1,
-                                        resources_override=location.to_dict(),
-                                        planned_capacity=planned_capacity)
+    info = replica_managers.ReplicaInfo(
+        replica_id=replica_id,
+        cluster_name=(serve_utils.generate_replica_cluster_name(
+            'svc', replica_id, 'svc-hash')),
+        replica_port='8000',
+        is_spot=True,
+        location=location,
+        version=1,
+        resources_override=location.to_dict(),
+        planned_capacity=planned_capacity)
     info.replica_record_id = str(uuid.uuid4())
     info.created_at = None
     info.is_zero_cost = False
@@ -821,7 +927,15 @@ def _paid_launch_spec(
         info.to_storage_dict()['resources_override'])
     worker = paid_capacity.freeze_paid_launch_payload({
         'schema_version': 1,
-        'launch_yaml_content': 'resources: {}',
+        'launch_yaml_content': version_row[1],
+        'cluster_name': info.cluster_name,
+        'log_file_name': serve_utils.generate_replica_launch_log_file_name(
+            'svc', replica_id, 'svc-hash'),
+        'resources_override': json.loads(frozen_override),
+        'retry_until_up': False,
+        'frozen_controller_config_path':
+            (serve_utils.generate_versioned_config_yaml_file_name(
+                'svc', 1, 'svc-hash')),
     })
     card = accelerator.casefold()
     return paid_capacity.PaidLaunchSpec(
@@ -846,7 +960,19 @@ def _paid_launch_spec(
         accelerator=card,
         gpu_units_per_node=accelerator_count,
         num_nodes=num_nodes,
-        resources_override=frozen_override)
+        resources_override=frozen_override,
+        catalog_evidence=paid_capacity.PaidLaunchCatalogEvidence(
+            placement_catalog_sha256=(
+                paid_capacity.paid_launch_payload_sha256(placement_catalog)),
+            catalog_rank=catalog_entry.rank,
+            exploration_round=ordinal // paid_capacity.base_limit(),
+            slot_within_pool_window=ordinal % paid_capacity.base_limit(),
+            version_authority=paid_capacity.PaidLaunchVersionAuthority(
+                service_spec=serialized_spec,
+                service_spec_sha256=hashlib.sha256(serialized_spec).hexdigest(),
+                controller_config=controller_config,
+                controller_config_digest=version_row[4],
+                controller_config_snapshot_id=version_row[5])))
 
 
 def _replica_values(replica_id: int,
@@ -1390,7 +1516,8 @@ def _enable_durable_intent(engine,
                            max_replicas: int = 10,
                            replica_unit: str = 'physical_backend',
                            utilization_gate: bool = False,
-                           max_live_paid_gpu_units: int | None = None) -> None:
+                           max_live_paid_gpu_units: int | None = None,
+                           paid_backend_num_nodes: int = 1) -> None:
     with engine.begin() as connection:
         result = connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).where(
@@ -1410,7 +1537,9 @@ def _enable_durable_intent(engine,
                         replica_unit=replica_unit,
                         utilization_gate=utilization_gate,
                         max_live_paid_gpu_units=max_live_paid_gpu_units),
-                                      protocol=4)))
+                                      protocol=4),
+                    placement_catalog=_paid_placement_catalog(
+                        paid_backend_num_nodes)))
     assert result.rowcount == 1
 
 
@@ -1727,6 +1856,7 @@ def test_current_planner_uses_demand_committed_before_service_lock(
 
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
             service_name='svc',
             service_hash='svc-hash',
             service_lifecycle_epoch=3,
@@ -1749,10 +1879,13 @@ def test_current_planner_uses_demand_committed_before_service_lock(
 def test_current_planner_atomically_commits_sparse_multi_node_paid_wave(
         capacity_database, monkeypatch):
     engine, incarnation, _ = capacity_database
-    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           paid_backend_num_nodes=2)
     specs = tuple(
         _paid_launch_spec(
-            ordinal, 110 + ordinal, accelerator_count=8, num_nodes=2)
+            engine, ordinal, 110 + ordinal, accelerator_count=8, num_nodes=2)
         for ordinal in range(3))
     planner = mock.Mock(
         side_effect=lambda snapshot, supply: dataclasses.replace(
@@ -1764,7 +1897,8 @@ def test_current_planner_atomically_commits_sparse_multi_node_paid_wave(
             paid_launch_priority_by_accelerator={'l4': 73}))
 
     committed = capacity_admission.CapacityAdmissionRepository(
-        engine).plan_and_admit_current(service_name='svc',
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
                                        service_hash='svc-hash',
                                        service_lifecycle_epoch=3,
                                        service_version=1,
@@ -1808,6 +1942,190 @@ def test_current_planner_atomically_commits_sparse_multi_node_paid_wave(
                        committed.authority.content_sha256, 1)]
 
 
+def test_current_planner_commits_regionless_image_paid_authority(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    spec = _paid_launch_spec(engine, 0, 118)
+    stored_override = paid_capacity.thaw_paid_launch_payload(
+        spec.resources_override)
+    assert spot_placer.decode_resources_override(
+        stored_override)['image_id'] == {
+            None: 'skypilot:test-regionless-image'
+        }
+
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
+                                       service_hash='svc-hash',
+                                       service_lifecycle_epoch=3,
+                                       service_version=1,
+                                       accounting_cards={'l4': 1},
+                                       backend_num_nodes=1,
+                                       sequenced_reserved_fill=False,
+                                       planner=lambda snapshot, supply:
+                                       _current_decision(snapshot, supply, 1),
+                                       prepared_paid_launch_specs=(spec,))
+
+    assert [
+        member.replica_id for member in committed.paid_launch_receipt.members
+    ] == [118]
+    with engine.connect() as connection:
+        replica_state = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.replica_state).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id ==
+                    118)).scalar_one()
+    assert spot_placer.decode_resources_override(
+        replica_state['resources_override'])['image_id'] == {
+            None: 'skypilot:test-regionless-image'
+        }
+
+
+@pytest.mark.parametrize('mutation', [
+    'catalog',
+    'yaml',
+    'config',
+    'rank',
+    'round',
+    'slot',
+    'scope',
+])
+def test_current_planner_paid_authority_mutation_rolls_back_every_write(
+        capacity_database, mutation):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    spec = _paid_launch_spec(engine, 0, 119)
+    if mutation in ('rank', 'round', 'slot'):
+        changes = {
+            'rank': {
+                'catalog_rank': spec.catalog_evidence.catalog_rank + 1
+            },
+            'round': {
+                'exploration_round': 1
+            },
+            'slot': {
+                'slot_within_pool_window': 1
+            },
+        }[mutation]
+        spec = dataclasses.replace(spec,
+                                   catalog_evidence=dataclasses.replace(
+                                       spec.catalog_evidence, **changes))
+    else:
+        with engine.begin() as connection:
+            if mutation == 'scope':
+                connection.execute(
+                    sqlalchemy.update(serve_state_schema.services_table).where(
+                        serve_state_schema.services_table.c.name ==
+                        'svc').values(resource_scope='retired-scope'))
+            else:
+                versions = serve_state_schema.version_specs_table
+                if mutation == 'catalog':
+                    catalog = _paid_placement_catalog()
+                    catalog['entries'][0]['hourly_cost'] = 0.11
+                    values = {'placement_catalog': catalog}
+                elif mutation == 'yaml':
+                    values = {'yaml_content': 'resources:\n  disk_size: 20\n'}
+                else:
+                    config = serve_utils.sanitize_ha_recovery_config_bytes(
+                        _PAID_CONTROLLER_CONFIG_SOURCE +
+                        b'serve:\n  controller:\n    autostop: 31\n')
+                    values = {
+                        'controller_config': config,
+                        'controller_config_digest':
+                            hashlib.sha256(config).hexdigest(),
+                        'controller_config_snapshot_id': 'd' * 64,
+                    }
+                connection.execute(
+                    sqlalchemy.update(versions).where(
+                        versions.c.service_name == 'svc',
+                        versions.c.version == 1).values(**values))
+    before = _paid_write_counts(engine)
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(
+                **_current_owner_kwargs(engine),
+                service_name='svc',
+                service_hash='svc-hash',
+                service_lifecycle_epoch=3,
+                service_version=1,
+                accounting_cards={'l4': 1},
+                backend_num_nodes=1,
+                sequenced_reserved_fill=False,
+                planner=lambda snapshot, supply: _current_decision(
+                    snapshot, supply, 1),
+                prepared_paid_launch_specs=(spec,))
+
+    assert _paid_write_counts(engine) == before
+
+
+def test_current_planner_shutting_down_service_rolls_back_every_write(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    spec = _paid_launch_spec(engine, 0, 120)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    status='SHUTTING_DOWN'))
+    before = _paid_write_counts(engine)
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='no longer authorizes'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(
+                **_current_owner_kwargs(engine),
+                service_name='svc',
+                service_hash='svc-hash',
+                service_lifecycle_epoch=3,
+                service_version=1,
+                accounting_cards={'l4': 1},
+                backend_num_nodes=1,
+                sequenced_reserved_fill=False,
+                planner=lambda snapshot, supply: _current_decision(
+                    snapshot, supply, 1),
+                prepared_paid_launch_specs=(spec,))
+
+    assert _paid_write_counts(engine) == before
+
+
+def test_current_planner_stale_controller_aba_rolls_back_every_write(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    spec = _paid_launch_spec(engine, 0, 121)
+    stale_authority = _current_owner_kwargs(engine)
+    replacement_incarnation = uuid.uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    controller_incarnation=replacement_incarnation,
+                    controller_owner_epoch=5))
+    before = _paid_write_counts(engine)
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='Service changed'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(
+                **stale_authority,
+                service_name='svc',
+                service_hash='svc-hash',
+                service_lifecycle_epoch=3,
+                service_version=1,
+                accounting_cards={'l4': 1},
+                backend_num_nodes=1,
+                sequenced_reserved_fill=False,
+                planner=lambda snapshot, supply: _current_decision(
+                    snapshot, supply, 1),
+                prepared_paid_launch_specs=(spec,))
+
+    assert _paid_write_counts(engine) == before
+
+
 def test_current_planner_existing_paid_wave_prevents_duplicate_launch(
         capacity_database):
     engine, incarnation, _ = capacity_database
@@ -1816,6 +2134,7 @@ def test_current_planner_existing_paid_wave_prevents_duplicate_launch(
 
     def _commit(specs):
         return repository.plan_and_admit_current(
+            **_current_owner_kwargs(engine),
             service_name='svc',
             service_hash='svc-hash',
             service_lifecycle_epoch=3,
@@ -1828,9 +2147,13 @@ def test_current_planner_existing_paid_wave_prevents_duplicate_launch(
             prepared_paid_launch_specs=specs)
 
     first = _commit(
-        tuple(_paid_launch_spec(index, 120 + index) for index in range(2)))
+        tuple(
+            _paid_launch_spec(engine, index, 120 + index)
+            for index in range(2)))
     successor = _commit(
-        tuple(_paid_launch_spec(index, 130 + index) for index in range(2)))
+        tuple(
+            _paid_launch_spec(engine, index, 130 + index)
+            for index in range(2)))
 
     assert len(first.paid_launch_receipt.members) == 2
     assert successor.paid_launch_receipt.members == ()
@@ -1853,9 +2176,11 @@ def test_current_planner_enforces_exact_multi_gpu_paid_cap(
                            replica_unit='logical',
                            max_live_paid_gpu_units=16)
     specs = tuple(
-        _paid_launch_spec(
-            ordinal, 150 + ordinal, accelerator_count=8, planned_capacity=8)
-        for ordinal in range(3))
+        _paid_launch_spec(engine,
+                          ordinal,
+                          150 + ordinal,
+                          accelerator_count=8,
+                          planned_capacity=8) for ordinal in range(3))
     provider_methods = []
     for method_name in ('regions_with_offering', 'zones_provision_loop',
                         'get_feasible_launchable_resources'):
@@ -1867,6 +2192,7 @@ def test_current_planner_enforces_exact_multi_gpu_paid_cap(
 
     committed = capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
             service_name='svc',
             service_hash='svc-hash',
             service_lifecycle_epoch=3,
@@ -1899,6 +2225,7 @@ def test_current_planner_recomputes_prior_claims_after_stale_cleanup(
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
     repository = capacity_admission.CapacityAdmissionRepository(engine)
     first_commit = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -1907,7 +2234,7 @@ def test_current_planner_recomputes_prior_claims_after_stale_cleanup(
         backend_num_nodes=1,
         sequenced_reserved_fill=False,
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 1),
-        prepared_paid_launch_specs=(_paid_launch_spec(0, 160),))
+        prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 160),))
     assert len(first.paid_launch_receipt.members) == 1
     replicas = serve_state_schema.replicas_table
     with engine.begin() as connection:
@@ -1926,6 +2253,7 @@ def test_current_planner_recomputes_prior_claims_after_stale_cleanup(
                     replica_state=state))
 
     successor = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -1934,7 +2262,7 @@ def test_current_planner_recomputes_prior_claims_after_stale_cleanup(
         backend_num_nodes=1,
         sequenced_reserved_fill=False,
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 1),
-        prepared_paid_launch_specs=(_paid_launch_spec(0, 161),))
+        prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 161),))
 
     assert [
         member.replica_id for member in successor.paid_launch_receipt.members
@@ -1955,7 +2283,7 @@ def test_current_planner_empty_wave_fails_closed_on_old_incarnation_graph(
         capacity_database, retained_kind):
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
-    pool_key = _paid_launch_spec(0, 140).pool_key
+    pool_key = _paid_launch_spec(engine, 0, 140).pool_key
     now = time.time()
     with engine.begin() as connection:
         if retained_kind in ('claim', 'waiter'):
@@ -2020,7 +2348,8 @@ def test_current_planner_empty_wave_fails_closed_on_old_incarnation_graph(
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
                        match='retained authority graph'):
         capacity_admission.CapacityAdmissionRepository(
-            engine).plan_and_admit_current(service_name='svc',
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
                                            service_hash='svc-hash',
                                            service_lifecycle_epoch=3,
                                            service_version=1,
@@ -2049,6 +2378,7 @@ def test_current_planner_rolls_back_when_postwrite_clock_expires(
                        match='authority expired'):
         capacity_admission.CapacityAdmissionRepository(
             engine).plan_and_admit_current(
+                **_current_owner_kwargs(engine),
                 service_name='svc',
                 service_hash='svc-hash',
                 service_lifecycle_epoch=3,
@@ -2145,6 +2475,7 @@ def test_current_planner_admits_exact_card_saturated_demand(capacity_database):
 
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
             service_name='svc',
             service_hash='svc-hash',
             service_lifecycle_epoch=3,
@@ -2190,6 +2521,7 @@ def test_current_planner_rejects_saturated_partial_compatibility(
                        match='Current durable demand'):
         (capacity_admission.CapacityAdmissionRepository(
             engine).plan_and_admit_current(
+                **_current_owner_kwargs(engine),
                 service_name='svc',
                 service_hash='svc-hash',
                 service_lifecycle_epoch=3,
@@ -2218,6 +2550,7 @@ def test_current_planner_never_persists_paid_authority_for_reservation_only_card
 
     def commit() -> capacity_admission.CommittedCapacityPlan:
         return repository.plan_and_admit_current(
+            **_current_owner_kwargs(engine),
             service_name='svc',
             service_hash='svc-hash',
             service_lifecycle_epoch=3,
@@ -2254,6 +2587,7 @@ def test_current_planner_rejects_stale_prepared_fingerprint(capacity_database):
                        match='Prepared planning state changed'):
         (capacity_admission.CapacityAdmissionRepository(
             engine).plan_and_admit_current(
+                **_current_owner_kwargs(engine),
                 service_name='svc',
                 service_hash='svc-hash',
                 service_lifecycle_epoch=3,
@@ -2272,17 +2606,18 @@ def test_current_planner_accepts_semantic_noop_replica_rewrite(
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
     initial = capacity_admission.CapacityAdmissionRepository(
-        engine).plan_and_admit_current(
-            service_name='svc',
-            service_hash='svc-hash',
-            service_lifecycle_epoch=3,
-            service_version=1,
-            accounting_cards={'l4': 1},
-            backend_num_nodes=1,
-            sequenced_reserved_fill=False,
-            planner=lambda snapshot, supply: _current_decision(
-                snapshot, supply, 1),
-            prepared_paid_launch_specs=(_paid_launch_spec(0, 101),))
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
+                                       service_hash='svc-hash',
+                                       service_lifecycle_epoch=3,
+                                       service_version=1,
+                                       accounting_cards={'l4': 1},
+                                       backend_num_nodes=1,
+                                       sequenced_reserved_fill=False,
+                                       planner=lambda snapshot, supply:
+                                       _current_decision(snapshot, supply, 1),
+                                       prepared_paid_launch_specs=(
+                                           _paid_launch_spec(engine, 0, 101),))
     assert [
         member.replica_id for member in initial.paid_launch_receipt.members
     ] == [101]
@@ -2319,6 +2654,7 @@ def test_current_planner_accepts_semantic_noop_replica_rewrite(
 
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
             service_name='svc',
             service_hash='svc-hash',
             service_lifecycle_epoch=3,
@@ -2369,7 +2705,8 @@ def test_current_planner_serializes_concurrent_report_writer(capacity_database):
         return _current_decision(snapshot, supply, 1)
 
     committed = (capacity_admission.CapacityAdmissionRepository(
-        engine).plan_and_admit_current(service_name='svc',
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
                                        service_hash='svc-hash',
                                        service_lifecycle_epoch=3,
                                        service_version=1,
@@ -2402,7 +2739,8 @@ def test_current_planner_callback_failure_rolls_back(capacity_database):
 
     with pytest.raises(ValueError, match='injected planner failure'):
         (capacity_admission.CapacityAdmissionRepository(
-            engine).plan_and_admit_current(service_name='svc',
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
                                            service_hash='svc-hash',
                                            service_lifecycle_epoch=3,
                                            service_version=1,
@@ -2465,7 +2803,9 @@ def test_gate_covered_plan_commits_reservation_before_paid_residual(
         assert supply.allocation_reserved_capacity_by_accelerator == {'l4': 1}
         return _current_decision(snapshot, supply, 2)
 
-    committed = repository.plan_and_admit_current(service_name='svc',
+    committed = repository.plan_and_admit_current(**_current_owner_kwargs(
+        engine),
+                                                  service_name='svc',
                                                   service_hash='svc-hash',
                                                   service_lifecycle_epoch=3,
                                                   service_version=1,
@@ -2503,6 +2843,7 @@ def test_stale_grant_holdings_cannot_unlock_paid_before_reserved_feed(
     repository = capacity_admission.CapacityAdmissionRepository(engine)
 
     acquisition = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -2528,6 +2869,7 @@ def test_stale_grant_holdings_cannot_unlock_paid_before_reserved_feed(
         utilization_demand_witness_sha256=witness,
         utilization_ceiling=2)
     blocked = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -2550,6 +2892,7 @@ def test_stale_grant_holdings_cannot_unlock_paid_before_reserved_feed(
         utilization_demand_witness_sha256=witness,
         utilization_ceiling=2)
     released = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -2604,6 +2947,7 @@ def test_ungated_stale_grant_cannot_unlock_paid_before_reserved_feed(
 
     current_allocation[0] = _allocation_map({'l4': 1})
     released = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -2699,6 +3043,7 @@ def test_fill_demand_witness_retains_only_older_deadline_lower_bound(
     # the planner's conservative 585-second bucket.
     demand_state.ingest_report('svc', 'svc-hash', _deadline_report(2, 590))
     committed = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -2739,6 +3084,7 @@ def test_fill_demand_witness_retains_only_older_deadline_lower_bound(
         initial.reservation_acquisition_classes)
 
     successor = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -2766,6 +3112,7 @@ def test_fill_demand_witness_retains_only_older_deadline_lower_bound(
         'svc', 'svc-hash', (123, '10.0.0.5'), max_age_seconds=60) is None
 
     long_first = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -2782,6 +3129,7 @@ def test_fill_demand_witness_retains_only_older_deadline_lower_bound(
     assert (long_retained.demand_feed_generation
             < long_retained.observed_demand_feed_generation)
     long_successor = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -2815,7 +3163,8 @@ def test_gate_disabled_still_uses_current_reservation_without_witness(
     _mock_current_allocation(monkeypatch, allocation)
 
     committed = (capacity_admission.CapacityAdmissionRepository(
-        engine).plan_and_admit_current(service_name='svc',
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
                                        service_hash='svc-hash',
                                        service_lifecycle_epoch=3,
                                        service_version=1,
@@ -2850,6 +3199,7 @@ def test_committed_reservation_survives_gated_entitlement_change(
     _mock_current_allocation(monkeypatch, lambda: current_allocation[0])
     repository = capacity_admission.CapacityAdmissionRepository(engine)
     acquisition = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -2869,6 +3219,7 @@ def test_committed_reservation_survives_gated_entitlement_change(
                               utilization_ceiling=2)
     current_allocation[0] = initial
     first_commit = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -2922,7 +3273,9 @@ def test_committed_reservation_survives_gated_entitlement_change(
         return decision
 
     def _publish_successor():
-        return repository.plan_and_admit_current(service_name='svc',
+        return repository.plan_and_admit_current(**_current_owner_kwargs(
+            engine),
+                                                 service_name='svc',
                                                  service_hash='svc-hash',
                                                  service_lifecycle_epoch=3,
                                                  service_version=1,
@@ -3048,6 +3401,7 @@ def test_usage_gate_publishes_no_effect_acquisition_for_noncausal_evidence(
     repository = capacity_admission.CapacityAdmissionRepository(engine)
 
     bootstrap = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -3067,6 +3421,7 @@ def test_usage_gate_publishes_no_effect_acquisition_for_noncausal_evidence(
         utilization_demand_witness_sha256=exact_witness,
         utilization_ceiling=2)
     positive = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -3090,6 +3445,7 @@ def test_usage_gate_publishes_no_effect_acquisition_for_noncausal_evidence(
     current_allocation[0] = _allocation_map({'l4': 1}, **noncausal_kwargs)
 
     committed = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -3175,7 +3531,8 @@ def test_shutting_down_paid_row_leaves_baseline_only_after_cleanup_proof(
                 serve_state_schema.replicas_table).values(**replica))
 
     committed = (capacity_admission.CapacityAdmissionRepository(
-        engine).plan_and_admit_current(service_name='svc',
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
                                        service_hash='svc-hash',
                                        service_lifecycle_epoch=3,
                                        service_version=1,
@@ -3220,6 +3577,7 @@ def test_old_version_paid_row_charges_cap_without_covering_current_demand(
 
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
             service_name='svc',
             service_hash='svc-hash',
             service_lifecycle_epoch=3,
@@ -3270,6 +3628,7 @@ def test_paid_cap_separates_service_units_from_physical_gpu_debit(
 
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
             service_name='svc',
             service_hash='svc-hash',
             service_lifecycle_epoch=3,
@@ -3315,6 +3674,7 @@ def test_paid_cap_rejects_malformed_physical_width_attribution(
                        match='physical GPU attribution is malformed'):
         capacity_admission.CapacityAdmissionRepository(
             engine).plan_and_admit_current(
+                **_current_owner_kwargs(engine),
                 service_name='svc',
                 service_hash='svc-hash',
                 service_lifecycle_epoch=3,
@@ -3364,6 +3724,7 @@ def test_locked_paid_replica_relational_authority_rejects_json_contradiction(
     with pytest.raises(capacity_admission.CapacityAdmissionConflict):
         capacity_admission.CapacityAdmissionRepository(
             engine).plan_and_admit_current(
+                **_current_owner_kwargs(engine),
                 service_name='svc',
                 service_hash='svc-hash',
                 service_lifecycle_epoch=3,
@@ -3394,6 +3755,7 @@ def test_noncurrent_removed_reserved_card_is_retirement_only_inventory(
 
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
             service_name='svc',
             service_hash='svc-hash',
             service_lifecycle_epoch=3,
@@ -3417,7 +3779,8 @@ def test_disabled_fill_keeps_surviving_pending_intent_in_economic_baseline(
     _install_pending_east_capacity(engine)
 
     committed = capacity_admission.CapacityAdmissionRepository(
-        engine).plan_and_admit_current(service_name='svc',
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
                                        service_hash='svc-hash',
                                        service_lifecycle_epoch=3,
                                        service_version=1,
@@ -3929,6 +4292,7 @@ def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
     first_commit = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -3937,7 +4301,7 @@ def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
         backend_num_nodes=1,
         sequenced_reserved_fill=False,
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2),
-        prepared_paid_launch_specs=(_paid_launch_spec(0, 10),))
+        prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 10),))
     first = first_commit.authority
     first_claim = _claim_row(engine, 10)
 
@@ -3946,6 +4310,7 @@ def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
                                           route_receipt,
                                           sequence=2))
     successor_commit = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -3954,7 +4319,7 @@ def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
         backend_num_nodes=1,
         sequenced_reserved_fill=False,
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2),
-        prepared_paid_launch_specs=(_paid_launch_spec(0, 11),))
+        prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 11),))
     successor = successor_commit.authority
 
     assert successor.generation == first.generation + 1
@@ -4090,6 +4455,7 @@ def test_committed_claim_survives_successor_plan_that_accounts_for_it(
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
     first_commit = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -4098,7 +4464,7 @@ def test_committed_claim_survives_successor_plan_that_accounts_for_it(
         backend_num_nodes=1,
         sequenced_reserved_fill=False,
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2),
-        prepared_paid_launch_specs=(_paid_launch_spec(0, 10),))
+        prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 10),))
     first = first_commit.authority
     first_claim = _claim_row(engine, 10)
 
@@ -4111,6 +4477,7 @@ def test_committed_claim_survives_successor_plan_that_accounts_for_it(
         'svc', 'svc-hash',
         _demand_report(time.time(), route_receipt, sequence=2, request_count=2))
     successor_commit = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -4119,7 +4486,7 @@ def test_committed_claim_survives_successor_plan_that_accounts_for_it(
         backend_num_nodes=1,
         sequenced_reserved_fill=False,
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2),
-        prepared_paid_launch_specs=(_paid_launch_spec(0, 11),))
+        prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 11),))
     successor = successor_commit.authority
     assert successor.generation == first.generation + 1
     assert successor.remaining_launch_capacity() == {'l4': 1}
@@ -4143,6 +4510,7 @@ def test_committed_claim_survives_successor_plan_that_accounts_for_it(
         'svc', 'svc-hash',
         _demand_report(time.time(), route_receipt, sequence=3, request_count=1))
     fully_committed = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -4175,6 +4543,7 @@ def test_paid_claims_survive_unpublished_semantic_heartbeats(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
     first_commit = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -4183,7 +4552,7 @@ def test_paid_claims_survive_unpublished_semantic_heartbeats(capacity_database):
         backend_num_nodes=1,
         sequenced_reserved_fill=False,
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2),
-        prepared_paid_launch_specs=(_paid_launch_spec(0, 10),))
+        prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 10),))
     first = first_commit.authority
     first_claim = _claim_row(engine, 10)
 
@@ -4191,6 +4560,7 @@ def test_paid_claims_survive_unpublished_semantic_heartbeats(capacity_database):
         'svc', 'svc-hash',
         _demand_report(time.time(), route_receipt, sequence=2, request_count=2))
     successor = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -4803,6 +5173,7 @@ def test_only_quota_assigned_kueue_capacity_is_reserved_supply(
 
     authority = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
             service_name='svc',
             service_hash='svc-hash',
             service_lifecycle_epoch=3,
@@ -4826,7 +5197,8 @@ def test_missing_kueue_admission_does_not_revoke_committed_provider_effect(
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
     key = _install_waiting_kueue_capacity(engine)
     committed = capacity_admission.CapacityAdmissionRepository(
-        engine).plan_and_admit_current(service_name='svc',
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
                                        service_hash='svc-hash',
                                        service_lifecycle_epoch=3,
                                        service_version=1,
@@ -4895,6 +5267,7 @@ def test_cross_card_reserved_capacity_satisfies_supply_aware_target(
                 **_replica_values(22, zero_cost=True, accelerator='A100')))
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
             service_name='svc',
             service_hash='svc-hash',
             service_lifecycle_epoch=3,
@@ -5061,17 +5434,18 @@ def test_provider_start_accepts_fused_plan_paid_replica_row(capacity_database):
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
     committed = capacity_admission.CapacityAdmissionRepository(
-        engine).plan_and_admit_current(
-            service_name='svc',
-            service_hash='svc-hash',
-            service_lifecycle_epoch=3,
-            service_version=1,
-            accounting_cards={'l4': 1},
-            backend_num_nodes=1,
-            sequenced_reserved_fill=False,
-            planner=lambda snapshot, supply: _current_decision(
-                snapshot, supply, 1),
-            prepared_paid_launch_specs=(_paid_launch_spec(0, 84),))
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
+                                       service_hash='svc-hash',
+                                       service_lifecycle_epoch=3,
+                                       service_version=1,
+                                       accounting_cards={'l4': 1},
+                                       backend_num_nodes=1,
+                                       sequenced_reserved_fill=False,
+                                       planner=lambda snapshot, supply:
+                                       _current_decision(snapshot, supply, 1),
+                                       prepared_paid_launch_specs=(
+                                           _paid_launch_spec(engine, 0, 84),))
     assert [
         member.replica_id for member in committed.paid_launch_receipt.members
     ] == [84]
@@ -5236,6 +5610,7 @@ def test_committed_claim_survives_zero_target_successor(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
     first_commit = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,
@@ -5244,13 +5619,14 @@ def test_committed_claim_survives_zero_target_successor(capacity_database):
         backend_num_nodes=1,
         sequenced_reserved_fill=False,
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 1),
-        prepared_paid_launch_specs=(_paid_launch_spec(0, 30),))
+        prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 30),))
     first = first_commit.authority
     claim = _claim_row(engine, 30)
     demand_state.ingest_report(
         'svc', 'svc-hash',
         _demand_report(time.time(), route_receipt, sequence=2, request_count=0))
     zero_target = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
         service_name='svc',
         service_hash='svc-hash',
         service_lifecycle_epoch=3,

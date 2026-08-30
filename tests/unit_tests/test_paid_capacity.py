@@ -1,19 +1,29 @@
 """Tests for centralized SkyServe paid-capacity policy."""
 # pylint: disable=protected-access
 import dataclasses
+import hashlib
 import json
 from unittest import mock
 
 import pytest
 from spot_placer_test_utils import make_location
-from spot_placer_test_utils import make_placer
+from spot_placer_test_utils import make_placer as _make_placer
 
 from sky.serve import capacity_admission
 from sky.serve import capacity_planning
 from sky.serve import constants
 from sky.serve import paid_capacity
 from sky.serve import replica_managers
+from sky.serve import serve_utils
+from sky.serve import spot_placer
 from sky.utils import common_utils
+
+
+def make_placer(*args, **kwargs):
+    placer = _make_placer(*args, **kwargs)
+    placer._ranked_catalog_entries = (  # pylint: disable=protected-access
+        placer.placement_catalog.ranked_entries(placer.placement_contract))
+    return placer
 
 
 @pytest.fixture(autouse=True)
@@ -69,6 +79,8 @@ def _provider_free_launch_spec() -> paid_capacity.PaidLaunchSpec:
                                       workspace='default',
                                       num_nodes=1)
     info = _pending_info(7, location)
+    info.cluster_name = serve_utils.generate_replica_cluster_name(
+        'svc', 7, 'hash')
     info.replica_record_id = '11111111-1111-4111-8111-111111111111'
     info.created_at = None
     info.paid_capacity_pool_key = pool_key
@@ -78,8 +90,20 @@ def _provider_free_launch_spec() -> paid_capacity.PaidLaunchSpec:
     frozen_override = paid_capacity.freeze_paid_launch_payload(override)
     worker = paid_capacity.freeze_paid_launch_payload({
         'schema_version': 1,
-        'launch_yaml_content': 'resources: {}',
+        'launch_yaml_content': 'resources: {}\n',
+        'cluster_name': info.cluster_name,
+        'log_file_name': serve_utils.generate_replica_launch_log_file_name(
+            'svc', 7, 'hash'),
+        'resources_override': override,
+        'retry_until_up': False,
+        'frozen_controller_config_path':
+            (serve_utils.generate_versioned_config_yaml_file_name(
+                'svc', 1, 'hash')),
     })
+    service_spec_bytes = b'immutable-service-spec'
+    controller_config = b'active_workspace: default\n'
+    placement_catalog = spot_placer.PlacementCatalog(((location, 0.10),),
+                                                     num_nodes=1).to_dict()
     return paid_capacity.PaidLaunchSpec(
         ordinal=0,
         service_name='svc',
@@ -102,7 +126,21 @@ def _provider_free_launch_spec() -> paid_capacity.PaidLaunchSpec:
         accelerator='l4',
         gpu_units_per_node=1,
         num_nodes=1,
-        resources_override=frozen_override)
+        resources_override=frozen_override,
+        catalog_evidence=paid_capacity.PaidLaunchCatalogEvidence(
+            placement_catalog_sha256=(
+                paid_capacity.paid_launch_payload_sha256(placement_catalog)),
+            catalog_rank=0,
+            exploration_round=0,
+            slot_within_pool_window=0,
+            version_authority=paid_capacity.PaidLaunchVersionAuthority(
+                service_spec=service_spec_bytes,
+                service_spec_sha256=hashlib.sha256(
+                    service_spec_bytes).hexdigest(),
+                controller_config=controller_config,
+                controller_config_digest=hashlib.sha256(
+                    controller_config).hexdigest(),
+                controller_config_snapshot_id='c' * 64)))
 
 
 def test_paid_launch_spec_is_deeply_immutable_and_provider_free():
