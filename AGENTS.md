@@ -245,6 +245,12 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
 - Evaluate designs by their final topology: the completed system should have
   fewer concepts and ownership boundaries, while supporting future variation
   through the canonical abstraction rather than additional special cases.
+- Treat prolonged iteration on one problem as evidence that the abstraction
+  may be wrong or the implementation is not KISS enough. If work continues for
+  hours without converging, stop adding patches, restate the invariant, and
+  simplify or replace the abstraction before proceeding. Optimize for durable
+  correctness and useful output per engineering/token cost, not for preserving
+  sunk implementation effort.
 
 ### Typed Internal State and Compatibility Boundaries
 
