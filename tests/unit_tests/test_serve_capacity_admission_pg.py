@@ -3979,7 +3979,7 @@ def test_prospective_claim_accepts_later_clock_arrival_expiry(
     assert planned_snapshot is not None
     authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
         _plan(1))
-    claim = authority.claim_values('L4')
+    claim = {**authority.claim_values('L4'), 'pool_key': _paid_pool_key()}
     assert authority.remaining_launch_capacity() == {'l4': 1}
     assert claim['capacity_plan_accelerator'] == 'l4'
     assert claim['capacity_plan_units'] == 1
@@ -4134,33 +4134,24 @@ def test_prospective_claim_batch_rejects_mixed_plan_authorities(
         _validate_prospective_claim_batch(engine, [claim, mismatched])
 
 
-@pytest.mark.parametrize('mutation',
-                         ['h200-redistribution', 'fresh-zero-change'])
-def test_prospective_claim_rejects_nonexpiry_snapshot_change(
-        capacity_database, monkeypatch, mutation):
+def test_prospective_claim_accepts_positive_snapshot_churn(
+        capacity_database, monkeypatch):
     engine, _, _ = capacity_database
     authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
         _plan(1))
-    claim = authority.claim_values('L4')
+    claim = {**authority.claim_values('L4'), 'pool_key': _paid_pool_key()}
     assert authority.remaining_launch_capacity() == {'l4': 1}
     assert claim['capacity_plan_accelerator'] == 'l4'
 
     def _mutate(normalized):
-        if mutation == 'h200-redistribution':
-            arrivals = normalized['compatibility_demand']['arrivals']
-            assert len(arrivals) == 1
-            arrivals[0]['compatible_accelerators'] = ['H200']
-        elif mutation == 'fresh-zero-change':
-            normalized['fresh_aggregate_zero'] = True
-        else:
-            raise AssertionError(f'Unhandled mutation {mutation!r}.')
+        arrivals = normalized['compatibility_demand']['arrivals']
+        assert len(arrivals) == 1
+        arrivals[0]['compatible_accelerators'] = ['H200']
         return normalized
 
     _mock_prospective_snapshot_normalized_demand(monkeypatch, _mutate)
 
-    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                       match='demand semantics changed before admission'):
-        _validate_prospective_claim(engine, claim)
+    _validate_prospective_claim(engine, claim)
     assert authority.remaining_launch_capacity() == {'l4': 1}
 
 
@@ -4301,19 +4292,50 @@ def test_paid_claims_survive_unpublished_semantic_heartbeats(capacity_database):
                                                              prospective=True)
 
 
-def test_prospective_hundred_claim_batch_survives_heartbeat_churn(
+def test_prospective_hundred_claim_batch_survives_positive_demand_churn(
         capacity_database):
     engine, _, route_receipt = capacity_database
     authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
         _plan(100))
-    claim = authority.claim_values('L4')
+    claim = {**authority.claim_values('L4'), 'pool_key': _paid_pool_key()}
 
-    # Model the four-second candidate-freeze interval from the production
-    # 100-VM wave with multiple equivalent five-second reporter publications.
-    for sequence in (2, 3):
-        demand_state.ingest_report(
-            'svc', 'svc-hash',
-            _demand_report(time.time(), route_receipt, sequence=sequence))
+    # Model production pressure moving between arrivals, the queue, and the
+    # rejection window while the provider-free 100-VM wave is prepared. The
+    # current unexpired head remains the quantitative lease until the canonical
+    # planner publishes a successor.
+    report = _demand_report(time.time(),
+                            route_receipt,
+                            sequence=2,
+                            request_count=1_000)
+    report['queue_depth'] = 600
+    report['queue_depth_by_priority'] = {'50': 600}
+    report['queued_requests_by_compatibility'] = [{
+        'priority': 50,
+        'compatible_accelerators': ['L4'],
+        'count': 600,
+    }]
+    report['queued_request_deadline_buckets'] = [{
+        'priority': 50,
+        'compatible_accelerators': ['L4'],
+        'remaining_seconds': 300,
+        'count': 600,
+    }]
+    report['rejected_in_window'] = 200
+    report['rejected_in_recent_window'] = 150
+    report['rejected_in_window_by_priority'] = {'50': 200}
+    report['rejected_in_recent_window_by_priority'] = {'50': 150}
+    report['rejected_requests_by_compatibility'] = [{
+        'priority': 50,
+        'compatible_accelerators': ['L4'],
+        'count': 200,
+        'recent_count': 150,
+    }]
+    demand_state.ingest_report('svc', 'svc-hash', report)
+    current = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+    assert current is not None
+    assert current.demand_feed_generation > authority.demand_feed_generation
+    assert current.normalized_demand['queue_depth'] == 600
+    assert current.normalized_demand['rejected_in_window'] == 200
 
     fresh_until = _validate_prospective_claim_batch(engine, [{
         **claim, 'replica_id': replica_id
@@ -4754,7 +4776,7 @@ def test_atomic_hundred_claim_batch_rejects_fresh_zero_without_rows(
     assert snapshot.fresh_aggregate_zero
 
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                       match='demand semantics changed before admission'):
+                       match='Fresh aggregate zero revoked paid claim'):
         serve_state.try_add_replicas_with_paid_capacity_claims(
             'svc',
             'svc-hash',

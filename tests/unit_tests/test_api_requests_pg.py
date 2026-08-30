@@ -3541,6 +3541,127 @@ def test_cancelled_gcp_paid_present_cleanup_then_absence_retires_atomically(
     assert claim_count == pin_count == 0
 
 
+def _cancelled_aws_absence_payload(
+    graph: _PaidProviderAbsenceGraph,) -> dict[str, object]:
+    identity = request_postgres.bound_non_pool_aws_provider_identity(
+        graph.context, graph.authority)
+    assert identity is not None
+    return {
+        'association_id': str(graph.context.association_id),
+        'cluster_name': 'gc-service-3',
+        'instances': [],
+        'probe_contract': 'aws-client-token-instance-presence-v1',
+        'profile_kind': 'ORDINARY_PAID',
+        'provider_identity': identity,
+        'replica_record_id': str(_GC_REPLICA_RECORD_ID),
+        'result': 'ABSENT',
+    }
+
+
+def test_cancelled_aws_paid_absence_retires_atomically(bound_request_database,
+                                                       monkeypatch) -> None:
+    """Exact post-quiescence AWS absence releases every retained debit."""
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch,
+        production_http_normalization=True,
+        explicit_cancel=True,
+        effect_phase=ordinary_launch_binding.EffectPhase.SERVICE_JOB_IO)
+    payload = _cancelled_aws_absence_payload(graph)
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, graph.authority,
+        ordinary_launch_binding.ProviderEvidence.ABSENT, payload)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    manager._ordinary_launch_binding_authority = graph.authority
+
+    assert request_postgres.project_bound_non_pool_provider_absence(
+        graph.context,
+        graph.authority,
+        project_replica_result=lambda connection, projection: manager.
+        _project_bound_ordinary_launch(None, connection, projection))
+
+    with graph.engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id ==
+                  graph.context.association_id)).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'gc-service', serve_state_schema.replicas_table.c.replica_id ==
+                3)).mappings().one()
+        claim_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table)).scalar_one()
+        pin_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUEST_RETENTION_PINS)).scalar_one()
+    assert association['resolution'] == 'PROJECTED'
+    assert association['terminal_status'] == 'CANCELLED'
+    assert association['terminal_cause'] == 'explicit_cancel'
+    assert association['provider_evidence_payload'] == payload
+    assert replica['ordinary_launch_association_id'] is None
+    assert claim_count == pin_count == 0
+
+
+@pytest.mark.parametrize(
+    'near_miss',
+    ['wrong_account', 'wrong_pool', 'wrong_market', 'wrong_receipt'])
+def test_cancelled_aws_paid_cleanup_rejects_inexact_census(
+        bound_request_database, monkeypatch, near_miss: str) -> None:
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch,
+        production_http_normalization=True,
+        explicit_cancel=True,
+        effect_phase=ordinary_launch_binding.EffectPhase.SERVICE_JOB_IO)
+    payload = _cancelled_aws_absence_payload(graph)
+    changed = json.loads(json.dumps(payload))
+    if near_miss == 'wrong_account':
+        changed['provider_identity']['aws_account_id'] = '999999999999'
+    elif near_miss == 'wrong_pool':
+        changed['provider_identity']['instance_type'] = 'g6.2xlarge'
+    elif near_miss == 'wrong_market':
+        identity = changed['provider_identity']
+        changed['instances'] = [{
+            'availability_zone': identity['zone'],
+            'client_token': identity['client_token'],
+            'cluster_name_on_cloud': identity['cluster_name_on_cloud'],
+            'instance_id': 'i-0123456789abcdef0',
+            'instance_type': identity['instance_type'],
+            'market': 'on-demand',
+            'state': 'terminated',
+        }]
+    else:
+        changed['probe_contract'] = 'aws-unscoped-instance-presence-v0'
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict):
+        request_postgres.record_bound_non_pool_provider_evidence(
+            graph.context, graph.authority,
+            ordinary_launch_binding.ProviderEvidence.ABSENT, changed)
+
+    with graph.engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id ==
+                  graph.context.association_id)).mappings().one()
+        claim_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table)).scalar_one()
+        pin_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUEST_RETENTION_PINS)).scalar_one()
+    assert association['resolution'] == 'AMBIGUOUS'
+    assert association['provider_evidence'] == 'NOT_QUERIED'
+    assert claim_count == pin_count == 1
+
+
 def test_service_teardown_settles_exact_paid_provider_negative_ack(
         bound_request_database, monkeypatch) -> None:
     """Teardown uses the same exact ABSENT reducer as the live manager."""

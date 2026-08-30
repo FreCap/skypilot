@@ -7224,8 +7224,8 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._replica_manager.publish_target_num_replicas.assert_not_called()  # pylint: disable=line-too-long
         assert ctrl._scale_reconcile_coordinator.generation == 1  # pylint: disable=protected-access
 
-    def test_service_transition_waits_for_linearized_publication_epoch(self):
-        """The routing epoch is owned before the repository takes PG locks."""
+    def test_publication_lock_order_keeps_locked_planner_callback_pure(self):
+        """The locked planner cannot form a PG/actuation lock cycle."""
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
         decision_autoscaler = self._logical_durable_autoscaler(target=0)
@@ -7236,6 +7236,9 @@ class TestAutoscalerRuntimeSnapshot:
             service_lifecycle_epoch=3)
         transaction_entered = threading.Event()
         release_transaction = threading.Event()
+        actuation_epoch_held = threading.Event()
+        release_actuation_epoch = threading.Event()
+        planner_completed = threading.Event()
         transition_attempted = threading.Event()
         transition_acquired = threading.Event()
         repository = mock.Mock()
@@ -7258,6 +7261,7 @@ class TestAutoscalerRuntimeSnapshot:
             assert release_transaction.wait(timeout=5)
             snapshot = self._durable_snapshot()
             decision = kwargs['planner'](snapshot, projection)
+            planner_completed.set()
             planner_snapshot, candidate = decision.decode_planner()
             authority = _paid_authority(candidate.paid_residual.as_dict(),
                                         candidate.paid_launch_target.as_dict())
@@ -7286,6 +7290,11 @@ class TestAutoscalerRuntimeSnapshot:
             with ctrl._routing_state_lock:  # pylint: disable=protected-access
                 transition_acquired.set()
 
+        def _hold_actuation_epoch():
+            with ctrl._actuation_epoch_lock:  # pylint: disable=protected-access
+                actuation_epoch_held.set()
+                assert release_actuation_epoch.wait(timeout=5)
+
         repository.plan_and_publish_current.side_effect = _plan_current
         decision_autoscaler.plan_durable_capacity_reconcile.side_effect = (
             _durable_plan)
@@ -7297,16 +7306,25 @@ class TestAutoscalerRuntimeSnapshot:
             publisher = threading.Thread(target=_publish)
             publisher.start()
             assert transaction_entered.wait(timeout=5)
+            actuation_holder = threading.Thread(target=_hold_actuation_epoch)
+            actuation_holder.start()
+            assert actuation_epoch_held.wait(timeout=5)
             transition = threading.Thread(target=_transition)
             transition.start()
             assert transition_attempted.wait(timeout=5)
             assert not transition_acquired.wait(timeout=0.1)
             release_transaction.set()
+            planner_finished_without_actuation = planner_completed.wait(
+                timeout=1)
+            release_actuation_epoch.set()
             publisher.join(timeout=5)
             transition.join(timeout=5)
+            actuation_holder.join(timeout=5)
 
         assert not publisher.is_alive()
         assert not transition.is_alive()
+        assert not actuation_holder.is_alive()
+        assert planner_finished_without_actuation
         assert transition_acquired.is_set()
         assert result[0] is not None
 

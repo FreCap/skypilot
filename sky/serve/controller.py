@@ -6402,14 +6402,6 @@ class SkyServeController:
             nonlocal durable_plan, planned
             request_information = dict(snapshot.request_information)
             request_information['replace_request_window'] = True
-            with self._routing_state_lock:
-                if (not self._scale_actuation_is_current(
-                        actuation_generation, decision_autoscaler,
-                        decision_version) or
-                        self._scale_reconcile_coordinator.generation
-                        != notification_generation):
-                    raise capacity_admission.CapacityAdmissionConflict(
-                        'Controller actuation changed during current planning.')
             if supply is None:
                 raise capacity_admission.CapacityAdmissionConflict(
                     'Current locked capacity inventory is unavailable.')
@@ -6648,9 +6640,12 @@ class SkyServeController:
                 planner_payload=envelope.canonical_payload())
 
         # Service-version transitions already use routing-epoch -> PostgreSQL
-        # order.  Own the same short epoch before the repository takes its
-        # service row; taking it from the callback would invert that order and
-        # could deadlock an update waiting on the same service row.
+        # order. Own the same short epoch before the repository takes its
+        # service row. The planner callback must not re-enter the actuation
+        # epoch after PostgreSQL rows are locked: the reserved-capacity poller
+        # may own that epoch while waiting for those rows. Producer identity is
+        # checked here before the transaction and again before every provider
+        # effect in _reconcile_scale_once().
         with self._routing_state_lock:
             if (not self._scale_actuation_is_current(
                     actuation_generation, decision_autoscaler, decision_version)

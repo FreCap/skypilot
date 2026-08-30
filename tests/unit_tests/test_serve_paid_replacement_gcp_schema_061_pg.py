@@ -113,9 +113,9 @@ def test_serve061_lineage_and_runtime_metadata() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['064']
+    assert scripts.get_heads() == ['065']
     assert scripts.get_revision('061').down_revision == '060'
-    assert migration_utils.SERVE_VERSION == '064'
+    assert migration_utils.SERVE_VERSION == '065'
     constraint = next(
         item for item in
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
