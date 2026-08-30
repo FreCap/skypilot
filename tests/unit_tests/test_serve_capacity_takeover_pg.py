@@ -9,7 +9,7 @@ import uuid
 import pytest
 import sqlalchemy
 from test_serve_capacity_admission_pg import _demand_report
-from test_serve_capacity_admission_pg import _plan
+from test_serve_capacity_admission_pg import _plan_and_admit_target
 from test_serve_capacity_admission_pg import _route_identities
 from test_serve_capacity_admission_pg import _route_response
 from test_serve_capacity_admission_pg import capacity_database
@@ -126,8 +126,7 @@ def test_takeover_rebinds_pair_but_requires_new_route_and_report(
     assert snapshot is not None
     assert snapshot.demand_source_epoch == 1
     assert snapshot.route_generation == new_route.generation
-    paid_authority = capacity_admission.CapacityAdmissionRepository(
-        engine).publish(_plan(1))
+    paid_authority = _plan_and_admit_target(engine, 1)
     assert paid_authority.demand_source_epoch == 1
     assert paid_authority.demand_feed_generation == (
         snapshot.demand_feed_generation)
