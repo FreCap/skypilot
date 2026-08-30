@@ -118,8 +118,9 @@ when no exact shelter identity exists. It cannot borrow a partial arrival
 sample's card.
 
 The adapter preserves an `unattributed_saturated_work` boundary when request
-duration is unknown, the raw arrival gap remains positive, fixed work lacks an
-exact card, or classified arrival identity still overlaps lossy fixed work.
+duration is unknown, the arrival gap remaining after classified fixed-overlap
+work is positive, fixed work lacks an exact card, or classified arrival
+identity still overlaps lossy fixed work.
 The first three are global attribution failures and may retain committed
 positive capacity on every exact card. Fixed-overlap ambiguity carries an
 explicit compatible-card set and shelters only committed capacity on those

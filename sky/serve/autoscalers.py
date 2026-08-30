@@ -7073,10 +7073,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if saturated:
                 # Queue, rejection, in-flight, and arrival telemetry are
                 # projections of one request stream. Reduce them to one
-                # typed reconciliation before capacity allocation. Classified
-                # tails beyond the shared fixed-work bound remain incremental;
-                # unresolved identity and the unclassified aggregate
-                # saturation gap remain shelter-only.
+                # typed reconciliation before capacity allocation. Classes
+                # disjoint from lossy fixed work remain incremental; classes
+                # that intersect it and the unclassified aggregate saturation
+                # gap remain shelter-only.
                 if (work_profiles != explicit_profiles or
                         work_profiles != paid_profiles):
                     return None
@@ -7118,9 +7118,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 attributed_work = (sum(item[2] for item in work_profiles) +
                                    sum(exact_fixed_work.values()))
                 arrival_gap = max(0.0, arrival_work - attributed_work)
+                unclassified_arrival_gap = max(
+                    0.0, arrival_gap -
+                    observation_reconciliation.ambiguous_fixed_arrival_work)
                 global_saturated_uncertainty = (
                     duration is None or
-                    arrival_gap > _SLOT_CONVERSION_EPSILON or
+                    unclassified_arrival_gap > _SLOT_CONVERSION_EPSILON or
                     flexible_fixed > _SLOT_CONVERSION_EPSILON or
                     has_unattributed_fixed_work)
                 fixed_overlap_uncertainty = (

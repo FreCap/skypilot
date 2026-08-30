@@ -781,9 +781,17 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                          {'L4': 1})
         self.assertEqual(candidate.paid_residual.as_dict(), {})
         self.assertEqual(candidate.paid_launch_target.as_dict(), {})
+        next_state = candidate.next_policy_state
+        assert next_state is not None
+        self.assertTrue(
+            autoscaler.install_committed_capacity_plan(
+                expected_prior_fingerprint=result.prior_policy_fingerprint,
+                expected_prior_generation=result.expected_prior_generation,
+                next_policy_state=next_state))
 
         rejected_report = _durable_report(
             rejected=1,
+            generation=next_state.source_generation + 1,
             in_flight={1: 1},
             observed_slots={1: 1},
             compatibility_profiles=[{
@@ -814,6 +822,12 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
 
         assert successor is not None
         successor_candidate = successor.envelope.candidate
+        self.assertEqual(successor.expected_prior_generation,
+                         next_state.source_generation)
+        assert successor_candidate.next_policy_state is not None
+        self.assertEqual(
+            successor_candidate.next_policy_state.source_generation,
+            next_state.source_generation + 1)
         self.assertEqual(successor_candidate.aggregate_demand_target, 2)
         self.assertEqual(
             successor_candidate.supply_aware_demand_target.as_dict(), {'L4': 2})
@@ -888,35 +902,29 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         })
 
     def test_fixed_overlap_shelter_excludes_incompatible_committed_card(self):
-        duration = 60 / constants.LB_OFFERED_ARRIVAL_CAP
+        duration = 120 / constants.LB_OFFERED_ARRIVAL_CAP
         autoscaler = _durable_autoscaler(
-            max_replicas=200, expected_request_duration_seconds=duration)
+            max_replicas=100, expected_request_duration_seconds=duration)
         autoscaler.set_configured_accelerator_shapes({
             'L4': 1,
             'A100': 1,
-            'H200': 1,
         })
         a100 = _replica(1, card='A100', planned_capacity=1)
         l4 = _replica(2, card='L4', planned_capacity=50)
         replicas = (a100, l4)
-        report = _durable_report(queue_depth=100,
-                                 in_flight={
-                                     1: 1,
-                                     2: 0,
-                                 },
+        report = _durable_report(in_flight={
+            1: 1,
+            2: 0,
+        },
                                  observed_slots={
                                      1: 1,
                                      2: 50,
                                  },
-                                 queued_profiles=[{
-                                     'priority': 20,
-                                     'compatible_accelerators': ['H200'],
-                                     'count': 100,
-                                 }],
                                  compatibility_profiles=[{
                                      'priority': 50,
                                      'compatible_accelerators': ['A100'],
-                                     'count': 1,
+                                     'count':
+                                         (constants.LB_OFFERED_ARRIVAL_CAP),
                                      'timestamp': self._INSTANT.wall_time,
                                  }])
         report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
@@ -932,10 +940,10 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                     'L4': 50,
                 })),
             charged_paid_gpu_units=51)
-        inputs = dataclasses.replace(
-            _durable_inputs(replicas),
-            cold_paid_accelerator_order=('H200', 'A100', 'L4'),
-            prospective_paid_accelerator_order=('H200', 'A100', 'L4'))
+        inputs = dataclasses.replace(_durable_inputs(replicas),
+                                     cold_paid_accelerator_order=('A100', 'L4'),
+                                     prospective_paid_accelerator_order=('A100',
+                                                                         'L4'))
 
         result = self._plan(autoscaler,
                             report=report,
@@ -948,10 +956,8 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         candidate = result.envelope.candidate
         self.assertEqual(snapshot.retirement_shelter_target.as_dict(),
                          {'A100': 1})
-        self.assertEqual(candidate.retirement_floor_target.as_dict(), {
-            'A100': 1,
-            'H200': 100,
-        })
+        self.assertEqual(candidate.retirement_floor_target.as_dict(),
+                         {'A100': 1})
         self.assertNotIn('L4', candidate.retirement_floor_target.as_dict())
 
     def test_saturated_arrival_and_terminal_rejection_are_one_request(self):
