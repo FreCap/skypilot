@@ -1822,6 +1822,134 @@ def _make_manager(service_name='svc', next_replica_id=1):
     return mgr
 
 
+def _provider_free_paid_manager(next_replica_id=1):
+    manager = _make_manager(next_replica_id=next_replica_id)
+    manager._service_hash = 'hash'
+    manager._resource_scope = 'hash'
+    manager._workspace = 'default'
+    manager._ordinary_launch_binding_authority = _binding_authority(
+        ordinary_launch_binding.BindingMode.BOUND,
+        binding_epoch=2,
+        generic=True)
+    manager.yaml_content = 'resources: {}'
+    manager._version_specs = {1: mock.Mock()}
+    cheap = make_location('us-central1-a', {'L4': 1}, cloud_name='GCP')
+    expensive = make_location('us-central1-b', {'L4': 1}, cloud_name='GCP')
+    cheap.instance_type = 'g2-standard-4'
+    expensive.instance_type = 'g2-standard-8'
+    manager._spot_placer = make_placer({cheap: 0.1, expensive: 0.2})
+    manager._spot_placer.num_nodes = 1
+    return manager, cheap, expensive
+
+
+def test_prepare_paid_launch_specs_is_bounded_cost_ordered_and_io_free():
+    manager, cheap, expensive = _provider_free_paid_manager()
+    with mock.patch.object(manager,
+                           '_task_template_for_version',
+                           return_value=mock.Mock()), \
+         mock.patch.object(replica_managers,
+                           '_get_resources_ports',
+                           return_value='8080'), \
+         mock.patch.object(replica_managers.skypilot_config,
+                           'to_dict',
+                           return_value={'api_server': {'endpoint': 'local'}}), \
+         mock.patch.object(paid_capacity, 'base_limit', return_value=2), \
+         mock.patch.object(replica_managers.serve_state,
+                           'get_spec',
+                           side_effect=AssertionError('unexpected DB read')), \
+         mock.patch.object(paid_capacity,
+                           '_active_aws_account_id_for_workspace',
+                           side_effect=AssertionError('unexpected provider')):
+        specs = manager.prepare_paid_launch_specs(
+            accelerator_shapes={'L4': 1},
+            max_gpu_units_by_accelerator={'l4': 6},
+            max_candidates=10,
+            occupied_replica_ids={1})
+
+    assert len(specs) == 6
+    assert [spec.replica_id for spec in specs] == [2, 3, 4, 5, 6, 7]
+    cheap_key = paid_capacity.pool_key(cheap, workspace='default', num_nodes=1)
+    expensive_key = paid_capacity.pool_key(expensive,
+                                           workspace='default',
+                                           num_nodes=1)
+    assert [spec.pool_key for spec in specs] == [
+        cheap_key, cheap_key, expensive_key, expensive_key, cheap_key, cheap_key
+    ]
+    assert all(spec.accelerator == 'l4' and spec.physical_gpu_units == 1
+               for spec in specs)
+    assert all(
+        paid_capacity.thaw_paid_launch_payload(spec.initial_replica_state)
+        ['planned_capacity'] == 1 for spec in specs)
+    assert all(not isinstance(value, (dict, list, set))
+               for spec in specs
+               for value in vars(spec).values())
+
+
+def test_materialize_paid_launch_receipt_builds_only_sparse_members():
+    manager, _, _ = _provider_free_paid_manager()
+    with mock.patch.object(manager,
+                           '_task_template_for_version',
+                           return_value=mock.Mock()), \
+         mock.patch.object(replica_managers,
+                           '_get_resources_ports',
+                           return_value='8080'), \
+         mock.patch.object(replica_managers.skypilot_config,
+                           'to_dict',
+                           return_value={}), \
+         mock.patch.object(paid_capacity, 'base_limit', return_value=2):
+        specs = manager.prepare_paid_launch_specs(
+            accelerator_shapes={'l4': 1},
+            max_gpu_units_by_accelerator={'l4': 2},
+            max_candidates=2,
+            occupied_replica_ids=())
+    selected = specs[1]
+    member = paid_capacity.PaidLaunchReceiptMember(
+        replica_id=selected.replica_id,
+        replica_record_id=selected.replica_record_id,
+        pool_key=selected.pool_key,
+        accelerator=selected.accelerator,
+        plan_units=1,
+        physical_gpu_units=1)
+    receipt = paid_capacity.PaidLaunchReceipt(service_name='svc',
+                                              service_hash='hash',
+                                              service_lifecycle_epoch=1,
+                                              service_version=1,
+                                              capacity_plan_generation=9,
+                                              capacity_plan_sha256='a' * 64,
+                                              capacity_unit='physical-backend',
+                                              members=(member,))
+    info = mock.Mock(replica_id=selected.replica_id,
+                     replica_record_id=selected.replica_record_id)
+    worker = mock.Mock(replica_record_id=selected.replica_record_id)
+    launch_result = replica_managers._ReplicaLaunchResult(
+        replica_id=selected.replica_id,
+        planned_capacity=1,
+        funding=replica_managers._ReplicaLaunchFunding.PAID)
+
+    def _read_committed(service_name):
+        assert not manager.lock._is_owned()
+        assert service_name == 'svc'
+        return [info]
+
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           side_effect=_read_committed) as read, \
+         mock.patch.object(manager,
+                           '_build_paid_launch_worker_postcommit',
+                           return_value=(worker, launch_result)) as build, \
+         mock.patch.object(request_postgres,
+                           'inspect_bound_ordinary_launch') as inspect:
+        materialized = manager.materialize_paid_launch_receipt(receipt, specs)
+
+    assert materialized == (launch_result,)
+    read.assert_called_once_with('svc')
+    build.assert_called_once_with(selected, member, info)
+    inspect.assert_not_called()
+    assert manager._launch_thread_pool == {selected.replica_id: worker}
+    worker.start.assert_not_called()
+    assert specs[0].replica_id not in manager._launch_thread_pool
+
+
 def _fake_replica_info(replica_id, status=None):
     info = replica_managers.ReplicaInfo(replica_id=replica_id,
                                         cluster_name=f'svc-{replica_id}',

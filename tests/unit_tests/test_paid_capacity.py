@@ -1,5 +1,6 @@
 """Tests for centralized SkyServe paid-capacity policy."""
 # pylint: disable=protected-access
+import dataclasses
 import json
 from unittest import mock
 
@@ -59,6 +60,115 @@ def _pending_info(replica_id, location):
                                         location=location,
                                         version=1,
                                         resources_override=location.to_dict())
+
+
+def _provider_free_launch_spec() -> paid_capacity.PaidLaunchSpec:
+    location = make_location('us-central1', {'L4': 1}, cloud_name='GCP')
+    location.instance_type = 'g2-standard-4'
+    pool_key = paid_capacity.pool_key(location,
+                                      workspace='default',
+                                      num_nodes=1)
+    info = _pending_info(7, location)
+    info.replica_record_id = '11111111-1111-4111-8111-111111111111'
+    info.created_at = None
+    info.paid_capacity_pool_key = pool_key
+    initial_state = paid_capacity.freeze_paid_launch_payload(
+        info.to_storage_dict())
+    override = info.to_storage_dict()['resources_override']
+    frozen_override = paid_capacity.freeze_paid_launch_payload(override)
+    worker = paid_capacity.freeze_paid_launch_payload({
+        'schema_version': 1,
+        'launch_yaml_content': 'resources: {}',
+    })
+    return paid_capacity.PaidLaunchSpec(
+        ordinal=0,
+        service_name='svc',
+        service_hash='hash',
+        service_lifecycle_epoch=2,
+        service_version=1,
+        replica_id=7,
+        replica_record_id=info.replica_record_id,
+        cluster_name_seed=info.cluster_name,
+        initial_replica_state=initial_state,
+        worker_construction=worker,
+        provider_account=None,
+        cloud='gcp',
+        workspace='default',
+        region='us-central1',
+        zone=None,
+        instance_type='g2-standard-4',
+        pool_key=pool_key,
+        frontier_key=('l4',),
+        accelerator='l4',
+        gpu_units_per_node=1,
+        num_nodes=1,
+        resources_override=frozen_override)
+
+
+def test_paid_launch_spec_is_deeply_immutable_and_provider_free():
+    source = {'nested': {'items': [1, 2]}}
+    frozen = paid_capacity.freeze_paid_launch_payload(source)
+    source['nested']['items'].append(3)
+    assert paid_capacity.thaw_paid_launch_payload(frozen) == {
+        'nested': {
+            'items': [1, 2]
+        }
+    }
+
+    spec = _provider_free_launch_spec()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.replica_id = 8
+    forbidden = {
+        'replica_info', 'location', 'callback', 'worker', 'claim',
+        'capacity_plan_generation', 'demand_feed_generation', 'priority',
+        'created_at'
+    }
+    assert forbidden.isdisjoint(
+        field.name for field in dataclasses.fields(spec))
+    assert all(not isinstance(value, (dict, list, set))
+               for value in vars(spec).values())
+
+
+def test_paid_launch_spec_decodes_only_inside_persistence_adapter():
+    spec = _provider_free_launch_spec()
+    persistence = spec.persistence_spec(priority=17, frontier_limit=3)
+
+    assert persistence.candidate.replica_id == spec.replica_id
+    assert persistence.candidate.replica_info.replica_record_id == (
+        spec.replica_record_id)
+    assert persistence.candidate.location.to_pickleable() == (
+        persistence.candidate.replica_info.location)
+    assert persistence.candidate.capacity_plan_claim is None
+    assert persistence.pool_key == spec.pool_key
+    assert persistence.frontier_key == ('l4',)
+    assert persistence.frontier_limit == 3
+
+
+def test_paid_launch_receipt_is_sparse_accepted_identity_only():
+    spec = _provider_free_launch_spec()
+    member = paid_capacity.PaidLaunchReceiptMember(
+        replica_id=spec.replica_id,
+        replica_record_id=spec.replica_record_id,
+        pool_key=spec.pool_key,
+        accelerator='l4',
+        plan_units=1,
+        physical_gpu_units=1)
+    receipt = paid_capacity.PaidLaunchReceipt(service_name='svc',
+                                              service_hash='hash',
+                                              service_lifecycle_epoch=2,
+                                              service_version=1,
+                                              capacity_plan_generation=4,
+                                              capacity_plan_sha256='a' * 64,
+                                              capacity_unit='logical-gpu',
+                                              members=(member,))
+
+    assert receipt.members == (member,)
+    assert 'outcome' not in {field.name for field in dataclasses.fields(member)}
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        receipt.members = ()
+    with pytest.raises(ValueError, match='canonical'):
+        dataclasses.replace(spec,
+                            replica_record_id=f'{{{spec.replica_record_id}}}')
 
 
 def _paid_launch_authority(
