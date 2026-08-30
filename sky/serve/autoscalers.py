@@ -4893,11 +4893,15 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 continue
             priority = profile.get('priority')
             accelerators = profile.get('compatible_accelerators')
-            recent_count = profile.get('recent_count', profile.get('count', 1))
+            count = profile.get('count', 1)
+            recent_count = profile.get('recent_count', count)
             if (not isinstance(priority, int) or isinstance(priority, bool) or
                     not isinstance(accelerators, list) or not accelerators or
+                    not isinstance(count, int) or isinstance(count, bool) or
+                    count < 1 or
                     not isinstance(recent_count, int) or
-                    isinstance(recent_count, bool) or recent_count < 1 or
+                    isinstance(recent_count, bool) or recent_count < 0 or
+                    recent_count > count or
                     not all(
                         isinstance(item, str) and item
                         for item in accelerators)):
@@ -4905,6 +4909,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             rejected_profiles.append({
                 'priority': priority,
                 'compatible_accelerators': tuple(accelerators),
+                'count': count,
                 'recent_count': recent_count,
             })
         self.rejected_compatibility_profiles = rejected_profiles
