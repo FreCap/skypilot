@@ -2,11 +2,14 @@
 # pylint: disable=protected-access
 import copy
 import datetime
+from unittest import mock
 
+import fastapi
 import pytest
 
 from sky.serve import constants
 from sky.serve import demand_state
+from sky.serve import load_balancer
 
 
 def _report() -> dict:
@@ -87,6 +90,34 @@ def test_validate_report_accepts_complete_bounded_snapshot():
 
     assert normalized['sequence'] == 1
     assert len(digest) == 64
+    assert complete is True
+
+
+def test_validate_report_accepts_one_waiter_authoritative_queue_snapshot():
+    """Outer retry pressure cannot corrupt the exact waiter queue contract."""
+    lb = load_balancer.SkyServeLoadBalancer('http://controller:8001', 30001)
+    lb._configured_accelerators = ('L4',)
+    lb._queue_depth = 776
+    lb._queue_depth_by_priority = {50: 776}
+    now = 10_000.0
+    waiters: dict[int, load_balancer._RequestQueueWaiter] = {}
+    for sequence in range(353):
+        request = mock.MagicMock(spec=fastapi.Request)
+        setattr(request, '_skyserve_compatible_accelerators', ('L4',))
+        waiters[sequence] = load_balancer._RequestQueueWaiter(
+            request=request,
+            priority=50,
+            sequence=sequence,
+            future=mock.MagicMock(),
+            deadline_monotonic=now + 600)
+    lb._request_queue_waiters = {50: waiters}
+    report = _report()
+    report.update(lb._request_queue_demand_snapshot(now).payload())
+
+    normalized, _, complete = demand_state._validate_report(report)
+
+    assert normalized['queue_depth'] == 353
+    assert normalized['retry_handler_depth'] == 776
     assert complete is True
 
 

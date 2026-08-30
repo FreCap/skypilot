@@ -7,8 +7,11 @@ controller's capacity_hint for /_lb/capacity readers.
 """
 # pylint: disable=protected-access,use-implicit-booleaness-not-comparison
 import asyncio
+import dataclasses
 import hashlib
 import time
+import types
+from typing import Any
 from unittest import mock
 
 import fastapi
@@ -646,7 +649,7 @@ def _run_sync(lb, response_payload):
             'max_retries': lb._max_retries,
             'retry_initial_backoff_seconds': lb._retry_initial_backoff_seconds,
         })
-    captured = {}
+    captured: dict[str, Any] = {}
     with mock.patch.object(lb_module.aiohttp, 'ClientSession',
                            lambda: _FakeSession(response_payload, captured)), \
          mock.patch.object(lb_module.serve_utils,
@@ -703,7 +706,8 @@ def test_sync_payload_carries_demand_gauges():
     body = captured['json']
     assert body['routing_version'] == 7
     assert body['in_flight'] == {'http://a:8080': 2}
-    assert body['queue_depth'] == 3
+    assert body['queue_depth'] == 0
+    assert body['retry_handler_depth'] == 3
     assert body['rejected_in_window'] == 1
     assert body['rejected_in_recent_window'] == 1
     assert body['rejected_requests_by_compatibility'] == []
@@ -712,6 +716,66 @@ def test_sync_payload_carries_demand_gauges():
     # aggregator keeps clear-on-report semantics).
     assert lb._queue_depth == 3
     assert lb._rejected_in_window() == 1
+
+
+def test_demand_queue_snapshot_does_not_mix_retry_handlers_with_waiters():
+    """Incident regression: one mixed snapshot caused deterministic HTTP 400."""
+    lb = _make_lb()
+    lb._configured_accelerators = ('L4',)
+    lb._queue_depth = 776
+    lb._queue_depth_by_priority = {50: 776}
+    now = 10_000.0
+    waiters = {}
+    for sequence in range(353):
+        request = types.SimpleNamespace()
+        setattr(request, '_skyserve_compatible_accelerators', ('L4',))
+        waiters[sequence] = types.SimpleNamespace(request=request,
+                                                  abandoned=False,
+                                                  deadline_monotonic=now + 600)
+    lb._request_queue_waiters = {50: waiters}
+
+    snapshot = lb._request_queue_demand_snapshot(now)
+    payload = snapshot.payload()
+
+    assert snapshot.queue_depth == 353
+    assert payload['queue_depth_by_priority'] == {'50': 353}
+    assert sum(
+        profile['count']
+        for profile in payload['queued_requests_by_compatibility']) == 353
+    assert sum(profile['count']
+               for profile in payload['queued_request_deadline_buckets']) == 353
+    assert payload['retry_handler_depth'] == 776
+    assert payload['retry_handler_depth_by_priority'] == {'50': 776}
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(snapshot, 'queue_depth', 776)
+
+
+def test_rejection_snapshot_uses_one_recent_cutoff():
+    lb = _make_lb()
+    lb._configured_accelerators = ('L4',)
+    now = 10_000.0
+    recent = _request(job_id='recent')
+    retained = _request(job_id='retained')
+    for request in (recent, retained):
+        request._skyserve_request_priority = 50
+        request._skyserve_compatible_accelerators = ('L4',)
+        lb._record_rejection(request)
+    lb._reject_last_seen['recent'] = (now - 1, 50)
+    lb._reject_last_seen['retained'] = (
+        now - constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS - 1, 50)
+
+    payload = lb._rejected_demand_snapshot(now).payload()
+
+    assert payload['rejected_in_window'] == 2
+    assert payload['rejected_in_recent_window'] == 1
+    assert payload['rejected_in_window_by_priority'] == {'50': 2}
+    assert payload['rejected_in_recent_window_by_priority'] == {'50': 1}
+    assert payload['rejected_requests_by_compatibility'] == [{
+        'priority': 50,
+        'compatible_accelerators': ['L4'],
+        'count': 2,
+        'recent_count': 1,
+    }]
 
 
 def test_declared_async_replica_is_unknown_before_first_probe():
