@@ -28,6 +28,7 @@ from sqlalchemy.dialects import postgresql
 from sky.adaptors import common as adaptors_common
 from sky.serve import capacity_admission_schema
 from sky.serve import capacity_planning
+from sky.serve import compatibility_matching
 from sky.serve import constants
 from sky.serve import demand_state
 from sky.serve import demand_state_schema
@@ -1065,8 +1066,8 @@ class CommittedFillDemandWitness:
     capacity_plan_generation: int
     capacity_plan_sha256: str
     target_capacity: int
-    reservation_acquisition_target_by_accelerator: (
-        capacity_planning.AcceleratorCapacity | None)
+    reservation_acquisition_classes: (
+        tuple[compatibility_matching.CompatibilityDemand, ...] | None)
     semantic_sha256: str
     refreshed_at: datetime.datetime
 
@@ -1086,11 +1087,13 @@ class CommittedFillDemandWitness:
                 any(type(value) is not int or value < 1 for value in positive)
                 or type(self.target_capacity) is not int or
                 self.target_capacity < 0 or
-            (self.reservation_acquisition_target_by_accelerator is not None and
-             (not isinstance(self.reservation_acquisition_target_by_accelerator,
-                             capacity_planning.AcceleratorCapacity) or
-              self.reservation_acquisition_target_by_accelerator.total()
-              > self.target_capacity)) or
+            (self.reservation_acquisition_classes is not None and
+             (not isinstance(self.reservation_acquisition_classes, tuple) or
+              any(not isinstance(item,
+                                 compatibility_matching.CompatibilityDemand)
+                  for item in self.reservation_acquisition_classes) or
+              sum(item.count for item in self.reservation_acquisition_classes)
+              != self.target_capacity)) or
                 _SHA256_RE.fullmatch(self.route_sha256) is None or
                 _SHA256_RE.fullmatch(self.capacity_plan_sha256) is None or
                 _SHA256_RE.fullmatch(self.semantic_sha256) is None or
@@ -3261,17 +3264,11 @@ class CapacityAdmissionRepository:
                     candidate.reservation_demand_relation
                     is capacity_planning.ReservationDemandRelation.COMPATIBLE)
                 if reservation_compatible:
-                    reservation_acquisition_target = (
-                        capacity_planning.
-                        demand_witness_exact_reservation_target(
-                            planner_snapshot,
-                            candidate.demand_attribution,
-                            aggregate_demand_target=(
-                                candidate.aggregate_demand_target),
-                            raw_demand_target=candidate.raw_demand_target))
+                    reservation_acquisition_classes = (
+                        candidate.reservation_acquisition_classes)
                     target_capacity = candidate.aggregate_demand_target
                 else:
-                    reservation_acquisition_target = None
+                    reservation_acquisition_classes = None
                     target_capacity = 0
                 return CommittedFillDemandWitness(
                     service_name=service_name,
@@ -3286,8 +3283,8 @@ class CapacityAdmissionRepository:
                     capacity_plan_generation=int(plan['generation']),
                     capacity_plan_sha256=str(content_sha256),
                     target_capacity=target_capacity,
-                    reservation_acquisition_target_by_accelerator=(
-                        reservation_acquisition_target),
+                    reservation_acquisition_classes=(
+                        reservation_acquisition_classes),
                     semantic_sha256=semantic_sha256,
                     refreshed_at=refreshed_at)
             except (KeyError, TypeError, ValueError,

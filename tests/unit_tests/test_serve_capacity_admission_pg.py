@@ -2075,8 +2075,8 @@ def test_fill_demand_witness_rebinds_equivalent_heartbeat(
     assert refreshed.capacity_plan_generation == initial.capacity_plan_generation
     assert refreshed.semantic_sha256 == initial.semantic_sha256
     assert refreshed.target_capacity == initial.target_capacity
-    assert refreshed.reservation_acquisition_target_by_accelerator == (
-        initial.reservation_acquisition_target_by_accelerator)
+    assert refreshed.reservation_acquisition_classes == (
+        initial.reservation_acquisition_classes)
 
     demand_state.ingest_report(
         'svc', 'svc-hash',

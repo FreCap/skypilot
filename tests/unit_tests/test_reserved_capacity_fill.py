@@ -14,6 +14,7 @@ import copy
 import dataclasses
 import datetime
 import functools
+import json
 import os
 import pathlib
 import subprocess
@@ -36,6 +37,7 @@ from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.serve import autoscalers
 from sky.serve import capacity_admission
 from sky.serve import capacity_planning
+from sky.serve import compatibility_matching
 from sky.serve import constants
 from sky.serve import ordinary_launch_binding
 from sky.serve import placement_policy
@@ -6672,7 +6674,10 @@ class TestQueryFreeSlots(unittest.TestCase):
 
     def _fill_witness(
         self,
-        target: capacity_planning.AcceleratorCapacity | None,
+        classes: (tuple[compatibility_matching.CompatibilityDemand, ...] |
+                  None),
+        *,
+        target_capacity: int = 1,
     ) -> capacity_admission.CommittedFillDemandWitness:
         return capacity_admission.CommittedFillDemandWitness(
             service_name='svc',
@@ -6686,12 +6691,12 @@ class TestQueryFreeSlots(unittest.TestCase):
             route_source_epoch=1,
             capacity_plan_generation=1,
             capacity_plan_sha256='b' * 64,
-            target_capacity=1,
-            reservation_acquisition_target_by_accelerator=target,
+            target_capacity=target_capacity,
+            reservation_acquisition_classes=classes,
             semantic_sha256='c' * 64,
             refreshed_at=datetime.datetime.now(datetime.timezone.utc))
 
-    def test_flexible_witness_cannot_settle_or_unlock_paid_residual(self):
+    def test_missing_classes_cannot_settle_or_unlock_paid_residual(self):
         authority = reserved_capacity.demand_scoped_fill_pool_authority(
             self._fill_witness(None))
 
@@ -6699,22 +6704,62 @@ class TestQueryFreeSlots(unittest.TestCase):
                       reserved_capacity.FillPoolBudgetMode.HOLDINGS_ONLY)
         self.assertIsNone(authority.demonstrated_need)
         self.assertIsNone(authority.demand_witness_sha256)
-        self.assertIsNone(authority.exact_demand_target_by_accelerator)
+        self.assertIsNone(authority.acquisition_classes)
 
-    def test_exact_witness_authorizes_only_its_card_target(self):
+    def test_flexible_witness_authorizes_the_canonical_match(self):
+        classes = (compatibility_matching.CompatibilityDemand(
+            priority=3, compatible_cards=('a100', 'h200'), count=1),)
         authority = reserved_capacity.demand_scoped_fill_pool_authority(
-            self._fill_witness(
-                capacity_planning.AcceleratorCapacity.from_mapping({'A100': 1
-                                                                   })))
+            self._fill_witness(classes))
 
         self.assertIs(authority.mode,
-                      reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON)
+                      reserved_capacity.FillPoolBudgetMode.MATCHED)
         self.assertEqual(authority.demand_target_capacity, 1)
         self.assertEqual(authority.demonstrated_need, 1)
         self.assertEqual(authority.demand_witness_sha256, 'c' * 64)
-        self.assertEqual(
-            authority.exact_demand_target_by_accelerator,
-            capacity_planning.AcceleratorCapacity.from_mapping({'A100': 1}))
+        self.assertEqual(authority.acquisition_classes, classes)
+
+    def test_empty_classes_preserve_proven_zero_through_bounded_release(self):
+        authority = reserved_capacity.demand_scoped_fill_pool_authority(
+            self._fill_witness((), target_capacity=0))
+
+        self.assertIs(authority.mode,
+                      reserved_capacity.FillPoolBudgetMode.HOLDINGS_ONLY)
+        self.assertEqual(authority.demand_target_capacity, 0)
+        self.assertEqual(authority.demonstrated_need, 0)
+        self.assertIsNone(authority.demand_witness_sha256)
+        self.assertIsNone(authority.acquisition_classes)
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            3,
+            0, (reserved_capacity.FillPoolBudgetInput(
+                2, 10), reserved_capacity.FillPoolBudgetInput(2, 10)),
+            mode=authority.mode)
+        self.assertEqual([budget.edge_cap for budget in budgets], [2, 1])
+
+    def test_old_exact_target_claim_shape_fails_closed(self):
+        state = {
+            'cap': 1,
+            'hot_until': 2.0,
+            'stepped_at': 1.0,
+            'blind_since': None,
+            'demonstrated_need': 1,
+            'boot_hold': False,
+            'blind': False,
+            'demand_witness_sha256': 'd' * 64,
+            'reservation_acquisition_target_by_accelerator': {
+                'a100': 1,
+            },
+        }
+
+        allocation_module = reserved_capacity.reserved_fill_allocation
+        with self.assertRaisesRegex(
+                allocation_module.ReservedFillAllocationCorruptionError,
+                'unsupported shape'):
+            allocation_module._claim_utilization_authority({
+                'utilization_ceiling': 1,
+                'global_headroom': 1,
+                'utilization_state': json.dumps(state),
+            })
 
     def _exact_pool_snapshot(
         self,
@@ -6767,15 +6812,60 @@ class TestQueryFreeSlots(unittest.TestCase):
         rounds = {
             snapshot.pool_key: {
                 'sum_holdings': 0,
-                'last_observed_free': 100,
+                'feed_by_accelerator': json.dumps({
+                    reserved_capacity_broker.OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+                        'a100': 100
+                    },
+                    reserved_capacity_broker.SPENDABLE_FREE_BY_ACCELERATOR_KEY:
+                        {
+                            'a100': 100
+                        },
+                }),
             }
         }
+        edges = ({
+            'holdings_fill': 0,
+            'launchable': True,
+            'pool_position': 0,
+        },)
+        classes = (compatibility_matching.CompatibilityDemand(
+            priority=0, compatible_cards=('a100',), count=100),)
 
         self.assertFalse(
             reserved_capacity.reserved_fill_allocation.
             ReservedFillAllocationRepository.
-            _reservation_acquisition_is_complete({'a100': 100}, (snapshot,),
-                                                 rounds))
+            _reservation_acquisition_is_complete(classes, (snapshot,), rounds,
+                                                 edges, 100))
+
+    def test_settled_zero_cannot_cover_positive_compatible_supply(self):
+        snapshot = self._exact_pool_snapshot(0)
+        rounds = {
+            snapshot.pool_key: {
+                'sum_holdings': 0,
+                'feed_by_accelerator': json.dumps({
+                    reserved_capacity_broker.OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+                        'a100': 10
+                    },
+                    reserved_capacity_broker.SPENDABLE_FREE_BY_ACCELERATOR_KEY:
+                        {
+                            'a100': 10
+                        },
+                }),
+            }
+        }
+        edges = ({
+            'holdings_fill': 0,
+            'launchable': True,
+            'pool_position': 0,
+        },)
+        classes = (compatibility_matching.CompatibilityDemand(
+            priority=0, compatible_cards=('a100',), count=1),)
+
+        self.assertFalse(
+            reserved_capacity.reserved_fill_allocation.
+            ReservedFillAllocationRepository.
+            _reservation_acquisition_is_complete(classes, (snapshot,), rounds,
+                                                 edges, 0))
 
     def test_discovery_cap_settles_at_target_or_observed_maximum(self):
         for edge_cap, observed in ((100, 100), (47, 47)):
@@ -6783,15 +6873,31 @@ class TestQueryFreeSlots(unittest.TestCase):
             rounds = {
                 snapshot.pool_key: {
                     'sum_holdings': 0,
-                    'last_observed_free': observed,
+                    'feed_by_accelerator': json.dumps({
+                        reserved_capacity_broker.OBSERVED_FREE_BY_ACCELERATOR_KEY:
+                            {
+                                'a100': observed
+                            },
+                        reserved_capacity_broker.SPENDABLE_FREE_BY_ACCELERATOR_KEY:
+                            {
+                                'a100': observed
+                            },
+                    }),
                 }
             }
+            edges = ({
+                'holdings_fill': 0,
+                'launchable': True,
+                'pool_position': 0,
+            },)
+            classes = (compatibility_matching.CompatibilityDemand(
+                priority=0, compatible_cards=('a100',), count=100),)
 
             self.assertTrue(
                 reserved_capacity.reserved_fill_allocation.
                 ReservedFillAllocationRepository.
-                _reservation_acquisition_is_complete({'a100': 100}, (snapshot,),
-                                                     rounds))
+                _reservation_acquisition_is_complete(classes, (snapshot,),
+                                                     rounds, edges, 100))
 
     def test_discovery_caps_cannot_transfer_between_same_card_pools(self):
         east = self._exact_pool_snapshot(100,
@@ -6803,32 +6909,112 @@ class TestQueryFreeSlots(unittest.TestCase):
         rounds = {
             east.pool_key: {
                 'sum_holdings': 0,
-                'last_observed_free': 0,
+                'feed_by_accelerator': json.dumps({
+                    reserved_capacity_broker.OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+                        'a100': 0
+                    },
+                    reserved_capacity_broker.SPENDABLE_FREE_BY_ACCELERATOR_KEY:
+                        {
+                            'a100': 0
+                        },
+                }),
             },
             phx.pool_key: {
                 'sum_holdings': 0,
-                'last_observed_free': 100,
+                'feed_by_accelerator': json.dumps({
+                    reserved_capacity_broker.OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+                        'a100': 100
+                    },
+                    reserved_capacity_broker.SPENDABLE_FREE_BY_ACCELERATOR_KEY:
+                        {
+                            'a100': 100
+                        },
+                }),
             },
         }
+        edges = ({
+            'holdings_fill': 0,
+            'launchable': True,
+            'pool_position': 0,
+        }, {
+            'holdings_fill': 0,
+            'launchable': True,
+            'pool_position': 1,
+        })
+        classes = (compatibility_matching.CompatibilityDemand(
+            priority=0, compatible_cards=('a100',), count=100),)
 
         self.assertFalse(
             reserved_capacity.reserved_fill_allocation.
             ReservedFillAllocationRepository.
-            _reservation_acquisition_is_complete({'a100': 100}, (east, phx),
-                                                 rounds))
+            _reservation_acquisition_is_complete(classes, (east, phx), rounds,
+                                                 edges, 100))
 
     def test_demand_budget_funds_exact_card_before_pool_order(self):
+        classes = (compatibility_matching.CompatibilityDemand(
+            priority=0, compatible_cards=('a100',), count=1),)
         budgets = reserved_capacity.allocate_fill_pool_budgets(
             2,
             0, (
-                reserved_capacity.FillPoolBudgetInput(0, 10, ('h200',)),
-                reserved_capacity.FillPoolBudgetInput(0, 10, ('a100-80gb',)),
-                reserved_capacity.FillPoolBudgetInput(0, 10, ('a100',)),
+                reserved_capacity.FillPoolBudgetInput(0, 10, ('h200',), 'h'),
+                reserved_capacity.FillPoolBudgetInput(0, 10,
+                                                      ('a100-80gb',), 'a80'),
+                reserved_capacity.FillPoolBudgetInput(0, 10, ('a100',), 'a'),
             ),
-            mode=reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON,
+            mode=reserved_capacity.FillPoolBudgetMode.MATCHED,
             demand_target_capacity=1,
-            exact_demand_target_by_accelerator={'A100': 1})
+            acquisition_classes=classes)
         self.assertEqual([budget.edge_cap for budget in budgets], [0, 0, 1])
+
+    def test_flexible_budget_uses_complete_compatibility_match(self):
+        classes = (
+            compatibility_matching.CompatibilityDemand(
+                priority=0, compatible_cards=('a100', 'h200'), count=2),
+            compatibility_matching.CompatibilityDemand(priority=0,
+                                                       compatible_cards=('a100',
+                                                                         'l4'),
+                                                       count=1),
+        )
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            3,
+            0, (
+                reserved_capacity.FillPoolBudgetInput(0, 1, ('a100',), 'a'),
+                reserved_capacity.FillPoolBudgetInput(0, 1, ('h200',), 'h'),
+                reserved_capacity.FillPoolBudgetInput(0, 1, ('l4',), 'l'),
+            ),
+            mode=reserved_capacity.FillPoolBudgetMode.MATCHED,
+            demand_target_capacity=3,
+            acquisition_classes=classes)
+        self.assertEqual([budget.edge_cap for budget in budgets], [1, 1, 1])
+
+    def test_matched_budget_supports_duplicate_same_card_pools(self):
+        classes = (compatibility_matching.CompatibilityDemand(
+            priority=0, compatible_cards=('a100',), count=2),)
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            2,
+            0, (
+                reserved_capacity.FillPoolBudgetInput(0, 1,
+                                                      ('a100',), 'east-a100'),
+                reserved_capacity.FillPoolBudgetInput(0, 1,
+                                                      ('a100',), 'phx-a100'),
+            ),
+            mode=reserved_capacity.FillPoolBudgetMode.MATCHED,
+            demand_target_capacity=2,
+            acquisition_classes=classes)
+        self.assertEqual([budget.edge_cap for budget in budgets], [1, 1])
+
+    def test_matched_budget_uses_partial_service_ceiling(self):
+        classes = (compatibility_matching.CompatibilityDemand(
+            priority=0, compatible_cards=('a100',), count=100),)
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            10,
+            0, (reserved_capacity.FillPoolBudgetInput(0, 100,
+                                                      ('a100',), 'east-a100'),),
+            mode=reserved_capacity.FillPoolBudgetMode.MATCHED,
+            demand_target_capacity=100,
+            acquisition_classes=classes)
+
+        self.assertEqual([budget.edge_cap for budget in budgets], [10])
 
     def test_holdings_only_never_acquires_a_new_pool(self):
         budgets = reserved_capacity.allocate_fill_pool_budgets(
@@ -6841,69 +7027,84 @@ class TestQueryFreeSlots(unittest.TestCase):
         self.assertEqual([budget.edge_cap for budget in budgets], [1, 0])
 
     def test_exact_budget_drops_incompatible_holding_before_acquisition(self):
+        classes = (compatibility_matching.CompatibilityDemand(
+            priority=0, compatible_cards=('a100',), count=1),)
         budgets = reserved_capacity.allocate_fill_pool_budgets(
             1,
             0, (
-                reserved_capacity.FillPoolBudgetInput(1, 10, ('h200',)),
-                reserved_capacity.FillPoolBudgetInput(0, 10, ('a100',)),
+                reserved_capacity.FillPoolBudgetInput(1, 10, ('h200',), 'h'),
+                reserved_capacity.FillPoolBudgetInput(0, 10, ('a100',), 'a'),
             ),
-            mode=reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON,
+            mode=reserved_capacity.FillPoolBudgetMode.MATCHED,
             demand_target_capacity=1,
-            exact_demand_target_by_accelerator={'A100': 1})
+            acquisition_classes=classes)
         self.assertEqual([budget.edge_cap for budget in budgets], [0, 1])
 
     def test_exact_budget_ignores_headroom_for_paid_only_demand(self):
+        classes = (
+            compatibility_matching.CompatibilityDemand(
+                priority=0, compatible_cards=('a100',), count=1),
+            compatibility_matching.CompatibilityDemand(priority=0,
+                                                       compatible_cards=('l4',),
+                                                       count=100),
+        )
         budgets = reserved_capacity.allocate_fill_pool_budgets(
             127,
             0, (
-                reserved_capacity.FillPoolBudgetInput(0, 200, ('h200',)),
-                reserved_capacity.FillPoolBudgetInput(0, 200, ('a100',)),
+                reserved_capacity.FillPoolBudgetInput(0, 200, ('h200',), 'h'),
+                reserved_capacity.FillPoolBudgetInput(0, 200, ('a100',), 'a'),
             ),
-            mode=reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON,
+            mode=reserved_capacity.FillPoolBudgetMode.MATCHED,
             demand_target_capacity=101,
-            exact_demand_target_by_accelerator={'A100': 1})
+            acquisition_classes=classes)
         self.assertEqual([budget.edge_cap for budget in budgets], [0, 1])
 
     def test_exact_budget_does_not_transfer_unavailable_card_target(self):
+        classes = (
+            compatibility_matching.CompatibilityDemand(
+                priority=0, compatible_cards=('a100',), count=1),
+            compatibility_matching.CompatibilityDemand(
+                priority=0, compatible_cards=('h200',), count=1),
+        )
         budgets = reserved_capacity.allocate_fill_pool_budgets(
             2,
             0, (
-                reserved_capacity.FillPoolBudgetInput(0, 0, ('a100',)),
-                reserved_capacity.FillPoolBudgetInput(0, 2, ('h200',)),
+                reserved_capacity.FillPoolBudgetInput(0, 0, ('a100',), 'a'),
+                reserved_capacity.FillPoolBudgetInput(0, 2, ('h200',), 'h'),
             ),
-            mode=reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON,
+            mode=reserved_capacity.FillPoolBudgetMode.MATCHED,
             demand_target_capacity=2,
-            exact_demand_target_by_accelerator={
-                'A100': 1,
-                'H200': 1
-            })
+            acquisition_classes=classes)
         self.assertEqual([budget.edge_cap for budget in budgets], [0, 1])
 
     def test_exact_budget_clips_holdings_per_card_before_filling_peer(self):
+        classes = (
+            compatibility_matching.CompatibilityDemand(
+                priority=0, compatible_cards=('a100',), count=1),
+            compatibility_matching.CompatibilityDemand(
+                priority=0, compatible_cards=('h200',), count=2),
+        )
         budgets = reserved_capacity.allocate_fill_pool_budgets(
             3,
             0, (
-                reserved_capacity.FillPoolBudgetInput(3, 3, ('a100',)),
-                reserved_capacity.FillPoolBudgetInput(0, 2, ('h200',)),
+                reserved_capacity.FillPoolBudgetInput(3, 3, ('a100',), 'a'),
+                reserved_capacity.FillPoolBudgetInput(0, 2, ('h200',), 'h'),
             ),
-            mode=reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON,
+            mode=reserved_capacity.FillPoolBudgetMode.MATCHED,
             demand_target_capacity=3,
-            exact_demand_target_by_accelerator={
-                'A100': 1,
-                'H200': 2
-            })
+            acquisition_classes=classes)
         self.assertEqual([budget.edge_cap for budget in budgets], [1, 2])
 
     def test_exact_budget_rejects_multi_card_pool(self):
         with self.assertRaisesRegex(ValueError, 'one exact accelerator'):
             reserved_capacity.allocate_fill_pool_budgets(
                 1,
-                0,
-                (reserved_capacity.FillPoolBudgetInput(0, 1,
-                                                       ('a100', 'h200')),),
-                mode=reserved_capacity.FillPoolBudgetMode.EXACT_SINGLETON,
+                0, (reserved_capacity.FillPoolBudgetInput(
+                    0, 1, ('a100', 'h200'), 'composite'),),
+                mode=reserved_capacity.FillPoolBudgetMode.MATCHED,
                 demand_target_capacity=1,
-                exact_demand_target_by_accelerator={'A100': 1})
+                acquisition_classes=(compatibility_matching.CompatibilityDemand(
+                    priority=0, compatible_cards=('a100',), count=1),))
 
     def test_context_groups_keep_first_position_and_canonical_shapes(self):
         locations = [

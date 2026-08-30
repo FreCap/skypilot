@@ -4,6 +4,8 @@ import enum
 import math
 import typing
 
+from sky.serve import compatibility_matching
+
 if typing.TYPE_CHECKING:
     from sky.serve import replica_managers
 
@@ -13,6 +15,52 @@ class SupplyPreference(enum.Enum):
 
     WARM_FIRST = 'warm_first'
     ZERO_COST_FIRST = 'zero_cost_first'
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class CompatibilityTargetPlan:
+    """One exact-card target and its optional demand-owned reduction."""
+
+    target_entries: tuple[tuple[str, int], ...]
+    reservation_acquisition_classes: (
+        tuple[compatibility_matching.CompatibilityDemand, ...] | None)
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.target_entries, tuple) or
+                any(not isinstance(entry, tuple) or len(entry) != 2 or
+                    not isinstance(entry[0], str) or not entry[0] or
+                    type(entry[1]) is not int or entry[1] <= 0
+                    for entry in self.target_entries)):
+            raise ValueError('Compatibility target is malformed.')
+        if len({card.casefold() for card, _ in self.target_entries
+               }) != len(self.target_entries):
+            raise ValueError('Compatibility target repeats an accelerator.')
+        classes = self.reservation_acquisition_classes
+        if (classes is not None and (not isinstance(classes, tuple) or any(
+                not isinstance(item, compatibility_matching.CompatibilityDemand)
+                for item in classes))):
+            raise ValueError('Compatibility demand ownership is malformed.')
+        if (classes is not None and any(card != card.casefold()
+                                        for item in classes
+                                        for card in item.compatible_cards)):
+            raise ValueError('Compatibility demand ownership is not canonical.')
+        if (classes is not None and sum(item.count for item in classes) != sum(
+                count for _, count in self.target_entries)):
+            raise ValueError('Compatibility demand ownership is incomplete.')
+
+    def as_dict(self) -> dict[str, int]:
+        return dict(self.target_entries)
+
+
+@dataclasses.dataclass
+class _DemandOwnedSlot:
+    """Mutable fractional-work bin used only during one pure reduction."""
+
+    ordinal: int
+    card: str
+    unused_work: float
+    priority: int | None = None
+    compatible_cards: frozenset[str] | None = None
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -73,12 +121,15 @@ class DeadlineCapacityPlan:
 
     target_by_card: dict[str, int]
     infeasible_requests_by_priority: dict[int, float]
+    reservation_acquisition_classes: tuple[
+        compatibility_matching.CompatibilityDemand, ...] = ()
 
 
 @dataclasses.dataclass
 class _ActiveDeadlineSlot:
     card: str
     available_after_seconds: float
+    priority: int | None = None
 
 
 def _allocate_deadline_capacity_target(
@@ -172,10 +223,13 @@ def _allocate_deadline_capacity_target(
         return max(0.0, deadline - slot.available_after_seconds) * (
             utilization / duration[slot.card])
 
-    def _consume(slot: _ActiveDeadlineSlot, deadline: float,
-                 remaining: float) -> float:
+    def _consume(slot: _ActiveDeadlineSlot, deadline: float, remaining: float,
+                 *, priority: int) -> float:
         capacity = _slot_capacity(slot, deadline)
         used = min(remaining, capacity)
+        if used > epsilon:
+            slot.priority = (priority if slot.priority is None else max(
+                slot.priority, priority))
         slot.available_after_seconds += used * duration[slot.card] / utilization
         return remaining - used
 
@@ -230,7 +284,10 @@ def _allocate_deadline_capacity_target(
                         compatible_active,
                         key=lambda slot: _slot_capacity(slot, deadline),
                         reverse=True):
-                    remaining = _consume(slot, deadline, remaining)
+                    remaining = _consume(slot,
+                                         deadline,
+                                         remaining,
+                                         priority=priority)
                     if remaining <= epsilon:
                         break
 
@@ -259,7 +316,10 @@ def _allocate_deadline_capacity_target(
                         continue
                     active.append(slot)
                     target[slot.card] += 1
-                    remaining = _consume(slot, deadline, remaining)
+                    remaining = _consume(slot,
+                                         deadline,
+                                         remaining,
+                                         priority=priority)
 
                 if remaining > epsilon:
                     infeasible[priority] = (infeasible.get(priority, 0.0) +
@@ -298,11 +358,26 @@ def _allocate_deadline_capacity_target(
                         active.append(slot)
                         target[slot.card] += 1
                         assigned = min(1.0, remaining)
+                        slot.priority = priority
                         slot.available_after_seconds += (assigned *
                                                          duration[slot.card] /
                                                          utilization)
                         remaining -= assigned
 
+    acquisition: dict[tuple[int, tuple[str, ...]], int] = {}
+    for slot in active:
+        if slot.priority is None:
+            continue
+        # The deadline planner selected this exact card from a capacity-time
+        # curve.  It has not proved that relocating the slot preserves the
+        # service-time/SLA schedule, so reservation acquisition must pin it.
+        acquisition_key = (slot.priority, (slot.card.casefold(),))
+        acquisition[acquisition_key] = acquisition.get(acquisition_key, 0) + 1
+    classes = tuple(
+        compatibility_matching.CompatibilityDemand(
+            priority=priority, compatible_cards=compatible, count=count)
+        for (priority, compatible), count in sorted(
+            acquisition.items(), key=lambda item: (-item[0][0], item[0][1])))
     return DeadlineCapacityPlan(target_by_card={
         card: count for card, count in target.items() if count > 0
     },
@@ -310,10 +385,11 @@ def _allocate_deadline_capacity_target(
                                     priority: count
                                     for priority, count in infeasible.items()
                                     if count > epsilon
-                                })
+                                },
+                                reservation_acquisition_classes=classes)
 
 
-def _allocate_compatibility_target(
+def _plan_compatibility_target(
     *,
     configured_cards: list[str],
     capacities: dict[str, float],
@@ -330,8 +406,8 @@ def _allocate_compatibility_target(
     supply_preference: SupplyPreference,
     cold_order: list[str],
     use_existing_supply: bool,
-) -> dict[str, int]:
-    """Allocate exact-card work into one bounded per-card target.
+) -> CompatibilityTargetPlan:
+    """Allocate exact-card work and reduce its demand-owned capacity classes.
 
     `fixed_work_by_accelerator` is already-running or conservatively unknown
     work. It cannot move without preemption, so it consumes capacity only on
@@ -349,6 +425,43 @@ def _allocate_compatibility_target(
     under either policy.
     """
     demand_epsilon = 1e-9
+    canonical_by_name = {card.casefold(): card for card in configured_cards}
+    capacity_by_card = {
+        card: max(0.0, float(capacities.get(card, 0.0)))
+        for card in configured_cards
+    }
+    ownership_supported = True
+    fixed_priority = max((priority for priority, _, work in demand_profiles
+                          if work > demand_epsilon),
+                         default=0)
+    owned_slots: list[_DemandOwnedSlot] = []
+
+    def add_slot(card: str) -> _DemandOwnedSlot:
+        slot = _DemandOwnedSlot(ordinal=len(owned_slots),
+                                card=card,
+                                unused_work=max(0.0, capacities.get(card, 0.0)))
+        owned_slots.append(slot)
+        return slot
+
+    def consume_owned_slot(slot: _DemandOwnedSlot, *, priority: int,
+                           compatible: frozenset[str], work: float) -> float:
+        consumed = min(max(0.0, work), max(0.0, slot.unused_work))
+        if consumed <= demand_epsilon:
+            return 0.0
+        intersection = (compatible if slot.compatible_cards is None else
+                        slot.compatible_cards.intersection(compatible))
+        occupied = capacities.get(slot.card, 0.0) - slot.unused_work + consumed
+        intersection = frozenset(card for card in intersection
+                                 if capacity_by_card.get(card, 0.0) +
+                                 demand_epsilon >= occupied)
+        if not intersection:
+            return 0.0
+        slot.priority = (priority if slot.priority is None else max(
+            slot.priority, priority))
+        slot.compatible_cards = intersection
+        slot.unused_work = max(0.0, slot.unused_work - consumed)
+        return consumed
+
     # A logical scale-up wave can deliberately place a ceiling below the
     # eventual hard floors. Admit those floors incrementally instead of
     # returning a map whose sum exceeds the actuation fence. The configured
@@ -359,6 +472,8 @@ def _allocate_compatibility_target(
         floor = min(max(0, int(floors.get(card.casefold(), 0))),
                     remaining_floor_budget)
         target[card] = floor
+        for _ in range(floor):
+            add_slot(card)
         remaining_floor_budget -= floor
     unused_capacity = {
         card: target[card] * max(0.0, capacities.get(card, 0.0))
@@ -369,25 +484,38 @@ def _allocate_compatibility_target(
     # serving it before assigning any flexible backlog.
     for card in configured_cards:
         remaining = max(0.0, fixed_work_by_accelerator.get(card, 0.0))
-        consumed = min(remaining, unused_capacity.get(card, 0.0))
-        remaining -= consumed
-        unused_capacity[card] = max(0.0,
-                                    unused_capacity.get(card, 0.0) - consumed)
         capacity = capacities.get(card, 0.0)
         if capacity <= 0:
             continue
+        fixed_compatible = frozenset((card,))
+        for slot in owned_slots:
+            if slot.card != card:
+                continue
+            consumed = consume_owned_slot(slot,
+                                          priority=fixed_priority,
+                                          compatible=fixed_compatible,
+                                          work=remaining)
+            remaining -= consumed
+            unused_capacity[card] = max(
+                0.0,
+                unused_capacity.get(card, 0.0) - consumed)
+            if remaining <= demand_epsilon:
+                break
         while (remaining > demand_epsilon and
                sum(target.values()) < max_replicas):
             target[card] = target.get(card, 0) + 1
-            if capacity > remaining:
-                unused_capacity[card] = (unused_capacity.get(card, 0.0) +
-                                         capacity - remaining)
-                remaining = 0.0
-            else:
-                remaining -= capacity
+            slot = add_slot(card)
+            consumed = consume_owned_slot(slot,
+                                          priority=fixed_priority,
+                                          compatible=fixed_compatible,
+                                          work=remaining)
+            remaining -= consumed
+            # `unused_capacity` starts with floor capacity only; a newly
+            # added slot contributes exactly its unused tail.
+            unused_capacity[card] = (unused_capacity.get(card, 0.0) +
+                                     slot.unused_work)
 
     cold_rank = {card: index for index, card in enumerate(cold_order)}
-    canonical_by_name = {card.casefold(): card for card in configured_cards}
     grouped: dict[tuple[int, tuple[str, ...]], float] = {}
     for priority, raw_compatible, work in demand_profiles:
         requested = {
@@ -480,6 +608,55 @@ def _allocate_compatibility_target(
     groups_by_priority: dict[int, list[tuple[tuple[str, ...], float]]] = {}
     for (priority, compatible), work in grouped.items():
         groups_by_priority.setdefault(priority, []).append((compatible, work))
+
+    def project_ownership(*, priority: int, compatible: tuple[str, ...],
+                          accepted_work: float,
+                          new_slots: list[_DemandOwnedSlot],
+                          slack_by_card: dict[str, float]) -> bool:
+        """Bind accepted fractional work to the exact bins it consumed."""
+        if not ownership_supported:
+            return False
+        remaining = accepted_work
+        compatible_set = frozenset(compatible)
+        new_ordinals = {slot.ordinal for slot in new_slots}
+        # Mirror the allocator: consume earlier slack before newly added bins.
+        # This keeps per-bin ownership aligned with the aggregate slack map.
+        for card in compatible:
+            card_remaining = min(remaining, slack_by_card.get(card, 0.0))
+            while card_remaining > demand_epsilon:
+                candidates = []
+                for slot in owned_slots:
+                    if (slot.ordinal in new_ordinals or slot.card != card or
+                            slot.unused_work <= demand_epsilon):
+                        continue
+                    intersection = (
+                        compatible_set if slot.compatible_cards is None else
+                        slot.compatible_cards.intersection(compatible_set))
+                    if intersection:
+                        candidates.append(
+                            (-len(intersection), slot.ordinal, slot))
+                if not candidates:
+                    return False
+                slot = min(candidates, key=lambda item: item[:-1])[-1]
+                consumed = consume_owned_slot(slot,
+                                              priority=priority,
+                                              compatible=compatible_set,
+                                              work=card_remaining)
+                if consumed <= demand_epsilon:
+                    return False
+                card_remaining -= consumed
+                remaining -= consumed
+            if remaining <= demand_epsilon:
+                return True
+        for slot in new_slots:
+            remaining -= consume_owned_slot(slot,
+                                            priority=priority,
+                                            compatible=compatible_set,
+                                            work=remaining)
+            if remaining <= demand_epsilon:
+                return True
+        return remaining <= demand_epsilon
+
     for priority in sorted(groups_by_priority, reverse=True):
         pending = groups_by_priority[priority]
         while pending:
@@ -495,14 +672,19 @@ def _allocate_compatibility_target(
             compatible, remaining = pending.pop(selected_index)
             if sum(target.values()) >= max_replicas:
                 continue
+            original_work = remaining
+            slack_by_card: dict[str, float] = {}
             for card in compatible:
                 consumed = min(remaining, unused_capacity.get(card, 0.0))
                 remaining -= consumed
+                if consumed > demand_epsilon:
+                    slack_by_card[card] = consumed
                 unused_capacity[card] = max(
                     0.0,
                     unused_capacity.get(card, 0.0) - consumed)
                 if remaining <= demand_epsilon:
                     break
+            new_slots: list[_DemandOwnedSlot] = []
             while (remaining > demand_epsilon and
                    sum(target.values()) < max_replicas):
                 selected: str | None = None
@@ -519,6 +701,7 @@ def _allocate_compatibility_target(
                 if capacity <= 0:
                     break
                 target[selected] = target.get(selected, 0) + 1
+                new_slots.append(add_slot(selected))
                 if capacity > remaining:
                     unused_capacity[selected] = (
                         unused_capacity.get(selected, 0.0) + capacity -
@@ -526,6 +709,12 @@ def _allocate_compatibility_target(
                     remaining = 0.0
                 else:
                     remaining -= capacity
+            if not project_ownership(priority=priority,
+                                     compatible=compatible,
+                                     accepted_work=(original_work - remaining),
+                                     new_slots=new_slots,
+                                     slack_by_card=slack_by_card):
+                ownership_supported = False
 
     # The aggregate floor is independent from per-card floors. The demand pass
     # attributes its remainder to the cheapest card. The actuation pass may
@@ -540,7 +729,73 @@ def _allocate_compatibility_target(
         if selected is None:
             selected = cold_order[0]
         target[selected] = target.get(selected, 0) + 1
-    return {card: count for card, count in target.items() if count > 0}
+        add_slot(selected)
+
+    target_entries = tuple(
+        (card, count) for card, count in target.items() if count > 0)
+    target_total = sum(count for _, count in target_entries)
+    classes: tuple[compatibility_matching.CompatibilityDemand, ...] | None
+    if target_total == 0:
+        classes = ()
+    elif (not ownership_supported or len(owned_slots) != target_total or
+          any(slot.priority is None or slot.compatible_cards is None
+              for slot in owned_slots)):
+        classes = None
+    else:
+        grouped_classes: dict[tuple[int, tuple[str, ...]], int] = {}
+        for slot in owned_slots:
+            assert slot.priority is not None
+            assert slot.compatible_cards is not None
+            key = (slot.priority,
+                   tuple(
+                       sorted(
+                           card.casefold() for card in slot.compatible_cards)))
+            grouped_classes[key] = grouped_classes.get(key, 0) + 1
+        classes = tuple(
+            compatibility_matching.CompatibilityDemand(
+                priority=priority, compatible_cards=compatible, count=count)
+            for (priority, compatible
+                ), count in sorted(grouped_classes.items(),
+                                   key=lambda item: (-item[0][0], item[0][1])))
+    return CompatibilityTargetPlan(target_entries=target_entries,
+                                   reservation_acquisition_classes=classes)
+
+
+def _allocate_compatibility_target(
+    *,
+    configured_cards: list[str],
+    capacities: dict[str, float],
+    floors: dict[str, int],
+    min_replicas: int,
+    max_replicas: int,
+    demand_profiles: list[tuple[int, tuple[str, ...], float]],
+    fixed_work_by_accelerator: dict[str, float],
+    ready_zero_cost: dict[str, int],
+    committed_zero_cost: dict[str, int],
+    free_reserved: dict[str, int],
+    ready_paid: dict[str, int],
+    committed_paid: dict[str, int],
+    supply_preference: SupplyPreference,
+    cold_order: list[str],
+    use_existing_supply: bool,
+) -> dict[str, int]:
+    """Return the historical map view of the canonical typed allocation."""
+    return _plan_compatibility_target(
+        configured_cards=configured_cards,
+        capacities=capacities,
+        floors=floors,
+        min_replicas=min_replicas,
+        max_replicas=max_replicas,
+        demand_profiles=demand_profiles,
+        fixed_work_by_accelerator=fixed_work_by_accelerator,
+        ready_zero_cost=ready_zero_cost,
+        committed_zero_cost=committed_zero_cost,
+        free_reserved=free_reserved,
+        ready_paid=ready_paid,
+        committed_paid=committed_paid,
+        supply_preference=supply_preference,
+        cold_order=cold_order,
+        use_existing_supply=use_existing_supply).as_dict()
 
 
 def _replica_is_retiring_card_supply(
