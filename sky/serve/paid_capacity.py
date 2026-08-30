@@ -165,6 +165,15 @@ def paid_launch_payload_sha256(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(freeze_paid_launch_payload(value)).hexdigest()
 
 
+def decode_paid_launch_resources_override(value: bytes) -> dict[str, Any]:
+    """Decode one canonical immutable resources override."""
+    decoded = spot_placer.decode_resources_override(
+        thaw_paid_launch_payload(value))
+    if not isinstance(decoded, dict):
+        raise ValueError('Paid launch resources override is malformed.')
+    return decoded
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PaidLaunchVersionAuthority:
     """Immutable controller authority read from one elected version row."""
@@ -235,7 +244,6 @@ class PaidLaunchSpec:
     replica_id: int
     replica_record_id: str
     cluster_name_seed: str
-    initial_replica_state: bytes
     worker_construction: bytes
     provider_account: str | None
     cloud: str
@@ -300,8 +308,7 @@ class PaidLaunchSpec:
                 for card in self.frontier_key) or
                 self.frontier_key != tuple(sorted(set(self.frontier_key)))):
             raise ValueError('Paid launch frontier identity is noncanonical.')
-        for payload in (self.initial_replica_state, self.worker_construction,
-                        self.resources_override):
+        for payload in (self.worker_construction, self.resources_override):
             thaw_paid_launch_payload(payload)
         if not isinstance(self.catalog_evidence, PaidLaunchCatalogEvidence):
             raise ValueError('Paid launch has no typed version evidence.')
@@ -329,8 +336,15 @@ class PaidLaunchSpec:
     def physical_gpu_units(self) -> int:
         return self.gpu_units_per_node * self.num_nodes
 
-    def persistence_spec(self, *, priority: int,
-                         frontier_limit: int) -> 'PaidClaimPersistenceSpec':
+    def persistence_spec(
+        self,
+        *,
+        priority: int,
+        frontier_limit: int,
+        replica_port: str,
+        planned_capacity: int,
+        created_at: float | None,
+    ) -> 'PaidClaimPersistenceSpec':
         """Materialize the legacy SQL adapter without provider resolution.
 
         The immutable specification remains the cross-lock boundary.  This
@@ -340,7 +354,11 @@ class PaidLaunchSpec:
         if (type(priority) is not int or type(frontier_limit) is not int or  # pylint: disable=unidiomatic-typecheck
                 frontier_limit < 1):
             raise ValueError('Paid persistence policy inputs are malformed.')
-        state = thaw_paid_launch_payload(self.initial_replica_state)
+        state = build_pristine_paid_replica_state(
+            self,
+            replica_port=replica_port,
+            planned_capacity=planned_capacity,
+            created_at=created_at)
         info = replica_info_lib.ReplicaInfo.from_storage_dict(state)
         location = info.get_spot_location()
         if (location is None or location.to_pickleable() != info.location or
@@ -361,6 +379,46 @@ class PaidLaunchSpec:
                                         pool_key=self.pool_key,
                                         frontier_key=self.frontier_key,
                                         frontier_limit=frontier_limit)
+
+
+def build_pristine_paid_replica_state(
+    spec: PaidLaunchSpec,
+    *,
+    replica_port: str,
+    planned_capacity: int,
+    created_at: float | None,
+) -> dict[str, Any]:
+    """Construct the complete initial paid row from its sole typed seed."""
+    if not isinstance(spec, PaidLaunchSpec):
+        raise TypeError('Paid launch spec is malformed.')
+    if type(replica_port) is not str or not replica_port:  # pylint: disable=unidiomatic-typecheck
+        raise ValueError('Paid launch replica port is malformed.')
+    if type(planned_capacity) is not int or planned_capacity < 1:  # pylint: disable=unidiomatic-typecheck
+        raise ValueError('Paid launch planned capacity is malformed.')
+    if created_at is not None and (  # pylint: disable=unidiomatic-typecheck
+            type(created_at) is not float or not math.isfinite(created_at) or
+            created_at <= 0):
+        raise ValueError('Paid launch creation time is malformed.')
+    resources_override = decode_paid_launch_resources_override(
+        spec.resources_override)
+    location = spot_placer.Location.from_resources_override(resources_override)
+    if location is None:
+        raise ValueError('Paid launch has no exact location.')
+    info = replica_info_lib.ReplicaInfo(replica_id=spec.replica_id,
+                                        cluster_name=spec.cluster_name_seed,
+                                        replica_port=replica_port,
+                                        is_spot=True,
+                                        location=location,
+                                        version=spec.service_version,
+                                        resources_override=resources_override,
+                                        planned_capacity=planned_capacity)
+    # The prepared seed has no clock authority. PostgreSQL supplies the exact
+    # accepted timestamp after it locks paid capacity and before row insertion.
+    info.created_at = created_at
+    info.replica_record_id = spec.replica_record_id
+    info.is_zero_cost = False
+    info.paid_capacity_pool_key = spec.pool_key
+    return typing.cast(dict[str, Any], info.to_storage_dict())
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)

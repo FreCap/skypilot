@@ -288,23 +288,9 @@ def load_task_with_service_spec(
     yaml_content: str,
     authoritative_service_spec: 'service_spec.SkyServiceSpec | None' = None,
 ) -> task_lib.Task:
-    """Load task resources while preserving a committed service policy.
-
-    Service-policy validation evolves. Re-parsing an old committed YAML can
-    therefore reject it or silently activate new hidden defaults. When an
-    immutable pickled spec is available, parse the rest of the task without
-    the service/pool section and bind that authoritative spec afterwards.
-    """
-    if authoritative_service_spec is None:
-        return task_lib.Task.from_yaml_str(yaml_content)
-    config = yaml_utils.safe_load(yaml_content)
-    if not isinstance(config, dict):
-        raise ValueError('Service task YAML must contain a mapping.')
-    config.pop('service', None)
-    config.pop('pool', None)
-    task = task_lib.Task.from_yaml_config(config)
-    task.set_service(authoritative_service_spec)
-    return task
+    """Compatibility alias for the shared committed-policy task loader."""
+    return serve_utils.load_task_with_service_spec(yaml_content,
+                                                   authoritative_service_spec)
 
 
 @dataclasses.dataclass
@@ -4298,21 +4284,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                         assert storage_override is not None
                         planned_capacity = (width if self._uses_logical_replicas
                                             else 1)
-                        initial_info = ReplicaInfo(
-                            replica_id=replica_id,
-                            cluster_name=cluster_name,
-                            replica_port=replica_port,
-                            is_spot=True,
-                            location=location,
-                            version=version,
-                            resources_override=raw_override,
-                            planned_capacity=planned_capacity)
-                        initial_info.replica_record_id = replica_record_id
-                        initial_info.is_zero_cost = False
-                        initial_info.paid_capacity_pool_key = exact_pool_key
-                        initial_state = (
-                            paid_capacity.freeze_paid_launch_payload(
-                                initial_info.to_storage_dict()))
                         frozen_override = (
                             paid_capacity.freeze_paid_launch_payload(
                                 storage_override))
@@ -4334,40 +4305,45 @@ class SkyPilotReplicaManager(ReplicaManager):
                         provider_account = (
                             provider_identity.get('aws_account_id')
                             if isinstance(provider_identity, dict) else None)
-                        prepared.append(
-                            paid_capacity.PaidLaunchSpec(
-                                ordinal=len(prepared),
-                                service_name=self._service_name,
-                                service_hash=service_hash,
-                                service_lifecycle_epoch=(
-                                    authority.service_lifecycle_epoch),
-                                service_version=version,
-                                replica_id=replica_id,
-                                replica_record_id=replica_record_id,
-                                cluster_name_seed=cluster_name,
-                                initial_replica_state=initial_state,
-                                worker_construction=worker_construction,
-                                provider_account=provider_account,
-                                cloud=cloud,
-                                workspace=self._workspace,
-                                region=location.region,
-                                zone=location.zone,
-                                instance_type=location.instance_type,
-                                pool_key=exact_pool_key,
-                                frontier_key=(
-                                    paid_capacity.frontier_key(location)),
-                                accelerator=card,
-                                gpu_units_per_node=width,
-                                num_nodes=num_nodes,
-                                resources_override=frozen_override,
-                                catalog_evidence=(
-                                    paid_capacity.PaidLaunchCatalogEvidence(
-                                        placement_catalog_sha256=(
-                                            placement_catalog_sha256),
-                                        catalog_rank=catalog_rank,
-                                        exploration_round=(exploration_round),
-                                        slot_within_pool_window=pool_slot,
-                                        version_authority=version_authority))))
+                        paid_spec = paid_capacity.PaidLaunchSpec(
+                            ordinal=len(prepared),
+                            service_name=self._service_name,
+                            service_hash=service_hash,
+                            service_lifecycle_epoch=(
+                                authority.service_lifecycle_epoch),
+                            service_version=version,
+                            replica_id=replica_id,
+                            replica_record_id=replica_record_id,
+                            cluster_name_seed=cluster_name,
+                            worker_construction=worker_construction,
+                            provider_account=provider_account,
+                            cloud=cloud,
+                            workspace=self._workspace,
+                            region=location.region,
+                            zone=location.zone,
+                            instance_type=location.instance_type,
+                            pool_key=exact_pool_key,
+                            frontier_key=paid_capacity.frontier_key(location),
+                            accelerator=card,
+                            gpu_units_per_node=width,
+                            num_nodes=num_nodes,
+                            resources_override=frozen_override,
+                            catalog_evidence=(
+                                paid_capacity.PaidLaunchCatalogEvidence(
+                                    placement_catalog_sha256=(
+                                        placement_catalog_sha256),
+                                    catalog_rank=catalog_rank,
+                                    exploration_round=exploration_round,
+                                    slot_within_pool_window=pool_slot,
+                                    version_authority=version_authority)))
+                        # Exercise the same complete row constructor used by
+                        # PostgreSQL without giving this seed clock authority.
+                        paid_capacity.build_pristine_paid_replica_state(
+                            paid_spec,
+                            replica_port=replica_port,
+                            planned_capacity=planned_capacity,
+                            created_at=None)
+                        prepared.append(paid_spec)
                         remaining[card] -= physical_gpu_units
                         made_progress = True
                 if not made_progress:
@@ -4382,8 +4358,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         info: ReplicaInfo,
     ) -> tuple[_ReplicaLaunchThread, _ReplicaLaunchResult]:
         """Construct one normal bound worker from an acknowledged commit."""
-        initial = paid_capacity.thaw_paid_launch_payload(
-            spec.initial_replica_state)
         worker = paid_capacity.thaw_paid_launch_payload(
             spec.worker_construction)
         stored_override = paid_capacity.thaw_paid_launch_payload(
@@ -4393,7 +4367,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             'log_file_name', 'resources_override', 'retry_until_up',
             'frozen_controller_config_path'
         }
-        expected_info = ReplicaInfo.from_storage_dict(initial)
         if (set(worker) != expected_worker_fields or
                 worker['schema_version'] != 1 or
                 worker['cluster_name'] != spec.cluster_name_seed or
@@ -4402,22 +4375,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise ValueError('Paid launch frozen construction is inconsistent.')
         expected_plan_units = (spec.gpu_units_per_node
                                if self._uses_logical_replicas else 1)
-        if (expected_info.replica_id != spec.replica_id or
-                expected_info.replica_record_id != spec.replica_record_id or
-                expected_info.cluster_name != spec.cluster_name_seed or
-                expected_info.version != spec.service_version or
-                expected_info.planned_capacity != expected_plan_units or
-                expected_info.paid_capacity_pool_key != spec.pool_key or
-                expected_info.is_spot is not True or
-                expected_info.is_zero_cost is not False or
-                expected_info.reserved_fill is not False or
-                _encode_replica_resource_state(
-                    expected_info.resources_override) != stored_override or
-                member.plan_units != expected_plan_units or
+        if (member.plan_units != expected_plan_units or
                 member.physical_gpu_units != spec.physical_gpu_units):
             raise ValueError('Paid launch committed capacity shape disagrees.')
-        if info.to_storage_dict() != initial:
-            raise ValueError('Committed paid replica differs from its spec.')
 
         authority = self._ordinary_launch_binding_authority
         if (authority is None or not authority.generic_launches_required or
@@ -4457,6 +4417,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'committed paid launch controller config'))
         task_template = load_task_with_service_spec(launch_yaml_content,
                                                     launch_spec)
+        replica_port = _get_resources_ports(launch_yaml_content, launch_spec,
+                                            task_template)
+        expected_state = paid_capacity.build_pristine_paid_replica_state(
+            spec,
+            replica_port=replica_port,
+            planned_capacity=expected_plan_units,
+            created_at=info.created_at)
+        if info.to_storage_dict() != expected_state:
+            raise ValueError(
+                'Committed paid replica is not the pristine database state.')
         decoded_override = _decode_replica_resource_state(stored_override)
         location = spot_placer.Location.from_resources_override(
             decoded_override)

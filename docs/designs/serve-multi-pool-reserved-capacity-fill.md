@@ -3,9 +3,11 @@
 Last updated: 2026-08-30
 
 Status: **the exact-card compatible and statically disjoint edges are
-production-qualified; fixed-wave atomic paid admission remains in progress**. One
-PostgreSQL-authoritative planner now drives both reservation-aware actuation and
-paid Spot residual. Historical production runs proved complete East occupancy,
+production-qualified; the fixed-wave atomic paid-admission source candidate is
+implemented and undergoing PostgreSQL qualification, but is not deployed**. One
+PostgreSQL-authoritative planner is the canonical source path for both
+reservation-aware actuation and paid Spot residual. Historical production runs
+proved complete East occupancy,
 Kueue-bounded PHX occupancy, reclaim, mixed reserved-plus-Spot execution,
 at-least-100 Spot scale-out, 10,000 authenticated warm requests, and exact
 provider teardown. Full idle research occupancy is no longer a steady-state
@@ -1370,11 +1372,11 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` is PR #1806 merge `b1517869e47a9ebc36fc070440eb30f09928093d`. It includes PR #1805's empty-secret preflight and PR #1806's linear, card-scoped saturated-demand reconciliation. Both are deployed in release `1.1.1575`. The prior broad adaptive-state design was rejected by the KISS review; this document now specifies the smaller fixed-wave, in-place plan/admit fusion. Source implementation has not yet begun. |
-| Immutable planner correction | **Pure planner merged and deployed; atomic state/admission integration is pending.** One keyword-only frozen snapshot feeds one pure durable logical planner invocation. Its typed candidate separately records cold demand attribution, supply-aware actuation, warm/transition retention, reservation commitments and whole-backend padding, genuine paid residual and cap-bounded cold-launch authority, completeness/infeasibility, source generation, and snapshot/candidate fingerprints. The current writer still reads pacing authority from process memory and publishes plan/head before paid Phase A. Format 5 will persist only the minimal DB-epoch hysteresis/adoption/paid-window state and the exact accepted wave; only a disposable process cache updates postcommit. PR #1786 already carries exact per-node width times task-authoritative node count for physical backends. |
+| Source base | `origin/improvements` is PR #1806 merge `b1517869e47a9ebc36fc070440eb30f09928093d`. It includes PR #1805's empty-secret preflight and PR #1806's linear, card-scoped saturated-demand reconciliation. Both are deployed in release `1.1.1575`. The successor source candidate is the `fix/serve-atomic-adaptive-admission` stack through `0df81898c`, plus the final qualification corrections recorded by this design. It is neither merged nor deployed. The prior broad adaptive-state design was rejected by the KISS review and replaced by the smaller fixed-wave, in-place plan/admit fusion. |
+| Immutable planner correction | **The fused source path is implemented; adversarial and real-PostgreSQL qualification are in progress.** One keyword-only frozen snapshot feeds one pure durable logical planner invocation. Its typed candidate separately records cold demand attribution, supply-aware actuation, warm/transition retention, reservation commitments and whole-backend padding, genuine paid residual and cap-bounded cold-launch authority, completeness/infeasibility, source generation, and snapshot/candidate fingerprints. The same transaction now locks the elected version, exact server-owned service YAML, semantic controller configuration, catalog ordering, controller incarnation/owner epoch, demand, route, allocation, capacity/Kueue, prior plan, pools and dependent effects; invokes the planner once; and commits plan/head/policy plus only the accepted replica/claim/request wave. Provider launch materialization consumes the exact committed spec/config/catalog evidence. Only a disposable process cache updates postcommit. PR #1786 already carries exact per-node width times task-authoritative node count for physical backends. |
 | Deployed control plane | Helm revision 691 runs SkyPilot `1.1.1575` homogeneously across two API, two controller, and three executor replicas on image `sha256:2ee45d2e5350c0c041ac4d32e0a338616024cbb5564b7d2871833a8266a08676`. The image contains source `b1517869e47a9ebc36fc070440eb30f09928093d`. PostgreSQL remains the sole central store; Helm storage is disabled; no SkyPilot PVC or EFS is present. |
-| Fixed paid pacing | **Defect reproduced; simplified correction designed, source pending.** Lifecycle 148 kept the durable target at the legacy ten-slot/60-second wave because the separate adaptive reducer was unreachable. Durable logical services will delete that mode and use one restart-safe configured fixed wave; the fleet uses 100 percent/minimum 50 per 60 seconds. PostgreSQL owns only the accepted paid-window cursor across takeover. |
-| Atomic plan and paid admission | **Defect reproduced; correction designed, source pending.** Deadline heartbeats repeatedly advanced between plan publication and Phase-A replica/claim insertion. The final transaction must invoke the one planner and insert its exact accepted wave before releasing the service-row lock; no freshness comparator or TTL is relaxed. |
+| Fixed paid pacing | **Implemented in the source candidate; PostgreSQL qualification and deployment remain.** Lifecycle 148 kept the durable target at the legacy ten-slot/60-second wave because the separate adaptive reducer was unreachable. Durable logical services now delete that mode and use one restart-safe configured fixed wave; the fleet uses 100 percent/minimum 50 per 60 seconds. PostgreSQL owns only the accepted paid-window cursor across takeover. |
+| Atomic plan and paid admission | **Implemented in the source candidate; PostgreSQL qualification and deployment remain.** Deadline heartbeats previously advanced between plan publication and Phase-A replica/claim insertion. The fused transaction invokes the one planner and inserts its exact accepted wave before releasing the service-row lock; no freshness comparator or TTL is relaxed. The obsolete prospective publisher and separate Phase-A recovery path have been removed from the promoted path and their alternate-writer tests deleted. |
 | Format-4 activation | **Complete from empty Serve state and still current through `1.1.1575`.** No older capacity plan, claim, or provider effect crossed the strict-current decoder boundary. There was no row rewrite, compatibility decoder, storage migration, or infrastructure change. Format 5 is the pending current-only cutover; formats 1--4 will be strict failures after it activates. |
 | Format-5 activation | **Pending.** It requires complete PostgreSQL/provider exact zero, stopped Serve writes, one homogeneous API/controller/executor image, strict rejection of formats 1--4, and service recreation only after the exact runtime digest is verified. It changes the envelope codec only, not relational schema, authority topology, or infrastructure. |
 | Lifecycle-137 evidence | Release `1.1.1554` reached exactly 100 provider-`RUNNING` GCP Spot one-L4 workers with zero ordinary on-demand and zero wrong-shape capacity. All 10,000 authenticated warm requests returned first-attempt HTTP 200. Normal down converged service, replica, claim, waiter, VM, and disk state to exact zero before the schema-3 cutover. |
@@ -1930,8 +1932,7 @@ planning transaction:
 - a stable replica-record UUID (the member nonce), ordering ordinal and
   candidate numeric replica ID that the transaction must validate against the
   locked identity namespace;
-- the pure initial-row and launch-configuration inputs, including the
-  deterministic cluster-name seed and frozen worker-construction bytes;
+- the deterministic cluster-name seed and frozen worker-construction bytes;
 - exact Spot provider, provider account, cloud, workspace, region, zone,
   instance shape, pool and frontier identities;
 - exact accelerator card, per-node width, node count and resource override;
@@ -1947,6 +1948,17 @@ digest that could become a second durable identity. Those values either come
 from current locked state or are derived and cross-checked by the one transaction. Numeric
 replica IDs are reusable and never stand alone as a fence; the same candidate
 ID with a different locked UUID is a conflict.
+
+The template also carries no serialized initial ``ReplicaInfo``. PostgreSQL
+derives the ingress port from the locked YAML plus elected immutable service
+spec, invokes the one pristine paid-row constructor, and stamps ``created_at``
+from the paid-pool transaction's database clock. That constructor owns every
+initial readiness, retirement, cleanup, recovery and attribution default. The
+producer exercises the same constructor with a null timestamp but cannot
+provide row bytes or lifecycle state. Transactional readback and postcommit
+materialization compare the complete committed storage document against the
+same constructor, preventing a wrong port or pre-stamped terminal state from
+becoming provider authority.
 
 No new independently idempotent member key is invented. Preparation stages a
 bounded ordered set of launch specs and predeclares their sorted pool/identity
@@ -2028,11 +2040,16 @@ postcommit projection of the committed candidate/state.
 Every committed format-5 head, including ``GATE_ACQUISITION`` and
 ``FRESH_ZERO``, contains non-null policy state. Stale or incomplete evidence is
 ``ABORT_RETRY`` and publishes no successor head. With no prior head, a clean
-genesis may be synthesized only when the locked service has no live or
-capacity-authority graph: no prior plan/head authority, nonterminal replica,
-association, zero-cost intent, reserved claim edge or allocation debit, paid
-claim/waiter, API request, queue/pin, retention pin, unresolved provider
-operation, live VM/disk, or other format-bearing effect. Genesis binds the
+genesis may be synthesized only when the locked service has no retained
+provider-effect authority: no prior plan/head authority, provider-possible
+replica, unsettled or still-referenced association, live zero-cost intent,
+cross-incarnation reserved claim/debit, paid claim/waiter, API request,
+queue/pin, retention pin, unresolved provider operation, live VM/disk, or other
+format-bearing effect. A current, fully validated allocation observation may
+seed reserved-first planning because it is supply evidence rather than a
+provider effect. Detached old-incarnation association tombstones are ignored
+only after PostgreSQL proves terminal execution quiescence and the absence of
+replica, request, queue, pin and Kueue references. Genesis binds the
 immutable service incarnation, elected version, ``CapacityUnit`` and maximum;
 its counters, clocks and ceilings start at zero/``None``. The same transaction
 may then plan current positive demand. A missing head beside any live graph is
@@ -3082,12 +3099,15 @@ at-least-100 Spot scale-out, 10,000-request warm transport, mixed
 reserved-plus-Spot execution, and exact provider drain. They do not replace
 these remaining current-writer acceptance gates:
 
-1. Implement and source-qualify format-5 minimal DB-epoch policy memory, the
-   fixed 100-percent/minimum-50/60-second paid wave, the repository-wide lock
-   order, deeply immutable provider-free launch specs, the final-DB-clock fence, atomic
-   plan/head/policy/replica/claim/debit commit, and exact individual recovery.
-   Audit the probe/launch/cleanup paths so no provider/URL/Kubernetes/join work
-   or SQL entry occurs under a manager/actuation lock.
+1. Finish source qualification of the implemented format-5 minimal DB-epoch
+   policy memory, fixed 100-percent/minimum-50/60-second paid wave,
+   repository-wide lock order, deeply immutable provider-free launch specs,
+   final-DB-clock fence, atomic plan/head/policy/replica/claim/debit commit, and
+   exact individual recovery. Complete the real-PostgreSQL mutation, rollback,
+   clean-recreation, stale-owner/ABA and concurrent-reducer tests plus the final
+   adversarial review. Audit the probe/launch/cleanup paths so no
+   provider/URL/Kubernetes/join work or SQL entry occurs under a
+   manager/actuation lock.
 2. From complete service/provider exact zero, merge and build one immutable
    image, keep Serve writes stopped, and deploy every API/controller/executor
    role homogeneously with Helm. Strictly reject formats 1--4 and verify the

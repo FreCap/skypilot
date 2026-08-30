@@ -4546,13 +4546,14 @@ def update_replica_for_bound_ordinary_launch_in_transaction(
 ) -> bool:
     """Persist one exact bound-launch result on its reducer transaction.
 
-    The request reducer has already locked lifecycle, service, replica, and
-    association rows in canonical order.  This update-only helper deliberately
-    performs no commit and preserves the scalar association pointer until the
-    reducer clears it after the replica state is durable.  The explicit
-    provider-success bit comes from that transaction's locked terminal request
-    row; it is intentionally independent of the replica's absorbing teardown
-    status.
+    The request reducer has already locked lifecycle, service, paid pool,
+    replica, paid claim, and association rows.  The repeated pool/claim selects
+    below only revalidate locks owned by this transaction.  This update-only
+    helper deliberately performs no commit and preserves the scalar
+    association pointer until the reducer clears it after the replica state is
+    durable.  The explicit provider-success bit comes from that transaction's
+    locked terminal request row; it is intentionally independent of the
+    replica's absorbing teardown status.
     """
     if connection.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
         return False

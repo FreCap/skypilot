@@ -3244,6 +3244,30 @@ class _PreparedPaidAdmission:
     physical_gpu_units: int
 
 
+def _inert_recreated_service_association(
+    association: Mapping[str, Any],
+    *,
+    replica_records: set[tuple[int, str]],
+    retained_association_ids: set[uuid.UUID],
+    retained_request_ids: set[str],
+) -> bool:
+    """Return whether settled old-incarnation history is fully detached."""
+    try:
+        association_id = association['association_id']
+        replica_record = (int(association['replica_id']),
+                          str(association['replica_record_id']))
+        request_id = str(association['request_id'])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(
+        isinstance(association_id, uuid.UUID) and
+        replica_record not in replica_records and
+        association_id not in retained_association_ids and
+        request_id not in retained_request_ids and
+        ordinary_launch_binding.settled_association_proves_execution_quiescence(
+            association))
+
+
 def _canonical_prepared_paid_launch_specs(
     value: Sequence[serve_paid_capacity.PaidLaunchSpec],
     *,
@@ -3255,7 +3279,7 @@ def _canonical_prepared_paid_launch_specs(
     accounting_cards: Mapping[str, int],
     backend_num_nodes: int,
     locked_version: _LockedPaidLaunchVersionAuthority | None,
-) -> tuple[serve_paid_capacity.PaidLaunchSpec, ...]:
+) -> tuple[tuple[serve_paid_capacity.PaidLaunchSpec, ...], str | None]:
     """Validate the provider-free candidate lock superset."""
     if (not isinstance(value, Sequence) or isinstance(value,
                                                       (str, bytes, bytearray))):
@@ -3270,21 +3294,27 @@ def _canonical_prepared_paid_launch_specs(
     if ordinals != tuple(range(len(specs))):
         raise ValueError('Prepared paid launch order is noncanonical.')
     if not specs:
-        return specs
+        return specs, None
     if locked_version is None:
         raise CapacityAdmissionConflict(
             'Elected version has no immutable paid launch authority.')
     try:
+        controller_config = locked_version.controller_config
+        controller_config_digest = locked_version.controller_config_digest
+        controller_config_snapshot_id = (
+            locked_version.controller_config_snapshot_id)
+        if (not isinstance(controller_config, bytes) or
+                not isinstance(controller_config_digest, str) or
+                not isinstance(controller_config_snapshot_id, str)):
+            raise ValueError('Elected version controller config is absent.')
         expected_version_authority = (
             serve_paid_capacity.PaidLaunchVersionAuthority(
                 service_spec=locked_version.service_spec,
                 service_spec_sha256=hashlib.sha256(
                     locked_version.service_spec).hexdigest(),
-                controller_config=locked_version.controller_config,
-                controller_config_digest=(
-                    locked_version.controller_config_digest),
-                controller_config_snapshot_id=(
-                    locked_version.controller_config_snapshot_id)))
+                controller_config=controller_config,
+                controller_config_digest=controller_config_digest,
+                controller_config_snapshot_id=controller_config_snapshot_id))
         if (not isinstance(locked_version.launch_yaml_content, str) or
                 not locked_version.launch_yaml_content or
                 not isinstance(locked_version.placement_catalog, Mapping)):
@@ -3295,6 +3325,13 @@ def _canonical_prepared_paid_launch_specs(
         catalog = spot_placer.PlacementCatalog.from_dict(catalog_payload)
         if catalog.num_nodes != backend_num_nodes:
             raise ValueError('Placement catalog has a different node count.')
+        launch_spec = pickle.loads(expected_version_authority.service_spec)
+        launch_task = serve_utils.load_task_with_service_spec(
+            locked_version.launch_yaml_content, launch_spec)
+        if launch_task.service is None:
+            raise ValueError('Elected version has no service policy.')
+        replica_port = serve_utils.resolve_replica_ingress_port(
+            launch_task, pool=launch_task.service.pool)
         ranked_catalog = catalog.ranked_entries(
             locked_version.placement_contract)
         catalog_by_location = {
@@ -3335,8 +3372,6 @@ def _canonical_prepared_paid_launch_specs(
         try:
             worker = serve_paid_capacity.thaw_paid_launch_payload(
                 spec.worker_construction)
-            initial = serve_paid_capacity.thaw_paid_launch_payload(
-                spec.initial_replica_state)
             stored_override = serve_paid_capacity.thaw_paid_launch_payload(
                 spec.resources_override)
             decoded_override = spot_placer.decode_resources_override(
@@ -3351,6 +3386,9 @@ def _canonical_prepared_paid_launch_specs(
                                      workspace=spec.workspace,
                                      num_nodes=spec.num_nodes,
                                      aws_account_id=spec.provider_account))
+            expected_frontier_key = (
+                None if location is None else
+                serve_paid_capacity.frontier_key(location))
             expected_cluster_name = serve_utils.generate_replica_cluster_name(
                 service_name, spec.replica_id, resource_scope)
             expected_log_file_name = (
@@ -3386,20 +3424,9 @@ def _canonical_prepared_paid_launch_specs(
                 catalog_entry.normalized_hourly_cost <= 0 or
                 evidence.slot_within_pool_window >= pool_window or
                 expected_pool_key != spec.pool_key or
-                serve_paid_capacity.frontier_key(location) != spec.frontier_key
+                expected_frontier_key != spec.frontier_key
                 or worker.get('resources_override') != stored_override or
-                initial.get('resources_override') != stored_override or
-                initial.get('location')
-                != spot_placer.encode_resources_override(
-                    location.to_pickleable()) or
-                initial.get('replica_id') != spec.replica_id or
-                initial.get('replica_record_id') != spec.replica_record_id or
-                initial.get('cluster_name') != spec.cluster_name_seed or
-                initial.get('version') != spec.service_version or
-                initial.get('paid_capacity_pool_key') != spec.pool_key or
-                initial.get('is_spot') is not True or
-                initial.get('is_zero_cost') is not False or
-                initial.get('reserved_fill') is not False):
+                not isinstance(replica_port, str) or not replica_port):
             raise CapacityAdmissionConflict(
                 'Prepared paid launch disagrees with the elected catalog.')
         occurrence = occurrences_by_rank.get(evidence.catalog_rank, 0)
@@ -3418,7 +3445,7 @@ def _canonical_prepared_paid_launch_specs(
             raise ValueError('Prepared paid launch identities are duplicated.')
         identities.add(spec.replica_id)
         record_ids.add(spec.replica_record_id)
-    return specs
+    return specs, replica_port
 
 
 def _resolve_locked_policy_history(
@@ -3553,6 +3580,8 @@ def _clip_prepared_paid_admission(
     candidate: capacity_planning.CapacityPlanCandidate,
     decision: CapacityPlanDecision,
     frontier_limit: int,
+    replica_port: str,
+    created_at: float,
 ) -> tuple[_PreparedPaidAdmission, ...]:
     """Clip immutable cheapest-first specs to one planner paid target."""
     if candidate.reserved_launch_target.total() > 0:
@@ -3573,7 +3602,10 @@ def _clip_prepared_paid_admission(
             continue
         persistence_spec = launch_spec.persistence_spec(
             priority=decision.paid_launch_priority(card),
-            frontier_limit=frontier_limit)
+            frontier_limit=frontier_limit,
+            replica_port=replica_port,
+            planned_capacity=plan_units,
+            created_at=created_at)
         if persistence_spec.candidate.replica_info.planned_capacity != plan_units:
             raise CapacityAdmissionConflict(
                 'Prepared paid launch has the wrong planner debit width.')
@@ -3632,7 +3664,8 @@ def _read_paid_launch_receipt(
                 raise CapacityAdmissionConflict(
                     'Committed paid admission pool has no exact GPU shape.') \
                     from error
-            if (not isinstance(state, Mapping) or
+            if (not isinstance(state, Mapping) or dict(state) != item.
+                    persistence_spec.candidate.replica_info.to_storage_dict() or
                     state.get('replica_record_id') != spec.replica_record_id or
                     row['replica_pool_key'] != claim_pool_key or
                     claim_pool_key != spec.pool_key or
@@ -4458,16 +4491,17 @@ class CapacityAdmissionRepository:
                     backend_num_nodes != 1):
                 raise CapacityAdmissionConflict(
                     'Logical capacity requires one-node paid backends.')
-            prepared_specs = _canonical_prepared_paid_launch_specs(
-                prepared_paid_launch_specs,
-                service=service,
-                service_name=service_name,
-                service_hash=service_hash,
-                service_lifecycle_epoch=service_lifecycle_epoch,
-                service_version=service_version,
-                accounting_cards=canonical_cards,
-                backend_num_nodes=backend_num_nodes,
-                locked_version=fill_config.paid_launch_version)
+            prepared_specs, paid_replica_port = (
+                _canonical_prepared_paid_launch_specs(
+                    prepared_paid_launch_specs,
+                    service=service,
+                    service_name=service_name,
+                    service_hash=service_hash,
+                    service_lifecycle_epoch=service_lifecycle_epoch,
+                    service_version=service_version,
+                    accounting_cards=canonical_cards,
+                    backend_num_nodes=backend_num_nodes,
+                    locked_version=fill_config.paid_launch_version))
 
             locked_generation = connection.execute(
                 sqlalchemy.select(_DEMAND_GENERATIONS.c.generation).where(
@@ -4655,10 +4689,20 @@ class CapacityAdmissionRepository:
                     workspace=service.get('workspace'),
                     service_name=service_name,
                     service_hash=service_hash))
+            if prepared_specs and paid_replica_port is None:
+                raise CapacityAdmissionConflict(
+                    'Prepared paid launch has no locked replica port.')
+            canonical_paid_replica_port = paid_replica_port or ''
             temporary_persistence_specs = [
                 spec.persistence_spec(
                     priority=constants.LB_REQUEST_PRIORITY_MIN,
-                    frontier_limit=frontier_limit) for spec in prepared_specs
+                    frontier_limit=frontier_limit,
+                    replica_port=canonical_paid_replica_port,
+                    planned_capacity=(
+                        spec.gpu_units_per_node if fill_config.capacity_unit
+                        is reserved_fill_planner.FillCapacityUnit.LOGICAL else
+                        1),
+                    created_at=None) for spec in prepared_specs
             ]
             serve_state._validate_paid_capacity_admission_inputs(  # pylint: disable=protected-access
                 temporary_persistence_specs,
@@ -4699,16 +4743,13 @@ class CapacityAdmissionRepository:
             raw_waiter_rows = connection.execute(
                 sqlalchemy.select(_PAID_WAITERS.c.service_hash).where(
                     _PAID_WAITERS.c.service_name == service_name)).all()
+            association_statement = sqlalchemy.select(
+                ordinary_associations).where(
+                    ordinary_associations.c.service_name ==
+                    service_name).order_by(
+                        ordinary_associations.c.association_id)
             dependent_effect_rows = connection.execute(
-                sqlalchemy.select(ordinary_associations.c.association_id,
-                                  ordinary_associations.c.service_hash,
-                                  ordinary_associations.c.replica_id,
-                                  ordinary_associations.c.replica_record_id,
-                                  ordinary_associations.c.request_id).where(
-                                      ordinary_associations.c.service_name ==
-                                      service_name).order_by(
-                                          ordinary_associations.c.association_id
-                                      ).with_for_update()).mappings().all()
+                association_statement.with_for_update()).mappings().all()
             association_ids = tuple(
                 row['association_id'] for row in dependent_effect_rows)
             association_request_ids = tuple(
@@ -4759,20 +4800,62 @@ class CapacityAdmissionRepository:
                         != str(association['request_id'])):
                     raise CapacityAdmissionConflict(
                         'Retained ordinary launch request root is malformed.')
+            replica_records: set[tuple[int, str]] = set()
+            for replica_row in locked_capacity.replica_rows:
+                state = replica_row['replica_state']
+                if isinstance(state, Mapping):
+                    record_id = state.get('replica_record_id')
+                    if isinstance(record_id, str):
+                        replica_records.add(
+                            (int(replica_row['replica_id']), record_id))
+            retained_association_ids = {
+                row['ordinary_launch_association_id']
+                for row in dependent_request_rows
+                if isinstance(row['ordinary_launch_association_id'], uuid.UUID)
+            }
+            retained_association_ids.update({
+                row.association_id
+                for row in lane_projection.rows
+                if isinstance(row.association_id, uuid.UUID)
+            })
+            retained_association_ids.update({
+                row['pin_id']
+                for row in dependent_pin_rows
+                if isinstance(row['pin_id'], uuid.UUID)
+            })
+            retained_request_ids = {
+                str(row['request_id']) for row in dependent_request_rows
+            }
+            retained_request_ids.update(
+                {str(row['request_id']) for row in dependent_queue_rows})
+            retained_request_ids.update({
+                str(row['request_id'])
+                for row in dependent_pin_rows
+                if row['request_id'] is not None
+            })
+            active_effect_rows = [
+                row for row in dependent_effect_rows
+                if not (str(row['service_hash']) != service_hash and
+                        _inert_recreated_service_association(
+                            row,
+                            replica_records=replica_records,
+                            retained_association_ids=retained_association_ids,
+                            retained_request_ids=retained_request_ids))
+            ]
             if (any(str(row[1]) != service_hash for row in raw_claim_rows) or
                     any(str(row[0]) != service_hash for row in raw_waiter_rows)
                     or any(
                         str(row['service_hash']) != service_hash
-                        for row in dependent_effect_rows)):
+                        for row in active_effect_rows)):
                 raise CapacityAdmissionConflict(
                     'A retained authority graph belongs to another service '
                     'incarnation.')
             raw_claim_ids = {int(row[0]) for row in raw_claim_rows}
             association_replica_ids = {
-                int(row['replica_id']) for row in dependent_effect_rows
+                int(row['replica_id']) for row in active_effect_rows
             }
             association_record_ids = {
-                str(row['replica_record_id']) for row in dependent_effect_rows
+                str(row['replica_record_id']) for row in active_effect_rows
             }
             if any(spec.replica_id in raw_claim_ids or
                    spec.replica_id in association_replica_ids or
@@ -4798,7 +4881,7 @@ class CapacityAdmissionRepository:
                     allocation_reserved=allocation_reserved,
                     raw_claim_count=len(raw_claim_rows),
                     raw_waiter_count=len(raw_waiter_rows),
-                    dependent_effect_count=(len(dependent_effect_rows) +
+                    dependent_effect_count=(len(active_effect_rows) +
                                             len(dependent_request_rows) +
                                             len(dependent_queue_rows) +
                                             len(dependent_pin_rows))))
@@ -4915,7 +4998,9 @@ class CapacityAdmissionRepository:
                 prepared_specs,
                 candidate=candidate,
                 decision=decision,
-                frontier_limit=frontier_limit)
+                frontier_limit=frontier_limit,
+                replica_port=canonical_paid_replica_port,
+                created_at=paid_context.transaction_now)
             temporary_index = {
                 spec.candidate.replica_id: index
                 for index, spec in enumerate(temporary_persistence_specs)
