@@ -4898,11 +4898,9 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             if (not isinstance(priority, int) or isinstance(priority, bool) or
                     not isinstance(accelerators, list) or not accelerators or
                     not isinstance(count, int) or isinstance(count, bool) or
-                    count < 1 or
-                    not isinstance(recent_count, int) or
+                    count < 1 or not isinstance(recent_count, int) or
                     isinstance(recent_count, bool) or recent_count < 0 or
-                    recent_count > count or
-                    not all(
+                    recent_count > count or not all(
                         isinstance(item, str) and item
                         for item in accelerators)):
                 continue
@@ -6862,8 +6860,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     # arrival sample from supplying the missing card proof.
                     if replica_id not in infos_by_id:
                         return None
-                    has_unattributed_fixed_work = (
-                        has_unattributed_fixed_work or count > 0)
+                    has_unattributed_fixed_work = (has_unattributed_fixed_work
+                                                   or count > 0)
                     continue
                 if not _add_fixed(replica_id, float(count), retention_fixed):
                     return None
@@ -6889,9 +6887,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 # Unknown-capacity work has no current exact-card service
                 # proof. It may be sheltered by committed supply below, but
                 # must not enter economic demand or provider authority.
-                has_unattributed_fixed_work = (
-                    has_unattributed_fixed_work or
-                    sum(unknown_fixed.values()) > _SLOT_CONVERSION_EPSILON)
+                has_unattributed_fixed_work = (has_unattributed_fixed_work or
+                                               sum(unknown_fixed.values())
+                                               > _SLOT_CONVERSION_EPSILON)
             else:
                 for card, work in unknown_fixed.items():
                     retention_fixed[card] = (retention_fixed.get(card, 0.0) +
@@ -7066,59 +7064,84 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                                     self.qps_window_size)
             # Retention is already represented either by shaped profiles or
             # saturated exact-card fixed work. Adding it again would suppress
-            # valid arrival-gap demand.
+            # valid arrival-floor demand.
             attributed_work = (sum(item[2] for item in work_profiles) +
                                sum(exact_fixed_work.values()))
             arrival_gap = max(0.0, arrival_work - attributed_work)
-            # Preserve the pre-reduction uncertainty boundary.  The measured
-            # arrival sample below may safely authorize its own exact work, but
-            # it cannot make the saturated remainder or unattributed fixed work
-            # movable.  This boundary scopes both shelter and prior-policy
-            # authority neutralization later in the tick.
-            unattributed_saturated_work = saturated and (
-                duration is None or arrival_gap > _SLOT_CONVERSION_EPSILON or
-                flexible_fixed > _SLOT_CONVERSION_EPSILON or
-                has_unattributed_fixed_work)
-            if arrival_gap > _SLOT_CONVERSION_EPSILON:
-                arrival_evidence = [
-                    (int(profile['priority']),
-                     tuple(profile['compatible_accelerators']),
-                     float(profile['count']))
-                    for profile in arrivals
-                    if profile['timestamp'] >= instant.wall_time -
-                    arrival_evidence_window and float(profile['count']) > 0
-                ]
-                if not saturated:
+            unattributed_saturated_work = False
+            if saturated:
+                # Queue, rejection, in-flight, and arrival telemetry are
+                # projections of one request stream. Reduce them to one
+                # typed reconciliation before capacity allocation. Only an
+                # unmatched measured-arrival class that is also disjoint from
+                # lossy fixed work is incremental. The unclassified aggregate
+                # saturation gap remains shelter-only.
+                if (work_profiles != explicit_profiles or
+                        work_profiles != paid_profiles):
+                    return None
+                primary = tuple(
+                    capacity_planning.CompatibilityDemand(
+                        sequence=sequence,
+                        priority=priority,
+                        compatible_accelerators=compatible,
+                        work=work)
+                    for sequence, (priority, compatible,
+                                   work) in enumerate(work_profiles)
+                    if work > _SLOT_CONVERSION_EPSILON)
+                measured_arrivals: tuple[capacity_planning.CompatibilityDemand,
+                                         ...] = ()
+                if duration is not None:
+                    measured_arrivals = tuple(
+                        capacity_planning.CompatibilityDemand(
+                            sequence=sequence,
+                            priority=int(profile['priority']),
+                            compatible_accelerators=tuple(
+                                profile['compatible_accelerators']),
+                            work=(float(profile['count']) * duration /
+                                  arrival_evidence_window))
+                        for sequence, profile in enumerate(arrivals)
+                        if profile['timestamp'] >= instant.wall_time -
+                        arrival_evidence_window and float(profile['count']) > 0)
+                observation_reconciliation = (
+                    capacity_planning.reconcile_demand_observations(
+                        primary_profiles=primary,
+                        fixed_work=(capacity_planning.AcceleratorWork.
+                                    from_mapping(exact_fixed_work)),
+                        arrival_profiles=measured_arrivals))
+                work_profiles = [(profile.priority,
+                                  profile.compatible_accelerators, profile.work)
+                                 for profile in
+                                 observation_reconciliation.reconciled_profiles]
+                explicit_profiles = list(work_profiles)
+                paid_profiles = list(work_profiles)
+                attributed_work = (sum(item[2] for item in work_profiles) +
+                                   sum(exact_fixed_work.values()))
+                arrival_gap = max(0.0, arrival_work - attributed_work)
+                unattributed_saturated_work = (
+                    duration is None or
+                    arrival_gap > _SLOT_CONVERSION_EPSILON or
+                    flexible_fixed > _SLOT_CONVERSION_EPSILON or
+                    has_unattributed_fixed_work)
+                if attributed_work <= _SLOT_CONVERSION_EPSILON:
+                    return None
+                outstanding_work = attributed_work
+            else:
+                if arrival_gap > _SLOT_CONVERSION_EPSILON:
+                    arrival_evidence = [
+                        (int(profile['priority']),
+                         tuple(profile['compatible_accelerators']),
+                         float(profile['count']))
+                        for profile in arrivals
+                        if profile['timestamp'] >= instant.wall_time -
+                        arrival_evidence_window and float(profile['count']) > 0
+                    ]
                     arrival_evidence.extend(
                         (int(profile['priority']),
                          tuple(profile['compatible_accelerators']),
                          float(profile['count']))
                         for profile in queued_profiles
                         if float(profile['count']) > 0)
-                evidence_total = sum(item[2] for item in arrival_evidence)
-                if saturated:
-                    # The offered tracker has lost exact-card attribution.
-                    # Retained arrival samples may authorize only their own
-                    # measured rate; already-counted queue and rejection work
-                    # must never shape the unknown saturated gap.
-                    if duration is None:
-                        return None
-                    attributable_arrival_work = (evidence_total * duration /
-                                                 arrival_evidence_window)
-                    shaped_work = min(arrival_gap, attributable_arrival_work)
-                    if shaped_work > _SLOT_CONVERSION_EPSILON:
-                        scale = shaped_work / evidence_total
-                        shaped_arrival = [
-                            (priority, compatible, work * scale)
-                            for priority, compatible, work in arrival_evidence
-                        ]
-                        work_profiles.extend(shaped_arrival)
-                        explicit_profiles.extend(shaped_arrival)
-                        paid_profiles.extend(shaped_arrival)
-                    arrival_work = attributed_work + shaped_work
-                    if arrival_work <= _SLOT_CONVERSION_EPSILON:
-                        return None
-                else:
+                    evidence_total = sum(item[2] for item in arrival_evidence)
                     if evidence_total <= 0:
                         return None
                     scale = arrival_gap / evidence_total
@@ -7129,14 +7152,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     work_profiles.extend(shaped_arrival)
                     explicit_profiles.extend(shaped_arrival)
                     paid_profiles.extend(shaped_arrival)
-
-            outstanding_work = (sum(item[2] for item in work_profiles) +
-                                sum(exact_fixed_work.values()) if saturated else
-                                sum(in_flight.values()) + queue_work +
-                                rejected_work + sum(unknown_fixed.values()))
-            raw_target = math.ceil(
-                max(outstanding_work, arrival_work) / effective_capacity -
-                _SLOT_CONVERSION_EPSILON)
+                outstanding_work = (sum(in_flight.values()) + queue_work +
+                                    rejected_work + sum(unknown_fixed.values()))
+            target_work = (outstanding_work if saturated else max(
+                outstanding_work, arrival_work))
+            raw_target = math.ceil(target_work / effective_capacity -
+                                   _SLOT_CONVERSION_EPSILON)
             minimum_capacity = min(
                 self.max_replicas,
                 max(self.min_replicas, 0 if fresh_zero else raw_target))

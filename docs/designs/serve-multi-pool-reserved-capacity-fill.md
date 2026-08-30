@@ -86,10 +86,27 @@ retirement. Fixed work is split before any arrival shaping: observed in-flight
 work bounded by materialized current supply becomes typed exact-card
 `fixed_work`, `explicit_fixed_work`, and `paid_fixed_work`, while work on
 retiring supply, unknown-capacity work, and overflow without materialized
-exact-card proof remain unattributed. Under saturation only that exact fixed
-work and measured classified arrivals enter paid attribution. Unattributed
-fixed work never enters aggregate demand, reservation acquisition, actuation
-scale-up, or paid authority; it can only preserve a retirement shelter/floor
+exact-card proof remain unattributed. Under saturation only exact attributable
+outstanding pressure and measured classified arrivals enter paid attribution.
+The existing outstanding-pressure projection (queue, rejection, and in-flight
+work) is one observation; retained arrivals are another observation of the
+same request stream, not additive demand. A request's priority and compatible
+accelerator tuple are immutable across its arrival, queue, and rejection
+projections for every accepted exact/additive route relation. Consequently,
+only an identical typed class can overlap between those classified
+projections; different tuples remain distinct instead of being coupled by an
+arbitrary maximum-flow tie-break. Exact fixed in-flight work has lost request
+priority and compatibility. It therefore cannot be paired with one of several
+arrival classes without inventing request identity and potentially selecting
+the wrong paid card. A residual arrival class that intersects any positive
+fixed-work card is attribution-ambiguous and remains shelter-only. A residual
+class disjoint from every fixed-work card is provably incremental and retains
+its original priority and compatibility tuple. This reconciliation is linear
+in classified profiles and the at-most-eight-card catalog; it expands neither
+requests nor profile pairs. The aggregate offered-arrival counter remains an
+alternative magnitude floor, never a second work stream.
+Unattributed fixed work never enters aggregate demand, reservation acquisition,
+actuation scale-up, or paid authority; it can only preserve a retirement shelter/floor
 bounded by already committed positive capacity, or make the tick fail closed
 when no exact shelter identity exists. It cannot borrow a partial arrival
 sample's card.
@@ -113,13 +130,24 @@ Offered-arrival counters and their saturation bit are stable planner inputs and
 therefore belong to the immutable normalized demand semantics used by
 PostgreSQL admission. Raw queue-deadline buckets remain available only in the
 locked planner input. Their `remaining_seconds` countdown is deliberately
-absent from the outer normalized identity: the reduced acquisition classes and
-attribution capture its capacity consequence, and an otherwise equivalent
-newer heartbeat must rebind the existing fill witness instead of revoking it
-merely because time advanced. The deadline-completeness bit remains normalized
-so a missing gauge still fails closed. This revised correction is source- and
-regression-complete; deployment and live post-failure cold-frontier proof
-remain open.
+absent from the outer normalized identity because hashing the raw heartbeat
+countdown caused the reservation broker and controller to revoke each other's
+otherwise stable work. This does not make two countdowns decision-equivalent.
+The persisted production-plan semantic digest remains the only causal lease
+identity. A newer heartbeat may retain an older plan only as an explicitly
+older, free-capacity lower bound when its complete deadline multiset is a
+monotonic tightening of the persisted planner input. The older plan keeps its
+original demand generation; it is never relabeled current. Prospective paid
+claim validation requires the exact current demand generation and receipt
+watermark for every deadline-bearing plan. A deadline extension, tightening,
+class/count change, incomplete gauge, or any fresh paid/provider effect
+therefore requires a new invocation of the one production planner under the
+PostgreSQL lock. Thus a 585-to-580-second countdown may retain target 18 while
+the controller publishes the fresh target 19, but the retained 18 witness can
+neither suppress that replan nor authorize paid launch. The
+deadline-completeness bit remains normalized so a missing gauge still fails
+closed. This revised correction is under source qualification; deployment and
+live post-failure cold-frontier proof remain open.
 
 The steady-state implementation is one deterministic counted subset-rank
 matcher, shared by capacity planning and the reserved-pool broker.  The pure planner
@@ -2413,7 +2441,12 @@ on-demand spill.
   the durable snapshot remains available, and paid authority covers only the
   exact attributable rejection work. With one retained L4 arrival and with
   mixed retained L4/A100 arrivals, prove the unknown remainder of the 100,000
-  saturation bound is never extrapolated onto those cards. With both current
+  saturation bound is never extrapolated onto those cards. Prove identical
+  classified pressure/arrival tuples overlap by magnitude, different immutable
+  tuples remain distinct, arrival classes intersecting lossy fixed-card work
+  remain shelter-only, and arrival classes disjoint from every fixed card
+  retain their original paid authority. Exercise all 255 compatibility subsets
+  across multiple priorities without a pairwise graph. With both current
   A100 work plus idle L4 supply and old/retiring A100 work plus one L4 arrival,
   prove fixed work does not inherit the L4 sample's paid authority. Seed the
   latter case with a stale inflated L4 target and prove the planning projection
@@ -2425,9 +2458,14 @@ on-demand spill.
   attributed saturated report does not shelter unrelated idle supply. Repeat
   without compatible attribution and with partial queue/rejection/priority profiles;
   the unknown gap and incomplete evidence must publish no provider authority.
-  Prove offered counters and saturation participate in normalized demand, while
-  a countdown-only deadline heartbeat preserves the existing fill witness. A
-  saturated report must not prove fresh aggregate zero or authorize retirement.
+  Prove offered counters and saturation participate in normalized demand.
+  Exercise the production planner with 1,000 ten-second L4 requests: a
+  585-second deadline commits target 18, a 580-second heartbeat may retain only
+  the generation-old 18 free-capacity lease, and a fresh locked planner run
+  commits target 19 under a new semantic digest. Prove a deadline extension
+  rejects retention, while a tightening whose reduced target stays unchanged
+  retains the old lease and republishes the same semantic digest. A saturated
+  report must not prove fresh aggregate zero or authorize retirement.
 - Seed conflicting process-local per-tick Kueue fields and warm-retention
   state, then invoke the durable adapter with a different immutable decision
   snapshot. Prove the canonical planner is called exactly once, observes the
@@ -2438,12 +2476,16 @@ on-demand spill.
 - Run real-PostgreSQL tests for transaction atomicity, lost acknowledgements,
   stale identity, owner takeover, provider rejection/ambiguity, and concurrent
   admission.
-- Advance one and both HA reporter generations while a 100-member paid wave is
-  frozen and prove one atomic commit when normalized demand is unchanged.
-  Repeat with fresh-zero, queue, rejection, in-flight, compatibility, reporter,
-  route contraction/rebinding, and routing-policy/queue-mode changes and prove
-  the complete positive-debit batch rolls back with zero rows, claims, waiters,
-  or pool debits.
+- For a non-deadline planner snapshot, advance one and both HA reporter
+  generations while a 100-member paid wave is frozen and prove one atomic
+  commit when normalized demand is unchanged. Repeat with fresh-zero, queue,
+  rejection, in-flight, compatibility, reporter, route contraction/rebinding,
+  and routing-policy/queue-mode changes and prove the complete positive-debit
+  batch rolls back with zero rows, claims, waiters, or pool debits. For a
+  deadline-bearing snapshot, prove any generation advance—including a pure
+  countdown tightening—rejects the prospective batch until the fresh locked
+  planner publishes its successor; extension, class/count change, and zero do
+  the same.
 - Publish a current head that adds an identity-valid selectable route while a
   positive reporter retains its prior immutable head. Prove demand remains
   available, the plan and paid claim bind the current head, and scale-up

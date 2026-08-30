@@ -26,6 +26,7 @@ import sqlalchemy
 from sqlalchemy.dialects import postgresql
 
 from sky.adaptors import common as adaptors_common
+from sky.serve import autoscaler_compatibility
 from sky.serve import capacity_admission_schema
 from sky.serve import capacity_planning
 from sky.serve import compatibility_matching
@@ -1044,7 +1045,7 @@ class PaidLaunchAuthority:
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class CommittedFillDemandWitness:
-    """Fresh PostgreSQL-committed demand semantics for the fill gate.
+    """PostgreSQL-committed causal demand lease for the free-capacity gate.
 
     This witness is deliberately longer-lived than provider-effect authority.
     ``serve_capacity_plan_heads.valid_until`` continues to fence launches at
@@ -1052,7 +1053,10 @@ class CommittedFillDemandWitness:
     separate bounded horizon only to acquire reservation entitlement.  The
     semantic digest excludes live replica, intent, reservation, and scheduler
     inventory so materializing the plan cannot invalidate the demand that
-    caused it.
+    caused it. ``demand_feed_generation`` is always the generation that the
+    production planner consumed. ``observed_demand_feed_generation`` may be
+    newer only for an explicitly retained monotonic deadline lower bound; it
+    never upgrades the old lease into current paid/provider authority.
     """
 
     service_name: str
@@ -1061,6 +1065,7 @@ class CommittedFillDemandWitness:
     service_version: int
     demand_source_epoch: int
     demand_feed_generation: int
+    observed_demand_feed_generation: int
     route_generation: int
     route_sha256: str
     route_source_epoch: int
@@ -1078,6 +1083,7 @@ class CommittedFillDemandWitness:
             self.service_version,
             self.demand_source_epoch,
             self.demand_feed_generation,
+            self.observed_demand_feed_generation,
             self.route_generation,
             self.route_source_epoch,
             self.capacity_plan_generation,
@@ -1086,7 +1092,9 @@ class CommittedFillDemandWitness:
                 not isinstance(self.service_hash, str) or
                 not self.service_hash or
                 any(type(value) is not int or value < 1 for value in positive)
-                or type(self.target_capacity) is not int or
+                or self.observed_demand_feed_generation
+                < self.demand_feed_generation or
+                type(self.target_capacity) is not int or
                 self.target_capacity < 0 or
             (self.reservation_acquisition_classes is not None and
              (not isinstance(self.reservation_acquisition_classes, tuple) or
@@ -2902,6 +2910,94 @@ _PLAN_DERIVED_DEMAND_FIELDS = frozenset({
 })
 
 
+def _deadline_demand_from_snapshot(
+    snapshot: demand_state.DurableAutoscalingSnapshot,
+) -> tuple[autoscaler_compatibility.DeadlineDemand, ...] | None:
+    """Decode the complete current deadline gauge without planning it."""
+    normalized = snapshot.normalized_demand
+    raw = snapshot.request_information.get('queued_request_deadline_buckets')
+    queue_depth = normalized.get('queue_depth')
+    if (type(queue_depth) is not int or queue_depth < 0 or
+            normalized.get('queue_deadline_profiles_complete') is not True or
+            not isinstance(raw, list)):
+        return None
+    try:
+        demand = tuple(
+            autoscaler_compatibility.DeadlineDemand(
+                sequence=sequence,
+                priority=int(profile['priority']),
+                compatible_cards=tuple(profile['compatible_accelerators']),
+                count=int(profile['count']),
+                remaining_seconds=float(profile['remaining_seconds']))
+            for sequence, profile in enumerate(raw))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if sum(item.count for item in demand) != queue_depth:
+        return None
+    return demand
+
+
+def _deadline_demand_is_monotonic_tightening(
+    prior: tuple[autoscaler_compatibility.DeadlineDemand, ...],
+    current: tuple[autoscaler_compatibility.DeadlineDemand, ...],
+) -> bool:
+    """Return whether every current deadline cohort only became tighter.
+
+    This is a relation between observations, not a capacity calculation. It
+    permits an older production plan to remain a free-capacity lower bound;
+    only the production planner may derive a new exact target.
+    """
+
+    def _group(
+        demand: tuple[autoscaler_compatibility.DeadlineDemand, ...],
+    ) -> dict[tuple[int, tuple[str, ...]], list[tuple[float, int]]]:
+        grouped: dict[tuple[int, tuple[str, ...]], dict[float, int]] = {}
+        for item in demand:
+            if item.count <= 0:
+                continue
+            key = item.priority, tuple(
+                card.casefold() for card in item.compatible_cards)
+            by_deadline = grouped.setdefault(key, {})
+            by_deadline[item.remaining_seconds] = (
+                by_deadline.get(item.remaining_seconds, 0) + item.count)
+        return {
+            key: sorted(by_deadline.items())
+            for key, by_deadline in grouped.items()
+        }
+
+    prior_groups = _group(prior)
+    current_groups = _group(current)
+    if set(prior_groups) != set(current_groups):
+        return False
+    for key, prior_deadlines in prior_groups.items():
+        current_deadlines = current_groups[key]
+        if (sum(count for _, count in prior_deadlines)
+                != sum(count for _, count in current_deadlines)):
+            return False
+        prior_index = current_index = 0
+        prior_remaining = prior_deadlines[0][1]
+        current_remaining = current_deadlines[0][1]
+        while prior_index < len(prior_deadlines):
+            prior_deadline = prior_deadlines[prior_index][0]
+            current_deadline = current_deadlines[current_index][0]
+            if current_deadline > prior_deadline:
+                return False
+            consumed = min(prior_remaining, current_remaining)
+            prior_remaining -= consumed
+            current_remaining -= consumed
+            if prior_remaining == 0:
+                prior_index += 1
+                if prior_index < len(prior_deadlines):
+                    prior_remaining = prior_deadlines[prior_index][1]
+            if current_remaining == 0:
+                current_index += 1
+                if current_index < len(current_deadlines):
+                    current_remaining = current_deadlines[current_index][1]
+        if current_index != len(current_deadlines):
+            return False
+    return True
+
+
 def _changed_demand_semantics(expected: Any,
                               current: Mapping[str, Any]) -> list[str]:
     """Return reporter-owned demand fields that differ from a new snapshot.
@@ -2983,10 +3079,11 @@ class CapacityAdmissionRepository:
         independent provider-effect fence.  Every current service, demand,
         route, plan-head, content-hash, and immutable fill-policy identity is
         nevertheless revalidated through one connection-bounded read.  A
-        newer heartbeat generation may reuse the plan only when the
-        reconstructed normalized demand and exact route context are
-        decision-equivalent; this witness carries no provider-effect
-        authority.
+        newer heartbeat generation may retain the plan only when the
+        reconstructed normalized demand and exact route context are unchanged
+        and any deadline multiset is a monotonic tightening. The witness keeps
+        the plan's original causal generation and is only a free-capacity
+        lower bound; it carries no provider-effect authority.
         """
         if (not isinstance(service_name, str) or not service_name or
                 not isinstance(expected_service_hash, str) or
@@ -3088,6 +3185,8 @@ class CapacityAdmissionRepository:
                  validate_snapshot_row(route))
                 if not route_projection.snapshot_owner_matches(route, service):
                     return None
+                planner_snapshot, candidate = _decode_planner_payload(
+                    payload.get('planner'))
                 if plan_demand_generation < current_demand_generation:
                     current_snapshot = demand_state.get_autoscaling_snapshot(
                         service_name,
@@ -3108,8 +3207,14 @@ class CapacityAdmissionRepository:
                                 payload.get('normalized_demand'),
                                 current_snapshot.normalized_demand)):
                         return None
-                planner_snapshot, candidate = _decode_planner_payload(
-                    payload.get('planner'))
+                    if planner_snapshot.deadline is not None:
+                        current_deadline = _deadline_demand_from_snapshot(
+                            current_snapshot)
+                        if (current_deadline is None or
+                                not _deadline_demand_is_monotonic_tightening(
+                                    planner_snapshot.deadline.demand,
+                                    current_deadline)):
+                            return None
                 if (planner_snapshot.service_version
                         != service['current_version'] or
                         planner_snapshot.source_generation
@@ -3139,7 +3244,9 @@ class CapacityAdmissionRepository:
                     service_lifecycle_epoch=int(service['lifecycle_epoch']),
                     service_version=int(service['current_version']),
                     demand_source_epoch=int(service['demand_source_epoch']),
-                    demand_feed_generation=int(current_demand_generation),
+                    demand_feed_generation=int(plan_demand_generation),
+                    observed_demand_feed_generation=int(
+                        current_demand_generation),
                     route_generation=int(route_head['generation']),
                     route_sha256=str(route['content_sha256']),
                     route_source_epoch=int(service['route_source_epoch']),
@@ -3196,9 +3303,23 @@ class CapacityAdmissionRepository:
                 raise CapacityAdmissionConflict(
                     'Demand feed advanced with changed or unavailable '
                     'semantics before plan publication.')
+            if plan.planner_payload:
+                try:
+                    planner_snapshot, _ = _decode_planner_payload(
+                        plan.planner_payload)
+                except ValueError as error:
+                    raise CapacityAdmissionConflict(
+                        'Stale plan has no decodable production planner '
+                        'snapshot.') from error
+                if planner_snapshot.deadline is not None:
+                    raise CapacityAdmissionConflict(
+                        'Deadline demand advanced before production plan '
+                        'publication; a fresh locked planner run is required.')
             # Heartbeats advance the durable sequence even when the canonical
-            # demand decision is unchanged. Rebind to the exact locked receipt
-            # so planning does not have to race the heartbeat interval.
+            # non-deadline demand decision is unchanged. Rebind to the exact
+            # locked receipt so legacy publication does not have to race the
+            # heartbeat interval. Deadline planning must use
+            # plan_and_publish_current() and never reaches this shortcut.
             plan = dataclasses.replace(
                 plan,
                 demand_feed_generation=current_snapshot.demand_feed_generation,
@@ -4273,7 +4394,7 @@ def validate_paid_claim_in_connection(
         raise CapacityAdmissionConflict(
             'Capacity plan digest no longer matches its payload.')
     try:
-        _, planner_candidate = _decode_planner_payload(
+        planner_snapshot, planner_candidate = _decode_planner_payload(
             claim_plan_payload.get('planner'))
     except ValueError as error:
         raise CapacityAdmissionConflict(
@@ -4441,6 +4562,16 @@ def validate_paid_claim_in_connection(
                 for row in fresh_reports)):
         raise CapacityAdmissionConflict(
             'Paid claim lost its fresh demand receipt watermark.')
+    if (planner_snapshot.deadline is not None and
+        (head['demand_feed_generation'] != current_demand_generation or
+         current_watermark_sha256 != head['receipt_watermark_sha256'])):
+        # Countdown-only heartbeats may retain an older fill witness as a
+        # monotonic free-capacity lower bound. They never extend that plan's
+        # prospective paid/provider lease: every new debit must come from a
+        # fresh planner run under the current PostgreSQL demand lock.
+        raise CapacityAdmissionConflict(
+            'Deadline demand advanced before paid claim admission; a fresh '
+            'locked planner run is required.')
     route_context = demand_state.validate_report_route_contexts(
         connection, service, fresh_reports, route_head, route, now)
     if (route_context is None or

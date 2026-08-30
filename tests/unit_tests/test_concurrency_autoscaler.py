@@ -708,6 +708,75 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             'A100': 1,
         })
 
+    def test_saturated_arrival_does_not_duplicate_same_card_fixed_work(self):
+        autoscaler = _durable_autoscaler(max_replicas=100,
+                                         expected_request_duration_seconds=60)
+        replica = _replica(1, card='L4')
+        report = _durable_report(in_flight={1: 1},
+                                 observed_slots={1: 1},
+                                 compatibility_profiles=[{
+                                     'priority': 20,
+                                     'compatible_accelerators': ['L4'],
+                                     'count': 1,
+                                     'timestamp': self._INSTANT.wall_time,
+                                 }])
+        report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
+                      unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
+                      headerless_arrivals_60s=0,
+                      headerless_arrivals_300s=0,
+                      offered_arrival_tracking_saturated=True)
+        reservation = dataclasses.replace(
+            _durable_reservation(),
+            existing_paid_capacity=(
+                capacity_planning.AcceleratorCapacity.from_mapping({'L4': 1})),
+            charged_paid_gpu_units=1)
+
+        result = self._plan(autoscaler,
+                            report=report,
+                            replicas=(replica,),
+                            reservation=reservation,
+                            decision_inputs=_durable_inputs((replica,)))
+
+        assert result is not None
+        candidate = result.envelope.candidate
+        self.assertEqual(candidate.aggregate_demand_target, 1)
+        self.assertEqual(candidate.supply_aware_demand_target.as_dict(),
+                         {'L4': 1})
+        self.assertEqual(candidate.paid_residual.as_dict(), {})
+        self.assertEqual(candidate.paid_launch_target.as_dict(), {})
+
+    def test_saturated_arrival_and_terminal_rejection_are_one_request(self):
+        autoscaler = _durable_autoscaler(max_replicas=100,
+                                         expected_request_duration_seconds=60)
+        report = _durable_report(rejected=1,
+                                 compatibility_profiles=[{
+                                     'priority': 20,
+                                     'compatible_accelerators': ['L4'],
+                                     'count': 1,
+                                     'timestamp': self._INSTANT.wall_time,
+                                 }],
+                                 rejected_profiles=[{
+                                     'priority': 20,
+                                     'compatible_accelerators': ['L4'],
+                                     'count': 1,
+                                     'recent_count': 1,
+                                 }])
+        report.update(rejected_in_recent_window=1,
+                      unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
+                      unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
+                      headerless_arrivals_60s=0,
+                      headerless_arrivals_300s=0,
+                      offered_arrival_tracking_saturated=True)
+
+        result = self._plan(autoscaler, report=report)
+
+        assert result is not None
+        candidate = result.envelope.candidate
+        self.assertEqual(candidate.aggregate_demand_target, 1)
+        self.assertEqual(candidate.supply_aware_demand_target.as_dict(),
+                         {'L4': 1})
+        self.assertEqual(candidate.paid_launch_target.as_dict(), {'L4': 1})
+
     def test_saturated_retiring_work_cannot_borrow_arrival_card(self):
         autoscaler = _durable_autoscaler(max_replicas=100,
                                          expected_request_duration_seconds=60)
@@ -2730,8 +2799,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertIsInstance(
             autoscaler.rejected_compatibility_profiles[0]
             ['compatible_accelerators'], tuple)
-        self.assertEqual(autoscaler.rejected_compatibility_profiles[0]
-                         ['count'], 5)
+        self.assertEqual(autoscaler.rejected_compatibility_profiles[0]['count'],
+                         5)
 
     def test_rejection_work_preserves_retained_and_recent_counts(self):
         autoscaler = _make_autoscaler()

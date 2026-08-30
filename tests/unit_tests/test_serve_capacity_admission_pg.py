@@ -5,6 +5,7 @@ import copy
 import dataclasses
 import datetime
 import json
+import math
 import pickle
 import threading
 import time
@@ -21,6 +22,7 @@ from test_kueue_lane_lineage_pg import _receipt as _kueue_receipt
 from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
+from sky.serve import autoscaler_compatibility
 from sky.serve import capacity_admission
 from sky.serve import capacity_admission_schema
 from sky.serve import capacity_planning
@@ -364,6 +366,7 @@ def _plan(
     None = None,
     expected_economic_capacity_graph_sha256: str | None = None,
     planner_supply: capacity_admission.ReservedSupplyProjection | None = None,
+    deadline: capacity_planning.DeadlinePlanningInput | None = None,
 ) -> capacity_admission.CapacityPlanInput:
     snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
     assert snapshot is not None
@@ -374,7 +377,8 @@ def _plan(
     decision = _current_decision(snapshot,
                                  planner_supply,
                                  demand_target,
-                                 target_by_accelerator=target)
+                                 target_by_accelerator=target,
+                                 deadline=deadline)
     _, candidate = decision.decode_planner()
     return capacity_admission.CapacityPlanInput(
         service_name='svc',
@@ -424,6 +428,10 @@ def _current_decision(
     backend_num_nodes: int = 1,
     provisioning_by_accelerator: dict[str, int] | None = None,
     max_live_paid_gpu_units: int | None = None,
+    work_by_accelerator: dict[str, float] | None = None,
+    capacity_per_accelerator: dict[str, float] | None = None,
+    deadline: capacity_planning.DeadlinePlanningInput | None = None,
+    maximum_capacity: int | None = None,
     return_candidate: bool = False,
 ) -> (capacity_admission.CapacityPlanDecision |
       capacity_planning.CapacityPlanCandidate):
@@ -439,7 +447,8 @@ def _current_decision(
     })
     configured = tuple(
         sorted(
-            set(requested_target) |
+            set(requested_target) | set(work_by_accelerator or ()) |
+            set(capacity_per_accelerator or ()) |
             (set() if supply is None else set(supply.reserved_accelerators))))
     if supply is None:
         policy = capacity_planning.ReservationGatePolicy.NOT_CONFIGURED
@@ -503,6 +512,8 @@ def _current_decision(
         allocation_demonstrated_need=(None if supply is None else
                                       supply.allocation_demonstrated_need),
         allocation_ceiling=(0 if supply is None else supply.allocation_ceiling))
+    work = (requested_target
+            if work_by_accelerator is None else work_by_accelerator)
     profiles = tuple(
         capacity_planning.CompatibilityDemand(
             sequence=sequence,
@@ -510,8 +521,7 @@ def _current_decision(
             compatible_accelerators=((card,) if compatible_accelerators is
                                      None else compatible_accelerators),
             work=float(count))
-        for sequence, (card,
-                       count) in enumerate(sorted(requested_target.items()))
+        for sequence, (card, count) in enumerate(sorted(work.items()))
         if count > 0)
     planner_snapshot = capacity_planning.CapacityPlanningSnapshot(
         source_generation=demand_snapshot.demand_feed_generation,
@@ -526,12 +536,16 @@ def _current_decision(
              physical_gpu_width_by_accelerator)),
         capacity_per_accelerator=(
             capacity_planning.AcceleratorWork.from_mapping(
-                {card: 1 for card in configured})),
+                ({
+                    card: 1 for card in configured
+                } if capacity_per_accelerator is None else
+                 capacity_per_accelerator))),
         floors=_capacity({card: 0 for card in configured}),
         minimum_capacity=0,
         paid_minimum_capacity=0,
         actuation_minimum_capacity=0,
-        maximum_capacity=max(10, sum(requested_target.values())),
+        maximum_capacity=(max(10, sum(requested_target.values()))
+                          if maximum_capacity is None else maximum_capacity),
         demand_profiles=profiles,
         explicit_demand_profiles=profiles,
         paid_demand_profiles=profiles,
@@ -557,6 +571,7 @@ def _current_decision(
         planning_time=1.0,
         max_live_paid_gpu_units=max_live_paid_gpu_units,
         retirement_shelter_target=capacity_planning.AcceleratorCapacity(),
+        deadline=deadline,
         source_fingerprint=planner_source_fingerprint,
         configured_reservation_accelerators=(() if supply is None else
                                              supply.reserved_accelerators),
@@ -572,7 +587,9 @@ def _current_decision(
     return capacity_admission.CapacityPlanDecision(
         capacity_target_by_accelerator=target_by_accelerator,
         normalized_demand_extensions={
-            'autoscaler_target': sum(requested_target.values()),
+            'autoscaler_target':
+                (candidate.aggregate_demand_target
+                 if deadline is not None else sum(requested_target.values())),
             'replica_unit': ('logical' if capacity_unit
                              is capacity_planning.CapacityUnit.LOGICAL_GPU else
                              'physical_backend'),
@@ -2190,7 +2207,7 @@ def test_ungated_stale_grant_cannot_unlock_paid_before_reserved_feed(
     assert released.authority.remaining_launch_capacity() == {'l4': 1}
 
 
-def test_fill_demand_witness_rebinds_countdown_only_deadline_heartbeat(
+def test_fill_demand_witness_retains_only_older_deadline_lower_bound(
         capacity_database, monkeypatch):
     engine, incarnation, route_receipt = capacity_database
     # A fresh aggregate-zero proof is only authoritative for the current
@@ -2213,8 +2230,8 @@ def test_fill_demand_witness_rebinds_countdown_only_deadline_heartbeat(
                            utilization_gate=True)
     allocation = _allocation_map({'l4': 1},
                                  utilization_gate_armed=True,
-                                 utilization_demonstrated_need=2,
-                                 utilization_ceiling=2)
+                                 utilization_demonstrated_need=1000,
+                                 utilization_ceiling=1000)
     _mock_current_allocation(monkeypatch, allocation)
     repository = capacity_admission.CapacityAdmissionRepository(engine)
 
@@ -2223,22 +2240,52 @@ def test_fill_demand_witness_rebinds_countdown_only_deadline_heartbeat(
                                 route_receipt,
                                 sequence=sequence,
                                 request_count=0)
-        report.update(queue_depth=1,
-                      queue_depth_by_priority={'50': 1},
+        report.update(queue_depth=1000,
+                      queue_depth_by_priority={'50': 1000},
                       queued_requests_by_compatibility=[{
                           'priority': 50,
                           'compatible_accelerators': ['L4'],
-                          'count': 1,
+                          'count': 1000,
                       }],
                       queued_request_deadline_buckets=[{
                           'priority': 50,
                           'compatible_accelerators': ['L4'],
                           'remaining_seconds': remaining_seconds,
-                          'count': 1,
+                          'count': 1000,
                       }])
         return report
 
-    demand_state.ingest_report('svc', 'svc-hash', _deadline_report(2, 3600))
+    def _production_deadline_decision(snapshot, supply):
+        raw_deadlines = snapshot.request_information[
+            'queued_request_deadline_buckets']
+        assert isinstance(raw_deadlines, list) and len(raw_deadlines) == 1
+        remaining = float(raw_deadlines[0]['remaining_seconds'])
+        deadline = capacity_planning.DeadlinePlanningInput(
+            demand=(autoscaler_compatibility.DeadlineDemand(
+                sequence=0,
+                priority=50,
+                compatible_cards=('l4',),
+                count=1000,
+                remaining_seconds=remaining),),
+            finite_supply=(),
+            service_seconds_by_accelerator=(
+                capacity_planning.AcceleratorWork.from_mapping({'l4': 10.0})),
+            service_time_sources=(('l4', 'configured'),),
+            utilization=0.95,
+            paid_cold_lead_seconds=0.0)
+        baseline_work = 1000 * 10.0 / 600.0
+        baseline_target = math.ceil(baseline_work / 0.95)
+        return _current_decision(snapshot,
+                                 supply,
+                                 baseline_target,
+                                 work_by_accelerator={'l4': baseline_work},
+                                 capacity_per_accelerator={'l4': 0.95},
+                                 deadline=deadline,
+                                 maximum_capacity=1000)
+
+    # Demand-state receipt aging floors a just-ingested 590-second report to
+    # the planner's conservative 585-second bucket.
+    demand_state.ingest_report('svc', 'svc-hash', _deadline_report(2, 590))
     committed = repository.plan_and_publish_current(
         service_name='svc',
         service_hash='svc-hash',
@@ -2246,38 +2293,94 @@ def test_fill_demand_witness_rebinds_countdown_only_deadline_heartbeat(
         service_version=1,
         accounting_cards={'l4': 0},
         sequenced_reserved_fill=True,
-        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2))
+        planner=_production_deadline_decision)
     assert committed.candidate.kind is (
         capacity_planning.CapacityPlanKind.GATE_ACQUISITION)
+    assert committed.candidate.aggregate_demand_target == 18
+    assert committed.planner_snapshot.deadline is not None
+    assert committed.planner_snapshot.deadline.demand[
+        0].remaining_seconds == 585
     initial = repository.read_current_fill_demand_witness('svc',
                                                           'svc-hash',
                                                           (123, '10.0.0.5'),
                                                           max_age_seconds=60)
     assert initial is not None
+    assert initial.target_capacity == 18
+    assert (initial.demand_feed_generation ==
+            initial.observed_demand_feed_generation)
 
-    demand_state.ingest_report('svc', 'svc-hash', _deadline_report(3, 3595))
-    refreshed = repository.read_current_fill_demand_witness('svc',
-                                                            'svc-hash',
-                                                            (123, '10.0.0.5'),
-                                                            max_age_seconds=60)
+    demand_state.ingest_report('svc', 'svc-hash', _deadline_report(3, 585))
+    retained = repository.read_current_fill_demand_witness('svc',
+                                                           'svc-hash',
+                                                           (123, '10.0.0.5'),
+                                                           max_age_seconds=60)
 
-    assert refreshed is not None
-    assert refreshed.demand_feed_generation > initial.demand_feed_generation
-    assert refreshed.capacity_plan_generation == initial.capacity_plan_generation
-    assert refreshed.semantic_sha256 == initial.semantic_sha256
-    assert refreshed.target_capacity == initial.target_capacity
-    assert refreshed.reservation_acquisition_classes == (
+    assert retained is not None
+    assert retained.demand_feed_generation == initial.demand_feed_generation
+    assert (retained.observed_demand_feed_generation
+            > retained.demand_feed_generation)
+    assert retained.capacity_plan_generation == initial.capacity_plan_generation
+    assert retained.semantic_sha256 == initial.semantic_sha256
+    assert retained.target_capacity == 18
+    assert retained.reservation_acquisition_classes == (
         initial.reservation_acquisition_classes)
 
-    demand_state.ingest_report(
-        'svc', 'svc-hash',
-        _demand_report(time.time(), route_receipt, sequence=4, request_count=2))
+    successor = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 0},
+        sequenced_reserved_fill=True,
+        planner=_production_deadline_decision)
+    assert successor.candidate.aggregate_demand_target == 19
+    assert successor.candidate.demand_witness_sha256 != (
+        committed.candidate.demand_witness_sha256)
+    current = repository.read_current_fill_demand_witness('svc',
+                                                          'svc-hash',
+                                                          (123, '10.0.0.5'),
+                                                          max_age_seconds=60)
+    assert current is not None
+    assert current.target_capacity == 19
+    assert (current.demand_feed_generation ==
+            current.observed_demand_feed_generation)
+
+    # An extension/reset is not a monotonic tightening and cannot retain even
+    # the free-capacity lower bound.
+    demand_state.ingest_report('svc', 'svc-hash', _deadline_report(4, 610))
     assert repository.read_current_fill_demand_witness(
         'svc', 'svc-hash', (123, '10.0.0.5'), max_age_seconds=60) is None
 
+    long_first = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 0},
+        sequenced_reserved_fill=True,
+        planner=_production_deadline_decision)
+    assert long_first.candidate.aggregate_demand_target == 18
+    demand_state.ingest_report('svc', 'svc-hash', _deadline_report(5, 605))
+    long_retained = repository.read_current_fill_demand_witness(
+        'svc', 'svc-hash', (123, '10.0.0.5'), max_age_seconds=60)
+    assert long_retained is not None
+    assert (long_retained.demand_feed_generation
+            < long_retained.observed_demand_feed_generation)
+    long_successor = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 0},
+        sequenced_reserved_fill=True,
+        planner=_production_deadline_decision)
+    assert long_successor.candidate.aggregate_demand_target == 18
+    assert (long_successor.candidate.demand_witness_sha256 ==
+            long_first.candidate.demand_witness_sha256)
+
     demand_state.ingest_report(
         'svc', 'svc-hash',
-        _demand_report(time.time(), route_receipt, sequence=5, request_count=0))
+        _demand_report(time.time(), route_receipt, sequence=6, request_count=0))
     zero_snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
     assert zero_snapshot is not None
     assert zero_snapshot.fresh_aggregate_zero
@@ -4196,6 +4299,60 @@ def test_plan_publication_rebases_equivalent_heartbeat(capacity_database):
         current.receipt_watermark)
     assert published['demand_feed_generation'] == receipt.generation
     assert published['payload']['normalized_demand']['autoscaler_target'] == 1
+
+
+@pytest.mark.parametrize('next_remaining_seconds', [580, 610])
+def test_deadline_heartbeat_revokes_prospective_paid_lease(
+        capacity_database, next_remaining_seconds):
+    engine, _, route_receipt = capacity_database
+
+    def _report(sequence: int, remaining_seconds: int) -> dict:
+        report = _demand_report(time.time(),
+                                route_receipt,
+                                sequence=sequence,
+                                request_count=0)
+        report.update(queue_depth=1,
+                      queue_depth_by_priority={'50': 1},
+                      queued_requests_by_compatibility=[{
+                          'priority': 50,
+                          'compatible_accelerators': ['L4'],
+                          'count': 1,
+                      }],
+                      queued_request_deadline_buckets=[{
+                          'priority': 50,
+                          'compatible_accelerators': ['L4'],
+                          'remaining_seconds': remaining_seconds,
+                          'count': 1,
+                      }])
+        return report
+
+    demand_state.ingest_report('svc', 'svc-hash', _report(2, 585))
+    deadline = capacity_planning.DeadlinePlanningInput(
+        demand=(autoscaler_compatibility.DeadlineDemand(
+            sequence=0,
+            priority=50,
+            compatible_cards=('l4',),
+            count=1,
+            remaining_seconds=585),),
+        finite_supply=(),
+        service_seconds_by_accelerator=(
+            capacity_planning.AcceleratorWork.from_mapping({'l4': 10.0})),
+        service_time_sources=(('l4', 'configured'),),
+        utilization=0.95,
+        paid_cold_lead_seconds=0.0)
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1, deadline=deadline))
+    assert authority.remaining_launch_capacity() == {'l4': 1}
+
+    demand_state.ingest_report('svc', 'svc-hash',
+                               _report(3, next_remaining_seconds))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='Deadline demand advanced'):
+        _validate_prospective_claim(engine, {
+            **authority.claim_values('l4'),
+            'pool_key': _paid_pool_key(),
+        })
 
 
 def test_plan_publication_rejects_advanced_demand_change(capacity_database):
