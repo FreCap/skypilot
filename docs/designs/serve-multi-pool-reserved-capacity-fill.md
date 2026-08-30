@@ -2246,10 +2246,13 @@ every other destructive commit. Additive fresh zero may publish a revoking
 zero plan and reject new spend, but it cannot retire or drain capacity until
 the reporter catches up and the cutover is `STABLE`. Unknown occupancy remains
 unknown and its associated supply remains conservatively protected; it cannot
-be treated as absent or released for paid residual or scale-down. The existing bounded
-`UNKNOWN_CAPACITY_REPLACEMENT` path may independently admit one demand-fenced
-replacement after its degradation timeout while the predecessor remains
-counted and protected; that path cannot recurse.
+be treated as absent or released for paid residual or scale-down. A promoted
+``DURABLE_FEED`` service does not admit an
+``UNKNOWN_CAPACITY_REPLACEMENT`` overlap. Retaining that older exception would
+create a second prospective paid-admission path and require the replica-manager
+lock to enter PostgreSQL. The predecessor remains protected until a fresh probe
+or exact cleanup evidence resolves it. Legacy replacement rows remain readable
+and cleanable, but the format-5 happy path creates no new replacement.
 
 Every AWS paid association uses a stable provider idempotency token bound to
 the immutable association and exact instance parameters. A lost provider

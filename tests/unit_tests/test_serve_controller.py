@@ -10,6 +10,7 @@ pruned when a replica leaves the ready set.
 import asyncio
 import concurrent.futures
 import contextlib
+import dataclasses
 import hashlib
 import inspect
 import json
@@ -4824,6 +4825,27 @@ class TestAutoscalerRuntimeSnapshot:
         if supply is None:
             supply = TestAutoscalerRuntimeSnapshot._reserved_supply_projection(
                 economic_replica_infos=replica_infos)
+        if (supply.prior_policy_state is None or
+                supply.prior_candidate is None or
+                supply.planning_db_epoch is None):
+            capacity_unit = (capacity_planning.CapacityUnit.LOGICAL_GPU
+                             if scaler.replica_unit == 'logical' else
+                             capacity_planning.CapacityUnit.PHYSICAL_BACKEND)
+            prior_policy_state, prior_candidate = (
+                capacity_planning.genesis_capacity_policy(
+                    service_name='svc',
+                    service_version=scaler.latest_version,
+                    last_reduced_demand_generation=0,
+                    capacity_unit=capacity_unit,
+                    maximum_capacity=scaler.max_replicas,
+                    physical_gpu_width_by_accelerator=(
+                        capacity_planning.AcceleratorCapacity.from_mapping(
+                            scaler.configured_accelerator_shapes)),
+                    backend_num_nodes=scaler.backend_num_nodes))
+            supply = dataclasses.replace(supply,
+                                         prior_policy_state=prior_policy_state,
+                                         prior_candidate=prior_candidate,
+                                         planning_db_epoch=1.0)
 
         def _durable_plan(_replica_infos,
                           request_information,
@@ -5687,6 +5709,7 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler = scaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
+        witness = self._gate_demand_witness(scaler, ('L4',))
 
         unavailable = self._reserved_supply_projection(
             policy=(controller.capacity_admission.ReservedSupplyPolicy.
@@ -5697,7 +5720,6 @@ class TestAutoscalerRuntimeSnapshot:
                                       supply=unavailable)
         ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()
 
-        witness = self._gate_demand_witness(scaler, ('L4',))
         allocation, _ = self._reserved_fill_allocation(
             grant=0,
             utilization_gate_armed=True,

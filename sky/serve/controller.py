@@ -6322,6 +6322,7 @@ class SkyServeController:
     def _prepare_current_paid_launch_specs(
         self,
         decision_autoscaler: autoscalers.ConcurrencyAutoscaler,
+        decision_version: int,
         replica_infos: list[replica_managers.ReplicaInfo],
         max_live_paid_gpu_units: int | None,
     ) -> tuple[paid_capacity.PaidLaunchSpec, ...]:
@@ -6372,6 +6373,32 @@ class SkyServeController:
             for card, width in shapes.items()
         }
         max_candidates = sum(backend_limits.values())
+        try:
+            version_authority = serve_state.get_paid_launch_version_authority(
+                self._service_name, decision_version)
+        except serve_state.ControllerConfigCorruptionError as error:
+            logger.warning(
+                'Suppressing paid candidates because elected-version '
+                'authority is corrupt: %s',
+                common_utils.format_exception(error))
+            return ()
+        if version_authority is None:
+            logger.warning(
+                'Suppressing paid candidates because elected '
+                'version %s has no immutable launch authority.',
+                decision_version)
+            return ()
+        try:
+            serve_utils.parse_and_validate_version_controller_config(
+                version_authority.controller_config,
+                self._replica_manager.workspace,
+                'prepared paid launch controller config')
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Suppressing paid candidates because elected-version '
+                'controller config is invalid: %s',
+                common_utils.format_exception(error))
+            return ()
         placer = self._replica_manager.spot_placer
         aws_account_id = None
         if placer is not None:
@@ -6396,6 +6423,7 @@ class SkyServeController:
                 max_candidates=max_candidates,
                 occupied_replica_ids=(
                     info.replica_id for info in replica_infos),
+                version_authority=version_authority,
                 aws_account_id=aws_account_id)
             if (not isinstance(prepared, tuple) or
                     any(not isinstance(spec, paid_capacity.PaidLaunchSpec)
@@ -6477,7 +6505,8 @@ class SkyServeController:
                            'the active service paid cap is malformed.')
             return None
         prepared_paid_launch_specs = self._prepare_current_paid_launch_specs(
-            decision_autoscaler, replica_infos, max_live_paid_gpu_units)
+            decision_autoscaler, decision_version, replica_infos,
+            max_live_paid_gpu_units)
 
         planned: _LinearizedScalePlan | None = None
         durable_plan: autoscalers.DurableCapacityReconcilePlan | None = None
@@ -6804,6 +6833,10 @@ class SkyServeController:
                     service_hash=service_hash,
                     service_lifecycle_epoch=(binding.service_lifecycle_epoch),
                     service_version=decision_version,
+                    expected_controller_incarnation=(
+                        binding.controller_incarnation),
+                    expected_controller_owner_epoch=(
+                        binding.controller_owner_epoch),
                     accounting_cards=accounting_cards,
                     backend_num_nodes=backend_num_nodes,
                     sequenced_reserved_fill=sequenced_reserved_fill,

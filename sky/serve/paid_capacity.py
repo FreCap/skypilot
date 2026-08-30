@@ -12,6 +12,7 @@ from collections.abc import Sequence
 import dataclasses
 import enum
 import functools
+import hashlib
 import json
 import math
 import os
@@ -159,6 +160,62 @@ def thaw_paid_launch_payload(value: bytes) -> dict[str, Any]:
     return decoded
 
 
+def paid_launch_payload_sha256(value: Mapping[str, Any]) -> str:
+    """Hash one canonical JSON authority payload."""
+    return hashlib.sha256(freeze_paid_launch_payload(value)).hexdigest()
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PaidLaunchVersionAuthority:
+    """Immutable controller authority read from one elected version row."""
+
+    service_spec: bytes
+    service_spec_sha256: str
+    controller_config: bytes
+    controller_config_digest: str
+    controller_config_snapshot_id: str
+
+    def __post_init__(self) -> None:
+        if (type(self.service_spec) is not bytes or not self.service_spec or
+                type(self.service_spec_sha256) is not str or
+                _SHA256_RE.fullmatch(self.service_spec_sha256) is None or
+                hashlib.sha256(self.service_spec).hexdigest()
+                != self.service_spec_sha256 or
+                type(self.controller_config) is not bytes or
+                type(self.controller_config_digest) is not str or
+                _SHA256_RE.fullmatch(self.controller_config_digest) is None or
+                hashlib.sha256(self.controller_config).hexdigest()
+                != self.controller_config_digest or
+                type(self.controller_config_snapshot_id) is not str or
+                _SHA256_RE.fullmatch(
+                    self.controller_config_snapshot_id) is None):
+            raise ValueError('Paid launch version authority is malformed.')
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PaidLaunchCatalogEvidence:
+    """Immutable elected-version and catalog facts for one Spot template."""
+
+    placement_catalog_sha256: str
+    catalog_rank: int
+    exploration_round: int
+    slot_within_pool_window: int
+    version_authority: PaidLaunchVersionAuthority
+
+    def __post_init__(self) -> None:
+        if (type(self.placement_catalog_sha256) is not str or
+                _SHA256_RE.fullmatch(self.placement_catalog_sha256) is None):
+            raise ValueError('Paid launch version evidence has a bad digest.')
+        if not isinstance(self.version_authority, PaidLaunchVersionAuthority):
+            raise ValueError('Paid launch has no elected-version authority.')
+        integer_fields = (self.catalog_rank, self.exploration_round,
+                          self.slot_within_pool_window)
+        if any(
+                type(value) is not int or value < 0  # pylint: disable=unidiomatic-typecheck
+                for value in integer_fields):
+            raise ValueError('Paid launch catalog ordering is malformed.')
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PaidLaunchSpec:
     """Deeply immutable provider-free candidate for atomic paid admission.
@@ -192,6 +249,7 @@ class PaidLaunchSpec:
     gpu_units_per_node: int
     num_nodes: int
     resources_override: bytes
+    catalog_evidence: PaidLaunchCatalogEvidence
 
     def __post_init__(self) -> None:
         nonempty_strings = (
@@ -245,6 +303,8 @@ class PaidLaunchSpec:
         for payload in (self.initial_replica_state, self.worker_construction,
                         self.resources_override):
             thaw_paid_launch_payload(payload)
+        if not isinstance(self.catalog_evidence, PaidLaunchCatalogEvidence):
+            raise ValueError('Paid launch has no typed version evidence.')
 
         pool = pool_key_payload(self.pool_key)
         if pool is None or pool.get('use_spot') is not True:

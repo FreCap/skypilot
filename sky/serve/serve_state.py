@@ -4579,16 +4579,16 @@ def update_replica_for_bound_ordinary_launch_in_transaction(
                 transaction_replica_info.paid_capacity_pool_key
                 != paid_capacity_pool_key):
             return False
+        pool = connection.execute(
+            sqlalchemy.select(paid_capacity_pools_table).where(
+                paid_capacity_pools_table.c.pool_key ==
+                paid_capacity_pool_key).with_for_update()).one_or_none()
         claim = connection.execute(
             sqlalchemy.select(paid_capacity_claims_table).where(
                 paid_capacity_claims_table.c.service_name == service_name,
                 paid_capacity_claims_table.c.service_hash == service_hash,
                 paid_capacity_claims_table.c.replica_id == replica_id,
                 paid_capacity_claims_table.c.pool_key ==
-                paid_capacity_pool_key).with_for_update()).one_or_none()
-        pool = connection.execute(
-            sqlalchemy.select(paid_capacity_pools_table).where(
-                paid_capacity_pools_table.c.pool_key ==
                 paid_capacity_pool_key).with_for_update()).one_or_none()
         if claim is None or pool is None:
             return False
@@ -8538,8 +8538,12 @@ def get_scale_planning_state_fingerprint(service_name: str,
     with orm.Session(engine) as session:
         runtime_query = sqlalchemy.select(
             services_table.c.hash,
+            services_table.c.status,
+            services_table.c.current_version,
             services_table.c.controller_pid,
             services_table.c.controller_ip,
+            services_table.c.controller_incarnation,
+            services_table.c.controller_owner_epoch,
             services_table.c.active_versions,
         ).where(services_table.c.name == service_name)
         if require_version:
@@ -8580,8 +8584,14 @@ def get_scale_planning_state_fingerprint(service_name: str,
     material = {
         'runtime': {
             'hash': runtime['hash'],
+            'status': runtime['status'],
+            'current_version': runtime['current_version'],
             'controller_pid': runtime['controller_pid'],
             'controller_ip': runtime['controller_ip'],
+            'controller_incarnation':
+                (None if runtime['controller_incarnation'] is None else str(
+                    runtime['controller_incarnation'])),
+            'controller_owner_epoch': runtime['controller_owner_epoch'],
             'active_versions': (json.loads(runtime['active_versions'])
                                 if runtime['active_versions'] else []),
         },
@@ -9998,6 +10008,56 @@ def get_version_controller_config(
             f'Controller config snapshot for service {service_name!r}, '
             f'version {version} is incomplete.')
     return snapshot
+
+
+def get_paid_launch_version_authority(
+    service_name: str,
+    version: int,
+) -> paid_capacity.PaidLaunchVersionAuthority | None:
+    """Read one active version's immutable spec and controller snapshot."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.select(
+                version_specs_table.c.spec,
+                version_specs_table.c.controller_config,
+                version_specs_table.c.controller_config_digest,
+                version_specs_table.c.controller_config_snapshot_id,
+            ).where(version_specs_table.c.service_name == service_name,
+                    version_specs_table.c.version == version,
+                    version_specs_table.c.yaml_content.isnot(None),
+                    version_specs_table.c.quarantined_at.is_(None),
+                    version_specs_table.c.retired_at.is_(None))).fetchone()
+    if result is None:
+        return None
+    service_spec_bytes = result[0]
+    controller_config = result[1]
+    if isinstance(service_spec_bytes, memoryview):
+        service_spec_bytes = service_spec_bytes.tobytes()
+    if isinstance(controller_config, memoryview):
+        controller_config = controller_config.tobytes()
+    if not isinstance(service_spec_bytes, bytes) or not service_spec_bytes:
+        raise ControllerConfigCorruptionError(
+            f'Service spec for service {service_name!r}, version {version} '
+            'is unavailable for paid launch preparation.')
+    try:
+        snapshot = _validate_controller_config_snapshot(
+            controller_config,
+            result[2],
+            result[3],
+            argument_name='persisted paid launch controller config')
+        if snapshot is None:
+            raise ValueError('controller config snapshot is absent')
+        return paid_capacity.PaidLaunchVersionAuthority(
+            service_spec=service_spec_bytes,
+            service_spec_sha256=hashlib.sha256(service_spec_bytes).hexdigest(),
+            controller_config=snapshot[0],
+            controller_config_digest=snapshot[1],
+            controller_config_snapshot_id=snapshot[2])
+    except ValueError as error:
+        raise ControllerConfigCorruptionError(
+            f'Paid launch authority for service {service_name!r}, version '
+            f'{version} failed integrity validation: {error}') from error
 
 
 def get_service_config_recovery_identity(

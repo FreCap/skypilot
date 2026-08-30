@@ -687,41 +687,13 @@ def _encode_replica_resource_state(
     PostgreSQL JSONB reads it back as the string ``"null"``. Store this one
     nested mapping as key/value pairs so its key types survive the round trip.
     """
-    if state is None:
-        return None
-    encoded = dict(state)
-    image_id = encoded.get('image_id')
-    if isinstance(image_id, dict):
-        encoded['image_id'] = [
-            [region, image] for region, image in image_id.items()
-        ]
-    return encoded
+    return spot_placer.encode_resources_override(state)
 
 
 def _decode_replica_resource_state(
         state: dict[str, Any] | None) -> dict[str, Any] | None:
     """Restores the internal location/resources override representation."""
-    if state is None:
-        return None
-    decoded = dict(state)
-    image_id = decoded.get('image_id')
-    if isinstance(image_id, list):
-        restored_image_id = {}
-        for item in image_id:
-            if not isinstance(item, list) or len(item) != 2:
-                raise ValueError('Invalid replica image_id storage state: '
-                                 f'{image_id!r}')
-            restored_image_id[item[0]] = item[1]
-        decoded['image_id'] = restored_image_id
-    elif isinstance(image_id, dict) and 'null' in image_id:
-        # Compatibility for version-1 rows written before image_id mappings
-        # used a lossless representation. The JSON encoder coerced a None key
-        # to the literal string "null".
-        decoded['image_id'] = {
-            None if region == 'null' else region: image
-            for region, image in image_id.items()
-        }
-    return decoded
+    return spot_placer.decode_resources_override(state)
 
 
 def _exact_reserved_fill_marker(value: Any) -> bool:
@@ -897,8 +869,8 @@ def validate_reserved_fill_allocation_attribution(
                 'Policy-bound reserved-fill launch requires a current '
                 f'ReplicaInfo v{_REPLICA_INFO_VERSION} row.')
         if (admission_sequence is None or
-                values['reserved_fill_allocation_claim_generation'] !=
-                service_generation):
+                values['reserved_fill_allocation_claim_generation']
+                != service_generation):
             raise exceptions.KubernetesPhysicalClusterIdentityError(
                 'Policy-bound reserved-fill launch requires complete admitted '
                 'allocation provenance.')
@@ -1099,13 +1071,15 @@ def is_recoverable_uncommitted_logical_retirement(info: Any) -> bool:
          confirmed_generation >= typing.cast(int, selection_generation)))
     strict_idle_wait = (status.wait_for_idle_before_termination is True and
                         confirmation_valid)
-    bounded_precommit = (
-        status.wait_for_idle_before_termination is False and
-        bounded_deadline is True and type(confirmed_generation) is int and
-        generation_valid and
-        confirmed_generation >= typing.cast(int, selection_generation) and
-        type(info.version) is int and type(retirement_version) is int and
-        info.version <= retirement_version)
+    bounded_precommit = (status.wait_for_idle_before_termination is False and
+                         bounded_deadline is True and
+                         type(confirmed_generation) is int and
+                         generation_valid and
+                         confirmed_generation >= typing.cast(
+                             int, selection_generation) and
+                         type(info.version) is int and
+                         type(retirement_version) is int and
+                         info.version <= retirement_version)
     return bool(
         status.sky_launch_status == common_utils.ProcessStatus.SUCCEEDED and
         status.sky_down_status == common_utils.ProcessStatus.SCHEDULED and
@@ -1449,8 +1423,8 @@ class ReplicaInfo:
                 'logical_retirement_confirmed_generation':
                     status_property.logical_retirement_confirmed_generation,
                 'logical_retirement_bounded_deadline':
-                    (status_property.logical_retirement_bounded_deadline is True
-                    ),
+                    (status_property.logical_retirement_bounded_deadline
+                     is True),
                 'logical_retirement_committed': logical_retirement_committed,
             },
         }
@@ -1633,9 +1607,9 @@ class ReplicaInfo:
                 'logical_retirement_confirmed_generation'),
             logical_retirement_bounded_deadline=(
                 _status_value('logical_retirement_bounded_deadline') is True),
-            logical_retirement_committed=(
-                logical_retirement_committed
-                if type(logical_retirement_committed) is bool else None),
+            logical_retirement_committed=(logical_retirement_committed
+                                          if type(logical_retirement_committed)
+                                          is bool else None),
         )
         quarantine = replica.system_recovery_quarantine
         if quarantine is not None:
@@ -1768,8 +1742,8 @@ class ReplicaInfo:
         # scheme. The LB reaches replicas over public IPs across clouds and
         # regions, so this hop is https whenever replica TLS is enabled.
         if not endpoint.startswith('http'):
-            scheme = ('https' if serve_utils.replica_tls_mode() !=
-                      serve_constants.REPLICA_TLS_MODE_OFF else 'http')
+            scheme = ('https' if serve_utils.replica_tls_mode()
+                      != serve_constants.REPLICA_TLS_MODE_OFF else 'http')
             endpoint = f'{scheme}://{endpoint}'
         return endpoint
 

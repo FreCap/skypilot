@@ -15,6 +15,7 @@ import math
 from multiprocessing import pool as mp_pool
 import os
 import pathlib
+import pickle
 import queue
 import threading
 import time
@@ -4132,6 +4133,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         max_gpu_units_by_accelerator: Mapping[str, int],
         max_candidates: int,
         occupied_replica_ids: Iterable[int],
+        version_authority: paid_capacity.PaidLaunchVersionAuthority,
         aws_account_id: str | None = None,
     ) -> tuple[paid_capacity.PaidLaunchSpec, ...]:
         """Freeze a bounded cost-ordered Spot superset without authority I/O.
@@ -4175,6 +4177,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise ValueError('occupied_replica_ids is malformed.')
         if max_candidates == 0 or not any(caps.values()):
             return ()
+        if not isinstance(version_authority,
+                          paid_capacity.PaidLaunchVersionAuthority):
+            raise ValueError('Paid launch version authority is malformed.')
 
         with self.lock:
             if self._update_recovery_required or self._is_pool:
@@ -4190,23 +4195,35 @@ class SkyPilotReplicaManager(ReplicaManager):
                     authority.service_workspace != self._workspace):
                 return ()
             version = self.latest_version
-            launch_spec = self._version_specs.get(version)
-            if launch_spec is None:
+            local_launch_spec = self._version_specs.get(version)
+            if local_launch_spec is None:
                 # Preparation is deliberately database-free.  A controller
                 # without its elected immutable spec retries after recovery.
                 return ()
+            try:
+                launch_spec = pickle.loads(version_authority.service_spec)
+            except Exception:  # pylint: disable=broad-except
+                return ()
+            if type(launch_spec) is not type(local_launch_spec):
+                return ()
             launch_yaml_content = self.yaml_content
-            launch_task_template = self._task_template_for_version(
-                version, launch_yaml_content, launch_spec)
+            launch_task_template = load_task_with_service_spec(
+                launch_yaml_content, launch_spec)
             replica_port = _get_resources_ports(launch_yaml_content,
                                                 launch_spec,
                                                 launch_task_template)
-            controller_config = skypilot_config.to_dict()
-            controller_config_path = os.environ.get(
-                skypilot_config.ENV_VAR_SKYPILOT_CONFIG)
+            controller_config_path = (
+                serve_utils.generate_versioned_config_yaml_file_name(
+                    self._service_name, version, self._resource_scope))
             num_nodes = placer.num_nodes
             if (type(num_nodes) is not int or num_nodes < 1):  # pylint: disable=unidiomatic-typecheck
                 return ()
+            placement_catalog = placer.placement_catalog.to_dict()
+            placement_catalog_sha256 = (
+                paid_capacity.paid_launch_payload_sha256(placement_catalog))
+            catalog_entries = {
+                entry.location: entry for entry in placer.ranked_catalog_entries
+            }
             ranked_locations = []
             for location in placer.ranked_active_locations():
                 cloud = str(location.cloud).casefold()
@@ -4222,18 +4239,29 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if (card not in shapes or type(raw_width) is not int or  # pylint: disable=unidiomatic-typecheck
                         raw_width != shapes[card]):
                     continue
-                ranked_locations.append((location, cloud, card, raw_width))
+                catalog_entry = catalog_entries.get(location)
+                if (catalog_entry is None or
+                        not math.isfinite(catalog_entry.hourly_cost) or
+                        catalog_entry.hourly_cost <= 0 or
+                        not math.isfinite(catalog_entry.normalized_hourly_cost)
+                        or catalog_entry.normalized_hourly_cost <= 0):
+                    # An unpriced or stale catalog member cannot become paid
+                    # provider authority.  Keep trying exact priced pools.
+                    continue
+                ranked_locations.append(
+                    (location, cloud, card, raw_width, catalog_entry.rank))
             if not ranked_locations:
                 return ()
 
             prepared: list[paid_capacity.PaidLaunchSpec] = []
             remaining = dict(caps)
             per_pool_window = paid_capacity.base_limit()
+            exploration_round = 0
             while len(prepared) < max_candidates:
                 made_progress = False
-                for location, cloud, card, width in ranked_locations:
+                for location, cloud, card, width, catalog_rank in ranked_locations:
                     physical_gpu_units = width * num_nodes
-                    for _ in range(per_pool_window):
+                    for pool_slot in range(per_pool_window):
                         if (len(prepared) >= max_candidates or
                                 remaining[card] < physical_gpu_units):
                             break
@@ -4264,10 +4292,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 self._service_name, replica_id,
                                 self._resource_scope))
                         raw_override = location.to_dict()
-                        storage_override = dict(raw_override)
-                        storage_override['cloud'] = cloud
+                        raw_override['cloud'] = cloud
                         storage_override = _encode_replica_resource_state(
-                            storage_override)
+                            raw_override)
                         assert storage_override is not None
                         planned_capacity = (width if self._uses_logical_replicas
                                             else 1)
@@ -4297,7 +4324,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 'log_file_name': log_file_name,
                                 'resources_override': storage_override,
                                 'retry_until_up': False,
-                                'frozen_controller_config': controller_config,
                                 'frozen_controller_config_path': controller_config_path,
                             }))
                         pool_payload = paid_capacity.pool_key_payload(
@@ -4333,11 +4359,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 accelerator=card,
                                 gpu_units_per_node=width,
                                 num_nodes=num_nodes,
-                                resources_override=frozen_override))
+                                resources_override=frozen_override,
+                                catalog_evidence=(
+                                    paid_capacity.PaidLaunchCatalogEvidence(
+                                        placement_catalog_sha256=(
+                                            placement_catalog_sha256),
+                                        catalog_rank=catalog_rank,
+                                        exploration_round=(exploration_round),
+                                        slot_within_pool_window=pool_slot,
+                                        version_authority=version_authority))))
                         remaining[card] -= physical_gpu_units
                         made_progress = True
                 if not made_progress:
                     break
+                exploration_round += 1
             return tuple(prepared)
 
     def _build_paid_launch_worker_postcommit(
@@ -4356,7 +4391,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         expected_worker_fields = {
             'schema_version', 'launch_yaml_content', 'cluster_name',
             'log_file_name', 'resources_override', 'retry_until_up',
-            'frozen_controller_config', 'frozen_controller_config_path'
+            'frozen_controller_config_path'
         }
         expected_info = ReplicaInfo.from_storage_dict(initial)
         if (set(worker) != expected_worker_fields or
@@ -4398,16 +4433,30 @@ class SkyPilotReplicaManager(ReplicaManager):
                 NonPoolLaunchProfileKind.ORDINARY_PAID):
             raise _BoundOrdinaryLaunchUnresolvedError(
                 'Committed paid launch has no ordinary-paid profile.')
-        launch_spec = self._version_specs.get(spec.service_version)
-        if launch_spec is None:
+        local_launch_spec = self._version_specs.get(spec.service_version)
+        if local_launch_spec is None:
             raise _BoundOrdinaryLaunchUnresolvedError(
                 'Committed paid launch lost its elected service spec.')
+        try:
+            launch_spec = pickle.loads(
+                spec.catalog_evidence.version_authority.service_spec)
+        except Exception as error:  # pylint: disable=broad-except
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Committed paid launch has a corrupt elected service spec.'
+            ) from error
+        if type(launch_spec) is not type(local_launch_spec):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Committed paid launch has a mismatched service spec type.')
         launch_yaml_content = worker['launch_yaml_content']
         if not isinstance(launch_yaml_content, str):
             raise ValueError('Paid launch YAML construction is malformed.')
-        task_template = self._task_template_for_version(spec.service_version,
-                                                        launch_yaml_content,
-                                                        launch_spec)
+        version_authority = spec.catalog_evidence.version_authority
+        frozen_controller_config = (
+            serve_utils.parse_and_validate_version_controller_config(
+                version_authority.controller_config, self._workspace,
+                'committed paid launch controller config'))
+        task_template = load_task_with_service_spec(launch_yaml_content,
+                                                    launch_spec)
         decoded_override = _decode_replica_resource_state(stored_override)
         location = spot_placer.Location.from_resources_override(
             decoded_override)
@@ -4461,7 +4510,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             'task_template': task_template,
             'service_name': self._service_name,
             'workspace': self._workspace,
-            'frozen_controller_config': worker['frozen_controller_config'],
+            'frozen_controller_config': frozen_controller_config,
             'frozen_controller_config_path':
                 worker['frozen_controller_config_path'],
             'ordinary_launch_submission_uuid': submission_id,
