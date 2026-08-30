@@ -56,6 +56,8 @@ _DEPENDENCY_VIOLATION_PATTERN = re.compile(
 _RESUME_INSTANCE_TIMEOUT = 480  # 8 minutes
 _RESUME_PER_INSTANCE_TIMEOUT = 120  # 2 minutes
 _ORDINARY_PAID_PROVIDER_PROOF_RETRY_SECONDS = 5
+_FRESH_INSTANCE_TAG_MAX_ATTEMPTS = 3
+_FRESH_INSTANCE_TAG_RETRYABLE_ERROR_CODES = ('InvalidInstanceID.NotFound',)
 
 # ======================== About AWS subnet/VPC ========================
 # https://stackoverflow.com/questions/37407492/are-there-differences-in-networking-performance-if-ec2-instances-are-in-differen
@@ -367,8 +369,8 @@ def _promote_provider_negative_ack(
     }
     raw_subnet_ids: list[str] = []
     for raw_attempt in candidate['attempts']:
-        if type(raw_attempt
-               ) is not dict or set(raw_attempt) != raw_attempt_keys:
+        if type(raw_attempt) is not dict or set(
+                raw_attempt) != raw_attempt_keys:
             return None
         raw_subnet_ids.append(raw_attempt['subnet_id'])
 
@@ -521,8 +523,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
             raise _pause_ordinary_paid_provider_proof(
                 'Ordinary-paid AWS subnet proof is temporarily unavailable '
                 'before provider inventory.')
-        if (request_subnet_availability_zones.get(raw_subnet_ids[0]) !=
-                exact_availability_zone):
+        if (request_subnet_availability_zones.get(raw_subnet_ids[0])
+                != exact_availability_zone):
             raise exceptions.ServeReplicaLaunchFenceError(
                 'Ordinary-paid AWS provider subnet does not match its '
                 'immutable availability-zone scope.')
@@ -639,7 +641,9 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
         else:
             assert False, state
 
-    def _create_node_tag(target_instance, is_head: bool = True) -> str:
+    def _create_node_tag(target_instance,
+                         is_head: bool = True,
+                         retry_eventual_consistency: bool = False) -> str:
         node_type_tags = (constants.HEAD_NODE_TAGS
                           if is_head else constants.WORKER_NODE_TAGS)
         node_tag = [{'Key': k, 'Value': v} for k, v in node_type_tags.items()]
@@ -658,10 +662,23 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
             tag for tag in target_instance.tags
             if not tag['Key'].startswith('aws:')
         ]
-        ec2.meta.client.create_tags(
-            Resources=[target_instance.id],
-            Tags=target_instance_tags + node_tag,
-        )
+        resources = [target_instance.id]
+        tags_to_create = target_instance_tags + node_tag
+        if retry_eventual_consistency:
+            # RunInstances can return before the new instance is visible to a
+            # subsequent CreateTags request. Retry only that documented
+            # eventual-consistency response; all other client errors retain
+            # their existing fail-fast behavior.
+            _ec2_call_with_retry_on_server_error(
+                ec2.meta.client.create_tags,
+                additional_retryable_error_codes=(
+                    _FRESH_INSTANCE_TAG_RETRYABLE_ERROR_CODES),
+                max_attempts=_FRESH_INSTANCE_TAG_MAX_ATTEMPTS,
+                Resources=resources,
+                Tags=tags_to_create)
+        else:
+            ec2.meta.client.create_tags(Resources=resources,
+                                        Tags=tags_to_create)
         return target_instance.id
 
     if head_instance_id is None:
@@ -718,8 +735,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 # SkyPilot more responsive.
                 fut = pool_.apply_async(inst.wait_until_stopped)
                 per_instance_time_start = time.time()
-                while (time.time() - per_instance_time_start <
-                       _RESUME_PER_INSTANCE_TIMEOUT):
+                while (time.time() - per_instance_time_start
+                       < _RESUME_PER_INSTANCE_TIMEOUT):
                     if fut.ready():
                         fut.get()
                         break
@@ -912,12 +929,17 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
         # the worker tag is a legacy feature, so we would not care about
         # more corner cases.
         if head_instance_id is None:
-            head_instance_id = _create_node_tag(created_instances[0])
+            head_instance_id = _create_node_tag(created_instances[0],
+                                                retry_eventual_consistency=True)
             for inst in created_instances[1:]:
-                _create_node_tag(inst, is_head=False)
+                _create_node_tag(inst,
+                                 is_head=False,
+                                 retry_eventual_consistency=True)
         else:
             for inst in created_instances:
-                _create_node_tag(inst, is_head=False)
+                _create_node_tag(inst,
+                                 is_head=False,
+                                 retry_eventual_consistency=True)
 
     assert head_instance_id is not None
     fresh_identity = None

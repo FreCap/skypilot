@@ -1817,7 +1817,7 @@ One bounded paid wave uses one PostgreSQL transaction to:
    accepted candidates, within the same transaction;
 3. insert the ordered policy-valid subset as `SCHEDULED` replica rows with paid
    claims and global/pool debits; and
-4. commit before any worker is registered or started.
+4. commit before any worker is built, registered, or started.
 
 Each intended member has one exact cheapest-first location and is never
 reassigned in-transaction. Exact-pool saturation defers that member while later
@@ -1833,21 +1833,29 @@ limit to reach a requested size. A normal singleton admission is the same
 operation with one candidate. There is no durable batch table or historical
 manifest.
 
-After commit, the existing launch-reservation transaction charges P before
-starting manager workers. Each worker then uses the unchanged generic non-pool
-binding transaction to create its association, immutable API request, queue
-row, and retention pin. Queue visibility at that later commit is intentional
-executor activation. The provider guard still exact-matches the complete
-replica, claim, binding, request, and execution authority before its first
-effect. Fresh complete current load-balancer reports authorize the prospective
-paid debit, not a second post-commit lease: report expiry, ingestion blackout,
-or HA-role heartbeat advancement cannot revoke the exact committed graph's one
-provider effect. The guard still requires an unexpired current route head and
-matching lifecycle, source epochs, owner, plan integrity, and bounded debit. A
-crash or lost commit acknowledgement between the two phases leaves inert state,
-never provider authority. In-process recovery exact-matches only the ambiguous
-frozen identities after releasing the manager lock; startup recovery enumerates
-them after process death. Both atomically retire and replan association-less
+After commit, the manager builds workers only for the transaction's committed
+members, and the existing launch-reservation transaction charges P before
+starting them. Each worker then uses the unchanged generic non-pool binding
+transaction to create its association, immutable API request, queue row, and
+retention pin. Queue visibility at that later commit is intentional executor
+activation. A rejected Phase-A member never constructs a worker. A postcommit
+worker-construction failure leaves an association-less replica+claim pair with
+no provider authority; the existing exact pre-admission recovery retires and
+replans it while construction continues for later committed wave members. An
+interrupt queues the current and later committed-but-unpublished identities
+for that same exact recovery before propagating. The provider guard still
+exact-matches the complete replica, claim, binding, request, and execution
+authority before its first effect. Fresh
+complete current load-balancer reports authorize the prospective paid debit,
+not a second post-commit lease: report expiry, ingestion blackout, or HA-role
+heartbeat advancement cannot revoke the exact committed graph's one provider
+effect. The guard still requires an unexpired current route head and matching
+lifecycle, source epochs, owner, plan integrity, and bounded debit. A crash or
+lost commit acknowledgement between the two phases leaves inert state, never
+provider authority. In-process recovery exact-matches only unsettled or
+committed-but-unpublished frozen identities after releasing the manager lock;
+startup recovery enumerates them after process death. Both atomically retire
+and replan association-less
 replica+claim pairs, adopt an exact association if binding won the race, and
 infer no historical batch manifest.
 

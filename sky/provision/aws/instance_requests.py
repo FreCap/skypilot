@@ -260,42 +260,54 @@ def _raise_ambiguous_create_pause(
     raise _provider_create_ambiguous_error() from error
 
 
-def _ec2_call_with_retry_on_server_error(ec2_fail_fast_fn: Callable[..., _T],
-                                         log_level=logging.DEBUG,
-                                         **kwargs) -> _T:
+def _ec2_call_with_retry_on_server_error(
+        ec2_fail_fast_fn: Callable[..., _T],
+        log_level=logging.DEBUG,
+        *,
+        additional_retryable_error_codes: tuple[str, ...] = (),
+        max_attempts: int | None = None,
+        **kwargs) -> _T:
+    """Call EC2 with bounded retries for server and opted-in error codes."""
     # Here we have to handle 'RequestLimitExceeded' error, so the provision
     # would not fail due to request limit issues.
     # Here the backoff config (5, 12) is picked at random and does not
     # have any special meaning.
     backoff = common_utils.Backoff(initial_backoff=5, max_backoff_factor=12)
-    ret = None
+    if max_attempts is None:
+        max_attempts = utils.BOTO_MAX_RETRIES
+    if max_attempts < 1:
+        raise ValueError('max_attempts must be positive.')
+    retryable_error_codes = frozenset({
+        'RequestLimitExceeded',
+        'ServerInternal',
+        'ServiceUnavailable',
+        'InternalError',
+        'Unavailable',
+    }).union(additional_retryable_error_codes)
     last_retryable_error: BaseException | None = None
-    for _ in range(utils.BOTO_MAX_RETRIES):
+    for attempt in range(max_attempts):
         try:
-            ret = ec2_fail_fast_fn(**kwargs)
-            break
+            return ec2_fail_fast_fn(**kwargs)
         except aws.botocore_exceptions().ClientError as e:
             # Retry server side errors, as they are likely to be transient.
             # https://docs.aws.amazon.com/AWSEC2/latest/APIReference/errors-overview.html#api-error-codes-table-server # pylint: disable=line-too-long
             error_code = e.response['Error']['Code']
-            if error_code in [
-                    'RequestLimitExceeded', 'ServerInternal',
-                    'ServiceUnavailable', 'InternalError', 'Unavailable'
-            ]:
+            if error_code in retryable_error_codes:
                 last_retryable_error = e
-                time.sleep(backoff.current_backoff())
-                logger.debug(f'create_instances: {error_code}, retrying.')
-                continue
+                if attempt + 1 < max_attempts:
+                    time.sleep(backoff.current_backoff())
+                    logger.debug(
+                        f'EC2 call failed with {error_code}; retrying.')
+                    continue
+                break
             logger.log(log_level, f'create_instances: Attempt failed with {e}')
             raise
-    if ret is None:
-        error = RuntimeError(
-            f'Failed to call EC2 function {ec2_fail_fast_fn}; retryable '
-            'server errors exhausted all local attempts.')
-        if last_retryable_error is not None:
-            raise error from last_retryable_error
-        raise error
-    return ret
+    error = RuntimeError(
+        f'Failed to call EC2 function {ec2_fail_fast_fn}; retryable '
+        'errors exhausted all local attempts.')
+    if last_retryable_error is not None:
+        raise error from last_retryable_error
+    raise error
 
 
 def _format_tags(tags: dict[str, str]) -> list:
