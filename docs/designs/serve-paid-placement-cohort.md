@@ -2,7 +2,7 @@
 
 _Created: 2026-07-22_
 _Expanded: 2026-07-23_
-_Last updated: 2026-08-28_
+_Last updated: 2026-08-30_
 
 ## Status
 
@@ -26,6 +26,18 @@ projected route before the remaining prospective claims could commit. GCP
 usually produced a `RUNNING` VM 10-30 seconds after commitment, but repeated
 route-plan self-invalidation stretched 100 Spot L4 VMs to 27 minutes 53
 seconds.
+
+The active 2026-08-30 correction retains that one-transaction Phase-A
+boundary while removing launch-worker construction from its freshness window.
+Candidate preparation freezes only the exact placement, replica identity,
+priority, backend width, and immutable plan debit required by Phase A. After
+the transaction returns its authoritative member receipt, the manager builds
+and registers workers only for committed members. A construction failure after
+commit cannot reach a provider: the association-less replica and claim are
+retired and replanned by the existing exact pre-admission recovery path without
+suppressing construction of later committed wave members. An interrupt queues
+the current and every later committed-but-unpublished identity for that same
+exact recovery before propagating.
 
 The 2026-08-28 retained-route semantic-equivalence correction described below
 is source-complete and under qualification. It is not part of the earlier
@@ -525,8 +537,9 @@ Claim acquisition uses this bounded-batch transaction protocol:
 1. Before the transaction, the existing placer freezes an ordered candidate
    for each logical slot from one advisory budget. Each candidate has one exact
    location, pool key, replica/record identity, priority, width, and immutable
-   plan debit. No replica is prepared for two alternative locations, and a
-   rejected identity is never reassigned inside the transaction.
+   plan debit. It does not build a launch worker or materialize the later
+   generic request. No replica is prepared for two alternative locations, and
+   a rejected identity is never reassigned inside the transaction.
 2. Acquire the zero-cost protocol observation lock, lifecycle row, and service
    owner row in the deployed paid-admission order. Read an advisory claim
    snapshot only to discover every retained pool that must join the sorted lock
@@ -589,15 +602,18 @@ Claim acquisition uses this bounded-batch transaction protocol:
    evidence normalization. A deliberate policy denial may commit waiter-only
    state; a successful subset commits its final per-pool waiter effects with
    its replica and claim rows.
-6. After commit, the manager registers the already-built ordinary launch
-   workers. The existing launch-reservation transaction charges the process P
-   budget in a batch, and each worker uses the canonical generic non-pool
-   binding path before provider I/O. A crash anywhere after the claim commit
-   leaves ordinary unresolved replica rows that recovery exact-matches by
-   replica identity. An association-less Phase-A replica+claim pair has no
-   provider-effect authority: recovery atomically retires the pair with the
-   existing proof-backed pre-admission primitive, wakes reconciliation, and a
-   fresh plan may mint a new identity. If binding won the row-lock race,
+6. After commit, the manager builds and registers ordinary launch workers only
+   for the committed members. The existing launch-reservation transaction
+   charges the process P budget in a batch, and each worker uses the canonical
+   generic non-pool binding path before provider I/O. A crash or worker-build
+   failure anywhere after the claim commit leaves ordinary unresolved replica
+   rows that recovery exact-matches by replica identity. One member's ordinary
+   construction failure does not suppress later committed members. An
+   interrupt queues the current and remaining committed-but-unpublished
+   members before propagating. An association-less Phase-A replica+claim pair
+   has no provider-effect authority: recovery atomically retires the pair with
+   the existing proof-backed pre-admission primitive, wakes reconciliation,
+   and a fresh plan may mint a new identity. If binding won the row-lock race,
    recovery adopts the exact association and request instead of retiring it.
 
 The returned result names the committed members and each typed deferral. A
@@ -1418,7 +1434,7 @@ capacity without deriving either durable claim envelope from it.
 
 | Changed invariant | Test proof |
 | --- | --- |
-| One nominal paid wave validates one immutable plan and atomically commits its ordered policy-valid `SCHEDULED` replica+claim subset before any worker is registered | Real-PostgreSQL 100-member claim test plus replica-manager no-worker-before-commit test |
+| One nominal paid wave validates one immutable plan and atomically commits its ordered policy-valid `SCHEDULED` replica+claim subset before any worker is built or registered; rejected members never construct workers | Real-PostgreSQL 100-member claim test plus replica-manager post-commit worker-materialization test |
 | A member insert fault rolls back every new replica and claim; transaction-acknowledgement loss fails closed, scopes recovery to exact frozen identities, retires and replans association-less pairs, adopts bound pairs, and never infers a batch manifest | Real-PostgreSQL failpoint, lost-ack, exact-scope in-process recovery, and restart tests |
 | A multi-pool batch acquires the service row then exact-pool rows in canonical sorted order and never exceeds the service envelope, card frontier, adaptive pool depth, plan residual, or global paid cap; later P admission independently prevents started workers from exceeding process capacity | Real-PostgreSQL sorted-lock instrumentation and saturation tests, aggregate summed-debit tests, plus retained cross-pool concurrency and P-reservation regressions |
 | A route, allocation, capacity-graph, or demand-semantic change before the transaction rejects every member; monotonic semantic-equivalent reporter heartbeats do not starve a prepared wave; report expiry, ingestion blackout, and HA-role advancement after commit do not revoke an already committed batch, while an independently fresh current route remains mandatory | Capacity-plan conflict/rollback tests, 100-member equivalent-heartbeat admission, 100-member fresh-zero rollback, post-commit report-expiry/current-ACTIVE-mismatch tests, stale-current-route rejection, plus retained capacity-plan CAS tests |

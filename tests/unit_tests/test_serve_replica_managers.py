@@ -18080,6 +18080,7 @@ class TestPaidLocationLaunchBudget:
         existing = []
         prepared = []
         workers = []
+        worker_factories = []
         for replica_id in range(1, count + 1):
             info = self._info(
                 replica_id, paid,
@@ -18088,6 +18089,8 @@ class TestPaidLocationLaunchBudget:
             worker = mock.Mock()
             existing.append(info)
             workers.append(worker)
+            worker_factory = mock.Mock(return_value=worker)
+            worker_factories.append(worker_factory)
             prepared.append(
                 replica_managers._PreparedPaidLaunch(
                     candidate=paid_capacity.PaidClaimCandidate(
@@ -18098,8 +18101,9 @@ class TestPaidLocationLaunchBudget:
                     launch_result=_accepted_launch_result(
                         replica_id, 1,
                         replica_managers._ReplicaLaunchFunding.PAID),
-                    launch_thread=worker))
-        return manager, paid, budget, existing, prepared, workers
+                    launch_thread_factory=worker_factory))
+        return (manager, paid, budget, existing, prepared, worker_factories,
+                workers)
 
     @staticmethod
     def _ambiguous_paid_manager():
@@ -18482,6 +18486,7 @@ class TestPaidLocationLaunchBudget:
         def _admit_batch(**kwargs):
             candidates = kwargs['candidates']
             assert len(candidates) == 3
+            assert not workers
             assert not manager._launch_thread_pool
             manager._persist_new_replica.assert_not_called()
             results = [
@@ -18530,15 +18535,14 @@ class TestPaidLocationLaunchBudget:
         } == {1, 2}
         assert [info.replica_id for info in existing] == [1, 2]
         assert manager._next_replica_id == 4
-        assert len(workers) == 3
+        assert len(workers) == 2
         assert all(worker.start.call_count == 0 for worker in workers)
-        # The side effect returns the authoritative members directly; only
-        # the two ACQUIRED workers receive their exact Phase-A handoff.
+        # Phase A commits before construction, and only the two ACQUIRED
+        # members materialize workers and receive their exact handoff.
         assert workers[0].install_paid_claim_commit_receipt.call_args.args[0] \
             .claim_result is paid_capacity.ClaimResult.ACQUIRED
         assert workers[1].install_paid_claim_commit_receipt.call_args.args[0] \
             .claim_result is paid_capacity.ClaimResult.ACQUIRED
-        workers[2].install_paid_claim_commit_receipt.assert_not_called()
         candidates = admit_batch.call_args.kwargs['candidates']
         assert [
             candidate.capacity_plan_claim['capacity_plan_units']
@@ -18609,6 +18613,7 @@ class TestPaidLocationLaunchBudget:
         def _admit_batch(**kwargs):
             candidates = kwargs['candidates']
             assert len(candidates) == 76
+            assert not workers
             assert all(
                 candidate.location.use_spot is True for candidate in candidates)
             assert collections.Counter(
@@ -18719,8 +18724,8 @@ class TestPaidLocationLaunchBudget:
 
         def _release_after_enqueue(location):
             assert location == paid
-            with manager._ambiguous_paid_phase_a_lock:
-                assert len(manager._ambiguous_paid_phase_a_recoveries) == 2
+            with manager._paid_phase_a_recovery_lock:
+                assert len(manager._paid_phase_a_recoveries) == 2
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -18756,13 +18761,13 @@ class TestPaidLocationLaunchBudget:
         assert not manager._launch_thread_pool
         assert manager._next_replica_id == 3
         assert release.call_args_list == [mock.call(paid), mock.call(paid)]
-        assert len(workers) == 2
+        assert not workers
         assert all(worker.start.call_count == 0 for worker in workers)
         candidates = admit_batch.call_args.kwargs['candidates']
-        with manager._ambiguous_paid_phase_a_lock:
-            queued = set(manager._ambiguous_paid_phase_a_recoveries)
+        with manager._paid_phase_a_recovery_lock:
+            queued = set(manager._paid_phase_a_recoveries)
         assert queued == {
-            replica_managers._AmbiguousPaidPhaseAIdentity(
+            replica_managers._PaidPhaseARecoveryIdentity(
                 candidate.replica_id, candidate.replica_info.replica_record_id)
             for candidate in candidates
         }
@@ -18772,19 +18777,19 @@ class TestPaidLocationLaunchBudget:
         ordinary_launch_binding.PreAdmissionRetirementDisposition.RETIRED,
         ordinary_launch_binding.PreAdmissionRetirementDisposition.ABSENT,
     ])
-    def test_ambiguous_paid_phase_a_exact_retirement_notifies_and_leaves_unrelated(
+    def test_paid_phase_a_recovery_exact_retirement_notifies_and_leaves_unrelated(
             self, disposition):
         manager = self._ambiguous_paid_manager()
-        exact = replica_managers._AmbiguousPaidPhaseAIdentity(
+        exact = replica_managers._PaidPhaseARecoveryIdentity(
             3, '22222222-2222-4222-8222-222222222222')
-        unrelated = replica_managers._AmbiguousPaidPhaseAIdentity(
+        unrelated = replica_managers._PaidPhaseARecoveryIdentity(
             4, '33333333-3333-4333-8333-333333333333')
-        with manager._ambiguous_paid_phase_a_lock:
-            manager._ambiguous_paid_phase_a_recoveries[exact] = (
-                replica_managers._AmbiguousPaidPhaseARecovery())
-            manager._ambiguous_paid_phase_a_recoveries[unrelated] = (
-                replica_managers._AmbiguousPaidPhaseARecovery(
-                    retry_at=time.monotonic() + 3600))
+        with manager._paid_phase_a_recovery_lock:
+            manager._paid_phase_a_recoveries[exact] = (
+                replica_managers._PaidPhaseARecovery())
+            manager._paid_phase_a_recoveries[unrelated] = (
+                replica_managers._PaidPhaseARecovery(retry_at=time.monotonic() +
+                                                     3600))
         retirement = ordinary_launch_binding.PreAdmissionRetirement(disposition)
 
         def _retire(authority, replica_id, replica_record_id):
@@ -18800,26 +18805,25 @@ class TestPaidLocationLaunchBudget:
                 side_effect=_retire) as retire, \
              mock.patch.object(replica_managers.request_postgres,
                                'inspect_bound_ordinary_launch') as inspect:
-            manager._reconcile_ambiguous_paid_phase_a_outcomes()
+            manager._reconcile_paid_phase_a_recoveries()
 
         retire.assert_called_once()
         inspect.assert_not_called()
         manager._notify_scale_reconciliation.assert_called_once_with()
-        with manager._ambiguous_paid_phase_a_lock:
-            assert set(
-                manager._ambiguous_paid_phase_a_recoveries) == {unrelated}
+        with manager._paid_phase_a_recovery_lock:
+            assert set(manager._paid_phase_a_recoveries) == {unrelated}
 
-    def test_ambiguous_paid_phase_a_recovery_coalesces_and_retries(self):
-        manager, _, _, _, prepared, _ = self._prepared_paid_wave(count=1)
+    def test_paid_phase_a_recovery_coalesces_and_retries(self):
+        manager, _, _, _, prepared, _, _ = self._prepared_paid_wave(count=1)
         manager._ordinary_launch_binding_authority = _binding_authority(
             ordinary_launch_binding.BindingMode.BOUND,
             binding_epoch=2,
             generic=True)
         manager._notify_scale_reconciliation = mock.Mock()
-        manager._enqueue_ambiguous_paid_phase_a_recovery(prepared)
-        manager._enqueue_ambiguous_paid_phase_a_recovery(prepared)
-        with manager._ambiguous_paid_phase_a_lock:
-            assert len(manager._ambiguous_paid_phase_a_recoveries) == 1
+        manager._enqueue_paid_phase_a_recovery(prepared)
+        manager._enqueue_paid_phase_a_recovery(prepared)
+        with manager._paid_phase_a_recovery_lock:
+            assert len(manager._paid_phase_a_recoveries) == 1
         retirement = ordinary_launch_binding.PreAdmissionRetirement(
             ordinary_launch_binding.PreAdmissionRetirementDisposition.RETIRED)
 
@@ -18831,14 +18835,13 @@ class TestPaidLocationLaunchBudget:
              mock.patch.object(replica_managers.time,
                                'monotonic',
                                return_value=100.0):
-            manager._reconcile_ambiguous_paid_phase_a_outcomes()
-            manager._reconcile_ambiguous_paid_phase_a_outcomes()
+            manager._reconcile_paid_phase_a_recoveries()
+            manager._reconcile_paid_phase_a_recoveries()
 
         retire.assert_called_once()
         manager._notify_scale_reconciliation.assert_not_called()
-        with manager._ambiguous_paid_phase_a_lock:
-            recovery = next(
-                iter(manager._ambiguous_paid_phase_a_recoveries.values()))
+        with manager._paid_phase_a_recovery_lock:
+            recovery = next(iter(manager._paid_phase_a_recoveries.values()))
             assert recovery.attempts == 1
             assert recovery.retry_at > 100.0
 
@@ -18849,17 +18852,17 @@ class TestPaidLocationLaunchBudget:
              mock.patch.object(replica_managers.time,
                                'monotonic',
                                return_value=recovery.retry_at):
-            manager._reconcile_ambiguous_paid_phase_a_outcomes()
+            manager._reconcile_paid_phase_a_recoveries()
 
         retry.assert_called_once()
         manager._notify_scale_reconciliation.assert_called_once_with()
-        with manager._ambiguous_paid_phase_a_lock:
-            assert not manager._ambiguous_paid_phase_a_recoveries
+        with manager._paid_phase_a_recovery_lock:
+            assert not manager._paid_phase_a_recoveries
 
-    def test_ambiguous_paid_phase_a_association_is_adopted_exactly(self):
+    def test_paid_phase_a_recovery_association_is_adopted_exactly(self):
         manager = self._ambiguous_paid_manager()
         context = _bound_non_pool_context()
-        identity = replica_managers._AmbiguousPaidPhaseAIdentity(
+        identity = replica_managers._PaidPhaseARecoveryIdentity(
             context.replica_id, str(context.replica_record_id))
         info = _fake_replica_info(
             identity.replica_id,
@@ -18867,9 +18870,9 @@ class TestPaidLocationLaunchBudget:
         info.replica_record_id = identity.replica_record_id
         reduction = types.SimpleNamespace(context=context,
                                           disposition='ADOPT_ACTIVE')
-        with manager._ambiguous_paid_phase_a_lock:
-            manager._ambiguous_paid_phase_a_recoveries[identity] = (
-                replica_managers._AmbiguousPaidPhaseARecovery())
+        with manager._paid_phase_a_recovery_lock:
+            manager._paid_phase_a_recoveries[identity] = (
+                replica_managers._PaidPhaseARecovery())
         retirement = ordinary_launch_binding.PreAdmissionRetirement(
             ordinary_launch_binding.PreAdmissionRetirementDisposition.ASSOCIATED
         )
@@ -18889,7 +18892,7 @@ class TestPaidLocationLaunchBudget:
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=info) as get_info:
-            manager._reconcile_ambiguous_paid_phase_a_outcomes()
+            manager._reconcile_paid_phase_a_recoveries()
 
         retire.assert_called_once_with(
             manager._ordinary_launch_binding_authority, identity.replica_id,
@@ -18900,14 +18903,14 @@ class TestPaidLocationLaunchBudget:
         manager._install_bound_launch_adopter.assert_called_once_with(
             info, context, start=False)
         manager._notify_scale_reconciliation.assert_not_called()
-        with manager._ambiguous_paid_phase_a_lock:
-            assert not manager._ambiguous_paid_phase_a_recoveries
+        with manager._paid_phase_a_recovery_lock:
+            assert not manager._paid_phase_a_recoveries
 
     @pytest.mark.parametrize('receipt_kind',
                              ['sequence', 'enum', 'mixed_ownership'])
     def test_paid_batch_invalid_receipt_publishes_no_workers(
             self, receipt_kind):
-        manager, paid, budget, existing, prepared, workers = (
+        manager, paid, budget, existing, prepared, worker_factories, workers = (
             self._prepared_paid_wave())
         candidates = [item.candidate for item in prepared]
         if receipt_kind == 'sequence':
@@ -18939,18 +18942,19 @@ class TestPaidLocationLaunchBudget:
 
         assert not existing
         assert not manager._launch_thread_pool
+        assert all(factory.call_count == 0 for factory in worker_factories)
         assert all(worker.start.call_count == 0 for worker in workers)
         assert release.call_args_list == [mock.call(paid), mock.call(paid)]
-        with manager._ambiguous_paid_phase_a_lock:
-            assert set(manager._ambiguous_paid_phase_a_recoveries) == {
-                replica_managers._AmbiguousPaidPhaseAIdentity(
+        with manager._paid_phase_a_recovery_lock:
+            assert set(manager._paid_phase_a_recoveries) == {
+                replica_managers._PaidPhaseARecoveryIdentity(
                     candidate.replica_id,
                     candidate.replica_info.replica_record_id)
                 for candidate in candidates
             }
 
     def test_paid_batch_collision_preflight_publishes_no_partial_wave(self):
-        manager, paid, budget, existing, prepared, workers = (
+        manager, paid, budget, existing, prepared, worker_factories, workers = (
             self._prepared_paid_wave())
         candidates = [item.candidate for item in prepared]
         receipt = paid_capacity.PaidClaimBatchResult(
@@ -18978,18 +18982,19 @@ class TestPaidLocationLaunchBudget:
         } == {candidates[1].replica_id}
         assert manager._launch_thread_pool[
             candidates[1].replica_id] is collision
+        assert all(factory.call_count == 0 for factory in worker_factories)
         assert all(worker.start.call_count == 0 for worker in workers)
         assert release.call_args_list == [mock.call(paid), mock.call(paid)]
-        with manager._ambiguous_paid_phase_a_lock:
-            assert set(manager._ambiguous_paid_phase_a_recoveries) == {
-                replica_managers._AmbiguousPaidPhaseAIdentity(
+        with manager._paid_phase_a_recovery_lock:
+            assert set(manager._paid_phase_a_recoveries) == {
+                replica_managers._PaidPhaseARecoveryIdentity(
                     candidate.replica_id,
                     candidate.replica_info.replica_record_id)
                 for candidate in candidates
             }
 
     def test_paid_batch_member_extraction_interrupt_queues_exact_recovery(self):
-        manager, paid, budget, existing, prepared, workers = (
+        manager, paid, budget, existing, prepared, worker_factories, workers = (
             self._prepared_paid_wave())
 
         class _InterruptedReceipt:
@@ -19010,11 +19015,12 @@ class TestPaidLocationLaunchBudget:
 
         assert not existing
         assert not manager._launch_thread_pool
+        assert all(factory.call_count == 0 for factory in worker_factories)
         assert all(worker.start.call_count == 0 for worker in workers)
         assert release.call_args_list == [mock.call(paid), mock.call(paid)]
-        with manager._ambiguous_paid_phase_a_lock:
-            assert set(manager._ambiguous_paid_phase_a_recoveries) == {
-                replica_managers._AmbiguousPaidPhaseAIdentity(
+        with manager._paid_phase_a_recovery_lock:
+            assert set(manager._paid_phase_a_recoveries) == {
+                replica_managers._PaidPhaseARecoveryIdentity(
                     item.candidate.replica_id,
                     item.candidate.replica_info.replica_record_id)
                 for item in prepared
@@ -19022,8 +19028,8 @@ class TestPaidLocationLaunchBudget:
 
     def test_paid_batch_postcommit_publication_interrupt_wakes_exact_adoption(
             self):
-        manager, _, budget, existing, prepared, workers = (
-            self._prepared_paid_wave())
+        manager, paid, budget, existing, prepared, worker_factories, workers = (
+            self._prepared_paid_wave(count=3))
         candidates = [item.candidate for item in prepared]
         receipt = paid_capacity.PaidClaimBatchResult(
             tuple(
@@ -19046,17 +19052,67 @@ class TestPaidLocationLaunchBudget:
         with mock.patch.object(paid_capacity,
                                'try_persist_claim_batch',
                                return_value=receipt), \
+             mock.patch.object(manager._spot_placer,
+                               'release_retry') as release, \
              pytest.raises(KeyboardInterrupt):
             manager._finalize_prepared_paid_launches(prepared, budget, existing)
 
-        # Phase A is proven committed, so never retire either row as
-        # ambiguous. The periodic/startup exact adopter sees the second durable
-        # row after this wake while preserving the first exact worker.
+        # Phase A is proven committed. Preserve the first published worker and
+        # queue the interrupted member plus every later committed/unpublished
+        # identity for exact retire-or-adopt settlement.
         assert set(interrupted_pool) == {candidates[0].replica_id}
         assert manager._launch_completion_event.is_set()
+        assert [factory.call_count for factory in worker_factories] == [1, 1, 0]
+        assert release.call_args_list == [mock.call(paid), mock.call(paid)]
         assert all(worker.start.call_count == 0 for worker in workers)
-        with manager._ambiguous_paid_phase_a_lock:
-            assert not manager._ambiguous_paid_phase_a_recoveries
+        with manager._paid_phase_a_recovery_lock:
+            assert set(manager._paid_phase_a_recoveries) == {
+                replica_managers._PaidPhaseARecoveryIdentity(
+                    candidate.replica_id,
+                    candidate.replica_info.replica_record_id)
+                for candidate in candidates[1:]
+            }
+
+    def test_paid_batch_middle_worker_failure_keeps_later_member_live(self):
+        manager, paid, budget, existing, prepared, worker_factories, workers = (
+            self._prepared_paid_wave(count=3))
+        candidates = [item.candidate for item in prepared]
+        receipt = paid_capacity.PaidClaimBatchResult(
+            tuple(
+                paid_capacity.PaidClaimBatchMemberResult(
+                    candidate.replica_id, candidate.replica_info.
+                    replica_record_id, paid_capacity.ClaimResult.ACQUIRED)
+                for candidate in candidates))
+        worker_factories[1].side_effect = RuntimeError(
+            'worker construction failed')
+        manager._launch_completion_event.clear()
+
+        with mock.patch.object(paid_capacity,
+                               'try_persist_claim_batch',
+                               return_value=receipt), \
+             mock.patch.object(manager._spot_placer,
+                               'release_retry') as release:
+            committed = manager._finalize_prepared_paid_launches(
+                prepared, budget, existing)
+
+        assert {
+            replica_id for replica_id, _ in manager._launch_thread_pool.items()
+        } == {candidates[0].replica_id, candidates[2].replica_id}
+        assert [result.replica_id for result in committed] == [1, 3]
+        assert manager._launch_completion_event.is_set()
+        assert [factory.call_count for factory in worker_factories] == [1, 1, 1]
+        assert release.call_args_list == [mock.call(paid)]
+        workers[0].install_paid_claim_commit_receipt.assert_called_once()
+        workers[1].install_paid_claim_commit_receipt.assert_not_called()
+        workers[2].install_paid_claim_commit_receipt.assert_called_once()
+        assert all(worker.start.call_count == 0 for worker in workers)
+        assert [info.replica_id for info in existing] == [1, 2, 3]
+        with manager._paid_phase_a_recovery_lock:
+            assert set(manager._paid_phase_a_recoveries) == {
+                replica_managers._PaidPhaseARecoveryIdentity(
+                    candidates[1].replica_id,
+                    candidates[1].replica_info.replica_record_id)
+            }
 
     def test_env_override_and_invalid_fallback(self, monkeypatch):
         paid_capacity._parse_positive_int.cache_clear()

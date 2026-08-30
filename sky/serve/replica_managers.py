@@ -338,20 +338,20 @@ class _PreparedPaidLaunch:
 
     candidate: 'paid_capacity.PaidClaimCandidate'
     launch_result: _ReplicaLaunchResult
-    launch_thread: '_ReplicaLaunchThread'
+    launch_thread_factory: 'Callable[[], _ReplicaLaunchThread | None]'
 
 
 @dataclasses.dataclass(frozen=True)
-class _AmbiguousPaidPhaseAIdentity:
-    """Exact staged replica whose Phase-A commit outcome is unknown."""
+class _PaidPhaseARecoveryIdentity:
+    """Exact staged replica requiring Phase-A settlement or publication."""
 
     replica_id: int
     replica_record_id: str
 
 
 @dataclasses.dataclass
-class _AmbiguousPaidPhaseARecovery:
-    """Process-local retry state for one exact ambiguous Phase-A identity."""
+class _PaidPhaseARecovery:
+    """Process-local retry state for one exact Phase-A identity."""
 
     attempts: int = 0
     retry_at: float = 0.0
@@ -3853,9 +3853,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
         self._non_pool_reconciliation_attempts: dict[int, int] = {}
         self._non_pool_reconciliation_retry_at: dict[int, float] = {}
-        self._ambiguous_paid_phase_a_lock = threading.Lock()
-        self._ambiguous_paid_phase_a_recoveries: dict[
-            _AmbiguousPaidPhaseAIdentity, _AmbiguousPaidPhaseARecovery] = {}
+        self._paid_phase_a_recovery_lock = threading.Lock()
+        self._paid_phase_a_recoveries: dict[_PaidPhaseARecoveryIdentity,
+                                            _PaidPhaseARecovery] = {}
         self._ordinary_launch_binding_authority: (ControllerBindingAuthority |
                                                   None) = None
         self._ordinary_launch_binding_transition_lock = threading.Lock()
@@ -4965,7 +4965,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     serve_state.ReplicaStatus.PROVISIONING) or
                     info.replica_id in runtime.launch_thread_pool or
                     info.replica_id in runtime.down_thread_pool or
-                    self._ambiguous_paid_phase_a_is_pending(info)):
+                    self._paid_phase_a_recovery_is_pending(info)):
                 continue
             try:
                 reduction = request_postgres.inspect_bound_ordinary_launch(
@@ -8741,16 +8741,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._demote_system_recovery_candidate, replica_id,
                     recovery_intent),
             }
-        t = _make_launch_thread(recovery_launch_kwargs)
-        assert t is not None
-        if existing_replica_infos is not None:
-            # Bulk callers (recovery re-drive) reuse one snapshot across a
-            # whole wave of launches. Append each accepted replica so shared
-            # zero-cost capacity accounting sees the in-wave reservations.
-            existing_replica_infos.append(info)
         if stage_paid_launch:
             assert prepared_paid_launches is not None
             assert location is not None
+            if existing_replica_infos is not None:
+                # Candidate selection shares one mutable wave snapshot. Keep
+                # this exact uncommitted row visible to later placements; the
+                # Phase-A receipt removes rejected candidates below.
+                existing_replica_infos.append(info)
             prepared_paid_launches.append(
                 _PreparedPaidLaunch(candidate=paid_capacity.PaidClaimCandidate(
                     replica_id=replica_id,
@@ -8759,8 +8757,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                     priority=launch_priority,
                     capacity_plan_claim=capacity_plan_claim),
                                     launch_result=launch_result,
-                                    launch_thread=t))
+                                    launch_thread_factory=functools.partial(
+                                        _make_launch_thread,
+                                        recovery_launch_kwargs)))
             return launch_result
+        t = _make_launch_thread(recovery_launch_kwargs)
+        assert t is not None
+        if existing_replica_infos is not None:
+            # Bulk callers (recovery re-drive) reuse one snapshot across a
+            # whole wave of launches. Append each accepted replica so shared
+            # zero-cost capacity accounting sees the in-wave reservations.
+            existing_replica_infos.append(info)
         # Don't start right now; _refresh_thread_pool owns the shared launch
         # limit and final ownership/target fences.  Wake it immediately,
         # though: a planner-bound paid claim can be invalidated by the next
@@ -10094,42 +10101,42 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise ValueError('Protocol-v2 fill requires typed plan admission.')
         self.scale_up_batch([resources_override])
 
-    def _enqueue_ambiguous_paid_phase_a_recovery(
+    def _enqueue_paid_phase_a_recovery(
             self,
             prepared_paid_launches: Iterable[_PreparedPaidLaunch]) -> None:
-        """Coalesce exact unknown Phase-A outcomes without database I/O."""
+        """Coalesce exact unsettled Phase-A identities without database I/O."""
         identities = tuple(
-            _AmbiguousPaidPhaseAIdentity(
+            _PaidPhaseARecoveryIdentity(
                 prepared.candidate.replica_id,
                 prepared.candidate.replica_info.replica_record_id)
             for prepared in prepared_paid_launches)
         if not identities:
             return
-        with self._ambiguous_paid_phase_a_lock:
+        with self._paid_phase_a_recovery_lock:
             for identity in identities:
-                self._ambiguous_paid_phase_a_recoveries.setdefault(
-                    identity, _AmbiguousPaidPhaseARecovery())
+                self._paid_phase_a_recoveries.setdefault(
+                    identity, _PaidPhaseARecovery())
         # The supervised refresher drains this queue only after its locked
         # refresh pass returns. Waking it here never performs database or
         # provider I/O under the scale-up manager lock.
         self._legacy_mutation_runtime_state().launch_completion_event.set()
 
-    def _ambiguous_paid_phase_a_is_pending(self, info: ReplicaInfo) -> bool:
-        identity = _AmbiguousPaidPhaseAIdentity(info.replica_id,
-                                                info.replica_record_id)
-        with self._ambiguous_paid_phase_a_lock:
-            return identity in self._ambiguous_paid_phase_a_recoveries
+    def _paid_phase_a_recovery_is_pending(self, info: ReplicaInfo) -> bool:
+        identity = _PaidPhaseARecoveryIdentity(info.replica_id,
+                                               info.replica_record_id)
+        with self._paid_phase_a_recovery_lock:
+            return identity in self._paid_phase_a_recoveries
 
-    def _resolve_ambiguous_paid_phase_a(
-            self, identity: _AmbiguousPaidPhaseAIdentity) -> None:
-        with self._ambiguous_paid_phase_a_lock:
-            self._ambiguous_paid_phase_a_recoveries.pop(identity, None)
+    def _resolve_paid_phase_a_recovery(
+            self, identity: _PaidPhaseARecoveryIdentity) -> None:
+        with self._paid_phase_a_recovery_lock:
+            self._paid_phase_a_recoveries.pop(identity, None)
 
-    def _retry_ambiguous_paid_phase_a(self,
-                                      identity: _AmbiguousPaidPhaseAIdentity,
-                                      error: Exception) -> None:
-        with self._ambiguous_paid_phase_a_lock:
-            recovery = self._ambiguous_paid_phase_a_recoveries.get(identity)
+    def _retry_paid_phase_a_recovery(self,
+                                     identity: _PaidPhaseARecoveryIdentity,
+                                     error: Exception) -> None:
+        with self._paid_phase_a_recovery_lock:
+            recovery = self._paid_phase_a_recoveries.get(identity)
             if recovery is None:
                 return
             recovery.attempts += 1
@@ -10139,24 +10146,25 @@ class SkyPilotReplicaManager(ReplicaManager):
                 _NON_POOL_RECONCILIATION_RETRY_MAX_SECONDS)
             recovery.retry_at = time.monotonic() + delay
         logger.warning(
-            'Exact ambiguous paid Phase-A recovery for replica %s failed; '
+            'Exact paid Phase-A recovery for replica %s failed; '
             'retrying in %.1f seconds: %s', identity.replica_id, delay,
             common_utils.format_exception(error))
 
-    def _reconcile_ambiguous_paid_phase_a_outcomes(self) -> None:
-        """Resolve exact unknown Phase-A commits outside the manager lock."""
+    def _reconcile_paid_phase_a_recoveries(self) -> None:
+        """Settle exact unpublished Phase-A identities outside manager lock."""
         now = time.monotonic()
-        with self._ambiguous_paid_phase_a_lock:
-            identities = tuple(identity for identity, recovery in
-                               self._ambiguous_paid_phase_a_recoveries.items()
-                               if recovery.retry_at <= now)
+        with self._paid_phase_a_recovery_lock:
+            identities = tuple(
+                identity
+                for identity, recovery in self._paid_phase_a_recoveries.items()
+                if recovery.retry_at <= now)
         for identity in identities:
             try:
                 authority = self._ordinary_launch_binding_authority
                 if (authority is None or
                         not authority.retained_non_pool_settlement_allowed):
                     raise _BoundOrdinaryLaunchUnresolvedError(
-                        'Exact ambiguous paid Phase-A recovery has no retained '
+                        'Exact paid Phase-A recovery has no retained '
                         'generic settlement authority.')
                 retirement = (ordinary_launch_binding.
                               retire_pre_admission_non_pool_launch_intent(
@@ -10167,14 +10175,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                         PreAdmissionRetirementDisposition.RETIRED,
                         ordinary_launch_binding.
                         PreAdmissionRetirementDisposition.ABSENT):
-                    self._resolve_ambiguous_paid_phase_a(identity)
+                    self._resolve_paid_phase_a_recovery(identity)
                     self._notify_scale_reconciliation()
                     continue
                 if retirement.disposition is not (
                         ordinary_launch_binding.
                         PreAdmissionRetirementDisposition.ASSOCIATED):
                     raise _BoundOrdinaryLaunchUnresolvedError(
-                        'Exact ambiguous paid Phase-A retirement returned an '
+                        'Exact paid Phase-A retirement returned an '
                         'unknown disposition.')
 
                 # Admission won the exact row race. It is no longer safe to
@@ -10189,7 +10197,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if (reduction is None or info is None or
                         info.replica_record_id != identity.replica_record_id):
                     raise _BoundOrdinaryLaunchUnresolvedError(
-                        'Associated ambiguous paid Phase-A identity lost its '
+                        'Associated paid Phase-A identity lost its '
                         'exact durable projection.')
                 bound_context = reduction.context
                 if (not isinstance(
@@ -10200,12 +10208,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                         str(bound_context.replica_record_id)
                         != identity.replica_record_id):
                     raise _BoundOrdinaryLaunchUnresolvedError(
-                        'Associated ambiguous paid Phase-A projection returned '
+                        'Associated paid Phase-A projection returned '
                         'a mismatched request identity.')
                 classification = _bound_projection_classification(reduction)
                 if classification not in ('ADOPT_ACTIVE', 'WAIT_QUIESCENCE'):
                     raise _BoundOrdinaryLaunchUnresolvedError(
-                        'Associated ambiguous paid Phase-A request requires '
+                        'Associated paid Phase-A request requires '
                         'supervised fail-closed recovery: '
                         f'{classification!r}.')
 
@@ -10220,18 +10228,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                         if (getattr(existing, 'replica_record_id', None)
                                 != identity.replica_record_id):
                             raise _BoundOrdinaryLaunchUnresolvedError(
-                                'Associated ambiguous paid Phase-A identity '
+                                'Associated paid Phase-A identity '
                                 'collided with a different local worker.')
                     elif not self._install_bound_launch_adopter(
                             info, bound_context, start=False):
                         raise _BoundOrdinaryLaunchUnresolvedError(
-                            'Associated ambiguous paid Phase-A adopter could '
+                            'Associated paid Phase-A adopter could '
                             'not be registered.')
-                self._resolve_ambiguous_paid_phase_a(identity)
+                self._resolve_paid_phase_a_recovery(identity)
                 self._legacy_mutation_runtime_state(
                 ).launch_completion_event.set()
             except Exception as error:  # pylint: disable=broad-except
-                self._retry_ambiguous_paid_phase_a(identity, error)
+                self._retry_paid_phase_a_recovery(identity, error)
 
     @staticmethod
     def _remove_prepared_paid_info(existing_replica_infos: list['ReplicaInfo'] |
@@ -10265,12 +10273,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                 placer.release_retry(prepared.candidate.location)
             self._remove_prepared_paid_info(existing_replica_infos, prepared)
 
-        def _discard_ambiguous() -> None:
-            # Queue exact identities before dropping the only frozen local
-            # workers. The post-lock supervised reconciler proves whether
-            # Phase A committed; this stack must never infer from the error.
-            self._enqueue_ambiguous_paid_phase_a_recovery(
-                prepared_paid_launches)
+        def _release_retry(prepared: _PreparedPaidLaunch) -> None:
+            placer = self._spot_placer
+            if placer is not None:
+                placer.release_retry(prepared.candidate.location)
+
+        def _discard_unsettled() -> None:
+            # Queue exact identities before dropping the frozen candidates.
+            # The post-lock supervised reconciler proves whether Phase A
+            # committed; this stack must never infer from the error.
+            self._enqueue_paid_phase_a_recovery(prepared_paid_launches)
             for prepared in prepared_paid_launches:
                 _release(prepared)
             self._persist_spot_placement_state_if_dirty()
@@ -10294,7 +10306,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 common_utils.format_exception(error))
             return []
         except BaseException:  # pylint: disable=broad-exception-caught
-            _discard_ambiguous()
+            _discard_unsettled()
             raise
 
         expected_identities = tuple(
@@ -10306,21 +10318,21 @@ class SkyPilotReplicaManager(ReplicaManager):
                 (member.replica_id, member.replica_record_id)
                 for member in members)
         except BaseException as error:  # pylint: disable=broad-exception-caught
-            _discard_ambiguous()
+            _discard_unsettled()
             if not isinstance(error, Exception):
                 raise
             raise RuntimeError(
                 'Atomic paid launch admission returned an invalid result.'
             ) from error
         if result_identities != expected_identities:
-            _discard_ambiguous()
+            _discard_unsettled()
             raise RuntimeError('Atomic paid launch admission returned a '
                                'mismatched member sequence.')
 
         try:
             claim_results = tuple(member.claim_result for member in members)
         except BaseException as error:  # pylint: disable=broad-exception-caught
-            _discard_ambiguous()
+            _discard_unsettled()
             if not isinstance(error, Exception):
                 raise
             raise RuntimeError(
@@ -10350,7 +10362,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if claim_result is paid_capacity.ClaimResult.ACQUIRED and
             member.replica_id in legacy_runtime.launch_thread_pool), None)
         if invalid_members:
-            _discard_ambiguous()
+            _discard_unsettled()
             raise RuntimeError(
                 'Globally managed paid launch batch returned an invalid '
                 f'claim result: {invalid_members[0][1]!r}.')
@@ -10359,7 +10371,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # admitting any member. A mixed receipt cannot be interpreted as
             # a sparse commit, so reconcile every exact candidate before
             # publishing even an apparently ACQUIRED worker.
-            _discard_ambiguous()
+            _discard_unsettled()
             raise RuntimeError(
                 'Atomic paid launch admission returned a mixed ownership-lost '
                 'receipt.')
@@ -10368,7 +10380,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # before publishing the first worker. A late collision can
             # otherwise strand an earlier ACQUIRED member in a half-published
             # process-local wave.
-            _discard_ambiguous()
+            _discard_unsettled()
             raise RuntimeError(
                 'Committed paid launch collided with an existing worker for '
                 f'replica {collided_replica_id}.')
@@ -10376,18 +10388,58 @@ class SkyPilotReplicaManager(ReplicaManager):
         committed: list[_ReplicaLaunchResult] = []
         rejected = False
         ownership_lost = False
-        try:
-            for prepared, member, claim_result in zip(prepared_paid_launches,
-                                                      members,
-                                                      claim_results,
-                                                      strict=True):
+        publication_recovery_queued = False
+
+        def _queue_interrupted_tail(start_index: int) -> None:
+            nonlocal rejected
+            unpublished = []
+            for pending, pending_result in zip(
+                    prepared_paid_launches[start_index:],
+                    claim_results[start_index:],
+                    strict=True):
+                replica_id = pending.candidate.replica_id
+                if pending_result is paid_capacity.ClaimResult.ACQUIRED:
+                    if replica_id not in legacy_runtime.launch_thread_pool:
+                        _release_retry(pending)
+                        unpublished.append(pending)
+                else:
+                    rejected = True
+                    _release(pending)
+            self._enqueue_paid_phase_a_recovery(unpublished)
+            self._persist_spot_placement_state_if_dirty()
+
+        for index, (prepared, member, claim_result) in enumerate(
+                zip(prepared_paid_launches, members, claim_results,
+                    strict=True)):
+            try:
                 location = prepared.candidate.location
                 if claim_result is paid_capacity.ClaimResult.ACQUIRED:
                     replica_id = prepared.candidate.replica_id
-                    prepared.launch_thread.install_paid_claim_commit_receipt(
-                        member)
-                    legacy_runtime.launch_thread_pool[replica_id] = (
-                        prepared.launch_thread)
+                    try:
+                        launch_thread = prepared.launch_thread_factory()
+                        if launch_thread is None:
+                            raise RuntimeError(
+                                'Committed paid launch did not materialize a '
+                                'launch worker.')
+                        launch_thread.install_paid_claim_commit_receipt(member)
+                        legacy_runtime.launch_thread_pool[replica_id] = (
+                            launch_thread)
+                    except Exception as error:  # pylint: disable=broad-except
+                        # This member is durably committed but cannot reach a
+                        # provider without a published worker. Recover only
+                        # its exact identity and keep publishing its siblings.
+                        if replica_id not in legacy_runtime.launch_thread_pool:
+                            _release_retry(prepared)
+                            self._enqueue_paid_phase_a_recovery((prepared,))
+                            publication_recovery_queued = True
+                        else:
+                            committed.append(prepared.launch_result)
+                        logger.warning(
+                            'Committed paid Phase-A member %s could not be '
+                            'published; continuing its wave and reconciling '
+                            'the exact identity: %s', replica_id,
+                            common_utils.format_exception(error))
+                        continue
                     committed.append(prepared.launch_result)
                     continue
 
@@ -10407,25 +10459,26 @@ class SkyPilotReplicaManager(ReplicaManager):
                         paid_location_launch_budget, location)
                 elif claim_result is paid_capacity.ClaimResult.OWNERSHIP_LOST:
                     ownership_lost = True
-
-            if rejected:
-                self._persist_spot_placement_state_if_dirty()
-            if committed:
-                # Registration intentionally follows the all-or-subset durable
-                # commit. The shared refresher remains the sole owner of starts.
+            except BaseException:  # pylint: disable=broad-exception-caught
+                # The receipt proves Phase A. Preserve already-published
+                # workers and queue only current/later ACQUIRED identities
+                # whose workers are still absent before propagating an
+                # interrupt or process-exit signal.
+                _queue_interrupted_tail(index)
                 legacy_runtime.launch_completion_event.set()
-            if ownership_lost:
-                raise RuntimeError(
-                    f'Service {self._service_name!r} controller ownership '
-                    'changed while claiming paid capacity.')
-        except BaseException:  # pylint: disable=broad-exception-caught
-            # The complete receipt was validated, so Phase A is no longer
-            # ambiguous and must not be retired. If publication is interrupted,
-            # exact workers already registered remain valid; after self.lock
-            # unwinds, the ordinary durable-row adopter publishes every missing
-            # committed member. Process death uses the same startup recovery.
+                raise
+
+        if rejected or publication_recovery_queued:
+            self._persist_spot_placement_state_if_dirty()
+        if committed or publication_recovery_queued:
+            # Registration intentionally follows the all-or-subset durable
+            # commit. The shared refresher remains the sole owner of starts
+            # and exact unpublished-member recovery.
             legacy_runtime.launch_completion_event.set()
-            raise
+        if ownership_lost:
+            raise RuntimeError(
+                f'Service {self._service_name!r} controller ownership '
+                'changed while claiming paid capacity.')
         return committed
 
     def scale_up_batch(
@@ -15445,9 +15498,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if self._manager_daemon_should_stop():
                     return
                 # `_refresh_thread_pool()` has released the manager lock here.
-                # Unknown paid Phase-A outcomes require PostgreSQL settlement
-                # before any exact worker can be published or retired.
-                self._reconcile_ambiguous_paid_phase_a_outcomes()
+                # Unsettled or unpublished paid Phase-A identities require
+                # PostgreSQL settlement before they can be retired or adopted.
+                self._reconcile_paid_phase_a_recoveries()
                 if self._manager_daemon_should_stop():
                     return
                 wait_state_changed = self._resolve_wait_for_idle_urls()
