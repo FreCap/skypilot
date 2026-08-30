@@ -942,6 +942,18 @@ def _active_aws_account_id_for_locations(
     return _active_aws_account_id_for_workspace(workspace, aws_clouds[0])
 
 
+def resolve_aws_account_id_for_locations(
+        locations: Iterable[spot_placer.Location], *,
+        workspace: str) -> str | None:
+    """Resolve AWS identity before entering launch-admission locks.
+
+    This is the provider-I/O seam for immutable paid launch preparation.  A
+    caller must invoke it before taking a ReplicaManager, routing, or database
+    lock and then pass the returned scalar into provider-free preparation.
+    """
+    return _active_aws_account_id_for_locations(locations, workspace=workspace)
+
+
 def pool_key(location: spot_placer.Location,
              *,
              workspace: str,
