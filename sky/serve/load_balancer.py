@@ -150,6 +150,83 @@ class _SelectedReplica:
     route_sync_generation: int
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _QueuedDemandSnapshot:
+    """One immutable view of the bounded admission-waiter registry."""
+
+    queue_depth: int
+    queue_depth_by_priority: tuple[tuple[int, int], ...]
+    compatibility_profiles: tuple[tuple[int, tuple[str, ...], int], ...]
+    deadline_profiles: (tuple[tuple[int, tuple[str, ...], int, int], ...] |
+                        None)
+    retry_handler_depth: int
+    retry_handler_depth_by_priority: tuple[tuple[int, int], ...]
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            'queue_depth': self.queue_depth,
+            'queue_depth_by_priority': {
+                str(priority): count
+                for priority, count in self.queue_depth_by_priority
+            },
+            'queued_requests_by_compatibility': [{
+                'priority': priority,
+                'compatible_accelerators': list(cards),
+                'count': count,
+            } for priority, cards, count in self.compatibility_profiles],
+            'queued_request_deadline_buckets': (
+                None if self.deadline_profiles is None else
+                [{
+                    'priority': priority,
+                    'compatible_accelerators': list(cards),
+                    'remaining_seconds': remaining,
+                    'count': count,
+                }
+                 for priority, cards, remaining, count in self.deadline_profiles
+                ]),
+            # This gauge is useful operationally but is not interchangeable
+            # with the admission queue: it also covers selection and retry
+            # backoff, whose requests have no waiter/deadline registry entry.
+            'retry_handler_depth': self.retry_handler_depth,
+            'retry_handler_depth_by_priority': {
+                str(priority): count
+                for priority, count in self.retry_handler_depth_by_priority
+            },
+        }
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _RejectedDemandSnapshot:
+    """One immutable cutoff-consistent view of retained rejections."""
+
+    rejected_in_window: int
+    rejected_in_recent_window: int
+    rejected_by_priority: tuple[tuple[int, int], ...]
+    recent_rejected_by_priority: tuple[tuple[int, int], ...]
+    compatibility_profiles: tuple[tuple[int, tuple[str, ...], int, int], ...]
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            'rejected_in_window': self.rejected_in_window,
+            'rejected_in_recent_window': self.rejected_in_recent_window,
+            'rejected_in_window_by_priority': {
+                str(priority): count
+                for priority, count in self.rejected_by_priority
+            },
+            'rejected_in_recent_window_by_priority': {
+                str(priority): count
+                for priority, count in self.recent_rejected_by_priority
+            },
+            'rejected_requests_by_compatibility': [{
+                'priority': priority,
+                'compatible_accelerators': list(cards),
+                'count': count,
+                'recent_count': recent_count,
+            } for priority, cards, count, recent_count in
+                                                   self.compatibility_profiles],
+        }
+
+
 class SkyServeLoadBalancer:
     """SkyServeLoadBalancer: distribute incoming traffic with proxy.
 
@@ -1560,75 +1637,84 @@ class SkyServeLoadBalancer:
         setattr(request, _REQUEST_GRANTED_ACCELERATOR_ATTR, selected)
         return True
 
-    def _request_queue_profiles(self) -> list[dict[str, Any]]:
-        """Return bounded queue counts by priority and compatibility set."""
+    def _request_queue_demand_snapshot(
+        self,
+        observed_monotonic: float | None = None,
+    ) -> _QueuedDemandSnapshot:
+        """Freeze all queue projections from one waiter-registry traversal."""
+        if observed_monotonic is None:
+            observed_monotonic = time.monotonic()
         configured = self._configured_accelerators
-        if configured is None:
-            return []
-        order = {card: index for index, card in enumerate(configured)}
-        grouped: dict[tuple[int, frozenset[str]], int] = {}
+        order = ({
+            card: index for index, card in enumerate(configured)
+        } if configured is not None else {})
+        by_priority: dict[int, int] = {}
+        compatibility: dict[tuple[int, frozenset[str]], int] = {}
+        deadlines: dict[tuple[int, frozenset[str], int], int] = {}
+        bucket_seconds = constants.LB_REQUEST_DEADLINE_BUCKET_SECONDS
         for priority, bucket in self._request_queue_waiters_for_instance(
         ).items():
             for waiter in bucket.values():
                 if waiter.abandoned:
                     continue
+                by_priority[priority] = by_priority.get(priority, 0) + 1
+                if configured is None:
+                    continue
                 compatible = getattr(waiter.request, _REQUEST_ACCELERATORS_ATTR,
                                      None)
                 cards = frozenset(
                     compatible if compatible is not None else configured)
-                grouped[(priority, cards)] = grouped.get(
+                compatibility[(priority, cards)] = compatibility.get(
                     (priority, cards), 0) + 1
-        return [{
-            'priority': priority,
-            'compatible_accelerators': sorted(
-                cards, key=lambda card: order.get(card, len(order))),
-            'count': count,
-        } for (priority, cards), count in sorted(
-            grouped.items(),
-            key=lambda item:
-            (-item[0][0],
-             tuple(sorted(order.get(card, len(order)) for card in item[0][1]))))
-               ]
+                remaining = max(0.0,
+                                waiter.deadline_monotonic - observed_monotonic)
+                remaining_bucket = int(
+                    remaining // bucket_seconds) * bucket_seconds
+                deadline_key = (priority, cards, remaining_bucket)
+                deadlines[deadline_key] = deadlines.get(deadline_key, 0) + 1
+
+        def _cards(cards: frozenset[str]) -> tuple[str, ...]:
+            return tuple(
+                sorted(cards, key=lambda card: order.get(card, len(order))))
+
+        compatibility_profiles = tuple(
+            (priority, _cards(cards), count)
+            for (priority, cards), count in sorted(
+                compatibility.items(),
+                key=lambda item: (-item[0][0],
+                                  tuple(
+                                      order.get(card, len(order))
+                                      for card in _cards(item[0][1])))))
+        deadline_profiles = (None if configured is None else tuple(
+            (priority, _cards(cards), remaining, count)
+            for (priority, cards, remaining), count in sorted(
+                deadlines.items(),
+                key=lambda item: (-item[0][0], item[0][2],
+                                  tuple(
+                                      order.get(card, len(order))
+                                      for card in _cards(item[0][1]))))))
+        return _QueuedDemandSnapshot(
+            queue_depth=sum(by_priority.values()),
+            queue_depth_by_priority=tuple(sorted(by_priority.items())),
+            compatibility_profiles=compatibility_profiles,
+            deadline_profiles=deadline_profiles,
+            retry_handler_depth=max(0, self._queue_depth),
+            retry_handler_depth_by_priority=tuple(
+                sorted((priority, count) for priority, count in
+                       self._queue_depth_by_priority.items() if count > 0)))
+
+    def _request_queue_profiles(self) -> list[dict[str, Any]]:
+        """Return bounded queue counts by priority and compatibility set."""
+        return self._request_queue_demand_snapshot().payload(
+        )['queued_requests_by_compatibility']
 
     def _request_queue_deadline_profiles(
             self,
             observed_monotonic: float | None = None) -> list[dict[str, Any]]:
         """Return exact queue classes with conservative remaining deadlines."""
-        configured = self._configured_accelerators
-        if configured is None:
-            return []
-        if observed_monotonic is None:
-            observed_monotonic = time.monotonic()
-        order = {card: index for index, card in enumerate(configured)}
-        bucket_seconds = constants.LB_REQUEST_DEADLINE_BUCKET_SECONDS
-        grouped: dict[tuple[int, frozenset[str], int], int] = {}
-        for priority, bucket in self._request_queue_waiters_for_instance(
-        ).items():
-            for waiter in bucket.values():
-                if waiter.abandoned:
-                    continue
-                compatible = getattr(waiter.request, _REQUEST_ACCELERATORS_ATTR,
-                                     None)
-                cards = frozenset(
-                    compatible if compatible is not None else configured)
-                remaining = max(0.0,
-                                waiter.deadline_monotonic - observed_monotonic)
-                remaining_bucket = int(
-                    remaining // bucket_seconds) * bucket_seconds
-                key = (priority, cards, remaining_bucket)
-                grouped[key] = grouped.get(key, 0) + 1
-        return [{
-            'priority': priority,
-            'compatible_accelerators': sorted(
-                cards, key=lambda card: order.get(card, len(order))),
-            'remaining_seconds': remaining,
-            'count': count,
-        } for (priority, cards, remaining), count in sorted(
-            grouped.items(),
-            key=lambda item:
-            (-item[0][0], item[0][2],
-             tuple(sorted(order.get(card, len(order)) for card in item[0][1]))))
-               ]
+        profiles = self._request_queue_demand_snapshot(
+            observed_monotonic).payload()['queued_request_deadline_buckets']
+        return [] if profiles is None else profiles
 
     def _record_request_demand_once(self, request: fastapi.Request) -> None:
         """Commit one legacy/accepted demand event for this LB request."""
@@ -2328,7 +2414,10 @@ class SkyServeLoadBalancer:
             profiles.pop(key, None)
         return current
 
-    def _prune_reject_window(self) -> dict[str, tuple[float, int]]:
+    def _prune_reject_window(
+        self,
+        observed_monotonic: float | None = None,
+    ) -> dict[str, tuple[float, int]]:
         """Drop reject entries older than the window; return the live dict.
 
         The READ funnel: every gauge read goes through here, on the
@@ -2342,7 +2431,9 @@ class SkyServeLoadBalancer:
         Always assigns a fresh instance dict so readers cannot mutate the
         writer's ordered snapshot while iterating it.
         """
-        cutoff = time.monotonic() - constants.LB_REJECT_WINDOW_SECONDS
+        if observed_monotonic is None:
+            observed_monotonic = time.monotonic()
+        cutoff = observed_monotonic - constants.LB_REJECT_WINDOW_SECONDS
         current = self._reject_last_seen
         pruned: dict[str, tuple[float, int]] = {}
         if current:
@@ -2411,25 +2502,8 @@ class SkyServeLoadBalancer:
 
     def _rejected_compatibility_profiles(self) -> list[dict[str, Any]]:
         """Return the replaceable recent-rejection gauge by exact profile."""
-        retained = self._prune_reject_window()
-        profiles = self._reject_compatibility_by_key
-        cutoff = (time.monotonic() -
-                  constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
-        grouped: dict[tuple[int, tuple[str, ...]], tuple[int, int]] = {}
-        for key, (last_seen, _) in retained.items():
-            profile = profiles.get(key)
-            if profile is None:
-                continue
-            count, recent_count = grouped.get(profile, (0, 0))
-            grouped[profile] = (count + 1,
-                                recent_count + int(last_seen > cutoff))
-        return [{
-            'priority': priority,
-            'compatible_accelerators': list(compatible),
-            'count': count,
-            'recent_count': recent_count,
-        } for (priority, compatible), (count, recent_count) in sorted(
-            grouped.items(), key=lambda item: (-item[0][0], item[0][1]))]
+        return self._rejected_demand_snapshot().payload(
+        )['rejected_requests_by_compatibility']
 
     @staticmethod
     def _request_has_stable_job_id(request: fastapi.Request) -> bool:
@@ -3213,29 +3287,58 @@ class SkyServeLoadBalancer:
             return after_free > before_free and not (rejected and
                                                      request is not None)
 
+    def _rejected_demand_snapshot(
+        self,
+        observed_monotonic: float | None = None,
+    ) -> _RejectedDemandSnapshot:
+        """Freeze all rejection projections with one retention/rate cutoff."""
+        if observed_monotonic is None:
+            observed_monotonic = time.monotonic()
+        retained = self._prune_reject_window(observed_monotonic)
+        cutoff = (observed_monotonic -
+                  constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
+        by_priority: dict[int, int] = {}
+        recent_by_priority: dict[int, int] = {}
+        grouped: dict[tuple[int, tuple[str, ...]], tuple[int, int]] = {}
+        compatibility = self._reject_compatibility_by_key
+        recent_total = 0
+        for key, (last_seen, priority) in retained.items():
+            by_priority[priority] = by_priority.get(priority, 0) + 1
+            recent = last_seen > cutoff
+            if recent:
+                recent_total += 1
+                recent_by_priority[priority] = (
+                    recent_by_priority.get(priority, 0) + 1)
+            profile = compatibility.get(key)
+            if profile is None:
+                continue
+            count, recent_count = grouped.get(profile, (0, 0))
+            grouped[profile] = (count + 1, recent_count + int(recent))
+        return _RejectedDemandSnapshot(
+            rejected_in_window=len(retained),
+            rejected_in_recent_window=recent_total,
+            rejected_by_priority=tuple(sorted(by_priority.items())),
+            recent_rejected_by_priority=tuple(sorted(
+                recent_by_priority.items())),
+            compatibility_profiles=tuple(
+                (priority, compatible, count, recent_count)
+                for (priority, compatible), (count, recent_count) in
+                sorted(grouped.items(),
+                       key=lambda item: (-item[0][0], item[0][1]))))
+
     def _rejected_in_window(self) -> int:
         """Unique jobs terminally 503'd within the reject window (gauge)."""
-        return len(self._prune_reject_window())
+        return self._rejected_demand_snapshot().rejected_in_window
 
     def _rejected_in_recent_window(self) -> int:
         """Unique rejected jobs refreshed in the autoscaler rate window."""
-        retained = self._prune_reject_window()
-        cutoff = (time.monotonic() -
-                  constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
-        return sum(last_seen > cutoff for last_seen, _ in retained.values())
+        return self._rejected_demand_snapshot().rejected_in_recent_window
 
     def _rejected_by_priority(self, recent: bool = False) -> dict[str, int]:
-        retained = self._prune_reject_window()
-        cutoff = (time.monotonic() -
-                  constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
-        counts: dict[int, int] = {}
-        for last_seen, priority in retained.values():
-            if recent and last_seen <= cutoff:
-                continue
-            counts[priority] = counts.get(priority, 0) + 1
-        return {
-            str(priority): count for priority, count in sorted(counts.items())
-        }
+        snapshot = self._rejected_demand_snapshot()
+        counts = (snapshot.recent_rejected_by_priority
+                  if recent else snapshot.rejected_by_priority)
+        return {str(priority): count for priority, count in counts}
 
     def _offered_arrivals_for_write(
             self,
@@ -4238,6 +4341,11 @@ class SkyServeLoadBalancer:
                 prediction_time_history = (
                     self._request_aggregator.prediction_time_history_snapshot())
             request_batch_accepted = route_only
+            demand_observed_monotonic = time.monotonic()
+            queue_snapshot = self._request_queue_demand_snapshot(
+                demand_observed_monotonic)
+            rejection_snapshot = self._rejected_demand_snapshot(
+                demand_observed_monotonic)
             sync_payload = {
                 # Catalog/version fence for compatibility gauges. This is the
                 # version of the routing spec already applied by this LB, not
@@ -4260,20 +4368,8 @@ class SkyServeLoadBalancer:
                 'occupancy_sample_generation': occupancy_sample_generation,
                 'draining_urls': list(self._draining_clients),
                 'lb_session_id': session_id,
-                'queue_depth': self._queue_depth,
-                'queued_requests_by_compatibility':
-                    self._request_queue_profiles(),
-                'queued_request_deadline_buckets':
-                    self._request_queue_deadline_profiles(),
-                'rejected_requests_by_compatibility':
-                    self._rejected_compatibility_profiles(),
-                'queue_depth_by_priority':
-                    self._queue_depth_priority_snapshot(),
-                'rejected_in_window': self._rejected_in_window(),
-                'rejected_in_recent_window': self._rejected_in_recent_window(),
-                'rejected_in_window_by_priority': self._rejected_by_priority(),
-                'rejected_in_recent_window_by_priority':
-                    self._rejected_by_priority(recent=True),
+                **queue_snapshot.payload(),
+                **rejection_snapshot.payload(),
                 **self._offered_arrival_counts(),
             }
             try:
@@ -4903,6 +4999,10 @@ class SkyServeLoadBalancer:
         self._demand_report_sequence += 1
         reporter_observed_at = time.time()
         reporter_observed_monotonic = time.monotonic()
+        queue_snapshot = self._request_queue_demand_snapshot(
+            reporter_observed_monotonic)
+        rejection_snapshot = self._rejected_demand_snapshot(
+            reporter_observed_monotonic)
         payload = {
             **self._ha_role_payload(current_routes_only=True),
             'protocol_version': constants.LB_DEMAND_REPORT_PROTOCOL_VERSION,
@@ -4917,19 +5017,8 @@ class SkyServeLoadBalancer:
                                             ()),
             'request_accelerator_compatibility_version':
                 self._request_accelerator_compatibility_version,
-            'queue_depth': self._queue_depth,
-            'queued_requests_by_compatibility': self._request_queue_profiles(),
-            'queued_request_deadline_buckets':
-                self._request_queue_deadline_profiles(
-                    reporter_observed_monotonic),
-            'rejected_requests_by_compatibility':
-                self._rejected_compatibility_profiles(),
-            'queue_depth_by_priority': self._queue_depth_priority_snapshot(),
-            'rejected_in_window': self._rejected_in_window(),
-            'rejected_in_recent_window': self._rejected_in_recent_window(),
-            'rejected_in_window_by_priority': self._rejected_by_priority(),
-            'rejected_in_recent_window_by_priority':
-                self._rejected_by_priority(recent=True),
+            **queue_snapshot.payload(),
+            **rejection_snapshot.payload(),
             **self._offered_arrival_counts(),
         }
         return payload, request_history, classification, prediction
