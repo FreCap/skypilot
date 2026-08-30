@@ -39,9 +39,13 @@ suppressing construction of later committed wave members. An interrupt queues
 the current and every later committed-but-unpublished identity for that same
 exact recovery before propagating.
 
-The 2026-08-28 retained-route semantic-equivalence correction described below
-is source-complete and under qualification. It is not part of the earlier
-production evidence in this status section.
+The 2026-08-30 additive-route correction described below is source-complete
+and under qualification. It is not part of the earlier production evidence in
+this status section. Release `1.1.1572` proved the post-commit worker boundary
+but then stalled after its first paid wave because new selectable workers
+advanced the route head and invalidated still-positive retained demand. The
+correction treats those new routes as additive supply while retaining exact
+identity and policy fences for every route the reporter actually applied.
 
 Release `1.1.1508` deploys paid claim acquisition as one bounded PostgreSQL
 transaction for the accepted batch instead of N singleton commits. Its first
@@ -102,28 +106,40 @@ total, and independent PostgreSQL
 and GCP censuses remained zero.
 
 The steady-state contract distinguishes those boundaries. Prospective planning
-continues to require fresh complete reports from the exact current ACTIVE slot
-and rejects a mixed HA role/cutover generation before any debit commits. Route
-projection generations have a separate contract: a report may reference the
-current head or a retained immutable generation only when its full digest is
-exact and PostgreSQL proves the retained snapshot has the current owner,
-lifecycle, service version, producer protocol, and exactly the current head's
-demand-report route-context digest. Capacity-hint-only successors can therefore
-compose; route expansion, contraction, identity, routing-policy,
-async-occupancy, or queue-compatibility-mode changes cannot. Translation, plan
-authority, and every prospective effect always bind the fresh current head,
-never the retained generation. Every ordinary or route-only LB sync installs
-the queue-attribution mode atomically with that route head; a malformed
-response installs neither, while response-only history acknowledgements remain
-outside this semantic fence. After the debit commits, report expiry,
-ingestion blackout, or HA-role heartbeat advancement is display-only: it may
-neither authorize nor revoke the claim's one provider effect. Phase B instead
-requires the exact durable action graph, immutable plan and bounded debit,
-monotonic source generations, unchanged lifecycle/source ownership, and an
-unexpired current route head whose immutable snapshot has the current owner.
-Wrong ownership, lifecycle/version/producer drift, semantic route mixing,
-corrupt or expired current or retained route evidence, or an overdrawn
-immutable debit still fails closed.
+requires fresh complete current-generation reports from the selected `ACTIVE`
+and, during handoff, `DRAINING` slots; `STANDBY` and `ARMED` reports remain
+operational telemetry and cannot change demand, route authority, or the public
+request summary. Route projection generations have a separate contract: a
+report may reference the current head or a retained immutable generation only
+when its full digest is exact and PostgreSQL proves the retained snapshot has
+the current owner, lifecycle, service version, and producer protocol. Routing
+policy, service version, and queue-attribution mode must match. Every selectable
+route in the retained snapshot must remain at the same URL with the same
+immutable identity and wire contract in the current head. The current head may
+contain additional selectable routes; that is additive supply and may
+authorize planning and paid or reserved scale-up. Route contraction, URL
+rebinding, selected-route wire drift, routing-policy drift, or queue-mode drift
+remains incompatible and rejects before a debit commits.
+
+Translation, plan authority, and every prospective effect always bind the
+fresh current head, never the retained generation. Additive compatibility may
+revoke new spend on fresh zero, but it does not authorize scale-down or paid or
+fresh-zero retirement. Service promotion and destructive authority require an
+exact route relation and a durably `STABLE` LB cutover phase. Final logical
+retirement reconstructs the current and retained routes
+and rechecks exact relation plus `STABLE` under the existing PostgreSQL locks.
+Every ordinary or route-only LB sync installs the queue-attribution mode
+atomically with that route head; a malformed response installs neither, while
+response-only history acknowledgements remain outside this semantic fence.
+After the debit commits, report expiry, ingestion blackout, or HA-role
+heartbeat advancement is display-only: it may neither authorize nor revoke the
+claim's one provider effect. Phase B instead requires the exact durable action
+graph, immutable plan and bounded debit, monotonic source generations,
+unchanged lifecycle/source ownership, and an unexpired current route head whose
+immutable snapshot has the current owner. Wrong ownership,
+lifecycle/version/producer drift, incompatible route mixing, corrupt or expired
+current or retained route evidence, or an overdrawn immutable debit still fails
+closed.
 
 The PostgreSQL global paid-capacity authority shipped with database migration
 027. PR #909 reduced its exact-pool bootstrap from 60 to four, added a sticky
@@ -565,15 +581,19 @@ Claim acquisition uses this bounded-batch transaction protocol:
    a later member in the same batch, the final saturated waiter refresh wins
    over the earlier acquired-waiter removal. Cross-pool cleanup remains the
    established postcommit service-row-only transaction.
-4. Exact-match the current route, reserved allocation, capacity graph, and one
-   capacity-plan authority once per distinct debit card in the same
-   transaction. Lock the current complete elected demand reporters, require
-   their generation and watermark to be internally consistent, and reconstruct
+4. Validate the fresh current route head, reserved allocation, capacity graph,
+   and one capacity-plan authority once per distinct debit card in the same
+   transaction. Lock the current complete elected demand reporters, exclude
+   `STANDBY` and `ARMED`, require the selected `ACTIVE`, and reconstruct
    normalized demand from that exact row set. A monotonically newer heartbeat
    generation or watermark is admissible only when those current semantics are
    unchanged from the immutable plan (apart from the existing natural-arrival
-   expiry allowance). Fresh aggregate zero or any queue, rejection, in-flight,
-   priority, accelerator, reporter, or route change rejects the whole
+   expiry allowance). A reporter may still name a retained route whose
+   selectable set is an identity-exact subset of the current selectable set;
+   current-only route additions are additive supply and do not reject a
+   prospective Phase-A wave. Fresh aggregate zero or any queue, rejection,
+   in-flight, priority, accelerator, reporter, route contraction/rebinding, or
+   routing-policy/queue-mode change rejects the whole positive-debit
    transaction. Sum all accepted incoming units by card before validating them
    against existing same-plan claims. A stale graph or insufficient residual
    rejects the transaction; it never preserves candidate identities across a
@@ -1437,7 +1457,7 @@ capacity without deriving either durable claim envelope from it.
 | One nominal paid wave validates one immutable plan and atomically commits its ordered policy-valid `SCHEDULED` replica+claim subset before any worker is built or registered; rejected members never construct workers | Real-PostgreSQL 100-member claim test plus replica-manager post-commit worker-materialization test |
 | A member insert fault rolls back every new replica and claim; transaction-acknowledgement loss fails closed, scopes recovery to exact frozen identities, retires and replans association-less pairs, adopts bound pairs, and never infers a batch manifest | Real-PostgreSQL failpoint, lost-ack, exact-scope in-process recovery, and restart tests |
 | A multi-pool batch acquires the service row then exact-pool rows in canonical sorted order and never exceeds the service envelope, card frontier, adaptive pool depth, plan residual, or global paid cap; later P admission independently prevents started workers from exceeding process capacity | Real-PostgreSQL sorted-lock instrumentation and saturation tests, aggregate summed-debit tests, plus retained cross-pool concurrency and P-reservation regressions |
-| A route, allocation, capacity-graph, or demand-semantic change before the transaction rejects every member; monotonic semantic-equivalent reporter heartbeats do not starve a prepared wave; report expiry, ingestion blackout, and HA-role advancement after commit do not revoke an already committed batch, while an independently fresh current route remains mandatory | Capacity-plan conflict/rollback tests, 100-member equivalent-heartbeat admission, 100-member fresh-zero rollback, post-commit report-expiry/current-ACTIVE-mismatch tests, stale-current-route rejection, plus retained capacity-plan CAS tests |
+| A route contraction/rebinding/policy change, allocation, capacity-graph, or demand-semantic change before the transaction rejects every member; identity-exact current route additions preserve retained demand for scale-up but cannot authorize destruction; non-authoritative HA reports are excluded; monotonic semantic-equivalent reporter heartbeats do not starve a prepared wave; report expiry, ingestion blackout, and HA-role advancement after commit do not revoke an already committed batch, while an independently fresh current route remains mandatory | Capacity-plan conflict/rollback tests, retained-route addition/contraction/rebinding tests, `STANDBY`/`ARMED` filtering, exact-plus-`STABLE` retirement and promotion tests, 100-member equivalent-heartbeat admission, 100-member fresh-zero rollback, post-commit report-expiry/current-ACTIVE-mismatch tests, stale-current-route rejection, plus retained capacity-plan CAS tests |
 | A default non-planner cold batch remains clipped to pool depth 4, service envelope 16, and card frontier 2; planner-bound protocol-v2 admission instead derives its aggregate cohort from the committed plan while preserving exact-pool and hard-cap fences | Pure configuration, manager integration, rendered-Helm, plan-cohort, and real-PostgreSQL tests |
 | Default and invalid fallback are 4; maximum is at least bootstrap | Pure configuration tests |
 | Failure cooldown defaults to ten minutes and rejects invalid overrides | Pure configuration tests |
@@ -1486,6 +1506,19 @@ capacity without deriving either durable claim envelope from it.
 | A rollback binary targeting 026 accepts an already-upgraded 027 schema | Migration ownership test |
 
 ## Manual Test Plan
+
+For the additive-route qualification, start from no service and empty paid
+provider inventories, deploy one homogeneous image, and create a Spot-only
+service with sustained positive demand. Freeze the first reporter's immutable
+route generation, let the first paid workers become selectable and advance the
+current route head, and require a second and later Phase-A wave to commit from
+the retained demand. Confirm every retained selectable URL remains
+identity-exact, every claim binds the fresh current head, and ordinary
+on-demand remains zero. While the relation is additive or the HA cutover is not
+`STABLE`, inject both scale-up and scale-down decisions and require only
+scale-up. After the reporters apply the exact current head and the cutover is
+`STABLE`, stop demand and require normal retirement and exact PostgreSQL/cloud
+zero through the stale/quiescence horizon.
 
 Run two staging services against the same exact paid pool. Generate enough
 demand for both to exceed four unresolved launches. Confirm the combined claim
@@ -1686,13 +1719,14 @@ placement spread, API request queue depth, provider capacity errors,
 typed-outcome-to-pool-close latency, pending teardown duration, and launch
 latency.
 
-The current recovery baseline is release `1.1.1513` at Helm revision 635,
-PostgreSQL-only with `storage.enabled=false`. For rollout or configuration
-drift, first redeploy that exact chart and image digest through Helm while
-reusing the current values. Do not reintroduce a PVC, EFS, a Terragrunt runtime
-pin, or historical declarative values. For a code defect, prefer one
-homogeneous fix-forward image so every API, controller, and executor observes
-the same protocol.
+The current recovery baseline is release `1.1.1572` at Helm revision 688,
+source `d80bdb2a0adcc64113ffd2f19b3dcd61c0058228`, homogeneous image
+`sha256:d07db658aff6ef40fe6b78b055eaba38b5ebba5e7cf3f3209787be02f8648a8a`,
+and PostgreSQL-only with `storage.enabled=false`. No service currently exists.
+For rollout or configuration drift, reuse the current Helm values and set the
+same exact immutable successor image on every API, controller, and executor
+role. Do not reintroduce a PVC, EFS, a Terragrunt runtime pin, or historical
+declarative values.
 
 A binary rollback is permitted only to an explicitly qualified N-1 artifact
 after a read-only census proves its schema and protocol can consume every live
@@ -1706,6 +1740,12 @@ The old 1.1.791/1.1.789/PVC guidance below this design's Git history is
 historical evidence only, not a current runbook.
 
 ## Verification Evidence
+
+The additive-route correction has source and focused PostgreSQL evidence only.
+Its homogeneous Helm deployment, clean service recreation, sustained
+second-wave route-expansion continuity, no-on-demand census, exact-plus-stable
+destructive resumption, and normal exact-zero teardown remain open. Do not
+attribute the historical evidence below to this source candidate.
 
 Production Spot-lifecycle qualification on 2026-08-26:
 
@@ -2182,6 +2222,12 @@ that deployment later the same day.
   at least 100 native one-L4 GCP Spot VMs concurrently `RUNNING` under a hard
   120 cap with zero on-demand, followed by normal teardown to repeated exact
   PostgreSQL and provider zero.
+- Open: merge and deploy the additive-route correction homogeneously, recreate
+  the service from empty state, prove sustained positive demand survives the
+  first and later selectable-route expansions, and observe a second paid or
+  reserved wave. Require no ordinary on-demand, no additive/non-`STABLE`
+  destructive or promotion authority, then exact current reporters plus
+  `STABLE` normal retirement and repeated exact PostgreSQL/provider zero.
 - Open investigation: determine whether raw volatile telemetry equality can be
   replaced by a complete decision-output fingerprint for a fixed-floor wave.
   It must preserve effective target, exact-card allocation, compatibility,

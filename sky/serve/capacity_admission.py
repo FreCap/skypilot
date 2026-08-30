@@ -33,6 +33,7 @@ from sky.serve import constants
 from sky.serve import demand_state
 from sky.serve import demand_state_schema
 from sky.serve import kueue_lane_capacity
+from sky.serve import lb_ha
 from sky.serve import paid_capacity as serve_paid_capacity
 from sky.serve import route_projection
 from sky.serve import route_projection_schema
@@ -3209,6 +3210,12 @@ class CapacityAdmissionRepository:
                 _DEMAND_REPORTS.c.valid_until
                 > now).order_by(_DEMAND_REPORTS.c.reporter_session_id).
             with_for_update()).mappings().all()
+        selected_reports = demand_state.current_demand_report_rows(
+            reports, service)
+        if selected_reports is None:
+            raise CapacityAdmissionConflict(
+                'Fresh demand has no current load balancer.')
+        reports = selected_reports
         watermark = [{
             'reporter_session_id': row['reporter_session_id'],
             'sequence': int(row['sequence']),
@@ -3226,9 +3233,7 @@ class CapacityAdmissionRepository:
             zero_plan and service['route_projection_protocol_version'] == 2 and
             demand_state.reports_prove_fresh_aggregate_zero(reports))
         if (watermark != _canonical_watermark(plan.receipt_watermark) or
-                not (reports_complete or reports_allow_zero) or
-                not demand_state.reports_match_current_lb_authority(
-                    reports, service)):
+                not (reports_complete or reports_allow_zero)):
             raise CapacityAdmissionConflict(
                 'Fresh demand receipts changed before plan publication.')
         route_head = connection.execute(
@@ -4416,6 +4421,12 @@ def validate_paid_claim_in_connection(
             _DEMAND_REPORTS.c.valid_until
             > now).order_by(_DEMAND_REPORTS.c.reporter_session_id).
         with_for_update()).mappings().all()
+    selected_reports = demand_state.current_demand_report_rows(
+        fresh_reports, service)
+    if selected_reports is None:
+        raise CapacityAdmissionConflict(
+            'Paid claim lost its current load balancer.')
+    fresh_reports = selected_reports
     current_watermark = [{
         'reporter_session_id': row['reporter_session_id'],
         'sequence': int(row['sequence']),
@@ -4427,9 +4438,7 @@ def validate_paid_claim_in_connection(
         (head['demand_feed_generation'] == current_demand_generation and
          current_watermark_sha256 != head['receipt_watermark_sha256']) or
             any(row['complete'] is not True or row['protocol_version'] != 2
-                for row in fresh_reports) or
-            not demand_state.reports_match_current_lb_authority(
-                fresh_reports, service)):
+                for row in fresh_reports)):
         raise CapacityAdmissionConflict(
             'Paid claim lost its fresh demand receipt watermark.')
     route_context = demand_state.validate_report_route_contexts(
@@ -4810,6 +4819,9 @@ def promote_service_in_connection(
     current_mode = DemandSourceMode(service['demand_source_mode'])
     if current_mode is DemandSourceMode.DURABLE_FEED:
         return int(service['demand_source_epoch'])
+    if (service['lb_cutover_phase'] != lb_ha.LbCutoverPhase.STABLE.value):
+        raise CapacityAdmissionUnavailable(
+            'Promotion requires a stable load balancer cutover.')
     if participant_barrier_passed is True:
         raise CapacityAdmissionUnavailable(
             'A precomputed fleet barrier cannot authorize promotion.')
@@ -4856,6 +4868,11 @@ def promote_service_in_connection(
             _DEMAND_REPORTS.c.service_hash == service['hash'],
             _DEMAND_REPORTS.c.valid_until
             > now).with_for_update()).mappings().all()
+    selected_reports = demand_state.current_demand_report_rows(reports, service)
+    if selected_reports is None:
+        raise CapacityAdmissionUnavailable(
+            'Promotion requires a current load balancer.')
+    reports = selected_reports
     if (route_head is None or route is None or
             route_head['valid_until'] <= now or
             route['service_hash'] != service['hash'] or
@@ -4867,14 +4884,13 @@ def promote_service_in_connection(
             != service['route_projection_protocol_version'] or
             generation is None or not reports or
             any(row['complete'] is not True or row['protocol_version'] != 2
-                for row in reports) or
-            not demand_state.reports_match_current_lb_authority(
-                reports, service)):
+                for row in reports)):
         raise CapacityAdmissionUnavailable(
             'Promotion requires fresh complete demand and route evidence.')
     route_context = demand_state.validate_report_route_contexts(
         connection, service, reports, route_head, route, now)
-    if route_context is None:
+    if (route_context is None or route_context.relation
+            is not route_projection.DemandReportRouteRelation.EXACT):
         raise CapacityAdmissionUnavailable(
             'Fresh demand does not match the current projected route '
             'context.')

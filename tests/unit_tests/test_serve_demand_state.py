@@ -178,13 +178,35 @@ def test_current_lb_authority_requires_exact_ha_active_generation():
         'lb_active_slot': 'a',
         'lb_cutover_generation': 2,
     }
-    assert demand_state.reports_match_current_lb_authority(rows, service)
+    assert demand_state.current_demand_report_rows(rows, service) == rows
 
     report['applied_generation'] = 1
-    assert not demand_state.reports_match_current_lb_authority(rows, service)
+    assert demand_state.current_demand_report_rows(rows, service) is None
     report['applied_generation'] = 2
     report['applied_role'] = 'DRAINING'
-    assert not demand_state.reports_match_current_lb_authority(rows, service)
+    assert demand_state.current_demand_report_rows(rows, service) is None
+
+
+@pytest.mark.parametrize('non_authoritative_role', ['STANDBY', 'ARMED'])
+def test_current_lb_authority_excludes_non_authoritative_report(
+        non_authoritative_role):
+    active = _report()
+    non_authoritative = copy.deepcopy(active)
+    non_authoritative['applied_role'] = non_authoritative_role
+    rows = [{
+        'lb_slot': 'a',
+        'payload': active,
+    }, {
+        'lb_slot': 'b',
+        'payload': non_authoritative,
+    }]
+    service = {
+        'lb_ha_enabled': 1,
+        'lb_active_slot': 'a',
+        'lb_cutover_generation': 2,
+    }
+
+    assert demand_state.current_demand_report_rows(rows, service) == rows[:1]
 
 
 def test_fresh_aggregate_zero_requires_full_quiet_window_coverage():

@@ -123,77 +123,6 @@ def test_occupancy_context_excludes_capacity_but_fences_replica_identity():
             != draining)
 
 
-def test_demand_report_context_fences_queue_mode_not_capacity_or_ack():
-    response = {
-        'service_version': 7,
-        'routing_spec': {
-            'load_balancing_policy_name': 'least_load'
-        },
-        'replica_info': {
-            'http://replica:8080': {
-                'async_occupancy': 'true',
-            }
-        },
-        'capacity_hint': {
-            'warm_retention_target_by_accelerator': {}
-        },
-        'request_history_accepted': False,
-        'queued_compatibility_demand_supported': True,
-    }
-    identities = {
-        'http://replica:8080': {
-            'replica_record_id': str(uuid.uuid4()),
-        }
-    }
-    digest = route_projection.demand_report_route_context_sha256(
-        response, identities)
-
-    capacity_only = copy.deepcopy(response)
-    capacity_only['capacity_hint'] = {
-        'warm_retention_target_by_accelerator': {
-            'H200': 30
-        }
-    }
-    ready_count_only = copy.deepcopy(response)
-    ready_count_only['num_ready_replicas'] = 2
-    acknowledged = copy.deepcopy(response)
-    acknowledged['request_history_accepted'] = True
-    queue_rollback = copy.deepcopy(response)
-    queue_rollback['queued_compatibility_demand_supported'] = False
-    changed_replica = copy.deepcopy(response)
-    changed_replica['replica_info']['http://replica:8080'][
-        'async_occupancy'] = 'false'
-    changed_identity = copy.deepcopy(identities)
-    changed_identity['http://replica:8080']['replica_record_id'] = str(
-        uuid.uuid4())
-    changed_draining = copy.deepcopy(response)
-    changed_draining[constants.LB_DRAINING_REPLICA_INFO_KEY] = {
-        'http://retired:8080': {
-            'async_occupancy': 'true',
-        }
-    }
-    changed_routing = copy.deepcopy(response)
-    changed_routing['routing_spec']['load_balancing_policy_name'] = (
-        'round_robin')
-
-    assert (route_projection.demand_report_route_context_sha256(
-        capacity_only, identities) == digest)
-    assert (route_projection.demand_report_route_context_sha256(
-        ready_count_only, identities) == digest)
-    assert (route_projection.demand_report_route_context_sha256(
-        acknowledged, identities) == digest)
-    assert (route_projection.demand_report_route_context_sha256(
-        queue_rollback, identities) != digest)
-    assert (route_projection.demand_report_route_context_sha256(
-        changed_replica, identities) != digest)
-    assert (route_projection.demand_report_route_context_sha256(
-        response, changed_identity) != digest)
-    assert (route_projection.demand_report_route_context_sha256(
-        changed_draining, identities) != digest)
-    assert (route_projection.demand_report_route_context_sha256(
-        changed_routing, identities) != digest)
-
-
 def test_selected_route_context_ignores_unrelated_fleet_churn():
     selected_url = 'http://selected:8080'
     response = {
@@ -241,6 +170,88 @@ def test_selected_route_context_ignores_unrelated_fleet_churn():
     changed_spec['routing_spec']['load_balancing_policy_name'] = 'round_robin'
     assert route_projection.selected_route_context_sha256(
         changed_spec, expanded_identities, selected_url) != initial
+
+
+def test_demand_report_route_relation_uses_only_selectable_routes():
+    selected_url = 'http://selected:8080'
+    response = {
+        'service_version': 7,
+        'routing_spec': {
+            'load_balancing_policy_name': 'least_load',
+        },
+        'replica_info': {
+            selected_url: {
+                'gpu_type': 'L4',
+                'gpu_count': '1',
+            },
+        },
+        'queued_compatibility_demand_supported': True,
+    }
+    identities = {
+        selected_url: {
+            'replica_id': 1,
+            'replica_record_id': str(uuid.uuid4()),
+            'service_version': 7,
+            'gpu_type': 'L4',
+            'gpu_count': 1,
+            'advertised': True,
+            'alias_expires_at': None,
+        },
+    }
+    classify = route_projection.classify_demand_report_route_relation
+    relation = route_projection.DemandReportRouteRelation
+
+    assert classify(response, identities, response,
+                    identities) is relation.EXACT
+
+    unadvertised = copy.deepcopy(identities)
+    unadvertised['http://unadvertised:8080'] = {
+        **identities[selected_url],
+        'replica_id': 2,
+        'replica_record_id': str(uuid.uuid4()),
+        'advertised': False,
+    }
+    assert classify(response, identities, response,
+                    unadvertised) is relation.EXACT
+
+    fenced = copy.deepcopy(response)
+    fenced['replica_info']['http://recovery-fenced:8080'] = {
+        constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+            constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+    }
+    assert classify(response, identities, fenced, identities) is relation.EXACT
+
+    expanded = copy.deepcopy(response)
+    expanded_identities = copy.deepcopy(identities)
+    added_url = 'http://added:8080'
+    expanded['replica_info'][added_url] = {
+        'gpu_type': 'H200',
+        'gpu_count': '8',
+    }
+    expanded_identities[added_url] = {
+        **identities[selected_url],
+        'replica_id': 2,
+        'replica_record_id': str(uuid.uuid4()),
+        'gpu_type': 'H200',
+        'gpu_count': 8,
+    }
+    assert classify(response, identities, expanded,
+                    expanded_identities) is relation.ADDITIVE_COMPATIBLE
+
+    rebound = copy.deepcopy(identities)
+    rebound[selected_url]['replica_record_id'] = str(uuid.uuid4())
+    assert classify(response, identities, response,
+                    rebound) is relation.INCOMPATIBLE
+
+    contracted = copy.deepcopy(response)
+    contracted['replica_info'] = {}
+    assert classify(response, identities, contracted,
+                    {}) is relation.INCOMPATIBLE
+
+    changed_policy = copy.deepcopy(response)
+    changed_policy['routing_spec']['load_balancing_policy_name'] = 'round_robin'
+    assert classify(response, identities, changed_policy,
+                    identities) is relation.INCOMPATIBLE
 
 
 def test_builds_existing_full_response_with_private_exact_identity():

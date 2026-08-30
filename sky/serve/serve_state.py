@@ -6876,8 +6876,7 @@ def _logical_retirement_reports_are_current(
 ) -> bool:
     """Revalidate exact LB and occupancy evidence at the database clock."""
     if (not rows or _logical_retirement_receipt_watermark(rows)
-            != authority.receipt_watermark or
-            not demand_state.reports_match_current_lb_authority(rows, service)):
+            != authority.receipt_watermark):
         return False
     complete = all(row['complete'] is True and row['protocol_version'] == 2
                    for row in rows)
@@ -7106,7 +7105,9 @@ def commit_logical_retirement(
                 (service['lb_ha_enabled'] == 1) == authority.lb_ha_enabled and
                 service['lb_active_slot'] == authority.lb_active_slot and
                 service['lb_cutover_generation']
-                == authority.lb_cutover_generation)
+                == authority.lb_cutover_generation and
+                service['lb_cutover_phase']
+                == lb_ha.LbCutoverPhase.STABLE.value)
         except (AttributeError, KeyError, TypeError, ValueError):
             service_matches = False
         if not service_matches:
@@ -7152,7 +7153,13 @@ def commit_logical_retirement(
                 reports.c.valid_until
                 > report_query_now).order_by(reports.c.reporter_session_id).
             with_for_update()).mappings().all()
-
+        selected_report_rows = demand_state.current_demand_report_rows(
+            report_rows, service)
+        if selected_report_rows is None:
+            session.rollback()
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
+        report_rows = selected_report_rows
         route_heads = route_projection_schema.serve_route_heads_table
         routes = route_projection_schema.serve_route_snapshots_table
         route_head = session.execute(
@@ -7184,7 +7191,8 @@ def commit_logical_retirement(
             session.connection(), service, report_rows, route_head, route,
             report_query_now)
         route_context_matches = bool(
-            route_context is not None and
+            route_context is not None and route_context.relation
+            is route_projection.DemandReportRouteRelation.EXACT and
             route_context.generation == authority.route_generation and
             route_context.content_sha256 == authority.route_sha256 and
             route_context.source_epoch == authority.route_source_epoch)
