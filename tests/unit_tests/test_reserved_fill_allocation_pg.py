@@ -20,6 +20,7 @@ from test_pool_capacity_observation_pg import pg_server  # noqa: F401
 from sky import clouds
 from sky import global_user_state_schema
 from sky.client import sdk
+from sky.serve import compatibility_matching
 from sky.serve import constants as serve_constants
 from sky.serve import kubernetes_identity
 from sky.serve import ordinary_launch_binding
@@ -456,6 +457,7 @@ def _commit_evidence(
     exact_feed = {
         _SERVICE: service_counts,
         reserved_capacity_broker.OBSERVED_FREE_BY_ACCELERATOR_KEY: observed_slot_counts,
+        reserved_capacity_broker.SPENDABLE_FREE_BY_ACCELERATOR_KEY: observed_slot_counts,
         reserved_capacity_broker.BROKER_SLOT_WIDTH_KEY: broker_slot_width,
     }
     with engine.begin() as connection:
@@ -2134,6 +2136,9 @@ def _utilization_state(*, cap: int, demonstrated_need: int,
         'stepped_at': stepped_at,
         'blind_since': None,
         'demonstrated_need': demonstrated_need,
+        'demand_witness_sha256': None,
+        'reservation_acquisition_classes': None,
+        'reservation_acquisition_binding_sha256': None,
         'boot_hold': False,
         'blind': False,
     }
@@ -2145,9 +2150,18 @@ def _exact_utilization_state(*, cap: int, demonstrated_need: int,
                                demonstrated_need=demonstrated_need,
                                stepped_at=1.0)
     state['demand_witness_sha256'] = 'd' * 64
-    state['reservation_acquisition_target_by_accelerator'] = {
-        accelerator: demonstrated_need
-    }
+    demand = compatibility_matching.CompatibilityDemand(
+        priority=0,
+        compatible_cards=(accelerator.casefold(),),
+        count=demonstrated_need)
+    state['reservation_acquisition_classes'] = [{
+        'priority': demand.priority,
+        'compatible_cards': list(demand.compatible_cards),
+        'count': demand.count,
+    }]
+    state['reservation_acquisition_binding_sha256'] = (
+        reserved_fill_allocation.reservation_acquisition_binding_sha256(
+            'd' * 64, (demand,)))
     return state
 
 
@@ -2351,6 +2365,9 @@ def test_exact_acquisition_waits_for_complete_discovery_round(
         reserved_capacity_broker.OBSERVED_FREE_BY_ACCELERATOR_KEY: {
             'a100': 47
         },
+        reserved_capacity_broker.SPENDABLE_FREE_BY_ACCELERATOR_KEY: {
+            'a100': 47
+        },
         reserved_capacity_broker.BROKER_SLOT_WIDTH_KEY: 1,
     }
     with allocation_engine.begin() as connection:
@@ -2385,6 +2402,112 @@ def test_exact_acquisition_waits_for_complete_discovery_round(
     assert complete is not None
     assert complete.upward_grants_settled
     assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) == complete
+
+
+def test_flexible_acquisition_settles_against_exact_locked_supply(
+        allocation_engine, monkeypatch) -> None:
+    monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)
+    _, snapshot = _commit_evidence(allocation_engine,
+                                   accelerator_names=('a100',),
+                                   free_slots=3,
+                                   feed_by_accelerator={'a100': 3},
+                                   edge_cap=3,
+                                   grant=3)
+    state = _exact_utilization_state(cap=3,
+                                     demonstrated_need=3,
+                                     accelerator='a100')
+    flexible_class = compatibility_matching.CompatibilityDemand(
+        priority=0, compatible_cards=('a100', 'h200'), count=3)
+    state['reservation_acquisition_classes'] = [{
+        'priority': flexible_class.priority,
+        'compatible_cards': list(flexible_class.compatible_cards),
+        'count': flexible_class.count,
+    }]
+    state['reservation_acquisition_binding_sha256'] = (
+        reserved_fill_allocation.reservation_acquisition_binding_sha256(
+            'd' * 64, (flexible_class,)))
+    with allocation_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.reserved_fill_service_claim_sets_table).
+            where(serve_state_schema.reserved_fill_service_claim_sets_table.c.
+                  service_name == _SERVICE).values(
+                      global_headroom=3,
+                      utilization_ceiling=3,
+                      utilization_state=json.dumps(state)))
+    repository = _repository(allocation_engine)
+
+    allocation = repository.publish(_SERVICE,
+                                    expected_service_hash=_SERVICE_HASH,
+                                    expected_controller_owner=_OWNER,
+                                    expected_claim_generation=11,
+                                    expected_gate_generation=1,
+                                    pool_snapshots=(snapshot,))
+
+    assert allocation is not None
+    assert allocation.upward_grants_settled
+    assert repository.read_current(_SERVICE, _SERVICE_HASH,
+                                   _OWNER) == allocation
+
+
+def test_acquisition_class_tamper_revokes_settled_allocation(
+        allocation_engine, monkeypatch) -> None:
+    monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)
+    _, snapshot = _commit_evidence(allocation_engine,
+                                   accelerator_names=('a100',),
+                                   free_slots=3,
+                                   feed_by_accelerator={'a100': 3},
+                                   edge_cap=3,
+                                   grant=3)
+    state = _exact_utilization_state(cap=3,
+                                     demonstrated_need=3,
+                                     accelerator='a100')
+    with allocation_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.reserved_fill_service_claim_sets_table).
+            where(serve_state_schema.reserved_fill_service_claim_sets_table.c.
+                  service_name == _SERVICE).values(
+                      global_headroom=3,
+                      utilization_ceiling=3,
+                      utilization_state=json.dumps(state)))
+    repository = _repository(allocation_engine)
+    settled = repository.publish(_SERVICE,
+                                 expected_service_hash=_SERVICE_HASH,
+                                 expected_controller_owner=_OWNER,
+                                 expected_claim_generation=11,
+                                 expected_gate_generation=1,
+                                 pool_snapshots=(snapshot,))
+    assert settled is not None
+    assert settled.upward_grants_settled
+
+    tampered = copy.deepcopy(state)
+    tampered['reservation_acquisition_classes'] = [{
+        'priority': 0,
+        'compatible_cards': ['h200'],
+        'count': 3,
+    }]
+    with allocation_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.reserved_fill_service_claim_sets_table).
+            where(serve_state_schema.reserved_fill_service_claim_sets_table.c.
+                  service_name == _SERVICE).values(
+                      utilization_state=json.dumps(tampered)))
+
+    with pytest.raises(
+            reserved_fill_allocation.ReservedFillAllocationCorruptionError,
+            match='do not match their binding'):
+        repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER)
+    with pytest.raises(
+            reserved_fill_allocation.ReservedFillAllocationCorruptionError,
+            match='do not match their binding'):
+        repository.publish(_SERVICE,
+                           expected_service_hash=_SERVICE_HASH,
+                           expected_controller_owner=_OWNER,
+                           expected_claim_generation=11,
+                           expected_gate_generation=1,
+                           pool_snapshots=(snapshot,))
 
 
 @pytest.mark.parametrize('lock_target', ['protocol', 'legacy-projection'])

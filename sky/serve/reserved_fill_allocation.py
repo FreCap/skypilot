@@ -13,6 +13,7 @@ durable adapter between committed broker evidence and the pure
 """
 
 from collections.abc import Mapping
+import hashlib
 import json
 import math
 import re
@@ -21,6 +22,7 @@ from typing import Any
 import sqlalchemy
 from sqlalchemy.engine import RowMapping
 
+from sky.serve import compatibility_matching
 from sky.serve import pool_capacity_observation
 from sky.serve import pool_capacity_observation_schema
 from sky.serve import reserved_capacity_broker
@@ -31,6 +33,7 @@ from sky.serve import serve_state_schema
 _AUTHORITATIVE_CLAIM_SET = 'authoritative_v2'
 _MAX_BIGINT = 2**63 - 1
 _SHA256_PATTERN = re.compile(r'^[0-9a-f]{64}$')
+_ACQUISITION_BINDING_PROTOCOL = 'skyserve-reserved-acquisition-binding-v1'
 
 
 class ReservedFillAllocationError(RuntimeError):
@@ -135,9 +138,72 @@ def _exact_nonnegative_counts(value: Any, subject: str) -> dict[str, int]:
     return normalized
 
 
+def _decode_acquisition_classes(
+    value: Any,
+) -> tuple[compatibility_matching.CompatibilityDemand, ...] | None:
+    """Decode only the current canonical class shape, or fail closed."""
+    if value is None:
+        return None
+    if type(value) is not list:
+        raise ReservedFillAllocationCorruptionError(
+            'Reservation acquisition classes must be an exact JSON list.')
+    classes: list[compatibility_matching.CompatibilityDemand] = []
+    for raw_item in value:
+        if type(raw_item) is not dict or set(raw_item) != {
+                'priority', 'compatible_cards', 'count'
+        }:
+            raise ReservedFillAllocationCorruptionError(
+                'Reservation acquisition class has an unsupported shape.')
+        raw_cards = raw_item['compatible_cards']
+        if type(raw_cards) is not list:
+            raise ReservedFillAllocationCorruptionError(
+                'Reservation acquisition compatibility is malformed.')
+        try:
+            item = compatibility_matching.CompatibilityDemand(
+                priority=raw_item['priority'],
+                compatible_cards=tuple(raw_cards),
+                count=raw_item['count'])
+        except ValueError as error:
+            raise ReservedFillAllocationCorruptionError(
+                'Reservation acquisition class is malformed.') from error
+        if list(item.compatible_cards) != raw_cards:
+            raise ReservedFillAllocationCorruptionError(
+                'Reservation acquisition class is not canonical.')
+        classes.append(item)
+    return tuple(classes)
+
+
+def reservation_acquisition_binding_sha256(
+    demand_witness_sha256: str,
+    acquisition_classes: tuple[compatibility_matching.CompatibilityDemand, ...],
+) -> str:
+    """Bind one copied demand witness to its canonical acquisition classes."""
+    if (type(demand_witness_sha256) is not str or
+            _SHA256_PATTERN.fullmatch(demand_witness_sha256) is None or
+            type(acquisition_classes) is not tuple or
+            any(not isinstance(item, compatibility_matching.CompatibilityDemand)
+                for item in acquisition_classes)):
+        raise ValueError('Reservation acquisition binding input is malformed.')
+    payload = {
+        'protocol': _ACQUISITION_BINDING_PROTOCOL,
+        'demand_witness_sha256': demand_witness_sha256,
+        'reservation_acquisition_classes': [{
+            'priority': item.priority,
+            'compatible_cards': list(item.compatible_cards),
+            'count': item.count,
+        } for item in acquisition_classes],
+    }
+    encoded = json.dumps(payload,
+                         sort_keys=True,
+                         separators=(',', ':'),
+                         ensure_ascii=True).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _claim_utilization_authority(
     set_row: RowMapping,
-) -> tuple[bool, int | None, str | None, bool, int, dict[str, int] | None]:
+) -> tuple[bool, int | None, str | None, bool, int, (
+        tuple[compatibility_matching.CompatibilityDemand, ...] | None)]:
     """Decode the exact service-wide utilization witness for one map."""
     ceiling = set_row['utilization_ceiling']
     headroom = set_row['global_headroom']
@@ -152,25 +218,24 @@ def _claim_utilization_authority(
                 'An ungated reserved-fill claim has a reduced ceiling.')
         return False, None, None, False, ceiling, None
     state = _decode_json_object(raw_state, 'Claim utilization state')
-    previous_fields = {
+    base_fields = {
         'cap', 'hot_until', 'stepped_at', 'blind_since', 'demonstrated_need',
         'boot_hold', 'blind'
     }
-    current_fields = previous_fields | {'demand_witness_sha256'}
-    acquisition_fields = current_fields | {
-        'reservation_acquisition_target_by_accelerator'
+    acquisition_fields = base_fields | {
+        'demand_witness_sha256', 'reservation_acquisition_classes',
+        'reservation_acquisition_binding_sha256'
     }
-    if set(state) not in (previous_fields, current_fields, acquisition_fields):
+    if set(state) != acquisition_fields:
         raise ReservedFillAllocationCorruptionError(
             'Claim utilization state has an unsupported shape.')
     cap = state['cap']
     need = state['demonstrated_need']
     demand_witness_sha256 = state.get('demand_witness_sha256')
-    raw_acquisition_target = state.get(
-        'reservation_acquisition_target_by_accelerator')
-    acquisition_target = (
-        None if raw_acquisition_target is None else _exact_nonnegative_counts(
-            raw_acquisition_target, 'Reservation acquisition target'))
+    acquisition_classes = _decode_acquisition_classes(
+        state.get('reservation_acquisition_classes'))
+    acquisition_binding_sha256 = state.get(
+        'reservation_acquisition_binding_sha256')
     boot_hold = state['boot_hold']
     blind = state['blind']
     times = (state['hot_until'], state['stepped_at'])
@@ -188,17 +253,34 @@ def _claim_utilization_authority(
         (demand_witness_sha256 is not None and
          (type(demand_witness_sha256) is not str or
           _SHA256_PATTERN.fullmatch(demand_witness_sha256) is None)) or
-        (acquisition_target is not None and
-         (not acquisition_target or
-          any(count <= 0 for count in acquisition_target.values()) or
-          need is None or demand_witness_sha256 is None or
-          sum(acquisition_target.values()) > need)) or
+        (acquisition_binding_sha256 is not None and
+         (type(acquisition_binding_sha256) is not str or
+          _SHA256_PATTERN.fullmatch(acquisition_binding_sha256) is None)) or
+        (acquisition_classes is not None and
+         (need is None or demand_witness_sha256 is None or
+          acquisition_binding_sha256 is None or
+          sum(item.count for item in acquisition_classes) != need)) or
+        (acquisition_classes is None and
+         (demand_witness_sha256 is not None or
+          acquisition_binding_sha256 is not None)) or
         (blind and
          (need is not None or boot_hold)) or (not blind and need is None)):
         raise ReservedFillAllocationCorruptionError(
             'Claim utilization witness is malformed.')
+    if acquisition_classes is not None:
+        assert demand_witness_sha256 is not None
+        try:
+            expected_binding = reservation_acquisition_binding_sha256(
+                demand_witness_sha256, acquisition_classes)
+        except ValueError as error:
+            raise ReservedFillAllocationCorruptionError(
+                'Reservation acquisition binding input is malformed.'
+            ) from error
+        if acquisition_binding_sha256 != expected_binding:
+            raise ReservedFillAllocationCorruptionError(
+                'Reservation acquisition classes do not match their binding.')
     return (True, need, demand_witness_sha256, boot_hold, ceiling,
-            acquisition_target)
+            acquisition_classes)
 
 
 def _decode_accelerator_names(value: Any) -> tuple[str, ...]:
@@ -687,46 +769,86 @@ class ReservedFillAllocationRepository:
 
     @staticmethod
     def _reservation_acquisition_is_complete(
-        target_by_accelerator: dict[str, int],
+        acquisition_classes: (tuple[compatibility_matching.CompatibilityDemand,
+                                    ...]),
         pool_snapshots: tuple[reserved_fill_planner.PoolFillSnapshot, ...],
         locked_rounds: Mapping[str, RowMapping],
+        edges: tuple[RowMapping, ...],
+        maximum_assigned: int,
     ) -> bool:
-        """Whether exact caps cover demand or all freshly observed supply."""
-        caps: dict[str, int] = {}
-        spendable: dict[str, int] = {}
-        seen: set[str] = set()
-        for snapshot in pool_snapshots:
+        """Whether current caps equal the canonical locked-supply match."""
+        if (len(pool_snapshots) != len(edges) or
+                type(maximum_assigned) is not int or maximum_assigned < 0):
+            return False
+        supply: list[compatibility_matching.CompatibilitySupply] = []
+        actual_caps: dict[str, int] = {}
+        for snapshot, edge in zip(pool_snapshots, edges):
             identity = reserved_capacity_broker.parse_pool_identity(
                 snapshot.pool_key)
             if len(identity.gpu_names) != 1:
                 return False
             card = identity.gpu_names[0].casefold()
-            if card not in target_by_accelerator:
-                continue
-            # Cross-pool redistribution needs a joint service-by-pool
-            # augmenting matcher.  The current qualification topology has one
-            # physical pool per target card; fail closed rather than letting a
-            # cap on an empty sibling masquerade as coverage for a full one.
-            if card in seen:
-                return False
             round_row = locked_rounds.get(snapshot.pool_key)
             if round_row is None:
                 return False
-            holdings = round_row['sum_holdings']
-            observed = round_row['last_observed_free']
+            holdings = edge['holdings_fill']
+            sum_holdings = round_row['sum_holdings']
+            launchable = edge['launchable']
             if (type(holdings) is not int or holdings < 0 or
-                    type(observed) is not int or observed < 0):
+                    type(sum_holdings) is not int or sum_holdings < 0 or
+                    type(launchable) not in (bool, int) or
+                    int(launchable) not in (0, 1)):
                 raise ReservedFillAllocationCorruptionError(
-                    'Reserved-fill discovery capacity is malformed.')
-            seen.add(card)
-            pool_spendable = holdings + observed
-            caps[card] = min(snapshot.edge_cap, pool_spendable)
-            spendable[card] = pool_spendable
-        for card, target in target_by_accelerator.items():
-            if card not in seen or caps.get(card, 0) < min(
-                    target, spendable.get(card, 0)):
+                    'Reserved-fill matcher capacity is malformed.')
+            shaped_feed = _decode_json_object(round_row['feed_by_accelerator'],
+                                              'Round exact-card matcher feed')
+            spendable = _exact_nonnegative_counts(
+                shaped_feed.get(
+                    reserved_capacity_broker.SPENDABLE_FREE_BY_ACCELERATOR_KEY),
+                'Round spendable exact-card capacity')
+            observed = _exact_nonnegative_counts(
+                shaped_feed.get(
+                    reserved_capacity_broker.OBSERVED_FREE_BY_ACCELERATOR_KEY),
+                'Round observed exact-card capacity')
+            if (set(spendable) != {card} or set(observed) != {card} or
+                    spendable[card] > observed[card]):
                 return False
-        return True
+            capacity = (holdings if not bool(launchable) else max(
+                holdings, sum_holdings + spendable[card]))
+            pool_position = edge['pool_position']
+            if type(pool_position) is not int or pool_position < 0:
+                raise ReservedFillAllocationCorruptionError(
+                    'Reserved-fill matcher rank is malformed.')
+            if capacity > 0:
+                supply.append(
+                    compatibility_matching.CompatibilitySupply(
+                        supply_id=snapshot.pool_key,
+                        card=card,
+                        capacity=capacity,
+                        preferred_capacity=min(holdings, capacity),
+                        stable_rank=pool_position))
+            actual_caps[snapshot.pool_key] = snapshot.edge_cap
+        try:
+            matched = compatibility_matching.match_compatible_capacity(
+                demand=acquisition_classes,
+                supply=tuple(supply),
+                maximum_assigned=maximum_assigned)
+        except ValueError as error:
+            raise ReservedFillAllocationCorruptionError(
+                'Reservation compatibility match is malformed.') from error
+        expected_caps = dict(matched.assigned_by_supply)
+        if (sum(item.count for item in acquisition_classes) > 0 and
+                sum(expected_caps.values()) == 0 and any(
+                    any(item.card in demand.compatible_cards
+                        for demand in acquisition_classes)
+                    for item in supply)):
+            # A covering positive witness cannot be settled by an all-zero
+            # cap while current compatible spendable supply exists.  The
+            # service-wide ceiling must advance and a later round must match
+            # that supply before a paid residual can become causal.
+            return False
+        return all(actual_cap == expected_caps.get(pool_key, 0)
+                   for pool_key, actual_cap in actual_caps.items())
 
     @staticmethod
     def _read_allocation_columns(
@@ -858,7 +980,7 @@ class ReservedFillAllocationRepository:
                 return None
             (utilization_gate_armed, utilization_demonstrated_need,
              utilization_demand_witness_sha256, utilization_boot_hold,
-             utilization_ceiling, reservation_acquisition_target) = (
+             utilization_ceiling, reservation_acquisition_classes) = (
                  _claim_utilization_authority(set_row))
             if (service_row['current_version'] != set_row['service_version'] or
                     not self._lock_projection_source(
@@ -882,10 +1004,10 @@ class ReservedFillAllocationRepository:
                     utilization_demand_witness_sha256 is not None):
                 upward_grants_settled = (
                     upward_grants_settled and
-                    reservation_acquisition_target is not None and
+                    reservation_acquisition_classes is not None and
                     self._reservation_acquisition_is_complete(
-                        reservation_acquisition_target, pool_snapshots,
-                        locked_rounds))
+                        reservation_acquisition_classes, pool_snapshots,
+                        locked_rounds, edges, utilization_ceiling))
 
             allocation_columns = self._read_allocation_columns(connection, name)
             if allocation_columns is None:
@@ -1050,8 +1172,8 @@ class ReservedFillAllocationRepository:
         set_row, edges = claim_state
         (utilization_gate_armed, utilization_demonstrated_need,
          utilization_demand_witness_sha256, utilization_boot_hold,
-         utilization_ceiling,
-         reservation_acquisition_target) = _claim_utilization_authority(set_row)
+         utilization_ceiling, reservation_acquisition_classes
+        ) = _claim_utilization_authority(set_row)
         if (service_row['current_version'] != set_row['service_version'] or
                 not self._lock_projection_source(
                     connection, name, set_row['service_version'], edges)):
@@ -1127,10 +1249,10 @@ class ReservedFillAllocationRepository:
                 utilization_demand_witness_sha256 is not None):
             upward_grants_settled = (
                 upward_grants_settled and
-                reservation_acquisition_target is not None and
+                reservation_acquisition_classes is not None and
                 self._reservation_acquisition_is_complete(
-                    reservation_acquisition_target, allocation.pool_snapshots,
-                    locked_rounds))
+                    reservation_acquisition_classes, allocation.pool_snapshots,
+                    locked_rounds, edges, utilization_ceiling))
         if allocation.upward_grants_settled != upward_grants_settled:
             return None
         return allocation

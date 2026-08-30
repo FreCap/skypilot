@@ -5018,11 +5018,15 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         decisions = _decisions(autoscaler, [])
 
         self.assertEqual(len(decisions), 1)
-        self.assertIsInstance(decisions[0].target,
-                              autoscalers.LogicalScaleTarget)
-        self.assertEqual(
-            dict(decisions[0].target.target_capacity_by_accelerator),
-            {'A100': 1})
+        # This fixture is the isolated ungated, nonsequenced overlay. An idle
+        # floor has no demand owner in the canonical sequenced planner, while
+        # the retained overlay may still launch its exact zero-cost-only slot.
+        self.assertEqual(decisions[0].target, {
+            '_reserved_fill_zero_cost_only': True,
+            'accelerators': {
+                'A100': 1,
+            },
+        })
 
     def test_preempted_logical_card_does_not_suppress_replacement(self):
         autoscaler = _make_autoscaler(max_replicas=1, replica_unit='logical')

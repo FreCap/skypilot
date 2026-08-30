@@ -45,7 +45,7 @@ from sky import skypilot_config
 from sky.adaptors import kubernetes
 from sky.catalog import kubernetes_catalog
 from sky.serve import capacity_admission
-from sky.serve import capacity_planning
+from sky.serve import compatibility_matching
 from sky.serve import constants
 from sky.serve import pool_capacity_observation
 from sky.serve import pool_capacity_observer
@@ -256,6 +256,7 @@ class FillPoolBudgetInput:
     holdings: int
     capacity_hint: int
     accelerator_names: tuple[str, ...] = ()
+    supply_id: str = ''
 
 
 class FillPoolBudgetMode(enum.Enum):
@@ -263,7 +264,7 @@ class FillPoolBudgetMode(enum.Enum):
 
     LEGACY = 'legacy'
     HOLDINGS_ONLY = 'holdings_only'
-    EXACT_SINGLETON = 'exact_singleton'
+    MATCHED = 'matched'
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -272,8 +273,8 @@ class FillPoolDemandAuthority:
 
     mode: FillPoolBudgetMode
     demand_target_capacity: int
-    exact_demand_target_by_accelerator: (capacity_planning.AcceleratorCapacity |
-                                         None)
+    acquisition_classes: (tuple[compatibility_matching.CompatibilityDemand, ...]
+                          | None)
     demonstrated_need: int | None
     demand_witness_sha256: str | None
 
@@ -281,19 +282,28 @@ class FillPoolDemandAuthority:
 def demand_scoped_fill_pool_authority(
     witness: capacity_admission.CommittedFillDemandWitness | None,
 ) -> FillPoolDemandAuthority:
-    """Fail closed unless a witness proves a positive exact-card target."""
-    target = (None if witness is None else
-              witness.reservation_acquisition_target_by_accelerator)
-    if witness is None or target is None or target.total() <= 0:
+    """Fail closed unless a witness proves complete acquisition classes."""
+    classes = (None
+               if witness is None else witness.reservation_acquisition_classes)
+    if witness is None or classes is None:
         return FillPoolDemandAuthority(mode=FillPoolBudgetMode.HOLDINGS_ONLY,
                                        demand_target_capacity=0,
-                                       exact_demand_target_by_accelerator=None,
+                                       acquisition_classes=None,
                                        demonstrated_need=None,
                                        demand_witness_sha256=None)
+    if witness.target_capacity == 0:
+        # Zero demand revokes acquisition immediately, but existing holdings
+        # still drain through the release governor's bounded cap instead of
+        # collapsing every edge in one reconciliation.
+        return FillPoolDemandAuthority(mode=FillPoolBudgetMode.HOLDINGS_ONLY,
+                                       demand_target_capacity=0,
+                                       acquisition_classes=None,
+                                       demonstrated_need=0,
+                                       demand_witness_sha256=None)
     return FillPoolDemandAuthority(
-        mode=FillPoolBudgetMode.EXACT_SINGLETON,
+        mode=FillPoolBudgetMode.MATCHED,
         demand_target_capacity=witness.target_capacity,
-        exact_demand_target_by_accelerator=target,
+        acquisition_classes=classes,
         demonstrated_need=witness.target_capacity,
         demand_witness_sha256=witness.semantic_sha256)
 
@@ -1428,19 +1438,18 @@ def allocate_fill_pool_budgets(
     *,
     mode: FillPoolBudgetMode = FillPoolBudgetMode.LEGACY,
     demand_target_capacity: int = 0,
-    exact_demand_target_by_accelerator: Mapping[str, int] | None = None,
+    acquisition_classes: (tuple[compatibility_matching.CompatibilityDemand, ...]
+                          | None) = None,
 ) -> tuple[FillPoolBudget, ...]:
     """Partition one service budget over ordered physical pool edges.
 
-    Legacy/ungated callers retain existing holdings first and water-fill the
-    remainder over every pool.  A demand-scoped caller partitions its budget
-    only over exact singleton-card demand.  Flexible demand receives no new
-    pool cap until the broker supports request-class matching; treating its
-    cheapest cold attribution as an exact requirement would be incorrect.
+    Legacy callers retain existing holdings first and water-fill the remainder.
+    A demand-scoped caller uses the same canonical compatibility matcher as
+    capacity planning.  Cold demand attribution is explanatory only and never
+    chooses a reserved pool.
 
-    Protocol-v2 pool specs are one exact card each.  Demand-scoped allocation
-    enforces that invariant rather than letting an aggregate cap imply a card
-    choice inside a legacy multi-card pool.
+    Protocol-v2 pool specs are one exact card each.  Composite observations
+    fail closed rather than letting an aggregate cap imply a card choice.
     """
     if (isinstance(global_budget, bool) or not isinstance(global_budget, int) or
             global_budget < 0):
@@ -1473,35 +1482,32 @@ def allocate_fill_pool_budgets(
             sorted({card.casefold() for card in pool.accelerator_names}))
         if len(canonical_cards) != len(pool.accelerator_names):
             raise ValueError('Pool accelerator names are malformed.')
-        if (mode is FillPoolBudgetMode.EXACT_SINGLETON and
-                len(canonical_cards) != 1):
-            raise ValueError('Demand-scoped pool budgets require one exact '
+        if (mode is FillPoolBudgetMode.MATCHED and len(canonical_cards) != 1):
+            raise ValueError('Matched pool budgets require one exact '
                              'accelerator per pool.')
+        if (mode is FillPoolBudgetMode.MATCHED and
+            (not isinstance(pool.supply_id, str) or not pool.supply_id)):
+            raise ValueError('Matched pool budgets require a pool identity.')
         normalized_pool_cards.append(canonical_cards)
+    if (mode is FillPoolBudgetMode.MATCHED and
+            len({pool.supply_id for pool in pools}) != len(pools)):
+        raise ValueError('Matched pool identities must be unique.')
 
-    raw_target = ({} if exact_demand_target_by_accelerator is None else
-                  exact_demand_target_by_accelerator)
-    if not isinstance(raw_target, Mapping):
-        raise ValueError('Demand target must be an accelerator mapping.')
-    target_by_card: dict[str, int] = {}
-    seen_target_cards: set[str] = set()
-    for raw_card, count in raw_target.items():
-        folded = raw_card.casefold() if isinstance(raw_card, str) else ''
-        if (not isinstance(raw_card, str) or not raw_card or
-                isinstance(count, bool) or not isinstance(count, int) or
-                count < 0 or folded in seen_target_cards):
-            raise ValueError('Demand target accelerator state is malformed.')
-        seen_target_cards.add(folded)
-        if count > 0:
-            target_by_card[folded] = count
-    target_total = sum(target_by_card.values())
-    if target_total > demand_target_capacity:
-        raise ValueError('Exact demand exceeds aggregate demand.')
-    if (mode is FillPoolBudgetMode.EXACT_SINGLETON and
-        (demand_target_capacity == 0 or target_total == 0)):
-        raise ValueError('Exact pool budgets require positive exact demand.')
-    if (mode is not FillPoolBudgetMode.EXACT_SINGLETON and target_total != 0):
-        raise ValueError('Only exact pool budgets accept card targets.')
+    if acquisition_classes is not None and (
+            not isinstance(acquisition_classes, tuple) or
+            any(not isinstance(item, compatibility_matching.CompatibilityDemand)
+                for item in acquisition_classes)):
+        raise ValueError('Acquisition classes are malformed.')
+    acquisition_total = (0 if acquisition_classes is None else sum(
+        item.count for item in acquisition_classes))
+    if (mode is FillPoolBudgetMode.MATCHED and
+        (acquisition_classes is None or
+         acquisition_total != demand_target_capacity)):
+        raise ValueError('Matched pool budgets require complete demand '
+                         'classes.')
+    if (mode is not FillPoolBudgetMode.MATCHED and
+            acquisition_classes is not None):
+        raise ValueError('Only matched pool budgets accept demand classes.')
 
     caps = [0] * len(pools)
     limits = [max(pool.holdings, pool.capacity_hint) for pool in pools]
@@ -1529,37 +1535,24 @@ def allocate_fill_pool_budgets(
             allocated_total += allocated
         return allocated_total
 
-    if mode is FillPoolBudgetMode.EXACT_SINGLETON:
-        if target_total > 0:
-            # The immutable exact-card projection is already the full demand
-            # that these pools may satisfy.  Aggregate utilization headroom
-            # must not be reinterpreted as additional card-specific demand.
-            exact_budget = min(global_budget, target_total)
-            card_budgets = {
-                card: exact_budget * count // target_total
-                for card, count in target_by_card.items()
-            }
-            remainder = exact_budget - sum(card_budgets.values())
-            remainder_order = sorted(
-                target_by_card,
-                key=lambda card:
-                (-(exact_budget * target_by_card[card] % target_total), card))
-            for card in remainder_order[:remainder]:
-                card_budgets[card] += 1
-
-            for card in sorted(card_budgets):
-                remaining = card_budgets[card]
-                matching = [
-                    index
-                    for index, pool_cards in enumerate(normalized_pool_cards)
-                    if pool_cards == (card,)
-                ]
-                for index in matching:
-                    retained = min(pools[index].holdings, remaining)
-                    caps[index] = retained
-                    remaining -= retained
-                if remaining > 0:
-                    water_fill(matching, remaining)
+    if mode is FillPoolBudgetMode.MATCHED:
+        assert acquisition_classes is not None
+        supply = tuple(
+            compatibility_matching.CompatibilitySupply(
+                supply_id=pool.supply_id,
+                card=normalized_pool_cards[index][0],
+                capacity=limits[index],
+                preferred_capacity=min(pool.holdings, limits[index]),
+                stable_rank=index)
+            for index, pool in enumerate(pools)
+            if limits[index] > 0)
+        matched = compatibility_matching.match_compatible_capacity(
+            demand=acquisition_classes,
+            supply=supply,
+            maximum_assigned=global_budget)
+        matched_by_supply = dict(matched.assigned_by_supply)
+        for index, pool in enumerate(pools):
+            caps[index] = matched_by_supply.get(pool.supply_id, 0)
     else:
         remaining = global_budget
         for index, pool in enumerate(pools):
@@ -3702,7 +3695,8 @@ def _broker_cycle_v2(
         holdings_by_pool.get(spec.pool_key, (0, 0))[0] for spec in specs)
     budget_mode = FillPoolBudgetMode.LEGACY
     demand_target_capacity = 0
-    exact_demand_target_by_accelerator: Mapping[str, int] | None = None
+    acquisition_classes: (tuple[compatibility_matching.CompatibilityDemand, ...]
+                          | None) = None
     if autoscaler.reserved_fill_utilization_gate:
         demand_witness_sha256 = None
         if durable_feed:
@@ -3724,17 +3718,13 @@ def _broker_cycle_v2(
                     logger.warning(
                         'Reserved-fill durable demand witness is unavailable: '
                         f'{common_utils.format_exception(error)}')
-            # An aggregate/flexible witness is not yet enough authority to
-            # select a physical pool.  Keeping it out of the causal
-            # allocation fence also prevents a settled zero grant from
-            # unlocking paid residual while compatible free GPUs exist.
+            # The committed typed classes are the only durable authority for
+            # choosing an exact physical pool.  Missing reduction remains
+            # holdings-only and cannot settle a compatible paid residual.
             demand_authority = demand_scoped_fill_pool_authority(witness)
             budget_mode = demand_authority.mode
             demand_target_capacity = (demand_authority.demand_target_capacity)
-            exact_demand_target_by_accelerator = (
-                None if demand_authority.exact_demand_target_by_accelerator
-                is None else
-                demand_authority.exact_demand_target_by_accelerator.as_dict())
+            acquisition_classes = demand_authority.acquisition_classes
             demonstrated_need = demand_authority.demonstrated_need
             demand_witness_sha256 = demand_authority.demand_witness_sha256
             pre_ready_statuses = (
@@ -3750,6 +3740,12 @@ def _broker_cycle_v2(
             demonstrated_need = (None if sample is None else
                                  sample.demonstrated_need())
             boot_hold = False if sample is None else sample.boot_hold()
+        acquisition_binding_sha256 = None
+        if acquisition_classes is not None:
+            assert demand_witness_sha256 is not None
+            acquisition_binding_sha256 = (
+                reserved_fill_allocation.reservation_acquisition_binding_sha256(
+                    demand_witness_sha256, acquisition_classes))
         prior_state = (previous_set.get('utilization_state')
                        if previous_set is not None else None)
         utilization_state = reserved_capacity_broker.advance_release_target(
@@ -3773,9 +3769,13 @@ def _broker_cycle_v2(
         utilization_state.update({
             'demonstrated_need': demonstrated_need,
             'demand_witness_sha256': demand_witness_sha256,
-            'reservation_acquisition_target_by_accelerator':
-                (None if exact_demand_target_by_accelerator is None else
-                 dict(exact_demand_target_by_accelerator)),
+            'reservation_acquisition_classes':
+                (None if acquisition_classes is None else [{
+                    'priority': item.priority,
+                    'compatible_cards': list(item.compatible_cards),
+                    'count': item.count,
+                } for item in acquisition_classes]),
+            'reservation_acquisition_binding_sha256': acquisition_binding_sha256,
             'boot_hold': boot_hold,
             'blind': demonstrated_need is None,
         })
@@ -3820,14 +3820,15 @@ def _broker_cycle_v2(
                     now,
                     round_row=round_rows[spec.pool_key],
                     observation_repository=(observation_repository)),
-                accelerator_names=spec.accelerator_names))
+                accelerator_names=spec.accelerator_names,
+                supply_id=spec.pool_key))
     budgets = allocate_fill_pool_budgets(
         global_budget,
         autoscaler.reserved_fill_floor_replicas,
         tuple(budget_inputs),
         mode=budget_mode,
         demand_target_capacity=demand_target_capacity,
-        exact_demand_target_by_accelerator=(exact_demand_target_by_accelerator))
+        acquisition_classes=acquisition_classes)
 
     edges: list[dict[str, Any]] = []
     for spec, budget in zip(specs, budgets):

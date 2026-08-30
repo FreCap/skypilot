@@ -9,8 +9,9 @@ import typing
 from typing import Mapping, TypeVar
 
 from sky.serve import autoscaler_compatibility
+from sky.serve import compatibility_matching
 
-CAPACITY_PLANNING_ENVELOPE_SCHEMA_VERSION = 3
+CAPACITY_PLANNING_ENVELOPE_SCHEMA_VERSION = 4
 _MAX_EXACT_ACCOUNTING_INTEGER = (1 << 63) - 1
 
 _EnumT = TypeVar('_EnumT', bound=enum.Enum)
@@ -1164,39 +1165,12 @@ class CapacityPlanningSnapshot:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class _DemandWitnessClass:
-    """One stable request class participating in reservation acquisition."""
-
-    source: str
-    priority: int
-    compatible_accelerators: tuple[str, ...]
-    count: int | None = None
-
-    def __post_init__(self) -> None:
-        if (self.source not in {'demand', 'explicit', 'paid', 'deadline'} or
-                type(self.priority) is not int or
-            (self.count is not None and
-             (type(self.count) is not int or self.count < 0))):
-            raise ValueError('Demand witness class is malformed.')
-        compatible = tuple(
-            sorted({
-                card.casefold(): card
-                for card in self.compatible_accelerators
-                if isinstance(card, str) and card
-            }.values(),
-                   key=str.casefold))
-        if not compatible:
-            raise ValueError('Demand witness class has no accelerator.')
-        object.__setattr__(self, 'compatible_accelerators', compatible)
-
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
 class _DemandWitnessSemantics:
     """Decision-equivalent reservation-acquisition identity.
 
     Raw work estimates and deadline countdowns are intentionally absent.  The
-    reduced target and exact-card attribution already capture their capacity
-    consequence; hashing the moving inputs would make equivalent load-balancer
+    reduced acquisition classes and attribution already capture their capacity
+    consequence; hashing moving inputs would make equivalent load-balancer
     heartbeats continuously revoke a reservation grant.
     """
 
@@ -1206,131 +1180,219 @@ class _DemandWitnessSemantics:
     capacity_unit: str
     backend_num_nodes: int
     physical_gpu_width_by_accelerator: AcceleratorCapacity
-    request_classes: tuple[_DemandWitnessClass, ...]
+    reservation_acquisition_classes: (
+        tuple[compatibility_matching.CompatibilityDemand, ...] | None)
     aggregate_demand_target: int
     demand_attribution: AcceleratorCapacity
-    reservation_acquisition_target: AcceleratorCapacity | None
 
     @property
     def sha256(self) -> str:
         payload = dataclasses.asdict(self)
-        payload['protocol'] = 'serve-fill-demand-witness-v4'
+        payload['protocol'] = 'serve-fill-demand-witness-v5'
         return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 
-def _demand_witness_classes(
-    snapshot: CapacityPlanningSnapshot,) -> tuple[_DemandWitnessClass, ...]:
-    """Return canonical request-class shape without volatile work or clocks."""
-    classes: dict[tuple[str, int, tuple[str, ...], int | None],
-                  _DemandWitnessClass] = {}
-    profile_sources = (
-        ('demand', snapshot.demand_profiles),
-        ('explicit', snapshot.explicit_demand_profiles),
-        ('paid', snapshot.paid_demand_profiles),
-    )
-    for source, profiles in profile_sources:
-        for profile in profiles:
-            if profile.work <= 0:
-                continue
-            item = _DemandWitnessClass(
-                source=source,
-                priority=profile.priority,
-                compatible_accelerators=profile.compatible_accelerators)
-            class_key = (
-                item.source, item.priority,
-                tuple(card.casefold() for card in item.compatible_accelerators),
-                item.count)
-            classes[class_key] = item
-    if snapshot.deadline is not None:
-        deadline_counts: dict[tuple[int, tuple[str, ...]], int] = {}
-        for demand in snapshot.deadline.demand:
-            if demand.count <= 0:
-                continue
-            deadline_key = (demand.priority, demand.compatible_cards)
-            deadline_counts[deadline_key] = (
-                deadline_counts.get(deadline_key, 0) + demand.count)
-        for (priority, cards), count in deadline_counts.items():
-            item = _DemandWitnessClass(source='deadline',
-                                       priority=priority,
-                                       compatible_accelerators=cards,
-                                       count=count)
-            class_key = (
-                item.source, item.priority,
-                tuple(card.casefold() for card in item.compatible_accelerators),
-                item.count)
-            classes[class_key] = item
-    return tuple(classes[key] for key in sorted(classes))
-
-
-def demand_witness_exact_reservation_target(
-    snapshot: CapacityPlanningSnapshot,
-    demand_attribution: AcceleratorCapacity,
+def _apply_deadline_acquisition_pins(
+    classes: tuple[compatibility_matching.CompatibilityDemand, ...] | None,
+    deadline_classes: tuple[compatibility_matching.CompatibilityDemand, ...],
     *,
     aggregate_demand_target: int,
-    raw_demand_target: int,
+) -> tuple[compatibility_matching.CompatibilityDemand, ...] | None:
+    """Exact-pin only the demand units selected by the SLA planner."""
+    if classes is None:
+        # Deadline-only planning expresses the SLA result as exact-card floors,
+        # so the ordinary reducer intentionally has no separate owner.  The
+        # deadline planner's selected slots are the complete ownership proof.
+        return (deadline_classes if sum(item.count for item in deadline_classes)
+                == aggregate_demand_target else None)
+    if not deadline_classes:
+        return classes
+    remaining = {
+        (item.priority, item.compatible_cards): item.count for item in classes
+    }
+    pinned: dict[tuple[int, tuple[str, ...]], int] = {}
+    for deadline in deadline_classes:
+        if len(deadline.compatible_cards) != 1:
+            return None
+        card = deadline.compatible_cards[0]
+        needed = deadline.count
+        candidates = sorted(
+            (key for key, count in remaining.items()
+             if count > 0 and key[0] == deadline.priority and card in key[1]),
+            key=lambda key: (len(key[1]), key[1]))
+        for key in candidates:
+            consumed = min(needed, remaining[key])
+            remaining[key] -= consumed
+            needed -= consumed
+            if needed == 0:
+                break
+        if needed:
+            # The deadline planner selected an exact slot but the ordinary
+            # reduction cannot prove which same-priority demand unit owns it.
+            return None
+        pin = (deadline.priority, (card,))
+        pinned[pin] = pinned.get(pin, 0) + deadline.count
+    combined = dict(pinned)
+    for key, count in remaining.items():
+        if count > 0:
+            combined[key] = combined.get(key, 0) + count
+    result = tuple(
+        compatibility_matching.CompatibilityDemand(
+            priority=priority, compatible_cards=compatible, count=count)
+        for (priority, compatible), count in sorted(
+            combined.items(), key=lambda item: (-item[0][0], item[0][1])))
+    if sum(item.count for item in result) != aggregate_demand_target:
+        return None
+    return result
+
+
+def _match_supply_aware_demand(
+    snapshot: CapacityPlanningSnapshot,
+    classes: tuple[compatibility_matching.CompatibilityDemand, ...],
+    *,
+    pending_reserved: dict[str, int],
+    eligible_reserved: dict[str, int],
 ) -> AcceleratorCapacity | None:
-    """Return the exact-card portion safe for pool-budget acquisition.
+    """Match post-policy classes through reservation-first finite supply."""
+    demand_units = sum(item.count for item in classes)
+    if demand_units == 0:
+        return AcceleratorCapacity()
+    canonical = {
+        card.casefold(): card for card in snapshot.configured_accelerators
+    }
+    reservation = snapshot.reservation
+    supply: list[compatibility_matching.CompatibilitySupply] = []
+    stable_rank = 0
 
-    Demand attribution is a cheapest-compatible explanation for flexible
-    request classes, not authority to reserve that particular card.  Until
-    the broker carries request-class cardinality and performs exact-card
-    matching, only an entirely singleton-card witness may steer pool budgets.
-    Mixed, flexible, and classless demand therefore fails closed here.
+    def add_tier(
+        name: str,
+        values: Mapping[str, int],
+        *,
+        preferred: bool,
+        card_order: tuple[str, ...] | None = None,
+    ) -> None:
+        nonlocal stable_rank
+        if card_order is None:
+            card_order = snapshot.configured_accelerators
+        for card in card_order:
+            card = canonical[card.casefold()]
+            count = max(0, int(values.get(card, 0)))
+            if count > 0:
+                supply.append(
+                    compatibility_matching.CompatibilitySupply(
+                        supply_id=f'{name}:{card.casefold()}',
+                        card=card.casefold(),
+                        capacity=count,
+                        preferred_capacity=(count if preferred else 0),
+                        stable_rank=stable_rank))
+            stable_rank += 1
 
-    The result is derived exclusively from inputs bound by the v4
-    witness semantic digest.
-    """
-    if (not isinstance(snapshot, CapacityPlanningSnapshot) or
-            not isinstance(demand_attribution, AcceleratorCapacity) or
-            type(aggregate_demand_target) is not int or
-            aggregate_demand_target < 0 or type(raw_demand_target) is not int or
-            raw_demand_target < 0 or
-            demand_attribution.total() != aggregate_demand_target):
-        raise ValueError('Demand witness reservation inputs are malformed.')
-    reserved = {
-        card.casefold(): card
-        for card in snapshot.configured_reservation_accelerators
+    # Existing and pending reservation holdings are retained first. Eligible
+    # zero-cost capacity still precedes already-paid supply so compatible free
+    # GPUs can drain surplus Spot. Existing paid then precedes cold paid.
+    add_tier('existing-zero',
+             reservation.existing_zero_cost_capacity.as_dict(),
+             preferred=True)
+    add_tier('pending-zero', pending_reserved, preferred=True)
+    # `preferred_capacity` is the strict zero-cost preference: every compatible
+    # free unit dominates every paid unit, including across reassignment.
+    add_tier('eligible-zero', eligible_reserved, preferred=True)
+    add_tier('existing-paid',
+             reservation.existing_paid_capacity.as_dict(),
+             preferred=False)
+    prospective = {
+        card.casefold() for card in snapshot.prospective_paid_accelerator_order
     }
-    demand_classes = _demand_witness_classes(snapshot)
-    unproven_capacity = (
-        aggregate_demand_target > raw_demand_target or
-        snapshot.paid_minimum_capacity > 0 or
-        any(count > 0 for _, count in snapshot.floors.entries) or
-        any(work > 0
-            for fixed in (snapshot.fixed_work, snapshot.explicit_fixed_work,
-                          snapshot.paid_fixed_work)
-            for _, work in fixed.entries))
-    if (unproven_capacity or not demand_classes or any(
-            len(item.compatible_accelerators) != 1 for item in demand_classes)):
+    add_tier('cold-paid', {
+        canonical[card.casefold()]: demand_units
+        for card in snapshot.prospective_paid_accelerator_order
+        if card.casefold() in canonical
+    },
+             preferred=False,
+             card_order=snapshot.prospective_paid_accelerator_order)
+    # A reservation-only card may retain unmatched economic demand but cannot
+    # mint paid authority. This final virtual tier conserves the target; paid
+    # projection remains intersected with the immutable prospective set.
+    unfunded_order = tuple(
+        dict.fromkeys((*snapshot.cold_accelerator_order,
+                       *snapshot.configured_accelerators)))
+    add_tier('unfunded', {
+        canonical[card.casefold()]: demand_units
+        for card in unfunded_order
+        if card.casefold() in canonical and card.casefold() not in prospective
+    },
+             preferred=False,
+             card_order=unfunded_order)
+    matched = compatibility_matching.match_compatible_capacity(
+        demand=classes, supply=tuple(supply))
+    if any(count > 0 for _, count in matched.unmatched_by_priority):
         return None
-    exact_cards = {
-        item.compatible_accelerators[0].casefold() for item in demand_classes
+    assigned = {
+        canonical[card.casefold()]: count
+        for card, count in matched.assigned_by_card
+        if count > 0 and card.casefold() in canonical
     }
-    attributed_cards = {
-        card.casefold()
-        for card, count in demand_attribution.entries
-        if count > 0
-    }
-    if not attributed_cards.issubset(exact_cards):
+    result = AcceleratorCapacity.from_mapping(assigned)
+    if result.total() != demand_units:
         return None
-    exact_reserved: dict[str, int] = {}
-    widths = snapshot.physical_gpu_width_by_accelerator.as_dict()
-    for card, count in demand_attribution.entries:
-        key = card.casefold()
-        if count > 0 and key in reserved and key in exact_cards:
-            if (snapshot.capacity_unit is CapacityUnit.LOGICAL_GPU and
-                    widths.get(card) != 1):
-                return None
-            exact_reserved[reserved[key]] = count
-    return AcceleratorCapacity.from_mapping(exact_reserved)
+    return result
+
+
+def _rebase_actuation_on_matched_demand(
+    *,
+    original_demand: AcceleratorCapacity,
+    matched_demand: AcceleratorCapacity,
+    actuation: AcceleratorCapacity,
+    configured_accelerators: tuple[str, ...],
+) -> AcceleratorCapacity | None:
+    """Preserve zero-cost-only padding around the matched demand target."""
+    if (original_demand.total() != matched_demand.total() or
+            actuation.total() < original_demand.total()):
+        return None
+    original = original_demand.as_dict()
+    desired = matched_demand.as_dict()
+    old_actuation = actuation.as_dict()
+    padding = actuation.total() - original_demand.total()
+    for card in configured_accelerators:
+        count = min(padding,
+                    max(0,
+                        old_actuation.get(card, 0) - original.get(card, 0)))
+        if count > 0:
+            desired[card] = desired.get(card, 0) + count
+            padding -= count
+    if padding:
+        return None
+    result = AcceleratorCapacity.from_mapping(desired)
+    return result if result.total() == actuation.total() else None
+
+
+def _acquisition_classes_cover(
+    classes: tuple[compatibility_matching.CompatibilityDemand, ...],
+    target: AcceleratorCapacity,
+) -> bool:
+    """Whether the shared matcher can realize one exact-card projection."""
+    supply = tuple(
+        compatibility_matching.CompatibilitySupply(
+            supply_id=f'target:{index}:{card.casefold()}',
+            card=card.casefold(),
+            capacity=count,
+            preferred_capacity=0,
+            stable_rank=index)
+        for index, (card, count) in enumerate(target.entries))
+    matched = compatibility_matching.match_compatible_capacity(demand=classes,
+                                                               supply=supply)
+    return (not any(count for _, count in matched.unmatched_by_priority) and
+            sum(count for _, count in matched.assigned_by_supply)
+            == target.total())
 
 
 def demand_witness_semantic_sha256(
     snapshot: CapacityPlanningSnapshot,
     *,
     aggregate_demand_target: int,
-    raw_demand_target: int,
     demand_attribution: AcceleratorCapacity,
+    reservation_acquisition_classes: (
+        tuple[compatibility_matching.CompatibilityDemand, ...] | None),
 ) -> str:
     """Hash only stable demand/config semantics used by gate acquisition.
 
@@ -1340,11 +1402,17 @@ def demand_witness_semantic_sha256(
     """
     if (not isinstance(snapshot, CapacityPlanningSnapshot) or
             type(aggregate_demand_target) is not int or
-            aggregate_demand_target < 0 or type(raw_demand_target) is not int or
-            raw_demand_target < 0 or
+            aggregate_demand_target < 0 or
             not isinstance(demand_attribution, AcceleratorCapacity) or
             demand_attribution.total() != aggregate_demand_target):
         raise ValueError('Demand witness semantics are malformed.')
+    if (reservation_acquisition_classes is not None and
+        (not isinstance(reservation_acquisition_classes, tuple) or
+         any(not isinstance(item, compatibility_matching.CompatibilityDemand)
+             for item in reservation_acquisition_classes) or
+         sum(item.count for item in reservation_acquisition_classes)
+         != aggregate_demand_target)):
+        raise ValueError('Demand witness acquisition classes are malformed.')
     semantics = _DemandWitnessSemantics(
         scope_sha256=snapshot.demand_witness_scope_sha256,
         configured_accelerators=snapshot.configured_accelerators,
@@ -1354,14 +1422,9 @@ def demand_witness_semantic_sha256(
         backend_num_nodes=snapshot.backend_num_nodes,
         physical_gpu_width_by_accelerator=(
             snapshot.physical_gpu_width_by_accelerator),
-        request_classes=_demand_witness_classes(snapshot),
+        reservation_acquisition_classes=reservation_acquisition_classes,
         aggregate_demand_target=aggregate_demand_target,
-        demand_attribution=demand_attribution,
-        reservation_acquisition_target=(demand_witness_exact_reservation_target(
-            snapshot,
-            demand_attribution,
-            aggregate_demand_target=aggregate_demand_target,
-            raw_demand_target=raw_demand_target)))
+        demand_attribution=demand_attribution)
     return semantics.sha256
 
 
@@ -1432,6 +1495,8 @@ class CapacityPlanCandidate:
     paid_cap: PaidCapProjection
     retirement_floor_target: AcceleratorCapacity
     next_policy_state: CapacityPolicyState | None = None
+    reservation_acquisition_classes: (
+        tuple[compatibility_matching.CompatibilityDemand, ...] | None) = None
 
     def __post_init__(self) -> None:
         capacities = (
@@ -1474,6 +1539,11 @@ class CapacityPlanCandidate:
                 not isinstance(self.reservation_demand_relation,
                                ReservationDemandRelation) or
                 not isinstance(self.snapshot_fingerprint, str) or
+            (self.reservation_acquisition_classes is not None and
+             (not isinstance(self.reservation_acquisition_classes, tuple) or
+              any(not isinstance(item,
+                                 compatibility_matching.CompatibilityDemand)
+                  for item in self.reservation_acquisition_classes))) or
             (self.next_policy_state is not None and
              not isinstance(self.next_policy_state, CapacityPolicyState)) or
                 not isinstance(self.infeasible_demand_by_priority, tuple) or
@@ -1487,6 +1557,18 @@ class CapacityPlanCandidate:
              any(character not in '0123456789abcdef'
                  for character in self.demand_witness_sha256))):
             raise ValueError('Capacity plan demand witness is malformed.')
+        acquisition_total = (
+            None if self.reservation_acquisition_classes is None else sum(
+                item.count for item in self.reservation_acquisition_classes))
+        if (acquisition_total is not None and
+                acquisition_total != self.aggregate_demand_target):
+            raise ValueError(
+                'Reservation acquisition classes do not conserve demand.')
+        classes = self.reservation_acquisition_classes
+        if (classes is not None and any(card != card.casefold()
+                                        for item in classes
+                                        for card in item.compatible_cards)):
+            raise ValueError('Reservation acquisition cards are not canonical.')
         disjoint_cards = tuple(
             sorted({
                 card.casefold(): card
@@ -1528,6 +1610,7 @@ class CapacityPlanCandidate:
             if (self.kind is not CapacityPlanKind.INCOMPLETE or
                     self.capacity_unit is not CapacityUnit.UNKNOWN or
                     self.demand_witness_sha256 is not None or
+                    self.reservation_acquisition_classes is not None or
                     self.reservation_demand_relation
                     is not ReservationDemandRelation.NOT_APPLICABLE or
                     self.statically_disjoint_demand_accelerators or
@@ -1540,6 +1623,10 @@ class CapacityPlanCandidate:
             raise ValueError('Complete capacity plan is marked incomplete.')
         if self.demand_witness_sha256 is None:
             raise ValueError('Complete capacity plan has no demand witness.')
+        if (classes is not None and not _acquisition_classes_cover(
+                classes, self.demand_attribution)):
+            raise ValueError(
+                'Reservation acquisition classes cannot realize demand.')
         if (self.next_policy_state is not None and
             (self.next_policy_state.source_generation != self.source_generation
              or self.next_policy_state.capacity_unit is not self.capacity_unit
@@ -1572,6 +1659,7 @@ class CapacityPlanCandidate:
             if (self.aggregate_demand_target <= 0 or
                     self.reservation_demand_relation
                     is not ReservationDemandRelation.COMPATIBLE or
+                    self.reservation_acquisition_classes is None or
                     self.demand_attribution.total()
                     != self.aggregate_demand_target or
                     any(value.total() for value in effect_capacities) or
@@ -1583,6 +1671,10 @@ class CapacityPlanCandidate:
                 self.supply_aware_demand_target.total()
                 != self.aggregate_demand_target):
             raise ValueError('Capacity plan does not conserve demand.')
+        if (classes is not None and not _acquisition_classes_cover(
+                classes, self.supply_aware_demand_target)):
+            raise ValueError('Reservation acquisition classes cannot realize '
+                             'the supply-aware demand target.')
         demand = self.supply_aware_demand_target.as_dict()
         reserved = self.reserved_capacity_committed.as_dict()
         new_reserved = self.new_reserved_capacity_committed.as_dict()
@@ -1642,6 +1734,11 @@ class CapacityPlanCandidate:
         elif self.retained_existing_target.total() != 0:
             raise ValueError('Demand plan carries fresh-zero retention.')
         if self.kind is CapacityPlanKind.DEMAND:
+            if (self.reservation_demand_relation
+                    is ReservationDemandRelation.COMPATIBLE and
+                    self.reservation_acquisition_classes is None):
+                raise ValueError(
+                    'Compatible demand has no reservation acquisition class.')
             if any(
                     reserved.get(card, 0) +
                     paid.get(card, 0) > demand.get(card, 0)
@@ -1750,6 +1847,8 @@ class CapacityPlanCandidate:
 _CAPACITY_FIELDS = frozenset({'entries'})
 _COMPATIBILITY_DEMAND_FIELDS = frozenset(
     {'sequence', 'priority', 'compatible_accelerators', 'work'})
+_RESERVATION_ACQUISITION_CLASS_FIELDS = frozenset(
+    {'priority', 'compatible_cards', 'count'})
 _DEADLINE_DEMAND_FIELDS = frozenset(
     {'sequence', 'priority', 'compatible_cards', 'count', 'remaining_seconds'})
 _DEADLINE_SUPPLY_FIELDS = frozenset({'card', 'available_after_seconds', 'tier'})
@@ -1868,8 +1967,9 @@ _CANDIDATE_FIELDS = frozenset({
     'backend_num_nodes', 'infeasible_demand_by_priority',
     'service_time_sources', 'attribution_complete', 'source_generation',
     'snapshot_fingerprint', 'paid_cap', 'next_policy_state',
-    'demand_witness_sha256', 'reservation_demand_relation',
-    'statically_disjoint_demand_accelerators', *_CANDIDATE_CAPACITY_FIELDS
+    'demand_witness_sha256', 'reservation_acquisition_classes',
+    'reservation_demand_relation', 'statically_disjoint_demand_accelerators',
+    *_CANDIDATE_CAPACITY_FIELDS
 })
 _ENVELOPE_FIELDS = frozenset({
     'schema_version', 'snapshot', 'candidate', 'snapshot_fingerprint',
@@ -2328,6 +2428,30 @@ def _decode_infeasible_demand(value: object) -> tuple[tuple[int, float], ...]:
     return tuple(result)
 
 
+def _decode_reservation_acquisition_classes(
+    value: object,
+) -> tuple[compatibility_matching.CompatibilityDemand, ...] | None:
+    if value is None:
+        return None
+    result = []
+    for index, raw_item in enumerate(
+            _require_sequence(value,
+                              'candidate.reservation_acquisition_classes')):
+        field = f'candidate.reservation_acquisition_classes[{index}]'
+        payload = _require_exact_keys(raw_item,
+                                      _RESERVATION_ACQUISITION_CLASS_FIELDS,
+                                      field)
+        result.append(
+            compatibility_matching.CompatibilityDemand(
+                priority=_require_int(payload['priority'], f'{field}.priority'),
+                compatible_cards=_require_strings(payload['compatible_cards'],
+                                                  f'{field}.compatible_cards'),
+                count=_require_int(payload['count'],
+                                   f'{field}.count',
+                                   minimum=1)))
+    return tuple(result)
+
+
 def _decode_candidate(value: object) -> CapacityPlanCandidate:
     payload = _require_exact_keys(value, _CANDIDATE_FIELDS, 'candidate')
     raw_next_policy_state = payload['next_policy_state']
@@ -2368,6 +2492,9 @@ def _decode_candidate(value: object) -> CapacityPlanCandidate:
                                else _require_sha256(
                                    payload['demand_witness_sha256'],
                                    'candidate.demand_witness_sha256')),
+        reservation_acquisition_classes=(
+            _decode_reservation_acquisition_classes(
+                payload['reservation_acquisition_classes'])),
         reservation_demand_relation=_require_enum(
             payload['reservation_demand_relation'], ReservationDemandRelation,
             'candidate.reservation_demand_relation'),
@@ -2434,8 +2561,9 @@ class CapacityPlanningEnvelope:
                 self.snapshot,
                 aggregate_demand_target=(
                     self.candidate.aggregate_demand_target),
-                raw_demand_target=self.candidate.raw_demand_target,
-                demand_attribution=self.candidate.demand_attribution)
+                demand_attribution=self.candidate.demand_attribution,
+                reservation_acquisition_classes=(
+                    self.candidate.reservation_acquisition_classes))
             if self.candidate.demand_witness_sha256 != expected_witness:
                 raise ValueError('Capacity candidate changes demand witness.')
             expected_relation, expected_disjoint = (
@@ -2504,6 +2632,12 @@ class CapacityPlanningEnvelope:
             card.casefold(): card
             for card in self.snapshot.configured_accelerators
         }
+        classes = self.candidate.reservation_acquisition_classes
+        if classes is not None and any(card.casefold() not in configured
+                                       for item in classes
+                                       for card in item.compatible_cards):
+            raise ValueError(
+                'Reservation acquisition class names an unknown card.')
         for field in _CANDIDATE_CAPACITY_FIELDS:
             capacity = getattr(self.candidate, field)
             if any(card.casefold() not in configured or
@@ -2603,6 +2737,7 @@ def incomplete_capacity_plan(*,
         source_generation=source_generation,
         snapshot_fingerprint='',
         demand_witness_sha256=None,
+        reservation_acquisition_classes=None,
         reservation_demand_relation=(ReservationDemandRelation.NOT_APPLICABLE),
         statically_disjoint_demand_accelerators=(),
         paid_cap=PaidCapProjection(max_live_paid_gpu_units=None,
@@ -3229,6 +3364,7 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
         if pending_reserved.get(card, 0) > 0 or
         eligible_reserved.get(card, 0) > 0
     }
+    deadline_plan: autoscaler_compatibility.DeadlineCapacityPlan | None = None
     deadline_target = AcceleratorCapacity()
     infeasible_by_priority: tuple[tuple[int, float], ...] = ()
     service_time_sources: tuple[tuple[str, str], ...] = ()
@@ -3263,14 +3399,14 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
         folded = card.casefold()
         allocation_floors[folded] = max(allocation_floors.get(folded, 0), count)
 
-    def allocate(
+    def allocate_plan(
         minimum: int,
         profiles: tuple[CompatibilityDemand, ...],
         fixed: AcceleratorWork,
         *,
         use_existing_supply: bool,
         maximum: int | None = None,
-    ) -> AcceleratorCapacity:
+    ) -> autoscaler_compatibility.CompatibilityTargetPlan:
         allocation_maximum = (snapshot.maximum_capacity
                               if maximum is None else maximum)
         minimum = min(minimum, allocation_maximum)
@@ -3293,7 +3429,7 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
             committed_paid[card] = max(
                 ready_paid[card], current_committed -
                 min(current_committed, current_committed_zero))
-        target = autoscaler_compatibility._allocate_compatibility_target(  # pylint: disable=protected-access
+        return autoscaler_compatibility._plan_compatibility_target(  # pylint: disable=protected-access
             configured_cards=configured,
             capacities=capacities,
             floors=allocation_floors,
@@ -3310,12 +3446,28 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
                 autoscaler_compatibility.SupplyPreference.ZERO_COST_FIRST),
             cold_order=list(snapshot.cold_accelerator_order),
             use_existing_supply=use_existing_supply)
-        return AcceleratorCapacity.from_mapping(target)
 
-    raw_demand = allocate(snapshot.minimum_capacity,
-                          snapshot.demand_profiles,
-                          snapshot.fixed_work,
-                          use_existing_supply=False)
+    def allocate(
+        minimum: int,
+        profiles: tuple[CompatibilityDemand, ...],
+        fixed: AcceleratorWork,
+        *,
+        use_existing_supply: bool,
+        maximum: int | None = None,
+    ) -> AcceleratorCapacity:
+        return AcceleratorCapacity.from_mapping(
+            allocate_plan(minimum,
+                          profiles,
+                          fixed,
+                          use_existing_supply=use_existing_supply,
+                          maximum=maximum).as_dict())
+
+    raw_demand_plan = allocate_plan(snapshot.minimum_capacity,
+                                    snapshot.demand_profiles,
+                                    snapshot.fixed_work,
+                                    use_existing_supply=False)
+    raw_demand = AcceleratorCapacity.from_mapping(raw_demand_plan.as_dict())
+    acquisition_plan = raw_demand_plan
     use_supply = (snapshot.actuation_supply_policy
                   is ActuationSupplyPolicy.REUSE_CURRENT_SUPPLY)
     reduction: _PolicyReduction | None = None
@@ -3369,6 +3521,12 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
             raw_paid = AcceleratorCapacity()
         else:
             demand = reduction.target_by_accelerator
+            if adopted_target != raw_demand.total():
+                acquisition_plan = allocate_plan(adopted_target,
+                                                 snapshot.demand_profiles,
+                                                 snapshot.fixed_work,
+                                                 use_existing_supply=False,
+                                                 maximum=adopted_target)
             supply_aware_demand = allocate(adopted_target,
                                            snapshot.demand_profiles,
                                            snapshot.fixed_work,
@@ -3395,6 +3553,41 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
                             snapshot.paid_fixed_work,
                             use_existing_supply=use_supply)
 
+    acquisition_classes = (() if fresh_zero else
+                           acquisition_plan.reservation_acquisition_classes)
+    if deadline_plan is not None and not fresh_zero:
+        acquisition_classes = _apply_deadline_acquisition_pins(
+            acquisition_classes,
+            deadline_plan.reservation_acquisition_classes,
+            aggregate_demand_target=demand.total())
+    if (acquisition_classes is not None and
+            sum(item.count for item in acquisition_classes) != demand.total()):
+        acquisition_classes = None
+
+    # Keep cold attribution diagnostic and rematch only the actuation/economic
+    # projection through the shared subset-rank matcher. This is the canonical
+    # A/B/C correction: a constrained class can revise an earlier flexible
+    # assignment so all compatible reservation supply is consumed before paid.
+    if use_supply and acquisition_classes is not None and not fresh_zero:
+        matched_demand = _match_supply_aware_demand(
+            snapshot,
+            acquisition_classes,
+            pending_reserved=pending_reserved,
+            eligible_reserved=eligible_reserved)
+        if matched_demand is None:
+            return incomplete_capacity_plan(
+                source_generation=snapshot.source_generation)
+        rebased_actuation = _rebase_actuation_on_matched_demand(
+            original_demand=supply_aware_demand,
+            matched_demand=matched_demand,
+            actuation=actuation,
+            configured_accelerators=snapshot.configured_accelerators)
+        if rebased_actuation is None:
+            return incomplete_capacity_plan(
+                source_generation=snapshot.source_generation)
+        supply_aware_demand = matched_demand
+        actuation = rebased_actuation
+
     economic_map = supply_aware_demand.as_dict()
 
     def intersect(raw: AcceleratorCapacity) -> AcceleratorCapacity:
@@ -3407,13 +3600,18 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
     demand_witness_sha256 = demand_witness_semantic_sha256(
         snapshot,
         aggregate_demand_target=demand.total(),
-        raw_demand_target=raw_demand.total(),
-        demand_attribution=demand)
+        demand_attribution=demand,
+        reservation_acquisition_classes=acquisition_classes)
     reservation_demand_relation, statically_disjoint_cards = (
         _classify_reservation_demand(snapshot,
                                      demand,
                                      supply_aware_demand,
                                      raw_demand_target=raw_demand.total()))
+    if (not fresh_zero and reservation_demand_relation
+            is ReservationDemandRelation.COMPATIBLE and
+            acquisition_classes is None):
+        return incomplete_capacity_plan(
+            source_generation=snapshot.source_generation)
     if (not fresh_zero and
             reservation.gate_policy is ReservationGatePolicy.UNGATED and
             reservation_demand_relation is ReservationDemandRelation.COMPATIBLE
@@ -3470,6 +3668,7 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
             source_generation=snapshot.source_generation,
             snapshot_fingerprint=snapshot.fingerprint,
             demand_witness_sha256=demand_witness_sha256,
+            reservation_acquisition_classes=acquisition_classes,
             reservation_demand_relation=reservation_demand_relation,
             statically_disjoint_demand_accelerators=(),
             paid_cap=PaidCapProjection(
@@ -3685,6 +3884,7 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
         source_generation=snapshot.source_generation,
         snapshot_fingerprint=snapshot.fingerprint,
         demand_witness_sha256=demand_witness_sha256,
+        reservation_acquisition_classes=acquisition_classes,
         reservation_demand_relation=reservation_demand_relation,
         statically_disjoint_demand_accelerators=statically_disjoint_cards,
         paid_cap=PaidCapProjection(
