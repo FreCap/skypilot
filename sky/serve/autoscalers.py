@@ -230,33 +230,10 @@ def bind_locked_kueue_capacity_snapshot(
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class PlanningInstant:
-    """The only wall/monotonic clock sample consumed by one durable plan."""
-
-    wall_time: float
-    monotonic_time: float
-
-    def __post_init__(self) -> None:
-        for value in (self.wall_time, self.monotonic_time):
-            if (not isinstance(value,
-                               (int, float)) or isinstance(value, bool) or
-                    not math.isfinite(value) or value < 0):
-                raise ValueError('Durable capacity planning time is invalid.')
-        object.__setattr__(self, 'wall_time', float(self.wall_time))
-        object.__setattr__(self, 'monotonic_time', float(self.monotonic_time))
-
-    @classmethod
-    def sample(cls) -> 'PlanningInstant':
-        return cls(wall_time=time.time(), monotonic_time=time.monotonic())
-
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
 class DurableCapacityReconcilePlan:
-    """One uncommitted pure plan and its post-commit CAS precondition."""
+    """One uncommitted pure plan and its controller effects."""
 
     envelope: capacity_planning.CapacityPlanningEnvelope
-    prior_policy_fingerprint: str
-    expected_prior_generation: int
     logical_target: LogicalCapacityTarget | None
     logical_retirement_floor: LogicalCapacityTarget | None
     retirement_shelter: (reserved_fill_planner.SequencedRetirementShelter |
@@ -270,15 +247,10 @@ class DurableCapacityReconcilePlan:
             raise ValueError('Durable capacity reconcile plan is malformed.')
         candidate = self.envelope.candidate
         prior = self.envelope.snapshot.prior_policy_state
-        if (not isinstance(self.prior_policy_fingerprint, str) or
-                len(self.prior_policy_fingerprint) != 64 or
-                type(self.expected_prior_generation) is not int or
-                self.expected_prior_generation < 0 or
-            (self.retirement_shelter is not None and
+        if ((self.retirement_shelter is not None and
              not isinstance(self.retirement_shelter,
                             reserved_fill_planner.SequencedRetirementShelter))
                 or prior is None or
-                self.expected_prior_generation != prior.source_generation or
                 not isinstance(self.scaling_decisions, tuple) or not all(
                     isinstance(item, AutoscalerDecision)
                     for item in self.scaling_decisions) or
@@ -286,7 +258,7 @@ class DurableCapacityReconcilePlan:
                 self.rollout_failure, UnrecoverableRolloutFailure))):
             raise ValueError('Durable capacity reconcile plan is malformed.')
         if candidate.kind is capacity_planning.CapacityPlanKind.GATE_ACQUISITION:
-            if (candidate.next_policy_state is not None or
+            if (candidate.next_policy_state != prior or
                     self.logical_target is not None or
                     self.logical_retirement_floor is not None or
                     self.retirement_shelter is not None or
@@ -340,6 +312,53 @@ class DurableCapacityReconcilePlan:
                         for card, width in shelter_shapes.items())):
                 raise ValueError('Durable capacity plan changes its retirement '
                                  'shelter.')
+
+
+def _without_ambiguous_prior_authority(
+    prior_policy_state: capacity_planning.CapacityPolicyState,
+    prior_candidate: capacity_planning.CapacityPlanCandidate,
+) -> tuple[capacity_planning.CapacityPolicyState,
+           capacity_planning.CapacityPlanCandidate]:
+    """Clear stale demand/effects while preserving durable policy identity."""
+    sanitized_state = dataclasses.replace(
+        prior_policy_state,
+        upscale_observations=0,
+        snap_target_on_next_recompute=False,
+        adopt_total_capacity_on_next_recompute=False)
+    empty = capacity_planning.AcceleratorCapacity()
+    sanitized_candidate = dataclasses.replace(
+        prior_candidate,
+        kind=capacity_planning.CapacityPlanKind.DEMAND,
+        aggregate_demand_target=0,
+        raw_demand_target=0,
+        demand_attribution=empty,
+        supply_aware_demand_target=empty,
+        reserved_capacity_committed=empty,
+        new_reserved_capacity_committed=empty,
+        reserved_launch_target=empty,
+        reserved_packing_padding_target=empty,
+        paid_residual=empty,
+        paid_launch_target=empty,
+        paid_packing_padding_target=empty,
+        zero_cost_padding_target=empty,
+        static_prefill_target=empty,
+        retained_existing_target=empty,
+        transition_retention_target=empty,
+        wave_limited_actuation_target=empty,
+        supply_aware_actuation_target=empty,
+        explicit_demand_attribution=empty,
+        paid_demand_attribution=empty,
+        warm_retention_target=empty,
+        deadline_target=empty,
+        infeasible_demand_by_priority=(),
+        service_time_sources=(),
+        reservation_demand_relation=(
+            capacity_planning.ReservationDemandRelation.NOT_APPLICABLE),
+        statically_disjoint_demand_accelerators=(),
+        retirement_floor_target=empty,
+        reservation_acquisition_classes=None,
+        next_policy_state=sanitized_state)
+    return sanitized_state, sanitized_candidate
 
 
 # Preserve historical private import and pickle identities while the pure
@@ -6028,11 +6047,6 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self.max_scale_down_rate_percentage: int = int(
             spec.max_scale_down_rate_percentage)
         self._last_scale_up_wave_at: float | None = None
-        # The durable planner must never compare a persisted wall timestamp
-        # with ``time.monotonic()``.  Keep its wave clock separate from the
-        # legacy/UI wall-clock field; a rebuilt controller starts
-        # conservatively at ``None`` until PostgreSQL restores policy state.
-        self._durable_last_scale_up_wave_monotonic: float | None = None
         # The timestamp opens a rollout window; this ceiling retains the
         # unspent part of that window when placement cannot make progress on
         # its first reconciliation tick. It is latest-version committed
@@ -6211,114 +6225,61 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self.target_num_replicas = 0
             self.target_num_replicas_by_accelerator = {}
 
-    def _export_durable_policy_state_locked(
-            self) -> capacity_planning.CapacityPolicyState:
-        """Export only state owned by the pure logical capacity policy."""
-
-        def _capacity(
-                values: Mapping[str,
-                                int]) -> capacity_planning.AcceleratorCapacity:
-            return capacity_planning.AcceleratorCapacity.from_mapping(values)
-
-        return capacity_planning.CapacityPolicyState(
-            service_name=self._service_name,
-            service_version=self.latest_version,
-            source_generation=self._reconcile_generation,
-            capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
-            maximum_capacity=self.max_replicas,
-            target_capacity=max(0, int(self.target_num_replicas)),
-            raw_target_capacity=max(0, int(self._raw_target_num_replicas)),
-            target_by_accelerator=_capacity(
-                self.target_num_replicas_by_accelerator),
-            explicit_target_by_accelerator=_capacity(
-                self._logical_adopted_explicit_target_by_accelerator),
-            paid_target_by_accelerator=_capacity(
-                self._logical_adopted_paid_target_by_accelerator),
-            warm_retention_target=_capacity(
-                self.warm_retention_target_by_accelerator),
-            cold_launch_authority_target=_capacity(
-                self.cold_launch_authority_by_accelerator),
-            zero_cost_padding_target=_capacity(
-                self.zero_cost_padding_target_by_accelerator),
-            desired_actuation_target=_capacity(
-                self._logical_actuation_desired_by_accelerator),
-            wave_limited_actuation_target=_capacity(
-                self._logical_actuation_target_by_accelerator),
-            transition_retention_target=_capacity(
-                self._logical_transition_retention_target_by_accelerator),
-            upscale_observations=max(0, int(self.upscale_counter)),
-            downscale_started_monotonic=self._downscale_started_at,
-            downscale_veto_streak=max(0, int(self._downscale_veto_streak)),
-            pressure_latched=bool(self._pressure_latched),
-            pressure_reasons=tuple(self._pressure_reasons),
-            snap_target_on_next_recompute=bool(
-                self._snap_target_on_next_recompute),
-            adopt_total_capacity_on_next_recompute=bool(
-                self._adopt_total_capacity_on_next_recompute),
-            upscale_pending=bool(self._upscale_pending),
-            logical_card_transition_pending=bool(
-                self._logical_card_transition_pending),
-            last_scale_up_wave_monotonic=(
-                self._durable_last_scale_up_wave_monotonic),
-            scale_up_wave_ceiling=self._logical_scale_up_wave_ceiling,
-            pending_retention_floor=self._pending_retention_floor,
-            pending_capacity_at_adoption=max(
-                0, int(self._pending_capacity_at_adoption)),
-            pending_budget_spent=max(0, int(self._pending_budget_spent)),
-            last_scale_down_allowance=max(0,
-                                          int(self._last_scale_down_allowance)),
-            last_pending_allowance=max(0, int(self._last_pending_allowance)))
-
-    def export_durable_capacity_policy_state(
-            self) -> capacity_planning.CapacityPolicyState:
-        """Return the typed CAS state used by durable capacity planning."""
-        with self._logical_state_lock:
-            return self._export_durable_policy_state_locked()
-
-    def install_committed_capacity_plan(
+    def install_committed_capacity_projection(
         self,
         *,
-        expected_prior_fingerprint: str,
-        expected_prior_generation: int,
-        next_policy_state: capacity_planning.CapacityPolicyState,
-    ) -> bool:
-        """CAS-install a committed pure plan without overwriting other state."""
-        if (not isinstance(expected_prior_fingerprint, str) or
-                len(expected_prior_fingerprint) != 64 or
-                type(expected_prior_generation) is not int or
-                expected_prior_generation < 0 or not isinstance(
-                    next_policy_state, capacity_planning.CapacityPolicyState)):
-            raise ValueError('Committed durable capacity state is malformed.')
+        committed_candidate: capacity_planning.CapacityPlanCandidate,
+    ) -> None:
+        """Project one committed candidate into disposable local state.
+
+        PostgreSQL owns durable policy history.  This projection supports
+        controller-local observability and legacy consumers after the commit;
+        it is never read as an input to durable planning.
+        """
+        if (not isinstance(committed_candidate,
+                           capacity_planning.CapacityPlanCandidate) or
+                committed_candidate.next_policy_state is None):
+            raise ValueError('Committed durable capacity plan is malformed.')
+        next_policy_state = committed_candidate.next_policy_state
+        expected_widths = capacity_planning.AcceleratorCapacity.from_mapping(
+            self.configured_accelerator_shapes)
         if (next_policy_state.service_name != self._service_name or
                 next_policy_state.service_version != self.latest_version or
                 next_policy_state.capacity_unit
                 is not capacity_planning.CapacityUnit.LOGICAL_GPU or
-                next_policy_state.maximum_capacity != self.max_replicas):
-            raise ValueError('Committed durable capacity state has a '
-                             'different policy identity.')
+                next_policy_state.maximum_capacity != self.max_replicas or
+                committed_candidate.capacity_unit
+                is not capacity_planning.CapacityUnit.LOGICAL_GPU or
+                committed_candidate.physical_gpu_width_by_accelerator
+                != expected_widths or
+                committed_candidate.backend_num_nodes != 1):
+            raise ValueError('Committed durable capacity plan has a different '
+                             'policy identity.')
 
-        # Materialize all mutable runtime values before taking the lock.  No
-        # malformed candidate can therefore leave a partially installed CAS.
-        target_by_card = next_policy_state.target_by_accelerator.as_dict()
+        target_by_card = committed_candidate.demand_attribution.as_dict()
         explicit_by_card = (
-            next_policy_state.explicit_target_by_accelerator.as_dict())
-        paid_by_card = next_policy_state.paid_target_by_accelerator.as_dict()
-        warm_by_card = next_policy_state.warm_retention_target.as_dict()
-        cold_by_card = next_policy_state.cold_launch_authority_target.as_dict()
-        padding_by_card = next_policy_state.zero_cost_padding_target.as_dict()
-        desired_by_card = next_policy_state.desired_actuation_target.as_dict()
+            committed_candidate.explicit_demand_attribution.as_dict())
+        paid_by_card = committed_candidate.paid_demand_attribution.as_dict()
+        warm_by_card = committed_candidate.warm_retention_target.as_dict()
+        cold_by_card = committed_candidate.paid_launch_target.as_dict()
+        padding_by_card = (
+            committed_candidate.zero_cost_padding_target.as_dict())
+        desired_by_card = (
+            committed_candidate.supply_aware_actuation_target.as_dict())
         wave_by_card = (
-            next_policy_state.wave_limited_actuation_target.as_dict())
+            committed_candidate.wave_limited_actuation_target.as_dict())
         transition_by_card = (
-            next_policy_state.transition_retention_target.as_dict())
+            committed_candidate.transition_retention_target.as_dict())
+        upscale_pending = (committed_candidate.raw_demand_target
+                           > committed_candidate.aggregate_demand_target)
+        card_transition_pending = (
+            committed_candidate.wave_limited_actuation_target
+            != committed_candidate.supply_aware_actuation_target)
         with self._logical_state_lock:
-            current = self._export_durable_policy_state_locked()
-            if (current.source_generation != expected_prior_generation or
-                    current.fingerprint != expected_prior_fingerprint):
-                return False
-            self.target_num_replicas = next_policy_state.target_capacity
+            self.target_num_replicas = (
+                committed_candidate.aggregate_demand_target)
             self._raw_target_num_replicas = (
-                next_policy_state.raw_target_capacity)
+                committed_candidate.raw_demand_target)
             self.target_num_replicas_by_accelerator = target_by_card
             self._logical_adopted_explicit_target_by_accelerator = (
                 explicit_by_card)
@@ -6332,43 +6293,32 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._logical_transition_retention_target_by_accelerator = (
                 transition_by_card)
             self.upscale_counter = next_policy_state.upscale_observations
-            self._downscale_started_at = (
-                next_policy_state.downscale_started_monotonic)
+            # Never copy a PostgreSQL epoch into the legacy monotonic clock
+            # domain. Durable planning reads this value only from PostgreSQL.
+            self._downscale_started_at = None
             self._downscale_veto_streak = (
                 next_policy_state.downscale_veto_streak)
-            self._pressure_latched = next_policy_state.pressure_latched
-            self._pressure_reasons = next_policy_state.pressure_reasons
             self._snap_target_on_next_recompute = (
                 next_policy_state.snap_target_on_next_recompute)
             self._adopt_total_capacity_on_next_recompute = (
                 next_policy_state.adopt_total_capacity_on_next_recompute)
-            self._upscale_pending = next_policy_state.upscale_pending
-            self._logical_card_transition_pending = (
-                next_policy_state.logical_card_transition_pending)
-            self._durable_last_scale_up_wave_monotonic = (
-                next_policy_state.last_scale_up_wave_monotonic)
-            self._logical_scale_up_wave_ceiling = (
-                next_policy_state.scale_up_wave_ceiling)
+            self._upscale_pending = upscale_pending
+            self._logical_card_transition_pending = card_transition_pending
             self._pending_retention_floor = (
                 next_policy_state.pending_retention_floor)
             self._pending_capacity_at_adoption = (
                 next_policy_state.pending_capacity_at_adoption)
             self._pending_budget_spent = next_policy_state.pending_budget_spent
-            self._last_scale_down_allowance = (
-                next_policy_state.last_scale_down_allowance)
-            self._last_pending_allowance = (
-                next_policy_state.last_pending_allowance)
-            self._reconcile_generation = next_policy_state.source_generation
+            self._reconcile_generation = committed_candidate.source_generation
             self.capacity_target_by_accelerator = dict(wave_by_card)
             self.capacity_target_complete = True
             self._last_logical_target_state = LogicalCapacityTarget(
                 version=self.latest_version,
-                generation=next_policy_state.source_generation,
+                generation=committed_candidate.source_generation,
                 target_capacity=sum(wave_by_card.values()),
                 target_capacity_by_accelerator=tuple(wave_by_card.items()),
                 accelerator_shapes=tuple(
                     self.configured_accelerator_shapes.items()))
-            return True
 
     def plan_durable_capacity_reconcile(
         self,
@@ -6381,8 +6331,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         retirement_shelter: (reserved_fill_planner.SequencedRetirementShelter |
                              None),
         max_live_paid_gpu_units: int | None,
+        prior_policy_state: capacity_planning.CapacityPolicyState,
+        prior_candidate: capacity_planning.CapacityPlanCandidate,
+        planning_db_epoch: float,
         fresh_zero: bool = False,
-        planning_instant: PlanningInstant | None = None,
         configured_reservation_accelerators: tuple[str, ...] = (),
         demand_witness_scope_sha256: str = '',
     ) -> DurableCapacityReconcilePlan | None:
@@ -6407,27 +6359,45 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # is independently protected from retirement below.
             return None
         if (self.replica_unit != 'logical' or
+                self.adaptive_scale_up is not None or
                 not isinstance(request_information, Mapping) or
                 not isinstance(reservation_input,
                                capacity_planning.ReservationPlanningInput) or
                 not isinstance(source_fingerprint, str) or
+                not isinstance(prior_policy_state,
+                               capacity_planning.CapacityPolicyState) or
+                not isinstance(prior_candidate,
+                               capacity_planning.CapacityPlanCandidate) or
+                not isinstance(planning_db_epoch, (int, float)) or
+                isinstance(planning_db_epoch, bool) or
+                not math.isfinite(planning_db_epoch) or planning_db_epoch < 0 or
             (retirement_shelter is not None and
              not isinstance(retirement_shelter,
                             reserved_fill_planner.SequencedRetirementShelter))
                 or (max_live_paid_gpu_units is not None and
                     (type(max_live_paid_gpu_units) is not int or
                      max_live_paid_gpu_units < 0)) or
-            (planning_instant is not None and
-             not isinstance(planning_instant, PlanningInstant)) or
                 type(fresh_zero) is not bool):
             return None
-        instant = planning_instant or PlanningInstant.sample()
 
         with self._logical_state_lock:
-            prior = self._export_durable_policy_state_locked()
             generation = request_information.get('reconcile_generation')
-            if (type(generation) is not int or
-                    generation < prior.source_generation):
+            if (type(generation) is not int or generation < max(
+                    prior_policy_state.last_reduced_demand_generation,
+                    prior_candidate.source_generation) or
+                    prior_policy_state.service_name != self._service_name or
+                    prior_policy_state.service_version != self.latest_version or
+                    prior_policy_state.capacity_unit
+                    is not capacity_planning.CapacityUnit.LOGICAL_GPU or
+                    prior_policy_state.maximum_capacity != self.max_replicas or
+                    prior_candidate.next_policy_state != prior_policy_state or
+                    prior_candidate.capacity_unit
+                    is not capacity_planning.CapacityUnit.LOGICAL_GPU or
+                    not prior_candidate.attribution_complete or
+                    any(timestamp is not None and timestamp > planning_db_epoch
+                        for timestamp in (
+                            prior_policy_state.downscale_started_db_epoch,
+                            prior_policy_state.paid_window_started_db_epoch))):
                 return None
             configured_cards = tuple(self._configured_cards_from_profiles())
             if (not configured_cards or
@@ -6438,7 +6408,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if (set(canonical) != {
                     card.casefold()
                     for card in self.configured_accelerator_shapes
-            }):
+            } or prior_candidate.physical_gpu_width_by_accelerator
+                    != capacity_planning.AcceleratorCapacity.from_mapping(
+                        self.configured_accelerator_shapes) or
+                    prior_candidate.backend_num_nodes != 1):
                 return None
             retirement_shelter_target = (
                 capacity_planning.AcceleratorCapacity())
@@ -6532,7 +6505,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if not isinstance(raw_timestamps, (list, tuple)):
                 return None
             timestamps: list[float] = []
-            cutoff = instant.wall_time - self.qps_window_size
+            cutoff = planning_db_epoch - self.qps_window_size
             for timestamp in raw_timestamps:
                 if (not isinstance(timestamp, (int, float)) or
                         isinstance(timestamp, bool) or
@@ -6610,14 +6583,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 return None
             arrivals = [
                 profile for profile in arrivals
-                if profile['timestamp'] >= instant.wall_time -
+                if profile['timestamp'] >= planning_db_epoch -
                 constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS
             ]
 
             def _adaptive_sample_fresh(observed_at: float | None) -> bool:
                 if observed_at is None:
                     return False
-                age = instant.wall_time - observed_at
+                age = planning_db_epoch - observed_at
                 return (-60.0 <= age <=
                         constants.AUTOSCALER_ADAPTIVE_SAMPLE_MAX_AGE_SECONDS)
 
@@ -6765,8 +6738,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                             (info.is_ready and observed == 0))
                 if degraded:
                     since = degraded_since.get(info.replica_id,
-                                               instant.wall_time)
-                    if (instant.wall_time - since >= constants.
+                                               planning_db_epoch)
+                    if (planning_db_epoch - since >= constants.
                             LOGICAL_UNKNOWN_CAPACITY_REPLACEMENT_SECONDS and
                             info.unknown_capacity_replacement is not True):
                         return 0
@@ -7101,7 +7074,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                             work=(float(profile['count']) * duration /
                                   arrival_evidence_window))
                         for sequence, profile in enumerate(arrivals)
-                        if profile['timestamp'] >= instant.wall_time -
+                        if profile['timestamp'] >= planning_db_epoch -
                         arrival_evidence_window and float(profile['count']) > 0)
                 observation_reconciliation = (
                     capacity_planning.reconcile_demand_observations(
@@ -7145,7 +7118,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                          tuple(profile['compatible_accelerators']),
                          float(profile['count']))
                         for profile in arrivals
-                        if profile['timestamp'] >= instant.wall_time -
+                        if profile['timestamp'] >= planning_db_epoch -
                         arrival_evidence_window and float(profile['count']) > 0
                     ]
                     arrival_evidence.extend(
@@ -7210,7 +7183,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         if estimated_card is None:
                             continue
                         observed_at = float(estimate['observed_at'])
-                        if (-60.0 <= instant.wall_time - observed_at <=
+                        if (-60.0 <= planning_db_epoch - observed_at <=
                                 constants.
                                 AUTOSCALER_ADAPTIVE_SAMPLE_MAX_AGE_SECONDS):
                             service_seconds[estimated_card] = float(
@@ -7242,7 +7215,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                                         tier=tier))
                         else:
                             created_at = info.created_at
-                            age = (max(0.0, instant.wall_time -
+                            age = (max(0.0, planning_db_epoch -
                                        float(created_at))
                                    if isinstance(created_at, (int, float)) and
                                    not isinstance(created_at, bool) else 0.0)
@@ -7293,18 +7266,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     pressure_reasons.append('recent_rejections')
                 if _offered(60) > 0:
                     pressure_reasons.append('offered_arrivals_60s')
-            rate_percentage = self.max_scale_up_rate_percentage
-            rate_minimum = self.scale_up_rate_min_replicas or 0
-            if (self.adaptive_scale_up is not None and
-                    self._adaptive_until is not None and
-                    instant.monotonic_time < self._adaptive_until):
-                rate_percentage = int(
-                    self.adaptive_scale_up['max_scale_up_rate_percentage'])
-                rate_minimum = int(
-                    self.adaptive_scale_up['scale_up_rate_min_replicas'])
-
             policy_input = capacity_planning.CapacityPolicyInput(
-                planning_monotonic_time=instant.monotonic_time,
+                planning_db_epoch=planning_db_epoch,
                 fresh_demand=True,
                 pressure_latched=bool(pressure_reasons),
                 pressure_reasons=tuple(pressure_reasons),
@@ -7322,8 +7285,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS),
                 max_downscale_pressure_vetoes=(
                     _MAX_CONSECUTIVE_DOWNSCALE_VETOES),
-                scale_up_rate_percentage=rate_percentage,
-                scale_up_rate_min_capacity=rate_minimum,
+                scale_up_rate_percentage=self.max_scale_up_rate_percentage,
+                scale_up_rate_min_capacity=(self.scale_up_rate_min_replicas or
+                                            0),
                 scale_up_rate_period_seconds=(
                     self.scale_up_rate_period_seconds),
                 max_scale_down_rate_percentage=(
@@ -7381,36 +7345,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 paid_profiles = []
                 capped_retention = {}
                 exact_fixed_work = {}
-            planning_prior = prior
+            planning_prior_state = prior_policy_state
+            planning_prior_candidate = prior_candidate
             if unattributed_saturated_work:
-                # A prior target can contain attribution learned from an older
-                # report (including a pre-upgrade saturated extrapolation).
-                # Keep the live state's identity for the post-commit CAS, but
-                # remove every authority-bearing projection before reduction.
-                # Existing committed supply is protected solely by the typed
-                # shelter above; only work attributable in this snapshot may
-                # rebuild economic and actuation authority.  Provider wave
-                # timestamps and ceilings remain intact: they are pacing
-                # evidence that prevents a duplicate launch, not demand.
-                empty_capacity = capacity_planning.AcceleratorCapacity()
-                planning_prior = dataclasses.replace(
-                    prior,
-                    target_capacity=0,
-                    raw_target_capacity=0,
-                    target_by_accelerator=empty_capacity,
-                    explicit_target_by_accelerator=empty_capacity,
-                    paid_target_by_accelerator=empty_capacity,
-                    warm_retention_target=empty_capacity,
-                    cold_launch_authority_target=empty_capacity,
-                    zero_cost_padding_target=empty_capacity,
-                    desired_actuation_target=empty_capacity,
-                    wave_limited_actuation_target=empty_capacity,
-                    transition_retention_target=empty_capacity,
-                    upscale_observations=0,
-                    snap_target_on_next_recompute=False,
-                    adopt_total_capacity_on_next_recompute=False,
-                    upscale_pending=False,
-                    logical_card_transition_pending=False)
+                (planning_prior_state, planning_prior_candidate) = (
+                    _without_ambiguous_prior_authority(prior_policy_state,
+                                                       prior_candidate))
             cold_order = (decision_inputs.cold_paid_accelerator_order or
                           configured_cards)
             # An exact empty tuple is a closed catalog result (including
@@ -7468,7 +7408,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     capacity_planning.ActuationSupplyPolicy.REUSE_CURRENT_SUPPLY
                 ),
                 attribution_complete=True,
-                planning_time=instant.wall_time,
+                planning_time=planning_db_epoch,
                 max_live_paid_gpu_units=max_live_paid_gpu_units,
                 retirement_shelter_target=retirement_shelter_target,
                 deadline=None if fresh_zero else deadline_input,
@@ -7476,7 +7416,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 configured_reservation_accelerators=(
                     configured_reservation_accelerators),
                 demand_witness_scope_sha256=demand_witness_scope_sha256,
-                prior_policy_state=planning_prior,
+                prior_policy_state=planning_prior_state,
+                prior_candidate=planning_prior_candidate,
                 policy_input=policy_input)
 
             # This is the sole production planner invocation for the durable
@@ -7494,8 +7435,6 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     capacity_planning.CapacityPlanKind.GATE_ACQUISITION):
                 return DurableCapacityReconcilePlan(
                     envelope=envelope,
-                    prior_policy_fingerprint=prior.fingerprint,
-                    expected_prior_generation=prior.source_generation,
                     logical_target=None,
                     logical_retirement_floor=None,
                     retirement_shelter=None,
@@ -7600,9 +7539,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
             next_state = candidate.next_policy_state
             assert next_state is not None
+            upscale_pending = (candidate.raw_demand_target
+                               > candidate.aggregate_demand_target)
+            card_transition_pending = (
+                candidate.wave_limited_actuation_target
+                != candidate.supply_aware_actuation_target)
             if (rollout_failure is None and not any(shortages.values()) and
-                    not next_state.upscale_pending and
-                    not next_state.logical_card_transition_pending):
+                    not upscale_pending and not card_transition_pending):
                 status_order = serve_state.ReplicaStatus.scale_down_decision_order(
                 )
 
@@ -7714,8 +7657,6 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
             return DurableCapacityReconcilePlan(
                 envelope=envelope,
-                prior_policy_fingerprint=prior.fingerprint,
-                expected_prior_generation=prior.source_generation,
                 logical_target=logical_target,
                 logical_retirement_floor=logical_retirement_floor,
                 retirement_shelter=retirement_shelter,
