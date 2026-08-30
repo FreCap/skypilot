@@ -11,7 +11,7 @@ from typing import Mapping, TypeVar
 from sky.serve import autoscaler_compatibility
 from sky.serve import compatibility_matching
 
-CAPACITY_PLANNING_ENVELOPE_SCHEMA_VERSION = 4
+CAPACITY_PLANNING_ENVELOPE_SCHEMA_VERSION = 5
 _MAX_EXACT_ACCOUNTING_INTEGER = (1 << 63) - 1
 
 _EnumT = TypeVar('_EnumT', bound=enum.Enum)
@@ -473,78 +473,43 @@ class CapacityUnit(enum.Enum):
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class CapacityPolicyState:
-    """Planner-owned logical autoscaling state for one committed generation.
+    """Minimal planner-owned memory for one committed generation.
 
     This is deliberately a named state object rather than a tuple or a frozen
-    ``dict``.  Every field participates in the fingerprint used by the
-    post-commit compare-and-swap.  Demand-report, provider, broker, and poller
-    state remain outside this object and therefore cannot be overwritten by a
-    capacity-plan install.
+    ``dict``. Prior targets and every actuation/economic projection live only
+    on the prior committed :class:`CapacityPlanCandidate`; duplicating those
+    effects here would create two durable authorities. Every timestamp is a
+    PostgreSQL epoch and is therefore portable across controller processes.
     """
 
     service_name: str
     service_version: int
-    source_generation: int
+    last_reduced_demand_generation: int
     capacity_unit: CapacityUnit
     maximum_capacity: int
-    target_capacity: int
-    raw_target_capacity: int
-    target_by_accelerator: AcceleratorCapacity
-    explicit_target_by_accelerator: AcceleratorCapacity
-    paid_target_by_accelerator: AcceleratorCapacity
-    warm_retention_target: AcceleratorCapacity
-    cold_launch_authority_target: AcceleratorCapacity
-    zero_cost_padding_target: AcceleratorCapacity
-    desired_actuation_target: AcceleratorCapacity
-    wave_limited_actuation_target: AcceleratorCapacity
-    transition_retention_target: AcceleratorCapacity
     upscale_observations: int
-    downscale_started_monotonic: float | None
+    downscale_started_db_epoch: float | None
     downscale_veto_streak: int
-    pressure_latched: bool
-    pressure_reasons: tuple[str, ...]
     snap_target_on_next_recompute: bool
     adopt_total_capacity_on_next_recompute: bool
-    upscale_pending: bool
-    logical_card_transition_pending: bool
-    last_scale_up_wave_monotonic: float | None
-    scale_up_wave_ceiling: int | None
     pending_retention_floor: int | None
     pending_capacity_at_adoption: int
     pending_budget_spent: int
-    last_scale_down_allowance: int
-    last_pending_allowance: int
+    paid_window_started_db_epoch: float | None
+    paid_window_ceiling_by_accelerator: AcceleratorCapacity
 
     def __post_init__(self) -> None:
-        capacities = (
-            self.target_by_accelerator,
-            self.explicit_target_by_accelerator,
-            self.paid_target_by_accelerator,
-            self.warm_retention_target,
-            self.cold_launch_authority_target,
-            self.zero_cost_padding_target,
-            self.desired_actuation_target,
-            self.wave_limited_actuation_target,
-            self.transition_retention_target,
-        )
         nonnegative_values = (
-            self.source_generation,
+            self.last_reduced_demand_generation,
             self.maximum_capacity,
-            self.target_capacity,
-            self.raw_target_capacity,
             self.upscale_observations,
             self.downscale_veto_streak,
             self.pending_capacity_at_adoption,
             self.pending_budget_spent,
-            self.last_scale_down_allowance,
-            self.last_pending_allowance,
         )
-        optional_nonnegative_values = (
-            self.scale_up_wave_ceiling,
-            self.pending_retention_floor,
-        )
-        optional_times = (self.downscale_started_monotonic,
-                          self.last_scale_up_wave_monotonic)
+        optional_nonnegative_values = (self.pending_retention_floor,)
+        optional_times = (self.downscale_started_db_epoch,
+                          self.paid_window_started_db_epoch)
         if (not isinstance(self.service_name, str) or not self.service_name or
                 type(self.service_version) is not int or
                 self.service_version < 1 or
@@ -557,37 +522,24 @@ class CapacityPolicyState:
                 any(value is not None and
                     (not isinstance(value, (int, float)) or isinstance(
                         value, bool) or not math.isfinite(value) or value < 0)
-                    for value in optional_times) or not all(
-                        isinstance(value, AcceleratorCapacity)
-                        for value in capacities) or any(
-                            type(value) is not bool for value in (
-                                self.pressure_latched,
-                                self.snap_target_on_next_recompute,
-                                self.adopt_total_capacity_on_next_recompute,
-                                self.upscale_pending,
-                                self.logical_card_transition_pending,
-                            )) or
-                not isinstance(self.pressure_reasons, tuple) or not all(
-                    isinstance(reason, str) and reason
-                    for reason in self.pressure_reasons)):
+                    for value in optional_times) or
+                not isinstance(self.paid_window_ceiling_by_accelerator,
+                               AcceleratorCapacity) or
+                any(
+                    type(value) is not bool for value in (
+                        self.snap_target_on_next_recompute,
+                        self.adopt_total_capacity_on_next_recompute,
+                    ))):
             raise ValueError('Capacity policy state is malformed.')
-        if self.target_capacity > self.maximum_capacity:
-            raise ValueError('Capacity policy target exceeds its maximum.')
-        if (self.target_by_accelerator.total()
-                not in (0, self.target_capacity)):
-            raise ValueError('Capacity policy target attribution is partial.')
-        for owned in (self.explicit_target_by_accelerator,
-                      self.paid_target_by_accelerator):
-            target = self.target_by_accelerator.as_dict()
-            if any(count > target.get(card, 0)
-                   for card, count in owned.entries):
-                raise ValueError('Capacity policy ownership exceeds target.')
-        object.__setattr__(self, 'downscale_started_monotonic',
-                           (None if self.downscale_started_monotonic is None
-                            else float(self.downscale_started_monotonic)))
-        object.__setattr__(self, 'last_scale_up_wave_monotonic',
-                           (None if self.last_scale_up_wave_monotonic is None
-                            else float(self.last_scale_up_wave_monotonic)))
+        if ((self.paid_window_started_db_epoch is None)
+                != (self.paid_window_ceiling_by_accelerator.total() == 0)):
+            raise ValueError('Paid window time and ceiling must be paired.')
+        object.__setattr__(self, 'downscale_started_db_epoch',
+                           (None if self.downscale_started_db_epoch is None else
+                            float(self.downscale_started_db_epoch)))
+        object.__setattr__(self, 'paid_window_started_db_epoch',
+                           (None if self.paid_window_started_db_epoch is None
+                            else float(self.paid_window_started_db_epoch)))
 
     def canonical_payload(self) -> dict[str, object]:
         payload = dataclasses.asdict(self)
@@ -604,7 +556,7 @@ class CapacityPolicyState:
 class CapacityPolicyInput:
     """Immutable fleet/config facts used to reduce one policy generation."""
 
-    planning_monotonic_time: float
+    planning_db_epoch: float
     fresh_demand: bool
     pressure_latched: bool
     pressure_reasons: tuple[str, ...]
@@ -635,10 +587,10 @@ class CapacityPolicyInput:
             self.max_scale_down_rate_percentage,
             self.overprovision_capacity,
         )
-        if (not isinstance(self.planning_monotonic_time, (int, float)) or
-                isinstance(self.planning_monotonic_time, bool) or
-                not math.isfinite(self.planning_monotonic_time) or
-                self.planning_monotonic_time < 0 or
+        if (not isinstance(self.planning_db_epoch, (int, float)) or
+                isinstance(self.planning_db_epoch, bool) or
+                not math.isfinite(self.planning_db_epoch) or
+                self.planning_db_epoch < 0 or
                 type(self.fresh_demand) is not bool or
                 type(self.pressure_latched) is not bool or
                 not isinstance(self.pressure_reasons, tuple) or not all(
@@ -664,8 +616,11 @@ class CapacityPolicyInput:
               self.scale_up_rate_period_seconds < 0)) or not isinstance(
                   self.latest_committed_by_accelerator, AcceleratorCapacity)):
             raise ValueError('Capacity policy input is malformed.')
-        object.__setattr__(self, 'planning_monotonic_time',
-                           float(self.planning_monotonic_time))
+        if ((self.scale_up_rate_percentage is None)
+                != (self.scale_up_rate_period_seconds is None)):
+            raise ValueError('Paid wave rate and period must be paired.')
+        object.__setattr__(self, 'planning_db_epoch',
+                           float(self.planning_db_epoch))
         object.__setattr__(self, 'downscale_delay_seconds',
                            float(self.downscale_delay_seconds))
         object.__setattr__(self, 'decision_interval_seconds',
@@ -893,6 +848,7 @@ class CapacityPlanningSnapshot:
     deadline: DeadlinePlanningInput | None = None
     source_fingerprint: str = ''
     prior_policy_state: CapacityPolicyState | None = None
+    prior_candidate: 'CapacityPlanCandidate | None' = None
     policy_input: CapacityPolicyInput | None = None
     configured_reservation_accelerators: tuple[str, ...] = ()
     demand_witness_scope_sha256: str = ''
@@ -941,6 +897,8 @@ class CapacityPlanningSnapshot:
              not isinstance(self.deadline, DeadlinePlanningInput)) or
             (self.prior_policy_state is not None and
              not isinstance(self.prior_policy_state, CapacityPolicyState)) or
+            (self.prior_candidate is not None and
+             not isinstance(self.prior_candidate, CapacityPlanCandidate)) or
             (self.policy_input is not None and
              not isinstance(self.policy_input, CapacityPolicyInput)) or
                 not isinstance(self.planning_time, (int, float)) or isinstance(
@@ -950,15 +908,27 @@ class CapacityPlanningSnapshot:
                 'Capacity planning identity or bounds are invalid.')
         _validate_physical_shape_accounting(
             self.physical_gpu_width_by_accelerator, self.backend_num_nodes)
-        if ((self.prior_policy_state is None) != (self.policy_input is None)):
-            raise ValueError('Capacity policy state and input must be paired.')
+        policy_items = (self.prior_policy_state, self.prior_candidate,
+                        self.policy_input)
+        if any(item is None for item in policy_items) and any(
+                item is not None for item in policy_items):
+            raise ValueError('Capacity policy state, candidate, and input must '
+                             'be paired.')
         if self.prior_policy_state is not None:
             policy_state = self.prior_policy_state
+            prior_candidate = self.prior_candidate
+            assert prior_candidate is not None
             assert self.policy_input is not None
             if (policy_state.service_version != self.service_version or
-                    policy_state.source_generation > self.source_generation or
+                    policy_state.last_reduced_demand_generation
+                    > self.source_generation or
                     policy_state.capacity_unit is not self.capacity_unit or
-                    policy_state.maximum_capacity != self.maximum_capacity):
+                    policy_state.maximum_capacity != self.maximum_capacity or
+                    prior_candidate.source_generation > self.source_generation
+                    or
+                    prior_candidate.capacity_unit is not self.capacity_unit or
+                    prior_candidate.next_policy_state != policy_state or
+                    not prior_candidate.attribution_complete):
                 raise ValueError('Capacity policy identity does not match its '
                                  'planning snapshot.')
         canonical = {
@@ -1025,37 +995,30 @@ class CapacityPlanningSnapshot:
 
         if self.prior_policy_state is not None:
             policy_state = self.prior_policy_state
-            normalized_policy_capacities: dict[str, AcceleratorCapacity] = {}
-            for field in _POLICY_STATE_CAPACITY_FIELDS:
-                values = getattr(policy_state, field)
-                if any(card.casefold() not in canonical
+            paid_ceiling = policy_state.paid_window_ceiling_by_accelerator
+            if any(card.casefold() not in canonical
+                   for card, _ in paid_ceiling.entries):
+                raise ValueError(
+                    'Capacity policy state names an unknown accelerator.')
+            normalized_policy_state = dataclasses.replace(
+                policy_state,
+                paid_window_ceiling_by_accelerator=canonical_capacity(
+                    paid_ceiling))
+            object.__setattr__(self, 'prior_policy_state',
+                               normalized_policy_state)
+            prior_candidate = self.prior_candidate
+            assert prior_candidate is not None
+            for field in _CANDIDATE_CAPACITY_FIELDS:
+                values = getattr(prior_candidate, field)
+                if any(card.casefold() not in canonical or
+                       canonical[card.casefold()] != card
                        for card, _ in values.entries):
                     raise ValueError(
-                        'Capacity policy state names an unknown accelerator.')
-                normalized_policy_capacities[field] = canonical_capacity(values)
+                        'Prior capacity candidate names a noncanonical card.')
             object.__setattr__(
-                self, 'prior_policy_state',
-                dataclasses.replace(
-                    policy_state,
-                    target_by_accelerator=normalized_policy_capacities[
-                        'target_by_accelerator'],
-                    explicit_target_by_accelerator=(
-                        normalized_policy_capacities[
-                            'explicit_target_by_accelerator']),
-                    paid_target_by_accelerator=normalized_policy_capacities[
-                        'paid_target_by_accelerator'],
-                    warm_retention_target=normalized_policy_capacities[
-                        'warm_retention_target'],
-                    cold_launch_authority_target=(normalized_policy_capacities[
-                        'cold_launch_authority_target']),
-                    zero_cost_padding_target=normalized_policy_capacities[
-                        'zero_cost_padding_target'],
-                    desired_actuation_target=normalized_policy_capacities[
-                        'desired_actuation_target'],
-                    wave_limited_actuation_target=(normalized_policy_capacities[
-                        'wave_limited_actuation_target']),
-                    transition_retention_target=(normalized_policy_capacities[
-                        'transition_retention_target'])))
+                self, 'prior_candidate',
+                dataclasses.replace(prior_candidate,
+                                    next_policy_state=normalized_policy_state))
             assert self.policy_input is not None
             policy_input = self.policy_input
             latest_committed = policy_input.latest_committed_by_accelerator
@@ -1244,6 +1207,9 @@ class CapacityPlanningSnapshot:
         if self.prior_policy_state is not None:
             payload['prior_policy_state']['capacity_unit'] = (
                 self.prior_policy_state.capacity_unit.value)
+            assert self.prior_candidate is not None
+            payload['prior_candidate'] = self.prior_candidate.canonical_payload(
+            )
         payload['reservation']['gate_policy'] = (
             self.reservation.gate_policy.value)
         payload['reservation']['evidence_state'] = (
@@ -1776,12 +1742,11 @@ class CapacityPlanCandidate:
             raise ValueError(
                 'Reservation acquisition classes cannot realize demand.')
         if (self.next_policy_state is not None and
-            (self.next_policy_state.source_generation != self.source_generation
-             or self.next_policy_state.capacity_unit is not self.capacity_unit
-             or self.next_policy_state.cold_launch_authority_target
-             != self.paid_launch_target)):
+            (self.next_policy_state.last_reduced_demand_generation
+             > self.source_generation or
+             self.next_policy_state.capacity_unit is not self.capacity_unit)):
             raise ValueError('Capacity plan next policy state has a different '
-                             'identity or paid launch authority.')
+                             'identity or future demand generation.')
         if self.kind is CapacityPlanKind.GATE_ACQUISITION:
             effect_capacities = (
                 self.supply_aware_demand_target,
@@ -1810,8 +1775,7 @@ class CapacityPlanCandidate:
                     self.reservation_acquisition_classes is None or
                     self.demand_attribution.total()
                     != self.aggregate_demand_target or
-                    any(value.total() for value in effect_capacities) or
-                    self.next_policy_state is not None):
+                    any(value.total() for value in effect_capacities)):
                 raise ValueError(
                     'Gate-acquisition plan carries an actuation effect.')
             return
@@ -2016,45 +1980,26 @@ _PAID_CAP_FIELDS = frozenset({
     'max_live_paid_gpu_units', 'charged_paid_gpu_units',
     'remaining_paid_gpu_units'
 })
-_POLICY_STATE_CAPACITY_FIELDS = (
-    'target_by_accelerator',
-    'explicit_target_by_accelerator',
-    'paid_target_by_accelerator',
-    'warm_retention_target',
-    'cold_launch_authority_target',
-    'zero_cost_padding_target',
-    'desired_actuation_target',
-    'wave_limited_actuation_target',
-    'transition_retention_target',
-)
+_POLICY_STATE_CAPACITY_FIELDS = ('paid_window_ceiling_by_accelerator',)
 _POLICY_STATE_FIELDS = frozenset({
     'service_name',
     'service_version',
-    'source_generation',
+    'last_reduced_demand_generation',
     'capacity_unit',
     'maximum_capacity',
-    'target_capacity',
-    'raw_target_capacity',
     'upscale_observations',
-    'downscale_started_monotonic',
+    'downscale_started_db_epoch',
     'downscale_veto_streak',
-    'pressure_latched',
-    'pressure_reasons',
     'snap_target_on_next_recompute',
     'adopt_total_capacity_on_next_recompute',
-    'upscale_pending',
-    'logical_card_transition_pending',
-    'last_scale_up_wave_monotonic',
-    'scale_up_wave_ceiling',
     'pending_retention_floor',
     'pending_capacity_at_adoption',
     'pending_budget_spent',
-    'last_scale_down_allowance',
-    'last_pending_allowance',
+    'paid_window_started_db_epoch',
     *_POLICY_STATE_CAPACITY_FIELDS,
 })
 _POLICY_INPUT_FIELDS = frozenset({
-    'planning_monotonic_time',
+    'planning_db_epoch',
     'fresh_demand',
     'pressure_latched',
     'pressure_reasons',
@@ -2084,8 +2029,9 @@ _SNAPSHOT_FIELDS = frozenset({
     'cold_accelerator_order', 'prospective_paid_accelerator_order',
     'planning_purpose', 'actuation_supply_policy', 'attribution_complete',
     'planning_time', 'max_live_paid_gpu_units', 'retirement_shelter_target',
-    'deadline', 'source_fingerprint', 'prior_policy_state', 'policy_input',
-    'configured_reservation_accelerators', 'demand_witness_scope_sha256'
+    'deadline', 'source_fingerprint', 'prior_policy_state', 'prior_candidate',
+    'policy_input', 'configured_reservation_accelerators',
+    'demand_witness_scope_sha256'
 })
 _CANDIDATE_CAPACITY_FIELDS = (
     'physical_gpu_width_by_accelerator',
@@ -2239,53 +2185,31 @@ def _decode_policy_state(value: object, field: str) -> CapacityPolicyState:
         service_version=_require_int(payload['service_version'],
                                      f'{field}.service_version',
                                      minimum=1),
-        source_generation=_require_int(payload['source_generation'],
-                                       f'{field}.source_generation',
-                                       minimum=0),
+        last_reduced_demand_generation=_require_int(
+            payload['last_reduced_demand_generation'],
+            f'{field}.last_reduced_demand_generation',
+            minimum=0),
         capacity_unit=_require_enum(payload['capacity_unit'], CapacityUnit,
                                     f'{field}.capacity_unit'),
         maximum_capacity=_require_int(payload['maximum_capacity'],
                                       f'{field}.maximum_capacity',
                                       minimum=0),
-        target_capacity=_require_int(payload['target_capacity'],
-                                     f'{field}.target_capacity',
-                                     minimum=0),
-        raw_target_capacity=_require_int(payload['raw_target_capacity'],
-                                         f'{field}.raw_target_capacity',
-                                         minimum=0),
         upscale_observations=_require_int(payload['upscale_observations'],
                                           f'{field}.upscale_observations',
                                           minimum=0),
-        downscale_started_monotonic=_require_optional_float(
-            payload['downscale_started_monotonic'],
-            f'{field}.downscale_started_monotonic',
+        downscale_started_db_epoch=_require_optional_float(
+            payload['downscale_started_db_epoch'],
+            f'{field}.downscale_started_db_epoch',
             minimum=0),
         downscale_veto_streak=_require_int(payload['downscale_veto_streak'],
                                            f'{field}.downscale_veto_streak',
                                            minimum=0),
-        pressure_latched=_require_bool(payload['pressure_latched'],
-                                       f'{field}.pressure_latched'),
-        pressure_reasons=_require_strings(payload['pressure_reasons'],
-                                          f'{field}.pressure_reasons'),
         snap_target_on_next_recompute=_require_bool(
             payload['snap_target_on_next_recompute'],
             f'{field}.snap_target_on_next_recompute'),
         adopt_total_capacity_on_next_recompute=_require_bool(
             payload['adopt_total_capacity_on_next_recompute'],
             f'{field}.adopt_total_capacity_on_next_recompute'),
-        upscale_pending=_require_bool(payload['upscale_pending'],
-                                      f'{field}.upscale_pending'),
-        logical_card_transition_pending=_require_bool(
-            payload['logical_card_transition_pending'],
-            f'{field}.logical_card_transition_pending'),
-        last_scale_up_wave_monotonic=_require_optional_float(
-            payload['last_scale_up_wave_monotonic'],
-            f'{field}.last_scale_up_wave_monotonic',
-            minimum=0),
-        scale_up_wave_ceiling=_require_optional_int(
-            payload['scale_up_wave_ceiling'],
-            f'{field}.scale_up_wave_ceiling',
-            minimum=0),
         pending_retention_floor=_require_optional_int(
             payload['pending_retention_floor'],
             f'{field}.pending_retention_floor',
@@ -2297,22 +2221,18 @@ def _decode_policy_state(value: object, field: str) -> CapacityPolicyState:
         pending_budget_spent=_require_int(payload['pending_budget_spent'],
                                           f'{field}.pending_budget_spent',
                                           minimum=0),
-        last_scale_down_allowance=_require_int(
-            payload['last_scale_down_allowance'],
-            f'{field}.last_scale_down_allowance',
+        paid_window_started_db_epoch=_require_optional_float(
+            payload['paid_window_started_db_epoch'],
+            f'{field}.paid_window_started_db_epoch',
             minimum=0),
-        last_pending_allowance=_require_int(payload['last_pending_allowance'],
-                                            f'{field}.last_pending_allowance',
-                                            minimum=0),
         **capacities)
 
 
 def _decode_policy_input(value: object, field: str) -> CapacityPolicyInput:
     payload = _require_exact_keys(value, _POLICY_INPUT_FIELDS, field)
     return CapacityPolicyInput(
-        planning_monotonic_time=_require_float(
-            payload['planning_monotonic_time'],
-            f'{field}.planning_monotonic_time'),
+        planning_db_epoch=_require_float(payload['planning_db_epoch'],
+                                         f'{field}.planning_db_epoch'),
         fresh_demand=_require_bool(payload['fresh_demand'],
                                    f'{field}.fresh_demand'),
         pressure_latched=_require_bool(payload['pressure_latched'],
@@ -2452,6 +2372,10 @@ def _decode_snapshot(value: object) -> CapacityPlanningSnapshot:
             not isinstance(raw_prior_policy_state, Mapping)):
         raise ValueError(
             'snapshot.prior_policy_state must be null or an object.')
+    raw_prior_candidate = payload['prior_candidate']
+    if (raw_prior_candidate is not None and
+            not isinstance(raw_prior_candidate, Mapping)):
+        raise ValueError('snapshot.prior_candidate must be null or an object.')
     raw_policy_input = payload['policy_input']
     if raw_policy_input is not None and not isinstance(raw_policy_input,
                                                        Mapping):
@@ -2546,6 +2470,8 @@ def _decode_snapshot(value: object) -> CapacityPlanningSnapshot:
         prior_policy_state=(
             None if raw_prior_policy_state is None else _decode_policy_state(
                 raw_prior_policy_state, 'snapshot.prior_policy_state')),
+        prior_candidate=(None if raw_prior_candidate is None else
+                         _decode_candidate(raw_prior_candidate)),
         policy_input=(None
                       if raw_policy_input is None else _decode_policy_input(
                           raw_policy_input, 'snapshot.policy_input')),
@@ -2679,19 +2605,19 @@ class CapacityPlanningEnvelope:
         next_policy_state = self.candidate.next_policy_state
         acquiring_gate = (self.candidate.kind
                           is CapacityPlanKind.GATE_ACQUISITION)
-        if (not acquiring_gate and
-            ((prior_policy_state is None) != (next_policy_state is None))):
+        if ((prior_policy_state is None) != (next_policy_state is None)):
             raise ValueError('Capacity candidate changes policy-state mode.')
-        if acquiring_gate and next_policy_state is not None:
+        if (acquiring_gate and prior_policy_state is not None and
+                next_policy_state != prior_policy_state):
             raise ValueError('Gate acquisition mutates capacity policy state.')
-        if prior_policy_state is not None and not acquiring_gate:
+        if prior_policy_state is not None:
             assert next_policy_state is not None
             if (next_policy_state.service_name
                     != prior_policy_state.service_name or
                     next_policy_state.service_version
                     != self.snapshot.service_version or
-                    next_policy_state.source_generation
-                    != self.snapshot.source_generation or
+                    next_policy_state.last_reduced_demand_generation
+                    > self.snapshot.source_generation or
                     next_policy_state.capacity_unit
                     is not self.snapshot.capacity_unit or
                     next_policy_state.maximum_capacity
@@ -2734,8 +2660,8 @@ class CapacityPlanningEnvelope:
                     != _remaining_paid_gpu_units(self.snapshot)):
                 raise ValueError('Capacity candidate changes paid-cap facts.')
             expected_paid_launch, expected_paid_padding = (
-                _project_paid_launch_authority(self.snapshot,
-                                               self.candidate.paid_residual))
+                _project_paced_paid_launch_authority(
+                    self.snapshot, self.candidate.paid_residual))
             if (self.candidate.paid_launch_target != expected_paid_launch or
                     self.candidate.paid_packing_padding_target
                     != expected_paid_padding):
@@ -2849,6 +2775,95 @@ def decode_planner_envelope(
     return snapshot, candidate
 
 
+def genesis_capacity_policy(
+    *,
+    service_name: str,
+    service_version: int,
+    last_reduced_demand_generation: int,
+    capacity_unit: CapacityUnit,
+    maximum_capacity: int,
+    physical_gpu_width_by_accelerator: AcceleratorCapacity,
+    backend_num_nodes: int = 1,
+) -> tuple[CapacityPolicyState, CapacityPlanCandidate]:
+    """Build the unique zero-effect prior pair for a proven-clean service.
+
+    The repository remains responsible for proving that no head, live replica,
+    claim, intent, provider operation, or other capacity-authority graph exists
+    before using this constructor. Keeping the mechanical zero candidate here
+    prevents callers from hand-building a second genesis representation.
+    """
+    state = CapacityPolicyState(
+        service_name=service_name,
+        service_version=service_version,
+        last_reduced_demand_generation=last_reduced_demand_generation,
+        capacity_unit=capacity_unit,
+        maximum_capacity=maximum_capacity,
+        upscale_observations=0,
+        downscale_started_db_epoch=None,
+        downscale_veto_streak=0,
+        snap_target_on_next_recompute=False,
+        adopt_total_capacity_on_next_recompute=False,
+        pending_retention_floor=None,
+        pending_capacity_at_adoption=0,
+        pending_budget_spent=0,
+        paid_window_started_db_epoch=None,
+        paid_window_ceiling_by_accelerator=AcceleratorCapacity())
+    identity = {
+        'protocol': 'serve-capacity-policy-genesis-v1',
+        'service_name': service_name,
+        'service_version': service_version,
+        'last_reduced_demand_generation': last_reduced_demand_generation,
+        'capacity_unit': capacity_unit.value,
+        'maximum_capacity': maximum_capacity,
+        'physical_gpu_width_by_accelerator':
+            dataclasses.asdict(physical_gpu_width_by_accelerator),
+        'backend_num_nodes': backend_num_nodes,
+    }
+    genesis_fingerprint = hashlib.sha256(
+        _canonical_json_bytes(identity)).hexdigest()
+    empty = AcceleratorCapacity()
+    candidate = CapacityPlanCandidate(
+        kind=CapacityPlanKind.DEMAND,
+        capacity_unit=capacity_unit,
+        physical_gpu_width_by_accelerator=(physical_gpu_width_by_accelerator),
+        backend_num_nodes=backend_num_nodes,
+        aggregate_demand_target=0,
+        raw_demand_target=0,
+        demand_attribution=empty,
+        supply_aware_demand_target=empty,
+        reserved_capacity_committed=empty,
+        new_reserved_capacity_committed=empty,
+        reserved_launch_target=empty,
+        reserved_packing_padding_target=empty,
+        paid_residual=empty,
+        paid_launch_target=empty,
+        paid_packing_padding_target=empty,
+        zero_cost_padding_target=empty,
+        static_prefill_target=empty,
+        retained_existing_target=empty,
+        transition_retention_target=empty,
+        wave_limited_actuation_target=empty,
+        supply_aware_actuation_target=empty,
+        explicit_demand_attribution=empty,
+        paid_demand_attribution=empty,
+        warm_retention_target=empty,
+        deadline_target=empty,
+        infeasible_demand_by_priority=(),
+        service_time_sources=(),
+        attribution_complete=True,
+        source_generation=last_reduced_demand_generation,
+        snapshot_fingerprint=genesis_fingerprint,
+        demand_witness_sha256=genesis_fingerprint,
+        reservation_demand_relation=(ReservationDemandRelation.NOT_APPLICABLE),
+        statically_disjoint_demand_accelerators=(),
+        paid_cap=PaidCapProjection(max_live_paid_gpu_units=None,
+                                   charged_paid_gpu_units=0,
+                                   remaining_paid_gpu_units=None),
+        retirement_floor_target=empty,
+        next_policy_state=state)
+    return state, candidate
+
+
 def incomplete_capacity_plan(*,
                              source_generation: int) -> CapacityPlanCandidate:
     """Return the unique fail-closed plan for unavailable exact-card input."""
@@ -2910,22 +2925,13 @@ class _PolicyReduction:
     explicit_target_by_accelerator: AcceleratorCapacity
     paid_target_by_accelerator: AcceleratorCapacity
     upscale_observations: int
-    downscale_started_monotonic: float | None
+    downscale_started_db_epoch: float | None
     downscale_veto_streak: int
-    pressure_latched: bool
-    pressure_reasons: tuple[str, ...]
     snap_target_on_next_recompute: bool
     adopt_total_capacity_on_next_recompute: bool
-    upscale_pending: bool
-    last_scale_up_wave_monotonic: float | None
-    scale_up_wave_ceiling: int | None
     pending_retention_floor: int | None
     pending_capacity_at_adoption: int
     pending_budget_spent: int
-    last_scale_down_allowance: int
-    last_pending_allowance: int
-    actuation_wave_budget: int | None
-    actuation_wave_is_new: bool
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -2934,7 +2940,6 @@ class _ActuationTransition:
 
     target: AcceleratorCapacity
     retention: AcceleratorCapacity
-    added_capacity: int
 
 
 def _capacity_gpu_units(*, capacity_unit: CapacityUnit,
@@ -2997,6 +3002,84 @@ def _project_paid_launch_authority(
             AcceleratorCapacity.from_mapping(packing_padding))
 
 
+def _paid_window_is_active(
+    state: CapacityPolicyState,
+    policy: CapacityPolicyInput,
+    *,
+    db_epoch: float,
+) -> bool:
+    """Return whether the committed fixed paid window is still active."""
+    started = state.paid_window_started_db_epoch
+    period = policy.scale_up_rate_period_seconds
+    if started is None or period is None:
+        return False
+    if started > db_epoch:
+        raise ValueError('Paid window is ahead of the PostgreSQL clock.')
+    return db_epoch - started < period
+
+
+def _project_paced_paid_launch_authority(
+    snapshot: CapacityPlanningSnapshot,
+    paid_residual: AcceleratorCapacity,
+) -> tuple[AcceleratorCapacity, AcceleratorCapacity]:
+    """Apply one fixed, per-card paid-residual wave to cold authority.
+
+    Reserved admission and logical target adoption deliberately do not consume
+    this budget. The committed window is an absolute per-card paid ceiling;
+    when it has expired, this function proposes a new wave but does not start
+    it. Only :func:`finalize_capacity_plan` may start that window after at least
+    one exact paid unit survives arbitration.
+    """
+    state = snapshot.prior_policy_state
+    policy = snapshot.policy_input
+    if state is None or policy is None or policy.scale_up_rate_percentage is None:
+        return _project_paid_launch_authority(snapshot, paid_residual)
+
+    residual = paid_residual.as_dict()
+    widths = snapshot.physical_gpu_width_by_accelerator.as_dict()
+    existing_paid = snapshot.reservation.existing_paid_capacity.as_dict()
+    authorized: dict[str, int] = {}
+    if _paid_window_is_active(state, policy, db_epoch=policy.planning_db_epoch):
+        ceiling = state.paid_window_ceiling_by_accelerator.as_dict()
+        for card in snapshot.prospective_paid_accelerator_order:
+            width = (widths[card] if snapshot.capacity_unit
+                     is CapacityUnit.LOGICAL_GPU else 1)
+            remaining_window = max(
+                0,
+                ceiling.get(card, 0) - existing_paid.get(card, 0))
+            launchable = remaining_window // width * width
+            count = min(residual.get(card, 0), launchable)
+            if count > 0:
+                authorized[card] = count
+    else:
+        rate = policy.scale_up_rate_percentage
+        assert rate is not None
+        remaining_wave = max(
+            policy.scale_up_rate_min_capacity,
+            math.ceil(policy.latest_committed_capacity * rate / 100.0))
+        selected_launch = 0
+        for card in snapshot.prospective_paid_accelerator_order:
+            count = residual.get(card, 0)
+            if count <= 0 or remaining_wave <= 0:
+                continue
+            width = (widths[card] if snapshot.capacity_unit
+                     is CapacityUnit.LOGICAL_GPU else 1)
+            launchable = remaining_wave // width * width
+            if launchable == 0 and selected_launch == 0:
+                # A positive wave must be able to make progress on one wide
+                # backend; its complete width becomes the typed wave ceiling.
+                launchable = width
+            selected = min(count, launchable)
+            if selected <= 0:
+                continue
+            launch = math.ceil(selected / width) * width
+            authorized[card] = selected
+            selected_launch += launch
+            remaining_wave = max(0, remaining_wave - launch)
+    return _project_paid_launch_authority(
+        snapshot, AcceleratorCapacity.from_mapping(authorized))
+
+
 def _compose_retirement_floor(
     snapshot: CapacityPlanningSnapshot,
     demand_target: AcceleratorCapacity,
@@ -3023,31 +3106,6 @@ def _compose_retirement_floor(
     return AcceleratorCapacity.from_mapping(target)
 
 
-def _logical_scale_up_budget(
-    snapshot: CapacityPlanningSnapshot,) -> tuple[int | None, bool]:
-    """Return this generation's aggregate/exact-card launch budget."""
-    policy = snapshot.policy_input
-    prior = snapshot.prior_policy_state
-    assert policy is not None
-    assert prior is not None
-    rate = policy.scale_up_rate_percentage
-    if rate is None:
-        return None, False
-    period = policy.scale_up_rate_period_seconds
-    if (prior.last_scale_up_wave_monotonic is not None and
-            prior.last_scale_up_wave_monotonic <= policy.planning_monotonic_time
-            and period is not None and
-            policy.planning_monotonic_time - prior.last_scale_up_wave_monotonic
-            < period):
-        if prior.scale_up_wave_ceiling is None:
-            return 0, False
-        return max(
-            0, prior.scale_up_wave_ceiling -
-            policy.nonterminal_committed_capacity), False
-    return max(policy.scale_up_rate_min_capacity,
-               math.ceil(policy.latest_committed_capacity * rate / 100.0)), True
-
-
 def _merge_capacity_ownership(
     *,
     fresh: AcceleratorCapacity,
@@ -3072,14 +3130,28 @@ def _reduce_capacity_policy(
     explicit_target: typing.Callable[[int], AcceleratorCapacity],
     paid_target: typing.Callable[[int], AcceleratorCapacity],
 ) -> _PolicyReduction:
-    """Purely apply hysteresis, rate limits, and exact-card adoption."""
+    """Purely apply hysteresis and exact-card adoption once per demand gen."""
     prior = snapshot.prior_policy_state
+    prior_candidate = snapshot.prior_candidate
     policy = snapshot.policy_input
     assert prior is not None
+    assert prior_candidate is not None
     assert policy is not None
     raw_total = raw_target.total()
-    old_total = prior.target_capacity
-    old_map = prior.target_by_accelerator
+    if (prior_candidate.kind is CapacityPlanKind.GATE_ACQUISITION and
+            prior.last_reduced_demand_generation
+            < prior_candidate.source_generation):
+        # Gate acquisition is permitted only over clean genesis and carries
+        # diagnostic demand, not an adopted target.
+        old_total = 0
+        old_map = AcceleratorCapacity()
+        old_explicit = AcceleratorCapacity()
+        old_paid = AcceleratorCapacity()
+    else:
+        old_total = prior_candidate.aggregate_demand_target
+        old_map = prior_candidate.demand_attribution
+        old_explicit = prior_candidate.explicit_demand_attribution
+        old_paid = prior_candidate.paid_demand_attribution
     if (prior.snap_target_on_next_recompute and
             prior.adopt_total_capacity_on_next_recompute):
         old_total = max(
@@ -3090,32 +3162,16 @@ def _reduce_capacity_policy(
 
     target = old_total
     upscale_observations = prior.upscale_observations
-    downscale_started = prior.downscale_started_monotonic
+    downscale_started = prior.downscale_started_db_epoch
     downscale_veto_streak = prior.downscale_veto_streak
-    pressure_latched = (prior.pressure_latched or policy.pressure_latched)
-    pressure_reasons = (prior.pressure_reasons
-                        if prior.pressure_latched else policy.pressure_reasons)
     snap = prior.snap_target_on_next_recompute
     adopt_total = prior.adopt_total_capacity_on_next_recompute
     pending_floor = prior.pending_retention_floor
     pending_capacity = prior.pending_capacity_at_adoption
     pending_spent = prior.pending_budget_spent
-    last_down_allowance = prior.last_scale_down_allowance
-    last_pending_allowance = prior.last_pending_allowance
-    wave_budget, wave_is_new = _logical_scale_up_budget(snapshot)
-    last_wave_time = prior.last_scale_up_wave_monotonic
-    wave_ceiling = prior.scale_up_wave_ceiling
-    # Monotonic timestamps are comparable across processes on one host, but
-    # not across hosts with different boot epochs.  A controller reschedule
-    # must not preserve a future cooldown/downscale timestamp and wedge
-    # convergence until the new host's uptime catches up.
     if (downscale_started is not None and
-            downscale_started > policy.planning_monotonic_time):
-        downscale_started = None
-    if (last_wave_time is not None and
-            last_wave_time > policy.planning_monotonic_time):
-        last_wave_time = None
-        wave_ceiling = None
+            downscale_started > policy.planning_db_epoch):
+        raise ValueError('Downscale state is ahead of the PostgreSQL clock.')
 
     def reset_downscale() -> None:
         nonlocal downscale_started
@@ -3126,44 +3182,25 @@ def _reduce_capacity_policy(
         if downscale_started is None:
             initial_credit = min(policy.downscale_delay_seconds,
                                  policy.decision_interval_seconds)
-            downscale_started = (policy.planning_monotonic_time -
-                                 initial_credit)
-        return (policy.planning_monotonic_time - downscale_started
+            downscale_started = policy.planning_db_epoch - initial_credit
+        return (policy.planning_db_epoch - downscale_started
                 >= policy.downscale_delay_seconds)
 
     def pressure_vetoes() -> bool:
-        nonlocal pressure_latched, pressure_reasons, downscale_veto_streak
-        if not pressure_latched:
+        nonlocal downscale_veto_streak
+        if not policy.pressure_latched:
             downscale_veto_streak = 0
             return False
         if (downscale_veto_streak >= policy.max_downscale_pressure_vetoes):
-            pressure_latched = False
-            pressure_reasons = ()
             downscale_veto_streak = 0
             return False
-        pressure_latched = False
-        pressure_reasons = ()
         downscale_veto_streak += 1
         return True
 
     def adopt_upscale(requested: int) -> None:
         nonlocal target, pending_floor, pending_capacity, pending_spent
-        nonlocal last_wave_time, wave_ceiling
         old_target = target
-        if wave_budget is None:
-            target = requested
-        elif wave_budget == 0:
-            target = old_target
-        else:
-            target = max(
-                old_target,
-                min(requested,
-                    policy.nonterminal_committed_capacity + wave_budget))
-        if (target > old_target and
-                target > policy.nonterminal_committed_capacity and
-                wave_budget is not None and wave_budget > 0 and wave_is_new):
-            last_wave_time = policy.planning_monotonic_time
-            wave_ceiling = (policy.nonterminal_committed_capacity + wave_budget)
+        target = requested
         if target > old_target:
             pending_floor = None
             pending_capacity = 0
@@ -3171,31 +3208,27 @@ def _reduce_capacity_policy(
 
     def adopt_downscale(requested: int) -> None:
         nonlocal target, pending_floor, pending_capacity, pending_spent
-        nonlocal last_down_allowance, last_pending_allowance
         committed = policy.latest_committed_capacity
         allowance = max(
             1,
             math.ceil(committed * policy.max_scale_down_rate_percentage /
                       100.0))
-        last_down_allowance = allowance
         target = max(requested, committed - allowance)
         provisioning = policy.provisioning_demand_owned_capacity
         pending_allowance = (max(
             1,
             math.ceil(provisioning * policy.max_scale_down_rate_percentage /
                       100.0)) if provisioning > 0 else 0)
-        last_pending_allowance = pending_allowance
         pending_capacity = provisioning
         pending_floor = max(0, provisioning - pending_allowance)
         pending_spent = 0
 
-    if not policy.fresh_demand:
+    consumes_generation = (policy.fresh_demand and snapshot.source_generation
+                           > prior.last_reduced_demand_generation)
+    if not consumes_generation:
         # A durable planner never converts stale telemetry into downscale or
-        # paid authority.  Holding the committed target is the only safe
-        # transition; the controller may still use its established arrival
-        # floor outside this durable path.
-        reset_downscale()
-        upscale_observations = 0
+        # advances hysteresis twice for a same-generation supply-only replan.
+        pass
     elif snap:
         snap = False
         adopt_total = False
@@ -3246,64 +3279,47 @@ def _reduce_capacity_policy(
     fresh_explicit = explicit_target(min(raw_total, target))
     fresh_paid = paid_target(min(raw_total, target))
     if target > raw_total and adopted_map.total() == target:
-        adopted_explicit = _merge_capacity_ownership(
-            fresh=fresh_explicit,
-            prior=prior.explicit_target_by_accelerator,
-            target=adopted_map)
-        adopted_paid = _merge_capacity_ownership(
-            fresh=fresh_paid,
-            prior=prior.paid_target_by_accelerator,
-            target=adopted_map)
+        adopted_explicit = _merge_capacity_ownership(fresh=fresh_explicit,
+                                                     prior=old_explicit,
+                                                     target=adopted_map)
+        adopted_paid = _merge_capacity_ownership(fresh=fresh_paid,
+                                                 prior=old_paid,
+                                                 target=adopted_map)
     else:
         adopted_explicit = fresh_explicit
         adopted_paid = fresh_paid
-    upscale_pending = (raw_total > target or any(
-        raw_target.get(card, 0) > adopted_map.get(card, 0)
-        for card in snapshot.configured_accelerators))
     return _PolicyReduction(target_capacity=target,
                             target_by_accelerator=adopted_map,
                             explicit_target_by_accelerator=adopted_explicit,
                             paid_target_by_accelerator=adopted_paid,
                             upscale_observations=upscale_observations,
-                            downscale_started_monotonic=downscale_started,
+                            downscale_started_db_epoch=downscale_started,
                             downscale_veto_streak=downscale_veto_streak,
-                            pressure_latched=pressure_latched,
-                            pressure_reasons=pressure_reasons,
                             snap_target_on_next_recompute=snap,
                             adopt_total_capacity_on_next_recompute=adopt_total,
-                            upscale_pending=upscale_pending,
-                            last_scale_up_wave_monotonic=last_wave_time,
-                            scale_up_wave_ceiling=wave_ceiling,
                             pending_retention_floor=pending_floor,
                             pending_capacity_at_adoption=pending_capacity,
-                            pending_budget_spent=pending_spent,
-                            last_scale_down_allowance=last_down_allowance,
-                            last_pending_allowance=last_pending_allowance,
-                            actuation_wave_budget=wave_budget,
-                            actuation_wave_is_new=wave_is_new)
+                            pending_budget_spent=pending_spent)
 
 
 def _limit_actuation_transition(
     snapshot: CapacityPlanningSnapshot,
-    reduction: _PolicyReduction,
     desired: AcceleratorCapacity,
 ) -> _ActuationTransition:
-    """Purely limit a cold exact-card migration to one configured wave."""
-    prior = snapshot.prior_policy_state
+    """Purely retain reusable capacity during an exact-card transition."""
+    prior_candidate = snapshot.prior_candidate
     policy = snapshot.policy_input
-    assert prior is not None
+    assert prior_candidate is not None
     assert policy is not None
     desired_map = desired.as_dict()
     target = desired.total()
     cards = list(snapshot.configured_accelerators)
     if target == 0:
         empty = AcceleratorCapacity()
-        return _ActuationTransition(target=empty,
-                                    retention=empty,
-                                    added_capacity=0)
+        return _ActuationTransition(target=empty, retention=empty)
     committed = policy.latest_committed_by_accelerator.as_dict()
-    previous = prior.wave_limited_actuation_target.as_dict()
-    if (desired == prior.desired_actuation_target and
+    previous = prior_candidate.wave_limited_actuation_target.as_dict()
+    if (desired == prior_candidate.supply_aware_actuation_target and
             sum(previous.values()) == target):
         current = {card: max(0, previous.get(card, 0)) for card in cards}
     else:
@@ -3340,16 +3356,12 @@ def _limit_actuation_transition(
         max(0,
             desired_map.get(card, 0) - current[card]) for card in cards)
     required_to_complete = max(0, target - sum(current.values()))
-    wave_budget = reduction.actuation_wave_budget
-    additions_left = (desired_additions if wave_budget is None else max(
-        0, wave_budget + policy.overprovision_capacity, required_to_complete))
-    added = 0
+    additions_left = max(desired_additions, required_to_complete)
     for card in cards:
         increase = max(0, desired_map.get(card, 0) - current[card])
         accepted = min(increase, additions_left)
         current[card] += accepted
         additions_left -= accepted
-        added += accepted
     excess = max(0, sum(current.values()) - target)
     for card in reversed(cards):
         removable = max(0, current[card] - desired_map.get(card, 0))
@@ -3368,9 +3380,7 @@ def _limit_actuation_transition(
         for card, count in limited.entries
         if count > desired_map.get(card, 0)
     })
-    return _ActuationTransition(target=limited,
-                                retention=retention,
-                                added_capacity=added)
+    return _ActuationTransition(target=limited, retention=retention)
 
 
 def _classify_reservation_demand(
@@ -3823,7 +3833,7 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
                 max_live_paid_gpu_units=snapshot.max_live_paid_gpu_units,
                 charged_paid_gpu_units=reservation.charged_paid_gpu_units,
                 remaining_paid_gpu_units=_remaining_paid_gpu_units(snapshot)),
-            next_policy_state=None)
+            next_policy_state=snapshot.prior_policy_state)
 
     warm = {
         card: math.ceil(work / capacities[card] - 1e-9)
@@ -3885,7 +3895,7 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
         demand_reserved_launch[card] = launch_capacity
 
     paid_residual_target = AcceleratorCapacity.from_mapping(paid_residual)
-    paid_launch, paid_packing_padding = _project_paid_launch_authority(
+    paid_launch, paid_packing_padding = _project_paced_paid_launch_authority(
         snapshot, paid_residual_target)
     reserved_launch = dict(demand_reserved_launch)
     if (reservation.gate_policy is ReservationGatePolicy.UNGATED and
@@ -3928,7 +3938,7 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
     transition_retention = AcceleratorCapacity()
     next_policy_state: CapacityPolicyState | None = None
     if reduction is not None:
-        transition = _limit_actuation_transition(snapshot, reduction, actuation)
+        transition = _limit_actuation_transition(snapshot, actuation)
         if actuation.total() > 0 and transition.target.total() == 0:
             return incomplete_capacity_plan(
                 source_generation=snapshot.source_generation)
@@ -3938,60 +3948,41 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
         policy = snapshot.policy_input
         assert prior is not None
         assert policy is not None
-        last_wave_time = reduction.last_scale_up_wave_monotonic
-        wave_ceiling = reduction.scale_up_wave_ceiling
-        if (transition.added_capacity > 0 and
-                reduction.actuation_wave_budget is not None and
-                reduction.actuation_wave_budget > 0 and
-                reduction.actuation_wave_is_new and
-                last_wave_time == prior.last_scale_up_wave_monotonic):
-            last_wave_time = policy.planning_monotonic_time
-            wave_ceiling = (policy.nonterminal_committed_capacity +
-                            reduction.actuation_wave_budget)
-        limited_map = wave_limited_actuation.as_dict()
-        next_padding = AcceleratorCapacity.from_mapping({
-            card: min(count, limited_map.get(card, 0))
-            for card, count in padding_target.entries
-            if count > 0 and limited_map.get(card, 0) > 0
-        })
-        next_policy_state = CapacityPolicyState(
-            service_name=prior.service_name,
-            service_version=snapshot.service_version,
-            source_generation=snapshot.source_generation,
-            capacity_unit=snapshot.capacity_unit,
-            maximum_capacity=snapshot.maximum_capacity,
-            target_capacity=reduction.target_capacity,
-            raw_target_capacity=raw_demand.total(),
-            target_by_accelerator=reduction.target_by_accelerator,
-            explicit_target_by_accelerator=(
-                reduction.explicit_target_by_accelerator),
-            paid_target_by_accelerator=(reduction.paid_target_by_accelerator),
-            warm_retention_target=AcceleratorCapacity.from_mapping(warm),
-            cold_launch_authority_target=paid_launch,
-            zero_cost_padding_target=next_padding,
-            desired_actuation_target=actuation,
-            wave_limited_actuation_target=wave_limited_actuation,
-            transition_retention_target=transition_retention,
-            upscale_observations=reduction.upscale_observations,
-            downscale_started_monotonic=(reduction.downscale_started_monotonic),
-            downscale_veto_streak=reduction.downscale_veto_streak,
-            pressure_latched=reduction.pressure_latched,
-            pressure_reasons=reduction.pressure_reasons,
-            snap_target_on_next_recompute=(
-                reduction.snap_target_on_next_recompute),
-            adopt_total_capacity_on_next_recompute=(
-                reduction.adopt_total_capacity_on_next_recompute),
-            upscale_pending=reduction.upscale_pending,
-            logical_card_transition_pending=(wave_limited_actuation
-                                             != actuation),
-            last_scale_up_wave_monotonic=last_wave_time,
-            scale_up_wave_ceiling=wave_ceiling,
-            pending_retention_floor=reduction.pending_retention_floor,
-            pending_capacity_at_adoption=(
-                reduction.pending_capacity_at_adoption),
-            pending_budget_spent=reduction.pending_budget_spent,
-            last_scale_down_allowance=reduction.last_scale_down_allowance,
-            last_pending_allowance=reduction.last_pending_allowance)
+        last_reduced_generation = prior.last_reduced_demand_generation
+        if policy.fresh_demand:
+            last_reduced_generation = snapshot.source_generation
+        if fresh_zero:
+            next_policy_state = dataclasses.replace(
+                prior,
+                service_version=snapshot.service_version,
+                last_reduced_demand_generation=last_reduced_generation,
+                upscale_observations=0,
+                downscale_started_db_epoch=None,
+                downscale_veto_streak=0,
+                snap_target_on_next_recompute=False,
+                adopt_total_capacity_on_next_recompute=False,
+                pending_retention_floor=None,
+                pending_capacity_at_adoption=0,
+                pending_budget_spent=0,
+                paid_window_started_db_epoch=None,
+                paid_window_ceiling_by_accelerator=AcceleratorCapacity())
+        else:
+            next_policy_state = dataclasses.replace(
+                prior,
+                service_version=snapshot.service_version,
+                last_reduced_demand_generation=last_reduced_generation,
+                upscale_observations=reduction.upscale_observations,
+                downscale_started_db_epoch=(
+                    reduction.downscale_started_db_epoch),
+                downscale_veto_streak=reduction.downscale_veto_streak,
+                snap_target_on_next_recompute=(
+                    reduction.snap_target_on_next_recompute),
+                adopt_total_capacity_on_next_recompute=(
+                    reduction.adopt_total_capacity_on_next_recompute),
+                pending_retention_floor=reduction.pending_retention_floor,
+                pending_capacity_at_adoption=(
+                    reduction.pending_capacity_at_adoption),
+                pending_budget_spent=reduction.pending_budget_spent)
     retirement_floor = _compose_retirement_floor(snapshot,
                                                  wave_limited_actuation)
     return CapacityPlanCandidate(
@@ -4040,3 +4031,97 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
             charged_paid_gpu_units=reservation.charged_paid_gpu_units,
             remaining_paid_gpu_units=_remaining_paid_gpu_units(snapshot)),
         next_policy_state=next_policy_state)
+
+
+def finalize_capacity_plan(
+    snapshot: CapacityPlanningSnapshot,
+    candidate: CapacityPlanCandidate,
+    *,
+    accepted_paid_plan_units: AcceleratorCapacity,
+    accepted_paid_gpu_units: int,
+    decision_db_epoch: float,
+) -> CapacityPlanCandidate:
+    """Finalize DB-clock policy memory after paid-member arbitration.
+
+    This is deliberately not a second planner. It validates the exact accepted
+    subset of the already planned paid authority, derives decision-time epochs,
+    and returns the same candidate with finalized minimal policy state. An
+    all-rejected subset never starts or advances a paid window.
+    """
+    state = snapshot.prior_policy_state
+    policy = snapshot.policy_input
+    next_state = candidate.next_policy_state
+    if (state is None or policy is None or next_state is None or
+            candidate.snapshot_fingerprint != snapshot.fingerprint or
+            candidate.source_generation != snapshot.source_generation):
+        raise ValueError('Capacity plan cannot be finalized for this snapshot.')
+    if (not isinstance(accepted_paid_plan_units, AcceleratorCapacity) or
+            type(accepted_paid_gpu_units) is not int or
+            accepted_paid_gpu_units < 0 or
+            not isinstance(decision_db_epoch, (int, float)) or
+            isinstance(decision_db_epoch, bool) or
+            not math.isfinite(float(decision_db_epoch)) or
+            decision_db_epoch < policy.planning_db_epoch):
+        raise ValueError('Accepted paid capacity or decision epoch is invalid.')
+
+    configured = {
+        card.casefold(): card for card in snapshot.configured_accelerators
+    }
+    proposed = candidate.paid_launch_target.as_dict()
+    widths = snapshot.physical_gpu_width_by_accelerator.as_dict()
+    for card, count in accepted_paid_plan_units.entries:
+        if (card.casefold() not in configured or
+                configured[card.casefold()] != card or
+                count > proposed.get(card, 0)):
+            raise ValueError(
+                'Accepted paid capacity exceeds planned authority.')
+        width = (widths[card]
+                 if snapshot.capacity_unit is CapacityUnit.LOGICAL_GPU else 1)
+        if count % width != 0:
+            raise ValueError('Accepted paid capacity is not whole-backend.')
+    expected_gpu_units = _capacity_gpu_units(
+        capacity_unit=snapshot.capacity_unit,
+        physical_widths=widths,
+        backend_num_nodes=snapshot.backend_num_nodes,
+        capacity=accepted_paid_plan_units)
+    if expected_gpu_units != accepted_paid_gpu_units:
+        raise ValueError('Accepted paid plan and physical GPU units disagree.')
+    maximum_paid = candidate.paid_cap.max_live_paid_gpu_units
+    if (maximum_paid is not None and
+            candidate.paid_cap.charged_paid_gpu_units + accepted_paid_gpu_units
+            > maximum_paid):
+        raise ValueError('Accepted paid capacity exceeds service cap.')
+
+    decision_db_epoch = float(decision_db_epoch)
+    downscale_started = next_state.downscale_started_db_epoch
+    if (state.downscale_started_db_epoch is None and
+            downscale_started is not None):
+        initial_credit = policy.planning_db_epoch - downscale_started
+        if initial_credit < 0:
+            raise ValueError('Proposed downscale epoch is in the future.')
+        downscale_started = decision_db_epoch - initial_credit
+
+    paid_window_started = state.paid_window_started_db_epoch
+    paid_window_ceiling = state.paid_window_ceiling_by_accelerator
+    if candidate.kind is CapacityPlanKind.FRESH_ZERO_RETENTION:
+        paid_window_started = None
+        paid_window_ceiling = AcceleratorCapacity()
+    elif (accepted_paid_plan_units.total() > 0 and
+          policy.scale_up_rate_percentage is not None and
+          not _paid_window_is_active(state, policy,
+                                     db_epoch=decision_db_epoch)):
+        existing = snapshot.reservation.existing_paid_capacity.as_dict()
+        proposed_wave = candidate.paid_launch_target.as_dict()
+        paid_window_started = decision_db_epoch
+        paid_window_ceiling = AcceleratorCapacity.from_mapping({
+            card: existing.get(card, 0) + count
+            for card, count in proposed_wave.items()
+            if count > 0
+        })
+
+    finalized_state = dataclasses.replace(
+        next_state,
+        downscale_started_db_epoch=downscale_started,
+        paid_window_started_db_epoch=paid_window_started,
+        paid_window_ceiling_by_accelerator=paid_window_ceiling)
+    return dataclasses.replace(candidate, next_policy_state=finalized_state)

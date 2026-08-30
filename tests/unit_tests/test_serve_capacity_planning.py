@@ -457,36 +457,19 @@ def _policy_state(**overrides: object) -> capacity_planning.CapacityPolicyState:
     values = {
         'service_name': 'svc',
         'service_version': 3,
-        'source_generation': 6,
+        'last_reduced_demand_generation': 6,
         'capacity_unit': capacity_planning.CapacityUnit.LOGICAL_GPU,
         'maximum_capacity': 20,
-        'target_capacity': 0,
-        'raw_target_capacity': 0,
-        'target_by_accelerator': _capacity(),
-        'explicit_target_by_accelerator': _capacity(),
-        'paid_target_by_accelerator': _capacity(),
-        'warm_retention_target': _capacity(),
-        'cold_launch_authority_target': _capacity(),
-        'zero_cost_padding_target': _capacity(),
-        'desired_actuation_target': _capacity(),
-        'wave_limited_actuation_target': _capacity(),
-        'transition_retention_target': _capacity(),
         'upscale_observations': 0,
-        'downscale_started_monotonic': None,
+        'downscale_started_db_epoch': None,
         'downscale_veto_streak': 0,
-        'pressure_latched': False,
-        'pressure_reasons': (),
         'snap_target_on_next_recompute': False,
         'adopt_total_capacity_on_next_recompute': False,
-        'upscale_pending': False,
-        'logical_card_transition_pending': False,
-        'last_scale_up_wave_monotonic': None,
-        'scale_up_wave_ceiling': None,
         'pending_retention_floor': None,
         'pending_capacity_at_adoption': 0,
         'pending_budget_spent': 0,
-        'last_scale_down_allowance': 0,
-        'last_pending_allowance': 0,
+        'paid_window_started_db_epoch': None,
+        'paid_window_ceiling_by_accelerator': _capacity(),
     }
     values.update(overrides)
     return capacity_planning.CapacityPolicyState(**values)
@@ -494,7 +477,7 @@ def _policy_state(**overrides: object) -> capacity_planning.CapacityPolicyState:
 
 def _policy_input(**overrides: object) -> capacity_planning.CapacityPolicyInput:
     values = {
-        'planning_monotonic_time': 100.0,
+        'planning_db_epoch': 100.0,
         'fresh_demand': True,
         'pressure_latched': False,
         'pressure_reasons': (),
@@ -515,6 +498,33 @@ def _policy_input(**overrides: object) -> capacity_planning.CapacityPolicyInput:
     }
     values.update(overrides)
     return capacity_planning.CapacityPolicyInput(**values)
+
+
+def _prior_candidate(
+    state: capacity_planning.CapacityPolicyState,
+    *,
+    target: int = 0,
+    card: str = 'L4',
+) -> capacity_planning.CapacityPlanCandidate:
+    if target == 0:
+        genesis_state, candidate = capacity_planning.genesis_capacity_policy(
+            service_name=state.service_name,
+            service_version=state.service_version,
+            last_reduced_demand_generation=(
+                state.last_reduced_demand_generation),
+            capacity_unit=state.capacity_unit,
+            maximum_capacity=state.maximum_capacity,
+            physical_gpu_width_by_accelerator=_capacity(L4=1, A100=1))
+        assert genesis_state.service_name == state.service_name
+        return dataclasses.replace(candidate, next_policy_state=state)
+    demand = (() if target == 0 else (_demand(50, (card,), target),))
+    candidate = capacity_planning.plan_capacity(
+        _snapshot(source_generation=state.last_reduced_demand_generation,
+                  maximum_capacity=state.maximum_capacity,
+                  demand_profiles=demand,
+                  explicit_demand_profiles=demand,
+                  paid_demand_profiles=demand))
+    return dataclasses.replace(candidate, next_policy_state=state)
 
 
 def test_identical_semantic_snapshots_have_identical_plans() -> None:
@@ -551,16 +561,18 @@ def test_identical_semantic_snapshots_have_identical_plans() -> None:
 
 def test_policy_generation_advances_once_and_round_trips_with_envelope(
 ) -> None:
-    snapshot = _snapshot(prior_policy_state=_policy_state(),
+    state = _policy_state()
+    snapshot = _snapshot(prior_policy_state=state,
+                         prior_candidate=_prior_candidate(state),
                          policy_input=_policy_input())
 
     candidate = capacity_planning.plan_capacity(snapshot)
 
     assert snapshot.prior_policy_state is not None
-    assert snapshot.prior_policy_state.source_generation == 6
+    assert snapshot.prior_policy_state.last_reduced_demand_generation == 6
     assert snapshot.source_generation == 7
     assert candidate.next_policy_state is not None
-    assert candidate.next_policy_state.source_generation == 7
+    assert candidate.next_policy_state.last_reduced_demand_generation == 7
     payload = capacity_planning.planner_envelope(snapshot, candidate)
     decoded_snapshot, decoded_candidate = (
         capacity_planning.decode_planner_envelope(payload))
@@ -568,18 +580,47 @@ def test_policy_generation_advances_once_and_round_trips_with_envelope(
     assert decoded_candidate == candidate
 
 
-def test_policy_wave_cooldown_uses_monotonic_not_wall_time() -> None:
+def test_format_five_policy_state_contains_only_reducer_memory() -> None:
+    state = _policy_state()
+
+    assert {field.name for field in dataclasses.fields(state)} == {
+        'service_name', 'service_version', 'last_reduced_demand_generation',
+        'capacity_unit', 'maximum_capacity', 'upscale_observations',
+        'downscale_started_db_epoch', 'downscale_veto_streak',
+        'snap_target_on_next_recompute',
+        'adopt_total_capacity_on_next_recompute', 'pending_retention_floor',
+        'pending_capacity_at_adoption', 'pending_budget_spent',
+        'paid_window_started_db_epoch', 'paid_window_ceiling_by_accelerator'
+    }
+    payload = state.canonical_payload()
+    assert not ({
+        'target_capacity', 'cold_launch_authority_target', 'pressure_latched',
+        'pressure_reasons', 'last_scale_up_wave_monotonic'
+    } & payload.keys())
+
+
+def test_genesis_policy_builds_one_valid_zero_prior_pair() -> None:
+    state, candidate = capacity_planning.genesis_capacity_policy(
+        service_name='svc',
+        service_version=3,
+        last_reduced_demand_generation=6,
+        capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+        maximum_capacity=20,
+        physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8))
+
+    assert candidate.next_policy_state == state
+    assert candidate.source_generation == 6
+    assert candidate.aggregate_demand_target == 0
+    assert candidate.wave_limited_actuation_target.total() == 0
+    assert candidate.paid_launch_target.total() == 0
+
+
+def test_fixed_paid_wave_uses_db_epoch_and_prior_committed_candidate() -> None:
     demand = (_demand(50, ('L4',), 5),)
-    prior = _policy_state(target_capacity=1,
-                          raw_target_capacity=1,
-                          target_by_accelerator=_capacity(L4=1),
-                          explicit_target_by_accelerator=_capacity(L4=1),
-                          paid_target_by_accelerator=_capacity(L4=1),
-                          desired_actuation_target=_capacity(L4=1),
-                          wave_limited_actuation_target=_capacity(L4=1),
-                          last_scale_up_wave_monotonic=95.0,
-                          scale_up_wave_ceiling=2)
-    policy = _policy_input(planning_monotonic_time=100.0,
+    state = _policy_state(paid_window_started_db_epoch=95.0,
+                          paid_window_ceiling_by_accelerator=_capacity(L4=2))
+    prior_candidate = _prior_candidate(state, target=1)
+    policy = _policy_input(planning_db_epoch=100.0,
                            latest_committed_capacity=1,
                            nonterminal_committed_capacity=1,
                            latest_committed_by_accelerator=_capacity(L4=1),
@@ -590,64 +631,179 @@ def test_policy_wave_cooldown_uses_monotonic_not_wall_time() -> None:
         'demand_profiles': demand,
         'explicit_demand_profiles': demand,
         'paid_demand_profiles': demand,
-        'prior_policy_state': prior,
+        'prior_policy_state': state,
+        'prior_candidate': prior_candidate,
         'policy_input': policy,
+        'reservation': _reservation(existing_paid=_capacity(L4=1)),
     }
 
-    first = capacity_planning.plan_capacity(
-        _snapshot(planning_time=1_000.0, **common))
-    second = capacity_planning.plan_capacity(
-        _snapshot(planning_time=2_000_000_000.0, **common))
+    snapshot = _snapshot(**common)
+    candidate = capacity_planning.plan_capacity(snapshot)
 
-    assert first.next_policy_state == second.next_policy_state
-    assert first.next_policy_state is not None
-    assert first.next_policy_state.target_capacity == 2
-    assert first.next_policy_state.last_scale_up_wave_monotonic == 95.0
+    assert candidate.aggregate_demand_target == 5
+    assert candidate.paid_launch_target.as_dict() == {'L4': 1}
+    finalized = capacity_planning.finalize_capacity_plan(
+        snapshot,
+        candidate,
+        accepted_paid_plan_units=_capacity(L4=1),
+        accepted_paid_gpu_units=1,
+        decision_db_epoch=101.0)
+    assert finalized.next_policy_state is not None
+    assert finalized.next_policy_state.paid_window_started_db_epoch == 95.0
+    assert (finalized.next_policy_state.paid_window_ceiling_by_accelerator ==
+            _capacity(L4=2))
 
-    later = capacity_planning.plan_capacity(
-        _snapshot(planning_time=1_000.0,
-                  **{
-                      **common,
-                      'policy_input': dataclasses.replace(
-                          policy, planning_monotonic_time=156.0),
-                  }))
-    assert later.next_policy_state is not None
-    assert later.next_policy_state.last_scale_up_wave_monotonic == 156.0
+    later_snapshot = _snapshot(
+        **{
+            **common,
+            'policy_input': dataclasses.replace(policy, planning_db_epoch=156.0
+                                               ),
+        })
+    later = capacity_planning.plan_capacity(later_snapshot)
+    later_finalized = capacity_planning.finalize_capacity_plan(
+        later_snapshot,
+        later,
+        accepted_paid_plan_units=_capacity(L4=1),
+        accepted_paid_gpu_units=1,
+        decision_db_epoch=157.0)
+    assert later_finalized.next_policy_state is not None
+    assert (
+        later_finalized.next_policy_state.paid_window_started_db_epoch == 157.0)
 
 
-def test_policy_rebases_monotonic_state_after_controller_host_change() -> None:
+def test_all_rejected_paid_wave_does_not_start_cooldown() -> None:
     demand = (_demand(50, ('L4',), 5),)
-    future_monotonic = 10_000.0
-    prior = _policy_state(target_capacity=1,
-                          raw_target_capacity=1,
-                          target_by_accelerator=_capacity(L4=1),
-                          explicit_target_by_accelerator=_capacity(L4=1),
-                          paid_target_by_accelerator=_capacity(L4=1),
-                          desired_actuation_target=_capacity(L4=1),
-                          wave_limited_actuation_target=_capacity(L4=1),
-                          downscale_started_monotonic=future_monotonic,
-                          last_scale_up_wave_monotonic=future_monotonic,
-                          scale_up_wave_ceiling=2)
-    policy = _policy_input(planning_monotonic_time=100.0,
-                           latest_committed_capacity=1,
-                           nonterminal_committed_capacity=1,
-                           latest_committed_by_accelerator=_capacity(L4=1),
+    state = _policy_state()
+    policy = _policy_input(planning_db_epoch=100.0,
                            scale_up_rate_percentage=100,
-                           scale_up_rate_min_capacity=1,
+                           scale_up_rate_min_capacity=2,
                            scale_up_rate_period_seconds=60.0)
+    snapshot = _snapshot(demand_profiles=demand,
+                         explicit_demand_profiles=demand,
+                         paid_demand_profiles=demand,
+                         prior_policy_state=state,
+                         prior_candidate=_prior_candidate(state),
+                         policy_input=policy)
+    candidate = capacity_planning.plan_capacity(snapshot)
 
-    plan = capacity_planning.plan_capacity(
-        _snapshot(demand_profiles=demand,
-                  explicit_demand_profiles=demand,
-                  paid_demand_profiles=demand,
-                  prior_policy_state=prior,
-                  policy_input=policy))
+    assert candidate.paid_launch_target.as_dict() == {'L4': 2}
+    rejected = capacity_planning.finalize_capacity_plan(
+        snapshot,
+        candidate,
+        accepted_paid_plan_units=_capacity(),
+        accepted_paid_gpu_units=0,
+        decision_db_epoch=101.0)
+    assert rejected.next_policy_state is not None
+    assert rejected.next_policy_state.paid_window_started_db_epoch is None
+    assert rejected.next_policy_state.paid_window_ceiling_by_accelerator.total(
+    ) == 0
 
-    assert plan.next_policy_state is not None
-    assert plan.next_policy_state.target_capacity == 2
-    assert plan.next_policy_state.last_scale_up_wave_monotonic == 100.0
-    assert (plan.next_policy_state.downscale_started_monotonic is None or
-            plan.next_policy_state.downscale_started_monotonic <= 100.0)
+
+def test_partial_acceptance_starts_full_fixed_per_card_wave() -> None:
+    demand = (
+        _demand(50, ('L4',), 3),
+        _demand(50, ('A100',), 3, sequence=1),
+    )
+    state = _policy_state()
+    snapshot = _snapshot(demand_profiles=demand,
+                         explicit_demand_profiles=demand,
+                         paid_demand_profiles=demand,
+                         prior_policy_state=state,
+                         prior_candidate=_prior_candidate(state),
+                         policy_input=_policy_input(
+                             scale_up_rate_percentage=100,
+                             scale_up_rate_min_capacity=4,
+                             scale_up_rate_period_seconds=60.0))
+    candidate = capacity_planning.plan_capacity(snapshot)
+
+    assert candidate.paid_launch_target.as_dict() == {'A100': 1, 'L4': 3}
+    finalized = capacity_planning.finalize_capacity_plan(
+        snapshot,
+        candidate,
+        accepted_paid_plan_units=_capacity(L4=1),
+        accepted_paid_gpu_units=1,
+        decision_db_epoch=101.0)
+
+    assert finalized.next_policy_state is not None
+    assert finalized.next_policy_state.paid_window_started_db_epoch == 101.0
+    assert (finalized.next_policy_state.paid_window_ceiling_by_accelerator ==
+            candidate.paid_launch_target)
+
+
+def test_same_demand_generation_does_not_advance_hysteresis_twice() -> None:
+    demand = (_demand(50, ('L4',), 5),)
+    state = _policy_state(last_reduced_demand_generation=7,
+                          upscale_observations=1)
+    snapshot = _snapshot(
+        demand_profiles=demand,
+        explicit_demand_profiles=demand,
+        paid_demand_profiles=demand,
+        prior_policy_state=state,
+        prior_candidate=_prior_candidate(state, target=1),
+        policy_input=_policy_input(upscale_delay_observations=2))
+
+    candidate = capacity_planning.plan_capacity(snapshot)
+
+    assert candidate.aggregate_demand_target == 1
+    assert candidate.next_policy_state is not None
+    assert candidate.next_policy_state.upscale_observations == 1
+
+
+def test_gate_acquisition_copies_minimal_state_without_consuming_generation(
+) -> None:
+    demand = (_demand(50, ('A100',), 3),)
+    state = _policy_state()
+    snapshot = _snapshot(
+        demand_profiles=demand,
+        explicit_demand_profiles=demand,
+        paid_demand_profiles=demand,
+        prior_policy_state=state,
+        prior_candidate=_prior_candidate(state),
+        policy_input=_policy_input(),
+        reservation=_reservation(
+            gate_policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence_state=(capacity_planning.ReservationEvidenceState.
+                            AUTHENTICATED_UNSETTLED),
+            authenticated=_capacity(A100=3)))
+
+    candidate = capacity_planning.plan_capacity(snapshot)
+
+    assert candidate.kind is capacity_planning.CapacityPlanKind.GATE_ACQUISITION
+    assert candidate.next_policy_state == state
+
+
+def test_policy_state_gets_prior_effects_only_from_committed_candidate(
+) -> None:
+    demand = (_demand(50, ('L4',), 1),)
+    state = _policy_state()
+    prior_candidate = _prior_candidate(state, target=5)
+    snapshot = _snapshot(demand_profiles=demand,
+                         explicit_demand_profiles=demand,
+                         paid_demand_profiles=demand,
+                         prior_policy_state=state,
+                         prior_candidate=prior_candidate,
+                         policy_input=_policy_input(
+                             latest_committed_capacity=5,
+                             nonterminal_committed_capacity=5,
+                             latest_committed_by_accelerator=_capacity(L4=5),
+                             downscale_delay_seconds=600.0))
+
+    candidate = capacity_planning.plan_capacity(snapshot)
+
+    assert candidate.aggregate_demand_target == 5
+    assert 'target_capacity' not in {
+        field.name for field in dataclasses.fields(state)
+    }
+
+
+def test_policy_rejects_future_db_epoch_instead_of_rebasing_it() -> None:
+    state = _policy_state(downscale_started_db_epoch=10_000.0)
+
+    with pytest.raises(ValueError, match='PostgreSQL clock'):
+        capacity_planning.plan_capacity(
+            _snapshot(prior_policy_state=state,
+                      prior_candidate=_prior_candidate(state),
+                      policy_input=_policy_input(planning_db_epoch=100.0)))
 
 
 def test_snapshot_fingerprint_binds_physical_gpu_packing() -> None:
@@ -1135,19 +1291,13 @@ def test_unsettled_usage_gate_commits_effect_free_acquisition() -> None:
 def test_downscale_hold_above_raw_demand_has_no_acquisition_classes() -> None:
     demand = (_demand(50, ('L4',), 1),)
     held = _capacity(L4=5)
-    prior = _policy_state(target_capacity=5,
-                          raw_target_capacity=5,
-                          target_by_accelerator=held,
-                          explicit_target_by_accelerator=held,
-                          paid_target_by_accelerator=held,
-                          cold_launch_authority_target=held,
-                          desired_actuation_target=held,
-                          wave_limited_actuation_target=held)
+    prior = _policy_state()
     snapshot = _snapshot(
         demand_profiles=demand,
         explicit_demand_profiles=demand,
         paid_demand_profiles=demand,
         prior_policy_state=prior,
+        prior_candidate=_prior_candidate(prior, target=5),
         policy_input=_policy_input(latest_committed_capacity=5,
                                    nonterminal_committed_capacity=5,
                                    latest_committed_by_accelerator=held,
@@ -2298,6 +2448,8 @@ def test_capacity_planning_records_are_keyword_only_and_deeply_immutable(
         capacity_planning.DeadlinePlanningInput,
         capacity_planning.ReservationPlanningInput,
         capacity_planning.PaidCapProjection,
+        capacity_planning.CapacityPolicyState,
+        capacity_planning.CapacityPolicyInput,
         capacity_planning.CapacityPlanningSnapshot,
         capacity_planning.CapacityPlanCandidate,
         capacity_planning.CapacityPlanningEnvelope,
@@ -2406,8 +2558,8 @@ def test_planner_envelope_rejects_invalid_schema_and_digests(
         capacity_planning.decode_planner_envelope(payload)
 
 
-@pytest.mark.parametrize('old_schema', (1, 2, 3))
-def test_schema_four_rejects_old_envelopes(old_schema: int) -> None:
+@pytest.mark.parametrize('old_schema', (1, 2, 3, 4))
+def test_format_five_strictly_rejects_old_envelopes(old_schema: int) -> None:
     payload = _planner_payload()
     payload['schema_version'] = old_schema
     snapshot = payload['snapshot']
@@ -2422,7 +2574,7 @@ def test_schema_four_rejects_old_envelopes(old_schema: int) -> None:
 
 
 @pytest.mark.parametrize('record', ('snapshot', 'candidate'))
-def test_schema_four_requires_backend_node_count(record: str) -> None:
+def test_format_five_requires_backend_node_count(record: str) -> None:
     payload = _planner_payload()
     nested = payload[record]
     assert isinstance(nested, dict)
@@ -2432,7 +2584,7 @@ def test_schema_four_requires_backend_node_count(record: str) -> None:
         capacity_planning.decode_planner_envelope(payload)
 
 
-def test_schema_four_requires_acquisition_classes() -> None:
+def test_format_five_requires_acquisition_classes() -> None:
     payload = _planner_payload()
     candidate = payload['candidate']
     assert isinstance(candidate, dict)
