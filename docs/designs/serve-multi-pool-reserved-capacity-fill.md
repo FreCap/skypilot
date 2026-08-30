@@ -21,7 +21,7 @@ of the complete ``A:1,B:1,C:1`` matching. That predecessor could therefore
 produce a false paid residual. Feeding raw pool observations into it would
 also have moved unowned, cross-service observations across the broker's
 ownership boundary. Source and PostgreSQL qualification are complete and the
-matcher is deployed homogeneously in the `1.1.1572` lineage; its bounded
+matcher remains deployed homogeneously in the `1.1.1573` lineage; its bounded
 flexible/mixed-card production proof remains open.
 
 A later release `1.1.1572` 10,000-request qualification exposed a distinct
@@ -32,7 +32,8 @@ controller required the retained and current selectable-route sets to be
 identical. It therefore discarded valid demand until the finite window expired
 instead of planning the next wave.
 
-The current correction replaces that whole-context equality with one typed
+Release `1.1.1573` deployed the correction that replaces whole-context
+equality with one typed
 route relation. A retained report is `ADDITIVE_COMPATIBLE` only when its
 routing policy, service version, and queue-attribution mode are unchanged and
 every selectable retained URL has the same immutable route identity and wire
@@ -45,8 +46,79 @@ authorize reserved and paid scale-up or revoke new spend on fresh zero, but it
 cannot authorize retirement. Destructive authority requires an exact route
 relation and a durably `STABLE` LB cutover phase; final logical retirement
 rechecks both under the existing PostgreSQL locks. Service promotion likewise
-requires an exact current route relation and a durably `STABLE` cutover. This correction is source- and
-PostgreSQL-test complete. Its homogeneous deployment and live multi-wave proof
+requires an exact current route relation and a durably `STABLE` cutover. This
+correction is source-, PostgreSQL-test-, and homogeneous-deployment complete.
+Helm revision 690 then reached the route relation in production: lifecycle 147
+selected an `EXACT` route at its saturated post-failure frontier after the
+first paid target of 10 had committed and eight AWS Spot VMs had run. The two
+remaining launches failed availability. The eight worker jobs failed only
+because all four task secret values had been omitted and were empty, not
+because of routing, admission, or model health; an independent Spot worker
+model-health request returned HTTP 200. Lifecycle 148 was recreated with
+nonempty secrets persisted in the task. This is deployment and constituent
+evidence, not the still-open successor multi-wave proof.
+
+The first `1.1.1573` recreated lifecycle exposed a separate post-failure
+cold-frontier demand admission defect. Lifecycle 147 first committed target 10,
+launched eight AWS Spot replicas (11--18), and recorded two failed-provision
+replicas (19--20). Its eight user jobs failed independently because all four
+task secrets were empty, and those replicas were torn down. Once active
+capacity returned to zero, the ACTIVE load balancer published an exact current
+route, a complete demand-window classification, and an exact L4
+rejected-demand profile, but its bounded offered-arrival tracker had reached
+the 100,000-entry cap. Durable ingestion incorrectly folded that
+magnitude-overflow bit into exact-card compatibility completeness. The
+controller therefore rejected the entire snapshot and could not commit the
+successor capacity plan that would launch the next wave.
+
+Offered-arrival saturation is a bounded conservative magnitude signal, not a
+missing exact-card gauge. A current report remains compatibility-complete when
+its demand-window, queue, rejection, priority, version, and accelerator-catalog
+profiles are otherwise complete; it preserves
+`offered_arrival_tracking_saturated: true` unchanged. The canonical pure
+planner must not extrapolate that aggregate bound through a retained partial
+sample: one classified L4 arrival cannot turn the other 99,999 unknown arrivals
+into L4 authority, and mixed retained samples cannot choose a card mix for the
+unknown remainder. Under saturation, exact classified arrivals, queued demand,
+and rejected demand authorize only their own attributable work; the
+unattributed offered-arrival gap authorizes neither paid capacity nor
+retirement. Fixed work is split before any arrival shaping: observed in-flight
+work bounded by materialized current supply becomes typed exact-card
+`fixed_work`, `explicit_fixed_work`, and `paid_fixed_work`, while work on
+retiring supply, unknown-capacity work, and overflow without materialized
+exact-card proof remain unattributed. Under saturation only that exact fixed
+work and measured classified arrivals enter paid attribution. Unattributed
+fixed work never enters aggregate demand, reservation acquisition, actuation
+scale-up, or paid authority; it can only preserve a retirement shelter/floor
+bounded by already committed positive capacity, or make the tick fail closed
+when no exact shelter identity exists. It cannot borrow a partial arrival
+sample's card.
+
+The adapter preserves an `unattributed_saturated_work` boundary when request
+duration is unknown or from the raw arrival gap and flexible fixed work before
+reducing the gap to the retained classified sample. Only while that boundary
+is true does the canonical typed retirement shelter retain current committed
+positive capacity on every exact card. A fully attributed saturated report
+therefore follows normal downscale
+policy instead of sheltering unrelated idle supply. The same boundary removes
+prior demand targets, ownership, actuation maps, and cold authority from the
+planning projection so stale hysteresis cannot resurrect unattributed paid or
+provider authority. The live prior fingerprint and generation remain the
+post-commit CAS precondition, and provider wave timestamps/ceilings remain as
+launch-pacing evidence. Missing or partial compatibility profiles remain
+fail-closed, and a saturated report can never prove fresh aggregate zero or
+authorize a zero-demand retirement.
+
+Offered-arrival counters and their saturation bit are stable planner inputs and
+therefore belong to the immutable normalized demand semantics used by
+PostgreSQL admission. Raw queue-deadline buckets remain available only in the
+locked planner input. Their `remaining_seconds` countdown is deliberately
+absent from the outer normalized identity: the reduced acquisition classes and
+attribution capture its capacity consequence, and an otherwise equivalent
+newer heartbeat must rebind the existing fill witness instead of revoking it
+merely because time advanced. The deadline-completeness bit remains normalized
+so a missing gauge still fails closed. This revised correction is source- and
+regression-complete; deployment and live post-failure cold-frontier proof
 remain open.
 
 The steady-state implementation is one deterministic counted subset-rank
@@ -1205,17 +1277,17 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` and the deployed production source are PR #1803 merge `d80bdb2a0adcc64113ffd2f19b3dcd61c0058228` (release `1.1.1572`). That lineage includes PR #1798's canonical schema-4 matcher, PR #1801's coherent immutable demand snapshots, PR #1802's current-plan admission lease, and PR #1803's commit-before-worker-construction boundary. The additive-route continuity correction described above is the current source candidate; it is not yet merged or deployed. |
+| Source base | `origin/improvements` is PR #1805 merge `d6c78d33696824b0b3d7c7864398ee693121f73d`, which adds source-complete empty-secret preflight rejection. PR #1805 is not deployed. The deployed production source remains PR #1804 merge `bd7e94804befedd68b9b83a7a3884332d1e4713d` (release `1.1.1573`), including PR #1798's canonical schema-4 matcher, PR #1801's coherent immutable demand snapshots, PR #1802's current-plan admission lease, PR #1803's commit-before-worker-construction boundary, and PR #1804's additive-route continuity correction. The offered-arrival saturation correction described above is the current PR #1806 source candidate; it is not yet merged or deployed. |
 | Immutable planner correction | **Merged and deployed homogeneously.** One keyword-only frozen snapshot feeds one pure durable logical planner invocation. Its typed candidate separately records cold demand attribution, supply-aware actuation, warm/transition retention, reservation commitments and whole-backend padding, genuine paid residual and cap-bounded cold-launch authority, completeness/infeasibility, source generation, and snapshot/candidate fingerprints. Policy state installs only after the PostgreSQL commit through a generation-and-fingerprint compare-and-swap. PR #1786 extends the same closed envelope to exact per-node width times task-authoritative node count for physical backends. |
-| Deployed control plane | SkyPilot `1.1.1572`, Helm revision 688, public API 93, homogeneous image `sha256:d07db658aff6ef40fe6b78b055eaba38b5ebba5e7cf3f3209787be02f8648a8a`, and chart `1.1.1572`. All two API, two controller, and three executor replicas are Ready on that exact digest. The API reports source `d80bdb2a0adcc64113ffd2f19b3dcd61c0058228`. PostgreSQL remains the sole central store; Helm storage is disabled; no SkyPilot PVC or EFS is present. |
-| Schema-4 activation | **Complete from empty Serve state and retained through `1.1.1572`.** No older capacity plan, claim, or provider effect crossed the strict-current decoder boundary. There was no row rewrite, compatibility decoder, storage migration, or infrastructure change. The current additive-route correction changes no schema. |
+| Deployed control plane | Helm revision 690 runs SkyPilot `1.1.1573` homogeneously across two API, two controller, and three executor replicas on image `sha256:1daf91011e2a6cdf7e6018642dedf28be890e9ee8883f618e6ba0569f4e1af84`. The image contains source `bd7e94804befedd68b9b83a7a3884332d1e4713d`; it does not contain merged PR #1805 or candidate PR #1806. PostgreSQL remains the sole central store; Helm storage is disabled; no SkyPilot PVC or EFS is present. |
+| Schema-4 activation | **Complete from empty Serve state and retained through `1.1.1573`.** No older capacity plan, claim, or provider effect crossed the strict-current decoder boundary. There was no row rewrite, compatibility decoder, storage migration, or infrastructure change. The additive-route and empty-secret corrections change no schema. |
 | Lifecycle-137 evidence | Release `1.1.1554` reached exactly 100 provider-`RUNNING` GCP Spot one-L4 workers with zero ordinary on-demand and zero wrong-shape capacity. All 10,000 authenticated warm requests returned first-attempt HTTP 200. Normal down converged service, replica, claim, waiter, VM, and disk state to exact zero before the schema-3 cutover. |
 | Lifecycle-136 evidence | Run `9462207b-e026-4c5e-b610-acaba61e9b0a` on `1.1.1550` reached exactly 100 provider-`RUNNING` GCP Spot L4 VMs, with zero on-demand and zero non-L4 VMs. It accepted the 10,000-ID continuation and subsequent 5,000-ID extension. Normal teardown reached provider zero in about 3 minutes 16 seconds and full PostgreSQL/provider/disk zero in about 3 minutes 45 seconds. The immutable bundle records SHA-256 `audit.jsonl` `51807331f170d1352e9001324bd2e66f169a8a04867b7ca9bf94d8c4b953a8d7`, `arm.json` `92542d925ad50f0916cd8dcdc3977d27aa7f6a5e27b269445e03b70eadc36e70`, and `guard.json` `54a503e1f83eaa4899bce38bcc254591f885587ba87e81241fe3332a4188a649`. |
 | Cold-scale timing | **Count is proven; the 3--5 minute performance objective remains open.** Lifecycle 137 took roughly 9.5 minutes to reach 100 because durable recent-failure/cooldown evidence limited many pools. Clean pools did use the configured base launch window of four. The follow-up must distinguish a clean-frontier benchmark from correctly fenced recently failed pools; it must not erase durable cooldown evidence to improve the number. |
 | Telemetry | PR #1783 is deployed in the current source lineage. The current demand endpoint is controller-independent and, after lifecycle-141 drain, reported two fresh complete HA reporters with exact queued, async-processing, HTTP-in-flight, and total-in-flight values all zero. Request history retained the classified successful request. The qualification client did not create protocol-covered async-ledger rows, so a current-schema nonzero exact terminal-ledger/UI capture remains a full-design acceptance gate. It is not provider billing authority. |
 | Writer protocol | Public API 93, worker projection 10, deployed and source non-pool capability cohort 13, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. The schema-3 cutover added no database migration. |
-| Service activation | **No service currently exists.** The exact-card reservation-before-Spot edge matrix remains historically production-qualified, but full flexible/mixed-card production convergence is not. Lifecycle 139 proved the compatible exact-A100 zero-cost edge; lifecycle 141 proved the statically disjoint exact-L4 Spot edge and exact teardown. The `1.1.1572` 10,000-request qualification exposed retained-demand invalidation after its first route-expanding paid wave and was torn down. The next service is recreated only after the additive-route image is homogeneous. See the [exact-card production evidence bundle](evidence/skyserve-final-convergence-2026-08-29/README.md). |
+| Service activation | Lifecycle 147 on homogeneous `1.1.1573` Helm revision 690 first committed target 10, launched eight AWS Spot replicas (11--18), and recorded two availability failures as replicas 19--20. The eight user jobs failed only because all four task secret values had been omitted and were empty, after which the replicas were torn down. At the subsequent zero-active-capacity frontier on 2026-08-30 14:26:04 UTC, PostgreSQL demand generation 404 selected ACTIVE report sequence 201; both it and the current route head named route generation 11 and digest `e05947ffb085c6af1e8bf887870b7a15c2d25e78ff884e04b01e1c796e7b6aae`, so the route relation was `EXACT`. The report preserved a fully classified priority-20 L4 rejection gauge of 236,390 and the 100,000-arrival saturation floor, but saturation incorrectly made that demand unavailable and prevented the successor plan and wave. A standalone Spot worker model-health request independently returned HTTP 200. Lifecycle 148 replaced lifecycle 147 with nonempty secrets persisted in its task; it has not yet supplied the missing multi-wave proof. PR #1805's empty-secret preflight is merged and source-complete but not deployed. The exact-card reservation-before-Spot edge matrix remains historically production-qualified, but full flexible/mixed-card production convergence is not. See the [exact-card production evidence bundle](evidence/skyserve-final-convergence-2026-08-29/README.md). |
 | Paid-location catalog | The two regionless paid templates expand into exact immutable cloud/region/zone/shape pools and remain Spot-only. Of the four missing commercial AWS G6/L4 regions, Zurich (`eu-central-2`) is the only qualified candidate: it has a ready source patch, a compatible curated image, and a successful real Spot launch/driver/workdir/teardown proof. Upstream source PR #10587 remains approval-blocked even though all checks pass, so source support is not yet merged or released. Draft catalog PR #191 was refreshed onto catalog master `69166fce3ece5b9dffe639d3e9ceca2ee1f89fa1`; its diff remains exactly 1,127 Zurich rows and no deletions, producing v8 VM hash `2e0ca474d692a484ba60e39af45d62babd5492376394bb732ea7e9a5d2b5614b` from current base/non-Zurich hash `f242f8b176755ab0f53ec7a8f112ba49c32be746dfd2df4c8879558f3136793a`. It must remain draft until #10587 merges, the publisher identity attests Zurich opt-in, source support is released before the shared catalog, and the authorized publisher makes GitHub and S3 byte-identical. Sao Paulo lacks a compatible curated image and launch proof; Hyderabad has images but no available opted-in account or launch proof; Malaysia has neither images nor opt-in/launch proof. No other missing commercial G6/L4 location passes all three gates, so none is added speculatively. GovCloud is outside this commercial catalog scope and also lacks the required source/image/credential/proof chain. `eu-south-2` and `me-central-1` already have hosted VM and image rows and must not be duplicated. |
 | Reserved occupancy | At 2026-08-26 23:09--23:13 UTC, East had 328 healthy compatible GPUs on 41 nodes: research requested 45 and 283 `boltz-l4-fleet` Pods requested the exact remainder; all 283 were Running and Ready, with zero free compatible GPU and zero pending research or fleet GPU Pod. PHX had 512 healthy H200 GPUs: research held 482 and the unchanged Kueue policy admitted 30/30 fleet Workloads; all 30 Pods were Running/Ready and PostgreSQL `READY`, with zero pending research GPU Workload. PostgreSQL independently reported exactly 63 A100, 220 A100-80GB, and 30 H200 reserved replicas `READY`, with zero durable intent pending. Thus the same lifecycle occupied East 328/328 and PHX 512/512 without changing scheduler policy. |
 | Reserved readiness projection | For the final PHX replica, PostgreSQL committed the intent at 22:43:32, the Pod appeared at 22:43:55, Kueue admitted it at 22:43:56, and the Pod became Ready at 22:44:32. PostgreSQL projected it `READY` only between 22:52:25 and 22:52:40, exposing a separate roughly eight-minute status-freshness lag rather than a capacity/admission failure. The post-Helm 23:13 UTC census retained the exact 30/30 admission and readiness with no churn. |
@@ -1226,8 +1298,8 @@ it has merged or been deployed.
 | Routing and queue | Lifecycle 119's low-priority run produced a small deadline-weighted target; the high-priority run increased the target through 49, 64, 128, and 178 before the paid cap clipped it at 100. The bounded stimulus recorded 2,248 submission starts, 289 accepted requests, 252 completion markers, and definitive queue-full rejections/retries; it is not the separate 10,000-terminal-request ledger proof. PR #1765's deployed capacity-time planner uses deadline buckets, exact compatibility, per-card service-time estimates, finite supply availability, and paid cold lead. A fresh current-schema nonzero queued/processing/in-flight/completed UI and heterogeneous capacity-time proof remains open. |
 | Partial mixed proof | Provider/DB censuses at 2026-08-25 19:45:47.538 and 19:45:56.281 UTC bracketed a 72-request completion wave and both had 44 reserved plus 28 paid replicas all `READY`, the same 28 AWS Spot instances—27 `g6.2xlarge` and one `g6.4xlarge`—and zero on-demand. The wave completed from 19:45:48.956 through 19:45:51.187; every request performed 9.533–12.451 seconds of concurrency-one GPU work, so at least 28 necessarily executed on Spot beside the 44 reserved workers. The Spot instances later fully drained at the provider. |
 | GCP Spot lifecycle proof | **Count, no-spill, warm-request, and teardown are complete.** Lifecycle 137 on `1.1.1554` reached exactly 100 concurrently provider-`RUNNING` one-L4 GCP Spot VMs with zero ordinary on-demand/wrong-shape capacity, served 10,000/10,000 authenticated warm requests with first-attempt HTTP 200, and completed normal exact-zero teardown. Earlier clean-frontier evidence reached 100 in 3 minutes 41.9 seconds and peaked at 117; lifecycle 137's roughly 9.5-minute run correctly retained recent-failure cooldowns. |
-| Final load proof | **The constituent exact-card placement and warm-transport proofs are complete; final-writer mixed convergence remains open.** Lifecycle 137 completed 10,000/10,000 authenticated warm requests, the historical mixed campaign proved 44 reserved plus 28 Spot workers serving concurrently with zero on-demand, lifecycle 139 proved exact compatible reservation admission, and lifecycle 141 proved a final-writer statically disjoint Spot request and teardown. Release `1.1.1572` did not sustain demand across its first selectable-route expansion, so a current-schema multi-wave campaign with exact async-ledger coverage and HA takeover remains required. |
-| Demand/publication ordering | PRs through #1803 are merged and deployed. Commit-before-worker construction is production-reached, but the route-expansion demand-continuity correction in this change is source-only. Its second-wave, reserved-first residual, and exact teardown evidence remain open. |
+| Final load proof | **The constituent exact-card placement and warm-transport proofs are complete; final-writer mixed convergence remains open.** Lifecycle 137 completed 10,000/10,000 authenticated warm requests, the historical mixed campaign proved 44 reserved plus 28 Spot workers serving concurrently with zero on-demand, lifecycle 139 proved exact compatible reservation admission, and lifecycle 141 proved a final-writer statically disjoint Spot request and teardown. Release `1.1.1572` did not sustain demand across its first selectable-route expansion. Release `1.1.1573` lifecycle 147 committed a first paid target of 10, ran eight AWS Spot VMs, and reached an `EXACT` route at the saturated cold frontier; a standalone Spot model-health request returned HTTP 200. Worker jobs failed only on omitted empty secrets, lifecycle 148 now persists nonempty secrets, and no successor multi-wave proof exists yet. A current-schema multi-wave campaign with exact async-ledger coverage and HA takeover remains required. |
+| Demand/publication ordering | PRs through #1804 are merged and deployed at Helm revision 690. Commit-before-worker construction is production-reached and additive route continuity is homogeneous; lifecycle 147 reached an `EXACT` relation, then exposed the independent saturation/completeness conflation before its successor plan at the post-failure zero-active frontier. PR #1805's empty-secret preflight is merged and source-complete but not deployed. PR #1806's saturation correction is source-only; its successor-wave, reserved-first residual, and exact teardown evidence remain open. |
 | Utilization/allocation causality | **Production-qualified for compatible and statically disjoint exact-card demand.** PR #1792 stabilized the decision-equivalent acquisition witness; PR #1794 bound budgets to exact cards; PRs #1795 and #1796 made statically disjoint L4 admission canonical and independent of unrelated A100/H200 allocation churn. Lifecycle 139 selected one zero-cost A100 and no paid claim. Lifecycle 141 selected one L4 Spot while committing zero incompatible reserved capacity, then returned to exact zero under `utilization_gate: true`. Flexible mixed-card acquisition, nonzero exact-ledger UI capture, multi-node paid accounting, and HA takeover remain full-design acceptance gates. |
 
 The completed paid-gate post-rollout census was green after Helm revision 635:
@@ -2336,6 +2408,26 @@ on-demand spill.
   gauges. Every such durable-logical input must grant zero fresh provider
   authority; it must never publish a raw fallback or discounted guessed-card
   paid plan.
+- Saturate the bounded offered-arrival tracker while preserving a complete
+  exact-card rejection profile. Prove ingestion preserves the saturation bit,
+  the durable snapshot remains available, and paid authority covers only the
+  exact attributable rejection work. With one retained L4 arrival and with
+  mixed retained L4/A100 arrivals, prove the unknown remainder of the 100,000
+  saturation bound is never extrapolated onto those cards. With both current
+  A100 work plus idle L4 supply and old/retiring A100 work plus one L4 arrival,
+  prove fixed work does not inherit the L4 sample's paid authority. Seed the
+  latter case with a stale inflated L4 target and prove the planning projection
+  clears its demand/provider authority while the live prior identity still
+  guards the successful CAS. Cover unknown-capacity work and in-flight work
+  beyond materialized slots: neither may enter reserved, paid, or actuation
+  authority, while only positive committed capacity is sheltered. Prove a
+  subset-card fleet constructs a positive-entry-only shelter, while a fully
+  attributed saturated report does not shelter unrelated idle supply. Repeat
+  without compatible attribution and with partial queue/rejection/priority profiles;
+  the unknown gap and incomplete evidence must publish no provider authority.
+  Prove offered counters and saturation participate in normalized demand, while
+  a countdown-only deadline heartbeat preserves the existing fill witness. A
+  saturated report must not prove fresh aggregate zero or authorize retirement.
 - Seed conflicting process-local per-tick Kueue fields and warm-retention
   state, then invoke the durable adapter with a different immutable decision
   snapshot. Prove the canonical planner is called exactly once, observes the

@@ -1547,6 +1547,147 @@ def test_current_planner_uses_demand_committed_before_service_lock(
     assert authority.remaining_launch_capacity() == {'l4': 2}
 
 
+def test_current_planner_admits_exact_card_saturated_demand(capacity_database):
+    engine, incarnation, route_receipt = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    arrival_cap = constants.LB_OFFERED_ARRIVAL_CAP
+    report = _demand_report(time.time(),
+                            route_receipt,
+                            sequence=2,
+                            request_count=0)
+    report.update(
+        queue_depth=1,
+        queue_depth_by_priority={'50': 1},
+        queued_requests_by_compatibility=[{
+            'priority': 50,
+            'compatible_accelerators': ['L4'],
+            'count': 1,
+        }],
+        queued_request_deadline_buckets=[{
+            'priority': 50,
+            'compatible_accelerators': ['L4'],
+            'remaining_seconds': 300,
+            'count': 1,
+        }],
+        rejected_in_window=arrival_cap,
+        rejected_in_recent_window=arrival_cap,
+        rejected_in_window_by_priority={'50': arrival_cap},
+        rejected_in_recent_window_by_priority={'50': arrival_cap},
+        rejected_requests_by_compatibility=[{
+            'priority': 50,
+            'compatible_accelerators': ['L4'],
+            'count': arrival_cap,
+            'recent_count': arrival_cap,
+        }],
+        unique_job_arrivals_60s=arrival_cap,
+        unique_job_arrivals_300s=arrival_cap,
+        offered_arrival_tracking_saturated=True,
+    )
+    demand_state.ingest_report('svc', 'svc-hash', report)
+    planning_fingerprint = (
+        serve_state.get_scale_planning_state_fingerprint('svc'))
+    assert planning_fingerprint is not None
+
+    def _planner(snapshot, supply):
+        assert snapshot.request_information[
+            'compatibility_demand_complete'] is True
+        assert snapshot.request_information[
+            'offered_arrival_tracking_saturated'] is True
+        assert snapshot.normalized_demand[
+            'offered_arrival_tracking_saturated'] is True
+        assert snapshot.normalized_demand['unique_job_arrivals_60s'] == (
+            arrival_cap)
+        assert 'queued_request_deadline_buckets' not in (
+            snapshot.normalized_demand)
+        remaining = snapshot.request_information[
+            'queued_request_deadline_buckets'][0]['remaining_seconds']
+        assert 0 < remaining <= 300
+        assert snapshot.normalized_demand['compatibility_demand'][
+            'rejected'] == [{
+                'priority': 50,
+                'compatible_accelerators': ['L4'],
+                'count': arrival_cap,
+                'recent_count': arrival_cap,
+            }]
+        normalized = snapshot.normalized_demand
+        changed_offered_count = copy.deepcopy(normalized)
+        changed_offered_count['unique_job_arrivals_60s'] -= 1
+        changed_saturation = copy.deepcopy(normalized)
+        changed_saturation['offered_arrival_tracking_saturated'] = False
+        assert capacity_admission._changed_demand_semantics(
+            normalized, changed_offered_count) == ['unique_job_arrivals_60s']
+        assert capacity_admission._changed_demand_semantics(
+            normalized,
+            changed_saturation) == ['offered_arrival_tracking_saturated']
+        return _current_decision(snapshot,
+                                 supply,
+                                 1,
+                                 source_fingerprint=planning_fingerprint)
+
+    committed = (capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 0},
+            sequenced_reserved_fill=False,
+            planner=_planner,
+            expected_planning_state_fingerprint=planning_fingerprint))
+
+    assert committed.demand_snapshot.demand_feed_generation == 2
+    assert committed.authority.remaining_launch_capacity() == {'l4': 1}
+
+
+@pytest.mark.parametrize('partial_component', ['arrivals', 'rejections'])
+def test_current_planner_rejects_saturated_partial_compatibility(
+        capacity_database, partial_component):
+    engine, incarnation, route_receipt = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    arrival_cap = constants.LB_OFFERED_ARRIVAL_CAP
+    report = _demand_report(time.time(),
+                            route_receipt,
+                            sequence=2,
+                            request_count=0)
+    report.update(unique_job_arrivals_60s=arrival_cap,
+                  unique_job_arrivals_300s=arrival_cap,
+                  offered_arrival_tracking_saturated=True)
+    if partial_component == 'arrivals':
+        report['demand_window']['compatibility_complete'] = False
+        report['demand_window']['buckets'][0]['request_count'] = 1
+    else:
+        report.update(rejected_in_window=1,
+                      rejected_in_recent_window=1,
+                      rejected_in_window_by_priority={'50': 1},
+                      rejected_in_recent_window_by_priority={'50': 1})
+    demand_state.ingest_report('svc', 'svc-hash', report)
+    planning_fingerprint = (
+        serve_state.get_scale_planning_state_fingerprint('svc'))
+    assert planning_fingerprint is not None
+    planner = mock.Mock()
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='Current durable demand'):
+        (capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_publish_current(
+                service_name='svc',
+                service_hash='svc-hash',
+                service_lifecycle_epoch=3,
+                service_version=1,
+                accounting_cards={'l4': 0},
+                sequenced_reserved_fill=False,
+                planner=planner,
+                expected_planning_state_fingerprint=planning_fingerprint))
+
+    planner.assert_not_called()
+    with engine.connect() as connection:
+        plan_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                capacity_admission_schema.serve_capacity_plans_table)
+        ).scalar_one()
+    assert plan_count == 0
+
+
 def test_current_planner_never_persists_paid_authority_for_reservation_only_card(
         capacity_database):
     engine, incarnation, _ = capacity_database
@@ -2049,7 +2190,7 @@ def test_ungated_stale_grant_cannot_unlock_paid_before_reserved_feed(
     assert released.authority.remaining_launch_capacity() == {'l4': 1}
 
 
-def test_fill_demand_witness_rebinds_equivalent_heartbeat(
+def test_fill_demand_witness_rebinds_countdown_only_deadline_heartbeat(
         capacity_database, monkeypatch):
     engine, incarnation, route_receipt = capacity_database
     # A fresh aggregate-zero proof is only authoritative for the current
@@ -2076,6 +2217,28 @@ def test_fill_demand_witness_rebinds_equivalent_heartbeat(
                                  utilization_ceiling=2)
     _mock_current_allocation(monkeypatch, allocation)
     repository = capacity_admission.CapacityAdmissionRepository(engine)
+
+    def _deadline_report(sequence: int, remaining_seconds: int) -> dict:
+        report = _demand_report(time.time(),
+                                route_receipt,
+                                sequence=sequence,
+                                request_count=0)
+        report.update(queue_depth=1,
+                      queue_depth_by_priority={'50': 1},
+                      queued_requests_by_compatibility=[{
+                          'priority': 50,
+                          'compatible_accelerators': ['L4'],
+                          'count': 1,
+                      }],
+                      queued_request_deadline_buckets=[{
+                          'priority': 50,
+                          'compatible_accelerators': ['L4'],
+                          'remaining_seconds': remaining_seconds,
+                          'count': 1,
+                      }])
+        return report
+
+    demand_state.ingest_report('svc', 'svc-hash', _deadline_report(2, 3600))
     committed = repository.plan_and_publish_current(
         service_name='svc',
         service_hash='svc-hash',
@@ -2092,10 +2255,7 @@ def test_fill_demand_witness_rebinds_equivalent_heartbeat(
                                                           max_age_seconds=60)
     assert initial is not None
 
-    demand_state.ingest_report(
-        'svc', 'svc-hash', _demand_report(time.time(),
-                                          route_receipt,
-                                          sequence=2))
+    demand_state.ingest_report('svc', 'svc-hash', _deadline_report(3, 3595))
     refreshed = repository.read_current_fill_demand_witness('svc',
                                                             'svc-hash',
                                                             (123, '10.0.0.5'),
@@ -2111,13 +2271,13 @@ def test_fill_demand_witness_rebinds_equivalent_heartbeat(
 
     demand_state.ingest_report(
         'svc', 'svc-hash',
-        _demand_report(time.time(), route_receipt, sequence=3, request_count=2))
+        _demand_report(time.time(), route_receipt, sequence=4, request_count=2))
     assert repository.read_current_fill_demand_witness(
         'svc', 'svc-hash', (123, '10.0.0.5'), max_age_seconds=60) is None
 
     demand_state.ingest_report(
         'svc', 'svc-hash',
-        _demand_report(time.time(), route_receipt, sequence=4, request_count=0))
+        _demand_report(time.time(), route_receipt, sequence=5, request_count=0))
     zero_snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
     assert zero_snapshot is not None
     assert zero_snapshot.fresh_aggregate_zero
