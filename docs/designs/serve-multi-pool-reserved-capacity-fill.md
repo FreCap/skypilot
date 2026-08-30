@@ -1739,33 +1739,39 @@ provider, Kubernetes, HTTP, filesystem, or replica-manager operation. All
 conflict-prone rows are locked before it runs; after it returns, only canonical
 validation and plan/head writes remain. Local target, logical reconcile state,
 retirement state, and provider effects are published only after commit.
+It never reacquires the controller routing or actuation locks and never samples
+a mutable controller generation after PostgreSQL locks are held. Producer
+identity is checked under the routing epoch before entering the repository and
+provider effects are fenced again after commit. This ordering prevents the
+reserved-capacity poller, which may hold the actuation epoch while waiting for
+the same PostgreSQL rows, from forming a lock cycle with plan publication.
 Fresh-positive retirement cancellation is a distinct current-generation batch
 transaction after an aborted candidate and before a fully refreshed retry. It
 accepts a generation newer than the caller's observation only after
 reconstructing fresh positive demand under the service lock; it never runs
 inside the callback.
 
-A prospective Phase-A debit may cross newer demand receipt generations only
-when the semantic plan itself is unchanged. In the same PostgreSQL transaction
-that inserts the wave, the controller locks the current service, route, demand
-reports, capacity graph, and plan head; requires every current reporter to be
-fresh, complete, elected, and bound to the plan's exact route; reconstructs the
-normalized demand snapshot from those locked reports; and compares it with the
-plan. A monotonically newer generation or receipt watermark is not by itself a
-semantic change. New, increased, or redistributed queue, in-flight, rejected,
-arrival, priority, or accelerator demand; fresh aggregate zero; a reporter or
-route mismatch; unavailable evidence; or any supply, cap, ownership, or plan
-change aborts the whole transaction before the first row is inserted. Natural
-rolling-window arrival expiry remains the only accepted demand-semantic
-contraction. This lets a large provider-free candidate preparation wave survive
-HA heartbeat churn without weakening immediate zero-demand revocation or the
-commit-before-provider boundary.
+A prospective Phase-A debit consumes the exact unexpired plan head copied into
+the process-local provider candidate. In the same PostgreSQL transaction that
+inserts the wave, the controller locks the current service and plan head,
+requires the candidate's generation and digest to remain that exact head,
+validates the batch's aggregate debit, and persists that plan identity on each
+claim. A committed successor therefore revokes every uncommitted predecessor
+candidate; the controller replans instead of rebinding provider choices across
+generations. Two transactions cannot spend old and new generations
+independently because only the current generation can pass Phase A.
 
-The semantic-equivalence comparator above remains a defensive contract for a
-previously committed plan used by later claim admission. The controller's
-canonical plan publisher no longer depends on it to race a current reporter:
-its plan is built from the exact demand generation already locked in the same
-transaction.
+The current head is a bounded spend lease over its immutable target. Newer
+report counts do not revoke it merely because arrivals move into the queue or
+rejection window while the provider-free candidate wave is being prepared.
+Admission still locks and requires fresh, complete, elected reports bound to the
+head's exact route and reconstructs a structurally current demand snapshot.
+Fresh aggregate zero, a reporter or route mismatch, unavailable evidence, plan
+expiry, or any supply, reservation, paid-cap, ownership, lifecycle, version,
+backend-shape, or current plan-head change aborts before the first row is
+inserted. Positive report-count churn does not reinterpret compatibility or
+quantity at this boundary: those decisions are frozen in the immutable plan,
+and only the canonical planner may replace them with a successor head.
 
 For a planner-bound paid call, the immutable plan's
 ``paid_launch_target_by_accelerator`` is the sole aggregate Phase-A purchase
