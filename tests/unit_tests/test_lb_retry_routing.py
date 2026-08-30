@@ -464,6 +464,7 @@ class TestRetriableStatusCodes(unittest.TestCase):
         balancer._stream_timeout_seconds = 5
         balancer._client_close_tasks = set()
         balancer._retriable_status_codes = frozenset(retriable)
+        balancer._async_request_ledger_protocol_version = 1
         return balancer
 
     def _client_returning(self,
@@ -628,7 +629,30 @@ class TestRetriableStatusCodes(unittest.TestCase):
         self.assertEqual(
             json.loads(result.body)['async_request_ledger_receipt'],
             dataclasses.asdict(duplicate))
+        self._assert_exact_receipt_headers(result, duplicate)
         client.send.assert_not_awaited()
+
+    def _assert_exact_receipt_headers(self, response, receipt):
+        self.assertEqual(
+            response.headers[
+                lb_module.constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER], '1')
+        self.assertEqual(
+            response.headers[
+                lb_module.constants.LB_ASYNC_SERVICE_INCARNATION_HEADER],
+            _SERVICE_INCARNATION)
+        self.assertEqual(
+            response.headers[lb_module.constants.LB_ASYNC_ATTEMPT_ID_HEADER],
+            receipt.attempt_id)
+        self.assertEqual(
+            response.headers[lb_module.constants.LB_ASYNC_ATTEMPT_NO_HEADER],
+            str(receipt.attempt_no))
+        self.assertEqual(
+            response.headers[
+                lb_module.constants.LB_ASYNC_LEDGER_REVISION_HEADER],
+            str(receipt.revision))
+        self.assertEqual(
+            response.headers[lb_module.constants.LB_ASYNC_LEDGER_STATE_HEADER],
+            receipt.state)
 
     def test_typed_route_conflict_is_pre_send_only_without_existing_receipt(
             self):
@@ -675,9 +699,13 @@ class TestRetriableStatusCodes(unittest.TestCase):
         self.assertNotIsInstance(result,
                                  lb_module._RouteAuthorityRetryableError)
         self.assertIs(ledger_client.get_receipt(request), existing)
+        self.assertEqual(
+            json.loads(result.body)['async_request_ledger_receipt'],
+            dataclasses.asdict(existing))
+        self._assert_exact_receipt_headers(result, existing)
         client.send.assert_not_awaited()
 
-    def test_generic_ledger_409_never_retries_or_sends(self):
+    def test_generic_ledger_409_recovers_authoritative_receipt(self):
         client, _ = self._client_returning(200)
         client.send = mock.AsyncMock()
         balancer = self._balancer([], client)
@@ -688,14 +716,70 @@ class TestRetriableStatusCodes(unittest.TestCase):
         balancer._bind_async_ledger = mock.AsyncMock(
             side_effect=ledger_client.AsyncLedgerTransportError(
                 409, 'generic conflict'))
+        receipt = ledger_client.AsyncLedgerReceipt(
+            request_key_sha256=identity.request_key_sha256,
+            attempt_id='22222222-2222-4222-8222-222222222222',
+            attempt_no=2,
+            state='ACCEPTED',
+            revision=3,
+            duplicate=True,
+            dispatch_authorized=False)
+
+        async def _lookup(lookup_request, lookup_identity):
+            self.assertIs(lookup_request, request)
+            self.assertIs(lookup_identity, identity)
+            ledger_client.set_receipt(lookup_request, receipt)
+            return receipt
+
+        balancer._lookup_async_ledger = mock.AsyncMock(side_effect=_lookup)
 
         result = asyncio.run(
             balancer._proxy_request_to('http://a:8080', request))
 
         self.assertEqual(result.status_code, 409)
-        self.assertEqual(json.loads(result.body)['detail'], 'generic conflict')
+        self.assertEqual(
+            json.loads(result.body)['async_request_ledger_receipt'],
+            dataclasses.asdict(receipt))
+        self._assert_exact_receipt_headers(result, receipt)
         self.assertNotIsInstance(result,
                                  lb_module._RouteAuthorityRetryableError)
+        balancer._lookup_async_ledger.assert_awaited_once_with(
+            request, identity)
+        client.send.assert_not_awaited()
+
+    def test_generic_ledger_409_without_receipt_is_unknown(self):
+        client, _ = self._client_returning(200)
+        client.send = mock.AsyncMock()
+        balancer = self._balancer([], client)
+        request = _request()
+        identity = ledger_client.AsyncLedgerIdentity('request-1', 'a' * 64,
+                                                     'stable-job-1')
+        vars(request)[ledger_client.IDENTITY_REQUEST_ATTR] = identity
+        balancer._bind_async_ledger = mock.AsyncMock(
+            side_effect=ledger_client.AsyncLedgerTransportError(
+                409, 'generic conflict'))
+        balancer._lookup_async_ledger = mock.AsyncMock(return_value=None)
+
+        result = asyncio.run(
+            balancer._proxy_request_to('http://a:8080', request))
+
+        self.assertEqual(result.status_code, 503)
+        self.assertEqual(
+            json.loads(result.body)['state'], 'ledger_outcome_unknown')
+        self.assertEqual(
+            result.headers[lb_module.constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER],
+            '1')
+        self.assertEqual(
+            result.headers[
+                lb_module.constants.LB_ASYNC_SERVICE_INCARNATION_HEADER],
+            _SERVICE_INCARNATION)
+        for header in (lb_module.constants.LB_ASYNC_ATTEMPT_ID_HEADER,
+                       lb_module.constants.LB_ASYNC_ATTEMPT_NO_HEADER,
+                       lb_module.constants.LB_ASYNC_LEDGER_REVISION_HEADER,
+                       lb_module.constants.LB_ASYNC_LEDGER_STATE_HEADER):
+            self.assertNotIn(header, result.headers)
+        balancer._lookup_async_ledger.assert_awaited_once_with(
+            request, identity)
         client.send.assert_not_awaited()
 
     def test_ledger_qualified_retriable_status_is_ambiguous_not_replayed(self):

@@ -5511,8 +5511,9 @@ class SkyServeLoadBalancer:
                     ledger_receipt = await self._bind_async_ledger(
                         request, selected, ledger_identity)
                 except async_request_ledger_client.AsyncLedgerRouteAuthorityConflict as error:
-                    if (async_request_ledger_client.get_receipt(request)
-                            is None):
+                    existing_receipt = (
+                        async_request_ledger_client.get_receipt(request))
+                    if existing_receipt is None:
                         # The typed stable-API code proves that this brand-new
                         # bind committed no row and preceded every provider
                         # send. Return an internal pre-dispatch outcome so the
@@ -5532,10 +5533,30 @@ class SkyServeLoadBalancer:
                             selected.route_source_epoch)
                     # A receipt means an attempt already exists. Even a
                     # malformed/mixed peer must never turn that into an
-                    # implicit replay.
-                    return fastapi.responses.JSONResponse(
-                        status_code=409, content={'detail': error.detail})
+                    # implicit replay. Return its complete recovery receipt,
+                    # not a body-only conflict that strands the exact caller.
+                    return self._existing_async_attempt_response(
+                        existing_receipt)
                 except async_request_ledger_client.AsyncLedgerTransportError as error:
+                    if error.status_code == 409:
+                        # A generic conflict does not carry a receipt. Resolve
+                        # it through the bounded read-only PostgreSQL path so a
+                        # lost acknowledgement or rejected predecessor cannot
+                        # become a receipt-less 409. A miss or unreadable
+                        # outcome cannot authorize replay and therefore uses
+                        # the existing fail-closed unknown response.
+                        try:
+                            existing_receipt = await self._lookup_async_ledger(
+                                request, ledger_identity)
+                        except async_request_ledger_client.AsyncLedgerTransportError as lookup_error:
+                            logger.warning(
+                                'Failed to resolve an async ledger bind '
+                                'conflict: %s', lookup_error.detail)
+                            existing_receipt = None
+                        if existing_receipt is not None:
+                            return self._existing_async_attempt_response(
+                                existing_receipt)
+                        return self._unknown_ledger_outcome_response()
                     return fastapi.responses.JSONResponse(
                         status_code=(error.status_code if
                                      400 <= error.status_code < 600 else 503),
