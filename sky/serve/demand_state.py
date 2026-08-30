@@ -118,13 +118,20 @@ class DurableAutoscalingSnapshot:
 
 @dataclasses.dataclass(frozen=True)
 class ValidatedReportRouteContext:
-    """Current route authority shared by every durable-demand boundary."""
+    """Current route authority shared by every durable-demand boundary.
+
+    ``relation`` is exact only when every accepted report has the current
+    demand-report route context.  A retained report whose referenced routes
+    are unchanged can still authorize additive planning, but it cannot
+    authorize retirement until its reporter observes the successor.
+    """
 
     generation: int
     content_sha256: str
     source_epoch: int
     response: Mapping[str, Any]
     identities: Mapping[str, Mapping[str, Any]]
+    relation: route_projection.DemandReportRouteRelation
 
 
 def _postgres_engine() -> sqlalchemy.engine.Engine:
@@ -813,41 +820,42 @@ def unavailable_request_summary(reason: str) -> dict[str, Any]:
     return _empty_summary('unavailable', reason)
 
 
-def reports_match_current_lb_authority(
+def current_demand_report_rows(
     rows: list[Mapping[str, Any]],
     service: Mapping[str, Any],
-) -> bool:
-    """Prove that fresh demand includes the currently selected ACTIVE LB.
+) -> list[Mapping[str, Any]] | None:
+    """Return only reports that participate in current demand authority.
 
     HA cutover advances the service generation before a new role becomes
     authoritative. A still-fresh report from a non-current generation must
-    therefore be display-only: it cannot promote durable demand or publish a
-    capacity plan. Post-commit callers filter out non-current generations
-    before calling this predicate so extraneous display evidence also cannot
-    revoke an already committed claim's one provider effect.
+    therefore fail closed. STANDBY and ARMED rows remain operational HA
+    telemetry, but the existing durable-demand contract admits only ACTIVE and
+    DRAINING rows and requires the selected ACTIVE load balancer.
     """
     ha_enabled = service.get('lb_ha_enabled') == 1
     active_slot = service.get('lb_active_slot')
     generation = service.get('lb_cutover_generation')
     current_active_present = False
+    selected: list[Mapping[str, Any]] = []
     for row in rows:
         payload = row.get('payload')
         if not isinstance(payload, Mapping):
-            return False
+            return None
         try:
             role = lb_ha.LbRole(payload.get('applied_role'))
         except (TypeError, ValueError):
-            return False
+            return None
         if role not in (lb_ha.LbRole.ACTIVE, lb_ha.LbRole.DRAINING):
             continue
         if ha_enabled and payload.get('applied_generation') != generation:
-            return False
+            return None
+        selected.append(row)
         if role is lb_ha.LbRole.ACTIVE:
             if (not ha_enabled or
                 (row.get('lb_slot') == active_slot and
                  payload.get('applied_generation') == generation)):
                 current_active_present = True
-    return current_active_present
+    return selected if current_active_present else None
 
 
 def reports_prove_fresh_aggregate_zero(rows: list[Mapping[str, Any]]) -> bool:
@@ -1029,9 +1037,9 @@ def get_request_summary(service_name: str, service_hash: str) -> dict[str, Any]:
                 sqlalchemy.select(
                     sqlalchemy.func.clock_timestamp())).scalar_one()
             service = connection.execute(
-                sqlalchemy.select(services.c.hash).where(
-                    services.c.name == service_name)).scalar_one_or_none()
-            if service != service_hash:
+                sqlalchemy.select(services).where(
+                    services.c.name == service_name)).mappings().one_or_none()
+            if service is None or service.get('hash') != service_hash:
                 return _empty_summary('unavailable',
                                       'service_incarnation_mismatch')
             generation = connection.execute(
@@ -1059,8 +1067,13 @@ def get_request_summary(service_name: str, service_hash: str) -> dict[str, Any]:
         return _empty_summary('stale',
                               'all_reports_expired',
                               generation=generation)
+    selected = current_demand_report_rows(fresh, service)
+    if selected is None:
+        return _empty_summary('stale',
+                              'active_report_missing',
+                              generation=generation)
     try:
-        return _aggregate_fresh_reports(fresh, generation, now)
+        return _aggregate_fresh_reports(selected, generation, now)
     except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
         return _empty_summary('unavailable',
                               'invalid_durable_payload',
@@ -1077,12 +1090,12 @@ def validate_report_route_contexts(
 ) -> ValidatedReportRouteContext | None:
     """Validate report routes against one fresh current semantic context.
 
-    Full route generations advance when observation-only capacity hints change.
-    A fresh reporter may therefore name an immutable retained generation while
-    the current head already names its capacity-only successor.  This is the
-    sole equivalence validator for durable demand: every retained snapshot must
-    be present, content-addressed, current-owner/version/epoch compatible, and
-    have exactly the current head's demand-report route context. The returned
+    Full route generations advance as supply changes.  A reporter may
+    therefore name an immutable retained generation while the
+    current head contains additional routes.  This is the sole relation
+    validator for durable demand: every retained snapshot must be present,
+    content-addressed, current-owner/version/epoch compatible, and each route
+    referenced by a report must be unchanged in the current head.  The returned
     authority and translation always come from the current head.
 
     The only query is a batch read bounded by distinct fresh reporter
@@ -1136,10 +1149,6 @@ def validate_report_route_contexts(
     if (not isinstance(route_sha256, str) or
             re.fullmatch(r'[0-9a-f]{64}', route_sha256) is None):
         return None
-    current_demand_report_context_sha256 = (
-        route_projection.demand_report_route_context_sha256(
-            current_response, current_identities))
-
     reported_route_digests: dict[int, str] = {}
     for row in reports:
         payload = row.get('payload')
@@ -1191,6 +1200,9 @@ def validate_report_route_contexts(
         if set(retained_routes_by_generation) != retained_generations:
             return None
 
+    decoded_routes: dict[int, tuple[Mapping[str, Any], Mapping[str, Any]]] = {
+        route_generation: (current_response, current_identities),
+    }
     for reported_generation, reported_digest in reported_route_digests.items():
         if reported_generation == route_generation:
             if reported_digest != route_sha256:
@@ -1210,19 +1222,28 @@ def validate_report_route_contexts(
                 validate_snapshot_row(retained_route))
         except route_projection.RouteProjectionError:
             return None
-        # Immutable snapshots intentionally omit the dynamic draining-route
-        # observation overlay.  Durable demand reports are built with
-        # ``current_routes_only=True`` under the LB routing lock, so they can
-        # contain no occupancy URL outside this stored current-route context.
-        if (route_projection.demand_report_route_context_sha256(
-                retained_response, retained_identities)
-                != current_demand_report_context_sha256):
+        decoded_routes[reported_generation] = (retained_response,
+                                               retained_identities)
+
+    relation = route_projection.DemandReportRouteRelation.EXACT
+    for row in reports:
+        payload = row['payload']
+        reported_generation = int(payload['route_projection_generation'])
+        reported_route = decoded_routes[reported_generation]
+        report_relation = (
+            route_projection.classify_demand_report_route_relation(
+                reported_route[0], reported_route[1], current_response,
+                current_identities))
+        if report_relation is route_projection.DemandReportRouteRelation.INCOMPATIBLE:
             return None
+        if report_relation is route_projection.DemandReportRouteRelation.ADDITIVE_COMPATIBLE:
+            relation = report_relation
     return ValidatedReportRouteContext(generation=route_generation,
                                        content_sha256=route_sha256,
                                        source_epoch=route_epoch,
                                        response=current_response,
-                                       identities=current_identities)
+                                       identities=current_identities,
+                                       relation=relation)
 
 
 def get_autoscaling_snapshot(
@@ -1235,14 +1256,14 @@ def get_autoscaling_snapshot(
     """Read the sole promoted demand source and translate its exact routes.
 
     Unlike the public summary, this read fails closed on every incomplete
-    reporter, semantically incompatible route generation, unknown URL
-    identity, or source-mode mismatch.  Reports from retained route generations
-    remain usable only when their immutable demand-report route context exactly
-    matches the current fresh head. Translation and returned authority always
-    bind to that current head. This function never calls a provider or
-    controller. A caller that already owns the canonical PostgreSQL locks may
-    provide its transaction so this same normalizer can prove demand semantics
-    at an effect boundary.
+    reporter, incompatible referenced route, unknown URL identity, or
+    source-mode mismatch.  Reports from retained route generations remain
+    usable for additive work when every route they referenced is unchanged in
+    the current fresh head. Translation and returned authority always bind to
+    that current head. This function never calls a provider or controller. A
+    caller that already owns the canonical PostgreSQL locks may provide its
+    transaction so this same normalizer can prove demand semantics at an effect
+    boundary.
     """
     read_started_monotonic = (_read_started_monotonic if _read_started_monotonic
                               is not None else time.monotonic())
@@ -1301,6 +1322,10 @@ def get_autoscaling_snapshot(
             reports_table.c.service_hash == service_hash,
             reports_table.c.valid_until > now).order_by(
                 reports_table.c.reporter_session_id)).mappings().all()
+    selected_rows = current_demand_report_rows(rows, service)
+    if selected_rows is None:
+        return None
+    rows = selected_rows
     route_context = validate_report_route_contexts(connection, service, rows,
                                                    head, route, now)
     if route_context is None:
@@ -1309,11 +1334,10 @@ def get_autoscaling_snapshot(
     route_generation = route_context.generation
     route_sha256 = route_context.content_sha256
     route_epoch = route_context.source_epoch
+    route_relation = route_context.relation
 
     ledger = lb_ha.LbSessionLedger(constants.LB_DEMAND_REPORT_TTL_SECONDS,
                                    constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS)
-    if not reports_match_current_lb_authority(rows, service):
-        return None
     stream_owners: set[str] = set()
     watermark: list[dict[str, Any]] = []
     timestamps: list[float] = []
@@ -1464,12 +1488,17 @@ def get_autoscaling_snapshot(
     if (scale_up_remaining_validity_seconds <= 0 or
             time.monotonic() >= scale_up_authority_deadline):
         return None
-    destructive_remaining_validity_seconds = (
-        scale_up_remaining_validity_seconds)
-    for age_seconds in aggregate.occupancy_sample_ages_seconds.values():
-        destructive_remaining_validity_seconds = min(
-            destructive_remaining_validity_seconds,
-            constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS - age_seconds)
+    destructive_remaining_validity_seconds = 0.0
+    stable_cutover = (
+        service.get('lb_cutover_phase') == lb_ha.LbCutoverPhase.STABLE.value)
+    if (route_relation is route_projection.DemandReportRouteRelation.EXACT and
+            stable_cutover):
+        destructive_remaining_validity_seconds = (
+            scale_up_remaining_validity_seconds)
+        for age_seconds in aggregate.occupancy_sample_ages_seconds.values():
+            destructive_remaining_validity_seconds = min(
+                destructive_remaining_validity_seconds,
+                constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS - age_seconds)
     authority_deadline = (read_started_monotonic +
                           max(0.0, destructive_remaining_validity_seconds))
     controller_pid = service['controller_pid']

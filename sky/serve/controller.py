@@ -6573,6 +6573,11 @@ class SkyServeController:
             retirement_floor = durable_plan.logical_retirement_floor
             assert retirement_floor is not None
             scaling_options = durable_plan.scaling_decisions
+            if (snapshot.reconcile_authority.deadline_monotonic
+                    <= time.monotonic()):
+                scaling_options = tuple(
+                    option for option in scaling_options if option.operator is
+                    autoscalers.AutoscalerDecisionOperator.SCALE_UP)
             if snapshot.fresh_aggregate_zero:
                 scaling_options = tuple(
                     option for option in scaling_options if option.operator !=
@@ -6866,7 +6871,9 @@ class SkyServeController:
                         self._notify_scale_reconcile()
                         return
                     retirement_changed = False
-                    if fresh_aggregate_zero:
+                    if (fresh_aggregate_zero and
+                            durable_snapshot.reconcile_authority.
+                            deadline_monotonic > time.monotonic()):
                         retirement_changed = (
                             self._replica_manager.
                             reconcile_fresh_zero_paid_retirements(

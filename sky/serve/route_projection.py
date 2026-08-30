@@ -651,23 +651,72 @@ def _occupancy_context_sha256(response: Mapping[str, Any],
             response, identities))).hexdigest()
 
 
-def demand_report_route_context_sha256(
-    response: Mapping[str, Any],
-    identities: Mapping[str, Any],
-) -> str:
-    """Digest immutable route state that defines demand-report semantics.
+class DemandReportRouteRelation(enum.Enum):
+    """How a retained demand-report route relates to the current route."""
 
-    Capacity hints, ready counts, and response-only history acknowledgements
-    may change without changing how an already-applied route attributes
-    demand. Queue-compatibility negotiation is different: it selects live
-    queue gauges versus legacy arrival recording and performs rollback
-    backfill, so it must fence retained-report equivalence even though it does
-    not invalidate an in-flight occupancy probe.
+    EXACT = 'exact'
+    ADDITIVE_COMPATIBLE = 'additive-compatible'
+    INCOMPATIBLE = 'incompatible'
+
+
+def classify_demand_report_route_relation(
+    retained_response: Mapping[str, Any],
+    retained_identities: Mapping[str, Any],
+    current_response: Mapping[str, Any],
+    current_identities: Mapping[str, Any],
+) -> DemandReportRouteRelation:
+    """Classify one immutable applied route against the current head.
+
+    The report's content-addressed route generation already authenticates what
+    the load balancer applied.  Demand therefore belongs to that stable routing
+    policy and selectable route set, not to unrelated identities in the
+    controller's current supply inventory.  Current-only selectable routes are
+    additive supply; every retained selectable route must remain exact.
+
+    This relation grants additive planning and spend revocation only. Callers
+    must require ``EXACT`` plus their stable-cutover fence for promotion,
+    zero-demand retirement, or other destructive authority.
     """
-    payload = _route_observation_context_payload(response, identities)
-    payload['queued_compatibility_demand_supported'] = response.get(
-        'queued_compatibility_demand_supported')
-    return hashlib.sha256(_canonical_json(payload)).hexdigest()
+    for field in ('service_version', 'routing_spec',
+                  'queued_compatibility_demand_supported'):
+        if retained_response.get(field) != current_response.get(field):
+            return DemandReportRouteRelation.INCOMPATIBLE
+
+    def _selectable_urls(response: Mapping[str, Any],
+                         identities: Mapping[str, Any]) -> set[str] | None:
+        routes = response.get('replica_info')
+        if not isinstance(routes, Mapping):
+            return None
+        selectable: set[str] = set()
+        for url, wire in routes.items():
+            if not isinstance(url, str) or not isinstance(wire, Mapping):
+                return None
+            if constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY in wire:
+                continue
+            identity = identities.get(url)
+            if (not isinstance(identity, Mapping) or
+                    identity.get('advertised') is not True or
+                    wire.get('gpu_type') != identity.get('gpu_type') or
+                    wire.get('gpu_count') != str(identity.get('gpu_count'))):
+                return None
+            selectable.add(url)
+        return selectable
+
+    retained_urls = _selectable_urls(retained_response, retained_identities)
+    current_urls = _selectable_urls(current_response, current_identities)
+    if retained_urls is None or current_urls is None:
+        return DemandReportRouteRelation.INCOMPATIBLE
+    if not retained_urls.issubset(current_urls):
+        return DemandReportRouteRelation.INCOMPATIBLE
+    for url in retained_urls:
+        if (selected_route_context_sha256(retained_response,
+                                          retained_identities, url)
+                != selected_route_context_sha256(current_response,
+                                                 current_identities, url)):
+            return DemandReportRouteRelation.INCOMPATIBLE
+    if retained_urls == current_urls:
+        return DemandReportRouteRelation.EXACT
+    return DemandReportRouteRelation.ADDITIVE_COMPATIBLE
 
 
 def selected_route_context_sha256(response: Mapping[str, Any],

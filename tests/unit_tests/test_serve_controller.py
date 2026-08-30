@@ -4388,7 +4388,8 @@ class TestAutoscalerRuntimeSnapshot:
                           observed_slots=None,
                           in_flight=None,
                           unknown_replica_ids=None,
-                          fresh_aggregate_zero=False):
+                          fresh_aggregate_zero=False,
+                          destructive_authority=True):
         observed_slots = dict(observed_slots or {})
         in_flight = dict(in_flight or {})
         unknown_replica_ids = set(unknown_replica_ids or ())
@@ -4423,7 +4424,9 @@ class TestAutoscalerRuntimeSnapshot:
             fresh_aggregate_zero=fresh_aggregate_zero,
             reconcile_authority=types.SimpleNamespace(
                 read_started_monotonic=read_started_monotonic,
-                deadline_monotonic=read_started_monotonic + 60))
+                deadline_monotonic=(read_started_monotonic +
+                                    60 if destructive_authority else
+                                    read_started_monotonic - 1)))
 
     @staticmethod
     def _durable_autoscaler(target=1):
@@ -6454,6 +6457,51 @@ class TestAutoscalerRuntimeSnapshot:
         ]
         repository.plan_and_publish_current.assert_called_once()
 
+    def test_additive_route_allows_scale_up_but_suppresses_scale_down(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler(target=1)
+        shapes = (('L4', 1),)
+        target_by_accelerator = (('L4', 1),)
+        decisions = [
+            autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_DOWN,
+                autoscalers.LogicalScaleDownTarget(
+                    version=1,
+                    reconcile_generation=3,
+                    target_capacity=1,
+                    replica_id=17,
+                    target_capacity_by_accelerator=target_by_accelerator,
+                    accelerator_shapes=shapes)),
+            autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_UP,
+                autoscalers.LogicalScaleTarget(
+                    version=1,
+                    reconcile_generation=3,
+                    target_capacity=1,
+                    target_capacity_by_accelerator=target_by_accelerator,
+                    accelerator_shapes=shapes,
+                    cold_launch_authority_by_accelerator=())),
+        ]
+        scaler.generate_scaling_decisions.side_effect = None
+        scaler.generate_scaling_decisions.return_value = decisions
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        ctrl._replica_manager.scale_up_to_logical_capacity.side_effect = [[],
+                                                                          []]
+        authority = mock.Mock()
+        authority.economic_residual.return_value = {}
+        authority.remaining_launch_capacity.return_value = {}
+        snapshot = self._durable_snapshot(observed_slots={17: 1},
+                                          in_flight={17: 0},
+                                          destructive_authority=False)
+
+        self._run_promoted_reconciles(ctrl, [snapshot], authority=authority)
+
+        ctrl._replica_manager.scale_down_logically_batch.assert_not_called()
+        assert ctrl._replica_manager.scale_up_to_logical_capacity.call_count == 2
+
     def test_promoted_mixed_logical_wave_forwards_paid_authority(self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
@@ -6593,6 +6641,21 @@ class TestAutoscalerRuntimeSnapshot:
             capacity_plan_sha256='c' * 64,
             route_generation=4)
         ctrl._replica_manager.scale_up_batch.assert_not_called()
+
+    def test_additive_route_zero_cannot_retire_paid_capacity(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._autoscaler = self._logical_durable_autoscaler(0)  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        snapshot = self._durable_snapshot(fresh_aggregate_zero=True,
+                                          destructive_authority=False)
+
+        self._run_promoted_reconciles(ctrl, [snapshot])
+
+        ctrl._replica_manager.reconcile_fresh_zero_paid_retirements.assert_not_called(
+        )
+        ctrl._replica_manager.scale_down_logically_batch.assert_not_called()
 
     def test_fresh_aggregate_zero_executes_bounded_retirement_wave(self):
         ctrl = _make_controller()
