@@ -7120,6 +7120,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 unattributed_saturated_work = (
                     duration is None or
                     arrival_gap > _SLOT_CONVERSION_EPSILON or
+                    observation_reconciliation.ambiguous_fixed_arrival_work
+                    > _SLOT_CONVERSION_EPSILON or
                     flexible_fixed > _SLOT_CONVERSION_EPSILON or
                     has_unattributed_fixed_work)
                 if attributed_work <= _SLOT_CONVERSION_EPSILON:

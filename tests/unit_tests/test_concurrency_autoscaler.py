@@ -745,6 +745,109 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         self.assertEqual(candidate.paid_residual.as_dict(), {})
         self.assertEqual(candidate.paid_launch_target.as_dict(), {})
 
+    def test_saturated_arrival_tail_beyond_fixed_work_launches(self):
+        autoscaler = _durable_autoscaler(max_replicas=100,
+                                         expected_request_duration_seconds=60)
+        replica = _replica(1, card='L4')
+        report = _durable_report(in_flight={1: 1},
+                                 observed_slots={1: 1},
+                                 compatibility_profiles=[{
+                                     'priority': 50,
+                                     'compatible_accelerators': ['L4'],
+                                     'count': 2,
+                                     'timestamp': self._INSTANT.wall_time,
+                                 }])
+        report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
+                      unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
+                      headerless_arrivals_60s=0,
+                      headerless_arrivals_300s=0,
+                      offered_arrival_tracking_saturated=True)
+        reservation = dataclasses.replace(
+            _durable_reservation(),
+            existing_paid_capacity=(
+                capacity_planning.AcceleratorCapacity.from_mapping({'L4': 1})),
+            charged_paid_gpu_units=1)
+
+        result = self._plan(autoscaler,
+                            report=report,
+                            replicas=(replica,),
+                            reservation=reservation,
+                            decision_inputs=_durable_inputs((replica,)))
+
+        assert result is not None
+        candidate = result.envelope.candidate
+        self.assertEqual(candidate.aggregate_demand_target, 2)
+        self.assertEqual(candidate.supply_aware_demand_target.as_dict(),
+                         {'L4': 2})
+        self.assertEqual(candidate.paid_residual.as_dict(), {'L4': 1})
+        self.assertEqual(candidate.paid_launch_target.as_dict(), {'L4': 1})
+
+    def test_ambiguous_fixed_overlap_shelters_when_scalar_gap_is_zero(self):
+        duration = 60 / constants.LB_OFFERED_ARRIVAL_CAP
+        autoscaler = _durable_autoscaler(
+            max_replicas=200, expected_request_duration_seconds=duration)
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+            'H200': 1,
+        })
+        replica = _replica(1, card='A100', planned_capacity=50)
+        report = _durable_report(
+            queue_depth=100,
+            in_flight={1: 1},
+            observed_slots={1: 50},
+            queued_profiles=[{
+                'priority': 20,
+                'compatible_accelerators': ['L4'],
+                'count': 100,
+            }],
+            compatibility_profiles=[{
+                'priority': 50,
+                'compatible_accelerators': ['A100', 'L4'],
+                'count': 1,
+                'timestamp': self._INSTANT.wall_time,
+            }, {
+                'priority': 50,
+                'compatible_accelerators': ['A100', 'H200'],
+                'count': 1,
+                'timestamp': self._INSTANT.wall_time,
+            }])
+        report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
+                      unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
+                      headerless_arrivals_60s=0,
+                      headerless_arrivals_300s=0,
+                      offered_arrival_tracking_saturated=True)
+        reservation = dataclasses.replace(
+            _durable_reservation(),
+            existing_paid_capacity=(
+                capacity_planning.AcceleratorCapacity.from_mapping({'A100': 50
+                                                                   })),
+            charged_paid_gpu_units=50)
+        inputs = dataclasses.replace(
+            _durable_inputs((replica,)),
+            cold_paid_accelerator_order=('L4', 'A100', 'H200'),
+            prospective_paid_accelerator_order=('L4', 'A100', 'H200'))
+
+        result = self._plan(autoscaler,
+                            report=report,
+                            replicas=(replica,),
+                            reservation=reservation,
+                            decision_inputs=inputs)
+
+        assert result is not None
+        snapshot = result.envelope.snapshot
+        candidate = result.envelope.candidate
+        # The scalar offered-arrival floor is already covered by the unrelated
+        # L4 queue plus fixed A100 work. The two flexible arrival classes still
+        # make ownership of that fixed work ambiguous, so current A100 supply
+        # must remain sheltered without granting either class a paid card.
+        self.assertEqual(snapshot.retirement_shelter_target.as_dict(),
+                         {'A100': 50})
+        self.assertEqual(candidate.retirement_floor_target.as_dict(), {
+            'L4': 100,
+            'A100': 50,
+        })
+
     def test_saturated_arrival_and_terminal_rejection_are_one_request(self):
         autoscaler = _durable_autoscaler(max_replicas=100,
                                          expected_request_duration_seconds=60)

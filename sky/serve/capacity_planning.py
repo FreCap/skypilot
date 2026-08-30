@@ -271,6 +271,7 @@ class DemandObservationReconciliation:
     reconciled_profiles: tuple[CompatibilityDemand, ...]
     incremental_arrival_work: float
     withheld_arrival_work: float
+    ambiguous_fixed_arrival_work: float
 
     def __post_init__(self) -> None:
         if (not isinstance(self.reconciled_profiles, tuple) or
@@ -279,7 +280,8 @@ class DemandObservationReconciliation:
                 len({item.sequence for item in self.reconciled_profiles
                     }) != len(self.reconciled_profiles)):
             raise ValueError('Reconciled demand profiles are malformed.')
-        for field in ('incremental_arrival_work', 'withheld_arrival_work'):
+        for field in ('incremental_arrival_work', 'withheld_arrival_work',
+                      'ambiguous_fixed_arrival_work'):
             value = getattr(self, field)
             if (not isinstance(value,
                                (int, float)) or isinstance(value, bool) or
@@ -356,14 +358,15 @@ def reconcile_demand_observations(
         (priority, compatible), _ = item
         return -priority, len(compatible), tuple(map(str.casefold, compatible))
 
-    fixed_cards = {
-        canonical[card.casefold()]
+    fixed_by_card = {
+        canonical[card.casefold()]: work
         for card, work in fixed_work.entries
         if work > 1e-12
     }
     reconciled = dict(primary)
     incremental_arrival_work = 0.0
     withheld_arrival_work = 0.0
+    ambiguous_fixed_arrival_work = 0.0
     for key, work in sorted(arrivals.items(), key=class_key):
         exact_overlap = min(work, primary.get(key, 0.0))
         withheld_arrival_work += exact_overlap
@@ -371,11 +374,21 @@ def reconcile_demand_observations(
         if residual <= 1e-12:
             continue
         _, compatible = key
-        if fixed_cards.intersection(compatible):
-            withheld_arrival_work += residual
+        # Charge the complete compatible fixed mass to every class. Reusing
+        # that upper bound is intentionally conservative when several classes
+        # could describe the same fixed work; it never has to choose which
+        # priority or flexible card owns the overlap. Any tail beyond the
+        # upper bound is nevertheless provably new work of this exact class.
+        compatible_fixed_work = math.fsum(
+            fixed_by_card.get(card, 0.0) for card in compatible)
+        fixed_overlap = min(residual, compatible_fixed_work)
+        withheld_arrival_work += fixed_overlap
+        ambiguous_fixed_arrival_work += fixed_overlap
+        incremental = residual - fixed_overlap
+        if incremental <= 1e-12:
             continue
-        reconciled[key] = math.fsum((reconciled.get(key, 0.0), residual))
-        incremental_arrival_work += residual
+        reconciled[key] = math.fsum((reconciled.get(key, 0.0), incremental))
+        incremental_arrival_work += incremental
 
     ordered_profiles = sorted(reconciled.items(), key=class_key)
     profiles = tuple(
@@ -388,7 +401,8 @@ def reconcile_demand_observations(
     return DemandObservationReconciliation(
         reconciled_profiles=profiles,
         incremental_arrival_work=max(0.0, incremental_arrival_work),
-        withheld_arrival_work=max(0.0, withheld_arrival_work))
+        withheld_arrival_work=max(0.0, withheld_arrival_work),
+        ambiguous_fixed_arrival_work=max(0.0, ambiguous_fixed_arrival_work))
 
 
 class ActuationSupplyPolicy(enum.Enum):

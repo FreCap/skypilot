@@ -98,13 +98,18 @@ projections; different tuples remain distinct instead of being coupled by an
 arbitrary maximum-flow tie-break. Exact fixed in-flight work has lost request
 priority and compatibility. It therefore cannot be paired with one of several
 arrival classes without inventing request identity and potentially selecting
-the wrong paid card. A residual arrival class that intersects any positive
-fixed-work card is attribution-ambiguous and remains shelter-only. A residual
-class disjoint from every fixed-work card is provably incremental and retains
-its original priority and compatibility tuple. This reconciliation is linear
-in classified profiles and the at-most-eight-card catalog; it expands neither
-requests nor profile pairs. The aggregate offered-arrival counter remains an
-alternative magnitude floor, never a second work stream.
+the wrong paid card. For each residual arrival class, the full compatible
+fixed-work mass is a conservative overlap upper bound. Any tail beyond that
+bound is provably incremental and retains its original priority and
+compatibility tuple. The bounded overlap remains attribution-ambiguous and can
+only shelter already committed capacity; reusing the full upper bound for
+several classes deliberately avoids choosing which class owns fixed work.
+Fixed-only capacity carries the minimum request priority unless typed work is
+copacked into its slot, so an unrelated high-priority arrival cannot upgrade
+its reservation entitlement. This reconciliation is linear in classified
+profiles and the at-most-eight-card catalog; it expands neither requests nor
+profile pairs. The aggregate offered-arrival counter remains an alternative
+magnitude floor, never a second work stream.
 Unattributed fixed work never enters aggregate demand, reservation acquisition,
 actuation scale-up, or paid authority; it can only preserve a retirement shelter/floor
 bounded by already committed positive capacity, or make the tick fail closed
@@ -2443,10 +2448,11 @@ on-demand spill.
   mixed retained L4/A100 arrivals, prove the unknown remainder of the 100,000
   saturation bound is never extrapolated onto those cards. Prove identical
   classified pressure/arrival tuples overlap by magnitude, different immutable
-  tuples remain distinct, arrival classes intersecting lossy fixed-card work
-  remain shelter-only, and arrival classes disjoint from every fixed card
-  retain their original paid authority. Exercise all 255 compatibility subsets
-  across multiple priorities without a pairwise graph. With both current
+  tuples remain distinct, the portion bounded by compatible lossy fixed-card
+  work remains shelter-only, and any typed tail beyond that bound retains its
+  original paid authority. Prove disjoint high-priority arrivals do not upgrade
+  fixed-only reservation classes. Exercise all 255 compatibility subsets across
+  multiple priorities without a pairwise graph. With both current
   A100 work plus idle L4 supply and old/retiring A100 work plus one L4 arrival,
   prove fixed work does not inherit the L4 sample's paid authority. Seed the
   latter case with a stale inflated L4 target and prove the planning projection
