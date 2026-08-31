@@ -3935,16 +3935,46 @@ def test_old_version_paid_row_charges_cap_without_covering_current_demand(
     [('logical', capacity_planning.CapacityUnit.LOGICAL_GPU, 4, 4, 1, 8, 8, 4,
       4, 4),
      ('physical_backend', capacity_planning.CapacityUnit.PHYSICAL_BACKEND, 8, 1,
-      2, 2, 16, 1, 16, 0)])
+      2, 2, None, 1, 16, 1)])
 def test_paid_cap_separates_service_units_from_physical_gpu_debit(
         capacity_database, replica_unit, capacity_unit, physical_width,
         planned_capacity, num_nodes, target, cap, expected_existing,
         expected_charged, expected_launch):
-    engine, incarnation, _ = capacity_database
+    engine, incarnation, route_receipt = capacity_database
     _enable_durable_intent(engine,
                            incarnation,
                            reserved_fill_enabled=False,
-                           replica_unit=replica_unit)
+                           replica_unit=replica_unit,
+                           max_live_paid_gpu_units=cap,
+                           paid_backend_num_nodes=num_nodes)
+
+    def _decision(snapshot, supply, decision_target):
+        return _current_decision(
+            snapshot,
+            supply,
+            decision_target,
+            capacity_unit=capacity_unit,
+            backend_num_nodes=num_nodes,
+            physical_gpu_width_by_accelerator={'l4': physical_width},
+            max_live_paid_gpu_units=cap)
+
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': physical_width},
+        backend_num_nodes=num_nodes,
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _decision(snapshot, supply, 0))
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(),
+                       route_receipt,
+                       sequence=2,
+                       request_count=target))
     replica = _replica_values(104,
                               zero_cost=False,
                               accelerator_count=physical_width,
@@ -3955,24 +3985,16 @@ def test_paid_cap_separates_service_units_from_physical_gpu_debit(
             sqlalchemy.insert(
                 serve_state_schema.replicas_table).values(**replica))
 
-    committed = (capacity_admission.CapacityAdmissionRepository(
-        engine).plan_and_admit_current(
-            **_current_owner_kwargs(engine),
-            service_name='svc',
-            service_hash='svc-hash',
-            service_lifecycle_epoch=3,
-            service_version=1,
-            accounting_cards={'l4': 1},
-            backend_num_nodes=1,
-            sequenced_reserved_fill=False,
-            planner=lambda snapshot, supply: _current_decision(
-                snapshot,
-                supply,
-                target,
-                capacity_unit=capacity_unit,
-                backend_num_nodes=num_nodes,
-                physical_gpu_width_by_accelerator={'l4': physical_width},
-                max_live_paid_gpu_units=cap)))
+    committed = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': physical_width},
+        backend_num_nodes=num_nodes,
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _decision(snapshot, supply, target))
 
     payload = _capacity_plan_payload(engine, committed.authority.generation)
     assert payload['existing_paid_capacity_by_accelerator'] == {
