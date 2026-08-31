@@ -1177,6 +1177,156 @@ def test_publish_is_complete_authenticated_and_idempotent(
     assert retry == first
 
 
+def test_publish_complete_map_keeps_healthy_pool_with_confirmed_phantom(
+        allocation_engine) -> None:
+    _, a100_snapshot = _commit_evidence(allocation_engine,
+                                        free_slots=2,
+                                        accelerator_names=('a100-80gb',),
+                                        edge_cap=2,
+                                        grant=2)
+    h200_pool = reserved_capacity_broker.make_pool_key(
+        _CONTEXT,
+        'h200',
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid=_UID)
+    observation_repository = (
+        pool_capacity_observation.PoolCapacityObservationRepository(
+            allocation_engine))
+    h200_lease = observation_repository.begin_observation(
+        pool_key=h200_pool,
+        physical_cluster_uid=_UID,
+        accelerator_names=('h200',),
+        access_context=_CONTEXT,
+        lease_duration_seconds=60,
+        authority_horizon_seconds=600)
+    h200_observation = observation_repository.complete_success(
+        h200_lease,
+        pool_capacity_observation.PoolCapacitySuccess.from_counts(
+            0, {'h200': 0}, present_accelerator_names=()),
+        access_context=_CONTEXT)
+
+    h200_projection = {'h200': _PROJECTION_MAP['h200']}
+    exact_zero = {
+        _SERVICE: {},
+        reserved_capacity_broker.OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 0
+        },
+        reserved_capacity_broker.SPENDABLE_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 0
+        },
+        reserved_capacity_broker.BROKER_SLOT_WIDTH_KEY: 1,
+    }
+    with allocation_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.reserved_fill_service_claim_sets_table).
+            where(serve_state_schema.reserved_fill_service_claim_sets_table.c.
+                  service_name == _SERVICE).values(edge_count=2))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name ==
+                _SERVICE,
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    worker_placement_projections=_WORKER_PROJECTIONS))
+        connection.execute(
+            serve_state_schema.reserved_fill_pool_claims_table.insert().values(
+                service_name=_SERVICE,
+                pool_key=h200_pool,
+                legacy_pool_key=json.dumps([_CONTEXT, ['h200']]),
+                pool_position=1,
+                access_context=_CONTEXT,
+                physical_cluster_uid=_UID,
+                accelerator_names=json.dumps(['h200']),
+                worker_projection_sha256_by_accelerator=h200_projection,
+                service_generation=11,
+                weight=1000,
+                floor_replicas=0,
+                gpus_per_replica=1,
+                holdings_fill=0,
+                effective_cap=0,
+                launchable=1,
+                heartbeat_ts=1))
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO reserved_fill_rounds
+                    (pool_key, round_id, snapshot_time, epoch,
+                     protocol_version, claim_generations, grants, feeds,
+                     feed_by_accelerator, raw_grants, feed_state,
+                     sum_holdings, last_observed_free,
+                     last_observed_free_ts, phantom_streak, fence_pending,
+                     observation_generation, observation_sequence,
+                     observation_materialization_sequence,
+                     observation_payload_sha256)
+                VALUES
+                    (:pool_key, 7, :snapshot_time, 23, 2,
+                     :claim_generations, :grants, :feeds,
+                     :feed_by_accelerator, :raw_grants, '{}', 0, 0,
+                     :snapshot_time, :phantom_streak, 0,
+                     :observation_generation, :observation_sequence,
+                     :observation_materialization_sequence,
+                     :observation_payload_sha256)
+            """), {
+                'pool_key': h200_pool,
+                'snapshot_time': h200_observation.observed_at,
+                'claim_generations': json.dumps({_SERVICE: 11}),
+                'grants': json.dumps({_SERVICE: 0}),
+                'feeds': json.dumps({_SERVICE: 0}),
+                'feed_by_accelerator': json.dumps(exact_zero),
+                'raw_grants': json.dumps({_SERVICE: 0}),
+                'phantom_streak':
+                    serve_constants.RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS,
+                'observation_generation':
+                    h200_observation.observation_generation,
+                'observation_sequence': h200_observation.observation_sequence,
+                'observation_materialization_sequence':
+                    h200_observation.materialization_sequence,
+                'observation_payload_sha256': h200_observation.payload_sha256,
+            })
+
+    h200_snapshot = reserved_fill_planner.PoolFillSnapshot(
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        pool_key=h200_pool,
+        physical_cluster_uid=_UID,
+        service_generation=11,
+        worker_projection_sha256_by_accelerator=tuple(h200_projection.items()),
+        edge_cap=0,
+        broker_slot_width=1,
+        free_slots=0,
+        free_slots_by_accelerator=(),
+        grant=0,
+        grant_epoch=23,
+        observation_generation=h200_observation.observation_generation,
+        observation_sequence=h200_observation.observation_sequence,
+        ordinary_zero_cost_admission_sequence=(
+            h200_observation.ordinary_admission_sequence),
+        valid_until=h200_observation.valid_until,
+        locations=(_location('H200'),))
+    snapshots = (
+        a100_snapshot,
+        h200_snapshot,
+    )
+    allocation = _repository(allocation_engine).publish(
+        _SERVICE,
+        expected_service_hash=_SERVICE_HASH,
+        expected_controller_owner=_OWNER,
+        expected_claim_generation=11,
+        expected_gate_generation=1,
+        pool_snapshots=snapshots)
+
+    assert allocation is not None
+    assert allocation.allocation_generation == 1
+    assert len(allocation.pool_snapshots) == 2
+    published = {
+        snapshot.pool_key: snapshot for snapshot in allocation.pool_snapshots
+    }
+    assert published[a100_snapshot.pool_key].free_slots == 2
+    assert (published[a100_snapshot.pool_key].free_slots_by_accelerator == ((
+        'a100-80gb', 2),))
+    assert published[h200_pool].free_slots == 0
+    assert published[h200_pool].free_slots_by_accelerator == ()
+    assert published[h200_pool].grant == 0
+
+
 def test_current_allocation_can_be_validated_on_caller_transaction(
         allocation_engine) -> None:
     _, snapshot = _commit_evidence(allocation_engine)

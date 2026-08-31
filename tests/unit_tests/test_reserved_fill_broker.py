@@ -1970,6 +1970,101 @@ def test_committed_observation_drives_provider_free_round_with_provenance(
     legacy_publish.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ('previous_phantom_streak', 'expected_exact_zero'),
+    [(0, False),
+     (serve_constants.RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS - 1, True)])
+def test_committed_phantom_is_typed_only_after_confirmation(
+        _broker_db, monkeypatch, clock, previous_phantom_streak,
+        expected_exact_zero):
+    pool = broker.make_pool_key('phx-context',
+                                'H200',
+                                protocol_version=broker.PROTOCOL_V2,
+                                physical_cluster_uid='phx-cluster')
+    edge = _v2_edge(pool)
+    previous_round = {
+        'protocol_version': broker.PROTOCOL_V2,
+        'claim_generations': json.dumps({'svc-a': 7}),
+        'grants': json.dumps({'svc-a': 3}),
+        'feeds': json.dumps({'svc-a': 3}),
+        'feed_by_accelerator': json.dumps({
+            broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+                'h200': 3
+            },
+            broker._SPENDABLE_FREE_BY_ACCELERATOR_KEY: {
+                'h200': 3
+            },
+            broker._BROKER_SLOT_WIDTH_KEY: 1,
+            'svc-a': {
+                'h200': 3
+            },
+        }),
+        'raw_grants': json.dumps({'svc-a': 3}),
+        'feed_state': json.dumps({}),
+        'utilization_state': None,
+        'round_id': 2,
+        'epoch': 4,
+        'snapshot_time': clock.now - 100,
+        'sum_holdings': 0,
+        'last_observed_free': 3,
+        'last_observed_free_ts': clock.now - 100,
+        'phantom_streak': previous_phantom_streak,
+        'shrink_baseline': None,
+        'fence_pending': False,
+    }
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        mock.Mock(return_value=broker.PROTOCOL_V2))
+    monkeypatch.setattr(serve_state, 'get_authoritative_reserved_fill_claims',
+                        mock.Mock(return_value=[edge]))
+    monkeypatch.setattr(serve_state,
+                        'prune_authoritative_reserved_fill_claim_sets',
+                        mock.Mock(return_value=[]))
+    monkeypatch.setattr(serve_state, 'get_reserved_fill_round',
+                        mock.Mock(return_value=previous_round))
+    monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                        mock.Mock(return_value={}))
+    publish_round = mock.Mock(return_value=True)
+    observation = dataclasses.replace(
+        _committed_observation(pool, free_gpus=0),
+        payload=pool_capacity_observation.PoolCapacitySuccess.from_counts(
+            0, {'h200': 0}, present_accelerator_names=()))
+
+    allocation = broker.run_round_from_committed_observation(
+        'svc-a',
+        pool,
+        observation,
+        60.0,
+        expected_service_generation=7,
+        publish_round=publish_round)
+
+    assert allocation is not None
+    assert allocation.feed == 0
+    publication = publish_round.call_args.args[0]
+    assert publication.observation_provenance is not None
+    if expected_exact_zero:
+        assert allocation.grant == 0
+        assert allocation.epoch == previous_round['epoch'] + 1
+        assert allocation.feed_by_accelerator == {}
+        assert allocation.observed_free_slots == 0
+        assert allocation.observed_free_slots_by_accelerator == {'h200': 0}
+        assert json.loads(publication.feed_by_accelerator) == {
+            broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+                'h200': 0
+            },
+            broker._SPENDABLE_FREE_BY_ACCELERATOR_KEY: {
+                'h200': 0
+            },
+            broker._BROKER_SLOT_WIDTH_KEY: 1,
+            'svc-a': {},
+        }
+    else:
+        assert allocation.grant == 3
+        assert allocation.feed_by_accelerator is None
+        assert allocation.observed_free_slots is None
+        assert allocation.observed_free_slots_by_accelerator is None
+        assert publication.feed_by_accelerator is None
+
+
 def test_committed_observation_converts_raw_gpus_once_with_broker_width(
         _broker_db, monkeypatch):
     pool = broker.make_pool_key('phx-context',
@@ -2199,11 +2294,15 @@ def test_v2_confirmed_phantom_preserves_generation_and_healthy_sibling(
     monkeypatch.setattr(serve_state,
                         'prune_authoritative_reserved_fill_claim_sets',
                         mock.Mock(return_value=[]))
-    monkeypatch.setattr(
-        serve_state, 'get_reserved_fill_round',
-        mock.Mock(side_effect=lambda pool_key: previous_phantom_round
-                  if pool_key == phantom_pool else None))
-    publish = mock.Mock(return_value=True)
+    rounds = {phantom_pool: previous_phantom_round}
+    monkeypatch.setattr(serve_state, 'get_reserved_fill_round',
+                        mock.Mock(side_effect=rounds.get))
+
+    def _publish(pool_key, **kwargs):
+        rounds[pool_key] = dict(kwargs, pool_key=pool_key, fence_pending=False)
+        return True
+
+    publish = mock.Mock(side_effect=_publish)
     monkeypatch.setattr(serve_state, 'publish_reserved_fill_round', publish)
     remove_pool = mock.Mock()
     monkeypatch.setattr(broker, '_remove_legacy_claims_for_pool', remove_pool)
@@ -2218,9 +2317,11 @@ def test_v2_confirmed_phantom_preserves_generation_and_healthy_sibling(
     assert phantom is not None
     assert phantom.grant == 0
     assert phantom.feed == 0
-    assert phantom.observed_free_slots is None
-    assert phantom.observed_free_slots_by_accelerator is None
+    assert phantom.feed_by_accelerator == {}
+    assert phantom.observed_free_slots == 0
+    assert phantom.observed_free_slots_by_accelerator == {'h200': 0}
     assert phantom.service_generation == 7
+    assert phantom.epoch == previous_phantom_round['epoch'] + 1
     remove_pool.assert_not_called()
     phantom_publish = publish.call_args
     assert json.loads(phantom_publish.kwargs['claim_generations']) == {
@@ -2228,6 +2329,42 @@ def test_v2_confirmed_phantom_preserves_generation_and_healthy_sibling(
     }
     assert json.loads(phantom_publish.kwargs['grants']) == {'svc-a': 0}
     assert json.loads(phantom_publish.kwargs['feeds']) == {'svc-a': 0}
+    assert json.loads(phantom_publish.kwargs['feed_by_accelerator']) == {
+        broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 0
+        },
+        'svc-a': {},
+    }
+    assert phantom_publish.kwargs[
+        'epoch'] == previous_phantom_round['epoch'] + 1
+
+    clock.advance(61)
+    recovered = broker.run_round_if_stale(
+        'svc-a',
+        phantom_pool,
+        lambda: broker.PoolObservation(4, ('H200',), (('h200', 4),)),
+        60.0,
+        expected_protocol_version=broker.PROTOCOL_V2,
+        expected_service_generation=7)
+    assert recovered is not None
+    assert recovered.grant == 0
+    assert recovered.feed == 0
+    assert recovered.feed_by_accelerator == {}
+    assert recovered.observed_free_slots_by_accelerator == {'h200': 4}
+    assert rounds[phantom_pool]['phantom_streak'] == 0
+
+    clock.advance(61)
+    resumed = broker.run_round_if_stale(
+        'svc-a',
+        phantom_pool,
+        lambda: broker.PoolObservation(4, ('H200',), (('h200', 4),)),
+        60.0,
+        expected_protocol_version=broker.PROTOCOL_V2,
+        expected_service_generation=7)
+    assert resumed is not None
+    assert resumed.grant == 3
+    assert resumed.feed == 3
+    assert resumed.feed_by_accelerator == {'h200': 3}
 
     healthy = broker.run_round_if_stale(
         'svc-a',
