@@ -498,6 +498,99 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
 
         self.assertIsNone(self._plan(autoscaler))
 
+    def test_fresh_zero_accepts_repository_canonical_card_casing(self):
+        """PostgreSQL card keys and YAML display names share one domain."""
+        autoscaler = _durable_autoscaler(max_replicas=1000)
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+            'H200': 1,
+        })
+        # Capacity admission canonicalizes its accounting-card domain before
+        # creating genesis history.  The live task catalog intentionally keeps
+        # the user-facing spelling from YAML.  These are the same exact cards,
+        # not a service-version or accelerator-shape change.
+        prior_state, prior_candidate = capacity_planning.genesis_capacity_policy(
+            service_name=autoscaler._service_name,
+            service_version=autoscaler.latest_version,
+            last_reduced_demand_generation=0,
+            capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+            maximum_capacity=autoscaler.max_replicas,
+            physical_gpu_width_by_accelerator=(
+                capacity_planning.AcceleratorCapacity.from_mapping({
+                    'l4': 1,
+                    'a100': 1,
+                    'a100-80gb': 1,
+                    'h200': 1,
+                })))
+        zero_inventory = (capacity_planning.AcceleratorCapacity.from_mapping({
+            'l4': 0,
+            'a100': 0,
+            'a100-80gb': 0,
+            'h200': 0,
+        }))
+        allocated_reservation = (
+            capacity_planning.AcceleratorCapacity.from_mapping({
+                'a100': 0,
+                'a100-80gb': 0,
+                'h200': 55,
+            }))
+        reservation = capacity_planning.ReservationPlanningInput(
+            gate_policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence_state=(capacity_planning.ReservationEvidenceState.
+                            AUTHENTICATED_SETTLED),
+            # East reports authoritative exact zero while PHX has authenticated
+            # H200 allocation.  Fresh aggregate zero must revoke the target
+            # without treating the other exact-zero pools as unavailable.
+            authenticated_capacity=allocated_reservation,
+            eligible_capacity=allocated_reservation,
+            pending_zero_cost_capacity=zero_inventory,
+            existing_zero_cost_capacity=zero_inventory,
+            existing_paid_capacity=zero_inventory,
+            charged_paid_gpu_units=0,
+            evidence_fingerprint='e' * 64,
+            allocation_demand_witness_sha256=_AUTO_GATE_WITNESS,
+            allocation_demonstrated_need=55,
+            allocation_ceiling=55)
+        decision_inputs = dataclasses.replace(
+            _durable_inputs(),
+            cold_paid_accelerator_order=('L4',),
+            prospective_paid_accelerator_order=('L4',))
+
+        plan_kwargs = dict(queue_depth=0,
+                           report=_durable_report(queue_depth=0),
+                           reservation=reservation,
+                           decision_inputs=decision_inputs,
+                           fresh_zero=True,
+                           prior_policy_state=prior_state,
+                           prior_candidate=prior_candidate,
+                           configured_reservation_accelerators=('a100',
+                                                                'a100-80gb',
+                                                                'h200'),
+                           demand_witness_scope_sha256='a' * 64)
+        canonical_autoscaler = _durable_autoscaler(max_replicas=1000)
+        canonical_autoscaler.set_configured_accelerator_shapes({
+            'l4': 1,
+            'a100': 1,
+            'a100-80gb': 1,
+            'h200': 1,
+        })
+        canonical_result = self._plan(canonical_autoscaler, **plan_kwargs)
+        self.assertIsNotNone(canonical_result)
+
+        result = self._plan(autoscaler, **plan_kwargs)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        candidate = result.envelope.candidate
+        self.assertEqual(
+            candidate.kind,
+            capacity_planning.CapacityPlanKind.FRESH_ZERO_RETENTION)
+        self.assertEqual(candidate.wave_limited_actuation_target.as_dict(), {})
+        self.assertEqual(candidate.paid_launch_target.as_dict(), {})
+        self.assertEqual(candidate.reserved_launch_target.as_dict(), {})
+
     def test_durable_planner_never_borrows_process_local_kueue_tick_state(self):
         autoscaler = _durable_autoscaler()
         warm_retention = {'L4': 7}

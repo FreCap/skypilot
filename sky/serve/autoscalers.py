@@ -6405,12 +6405,18 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         }) != len(configured_cards)):
                 return None
             canonical = {card.casefold(): card for card in configured_cards}
+            configured_shapes = {
+                card.casefold(): width
+                for card, width in self.configured_accelerator_shapes.items()
+            }
+            prior_shapes = {
+                card.casefold(): width for card, width in
+                prior_candidate.physical_gpu_width_by_accelerator.entries
+            }
             if (set(canonical) != {
                     card.casefold()
                     for card in self.configured_accelerator_shapes
-            } or prior_candidate.physical_gpu_width_by_accelerator
-                    != capacity_planning.AcceleratorCapacity.from_mapping(
-                        self.configured_accelerator_shapes) or
+            } or prior_shapes != configured_shapes or
                     prior_candidate.backend_num_nodes != 1):
                 return None
             retirement_shelter_target = (
