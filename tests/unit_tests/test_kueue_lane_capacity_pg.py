@@ -15,11 +15,14 @@ from test_kueue_lane_lineage_pg import (
 from test_kueue_lane_lineage_pg import _EAST_PROJECTION
 from test_kueue_lane_lineage_pg import _identity
 from test_kueue_lane_lineage_pg import _insert_intent
+from test_kueue_lane_lineage_pg import (
+    _install_canonical_cleanup_profile_authority)
 from test_kueue_lane_lineage_pg import _install_historical_v5_worker_projections
 from test_kueue_lane_lineage_pg import _install_retirable_materialized_graph
 from test_kueue_lane_lineage_pg import _materialize
 from test_kueue_lane_lineage_pg import _receipt
 from test_kueue_lane_lineage_pg import _reserved_location_state
+from test_kueue_lane_lineage_pg import _set_physical_provider_evidence
 from test_kueue_lane_lineage_pg import admission_database  # noqa: F401
 from test_kueue_lane_lineage_pg import postgres_engine  # noqa: F401
 from test_serve_resource_actions_pg import empty_postgres  # noqa: F401
@@ -29,6 +32,7 @@ from sky.serve import capacity_admission
 from sky.serve import kueue_lane_capacity
 from sky.serve import kueue_lane_lineage
 from sky.serve import kueue_lane_lineage_schema
+from sky.serve import ordinary_launch_binding
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
@@ -343,7 +347,17 @@ def test_each_copied_admission_identity_mismatch_is_exact_shape_unknown(
     assert key in projection.unknown_intent_keys
     assert projection.unknown_shapes == {('h200', 1)}
     assert not projection.unbounded_unknown
-    assert inventory == ({'h200': 1}, {'h200': 0}, {'h200': 0}, 0)
+    # A corrupted copied key leaves both the original materialized graph and
+    # the now-unmatched admission row as distinct unresolved authorities.
+    # Debit both exact shapes until their identity collision is adjudicated.
+    expected_pending = 1 if field == 'intent_idempotency_key' else 0
+    assert inventory == ({
+        'h200': 1
+    }, {
+        'h200': 0
+    }, {
+        'h200': expected_pending
+    }, 0)
 
 
 def test_proven_east_intent_without_admission_retains_legacy_accounting(
@@ -433,9 +447,17 @@ def test_provider_clean_retirement_deletes_live_intent_before_accounting(
         admission_database, monkeypatch) -> None:
     """Retained association history cannot become permanent UNKNOWN."""
     repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
-    key = 'd' * 64
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
     record_id, association_id, _ = _install_retirable_materialized_graph(
         admission_database, repository, intent_key=key, replica_id=1)
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _set_physical_provider_evidence(
+        admission_database, association_id,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
     _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
 
     assert serve_state.remove_replica(_SERVICE,
