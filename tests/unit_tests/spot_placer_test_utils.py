@@ -50,6 +50,8 @@ def make_placer(
     placer.placement_catalog = spot_placer.PlacementCatalog(tuple(
         sorted(costs.items(), key=lambda item: item[0].sort_key())),
                                                             num_nodes=1)
+    placer._ranked_catalog_entries = (  # pylint: disable=protected-access
+        placer.placement_catalog.ranked_entries(placement_contract))
     placer.location2status = {
         location: spot_placer.LocationStatus.ACTIVE for location in costs
     }

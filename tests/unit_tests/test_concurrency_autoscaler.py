@@ -329,6 +329,18 @@ def _durable_autoscaler(**overrides):
     return autoscaler
 
 
+def _durable_prior(autoscaler, *, generation=0):
+    return capacity_planning.genesis_capacity_policy(
+        service_name=autoscaler._service_name,
+        service_version=autoscaler.latest_version,
+        last_reduced_demand_generation=generation,
+        capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+        maximum_capacity=autoscaler.max_replicas,
+        physical_gpu_width_by_accelerator=(
+            capacity_planning.AcceleratorCapacity.from_mapping(
+                autoscaler.configured_accelerator_shapes)))
+
+
 def _retirement_shelter(
     target,
     *,
@@ -346,10 +358,9 @@ def _retirement_shelter(
 
 
 class TestDurableCapacityPlannerAdapter(unittest.TestCase):
-    """The controller adapter creates and installs one immutable plan."""
+    """The controller adapter creates one immutable DB-backed plan."""
 
-    _INSTANT = autoscalers.PlanningInstant(wall_time=1_000_000_000.0,
-                                           monotonic_time=100.0)
+    _DB_EPOCH = 1_000_000_000.0
 
     def _plan(self,
               autoscaler,
@@ -362,6 +373,9 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
               fresh_zero=False,
               retirement_shelter=None,
               max_live_paid_gpu_units=None,
+              prior_policy_state=None,
+              prior_candidate=None,
+              planning_db_epoch=None,
               configured_reservation_accelerators=None,
               demand_witness_scope_sha256=None):
         if reservation is None:
@@ -370,6 +384,10 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             report = _durable_report(queue_depth=queue_depth)
         if decision_inputs is None:
             decision_inputs = _durable_inputs(replicas)
+        if prior_policy_state is None and prior_candidate is None:
+            prior_policy_state, prior_candidate = _durable_prior(autoscaler)
+        if planning_db_epoch is None:
+            planning_db_epoch = self._DB_EPOCH
         gated = (reservation.gate_policy
                  is capacity_planning.ReservationGatePolicy.DEMAND_GATED)
         if configured_reservation_accelerators is None:
@@ -399,8 +417,10 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                 decision_inputs=decision_inputs,
                 retirement_shelter=retirement_shelter,
                 max_live_paid_gpu_units=max_live_paid_gpu_units,
+                prior_policy_state=prior_policy_state,
+                prior_candidate=prior_candidate,
+                planning_db_epoch=planning_db_epoch,
                 fresh_zero=fresh_zero,
-                planning_instant=self._INSTANT,
                 configured_reservation_accelerators=(
                     configured_reservation_accelerators),
                 demand_witness_scope_sha256=demand_witness_scope_sha256)
@@ -428,25 +448,55 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
     def test_one_snapshot_calls_the_canonical_planner_once_without_mutation(
             self):
         autoscaler = _durable_autoscaler()
-        before = autoscaler.export_durable_capacity_policy_state()
+        prior_state, prior_candidate = _durable_prior(autoscaler)
+        autoscaler.target_num_replicas = 17
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 17}
+        autoscaler.cold_launch_authority_by_accelerator = {'L4': 17}
+        before = (
+            autoscaler.target_num_replicas,
+            dict(autoscaler.target_num_replicas_by_accelerator),
+            dict(autoscaler.cold_launch_authority_by_accelerator),
+            autoscaler.reconcile_generation,
+        )
 
         with mock.patch.object(capacity_planning,
                                'plan_capacity',
                                wraps=capacity_planning.plan_capacity) as plan:
-            result = self._plan(autoscaler)
+            result = self._plan(autoscaler,
+                                prior_policy_state=prior_state,
+                                prior_candidate=prior_candidate)
 
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(plan.call_count, 1)
-        self.assertEqual(autoscaler.export_durable_capacity_policy_state(),
-                         before)
-        self.assertEqual(result.expected_prior_generation, 0)
+        self.assertEqual((autoscaler.target_num_replicas,
+                          autoscaler.target_num_replicas_by_accelerator,
+                          autoscaler.cold_launch_authority_by_accelerator,
+                          autoscaler.reconcile_generation), before)
         self.assertEqual(result.envelope.snapshot.source_generation, 1)
+        self.assertEqual(result.envelope.snapshot.prior_policy_state,
+                         prior_state)
+        self.assertEqual(result.envelope.snapshot.prior_candidate,
+                         prior_candidate)
+        policy_input = result.envelope.snapshot.policy_input
+        assert policy_input is not None
+        self.assertEqual(policy_input.planning_db_epoch, self._DB_EPOCH)
+        self.assertEqual(result.envelope.snapshot.planning_time, self._DB_EPOCH)
         self.assertEqual(
-            result.envelope.snapshot.prior_policy_state.source_generation, 0)
-        self.assertEqual(
-            result.envelope.candidate.next_policy_state.source_generation, 1)
+            result.envelope.candidate.next_policy_state.
+            last_reduced_demand_generation, 1)
         self.assertIsNone(result.rollout_failure)
+
+    def test_durable_planner_rejects_adaptive_scale_up(self):
+        autoscaler = _durable_autoscaler(
+            adaptive_scale_up={
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            })
+
+        self.assertIsNone(self._plan(autoscaler))
 
     def test_durable_planner_never_borrows_process_local_kueue_tick_state(self):
         autoscaler = _durable_autoscaler()
@@ -498,29 +548,36 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             autoscaler._kueue_ready_paid_replacement_replica_ids_for_tick,
             replacement_ids)
 
-    def test_post_commit_policy_install_is_generation_and_fingerprint_cas(self):
+    def test_post_commit_projection_is_derived_only_from_candidate(self):
         autoscaler = _durable_autoscaler()
         result = self._plan(autoscaler)
         assert result is not None
-        next_state = result.envelope.candidate.next_policy_state
+        candidate = result.envelope.candidate
+        next_state = candidate.next_policy_state
         assert next_state is not None
+        next_state = dataclasses.replace(
+            next_state, downscale_started_db_epoch=self._DB_EPOCH)
+        candidate = dataclasses.replace(candidate, next_policy_state=next_state)
+        autoscaler._downscale_started_at = 42.0
 
-        installed = autoscaler.install_committed_capacity_plan(
-            expected_prior_fingerprint=result.prior_policy_fingerprint,
-            expected_prior_generation=result.expected_prior_generation,
-            next_policy_state=next_state)
+        autoscaler.install_committed_capacity_projection(
+            committed_candidate=candidate)
 
-        self.assertTrue(installed)
-        self.assertEqual(autoscaler.export_durable_capacity_policy_state(),
-                         next_state)
-        committed = autoscaler.export_durable_capacity_policy_state()
-        self.assertFalse(
-            autoscaler.install_committed_capacity_plan(
-                expected_prior_fingerprint=result.prior_policy_fingerprint,
-                expected_prior_generation=result.expected_prior_generation,
-                next_policy_state=next_state))
-        self.assertEqual(autoscaler.export_durable_capacity_policy_state(),
-                         committed)
+        self.assertEqual(autoscaler.target_num_replicas,
+                         candidate.aggregate_demand_target)
+        self.assertEqual(autoscaler._raw_target_num_replicas,
+                         candidate.raw_demand_target)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         candidate.demand_attribution.as_dict())
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator,
+                         candidate.paid_launch_target.as_dict())
+        self.assertEqual(autoscaler.capacity_target_by_accelerator,
+                         candidate.wave_limited_actuation_target.as_dict())
+        self.assertEqual(autoscaler.reconcile_generation,
+                         candidate.source_generation)
+        self.assertEqual(autoscaler.upscale_counter,
+                         next_state.upscale_observations)
+        self.assertIsNone(autoscaler._downscale_started_at)
 
     def test_reservations_and_usage_gate_share_one_economic_path(self):
         settled = (
@@ -594,7 +651,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                 'priority': 20,
                 'compatible_accelerators': ['L4'],
                 'count': 1,
-                'timestamp': self._INSTANT.wall_time,
+                'timestamp': self._DB_EPOCH,
             }]))
         one_l4_result = self._plan(autoscaler,
                                    report=one_l4,
@@ -609,12 +666,12 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                 'priority': 20,
                 'compatible_accelerators': ['L4'],
                 'count': 1,
-                'timestamp': self._INSTANT.wall_time,
+                'timestamp': self._DB_EPOCH,
             }, {
                 'priority': 20,
                 'compatible_accelerators': ['A100'],
                 'count': 2,
-                'timestamp': self._INSTANT.wall_time,
+                'timestamp': self._DB_EPOCH,
             }]))
         mixed_result = self._plan(autoscaler,
                                   report=mixed,
@@ -665,7 +722,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                                      'priority': 20,
                                      'compatible_accelerators': ['L4'],
                                      'count': 1,
-                                     'timestamp': self._INSTANT.wall_time,
+                                     'timestamp': self._DB_EPOCH,
                                  }])
         report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
                       unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
@@ -718,7 +775,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                                      'priority': 20,
                                      'compatible_accelerators': ['L4'],
                                      'count': 1,
-                                     'timestamp': self._INSTANT.wall_time,
+                                     'timestamp': self._DB_EPOCH,
                                  }])
         report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
                       unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
@@ -755,7 +812,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                                      'priority': 50,
                                      'compatible_accelerators': ['L4'],
                                      'count': 2,
-                                     'timestamp': self._INSTANT.wall_time,
+                                     'timestamp': self._DB_EPOCH,
                                  }])
         report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
                       unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
@@ -783,22 +840,17 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         self.assertEqual(candidate.paid_launch_target.as_dict(), {})
         next_state = candidate.next_policy_state
         assert next_state is not None
-        self.assertTrue(
-            autoscaler.install_committed_capacity_plan(
-                expected_prior_fingerprint=result.prior_policy_fingerprint,
-                expected_prior_generation=result.expected_prior_generation,
-                next_policy_state=next_state))
 
         rejected_report = _durable_report(
             rejected=1,
-            generation=next_state.source_generation + 1,
+            generation=next_state.last_reduced_demand_generation + 1,
             in_flight={1: 1},
             observed_slots={1: 1},
             compatibility_profiles=[{
                 'priority': 50,
                 'compatible_accelerators': ['L4'],
                 'count': 2,
-                'timestamp': self._INSTANT.wall_time,
+                'timestamp': self._DB_EPOCH,
             }],
             rejected_profiles=[{
                 'priority': 50,
@@ -818,16 +870,26 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                                report=rejected_report,
                                replicas=(replica,),
                                reservation=reservation,
-                               decision_inputs=_durable_inputs((replica,)))
+                               decision_inputs=_durable_inputs((replica,)),
+                               prior_policy_state=next_state,
+                               prior_candidate=candidate,
+                               planning_db_epoch=self._DB_EPOCH + 1)
 
         assert successor is not None
         successor_candidate = successor.envelope.candidate
-        self.assertEqual(successor.expected_prior_generation,
-                         next_state.source_generation)
+        self.assertEqual(successor.envelope.snapshot.prior_policy_state,
+                         next_state)
+        self.assertEqual(
+            successor.envelope.snapshot.prior_candidate.aggregate_demand_target,
+            0)
+        self.assertEqual(
+            successor.envelope.snapshot.prior_candidate.next_policy_state,
+            successor.envelope.snapshot.prior_policy_state)
         assert successor_candidate.next_policy_state is not None
         self.assertEqual(
-            successor_candidate.next_policy_state.source_generation,
-            next_state.source_generation + 1)
+            successor_candidate.next_policy_state.
+            last_reduced_demand_generation,
+            next_state.last_reduced_demand_generation + 1)
         self.assertEqual(successor_candidate.aggregate_demand_target, 2)
         self.assertEqual(
             successor_candidate.supply_aware_demand_target.as_dict(), {'L4': 2})
@@ -858,12 +920,12 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                 'priority': 50,
                 'compatible_accelerators': ['A100', 'L4'],
                 'count': 1,
-                'timestamp': self._INSTANT.wall_time,
+                'timestamp': self._DB_EPOCH,
             }, {
                 'priority': 50,
                 'compatible_accelerators': ['A100', 'H200'],
                 'count': 1,
-                'timestamp': self._INSTANT.wall_time,
+                'timestamp': self._DB_EPOCH,
             }])
         report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
                       unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
@@ -925,7 +987,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                                      'compatible_accelerators': ['A100'],
                                      'count':
                                          (constants.LB_OFFERED_ARRIVAL_CAP),
-                                     'timestamp': self._INSTANT.wall_time,
+                                     'timestamp': self._DB_EPOCH,
                                  }])
         report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
                       unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
@@ -968,7 +1030,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                                      'priority': 20,
                                      'compatible_accelerators': ['L4'],
                                      'count': 1,
-                                     'timestamp': self._INSTANT.wall_time,
+                                     'timestamp': self._DB_EPOCH,
                                  }],
                                  rejected_profiles=[{
                                      'priority': 20,
@@ -992,45 +1054,47 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                          {'L4': 1})
         self.assertEqual(candidate.paid_launch_target.as_dict(), {'L4': 1})
 
-    def test_saturated_retiring_work_cannot_borrow_arrival_card(self):
+    def test_ambiguous_saturation_clears_stale_paid_authority(self):
         autoscaler = _durable_autoscaler(max_replicas=100,
-                                         expected_request_duration_seconds=60)
+                                         expected_request_duration_seconds=60,
+                                         max_scale_up_rate_percentage=100,
+                                         scale_up_rate_min_replicas=80,
+                                         scale_up_rate_period_seconds=60)
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
-        initial = autoscaler.export_durable_capacity_policy_state()
-        l4_51 = capacity_planning.AcceleratorCapacity.from_mapping({'L4': 51})
-        inflated_prior = dataclasses.replace(
-            initial,
-            target_capacity=51,
-            raw_target_capacity=51,
-            target_by_accelerator=l4_51,
-            explicit_target_by_accelerator=l4_51,
-            paid_target_by_accelerator=l4_51,
-            cold_launch_authority_target=l4_51,
-            desired_actuation_target=l4_51,
-            wave_limited_actuation_target=l4_51,
-            last_scale_up_wave_monotonic=75.0,
-            scale_up_wave_ceiling=80)
-        self.assertTrue(
-            autoscaler.install_committed_capacity_plan(
-                expected_prior_fingerprint=initial.fingerprint,
-                expected_prior_generation=initial.source_generation,
-                next_policy_state=inflated_prior))
-        live_prior = autoscaler.export_durable_capacity_policy_state()
+        inflated = self._plan(autoscaler,
+                              report=_durable_report(queue_depth=51))
+        assert inflated is not None
+        prior_candidate = capacity_planning.finalize_capacity_plan(
+            inflated.envelope.snapshot,
+            inflated.envelope.candidate,
+            accepted_paid_plan_units=(
+                capacity_planning.AcceleratorCapacity.from_mapping({'L4': 1})),
+            accepted_paid_gpu_units=1,
+            decision_db_epoch=self._DB_EPOCH)
+        prior_state = prior_candidate.next_policy_state
+        assert prior_state is not None
+        self.assertEqual(prior_candidate.aggregate_demand_target, 51)
+        self.assertEqual(prior_candidate.paid_launch_target.as_dict(),
+                         {'L4': 51})
+        self.assertEqual(prior_state.paid_window_started_db_epoch,
+                         self._DB_EPOCH)
         retiring = _replica(1, card='A100', version=0, planned_capacity=50)
         retiring.status_property.is_scale_down = True
-        report = _durable_report(in_flight={1: 50},
+        report = _durable_report(generation=2,
+                                 in_flight={1: 50},
                                  observed_slots={1: 50},
                                  compatibility_profiles=[{
                                      'priority': 20,
                                      'compatible_accelerators': ['L4'],
                                      'count': 1,
-                                     'timestamp': self._INSTANT.wall_time,
+                                     'timestamp': self._DB_EPOCH,
                                  }])
         report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
                       unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
                       headerless_arrivals_60s=0,
                       headerless_arrivals_300s=0,
-                      offered_arrival_tracking_saturated=True)
+                      offered_arrival_tracking_saturated=True,
+                      pressure_report_is_floored=True)
         reservation = dataclasses.replace(
             _durable_reservation(),
             existing_paid_capacity=(
@@ -1047,26 +1111,29 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                             report=report,
                             replicas=replicas,
                             reservation=reservation,
-                            decision_inputs=inputs)
+                            decision_inputs=inputs,
+                            prior_policy_state=prior_state,
+                            prior_candidate=prior_candidate,
+                            planning_db_epoch=self._DB_EPOCH + 1)
 
         assert result is not None
         snapshot = result.envelope.snapshot
         candidate = result.envelope.candidate
-        self.assertEqual(result.prior_policy_fingerprint,
-                         live_prior.fingerprint)
-        self.assertEqual(result.expected_prior_generation,
-                         live_prior.source_generation)
-        self.assertNotEqual(snapshot.prior_policy_state.fingerprint,
-                            live_prior.fingerprint)
-        self.assertEqual(snapshot.prior_policy_state.target_capacity, 0)
+        self.assertEqual(snapshot.prior_policy_state.service_name,
+                         prior_state.service_name)
+        self.assertEqual(snapshot.prior_policy_state.service_version,
+                         prior_state.service_version)
         self.assertEqual(
-            snapshot.prior_policy_state.target_by_accelerator.as_dict(), {})
+            snapshot.prior_policy_state.paid_window_started_db_epoch,
+            prior_state.paid_window_started_db_epoch)
         self.assertEqual(
-            snapshot.prior_policy_state.cold_launch_authority_target.as_dict(),
-            {})
-        self.assertEqual(
-            snapshot.prior_policy_state.last_scale_up_wave_monotonic, 75.0)
-        self.assertEqual(snapshot.prior_policy_state.scale_up_wave_ceiling, 80)
+            snapshot.prior_policy_state.paid_window_ceiling_by_accelerator,
+            prior_state.paid_window_ceiling_by_accelerator)
+        self.assertEqual(snapshot.prior_candidate.aggregate_demand_target, 0)
+        self.assertEqual(snapshot.prior_candidate.paid_launch_target.as_dict(),
+                         {})
+        self.assertEqual(snapshot.prior_candidate.next_policy_state,
+                         snapshot.prior_policy_state)
         self.assertEqual(snapshot.fixed_work.as_dict(), {})
         self.assertEqual(candidate.aggregate_demand_target, 1)
         self.assertEqual(candidate.supply_aware_demand_target.as_dict(),
@@ -1076,14 +1143,9 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         self.assertEqual(candidate.paid_launch_target.as_dict(), {'L4': 1})
         self.assertEqual(candidate.retirement_floor_target.as_dict(), {'L4': 1})
         assert candidate.next_policy_state is not None
-        self.assertTrue(
-            autoscaler.install_committed_capacity_plan(
-                expected_prior_fingerprint=result.prior_policy_fingerprint,
-                expected_prior_generation=result.expected_prior_generation,
-                next_policy_state=candidate.next_policy_state))
-        self.assertEqual(
-            autoscaler.export_durable_capacity_policy_state().target_capacity,
-            1)
+        autoscaler.install_committed_capacity_projection(
+            committed_candidate=candidate)
+        self.assertEqual(autoscaler.target_num_replicas, 1)
 
     def test_saturated_unknown_and_overflow_work_only_shelters_supply(self):
         autoscaler = _durable_autoscaler(max_replicas=100,
@@ -1106,7 +1168,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                                      'priority': 20,
                                      'compatible_accelerators': ['L4'],
                                      'count': 1,
-                                     'timestamp': self._INSTANT.wall_time,
+                                     'timestamp': self._DB_EPOCH,
                                  }])
         report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
                       unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
@@ -1204,8 +1266,8 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         candidate = result.envelope.candidate
         self.assertEqual(snapshot.fixed_work.as_dict(), {})
         self.assertEqual(snapshot.retirement_shelter_target.as_dict(), {})
-        self.assertEqual(snapshot.prior_policy_state.fingerprint,
-                         result.prior_policy_fingerprint)
+        self.assertEqual(snapshot.prior_candidate.next_policy_state,
+                         snapshot.prior_policy_state)
         self.assertEqual(candidate.aggregate_demand_target, 1)
         self.assertEqual(candidate.retirement_floor_target.as_dict(), {'L4': 1})
 
@@ -1227,7 +1289,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                                      'priority': 20,
                                      'compatible_accelerators': ['L4'],
                                      'count': 1,
-                                     'timestamp': self._INSTANT.wall_time,
+                                     'timestamp': self._DB_EPOCH,
                                  }])
         report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
                       unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
@@ -1274,7 +1336,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                                      'priority': 20,
                                      'compatible_accelerators': ['L4'],
                                      'count': 1,
-                                     'timestamp': self._INSTANT.wall_time,
+                                     'timestamp': self._DB_EPOCH,
                                  }])
         report.update(unique_job_arrivals_60s=constants.LB_OFFERED_ARRIVAL_CAP,
                       unique_job_arrivals_300s=constants.LB_OFFERED_ARRIVAL_CAP,
@@ -3422,7 +3484,9 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         autoscaler._logical_adopted_paid_target_by_accelerator = {'L4': 40}
         autoscaler._snap_target_on_next_recompute = False
 
-        paid_l4 = [_replica(replica_id, card='L4') for replica_id in range(31)]
+        paid_l4 = [
+            _replica(replica_id, card='L4') for replica_id in range(1, 32)
+        ]
         zero_cost_a100 = [
             _replica(replica_id, card='A100', reserved_fill=True)
             for replica_id in range(100, 136)

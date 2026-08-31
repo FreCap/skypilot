@@ -12,6 +12,7 @@ from collections.abc import Sequence
 import dataclasses
 import enum
 import functools
+import hashlib
 import json
 import math
 import os
@@ -20,6 +21,7 @@ import threading
 import time
 import typing
 from typing import Any
+import uuid
 
 from sky import clouds
 from sky import sky_logging
@@ -35,6 +37,7 @@ if typing.TYPE_CHECKING:
 
 logger = sky_logging.init_logger(__name__)
 serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
+replica_info_lib = adaptors_common.LazyImport('sky.serve.replica_info')
 
 _BASE_LIMIT_DEFAULT = 4
 _LEGACY_LOCAL_LIMIT_DEFAULT = 4
@@ -72,6 +75,7 @@ _POOL_KEY_VERSION = 2
 _AWS_ACCOUNT_ID_RE = re.compile(r'[0-9]{12}')
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
 _MAX_EXACT_SHAPE_INTEGER = (1 << 63) - 1
+MAX_PREPARED_LAUNCH_SPECS = 512
 _UNRESOLVED_STATUS_VALUES = frozenset({'PENDING', 'PROVISIONING'})
 _admission_summary_log_lock = threading.Lock()
 _admission_summary_log_signature: tuple[Any, ...] | None = None
@@ -125,6 +129,366 @@ class PhysicalBackendShape:
     @property
     def total_gpu_units(self) -> int:
         return self.gpu_units_per_node * self.num_nodes
+
+
+def freeze_paid_launch_payload(value: Mapping[str, Any]) -> bytes:
+    """Freeze one JSON object used by a provider-free launch specification."""
+    if not isinstance(value, Mapping):
+        raise TypeError('Paid launch payload must be a mapping.')
+    try:
+        return json.dumps(dict(value),
+                          sort_keys=True,
+                          separators=(',', ':'),
+                          allow_nan=False).encode('utf-8')
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            'Paid launch payload must be canonical JSON.') from error
+
+
+def thaw_paid_launch_payload(value: bytes) -> dict[str, Any]:
+    """Decode and verify one canonical provider-free launch payload."""
+    if type(value) is not bytes or not value:  # pylint: disable=unidiomatic-typecheck
+        raise ValueError('Paid launch payload must be nonempty bytes.')
+    try:
+        decoded = json.loads(value.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError('Paid launch payload is not valid JSON.') from error
+    if not isinstance(decoded, dict):
+        raise ValueError('Paid launch payload must encode one object.')
+    if freeze_paid_launch_payload(decoded) != value:
+        raise ValueError('Paid launch payload is not canonical JSON.')
+    return decoded
+
+
+def paid_launch_payload_sha256(value: Mapping[str, Any]) -> str:
+    """Hash one canonical JSON authority payload."""
+    return hashlib.sha256(freeze_paid_launch_payload(value)).hexdigest()
+
+
+def decode_paid_launch_resources_override(value: bytes) -> dict[str, Any]:
+    """Decode one canonical immutable resources override."""
+    decoded = spot_placer.decode_resources_override(
+        thaw_paid_launch_payload(value))
+    if not isinstance(decoded, dict):
+        raise ValueError('Paid launch resources override is malformed.')
+    return decoded
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PaidLaunchVersionAuthority:
+    """Immutable controller authority read from one elected version row."""
+
+    service_spec: bytes
+    service_spec_sha256: str
+    controller_config: bytes
+    controller_config_digest: str
+    controller_config_snapshot_id: str
+
+    def __post_init__(self) -> None:
+        if (type(self.service_spec) is not bytes or not self.service_spec or
+                type(self.service_spec_sha256) is not str or
+                _SHA256_RE.fullmatch(self.service_spec_sha256) is None or
+                hashlib.sha256(self.service_spec).hexdigest()
+                != self.service_spec_sha256 or
+                type(self.controller_config) is not bytes or
+                type(self.controller_config_digest) is not str or
+                _SHA256_RE.fullmatch(self.controller_config_digest) is None or
+                hashlib.sha256(self.controller_config).hexdigest()
+                != self.controller_config_digest or
+                type(self.controller_config_snapshot_id) is not str or
+                _SHA256_RE.fullmatch(
+                    self.controller_config_snapshot_id) is None):
+            raise ValueError('Paid launch version authority is malformed.')
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PaidLaunchCatalogEvidence:
+    """Immutable elected-version and catalog facts for one Spot template."""
+
+    placement_catalog_sha256: str
+    catalog_rank: int
+    exploration_round: int
+    slot_within_pool_window: int
+    version_authority: PaidLaunchVersionAuthority
+
+    def __post_init__(self) -> None:
+        if (type(self.placement_catalog_sha256) is not str or
+                _SHA256_RE.fullmatch(self.placement_catalog_sha256) is None):
+            raise ValueError('Paid launch version evidence has a bad digest.')
+        if not isinstance(self.version_authority, PaidLaunchVersionAuthority):
+            raise ValueError('Paid launch has no elected-version authority.')
+        integer_fields = (self.catalog_rank, self.exploration_round,
+                          self.slot_within_pool_window)
+        if any(
+                type(value) is not int or value < 0  # pylint: disable=unidiomatic-typecheck
+                for value in integer_fields):
+            raise ValueError('Paid launch catalog ordering is malformed.')
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PaidLaunchSpec:
+    """Deeply immutable provider-free candidate for atomic paid admission.
+
+    Every structured value is canonical JSON bytes or an immutable tuple.  In
+    particular, this boundary deliberately cannot retain ``ReplicaInfo``,
+    ``Location``, a callback, a launch worker, or mutable controller state.
+    Plan and demand authority are also absent: PostgreSQL derives those from
+    its final locked snapshot when it accepts a sparse subset.
+    """
+
+    ordinal: int
+    service_name: str
+    service_hash: str
+    service_lifecycle_epoch: int
+    service_version: int
+    replica_id: int
+    replica_record_id: str
+    cluster_name_seed: str
+    worker_construction: bytes
+    provider_account: str | None
+    cloud: str
+    workspace: str
+    region: str
+    zone: str | None
+    instance_type: str | None
+    pool_key: str
+    frontier_key: FrontierKey
+    accelerator: str
+    gpu_units_per_node: int
+    num_nodes: int
+    resources_override: bytes
+    catalog_evidence: PaidLaunchCatalogEvidence
+
+    def __post_init__(self) -> None:
+        nonempty_strings = (
+            self.service_name,
+            self.service_hash,
+            self.cluster_name_seed,
+            self.cloud,
+            self.workspace,
+            self.region,
+            self.pool_key,
+            self.accelerator,
+        )
+        if any(
+                type(value) is not str or not value
+                for value in nonempty_strings):
+            raise ValueError('Paid launch identities must be nonempty strings.')
+        if any(
+                type(value) is not int or value < minimum  # pylint: disable=unidiomatic-typecheck
+                for value, minimum in ((self.ordinal,
+                                        0), (self.service_lifecycle_epoch,
+                                             1), (self.service_version,
+                                                  1), (self.replica_id, 1),
+                                       (self.gpu_units_per_node,
+                                        1), (self.num_nodes, 1))):
+            raise ValueError('Paid launch integer identities are malformed.')
+        if self.gpu_units_per_node > (_MAX_EXACT_SHAPE_INTEGER //
+                                      self.num_nodes):
+            raise ValueError('Paid launch physical shape is too large.')
+        try:
+            record_id = str(uuid.UUID(self.replica_record_id))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError(
+                'Paid launch record identity must be a UUID string.') from error
+        if record_id != self.replica_record_id:
+            raise ValueError('Paid launch record UUID must be canonical.')
+        if (self.zone is not None and
+            (type(self.zone) is not str or not self.zone)):
+            raise ValueError('Paid launch zone must be nonempty or absent.')
+        if (self.provider_account is not None and
+            (type(self.provider_account) is not str or
+             not self.provider_account)):
+            raise ValueError('Paid launch provider account is malformed.')
+        if (self.cloud != self.cloud.casefold() or
+                self.accelerator != self.accelerator.casefold()):
+            raise ValueError('Paid launch cloud/card names must be folded.')
+        if (type(self.frontier_key) is not tuple or any(
+                type(card) is not str or not card or card != card.casefold()
+                for card in self.frontier_key) or
+                self.frontier_key != tuple(sorted(set(self.frontier_key)))):
+            raise ValueError('Paid launch frontier identity is noncanonical.')
+        for payload in (self.worker_construction, self.resources_override):
+            thaw_paid_launch_payload(payload)
+        if not isinstance(self.catalog_evidence, PaidLaunchCatalogEvidence):
+            raise ValueError('Paid launch has no typed version evidence.')
+
+        pool = pool_key_payload(self.pool_key)
+        if pool is None or pool.get('use_spot') is not True:
+            raise ValueError('Paid launch pool must be canonical Spot.')
+        accelerators = pool.get('accelerators')
+        if accelerators != [[self.accelerator, self.gpu_units_per_node]]:
+            raise ValueError('Paid launch pool and accelerator shape disagree.')
+        if (pool.get('cloud') != self.cloud or
+                pool.get('workspace') != self.workspace or
+                pool.get('region') != self.region or
+                pool.get('zone') != self.zone or
+                pool.get('instance_type') != self.instance_type or
+                pool.get('num_nodes') != self.num_nodes):
+            raise ValueError('Paid launch pool and location disagree.')
+        provider_identity = pool.get('provider_identity')
+        pool_account = (provider_identity.get('aws_account_id') if isinstance(
+            provider_identity, dict) else None)
+        if pool_account != self.provider_account:
+            raise ValueError('Paid launch pool and provider account disagree.')
+
+    @property
+    def physical_gpu_units(self) -> int:
+        return self.gpu_units_per_node * self.num_nodes
+
+    def persistence_spec(
+        self,
+        *,
+        priority: int,
+        frontier_limit: int,
+        replica_port: str,
+        planned_capacity: int,
+        created_at: float | None,
+    ) -> 'PaidClaimPersistenceSpec':
+        """Materialize the legacy SQL adapter without provider resolution.
+
+        The immutable specification remains the cross-lock boundary.  This
+        short-lived mutable form exists only inside the repository adapter,
+        where the final locked planner derives and installs claim authority.
+        """
+        if (type(priority) is not int or type(frontier_limit) is not int or  # pylint: disable=unidiomatic-typecheck
+                frontier_limit < 1):
+            raise ValueError('Paid persistence policy inputs are malformed.')
+        state = build_pristine_paid_replica_state(
+            self,
+            replica_port=replica_port,
+            planned_capacity=planned_capacity,
+            created_at=created_at)
+        info = replica_info_lib.ReplicaInfo.from_storage_dict(state)
+        location = info.get_spot_location()
+        if (location is None or location.to_pickleable() != info.location or
+                info.replica_id != self.replica_id or
+                info.replica_record_id != self.replica_record_id or
+                info.version != self.service_version or
+                info.cluster_name != self.cluster_name_seed or
+                info.paid_capacity_pool_key != self.pool_key or
+                info.is_spot is not True or info.is_zero_cost is not False or
+                info.reserved_fill is not False):
+            raise ValueError('Paid launch initial replica state is malformed.')
+        return PaidClaimPersistenceSpec(candidate=PaidClaimCandidate(
+            replica_id=self.replica_id,
+            replica_info=info,
+            location=location,
+            priority=priority,
+            capacity_plan_claim=None),
+                                        pool_key=self.pool_key,
+                                        frontier_key=self.frontier_key,
+                                        frontier_limit=frontier_limit)
+
+
+def build_pristine_paid_replica_state(
+    spec: PaidLaunchSpec,
+    *,
+    replica_port: str,
+    planned_capacity: int,
+    created_at: float | None,
+) -> dict[str, Any]:
+    """Construct the complete initial paid row from its sole typed seed."""
+    if not isinstance(spec, PaidLaunchSpec):
+        raise TypeError('Paid launch spec is malformed.')
+    if type(replica_port) is not str or not replica_port:  # pylint: disable=unidiomatic-typecheck
+        raise ValueError('Paid launch replica port is malformed.')
+    if type(planned_capacity) is not int or planned_capacity < 1:  # pylint: disable=unidiomatic-typecheck
+        raise ValueError('Paid launch planned capacity is malformed.')
+    if created_at is not None and (  # pylint: disable=unidiomatic-typecheck
+            type(created_at) is not float or not math.isfinite(created_at) or
+            created_at <= 0):
+        raise ValueError('Paid launch creation time is malformed.')
+    resources_override = decode_paid_launch_resources_override(
+        spec.resources_override)
+    location = spot_placer.Location.from_resources_override(resources_override)
+    if location is None:
+        raise ValueError('Paid launch has no exact location.')
+    info = replica_info_lib.ReplicaInfo(replica_id=spec.replica_id,
+                                        cluster_name=spec.cluster_name_seed,
+                                        replica_port=replica_port,
+                                        is_spot=True,
+                                        location=location,
+                                        version=spec.service_version,
+                                        resources_override=resources_override,
+                                        planned_capacity=planned_capacity)
+    # The prepared seed has no clock authority. PostgreSQL supplies the exact
+    # accepted timestamp after it locks paid capacity and before row insertion.
+    info.created_at = created_at
+    info.replica_record_id = spec.replica_record_id
+    info.is_zero_cost = False
+    info.paid_capacity_pool_key = spec.pool_key
+    return typing.cast(dict[str, Any], info.to_storage_dict())
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PaidLaunchReceiptMember:
+    """One exact accepted replica/claim identity read from PostgreSQL."""
+
+    replica_id: int
+    replica_record_id: str
+    pool_key: str
+    priority: int
+    accelerator: str
+    plan_units: int
+    physical_gpu_units: int
+
+    def __post_init__(self) -> None:
+        if (type(self.replica_id) is not int or self.replica_id < 1 or  # pylint: disable=unidiomatic-typecheck
+                type(self.replica_record_id) is not str
+                or type(self.pool_key) is not str
+                or pool_key_payload(self.pool_key) is None
+                or type(self.priority) is not int  # pylint: disable=unidiomatic-typecheck
+                or not constants.LB_REQUEST_PRIORITY_MIN <= self.priority <=
+                constants.LB_REQUEST_PRIORITY_MAX
+                or type(self.accelerator) is not str or not self.accelerator
+                or self.accelerator != self.accelerator.casefold()
+                or type(self.plan_units) is not int or self.plan_units < 1 or  # pylint: disable=unidiomatic-typecheck
+                type(self.physical_gpu_units) is not int or  # pylint: disable=unidiomatic-typecheck
+                self.physical_gpu_units < 1):
+            raise ValueError('Paid launch receipt member is malformed.')
+        try:
+            record_id = str(uuid.UUID(self.replica_record_id))
+        except (TypeError, ValueError) as error:
+            raise ValueError('Paid launch receipt record ID is not a UUID.') \
+                from error
+        if record_id != self.replica_record_id:
+            raise ValueError('Paid launch receipt record UUID is noncanonical.')
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PaidLaunchReceipt:
+    """Sparse committed subset returned by atomic plan/claim admission."""
+
+    service_name: str
+    service_hash: str
+    service_lifecycle_epoch: int
+    service_version: int
+    capacity_plan_generation: int
+    capacity_plan_sha256: str
+    capacity_unit: str
+    members: tuple[PaidLaunchReceiptMember, ...]
+
+    def __post_init__(self) -> None:
+        if (type(self.service_name) is not str or not self.service_name or
+                type(self.service_hash) is not str or not self.service_hash or
+                type(self.service_lifecycle_epoch) is not int or  # pylint: disable=unidiomatic-typecheck
+                self.service_lifecycle_epoch < 1
+                or type(self.service_version) is not int or  # pylint: disable=unidiomatic-typecheck
+                self.service_version < 1 or
+                type(self.capacity_plan_generation) is not int or  # pylint: disable=unidiomatic-typecheck
+                self.capacity_plan_generation < 1
+                or type(self.capacity_plan_sha256) is not str
+                or _SHA256_RE.fullmatch(self.capacity_plan_sha256) is None
+                or self.capacity_unit not in ('logical-gpu', 'physical-backend')
+                or type(self.members) is not tuple
+                or any(not isinstance(member, PaidLaunchReceiptMember)
+                       for member in self.members)):
+            raise ValueError('Paid launch receipt is malformed.')
+        identities = tuple((member.replica_id, member.replica_record_id)
+                           for member in self.members)
+        if len(identities) != len(set(identities)):
+            raise ValueError('Paid launch receipt members must be unique.')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -694,6 +1058,18 @@ def _active_aws_account_id_for_locations(
     if not aws_clouds:
         return None
     return _active_aws_account_id_for_workspace(workspace, aws_clouds[0])
+
+
+def resolve_aws_account_id_for_locations(
+        locations: Iterable[spot_placer.Location], *,
+        workspace: str) -> str | None:
+    """Resolve AWS identity before entering launch-admission locks.
+
+    This is the provider-I/O seam for immutable paid launch preparation.  A
+    caller must invoke it before taking a ReplicaManager, routing, or database
+    lock and then pass the returned scalar into provider-free preparation.
+    """
+    return _active_aws_account_id_for_locations(locations, workspace=workspace)
 
 
 def pool_key(location: spot_placer.Location,
@@ -2054,6 +2430,10 @@ def try_persist_claim_batch(
 
     identities = []
     for candidate in candidates:
+        if (type(candidate.priority) is not int or  # pylint: disable=unidiomatic-typecheck
+                not constants.LB_REQUEST_PRIORITY_MIN <= candidate.priority <=
+                constants.LB_REQUEST_PRIORITY_MAX):
+            raise ValueError('Paid claim priority must be exact and in range.')
         identities.append(
             (candidate.replica_id, candidate.replica_info.replica_record_id))
     if len(set(identities)) != len(identities):
@@ -2089,13 +2469,8 @@ def try_persist_claim_batch(
                                                        candidate_frontier)
         if effective_frontier is None:
             effective_frontier = exploration_frontier()
-        bounded_candidate = dataclasses.replace(
-            candidate,
-            priority=max(
-                constants.LB_REQUEST_PRIORITY_MIN,
-                min(constants.LB_REQUEST_PRIORITY_MAX, candidate.priority)))
         persistence_specs.append(
-            PaidClaimPersistenceSpec(candidate=bounded_candidate,
+            PaidClaimPersistenceSpec(candidate=candidate,
                                      pool_key=key,
                                      frontier_key=candidate_frontier,
                                      frontier_limit=effective_frontier))

@@ -154,24 +154,6 @@ class _LinearizedScalePlan:
         reserved_fill_planner.AuthenticatedAllocationMap | None) = None
 
 
-def _promoted_cost_rebalance_is_spot(
-        option: autoscalers.AutoscalerDecision) -> bool:
-    """Whether one promoted option respects prospective-Spot-only paid use.
-
-    Cost rebalance is an older, independently generated economic decision and
-    therefore carries no ``PaidLaunchAuthority``.  Once durable capacity
-    planning owns the service, admit a replacement only when its exact pinned
-    target explicitly proves Spot.  Non-rebalance work and scale-down remain
-    governed by their existing paths.
-    """
-    if (option.operator is not autoscalers.AutoscalerDecisionOperator.SCALE_UP
-            or option.reason
-            is not autoscalers.AutoscalerDecisionReason.COST_REBALANCE):
-        return True
-    return (isinstance(option.target, dict) and
-            option.target.get('use_spot') is True)
-
-
 class _LbPromotionReason(str, enum.Enum):
     """Bounded, non-authoritative reason for one promotion decision."""
 
@@ -6337,7 +6319,134 @@ class SkyServeController:
             allocation_demonstrated_need=(supply.allocation_demonstrated_need),
             allocation_ceiling=supply.allocation_ceiling)
 
-    def _plan_and_publish_current_capacity(
+    def _prepare_current_paid_launch_specs(
+        self,
+        decision_autoscaler: autoscalers.ConcurrencyAutoscaler,
+        decision_version: int,
+        replica_infos: list[replica_managers.ReplicaInfo],
+        max_live_paid_gpu_units: int | None,
+    ) -> tuple[paid_capacity.PaidLaunchSpec, ...]:
+        """Prepare one bounded provider-free Spot superset before all locks."""
+        logical_max = decision_autoscaler.max_replicas
+        backend_num_nodes = decision_autoscaler.backend_num_nodes
+        if (type(logical_max) is not int or logical_max <= 0 or
+                type(backend_num_nodes) is not int or backend_num_nodes < 1 or
+            (max_live_paid_gpu_units is not None and
+             (type(max_live_paid_gpu_units) is not int or
+              max_live_paid_gpu_units < 0))):
+            return ()
+        shapes = dict(decision_autoscaler.configured_accelerator_shapes)
+        if len(shapes) > paid_capacity.MAX_PREPARED_LAUNCH_SPECS:
+            logger.warning(
+                'Suppressing paid launch preparation because %s '
+                'accounting cards exceed the bounded spec set.', len(shapes))
+            return ()
+        desired_backends: dict[str, int] = {}
+        for card, width in shapes.items():
+            if type(width) is not int or width < 1:
+                return ()
+            physical_units = width * backend_num_nodes
+            logical_limit = math.ceil(logical_max / width)
+            physical_limit = (logical_limit if max_live_paid_gpu_units is None
+                              else max_live_paid_gpu_units // physical_units)
+            desired_backends[card] = min(logical_limit, physical_limit)
+        backend_limits = {
+            card: 1 for card, desired in desired_backends.items() if desired > 0
+        }
+        remaining_specs = (paid_capacity.MAX_PREPARED_LAUNCH_SPECS -
+                           len(backend_limits))
+        while remaining_specs > 0:
+            made_progress = False
+            for card in shapes:
+                if (desired_backends[card] <= 0 or
+                        backend_limits.get(card, 0) >= desired_backends[card]):
+                    continue
+                backend_limits[card] = backend_limits.get(card, 0) + 1
+                remaining_specs -= 1
+                made_progress = True
+                if remaining_specs == 0:
+                    break
+            if not made_progress:
+                break
+        card_ceilings = {
+            card: backend_limits.get(card, 0) * width * backend_num_nodes
+            for card, width in shapes.items()
+        }
+        max_candidates = sum(backend_limits.values())
+        try:
+            version_authority = serve_state.get_paid_launch_version_authority(
+                self._service_name, decision_version)
+        except serve_state.ControllerConfigCorruptionError as error:
+            logger.warning(
+                'Suppressing paid candidates because elected-version '
+                'authority is corrupt: %s',
+                common_utils.format_exception(error))
+            return ()
+        if version_authority is None:
+            logger.warning(
+                'Suppressing paid candidates because elected '
+                'version %s has no immutable launch authority.',
+                decision_version)
+            return ()
+        try:
+            serve_utils.parse_and_validate_version_controller_config(
+                version_authority.controller_config,
+                self._replica_manager.workspace,
+                'prepared paid launch controller config')
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Suppressing paid candidates because elected-version '
+                'controller config is invalid: %s',
+                common_utils.format_exception(error))
+            return ()
+        placer = self._replica_manager.spot_placer
+        aws_account_id = None
+        if placer is not None:
+            locations = tuple(placer.ranked_active_locations())
+            try:
+                # This is the only provider-I/O step.  It deliberately happens
+                # before ReplicaManager, routing, and PostgreSQL locks.
+                aws_account_id = (
+                    paid_capacity.resolve_aws_account_id_for_locations(
+                        locations, workspace=self._replica_manager.workspace))
+            except Exception as error:  # pylint: disable=broad-except
+                # Missing AWS identity suppresses AWS templates only.  GCP
+                # templates remain preparable in the same heterogeneous tick.
+                logger.warning(
+                    'Disabling AWS paid candidates because the exact workspace '
+                    'account is unavailable: %s',
+                    common_utils.format_exception(error))
+        try:
+            prepared = self._replica_manager.prepare_paid_launch_specs(
+                accelerator_shapes=shapes,
+                max_gpu_units_by_accelerator=card_ceilings,
+                max_candidates=max_candidates,
+                occupied_replica_ids=(
+                    info.replica_id for info in replica_infos),
+                version_authority=version_authority,
+                aws_account_id=aws_account_id)
+            if (not isinstance(prepared, tuple) or
+                    any(not isinstance(spec, paid_capacity.PaidLaunchSpec)
+                        for spec in prepared)):
+                raise ValueError('Replica manager returned malformed specs.')
+            return prepared
+        except (TypeError, ValueError) as error:
+            logger.warning(
+                'Suppressing paid launch preparation because its '
+                'provider-free inputs are invalid: %s',
+                common_utils.format_exception(error))
+            return ()
+
+    @staticmethod
+    def _install_committed_capacity_plan_projection(
+        decision_autoscaler: autoscalers.ConcurrencyAutoscaler,
+        committed_candidate: capacity_planning.CapacityPlanCandidate,
+    ) -> None:
+        """Isolate the disposable post-commit autoscaler projection adapter."""
+        decision_autoscaler.install_committed_capacity_projection(
+            committed_candidate=committed_candidate)
+
+    def _plan_and_admit_current_capacity(
         self,
         decision_autoscaler: autoscalers.Autoscaler,
         decision_version: int,
@@ -6345,11 +6454,12 @@ class SkyServeController:
         notification_generation: int,
         planning_state_fingerprint: str | None,
         prepared_decision_inputs: autoscalers.ScalingDecisionInputs,
+        replica_infos: list[replica_managers.ReplicaInfo],
         *,
         sequenced_reserved_fill: bool,
-    ) -> tuple[capacity_admission.PaidLaunchAuthority,
-               _LinearizedScalePlan] | None:
-        """Plan current demand and publish its residual in one DB boundary."""
+    ) -> tuple[capacity_admission.CommittedCapacityPlan, _LinearizedScalePlan,
+               tuple[paid_capacity.PaidLaunchSpec, ...]] | None:
+        """Plan and atomically admit one current paid wave in PostgreSQL."""
         binding = self._ordinary_launch_binding_authority
         service_hash = self._service_hash
         if (binding is None or not isinstance(service_hash, str) or
@@ -6366,15 +6476,18 @@ class SkyServeController:
         try:
             configured_shapes = capacity_planning.AcceleratorCapacity.from_mapping(
                 decision_autoscaler.configured_accelerator_shapes)
+            backend_num_nodes = decision_autoscaler.backend_num_nodes
             if (not configured_shapes.entries or
-                    any(width <= 0 for _, width in configured_shapes.entries)):
+                    any(width <= 0 for _, width in configured_shapes.entries) or
+                    type(backend_num_nodes) is not int or
+                    backend_num_nodes < 1):
                 raise ValueError('No positive accelerator shape.')
         except (TypeError, ValueError):
             logger.warning('Suppressing current capacity planning because the '
                            'autoscaler has no exact accounting cards.')
             return None
         accounting_cards = {
-            card.casefold(): 0 for card, _ in configured_shapes.entries
+            card.casefold(): width for card, width in configured_shapes.entries
         }
         try:
             max_live_paid_gpu_units = (
@@ -6391,6 +6504,9 @@ class SkyServeController:
             logger.warning('Suppressing promoted capacity planning because '
                            'the active service paid cap is malformed.')
             return None
+        prepared_paid_launch_specs = self._prepare_current_paid_launch_specs(
+            decision_autoscaler, decision_version, replica_infos,
+            max_live_paid_gpu_units)
 
         planned: _LinearizedScalePlan | None = None
         durable_plan: autoscalers.DurableCapacityReconcilePlan | None = None
@@ -6413,6 +6529,20 @@ class SkyServeController:
                     'Current request information has a mismatched generation.')
             reservation_input = self._reservation_input_from_locked_supply(
                 supply)
+            locked_max_live_paid_gpu_units = supply.max_live_paid_gpu_units
+            prior_policy_state = supply.prior_policy_state
+            prior_candidate = supply.prior_candidate
+            planning_db_epoch = supply.planning_db_epoch
+            if (not isinstance(prior_policy_state,
+                               capacity_planning.CapacityPolicyState) or
+                    not isinstance(prior_candidate,
+                                   capacity_planning.CapacityPlanCandidate) or
+                    not isinstance(planning_db_epoch, (int, float)) or
+                    isinstance(planning_db_epoch, bool) or
+                    not math.isfinite(planning_db_epoch) or
+                    planning_db_epoch < 0):
+                raise capacity_admission.CapacityAdmissionConflict(
+                    'Locked durable capacity history is unavailable.')
             locked_replica_infos = list(supply.economic_replica_infos)
             try:
                 locked_decision_inputs = (
@@ -6463,7 +6593,11 @@ class SkyServeController:
                         source_fingerprint=locked_source_fingerprint,
                         decision_inputs=locked_decision_inputs,
                         retirement_shelter=retirement_shelter,
-                        max_live_paid_gpu_units=max_live_paid_gpu_units,
+                        max_live_paid_gpu_units=(
+                            locked_max_live_paid_gpu_units),
+                        prior_policy_state=prior_policy_state,
+                        prior_candidate=prior_candidate,
+                        planning_db_epoch=planning_db_epoch,
                         fresh_zero=snapshot.fresh_aggregate_zero,
                         configured_reservation_accelerators=(
                             supply.reserved_accelerators),
@@ -6479,6 +6613,39 @@ class SkyServeController:
                     'Autoscaler returned no pure durable capacity plan.')
             envelope = durable_plan.envelope
             candidate = envelope.candidate
+            priority_by_accelerator: dict[str, int] = {}
+            for option in durable_plan.scaling_decisions:
+                if (option.operator
+                        is not autoscalers.AutoscalerDecisionOperator.SCALE_UP
+                        or not isinstance(option.target,
+                                          autoscalers.LogicalScaleTarget)):
+                    continue
+                for card, priority in (
+                        option.target.launch_priority_by_accelerator):
+                    folded = card.casefold()
+                    existing = priority_by_accelerator.get(folded)
+                    if existing is not None and existing != priority:
+                        raise ValueError('Durable plan returned conflicting '
+                                         'paid launch priorities.')
+                    priority_by_accelerator[folded] = priority
+            positive_paid_cards = {
+                card.casefold()
+                for card, count in candidate.paid_launch_target.entries
+                if count > 0
+            }
+            if (not positive_paid_cards.issubset(priority_by_accelerator) or
+                    any(
+                        type(priority) is not int or
+                        not serve_constants.LB_REQUEST_PRIORITY_MIN <= priority
+                        <= serve_constants.LB_REQUEST_PRIORITY_MAX
+                        for card, priority in priority_by_accelerator.items()
+                        if card in positive_paid_cards)):
+                raise ValueError('Durable plan has no exact priority for every '
+                                 'positive paid accelerator target.')
+            paid_launch_priorities = {
+                card: priority_by_accelerator[card]
+                for card in sorted(positive_paid_cards)
+            }
             next_policy_state = candidate.next_policy_state
             acquiring_gate = (
                 candidate.kind
@@ -6490,10 +6657,9 @@ class SkyServeController:
                     capacity_planning.CapacityPlanKind.GATE_ACQUISITION) or
                     not candidate.attribution_complete or
                     candidate.source_generation != demand_generation or
-                (acquiring_gate != (next_policy_state is None)) or
-                (next_policy_state is not None and
-                 next_policy_state.source_generation != demand_generation) or
-                    envelope.snapshot.source_fingerprint
+                    next_policy_state is None or
+                    next_policy_state.last_reduced_demand_generation
+                    > demand_generation or envelope.snapshot.source_fingerprint
                     != locked_source_fingerprint):
                 raise ValueError('Autoscaler returned a stale or incomplete '
                                  'durable capacity plan.')
@@ -6540,6 +6706,8 @@ class SkyServeController:
                     reserved_capacity_commitment_by_accelerator={},
                     expected_paid_residual_by_accelerator={},
                     expected_paid_launch_target_by_accelerator={},
+                    paid_launch_priority_by_accelerator=(
+                        paid_launch_priorities),
                     static_reserved_fill_target_by_accelerator={},
                     planner_payload=envelope.canonical_payload())
 
@@ -6606,7 +6774,7 @@ class SkyServeController:
                     != logical_target.target_capacity):
                 raise ValueError('Durable logical target differs from its '
                                  'capacity-plan candidate.')
-            padding = next_policy_state.zero_cost_padding_target.as_dict()
+            padding = candidate.zero_cost_padding_target.as_dict()
 
             planned = _LinearizedScalePlan(
                 snapshot=snapshot,
@@ -6640,6 +6808,7 @@ class SkyServeController:
                     candidate.paid_residual.as_dict()),
                 expected_paid_launch_target_by_accelerator=(
                     candidate.paid_launch_target.as_dict()),
+                paid_launch_priority_by_accelerator=paid_launch_priorities,
                 static_reserved_fill_target_by_accelerator=(
                     candidate.static_prefill_target.as_dict()),
                 planner_payload=envelope.canonical_payload())
@@ -6659,14 +6828,20 @@ class SkyServeController:
                 return None
             try:
                 committed = (capacity_admission.CapacityAdmissionRepository(
-                ).plan_and_publish_current(
+                ).plan_and_admit_current(
                     service_name=self._service_name,
                     service_hash=service_hash,
                     service_lifecycle_epoch=(binding.service_lifecycle_epoch),
                     service_version=decision_version,
+                    expected_controller_incarnation=(
+                        binding.controller_incarnation),
+                    expected_controller_owner_epoch=(
+                        binding.controller_owner_epoch),
                     accounting_cards=accounting_cards,
+                    backend_num_nodes=backend_num_nodes,
                     sequenced_reserved_fill=sequenced_reserved_fill,
                     planner=_planner,
+                    prepared_paid_launch_specs=(prepared_paid_launch_specs),
                     expected_planning_state_fingerprint=(
                         planning_state_fingerprint)))
             except (capacity_admission.CapacityAdmissionError,
@@ -6676,7 +6851,6 @@ class SkyServeController:
                     'planning could not commit: '
                     f'{common_utils.format_exception(error)}')
                 return None
-            authority = committed.authority
             snapshot = committed.demand_snapshot
             if (planned is None or planned.snapshot != snapshot or
                     durable_plan is None or planned.capacity_planning_snapshot
@@ -6690,43 +6864,20 @@ class SkyServeController:
                 capacity_planning_snapshot=committed.planner_snapshot,
                 capacity_plan_candidate=committed.candidate,
                 reserved_fill_allocation_map=committed.allocation_map)
-            next_policy_state = committed.candidate.next_policy_state
-            if next_policy_state is None:
-                if (committed.candidate.kind
-                        is capacity_planning.CapacityPlanKind.GATE_ACQUISITION):
-                    # This transaction durably published the exact demand
-                    # witness consumed by the utilization-gate poller.  It is
-                    # intentionally a committed no-effect disposition: keep
-                    # the current policy/replica state intact. Publication
-                    # wakes the fill poller; its allocation round then wakes
-                    # this controller, with bounded polling as the fallback.
-                    return authority, planned
-                logger.warning('Committed capacity plan has no next policy '
-                               'state.')
-                return None
             try:
-                installed = decision_autoscaler.install_committed_capacity_plan(
-                    expected_prior_fingerprint=(
-                        durable_plan.prior_policy_fingerprint),
-                    expected_prior_generation=(
-                        durable_plan.expected_prior_generation),
-                    next_policy_state=next_policy_state)
+                self._install_committed_capacity_plan_projection(
+                    decision_autoscaler, committed.candidate)
             except (TypeError, ValueError) as error:
                 logger.warning(
                     'Committed capacity plan could not install its local '
                     'policy state: %s', common_utils.format_exception(error))
                 self._notify_scale_reconcile()
                 return None
-            if not installed:
-                logger.warning('Committed capacity policy lost its '
-                               'post-commit compare-and-swap.')
-                self._notify_scale_reconcile()
-                return None
             # These controller-local cursors become visible only after the
             # PostgreSQL transaction committed the exact demand generation.
             self._reconcile_generation = planned.demand_generation
             self._durable_demand_snapshot = snapshot
-        return authority, planned
+        return committed, planned, prepared_paid_launch_specs
 
     def _reconcile_scale_once(self, reconcile_generation: int) -> None:
         """Plan and actuate one optimistic, version-fenced scale epoch."""
@@ -6810,19 +6961,23 @@ class SkyServeController:
                         self._scale_reconcile_coordinator.generation)
                     demand_generation = self._reconcile_generation
 
-                ordered_paid_authority = None
+                committed_capacity: (capacity_admission.CommittedCapacityPlan |
+                                     None) = None
+                prepared_paid_launch_specs: tuple[paid_capacity.PaidLaunchSpec,
+                                                  ...] = ()
                 durable_snapshot = None
                 durable_logical_snapshot = None
                 fresh_aggregate_zero = False
                 if durable_demand_promoted:
                     assert decision_inputs is not None
-                    current_plan = self._plan_and_publish_current_capacity(
+                    current_plan = self._plan_and_admit_current_capacity(
                         decision_autoscaler,
                         decision_version,
                         actuation_generation,
                         notification_generation,
                         planning_state_fingerprint,
                         decision_inputs,
+                        replica_infos,
                         sequenced_reserved_fill=sequenced_reserved_fill)
                     if current_plan is None:
                         self._refresh_replica_counts_snapshot()
@@ -6830,7 +6985,8 @@ class SkyServeController:
                         self._replica_manager.invalidate_logical_reconcile_state(
                         )
                         return
-                    ordered_paid_authority, linearized = current_plan
+                    (committed_capacity, linearized,
+                     prepared_paid_launch_specs) = current_plan
                     durable_snapshot = linearized.snapshot
                     durable_logical_snapshot = linearized.logical_snapshot
                     notification_generation = (
@@ -6851,14 +7007,23 @@ class SkyServeController:
                         return
                     if (committed_capacity_plan.kind is capacity_planning.
                             CapacityPlanKind.GATE_ACQUISITION):
+                        if committed_capacity.paid_launch_receipt.members:
+                            raise RuntimeError(
+                                'Gate acquisition committed paid launch work.')
                         # A gate-acquisition publication is neither a planning
-                        # failure nor a target of zero.  Preserve the active
-                        # logical target and every replica until the durable
-                        # allocation witness unlocks a later generation.
+                        # failure nor scale-to-zero authority. Its committed
+                        # candidate has already refreshed the disposable
+                        # autoscaler projection, but no manager target or
+                        # replica effect may follow until a durable allocation
+                        # witness unlocks a later generation.
                         return
                     reservation_budget = (committed_capacity_plan.
                                           reserved_launch_target.as_dict())
                     if any(reservation_budget.values()):
+                        if committed_capacity.paid_launch_receipt.members:
+                            raise RuntimeError(
+                                'Atomic capacity admission committed paid work '
+                                'beside compatible reserved work.')
                         self._accept_sequenced_reserved_fill(
                             linearized.reserved_fill_allocation_map,
                             decision_autoscaler, decision_version,
@@ -6870,6 +7035,11 @@ class SkyServeController:
                         # projections in one tick.
                         self._notify_scale_reconcile()
                         return
+                    paid_launch_receipt = (
+                        committed_capacity.paid_launch_receipt)
+                    if paid_launch_receipt.members:
+                        self._replica_manager.materialize_paid_launch_receipt(
+                            paid_launch_receipt, prepared_paid_launch_specs)
                     retirement_changed = False
                     if (fresh_aggregate_zero and
                             durable_snapshot.reconcile_authority.
@@ -6885,9 +7055,11 @@ class SkyServeController:
                                         durable_snapshot.demand_feed_generation
                                     ),
                                     capacity_plan_generation=(
-                                        ordered_paid_authority.generation),
+                                        committed_capacity.authority.generation
+                                    ),
                                     capacity_plan_sha256=(
-                                        ordered_paid_authority.content_sha256),
+                                        committed_capacity.authority.
+                                        content_sha256),
                                     route_generation=(
                                         durable_snapshot.route_generation)),
                                 replica_infos))
@@ -6929,53 +7101,24 @@ class SkyServeController:
                     plan = legacy_plan
                 scaling_options = list(plan.scaling_options)
                 if durable_demand_promoted:
-                    unfiltered_count = len(scaling_options)
+                    # The fused repository transaction is the sole promoted
+                    # launch path: reserved work is admitted above and paid
+                    # work is materialized only from its sparse receipt.  The
+                    # planner's SCALE_UP decisions supplied priority before
+                    # admission; replaying them through ReplicaManager would
+                    # create a second launch path. Unknown-capacity
+                    # predecessors remain protected and counted until probing
+                    # or evidence-backed cleanup resolves them.
                     scaling_options = [
-                        option for option in scaling_options
-                        if _promoted_cost_rebalance_is_spot(option)
+                        option for option in scaling_options if option.operator
+                        is not autoscalers.AutoscalerDecisionOperator.SCALE_UP
                     ]
-                    suppressed_count = unfiltered_count - len(scaling_options)
-                    if suppressed_count:
-                        logger.error(
-                            'Suppressed %s promoted cost-rebalance scale-up(s) '
-                            'whose pinned paid location was not explicit Spot.',
-                            suppressed_count)
                 target_num_replicas = plan.target_num_replicas
                 rollout_failure = plan.rollout_failure
                 logical_target = plan.logical_target
                 logical_retirement_floor = plan.logical_retirement_floor
                 retirement_shelter = plan.retirement_shelter
                 invalidate_logical_target = plan.invalidate_logical_target
-                ordinary_physical_overrides: list[dict[str, Any] | None] = []
-                ordinary_logical_targets: list[
-                    autoscalers.LogicalScaleTarget] = []
-                if durable_demand_promoted:
-                    ordinary_physical_overrides = [
-                        option.target
-                        for option in scaling_options
-                        if option.operator == autoscalers.
-                        AutoscalerDecisionOperator.SCALE_UP and option.reason !=
-                        autoscalers.AutoscalerDecisionReason.COST_REBALANCE and
-                        (option.target is None or
-                         isinstance(option.target, dict))
-                    ]
-                    ordinary_logical_targets = [
-                        option.target
-                        for option in scaling_options
-                        if option.operator ==
-                        autoscalers.AutoscalerDecisionOperator.SCALE_UP and
-                        option.reason != autoscalers.AutoscalerDecisionReason.
-                        COST_REBALANCE and isinstance(
-                            option.target, autoscalers.LogicalScaleTarget) and
-                        not option.target.replace_unknown_replica_ids
-                    ]
-                    for target in ordinary_logical_targets:
-                        if target.cold_launch_authority_by_accelerator is None:
-                            logger.warning(
-                                'Suppressing promoted logical paid launch '
-                                'without exact-card residual authority.')
-                            return
-                    assert ordered_paid_authority is not None
                 if not self._scale_actuation_is_current(actuation_generation,
                                                         decision_autoscaler,
                                                         decision_version):
@@ -7043,49 +7186,6 @@ class SkyServeController:
                     # earlier generation as well as suppressing this tick's
                     # aggregate-only intent.
                     self._replica_manager.invalidate_logical_target()
-                if durable_demand_promoted:
-                    zero_cost_progress = False
-                    if ordinary_physical_overrides:
-                        accepted = self._replica_manager.scale_up_batch(
-                            ordinary_physical_overrides,
-                            expected_version=decision_version,
-                            launch_priority=(
-                                decision_autoscaler.current_launch_priority()),
-                            paid_launch_allowed=False)
-                        zero_cost_progress = bool(accepted)
-                    for target in ordinary_logical_targets:
-                        zero_kwargs: dict[str, Any] = {
-                            'launch_priority': target.launch_priority,
-                            'paid_launch_allowed': False,
-                        }
-                        if target.launch_budget is not None:
-                            zero_kwargs['launch_budget'] = target.launch_budget
-                        if target.launch_priority_by_accelerator:
-                            zero_kwargs[
-                                'launch_priority_by_accelerator'] = dict(
-                                    target.launch_priority_by_accelerator)
-                        if target.target_capacity_by_accelerator:
-                            zero_kwargs[
-                                'target_capacity_by_accelerator'] = dict(
-                                    target.target_capacity_by_accelerator)
-                            zero_kwargs['accelerator_shapes'] = dict(
-                                target.accelerator_shapes)
-                        accepted = (
-                            self._replica_manager.scale_up_to_logical_capacity(
-                                target.target_capacity, target.version,
-                                target.reconcile_generation, **zero_kwargs))
-                        zero_cost_progress = zero_cost_progress or bool(
-                            accepted)
-                    if zero_cost_progress:
-                        # Replan from the newly committed zero-cost rows. Paid
-                        # residual is never inferred in the same pre-commit
-                        # snapshot.
-                        self._notify_scale_reconcile()
-                        return
-                    # Current demand, exact reserved supply and paid residual
-                    # already committed together before any local target or
-                    # zero-cost probe became visible.
-                    assert ordered_paid_authority is not None
                 # Batch consecutive SCALE_UP decisions into ONE
                 # replica-manager call: each scale_up acquires the manager
                 # lock, which the readiness-probe round holds for tens of
@@ -7121,18 +7221,13 @@ class SkyServeController:
                         return
                     aggregate_priority = (
                         producer_autoscaler.current_launch_priority())
-                    paid_authority_kwargs: dict[str, Any] = {}
-                    if ordered_paid_authority is not None:
-                        paid_authority_kwargs['paid_launch_authority'] = (
-                            ordered_paid_authority)
                     if not isinstance(
                             producer_autoscaler,
                             autoscalers.InstanceAwareRequestRateAutoscaler):
                         self._replica_manager.scale_up_batch(
                             list(pending_scale_up),  # noqa: B023
                             expected_version=expected_version,
-                            launch_priority=aggregate_priority,
-                            **paid_authority_kwargs)
+                            launch_priority=aggregate_priority)
                         pending_scale_up.clear()  # noqa: B023
                         return
 
@@ -7167,8 +7262,7 @@ class SkyServeController:
                         self._replica_manager.scale_up_batch(
                             resources_overrides,
                             expected_version=expected_version,
-                            launch_priority=launch_priority,
-                            **paid_authority_kwargs)
+                            launch_priority=launch_priority)
                     pending_scale_up.clear()  # noqa: B023
 
                 def _flush_logical_scale_down() -> None:
@@ -7242,11 +7336,6 @@ class SkyServeController:
                                         target_capacity_by_accelerator)
                                 replacement_kwargs['accelerator_shapes'] = dict(
                                     logical_scale_target.accelerator_shapes)
-                            if (scaling_option.reason != autoscalers.
-                                    AutoscalerDecisionReason.COST_REBALANCE and
-                                    ordered_paid_authority is not None):
-                                replacement_kwargs['paid_launch_authority'] = (
-                                    ordered_paid_authority)
                             self._replica_manager.scale_up_to_logical_capacity(
                                 logical_scale_target.target_capacity,
                                 logical_scale_target.version,

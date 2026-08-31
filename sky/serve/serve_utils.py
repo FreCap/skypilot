@@ -92,6 +92,7 @@ else:
 
 kueue_lane_observer = adaptors_common.LazyImport(
     'sky.serve.kueue_lane_observer')
+task_lib = adaptors_common.LazyImport('sky.task')
 
 logger: logging.Logger = sky_logging.init_logger(__name__)
 controller_transport.logger = logger
@@ -1682,6 +1683,23 @@ def validate_logical_replica_task(
                 'dynamic_fallback_per_gpu currently supports only single-node '
                 'services. Multi-node replica routing does not yet define a '
                 'safe logical capacity contract.')
+
+
+def load_task_with_service_spec(
+    yaml_content: str,
+    authoritative_service_spec: 'service_spec_lib.SkyServiceSpec | None' = None,
+) -> 'sky.Task':
+    """Load task resources while preserving one committed service policy."""
+    if authoritative_service_spec is None:
+        return task_lib.Task.from_yaml_str(yaml_content)
+    config = yaml_utils.safe_load(yaml_content)
+    if not isinstance(config, dict):
+        raise ValueError('Service task YAML must contain a mapping.')
+    config.pop('service', None)
+    config.pop('pool', None)
+    task = task_lib.Task.from_yaml_config(config)
+    task.set_service(authoritative_service_spec)
+    return task
 
 
 def resolve_replica_ingress_port(task: 'sky.Task', pool: bool) -> str:

@@ -15,6 +15,7 @@ import math
 from multiprocessing import pool as mp_pool
 import os
 import pathlib
+import pickle
 import queue
 import threading
 import time
@@ -287,23 +288,9 @@ def load_task_with_service_spec(
     yaml_content: str,
     authoritative_service_spec: 'service_spec.SkyServiceSpec | None' = None,
 ) -> task_lib.Task:
-    """Load task resources while preserving a committed service policy.
-
-    Service-policy validation evolves. Re-parsing an old committed YAML can
-    therefore reject it or silently activate new hidden defaults. When an
-    immutable pickled spec is available, parse the rest of the task without
-    the service/pool section and bind that authoritative spec afterwards.
-    """
-    if authoritative_service_spec is None:
-        return task_lib.Task.from_yaml_str(yaml_content)
-    config = yaml_utils.safe_load(yaml_content)
-    if not isinstance(config, dict):
-        raise ValueError('Service task YAML must contain a mapping.')
-    config.pop('service', None)
-    config.pop('pool', None)
-    task = task_lib.Task.from_yaml_config(config)
-    task.set_service(authoritative_service_spec)
-    return task
+    """Compatibility alias for the shared committed-policy task loader."""
+    return serve_utils.load_task_with_service_spec(yaml_content,
+                                                   authoritative_service_spec)
 
 
 @dataclasses.dataclass
@@ -330,15 +317,6 @@ class _ReplicaLaunchResult:
     replica_id: int
     planned_capacity: int
     funding: _ReplicaLaunchFunding
-
-
-@dataclasses.dataclass(frozen=True)
-class _PreparedPaidLaunch:
-    """One side-effect-free paid launch awaiting atomic Phase-A admission."""
-
-    candidate: 'paid_capacity.PaidClaimCandidate'
-    launch_result: _ReplicaLaunchResult
-    launch_thread_factory: 'Callable[[], _ReplicaLaunchThread | None]'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -396,7 +374,8 @@ class _ReplicaLaunchThread(thread_utils.SafeThread):
                  adopts_existing_bound_request: bool = False,
                  ordinary_legacy_launch: bool = False,
                  paid_claim_commit_receipt: (
-                     paid_capacity.PaidClaimBatchMemberResult | None) = None,
+                     paid_capacity.PaidClaimBatchMemberResult |
+                     paid_capacity.PaidLaunchReceiptMember | None) = None,
                  **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.replica_id = replica_id
@@ -410,16 +389,23 @@ class _ReplicaLaunchThread(thread_utils.SafeThread):
         self.adopts_existing_bound_request = adopts_existing_bound_request
         self.ordinary_legacy_launch = ordinary_legacy_launch
         self.paid_claim_commit_receipt: (
-            paid_capacity.PaidClaimBatchMemberResult | None) = None
+            paid_capacity.PaidClaimBatchMemberResult |
+            paid_capacity.PaidLaunchReceiptMember | None) = None
         if paid_claim_commit_receipt is not None:
             self.install_paid_claim_commit_receipt(paid_claim_commit_receipt)
 
     def install_paid_claim_commit_receipt(
-            self, receipt: paid_capacity.PaidClaimBatchMemberResult) -> None:
+        self, receipt: paid_capacity.PaidClaimBatchMemberResult |
+        paid_capacity.PaidLaunchReceiptMember
+    ) -> None:
         """Install the exact authoritative Phase-A result once."""
-        if (not isinstance(receipt, paid_capacity.PaidClaimBatchMemberResult) or
-                receipt.claim_result is not paid_capacity.ClaimResult.ACQUIRED
-                or receipt.replica_id != self.replica_id or
+        legacy_acquired = bool(
+            isinstance(receipt, paid_capacity.PaidClaimBatchMemberResult) and
+            receipt.claim_result is paid_capacity.ClaimResult.ACQUIRED)
+        durable_acquired = isinstance(receipt,
+                                      paid_capacity.PaidLaunchReceiptMember)
+        if (not (legacy_acquired or durable_acquired) or
+                receipt.replica_id != self.replica_id or
                 receipt.replica_record_id != self.replica_record_id):
             raise ValueError('Paid-claim commit receipt does not match its '
                              'launch worker.')
@@ -464,8 +450,9 @@ def _bound_ordinary_paid_claim_owns_provider_effect(
         return True
     receipt = launch_thread.paid_claim_commit_receipt
     return bool(
-        isinstance(receipt, paid_capacity.PaidClaimBatchMemberResult) and
-        receipt.claim_result is paid_capacity.ClaimResult.ACQUIRED and
+        ((isinstance(receipt, paid_capacity.PaidClaimBatchMemberResult) and
+          receipt.claim_result is paid_capacity.ClaimResult.ACQUIRED) or
+         isinstance(receipt, paid_capacity.PaidLaunchReceiptMember)) and
         receipt.replica_id == launch_thread.replica_id == info.replica_id and
         receipt.replica_record_id == launch_thread.replica_record_id ==
         info.replica_record_id)
@@ -3493,8 +3480,6 @@ class ReplicaManager:
         resources_overrides: list[dict[str, Any] | None],
         expected_version: int | None = None,
         launch_priority: int = (serve_constants.LB_REQUEST_PRIORITY_MIN),
-        paid_launch_authority: capacity_admission.PaidLaunchAuthority |
-        None = None,
         paid_launch_allowed: bool = True,
     ) -> list[_ReplicaLaunchResult]:
         """Scale up by len(resources_overrides) replicas in one batch.
@@ -3502,7 +3487,7 @@ class ReplicaManager:
         Subclasses may override to amortize per-call synchronization; the
         default just loops over `scale_up`.
         """
-        del launch_priority, paid_launch_authority, paid_launch_allowed
+        del launch_priority, paid_launch_allowed
         if (self._update_recovery_required or
             (expected_version is not None and
              expected_version != self.latest_version)):
@@ -3544,8 +3529,6 @@ class ReplicaManager:
         launch_priority: int = serve_constants.LB_REQUEST_PRIORITY_MIN,
         launch_priority_by_accelerator: dict[str, int] | None = None,
         cold_launch_authority_by_accelerator: dict[str, int] | None = None,
-        paid_launch_authority: capacity_admission.PaidLaunchAuthority |
-        None = None,
         paid_launch_allowed: bool = True,
     ) -> list[_ReplicaLaunchResult]:
         """Persist complete backend shapes until target capacity is covered."""
@@ -4128,6 +4111,531 @@ class SkyPilotReplicaManager(ReplicaManager):
         runtime = self._legacy_mutation_runtime_state()
         return (runtime.launch_completion_queue,
                 runtime.launch_completion_event)
+
+    def prepare_paid_launch_specs(
+        self,
+        *,
+        accelerator_shapes: Mapping[str, int],
+        max_gpu_units_by_accelerator: Mapping[str, int],
+        max_candidates: int,
+        occupied_replica_ids: Iterable[int],
+        version_authority: paid_capacity.PaidLaunchVersionAuthority,
+        aws_account_id: str | None = None,
+    ) -> tuple[paid_capacity.PaidLaunchSpec, ...]:
+        """Freeze a bounded cost-ordered Spot superset without authority I/O.
+
+        This runs before PostgreSQL knows the final target.  It therefore owns
+        no plan generation, claim, demand epoch, or launch authority.  The
+        caller may pass a per-card superset ceiling; the atomic repository is
+        free to accept a sparse subset from its final locked observation.
+
+        The only mutable inputs consulted under ``self.lock`` are the elected
+        manager configuration, its already-materialized placement catalog,
+        and numeric-ID allocator.  No database/provider operation or worker
+        construction occurs here.  Numeric IDs may be burned by a rejected
+        template; this avoids an in-process reservation object crossing the
+        transaction boundary.
+        """
+        if (type(max_candidates) is not int or max_candidates < 0 or  # pylint: disable=unidiomatic-typecheck
+                max_candidates > paid_capacity.MAX_PREPARED_LAUNCH_SPECS):
+            raise ValueError(
+                'max_candidates is outside the provider-free preparation '
+                'bound.')
+        shapes: dict[str, int] = {}
+        caps: dict[str, int] = {}
+        for raw_card, raw_width in accelerator_shapes.items():
+            card = str(raw_card).casefold()
+            if (not card or card in shapes or type(raw_width) is not int or  # pylint: disable=unidiomatic-typecheck
+                    raw_width < 1):
+                raise ValueError('accelerator_shapes is malformed.')
+            shapes[card] = raw_width
+        for raw_card, raw_cap in max_gpu_units_by_accelerator.items():
+            card = str(raw_card).casefold()
+            if (card not in shapes or card in caps or
+                    type(raw_cap) is not int or raw_cap < 0):  # pylint: disable=unidiomatic-typecheck
+                raise ValueError('max_gpu_units_by_accelerator is malformed.')
+            caps[card] = raw_cap
+        caps = {card: caps.get(card, 0) for card in shapes}
+        occupied = set(occupied_replica_ids)
+        if any(
+                type(replica_id) is not int or replica_id < 1  # pylint: disable=unidiomatic-typecheck
+                for replica_id in occupied):
+            raise ValueError('occupied_replica_ids is malformed.')
+        if max_candidates == 0 or not any(caps.values()):
+            return ()
+        if not isinstance(version_authority,
+                          paid_capacity.PaidLaunchVersionAuthority):
+            raise ValueError('Paid launch version authority is malformed.')
+
+        with self.lock:
+            if self._update_recovery_required or self._is_pool:
+                return ()
+            placer = self._spot_placer
+            authority = self._ordinary_launch_binding_authority
+            service_hash = self._service_hash
+            if (placer is None or authority is None or
+                    not authority.generic_launches_required or
+                    not isinstance(service_hash, str) or not service_hash or
+                    authority.service_name != self._service_name or
+                    authority.service_hash != service_hash or
+                    authority.service_workspace != self._workspace):
+                return ()
+            version = self.latest_version
+            local_launch_spec = self._version_specs.get(version)
+            if local_launch_spec is None:
+                # Preparation is deliberately database-free.  A controller
+                # without its elected immutable spec retries after recovery.
+                return ()
+            try:
+                launch_spec = pickle.loads(version_authority.service_spec)
+            except Exception:  # pylint: disable=broad-except
+                return ()
+            if type(launch_spec) is not type(local_launch_spec):
+                return ()
+            launch_yaml_content = self.yaml_content
+            launch_task_template = load_task_with_service_spec(
+                launch_yaml_content, launch_spec)
+            replica_port = _get_resources_ports(launch_yaml_content,
+                                                launch_spec,
+                                                launch_task_template)
+            controller_config_path = (
+                serve_utils.generate_versioned_config_yaml_file_name(
+                    self._service_name, version, self._resource_scope))
+            num_nodes = placer.num_nodes
+            if (type(num_nodes) is not int or num_nodes < 1):  # pylint: disable=unidiomatic-typecheck
+                return ()
+            placement_catalog = placer.placement_catalog.to_dict()
+            placement_catalog_sha256 = (
+                paid_capacity.paid_launch_payload_sha256(placement_catalog))
+            catalog_entries = {
+                entry.location: entry for entry in placer.ranked_catalog_entries
+            }
+            ranked_locations = []
+            for location in placer.ranked_active_locations():
+                cloud = str(location.cloud).casefold()
+                accelerators = location.accelerators
+                if (location.use_spot is not True or
+                        cloud not in ('aws', 'gcp') or
+                        location.instance_type is None or
+                        not isinstance(accelerators, dict) or
+                        len(accelerators) != 1):
+                    continue
+                raw_card, raw_width = next(iter(accelerators.items()))
+                card = str(raw_card).casefold()
+                if (card not in shapes or type(raw_width) is not int or  # pylint: disable=unidiomatic-typecheck
+                        raw_width != shapes[card]):
+                    continue
+                catalog_entry = catalog_entries.get(location)
+                if (catalog_entry is None or
+                        not math.isfinite(catalog_entry.hourly_cost) or
+                        catalog_entry.hourly_cost <= 0 or
+                        not math.isfinite(catalog_entry.normalized_hourly_cost)
+                        or catalog_entry.normalized_hourly_cost <= 0):
+                    # An unpriced or stale catalog member cannot become paid
+                    # provider authority.  Keep trying exact priced pools.
+                    continue
+                ranked_locations.append(
+                    (location, cloud, card, raw_width, catalog_entry.rank))
+            if not ranked_locations:
+                return ()
+
+            prepared: list[paid_capacity.PaidLaunchSpec] = []
+            remaining = dict(caps)
+            per_pool_window = paid_capacity.base_limit()
+            exploration_round = 0
+            while len(prepared) < max_candidates:
+                made_progress = False
+                for location, cloud, card, width, catalog_rank in ranked_locations:
+                    physical_gpu_units = width * num_nodes
+                    for pool_slot in range(per_pool_window):
+                        if (len(prepared) >= max_candidates or
+                                remaining[card] < physical_gpu_units):
+                            break
+                        try:
+                            exact_pool_key = paid_capacity.pool_key(
+                                location,
+                                workspace=self._workspace,
+                                num_nodes=num_nodes,
+                                aws_account_id=aws_account_id)
+                        except ValueError:
+                            # AWS account identity is intentionally not
+                            # resolved here: that would be provider I/O under
+                            # the manager lock. A catalog without a frozen
+                            # account contributes no provider-free template.
+                            break
+                        while self._next_replica_id in occupied:
+                            self._next_replica_id += 1
+                        replica_id = self._next_replica_id
+                        self._next_replica_id += 1
+                        occupied.add(replica_id)
+                        replica_record_id = str(uuid.uuid4())
+                        cluster_name = (
+                            serve_utils.generate_replica_cluster_name(
+                                self._service_name, replica_id,
+                                self._resource_scope))
+                        log_file_name = (
+                            serve_utils.generate_replica_launch_log_file_name(
+                                self._service_name, replica_id,
+                                self._resource_scope))
+                        raw_override = location.to_dict()
+                        raw_override['cloud'] = cloud
+                        storage_override = _encode_replica_resource_state(
+                            raw_override)
+                        assert storage_override is not None
+                        planned_capacity = (width if self._uses_logical_replicas
+                                            else 1)
+                        frozen_override = (
+                            paid_capacity.freeze_paid_launch_payload(
+                                storage_override))
+                        worker_construction = (
+                            paid_capacity.freeze_paid_launch_payload({
+                                'schema_version': 1,
+                                'launch_yaml_content': launch_yaml_content,
+                                'cluster_name': cluster_name,
+                                'log_file_name': log_file_name,
+                                'resources_override': storage_override,
+                                'retry_until_up': False,
+                                'frozen_controller_config_path': controller_config_path,
+                            }))
+                        pool_payload = paid_capacity.pool_key_payload(
+                            exact_pool_key)
+                        assert pool_payload is not None
+                        provider_identity = pool_payload.get(
+                            'provider_identity')
+                        provider_account = (
+                            provider_identity.get('aws_account_id')
+                            if isinstance(provider_identity, dict) else None)
+                        paid_spec = paid_capacity.PaidLaunchSpec(
+                            ordinal=len(prepared),
+                            service_name=self._service_name,
+                            service_hash=service_hash,
+                            service_lifecycle_epoch=(
+                                authority.service_lifecycle_epoch),
+                            service_version=version,
+                            replica_id=replica_id,
+                            replica_record_id=replica_record_id,
+                            cluster_name_seed=cluster_name,
+                            worker_construction=worker_construction,
+                            provider_account=provider_account,
+                            cloud=cloud,
+                            workspace=self._workspace,
+                            region=location.region,
+                            zone=location.zone,
+                            instance_type=location.instance_type,
+                            pool_key=exact_pool_key,
+                            frontier_key=paid_capacity.frontier_key(location),
+                            accelerator=card,
+                            gpu_units_per_node=width,
+                            num_nodes=num_nodes,
+                            resources_override=frozen_override,
+                            catalog_evidence=(
+                                paid_capacity.PaidLaunchCatalogEvidence(
+                                    placement_catalog_sha256=(
+                                        placement_catalog_sha256),
+                                    catalog_rank=catalog_rank,
+                                    exploration_round=exploration_round,
+                                    slot_within_pool_window=pool_slot,
+                                    version_authority=version_authority)))
+                        # Exercise the same complete row constructor used by
+                        # PostgreSQL without giving this seed clock authority.
+                        paid_capacity.build_pristine_paid_replica_state(
+                            paid_spec,
+                            replica_port=replica_port,
+                            planned_capacity=planned_capacity,
+                            created_at=None)
+                        prepared.append(paid_spec)
+                        remaining[card] -= physical_gpu_units
+                        made_progress = True
+                if not made_progress:
+                    break
+                exploration_round += 1
+            return tuple(prepared)
+
+    def _build_paid_launch_worker_postcommit(
+        self,
+        spec: paid_capacity.PaidLaunchSpec,
+        member: paid_capacity.PaidLaunchReceiptMember,
+        info: ReplicaInfo,
+    ) -> tuple[_ReplicaLaunchThread, _ReplicaLaunchResult]:
+        """Construct one normal bound worker from an acknowledged commit."""
+        worker = paid_capacity.thaw_paid_launch_payload(
+            spec.worker_construction)
+        stored_override = paid_capacity.thaw_paid_launch_payload(
+            spec.resources_override)
+        expected_worker_fields = {
+            'schema_version', 'launch_yaml_content', 'cluster_name',
+            'log_file_name', 'resources_override', 'retry_until_up',
+            'frozen_controller_config_path'
+        }
+        if (set(worker) != expected_worker_fields or
+                worker['schema_version'] != 1 or
+                worker['cluster_name'] != spec.cluster_name_seed or
+                worker['resources_override'] != stored_override or
+                worker['retry_until_up'] is not False):
+            raise ValueError('Paid launch frozen construction is inconsistent.')
+        expected_plan_units = (spec.gpu_units_per_node
+                               if self._uses_logical_replicas else 1)
+        if (member.plan_units != expected_plan_units or
+                member.physical_gpu_units != spec.physical_gpu_units):
+            raise ValueError('Paid launch committed capacity shape disagrees.')
+
+        authority = self._ordinary_launch_binding_authority
+        if (authority is None or not authority.generic_launches_required or
+                authority.service_name != spec.service_name or
+                authority.service_hash != spec.service_hash or
+                authority.service_lifecycle_epoch
+                != spec.service_lifecycle_epoch):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Committed paid launch lost promoted binding authority.')
+        profile_kind = ordinary_launch_binding.classify_non_pool_launch_profile(
+            info)
+        if (profile_kind is not ordinary_launch_binding.
+                NonPoolLaunchProfileKind.ORDINARY_PAID):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Committed paid launch has no ordinary-paid profile.')
+        local_launch_spec = self._version_specs.get(spec.service_version)
+        if local_launch_spec is None:
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Committed paid launch lost its elected service spec.')
+        try:
+            launch_spec = pickle.loads(
+                spec.catalog_evidence.version_authority.service_spec)
+        except Exception as error:  # pylint: disable=broad-except
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Committed paid launch has a corrupt elected service spec.'
+            ) from error
+        if type(launch_spec) is not type(local_launch_spec):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Committed paid launch has a mismatched service spec type.')
+        launch_yaml_content = worker['launch_yaml_content']
+        if not isinstance(launch_yaml_content, str):
+            raise ValueError('Paid launch YAML construction is malformed.')
+        version_authority = spec.catalog_evidence.version_authority
+        frozen_controller_config = (
+            serve_utils.parse_and_validate_version_controller_config(
+                version_authority.controller_config, self._workspace,
+                'committed paid launch controller config'))
+        task_template = load_task_with_service_spec(launch_yaml_content,
+                                                    launch_spec)
+        replica_port = _get_resources_ports(launch_yaml_content, launch_spec,
+                                            task_template)
+        expected_state = paid_capacity.build_pristine_paid_replica_state(
+            spec,
+            replica_port=replica_port,
+            planned_capacity=expected_plan_units,
+            created_at=info.created_at)
+        if info.to_storage_dict() != expected_state:
+            raise ValueError(
+                'Committed paid replica is not the pristine database state.')
+        decoded_override = _decode_replica_resource_state(stored_override)
+        location = spot_placer.Location.from_resources_override(
+            decoded_override)
+        if location is None:
+            raise ValueError('Paid launch location cannot be reconstructed.')
+        resources_override = location.to_dict()
+        bound_task = _build_replica_launch_task(
+            launch_yaml_content,
+            spec.replica_id,
+            resources_override,
+            exact_resources_override=True,
+            authoritative_service_spec=launch_spec,
+            service_name=self._service_name,
+            task_template=task_template)
+        bound_cloud = next(iter(bound_task.resources)).cloud
+        launch_fence = self._bound_ordinary_launch_fence_context(
+            info, spec.service_version)
+        submission_id = (
+            request_postgres.stable_bound_ordinary_launch_submission_id(
+                self._service_name, info.replica_id, info.replica_record_id))
+        inspect_bound, reduce_bound, cancel_bound = (
+            self._bound_ordinary_launch_callbacks(info, bound_cloud))
+        completion_queue, completion_event = self._launch_completion_state()
+        teardown_requested = threading.Event()
+        launch_thread_ref: list[_ReplicaLaunchThread | None] = [None]
+
+        def _cloud_launch_guard() -> bool | tuple[bool, str]:
+            generation = self._queued_launch_generation_decision(
+                spec.service_version)
+            if not generation[0]:
+                return generation
+            launch_thread = launch_thread_ref[0]
+            if (launch_thread is None or
+                    not _bound_ordinary_paid_claim_owns_provider_effect(
+                        info, launch_thread=launch_thread)):
+                return False, 'missing-committed-paid-receipt'
+            return generation
+
+        launch_kwargs: dict[str, Any] = {
+            'availability_max_retry': 1,
+            'exact_resources_override': True,
+            'pre_launch_guard':
+                self._ordinary_binding_profile_launch_is_authorized,
+            'cloud_launch_guard': _cloud_launch_guard,
+            'supersession_guard': functools.partial(
+                self._queued_launch_generation_decision, spec.service_version),
+            'continue_guard': self._launch_owner_watchdog_allows_continue,
+            'cleanup_continue_guard': self._service_is_cleanup_authorized,
+            'launch_fence': launch_fence,
+            'service_spec': launch_spec,
+            'task_template': task_template,
+            'service_name': self._service_name,
+            'workspace': self._workspace,
+            'frozen_controller_config': frozen_controller_config,
+            'frozen_controller_config_path':
+                worker['frozen_controller_config_path'],
+            'ordinary_launch_submission_uuid': submission_id,
+            'non_pool_launch_profile_kind': profile_kind.value,
+            'inspect_bound_ordinary_launch': inspect_bound,
+            'reduce_bound_ordinary_launch': reduce_bound,
+            'cancel_bound_ordinary_launch': cancel_bound,
+        }
+        input_digest = ordinary_launch_handoff.redacted_input_digest(
+            launch_yaml_content, resources_override)
+        if input_digest is not None:
+            launch_kwargs['ordinary_launch_handoff_context'] = {
+                'context_version':
+                    serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_VERSION,
+                'service_name': self._service_name,
+                'service_version': spec.service_version,
+                'replica_id': spec.replica_id,
+                'replica_record_id': spec.replica_record_id,
+                'controller_route_epoch':
+                    self._ordinary_launch_handoff_route_epoch,
+                'input_digest': input_digest,
+            }
+            launch_kwargs['ordinary_launch_event'] = functools.partial(
+                self._emit_ordinary_launch_handoff_event,
+                info,
+                input_digest=input_digest,
+                allow_demoted_candidate=False)
+        launch_thread = _ReplicaLaunchThread(
+            target=launch_cluster_with_frozen_controller_config,
+            replica_id=spec.replica_id,
+            replica_record_id=spec.replica_record_id,
+            service_hash=self._service_hash,
+            controller_owner=self._controller_owner,
+            teardown_requested=teardown_requested,
+            completion_queue=completion_queue,
+            completion_event=completion_event,
+            bound_ordinary_launch=True,
+            ordinary_legacy_launch=False,
+            paid_claim_commit_receipt=member,
+            args=(spec.replica_id, launch_yaml_content,
+                  spec.cluster_name_seed, worker['log_file_name'],
+                  self._legacy_mutation_runtime_state().replica_to_request_id,
+                  resources_override, False),
+            kwargs={
+                **launch_kwargs,
+                'teardown_requested': teardown_requested,
+            })
+        launch_thread_ref[0] = launch_thread
+        return (launch_thread,
+                _ReplicaLaunchResult(replica_id=spec.replica_id,
+                                     planned_capacity=expected_plan_units,
+                                     funding=_ReplicaLaunchFunding.PAID))
+
+    def materialize_paid_launch_receipt(
+        self,
+        receipt: paid_capacity.PaidLaunchReceipt,
+        prepared_specs: Iterable[paid_capacity.PaidLaunchSpec],
+    ) -> tuple[_ReplicaLaunchResult, ...]:
+        """Build and publish only the acknowledged sparse committed subset.
+
+        Exact row reads and every worker construction happen before the short
+        manager-lock publication section.  Fresh acknowledged members do not
+        have associations yet: the normal bound worker creates the unchanged
+        association/request/queue/pin graph when the shared launch executor
+        grants it a process slot.  Association read/adoption remains solely an
+        ambiguity and restart-recovery path.
+        """
+        if not isinstance(receipt, paid_capacity.PaidLaunchReceipt):
+            raise TypeError('receipt must be a PaidLaunchReceipt.')
+        specs = tuple(prepared_specs)
+        if any(not isinstance(spec, paid_capacity.PaidLaunchSpec)
+               for spec in specs):
+            raise TypeError('prepared_specs contains a non-launch spec.')
+        spec_by_identity = {
+            (spec.replica_id, spec.replica_record_id): spec for spec in specs
+        }
+        if len(spec_by_identity) != len(specs):
+            raise ValueError('Prepared paid launch identities must be unique.')
+        authority = self._ordinary_launch_binding_authority
+        if (receipt.service_name != self._service_name or
+                receipt.service_hash != self._service_hash or
+                receipt.service_version != self.latest_version or
+                authority is None or not authority.generic_launches_required or
+                receipt.service_lifecycle_epoch
+                != authority.service_lifecycle_epoch):
+            raise ValueError('Paid launch receipt is stale for this manager.')
+
+        built: list[tuple[ReplicaInfo, _ReplicaLaunchThread,
+                          _ReplicaLaunchResult]] = []
+        recovery_identities: list[_PaidPhaseARecoveryIdentity] = []
+        try:
+            committed_by_identity = {
+                (info.replica_id, info.replica_record_id): info
+                for info in serve_state.get_replica_infos(self._service_name)
+            }
+            for member in receipt.members:
+                identity = (member.replica_id, member.replica_record_id)
+                recovery_identities.append(
+                    _PaidPhaseARecoveryIdentity(member.replica_id,
+                                                member.replica_record_id))
+                spec = spec_by_identity.get(identity)
+                if (spec is None or spec.service_name != receipt.service_name or
+                        spec.service_hash != receipt.service_hash or
+                        spec.service_lifecycle_epoch
+                        != receipt.service_lifecycle_epoch or
+                        spec.service_version != receipt.service_version or
+                        spec.pool_key != member.pool_key or
+                        spec.accelerator != member.accelerator or
+                        spec.physical_gpu_units != member.physical_gpu_units):
+                    raise ValueError(
+                        'Paid launch receipt member has no exact prepared spec.'
+                    )
+                info = committed_by_identity.get(identity)
+                if info is None:
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Committed paid receipt lost its exact replica row.')
+                launch_thread, launch_result = (
+                    self._build_paid_launch_worker_postcommit(
+                        spec, member, info))
+                built.append((info, launch_thread, launch_result))
+        except BaseException:
+            self._enqueue_paid_phase_a_recovery_identities(recovery_identities)
+            raise
+
+        published: list[_ReplicaLaunchResult] = []
+        try:
+            with self.lock:
+                runtime = self._legacy_mutation_runtime_state()
+                for info, launch_thread, _ in built:
+                    existing = runtime.launch_thread_pool.get(info.replica_id)
+                    if (existing is not None and
+                            getattr(existing, 'replica_record_id',
+                                    None) != info.replica_record_id):
+                        raise _BoundOrdinaryLaunchUnresolvedError(
+                            'Committed paid receipt collided with another '
+                            'local replica worker.')
+                for info, launch_thread, launch_result in built:
+                    existing = runtime.launch_thread_pool.get(info.replica_id)
+                    if existing is None:
+                        # Fresh bound workers publish their request ID only
+                        # after generic binding commits.  Association adopters
+                        # use `_register_bound_launch_adopter`; this path must
+                        # not manufacture a process-local request pointer.
+                        runtime.launch_thread_pool[info.replica_id] = (
+                            launch_thread)
+                    published.append(launch_result)
+                if published:
+                    runtime.launch_completion_event.set()
+        except BaseException:
+            published_ids = {result.replica_id for result in published}
+            self._enqueue_paid_phase_a_recovery_identities(
+                identity for identity in recovery_identities
+                if identity.replica_id not in published_ids)
+            raise
+        return tuple(published)
 
     def _join_notified_launch_workers(self) -> None:
         """Join completion callbacks before the reducer checks is_alive()."""
@@ -6998,8 +7506,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         prior_yaml_content: str | None = None,
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
         paid_location_launch_budget: paid_capacity.LaunchBudget | None = None,
-        paid_launch_authority: capacity_admission.PaidLaunchAuthority |
-        None = None,
         paid_launch_allowed: bool = True,
         launch_priority: int = serve_constants.LB_REQUEST_PRIORITY_MIN,
         recovering_existing_replica: bool = False,
@@ -7011,15 +7517,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         require_preinitialized_physical_fence: bool = False,
         zero_cost_actuation_lease: (zero_cost_actuation.IntentLease |
                                     None) = None,
-        prepared_paid_launches: list[_PreparedPaidLaunch] | None = None,
     ) -> _ReplicaLaunchResult | None:
         """Enqueue one replica launch.
 
-        Returns immutable accounting facts after a launch is durably accepted
-        or staged for its caller-owned atomic paid wave, and None when no
-        launch is accepted. A zero-cost-only fill launch is skipped when no
-        zero-cost location is ACTIVE, and the skip must leak nothing -- no
-        replica row, no launch thread.
+        Returns immutable accounting facts after a launch is durably accepted,
+        and None when no launch is accepted. A zero-cost-only fill launch is
+        skipped when no zero-cost location is ACTIVE, and the skip must leak
+        nothing -- no replica row, no launch thread.
 
         prior_is_zero_cost: placement-cost provenance of a recovery row. The
         recovered exact pin remains on the same capacity, so preserve it even
@@ -7078,11 +7582,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         capture prepared outside the manager lock and never initialize one at
         the persistence seam.
 
-        prepared_paid_launches: optional wave-owned staging sink for fresh
-        globally managed paid launches. Eligible launches freeze their exact
-        replica, location, and worker here without writing or registering the
-        worker. The caller admits the complete sink in one PostgreSQL
-        transaction and publishes only its committed members.
         """
         if self._update_recovery_required:
             logger.info(
@@ -7289,17 +7788,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                 logger.info('Deferring demand launch without paid authority: '
                             'no placer can prove a zero-cost location.')
             return None
-        if (paid_launch_authority is not None and self._spot_placer is None and
-                not use_spot):
-            # A committed planner residual authorizes prospective Spot only.
-            # Without a placer there is no independent location witness that
-            # can turn an ordinary on-demand task into an exact Spot pin.
-            # Narrow this fence to planner-authorized launches so generic
-            # SkyServe services retain their existing on-demand behavior.
-            logger.error(
-                'Deferring planner-authorized paid launch because no Spot '
-                'placer can prove an exact Spot location.')
-            return None
         # A fill launch must reach the placer even though zero-cost k8s
         # entries are use_spot=False (the _should_use_spot gate above keys
         # on the task/override spot-ness, which says nothing about fill).
@@ -7330,9 +7818,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             if (binding_authority is not None and
                     binding_authority.generic_launches_required and
                     location.use_spot is not True):
-                # Cost rebalance predates durable capacity planning and does
-                # not carry PaidLaunchAuthority.  Once protocol-v2 owns every
-                # ordinary launch, its replacement path must obey the same
+                # Cost rebalance predates durable capacity planning. Once
+                # protocol-v2 owns every ordinary launch, its replacement
+                # path must obey the same
                 # prospective-Spot-only contract before creating a row or a
                 # launch worker.  Legacy/generic Serve remains unchanged.
                 logger.error(
@@ -7443,23 +7931,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                 allowed_locations = (
                     pool_allowed if allowed_locations is None else
                     allowed_locations.intersection(pool_allowed))
-            if paid_launch_authority is not None:
-                # A committed paid residual is prospective Spot authority,
-                # not permission to fall through to ordinary on-demand.  Keep
-                # generic SkyServe placement unchanged by narrowing only the
-                # planner-authorized launch handoff.  Zero-cost Kubernetes is
-                # still eligible on its independent reservation path.
-                zero_cost_locations = set(
-                    self._spot_placer.zero_cost_locations())
-                spot_or_zero_cost = {
-                    candidate
-                    for candidate in self._spot_placer.active_locations()
-                    if candidate in zero_cost_locations or
-                    candidate.use_spot is True
-                }
-                allowed_locations = (
-                    spot_or_zero_cost if allowed_locations is None else
-                    allowed_locations.intersection(spot_or_zero_cost))
             allowed_location_kwargs: dict[str, Any] = (
                 {} if allowed_locations is None else {
                     'allowed_locations': allowed_locations
@@ -7477,12 +7948,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'Deferring demand launch without paid authority: no '
                         'ACTIVE zero-cost location matches exact accelerator '
                         f'override {resources_override["accelerators"]!r}.')
-                    return None
-                if paid_launch_authority is not None:
-                    logger.info(
-                        'Deferring planner-authorized paid launch because no '
-                        'Spot location matches exact accelerator override '
-                        f'{resources_override["accelerators"]!r}.')
                     return None
                 raise ValueError(
                     'No active placement location matches exact accelerator '
@@ -7724,8 +8189,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 None if allowed_locations is None else {
                                     paid_capacity.frontier_key(candidate)
                                     for candidate in allowed_locations
-                                }),
-                            paid_launch_authority=paid_launch_authority))
+                                })))
                 assert paid_location_launch_budget is not None
                 if self._demand_should_skip_zero_cost(existing_replica_infos):
                     # The broker grant or speculative-probe budget says this
@@ -7792,19 +8256,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             if location is None:
                 logger.info('Deferring demand launch because every active paid '
                             'location is awaiting launch feedback.')
-                return None
-            if (paid_launch_authority is not None and
-                    location not in self._spot_placer.zero_cost_locations() and
-                    location.use_spot is not True):
-                # Paid residual is narrowly prospective Spot authority.  Keep
-                # the final handoff fail-closed even if a stale or custom
-                # placer returns an ordinary on-demand cloud entry.  Reserved
-                # zero-cost Kubernetes placement remains a separate path.
-                self._release_unstarted_location_retry(location)
-                logger.error(
-                    'Deferring planner-authorized paid launch because the '
-                    'selected non-zero-cost location is not Spot: %s.',
-                    location)
                 return None
             debit_paid_location_launch_budget = (
                 paid_location_launch_budget is not None and
@@ -8545,42 +8996,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                     return None
                 raise
 
-        capacity_plan_claim: Mapping[str, Any] | None = None
-        if debit_paid_location_launch_budget:
-            assert location is not None
-            try:
-                capacity_plan_claim = (
-                    None if paid_launch_authority is None else
-                    paid_launch_authority.claim_values(
-                        (str(next(iter(location.accelerators))).casefold()
-                         if location.accelerators and len(location.accelerators)
-                         == 1 else capacity_admission.AGGREGATE_ACCELERATOR),
-                        planned_capacity))
-            except capacity_admission.CapacityAdmissionError as error:
-                self._release_unstarted_location_retry(location)
-                logger.info(
-                    'Deferring paid demand launch because its ordered '
-                    'capacity authority changed: %s',
-                    common_utils.format_exception(error))
-                return None
-        stage_paid_launch = bool(
-            prepared_paid_launches is not None and
-            debit_paid_location_launch_budget and
-            paid_launch_authority is not None and
-            paid_location_launch_budget is not None and
-            paid_location_launch_budget.globally_managed and
-            not recovering_existing_replica and
-            cost_rebalance_for_replica_id is None and
-            not prior_unknown_capacity_replacement and recovery_intent is None)
-        if stage_paid_launch:
-            assert location is not None
-            assert paid_location_launch_budget is not None
-            # Generic ORDINARY_PAID classification happens while the worker
-            # is frozen, before Phase A. Carry the exact candidate pool on the
-            # in-memory row now; only the batch transaction can persist it.
-            info.paid_capacity_pool_key = (
-                paid_location_launch_budget.pool_key_by_location[location])
-
         logical_state_guard = (self._logical_state_lock
                                if logical_reconcile_fence is not None else
                                contextlib.nullcontext())
@@ -8624,90 +9039,73 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if debit_paid_location_launch_budget:
                     assert location is not None
                     assert paid_location_launch_budget is not None
-                    if stage_paid_launch:
-                        # The wave caller owns Phase A. Keep this exact
-                        # identity unpersisted and unregistered until every
-                        # candidate has been frozen and one atomic transaction
-                        # returns its authoritative sparse result.
-                        pass
-                    else:
-                        try:
-                            claim_result = paid_capacity.try_persist_claim(
-                                service_name=self._service_name,
-                                service_hash=self._service_hash,
-                                controller_owner=self._controller_owner,
+                    claim_result = paid_capacity.try_persist_claim(
+                        service_name=self._service_name,
+                        service_hash=self._service_hash,
+                        controller_owner=self._controller_owner,
+                        replica_id=replica_id,
+                        replica_info=info,
+                        location=location,
+                        budget=paid_location_launch_budget,
+                        priority=launch_priority)
+                    if claim_result is paid_capacity.ClaimResult.ACQUIRED:
+                        # The singleton helper is the one-member form of the
+                        # committed Phase-A transaction. Preserve its exact
+                        # identity on the private worker instead of inferring
+                        # commitment from the pre-commit pool key carried by
+                        # ReplicaInfo.
+                        paid_claim_commit_receipt = (
+                            paid_capacity.PaidClaimBatchMemberResult(
                                 replica_id=replica_id,
-                                replica_info=info,
-                                location=location,
-                                budget=paid_location_launch_budget,
-                                priority=launch_priority,
-                                capacity_plan_claim=capacity_plan_claim)
-                        except capacity_admission.CapacityAdmissionError as error:
-                            self._release_unstarted_location_retry(location)
-                            logger.info(
-                                'Deferring paid demand launch because its '
-                                'ordered capacity authority changed: %s',
-                                common_utils.format_exception(error))
-                            return None
-                        if claim_result is paid_capacity.ClaimResult.ACQUIRED:
-                            # The singleton helper is the one-member form of
-                            # the same committed Phase-A transaction. Preserve
-                            # its exact identity on the private worker instead
-                            # of inferring commitment from the pre-commit pool
-                            # key carried by ReplicaInfo.
-                            paid_claim_commit_receipt = (
-                                paid_capacity.PaidClaimBatchMemberResult(
-                                    replica_id=replica_id,
-                                    replica_record_id=info.replica_record_id,
-                                    claim_result=claim_result))
-                        if claim_result not in (
-                                paid_capacity.ClaimResult.ACQUIRED,
-                                paid_capacity.ClaimResult.LEGACY_LOCAL):
-                            # Selection consumes an expired bench's one-probe
-                            # reservation. An admission rejection never reached
-                            # the provider, so release that reservation instead
-                            # of silently extending the durable cooldown.
-                            assert self._spot_placer is not None
-                            self._spot_placer.release_retry(location)
-                            self._persist_spot_placement_state_if_dirty()
-                        if (claim_result ==
-                                paid_capacity.ClaimResult.FEEDBACK_PENDING):
-                            paid_capacity.defer_for_feedback(
-                                paid_location_launch_budget, location)
-                            logger.info('Deferring paid demand launch at '
-                                        f'{location}: {claim_result.value}.')
-                            return None
-                        if claim_result == paid_capacity.ClaimResult.SATURATED:
-                            paid_capacity.exhaust(paid_location_launch_budget,
-                                                  location)
-                            logger.info('Deferring paid demand launch at '
-                                        f'{location}: {claim_result.value}.')
-                            return None
-                        if (claim_result ==
-                                paid_capacity.ClaimResult.SERVICE_SATURATED):
-                            paid_capacity.exhaust_service(
-                                paid_location_launch_budget)
-                            logger.info(
-                                'Deferring paid demand launch because the '
-                                'service paid-capacity envelope is full.')
-                            return None
-                        if (claim_result == paid_capacity.ClaimResult.
-                                HIGHER_PRIORITY_WAITING):
-                            paid_capacity.defer_for_priority(
-                                paid_location_launch_budget, location)
-                            logger.info('Deferring paid demand launch at '
-                                        f'{location}: {claim_result.value}.')
-                            return None
-                        if claim_result == paid_capacity.ClaimResult.OWNERSHIP_LOST:
-                            raise RuntimeError(
-                                f'Service {self._service_name!r} controller '
-                                'ownership changed while claiming paid '
-                                'capacity.')
-                        if claim_result == paid_capacity.ClaimResult.LEGACY_LOCAL:
-                            if recovering_existing_replica:
-                                self._persist_replica(replica_id, info)
-                            else:
-                                self._persist_new_replica(replica_id, info)
+                                replica_record_id=info.replica_record_id,
+                                claim_result=claim_result))
+                    if claim_result not in (
+                            paid_capacity.ClaimResult.ACQUIRED,
+                            paid_capacity.ClaimResult.LEGACY_LOCAL):
+                        # Selection consumes an expired bench's one-probe
+                        # reservation. An admission rejection never reached
+                        # the provider, so release that reservation instead of
+                        # silently extending the durable cooldown.
+                        assert self._spot_placer is not None
+                        self._spot_placer.release_retry(location)
+                        self._persist_spot_placement_state_if_dirty()
+                    if (claim_result ==
+                            paid_capacity.ClaimResult.FEEDBACK_PENDING):
+                        paid_capacity.defer_for_feedback(
+                            paid_location_launch_budget, location)
+                        logger.info('Deferring paid demand launch at '
+                                    f'{location}: {claim_result.value}.')
+                        return None
+                    if claim_result == paid_capacity.ClaimResult.SATURATED:
+                        paid_capacity.exhaust(paid_location_launch_budget,
+                                              location)
+                        logger.info('Deferring paid demand launch at '
+                                    f'{location}: {claim_result.value}.')
+                        return None
+                    if (claim_result ==
+                            paid_capacity.ClaimResult.SERVICE_SATURATED):
+                        paid_capacity.exhaust_service(
+                            paid_location_launch_budget)
+                        logger.info(
+                            'Deferring paid demand launch because the service '
+                            'paid-capacity envelope is full.')
+                        return None
+                    if (claim_result ==
+                            paid_capacity.ClaimResult.HIGHER_PRIORITY_WAITING):
+                        paid_capacity.defer_for_priority(
+                            paid_location_launch_budget, location)
+                        logger.info('Deferring paid demand launch at '
+                                    f'{location}: {claim_result.value}.')
+                        return None
+                    if claim_result == paid_capacity.ClaimResult.OWNERSHIP_LOST:
+                        raise RuntimeError(
+                            f'Service {self._service_name!r} controller '
+                            'ownership changed while claiming paid capacity.')
+                    if claim_result == paid_capacity.ClaimResult.LEGACY_LOCAL:
+                        if recovering_existing_replica:
+                            self._persist_replica(replica_id, info)
+                        else:
+                            self._persist_new_replica(replica_id, info)
                 else:
                     if recovering_existing_replica:
                         self._persist_replica(replica_id, info)
@@ -8741,26 +9139,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._demote_system_recovery_candidate, replica_id,
                     recovery_intent),
             }
-        if stage_paid_launch:
-            assert prepared_paid_launches is not None
-            assert location is not None
-            if existing_replica_infos is not None:
-                # Candidate selection shares one mutable wave snapshot. Keep
-                # this exact uncommitted row visible to later placements; the
-                # Phase-A receipt removes rejected candidates below.
-                existing_replica_infos.append(info)
-            prepared_paid_launches.append(
-                _PreparedPaidLaunch(candidate=paid_capacity.PaidClaimCandidate(
-                    replica_id=replica_id,
-                    replica_info=info,
-                    location=location,
-                    priority=launch_priority,
-                    capacity_plan_claim=capacity_plan_claim),
-                                    launch_result=launch_result,
-                                    launch_thread_factory=functools.partial(
-                                        _make_launch_thread,
-                                        recovery_launch_kwargs)))
-            return launch_result
         t = _make_launch_thread(recovery_launch_kwargs)
         assert t is not None
         if existing_replica_infos is not None:
@@ -9209,8 +9587,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         existing_replica_infos: list['ReplicaInfo'] | None = None,
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
         paid_location_launch_budget: paid_capacity.LaunchBudget | None = None,
-        paid_launch_authority: capacity_admission.PaidLaunchAuthority |
-        None = None,
         logical_reconcile_fence: LogicalCapacityTarget | None = None,
         logical_reconcile_fence_requires_exact_generation: bool = False,
         unknown_capacity_replacement: bool = False,
@@ -9223,7 +9599,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         require_preinitialized_physical_fence: bool = False,
         zero_cost_actuation_lease: (zero_cost_actuation.IntentLease |
                                     None) = None,
-        prepared_paid_launches: list[_PreparedPaidLaunch] | None = None,
     ) -> _ReplicaLaunchResult | None:
         """Allocate an id and enqueue one replica launch. Lock must be held.
 
@@ -9262,9 +9637,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                             unknown_capacity_replacement_authorization)
             if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
                 direct_launch_kwargs['launch_priority'] = launch_priority
-            if paid_launch_authority is not None:
-                direct_launch_kwargs['paid_launch_authority'] = (
-                    paid_launch_authority)
             if not paid_launch_allowed:
                 direct_launch_kwargs['paid_launch_allowed'] = False
             if provider_phase_admission is not None:
@@ -9278,9 +9650,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             if zero_cost_actuation_lease is not None:
                 direct_launch_kwargs['zero_cost_actuation_lease'] = (
                     zero_cost_actuation_lease)
-            if prepared_paid_launches is not None:
-                direct_launch_kwargs['prepared_paid_launches'] = (
-                    prepared_paid_launches)
             launch_result = self._launch_replica(self._next_replica_id,
                                                  resources_override,
                                                  **direct_launch_kwargs)
@@ -9294,8 +9663,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             if paid_location_launch_budget is not None:
                 launch_kwargs['paid_location_launch_budget'] = (
                     paid_location_launch_budget)
-            if paid_launch_authority is not None:
-                launch_kwargs['paid_launch_authority'] = paid_launch_authority
             if logical_reconcile_fence is not None:
                 launch_kwargs['logical_reconcile_fence'] = (
                     logical_reconcile_fence)
@@ -9323,9 +9690,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             if zero_cost_actuation_lease is not None:
                 launch_kwargs['zero_cost_actuation_lease'] = (
                     zero_cost_actuation_lease)
-            if prepared_paid_launches is not None:
-                launch_kwargs['prepared_paid_launches'] = (
-                    prepared_paid_launches)
             launch_result = self._launch_replica(self._next_replica_id,
                                                  resources_override,
                                                  **launch_kwargs)
@@ -10101,17 +10465,15 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise ValueError('Protocol-v2 fill requires typed plan admission.')
         self.scale_up_batch([resources_override])
 
-    def _enqueue_paid_phase_a_recovery(
-            self,
-            prepared_paid_launches: Iterable[_PreparedPaidLaunch]) -> None:
-        """Coalesce exact unsettled Phase-A identities without database I/O."""
-        identities = tuple(
-            _PaidPhaseARecoveryIdentity(
-                prepared.candidate.replica_id,
-                prepared.candidate.replica_info.replica_record_id)
-            for prepared in prepared_paid_launches)
+    def _enqueue_paid_phase_a_recovery_identities(
+            self, identities: Iterable[_PaidPhaseARecoveryIdentity]) -> None:
+        """Coalesce exact committed identities without retaining templates."""
+        identities = tuple(identities)
         if not identities:
             return
+        if any(not isinstance(identity, _PaidPhaseARecoveryIdentity)
+               for identity in identities):
+            raise TypeError('Paid Phase-A recovery identity is malformed.')
         with self._paid_phase_a_recovery_lock:
             for identity in identities:
                 self._paid_phase_a_recoveries.setdefault(
@@ -10241,253 +10603,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             except Exception as error:  # pylint: disable=broad-except
                 self._retry_paid_phase_a_recovery(identity, error)
 
-    @staticmethod
-    def _remove_prepared_paid_info(existing_replica_infos: list['ReplicaInfo'] |
-                                   None, prepared: _PreparedPaidLaunch) -> None:
-        """Remove one uncommitted staged row from the mutable wave snapshot."""
-        if existing_replica_infos is None:
-            return
-        candidate = prepared.candidate
-        existing_replica_infos[:] = [
-            info for info in existing_replica_infos if not (
-                info.replica_id == candidate.replica_id and info.
-                replica_record_id == candidate.replica_info.replica_record_id)
-        ]
-
-    def _finalize_prepared_paid_launches(
-        self,
-        prepared_paid_launches: list[_PreparedPaidLaunch],
-        paid_location_launch_budget: paid_capacity.LaunchBudget | None,
-        existing_replica_infos: list['ReplicaInfo'] | None,
-    ) -> list[_ReplicaLaunchResult]:
-        """Atomically admit and then publish one frozen paid launch wave."""
-        if not prepared_paid_launches:
-            return []
-        if paid_location_launch_budget is None:
-            raise RuntimeError('Prepared paid launches require one frozen '
-                               'launch budget.')
-
-        def _release(prepared: _PreparedPaidLaunch) -> None:
-            placer = self._spot_placer
-            if placer is not None:
-                placer.release_retry(prepared.candidate.location)
-            self._remove_prepared_paid_info(existing_replica_infos, prepared)
-
-        def _release_retry(prepared: _PreparedPaidLaunch) -> None:
-            placer = self._spot_placer
-            if placer is not None:
-                placer.release_retry(prepared.candidate.location)
-
-        def _discard_unsettled() -> None:
-            # Queue exact identities before dropping the frozen candidates.
-            # The post-lock supervised reconciler proves whether Phase A
-            # committed; this stack must never infer from the error.
-            self._enqueue_paid_phase_a_recovery(prepared_paid_launches)
-            for prepared in prepared_paid_launches:
-                _release(prepared)
-            self._persist_spot_placement_state_if_dirty()
-
-        candidates = tuple(
-            prepared.candidate for prepared in prepared_paid_launches)
-        try:
-            batch_result = paid_capacity.try_persist_claim_batch(
-                service_name=self._service_name,
-                service_hash=self._service_hash,
-                controller_owner=self._controller_owner,
-                candidates=candidates,
-                budget=paid_location_launch_budget)
-        except capacity_admission.CapacityAdmissionError as error:
-            for prepared in prepared_paid_launches:
-                _release(prepared)
-            self._persist_spot_placement_state_if_dirty()
-            logger.info(
-                'Deferring paid demand launch wave because its ordered '
-                'capacity authority changed: %s',
-                common_utils.format_exception(error))
-            return []
-        except BaseException:  # pylint: disable=broad-exception-caught
-            _discard_unsettled()
-            raise
-
-        expected_identities = tuple(
-            (candidate.replica_id, candidate.replica_info.replica_record_id)
-            for candidate in candidates)
-        try:
-            members = tuple(batch_result.members)
-            result_identities = tuple(
-                (member.replica_id, member.replica_record_id)
-                for member in members)
-        except BaseException as error:  # pylint: disable=broad-exception-caught
-            _discard_unsettled()
-            if not isinstance(error, Exception):
-                raise
-            raise RuntimeError(
-                'Atomic paid launch admission returned an invalid result.'
-            ) from error
-        if result_identities != expected_identities:
-            _discard_unsettled()
-            raise RuntimeError('Atomic paid launch admission returned a '
-                               'mismatched member sequence.')
-
-        try:
-            claim_results = tuple(member.claim_result for member in members)
-        except BaseException as error:  # pylint: disable=broad-exception-caught
-            _discard_unsettled()
-            if not isinstance(error, Exception):
-                raise
-            raise RuntimeError(
-                'Atomic paid launch admission returned an invalid result.'
-            ) from error
-
-        valid_results = frozenset({
-            paid_capacity.ClaimResult.ACQUIRED,
-            paid_capacity.ClaimResult.SATURATED,
-            paid_capacity.ClaimResult.SERVICE_SATURATED,
-            paid_capacity.ClaimResult.FEEDBACK_PENDING,
-            paid_capacity.ClaimResult.HIGHER_PRIORITY_WAITING,
-            paid_capacity.ClaimResult.OWNERSHIP_LOST,
-        })
-        legacy_runtime = self._legacy_mutation_runtime_state()
-        invalid_members = tuple(
-            (member, claim_result)
-            for member, claim_result in zip(members, claim_results, strict=True)
-            if (not isinstance(claim_result, paid_capacity.ClaimResult) or
-                claim_result not in valid_results))
-        ownership_lost_count = sum(
-            claim_result is paid_capacity.ClaimResult.OWNERSHIP_LOST
-            for claim_result in claim_results)
-        collided_replica_id = next((
-            member.replica_id
-            for member, claim_result in zip(members, claim_results, strict=True)
-            if claim_result is paid_capacity.ClaimResult.ACQUIRED and
-            member.replica_id in legacy_runtime.launch_thread_pool), None)
-        if invalid_members:
-            _discard_unsettled()
-            raise RuntimeError(
-                'Globally managed paid launch batch returned an invalid '
-                f'claim result: {invalid_members[0][1]!r}.')
-        if 0 < ownership_lost_count < len(members):
-            # The state transaction returns OWNERSHIP_LOST uniformly before
-            # admitting any member. A mixed receipt cannot be interpreted as
-            # a sparse commit, so reconcile every exact candidate before
-            # publishing even an apparently ACQUIRED worker.
-            _discard_unsettled()
-            raise RuntimeError(
-                'Atomic paid launch admission returned a mixed ownership-lost '
-                'receipt.')
-        if collided_replica_id is not None:
-            # Validate the complete durable receipt and every local target
-            # before publishing the first worker. A late collision can
-            # otherwise strand an earlier ACQUIRED member in a half-published
-            # process-local wave.
-            _discard_unsettled()
-            raise RuntimeError(
-                'Committed paid launch collided with an existing worker for '
-                f'replica {collided_replica_id}.')
-
-        committed: list[_ReplicaLaunchResult] = []
-        rejected = False
-        ownership_lost = False
-        publication_recovery_queued = False
-
-        def _queue_interrupted_tail(start_index: int) -> None:
-            nonlocal rejected
-            unpublished = []
-            for pending, pending_result in zip(
-                    prepared_paid_launches[start_index:],
-                    claim_results[start_index:],
-                    strict=True):
-                replica_id = pending.candidate.replica_id
-                if pending_result is paid_capacity.ClaimResult.ACQUIRED:
-                    if replica_id not in legacy_runtime.launch_thread_pool:
-                        _release_retry(pending)
-                        unpublished.append(pending)
-                else:
-                    rejected = True
-                    _release(pending)
-            self._enqueue_paid_phase_a_recovery(unpublished)
-            self._persist_spot_placement_state_if_dirty()
-
-        for index, (prepared, member, claim_result) in enumerate(
-                zip(prepared_paid_launches, members, claim_results,
-                    strict=True)):
-            try:
-                location = prepared.candidate.location
-                if claim_result is paid_capacity.ClaimResult.ACQUIRED:
-                    replica_id = prepared.candidate.replica_id
-                    try:
-                        launch_thread = prepared.launch_thread_factory()
-                        if launch_thread is None:
-                            raise RuntimeError(
-                                'Committed paid launch did not materialize a '
-                                'launch worker.')
-                        launch_thread.install_paid_claim_commit_receipt(member)
-                        legacy_runtime.launch_thread_pool[replica_id] = (
-                            launch_thread)
-                    except Exception as error:  # pylint: disable=broad-except
-                        # This member is durably committed but cannot reach a
-                        # provider without a published worker. Recover only
-                        # its exact identity and keep publishing its siblings.
-                        if replica_id not in legacy_runtime.launch_thread_pool:
-                            _release_retry(prepared)
-                            self._enqueue_paid_phase_a_recovery((prepared,))
-                            publication_recovery_queued = True
-                        else:
-                            committed.append(prepared.launch_result)
-                        logger.warning(
-                            'Committed paid Phase-A member %s could not be '
-                            'published; continuing its wave and reconciling '
-                            'the exact identity: %s', replica_id,
-                            common_utils.format_exception(error))
-                        continue
-                    committed.append(prepared.launch_result)
-                    continue
-
-                rejected = True
-                _release(prepared)
-                if claim_result is paid_capacity.ClaimResult.FEEDBACK_PENDING:
-                    paid_capacity.defer_for_feedback(
-                        paid_location_launch_budget, location)
-                elif claim_result is paid_capacity.ClaimResult.SATURATED:
-                    paid_capacity.exhaust(paid_location_launch_budget, location)
-                elif (claim_result
-                      is paid_capacity.ClaimResult.SERVICE_SATURATED):
-                    paid_capacity.exhaust_service(paid_location_launch_budget)
-                elif (claim_result
-                      is paid_capacity.ClaimResult.HIGHER_PRIORITY_WAITING):
-                    paid_capacity.defer_for_priority(
-                        paid_location_launch_budget, location)
-                elif claim_result is paid_capacity.ClaimResult.OWNERSHIP_LOST:
-                    ownership_lost = True
-            except BaseException:  # pylint: disable=broad-exception-caught
-                # The receipt proves Phase A. Preserve already-published
-                # workers and queue only current/later ACQUIRED identities
-                # whose workers are still absent before propagating an
-                # interrupt or process-exit signal.
-                _queue_interrupted_tail(index)
-                legacy_runtime.launch_completion_event.set()
-                raise
-
-        if rejected or publication_recovery_queued:
-            self._persist_spot_placement_state_if_dirty()
-        if committed or publication_recovery_queued:
-            # Registration intentionally follows the all-or-subset durable
-            # commit. The shared refresher remains the sole owner of starts
-            # and exact unpublished-member recovery.
-            legacy_runtime.launch_completion_event.set()
-        if ownership_lost:
-            raise RuntimeError(
-                f'Service {self._service_name!r} controller ownership '
-                'changed while claiming paid capacity.')
-        return committed
-
     def scale_up_batch(
         self,
         resources_overrides: list[dict[str, Any] | None],
         expected_version: int | None = None,
         launch_priority: int = (serve_constants.LB_REQUEST_PRIORITY_MIN),
-        paid_launch_authority: capacity_admission.PaidLaunchAuthority |
-        None = None,
         paid_launch_allowed: bool = True,
     ) -> list[_ReplicaLaunchResult]:
         """Enqueue a batch of replica launches under one manager lock.
@@ -10532,8 +10652,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             batch_kwargs: dict[str, Any] = {}
             if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
                 batch_kwargs['launch_priority'] = launch_priority
-            if paid_launch_authority is not None:
-                batch_kwargs['paid_launch_authority'] = paid_launch_authority
             if not paid_launch_allowed:
                 batch_kwargs['paid_launch_allowed'] = False
             if not needs_reservation:
@@ -10558,8 +10676,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         resources_overrides: list[dict[str, Any] | None],
         expected_version: int | None = None,
         launch_priority: int = (serve_constants.LB_REQUEST_PRIORITY_MIN),
-        paid_launch_authority: capacity_admission.PaidLaunchAuthority |
-        None = None,
         paid_launch_allowed: bool = True,
     ) -> list[_ReplicaLaunchResult]:
         """Persist one physical batch while any shared demand lock is held."""
@@ -10616,11 +10732,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 max_live_paid_gpu_units=(
                     self._max_live_paid_gpu_units_for_version(batch_version)),
                 requested_frontier_keys=self._requested_paid_frontier_keys(
-                    resources_overrides),
-                paid_launch_authority=paid_launch_authority))
+                    resources_overrides)))
         deferred_paid_overrides: list[dict[str, Any] | None] = []
         accepted: list[_ReplicaLaunchResult] = []
-        prepared_paid_launches: list[_PreparedPaidLaunch] = []
         for resources_override in resources_overrides:
             pending_version = self._pending_version
             if (pending_version is not None and
@@ -10638,13 +10752,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     paid_location_launch_budget)
             if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
                 scale_up_kwargs['launch_priority'] = launch_priority
-            if paid_launch_authority is not None:
-                scale_up_kwargs['paid_launch_authority'] = paid_launch_authority
             if not paid_launch_allowed:
                 scale_up_kwargs['paid_launch_allowed'] = False
-            if paid_launch_authority is not None:
-                scale_up_kwargs['prepared_paid_launches'] = (
-                    prepared_paid_launches)
             stop_sequence_before = (paid_location_launch_budget.stop_sequence
                                     if paid_location_launch_budget is not None
                                     else 0)
@@ -10653,14 +10762,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if paid_location_launch_budget is not None else None)
             override_before = (None if resources_override is None else
                                dict(resources_override))
-            prepared_count_before = len(prepared_paid_launches)
             launch_result = self._scale_up_one_locked(resources_override,
                                                       used_replica_ids,
                                                       existing_replica_infos,
                                                       zero_cost_demand_budget,
                                                       **scale_up_kwargs)
-            if (launch_result is not None and
-                    len(prepared_paid_launches) == prepared_count_before):
+            if launch_result is not None:
                 accepted.append(launch_result)
             if paid_location_launch_budget is None:
                 continue
@@ -10676,10 +10783,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # complete pass must still examine different accelerator
                 # cards plus reserved-fill and pinned-rebalance overrides.
                 deferred_paid_overrides.append(override_before)
-        accepted.extend(
-            self._finalize_prepared_paid_launches(prepared_paid_launches,
-                                                  paid_location_launch_budget,
-                                                  existing_replica_infos))
         return accepted
 
     @with_lock
@@ -10695,8 +10798,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         launch_priority: int = serve_constants.LB_REQUEST_PRIORITY_MIN,
         launch_priority_by_accelerator: dict[str, int] | None = None,
         cold_launch_authority_by_accelerator: dict[str, int] | None = None,
-        paid_launch_authority: capacity_admission.PaidLaunchAuthority |
-        None = None,
         paid_launch_allowed: bool = True,
     ) -> list[_ReplicaLaunchResult]:
         """Plan and persist complete backend shapes up to a logical target.
@@ -10772,8 +10873,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         if cold_launch_authority_by_accelerator is not None:
             launch_kwargs['cold_launch_authority_by_accelerator'] = dict(
                 cold_launch_authority_by_accelerator)
-        if paid_launch_authority is not None:
-            launch_kwargs['paid_launch_authority'] = paid_launch_authority
         if not paid_launch_allowed:
             launch_kwargs['paid_launch_allowed'] = False
         if not self._uses_shared_zero_cost_demand_budget():
@@ -10801,8 +10900,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         launch_priority: int = (serve_constants.LB_REQUEST_PRIORITY_MIN),
         launch_priority_by_accelerator: dict[str, int] | None = None,
         cold_launch_authority_by_accelerator: dict[str, int] | None = None,
-        paid_launch_authority: capacity_admission.PaidLaunchAuthority |
-        None = None,
         paid_launch_allowed: bool = True,
     ) -> list[_ReplicaLaunchResult]:
         """Persist complete shapes while the global demand lock is held."""
@@ -10840,24 +10937,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 card not in card_targets or isinstance(raw_count, bool) or
                 not isinstance(raw_count, int) or raw_count < 0 for card,
                 raw_count in cold_launch_authority_by_accelerator.items())
-            if paid_launch_authority is None:
-                # Unbound/legacy local authority remains an economic ceiling;
-                # it cannot use physical packing to exceed the logical target.
-                malformed = malformed or any(
-                    raw_count > card_targets.get(card, 0) for card, raw_count in
-                    cold_launch_authority_by_accelerator.items())
-            else:
-                expected_launch = {
-                    str(card).casefold(): count for card, count in
-                    paid_launch_authority.remaining_launch_capacity().items()
-                }
-                actual_launch = {
-                    str(card).casefold(): count for card, count in
-                    cold_launch_authority_by_accelerator.items()
-                }
-                malformed = (malformed or actual_launch != expected_launch or
-                             any(count % shapes[card] != 0 for card, count in
-                                 cold_launch_authority_by_accelerator.items()))
+            # This legacy local authority remains an economic ceiling; it
+            # cannot use physical packing to exceed the logical target.
+            malformed = malformed or any(
+                raw_count > card_targets.get(card, 0) for card, raw_count in
+                cold_launch_authority_by_accelerator.items())
             if malformed:
                 logger.warning(
                     'Discarding malformed logical paid cold-launch authority: '
@@ -11029,12 +11113,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._max_live_paid_gpu_units_for_version(version)),
                 requested_frontier_keys=(None if not card_targets else {
                     (str(card).casefold(),) for card in paid_cards
-                }),
-                paid_launch_authority=paid_launch_authority)
+                }))
         deferred_cards: set[str] = set()
         launched_capacity = 0
         accepted: list[_ReplicaLaunchResult] = []
-        prepared_paid_launches: list[_PreparedPaidLaunch] = []
         while True:
             logical_state = self._logical_reconcile_state
             if not self._logical_target_fence_holds(
@@ -11131,15 +11213,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 target_capacity=target_capacity,
                                 target_capacity_by_accelerator=(card_targets),
                                 accelerator_shapes=shapes))
-            if paid_launch_authority is not None:
-                # Replacement attribution proves which uncertain backend may
-                # be overlapped; it grants no purchase authority. Every paid
-                # row in a mixed wave debits the same immutable demand plan so
-                # provider admission and the next row see one exact inventory.
-                launch_kwargs['paid_launch_authority'] = paid_launch_authority
-                launch_kwargs['prepared_paid_launches'] = (
-                    prepared_paid_launches)
-            prepared_count_before = len(prepared_paid_launches)
             launch_result = self._scale_up_one_locked(
                 resources_override,
                 used_replica_ids,
@@ -11158,8 +11231,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 logger.info('Logical scale-up made no placement progress; '
                             'retrying on the next reconciliation tick.')
                 break
-            if len(prepared_paid_launches) == prepared_count_before:
-                accepted.append(launch_result)
+            accepted.append(launch_result)
             if unknown_predecessor is not None:
                 unpaired_unknown_predecessor_ids.discard(
                     unknown_predecessor.replica_id)
@@ -11171,10 +11243,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                     0,
                     paid_authority_left.get(selected_card, 0) -
                     launch_result.planned_capacity)
-        accepted.extend(
-            self._finalize_prepared_paid_launches(prepared_paid_launches,
-                                                  paid_location_launch_budget,
-                                                  existing_replica_infos))
         return accepted
 
     def notify_version_pending(self, version: int) -> None:

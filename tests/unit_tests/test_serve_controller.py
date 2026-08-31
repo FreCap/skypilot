@@ -10,6 +10,7 @@ pruned when a replica leaves the ready set.
 import asyncio
 import concurrent.futures
 import contextlib
+import dataclasses
 import hashlib
 import inspect
 import json
@@ -131,6 +132,18 @@ def _paid_authority(residual=None, launch=None, **identity):
                                      'content_sha256', 'c' * 64),
                                  economic_residual=lambda: dict(residual),
                                  remaining_launch_capacity=lambda: dict(launch))
+
+
+def _paid_launch_version_authority(
+) -> controller.paid_capacity.PaidLaunchVersionAuthority:
+    service_spec = b'immutable-service-spec'
+    controller_config = b'active_workspace: default\n'
+    return controller.paid_capacity.PaidLaunchVersionAuthority(
+        service_spec=service_spec,
+        service_spec_sha256=hashlib.sha256(service_spec).hexdigest(),
+        controller_config=controller_config,
+        controller_config_digest=hashlib.sha256(controller_config).hexdigest(),
+        controller_config_snapshot_id='c' * 64)
 
 
 def test_logical_capacity_target_has_one_internal_representation():
@@ -1307,13 +1320,18 @@ def _register_update_test_routes(
     return fastapi_testclient.TestClient(ctrl._app)  # pylint: disable=protected-access
 
 
-def _binding_authority(mode: str, epoch: int, *, generic: bool = False):
+def _binding_authority(mode: str,
+                       epoch: int,
+                       *,
+                       generic: bool = False,
+                       service_hash: str = 'incarnation-a',
+                       service_lifecycle_epoch: int = 4):
     binding = controller.ordinary_launch_binding
     return binding.ControllerBindingAuthority(
         service_name='svc',
-        service_hash='incarnation-a',
+        service_hash=service_hash,
         service_workspace='workspace-a',
-        service_lifecycle_epoch=4,
+        service_lifecycle_epoch=service_lifecycle_epoch,
         controller_pid=123,
         controller_ip='10.0.0.1',
         controller_incarnation=controller.uuid.UUID(
@@ -1332,6 +1350,15 @@ def _binding_authority(mode: str, epoch: int, *, generic: bool = False):
             binding.NON_POOL_CAPABILITY_COHORT_EPOCH if generic else None),
         non_pool_receipt_protocol_version=(
             binding.NON_POOL_RECEIPT_PROTOCOL_VERSION if generic else None))
+
+
+def _promoted_planning_binding_authority():
+    """Return the exact production binding contract for durable planning."""
+    return _binding_authority('bound',
+                              1,
+                              generic=True,
+                              service_hash='svc-hash',
+                              service_lifecycle_epoch=3)
 
 
 def _resident_placement_page():
@@ -4448,6 +4475,7 @@ class TestAutoscalerRuntimeSnapshot:
         scaler.capacity_target_by_accelerator = {'L4': target}
         scaler.capacity_target_complete = True
         scaler.max_replicas = 1000
+        scaler.backend_num_nodes = 1
         scaler.reconcile_generation = 0
         scaler.info.return_value = {
             'demand_target_by_accelerator': {
@@ -4482,6 +4510,7 @@ class TestAutoscalerRuntimeSnapshot:
         scaler.warm_retention_target_by_accelerator = {}
         scaler.cold_launch_authority_by_accelerator = {}
         scaler.max_replicas = 1000
+        scaler.backend_num_nodes = 1
         scaler.reconcile_generation = 0
         scaler.logical_target_state = None
         scaler.test_emit_scale_up = emit_scale_up
@@ -4525,12 +4554,15 @@ class TestAutoscalerRuntimeSnapshot:
                         target_capacity=current_target,
                         target_capacity_by_accelerator=(target_by_accelerator),
                         accelerator_shapes=accelerator_shapes,
+                        launch_priority=50,
+                        launch_priority_by_accelerator=tuple(
+                            (card, 50) for card, _ in target_by_accelerator),
                         cold_launch_authority_by_accelerator=()))
             ]
 
         scaler.collect_request_information.side_effect = _collect
         scaler.generate_scaling_decisions.side_effect = _generate
-        scaler.install_committed_capacity_plan.return_value = True
+        scaler.install_committed_capacity_projection.return_value = None
         return scaler
 
     @staticmethod
@@ -4613,6 +4645,43 @@ class TestAutoscalerRuntimeSnapshot:
             allocation_bound=allocation is not None)
 
     @staticmethod
+    def _bind_policy_history(supply, scaler):
+        """Attach the exact durable history consumed by production planning."""
+        history = (supply.prior_policy_state, supply.prior_candidate,
+                   supply.planning_db_epoch)
+        if all(value is not None for value in history):
+            return supply
+        assert all(value is None for value in history)
+        capacity_unit = (capacity_planning.CapacityUnit.LOGICAL_GPU
+                         if scaler.replica_unit == 'logical' else
+                         capacity_planning.CapacityUnit.PHYSICAL_BACKEND)
+        prior_policy_state, prior_candidate = (
+            capacity_planning.genesis_capacity_policy(
+                service_name='svc',
+                service_version=scaler.latest_version,
+                last_reduced_demand_generation=0,
+                capacity_unit=capacity_unit,
+                maximum_capacity=scaler.max_replicas,
+                physical_gpu_width_by_accelerator=(
+                    capacity_planning.AcceleratorCapacity.from_mapping(
+                        scaler.configured_accelerator_shapes)),
+                backend_num_nodes=scaler.backend_num_nodes))
+        return dataclasses.replace(supply,
+                                   prior_policy_state=prior_policy_state,
+                                   prior_candidate=prior_candidate,
+                                   planning_db_epoch=1.0)
+
+    @staticmethod
+    def _scaling_decisions_at_generation(scaler, generation):
+        prior_generation = scaler.reconcile_generation
+        scaler.reconcile_generation = generation
+        try:
+            return tuple(
+                scaler.generate_scaling_decisions([], [scaler.latest_version]))
+        finally:
+            scaler.reconcile_generation = prior_generation
+
+    @staticmethod
     def _capacity_planning_envelope(scaler,
                                     reservation_input,
                                     *,
@@ -4655,53 +4724,23 @@ class TestAutoscalerRuntimeSnapshot:
                     fill_policy_sha256='e' *
                     64) if reservation_input.gate_policy
                 is capacity_planning.ReservationGatePolicy.DEMAND_GATED else '')
-        prior_target = max(0, int(scaler.target_num_replicas))
-        prior_target_by_card = {
-            card: int(scaler.target_num_replicas_by_accelerator.get(card, 0))
-            for card in cards
-            if scaler.target_num_replicas_by_accelerator.get(card, 0) > 0
-        }
+        empty_capacity = capacity_planning.AcceleratorCapacity()
         prior_policy_state = None
+        prior_candidate = None
         policy_input = None
         if capacity_unit is capacity_planning.CapacityUnit.LOGICAL_GPU:
-            prior_capacity = (capacity_planning.AcceleratorCapacity.
-                              from_mapping(prior_target_by_card))
-            empty_capacity = capacity_planning.AcceleratorCapacity()
-            prior_policy_state = capacity_planning.CapacityPolicyState(
-                service_name='svc',
-                service_version=scaler.latest_version,
-                source_generation=scaler.reconcile_generation,
-                capacity_unit=capacity_unit,
-                maximum_capacity=scaler.max_replicas,
-                target_capacity=prior_target,
-                raw_target_capacity=prior_target,
-                target_by_accelerator=prior_capacity,
-                explicit_target_by_accelerator=prior_capacity,
-                paid_target_by_accelerator=prior_capacity,
-                warm_retention_target=empty_capacity,
-                cold_launch_authority_target=empty_capacity,
-                zero_cost_padding_target=empty_capacity,
-                desired_actuation_target=prior_capacity,
-                wave_limited_actuation_target=prior_capacity,
-                transition_retention_target=empty_capacity,
-                upscale_observations=0,
-                downscale_started_monotonic=None,
-                downscale_veto_streak=0,
-                pressure_latched=False,
-                pressure_reasons=(),
-                snap_target_on_next_recompute=False,
-                adopt_total_capacity_on_next_recompute=False,
-                upscale_pending=False,
-                logical_card_transition_pending=False,
-                last_scale_up_wave_monotonic=None,
-                scale_up_wave_ceiling=None,
-                pending_retention_floor=None,
-                pending_capacity_at_adoption=0,
-                pending_budget_spent=0,
-                last_scale_down_allowance=0,
-                last_pending_allowance=0)
+            prior_policy_state, prior_candidate = (
+                capacity_planning.genesis_capacity_policy(
+                    service_name='svc',
+                    service_version=scaler.latest_version,
+                    last_reduced_demand_generation=scaler.reconcile_generation,
+                    capacity_unit=capacity_unit,
+                    maximum_capacity=scaler.max_replicas,
+                    physical_gpu_width_by_accelerator=(
+                        capacity_planning.AcceleratorCapacity.from_mapping(
+                            scaler.configured_accelerator_shapes))))
             policy_input = capacity_planning.CapacityPolicyInput(
-                planning_monotonic_time=1.0,
+                planning_db_epoch=1.0,
                 fresh_demand=True,
                 pressure_latched=False,
                 pressure_reasons=(),
@@ -4764,6 +4803,7 @@ class TestAutoscalerRuntimeSnapshot:
                 configured_reservation_accelerators),
             demand_witness_scope_sha256=demand_witness_scope_sha256,
             prior_policy_state=prior_policy_state,
+            prior_candidate=prior_candidate,
             policy_input=policy_input)
         return capacity_planning.CapacityPlanningEnvelope(
             schema_version=(
@@ -4796,8 +4836,6 @@ class TestAutoscalerRuntimeSnapshot:
                 capacity_planning.CapacityPlanKind.GATE_ACQUISITION):
             return autoscalers.DurableCapacityReconcilePlan(
                 envelope=envelope,
-                prior_policy_fingerprint=prior.fingerprint,
-                expected_prior_generation=prior.source_generation,
                 logical_target=None,
                 logical_retirement_floor=None,
                 retirement_shelter=None,
@@ -4822,8 +4860,6 @@ class TestAutoscalerRuntimeSnapshot:
                 scaler.configured_accelerator_shapes.items()))
         return autoscalers.DurableCapacityReconcilePlan(
             envelope=envelope,
-            prior_policy_fingerprint=prior.fingerprint,
-            expected_prior_generation=prior.source_generation,
             logical_target=logical_target,
             logical_retirement_floor=logical_retirement_floor,
             retirement_shelter=None,
@@ -4837,18 +4873,23 @@ class TestAutoscalerRuntimeSnapshot:
                                  supply=None,
                                  authority=None,
                                  repository=None,
-                                 max_live_paid_gpu_units=None):
+                                 paid_launch_receipt=None,
+                                 max_live_paid_gpu_units=None,
+                                 replica_infos=()):
         ctrl._replica_manager.max_live_paid_gpu_units = (  # pylint: disable=protected-access
             max_live_paid_gpu_units)
-        ctrl._ordinary_launch_binding_authority = types.SimpleNamespace(  # pylint: disable=protected-access
-            service_lifecycle_epoch=3)
+        ctrl._ordinary_launch_binding_authority = (  # pylint: disable=protected-access
+            _promoted_planning_binding_authority())
         scaler = ctrl._autoscaler  # pylint: disable=protected-access
         holdings = scaler.sequenced_reserved_fill_holdings
         if (isinstance(holdings, mock.Mock) and
                 isinstance(holdings.return_value, mock.Mock)):
             holdings.return_value = ()
         if supply is None:
-            supply = TestAutoscalerRuntimeSnapshot._reserved_supply_projection()
+            supply = TestAutoscalerRuntimeSnapshot._reserved_supply_projection(
+                economic_replica_infos=replica_infos)
+        supply = TestAutoscalerRuntimeSnapshot._bind_policy_history(
+            supply, scaler)
 
         def _durable_plan(_replica_infos,
                           request_information,
@@ -4860,14 +4901,9 @@ class TestAutoscalerRuntimeSnapshot:
                           demand_witness_scope_sha256=None,
                           **_kwargs):
             generation = request_information['reconcile_generation']
-            prior_generation = scaler.reconcile_generation
-            scaler.reconcile_generation = generation
-            try:
-                decisions = tuple(
-                    scaler.generate_scaling_decisions([],
-                                                      [scaler.latest_version]))
-            finally:
-                scaler.reconcile_generation = prior_generation
+            decisions = (
+                TestAutoscalerRuntimeSnapshot._scaling_decisions_at_generation(
+                    scaler, generation))
             return TestAutoscalerRuntimeSnapshot._durable_reconcile_plan(
                 scaler,
                 reservation_input,
@@ -4883,23 +4919,25 @@ class TestAutoscalerRuntimeSnapshot:
                 scaler.plan_durable_capacity_reconcile.side_effect is None):
             scaler.plan_durable_capacity_reconcile.side_effect = _durable_plan
 
-        def _install(*, expected_prior_fingerprint, expected_prior_generation,
-                     next_policy_state):
-            assert expected_prior_fingerprint
-            assert expected_prior_generation == scaler.reconcile_generation
-            scaler.reconcile_generation = next_policy_state.source_generation
-            scaler.target_num_replicas = next_policy_state.target_capacity
+        def _install(*, committed_candidate):
+            next_policy_state = committed_candidate.next_policy_state
+            assert next_policy_state is not None
+            scaler.reconcile_generation = committed_candidate.source_generation
+            scaler.target_num_replicas = (
+                committed_candidate.aggregate_demand_target)
             scaler.target_num_replicas_by_accelerator = (
-                next_policy_state.target_by_accelerator.as_dict())
+                committed_candidate.demand_attribution.as_dict())
             scaler.capacity_target_by_accelerator = (
-                next_policy_state.wave_limited_actuation_target.as_dict())
-            return True
+                committed_candidate.wave_limited_actuation_target.as_dict())
 
-        if (isinstance(scaler.install_committed_capacity_plan, mock.Mock) and
-                scaler.install_committed_capacity_plan.side_effect is None):
-            scaler.install_committed_capacity_plan.side_effect = _install
+        if (isinstance(scaler.install_committed_capacity_projection, mock.Mock)
+                and scaler.install_committed_capacity_projection.side_effect
+                is None):
+            scaler.install_committed_capacity_projection.side_effect = _install
         if repository is None:
             repository = mock.Mock()
+        if paid_launch_receipt is None:
+            paid_launch_receipt = types.SimpleNamespace(members=())
         use_planner_authority = authority is None
         snapshot_iterator = iter(snapshots)
 
@@ -4913,14 +4951,16 @@ class TestAutoscalerRuntimeSnapshot:
                 current_authority = _paid_authority(
                     candidate.paid_residual.as_dict(),
                     candidate.paid_launch_target.as_dict())
-            return types.SimpleNamespace(authority=current_authority,
-                                         demand_snapshot=snapshot,
-                                         planner_snapshot=planner_snapshot,
-                                         candidate=candidate,
-                                         allocation_map=supply.allocation_map)
+            return types.SimpleNamespace(
+                authority=current_authority,
+                demand_snapshot=snapshot,
+                planner_snapshot=planner_snapshot,
+                candidate=candidate,
+                allocation_map=supply.allocation_map,
+                paid_launch_receipt=(paid_launch_receipt))
 
-        if repository.plan_and_publish_current.side_effect is None:
-            repository.plan_and_publish_current.side_effect = _plan_current
+        if repository.plan_and_admit_current.side_effect is None:
+            repository.plan_and_admit_current.side_effect = _plan_current
         with mock.patch.object(
                 controller.capacity_admission,
                 'get_service_source_mode',
@@ -4931,7 +4971,7 @@ class TestAutoscalerRuntimeSnapshot:
                                return_value=repository), \
              mock.patch.object(controller.serve_state,
                                'get_replica_infos',
-                               return_value=[]), \
+                               return_value=list(replica_infos)), \
              mock.patch.object(
                  controller.serve_state,
                  'get_service_runtime_snapshot',
@@ -4948,8 +4988,13 @@ class TestAutoscalerRuntimeSnapshot:
                  autoscalers,
                  'prepare_controller_scaling_decision_inputs',
                  return_value=autoscalers.ScalingDecisionInputs(
-                     replica_ids=(),
+                     replica_ids=tuple(info.replica_id
+                                       for info in replica_infos),
                      gpu_shape_handles={},
+                     gpu_shapes_by_replica_id={
+                         info.replica_id: ('l4', info.planned_capacity)
+                         for info in replica_infos
+                     },
                      historical_scaling_values={})), \
              mock.patch.object(
                  autoscalers,
@@ -4968,6 +5013,161 @@ class TestAutoscalerRuntimeSnapshot:
             for _ in snapshots:
                 ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
         return repository
+
+    def test_paid_spec_preparation_is_card_fair_and_resolves_aws_first(self):
+        ctrl = _make_controller()
+        call_order = []
+        authority = _paid_launch_version_authority()
+        manager = mock.Mock()
+        manager.spot_placer.ranked_active_locations.return_value = [object()]
+        manager.workspace = 'default'
+
+        def _prepare(**kwargs):
+            call_order.append('prepare')
+            assert kwargs['aws_account_id'] == '210987654321'
+            assert kwargs['max_candidates'] == 512
+            assert kwargs['max_gpu_units_by_accelerator'] == {
+                'L4': 171,
+                'A100': 1368,
+                'H200': 170,
+            }
+            assert tuple(kwargs['occupied_replica_ids']) == (7, 9)
+            assert kwargs['version_authority'] == authority
+            return ()
+
+        manager.prepare_paid_launch_specs.side_effect = _prepare
+        ctrl._replica_manager = manager  # pylint: disable=protected-access
+        scaler = types.SimpleNamespace(max_replicas=10_000,
+                                       backend_num_nodes=1,
+                                       configured_accelerator_shapes={
+                                           'L4': 1,
+                                           'A100': 8,
+                                           'H200': 1,
+                                       })
+
+        def _resolve(_locations, *, workspace):
+            assert workspace == 'default'
+            assert not manager.prepare_paid_launch_specs.called
+            call_order.append('resolve')
+            return '210987654321'
+
+        with mock.patch.object(
+                controller.serve_state,
+                'get_paid_launch_version_authority',
+                return_value=authority) as get_authority, mock.patch.object(
+                    controller.serve_utils,
+                    'parse_and_validate_version_controller_config'
+                ), mock.patch.object(controller.paid_capacity,
+                                     'resolve_aws_account_id_for_locations',
+                                     side_effect=_resolve) as resolve:
+            prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
+                scaler, 1, [
+                    types.SimpleNamespace(replica_id=7),
+                    types.SimpleNamespace(replica_id=9)
+                ], None)
+
+        assert prepared == ()
+        assert call_order == ['resolve', 'prepare']
+        get_authority.assert_called_once_with('svc', 1)
+        resolve.assert_called_once()
+
+    def test_paid_spec_preparation_converts_logical_and_physical_caps(self):
+        ctrl = _make_controller()
+        manager = mock.Mock()
+        manager.spot_placer = None
+        manager.prepare_paid_launch_specs.return_value = ()
+        ctrl._replica_manager = manager  # pylint: disable=protected-access
+        authority = _paid_launch_version_authority()
+        scaler = types.SimpleNamespace(
+            max_replicas=100,
+            backend_num_nodes=2,
+            configured_accelerator_shapes={'A100': 8})
+
+        with mock.patch.object(
+                controller.serve_state,
+                'get_paid_launch_version_authority',
+                return_value=authority), mock.patch.object(
+                    controller.serve_utils,
+                    'parse_and_validate_version_controller_config'):
+            prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
+                scaler, 1, [], 120)
+
+        assert prepared == ()
+        manager.prepare_paid_launch_specs.assert_called_once_with(
+            accelerator_shapes={'A100': 8},
+            max_gpu_units_by_accelerator={'A100': 112},
+            max_candidates=7,
+            occupied_replica_ids=mock.ANY,
+            version_authority=authority,
+            aws_account_id=None)
+        assert tuple(manager.prepare_paid_launch_specs.call_args.
+                     kwargs['occupied_replica_ids']) == ()
+
+    def test_paid_spec_preparation_aws_identity_failure_keeps_other_clouds(
+            self):
+        ctrl = _make_controller()
+        manager = mock.Mock()
+        manager.spot_placer.ranked_active_locations.return_value = [object()]
+        manager.workspace = 'default'
+        manager.prepare_paid_launch_specs.return_value = ()
+        ctrl._replica_manager = manager  # pylint: disable=protected-access
+        authority = _paid_launch_version_authority()
+        scaler = types.SimpleNamespace(max_replicas=10,
+                                       backend_num_nodes=1,
+                                       configured_accelerator_shapes={'L4': 1})
+
+        with mock.patch.object(
+                controller.serve_state,
+                'get_paid_launch_version_authority',
+                return_value=authority), mock.patch.object(
+                    controller.serve_utils,
+                    'parse_and_validate_version_controller_config'
+                ), mock.patch.object(
+                    controller.paid_capacity,
+                    'resolve_aws_account_id_for_locations',
+                    side_effect=ValueError('AWS session expired')):
+            prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
+                scaler, 1, [], None)
+
+        assert prepared == ()
+        manager.prepare_paid_launch_specs.assert_called_once()
+        assert (
+            manager.prepare_paid_launch_specs.call_args.kwargs['aws_account_id']
+            is None)
+        assert (manager.prepare_paid_launch_specs.call_args.
+                kwargs['version_authority'] == authority)
+
+    @pytest.mark.parametrize('corrupt', [False, True])
+    def test_paid_spec_preparation_requires_immutable_version_authority(
+            self, corrupt):
+        ctrl = _make_controller()
+        manager = mock.Mock()
+        manager.spot_placer.ranked_active_locations.return_value = [object()]
+        manager.workspace = 'default'
+        ctrl._replica_manager = manager  # pylint: disable=protected-access
+        scaler = types.SimpleNamespace(max_replicas=10,
+                                       backend_num_nodes=1,
+                                       configured_accelerator_shapes={'L4': 1})
+        authority_read = (
+            serve_state.ControllerConfigCorruptionError('corrupt authority')
+            if corrupt else None)
+        patch_kwargs = ({
+            'side_effect': authority_read
+        } if corrupt else {
+            'return_value': None
+        })
+
+        with mock.patch.object(
+                controller.serve_state, 'get_paid_launch_version_authority',
+                **patch_kwargs), mock.patch.object(
+                    controller.paid_capacity,
+                    'resolve_aws_account_id_for_locations') as resolve:
+            prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
+                scaler, 1, [], None)
+
+        assert prepared == ()
+        resolve.assert_not_called()
+        manager.prepare_paid_launch_specs.assert_not_called()
 
     def test_locked_supply_translation_preserves_retiring_paid_capacity(self):
         projection = self._reserved_supply_projection(existing_paid={'L4': 7})
@@ -5109,8 +5309,8 @@ class TestAutoscalerRuntimeSnapshot:
                                         serve_state.ReplicaStatus.PROVISIONING,
                                         accelerators={'L4': 1})
         provisioning.resources_override = {'accelerators': {'L4': 1}}
-        ctrl._ordinary_launch_binding_authority = types.SimpleNamespace(  # pylint: disable=protected-access
-            service_lifecycle_epoch=3)
+        ctrl._ordinary_launch_binding_authority = (  # pylint: disable=protected-access
+            _promoted_planning_binding_authority())
 
         with mock.patch.object(
                 controller.capacity_admission,
@@ -5138,7 +5338,7 @@ class TestAutoscalerRuntimeSnapshot:
                  'prepare_controller_scaling_decision_inputs',
                  return_value=mock.Mock()), \
              mock.patch.object(ctrl,
-                               '_plan_and_publish_current_capacity',
+                               '_plan_and_admit_current_capacity',
                                return_value=None) as publish:
             ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
@@ -5177,8 +5377,8 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._durable_demand_snapshot = object()  # pylint: disable=protected-access
         ctrl._autoscaler = self._logical_durable_autoscaler()  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
-        ctrl._ordinary_launch_binding_authority = types.SimpleNamespace(  # pylint: disable=protected-access
-            service_lifecycle_epoch=3)
+        ctrl._ordinary_launch_binding_authority = (  # pylint: disable=protected-access
+            _promoted_planning_binding_authority())
 
         with mock.patch.object(
                 controller.capacity_admission,
@@ -5205,7 +5405,7 @@ class TestAutoscalerRuntimeSnapshot:
                  'prepare_controller_scaling_decision_inputs',
                  return_value=mock.Mock()), \
              mock.patch.object(ctrl,
-                               '_plan_and_publish_current_capacity',
+                               '_plan_and_admit_current_capacity',
                                return_value=None):
             ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
@@ -5250,7 +5450,7 @@ class TestAutoscalerRuntimeSnapshot:
 
         scaler.plan_durable_capacity_reconcile.assert_called_once()
         scaler.collect_request_information.assert_not_called()
-        scaler.install_committed_capacity_plan.assert_not_called()
+        scaler.install_committed_capacity_projection.assert_not_called()
         ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.publish_target_num_replicas.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.scale_up_batch.assert_not_called()
@@ -5262,7 +5462,7 @@ class TestAutoscalerRuntimeSnapshot:
             self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
-        scaler = self._logical_durable_autoscaler(target=2)
+        scaler = self._logical_durable_autoscaler(target=2, emit_scale_up=True)
         ctrl._autoscaler = scaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
@@ -5372,7 +5572,7 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.update_logical_reconcile_snapshot.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.publish_logical_target.assert_not_called()  # pylint: disable=line-too-long
-        ctrl._autoscaler.install_committed_capacity_plan.assert_not_called()  # pylint: disable=line-too-long,protected-access
+        ctrl._autoscaler.install_committed_capacity_projection.assert_not_called()  # pylint: disable=line-too-long,protected-access
 
     def test_promoted_logical_publish_rejection_stops_later_actuation(self):
         ctrl = _make_controller()
@@ -5468,7 +5668,7 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._replica_manager.scale_up_batch.assert_not_called()
         ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
 
-    def test_promoted_zero_cost_commit_prevents_paid_actuation_until_replan(
+    def test_promoted_paid_receipt_is_not_replayed_through_manager_scale_up(
             self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
@@ -5476,24 +5676,20 @@ class TestAutoscalerRuntimeSnapshot:
             target=1, emit_scale_up=True)
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
-        accepted = object()
-        ctrl._replica_manager.scale_up_to_logical_capacity.return_value = (  # pylint: disable=line-too-long
-            [accepted])
+        prepared_specs = (object(),)
+        receipt = types.SimpleNamespace(members=(object(),))
 
-        with mock.patch.object(ctrl, '_notify_scale_reconcile') as notify:
+        with mock.patch.object(ctrl,
+                               '_prepare_current_paid_launch_specs',
+                               return_value=prepared_specs):
             repository = self._run_promoted_reconciles(
-                ctrl, [self._durable_snapshot()])
+                ctrl, [self._durable_snapshot()], paid_launch_receipt=receipt)
 
-        ctrl._replica_manager.scale_up_to_logical_capacity.assert_called_once_with(  # pylint: disable=line-too-long
-            1,
-            1,
-            3,
-            launch_priority=0,
-            paid_launch_allowed=False,
-            target_capacity_by_accelerator={'L4': 1},
-            accelerator_shapes={'L4': 1})
-        repository.plan_and_publish_current.assert_called_once()
-        notify.assert_called_once_with()
+        ctrl._replica_manager.materialize_paid_launch_receipt.assert_called_once_with(  # pylint: disable=line-too-long
+            receipt, prepared_specs)
+        ctrl._replica_manager.scale_up_batch.assert_not_called()
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
+        repository.plan_and_admit_current.assert_called_once()
 
     def test_settled_usage_gate_commits_whole_reserved_backend_before_paid(
             self):
@@ -5539,7 +5735,7 @@ class TestAutoscalerRuntimeSnapshot:
             repository = self._run_promoted_reconciles(
                 ctrl, [self._durable_snapshot()], supply=supply)
 
-        repository.plan_and_publish_current.assert_called_once()
+        repository.plan_and_admit_current.assert_called_once()
         accept_reserved.assert_called_once_with(allocation, scaler, 1, 0,
                                                 {'A100': 8})
         # One unit of logical demand commits a complete eight-GPU backend.  The
@@ -5591,17 +5787,21 @@ class TestAutoscalerRuntimeSnapshot:
                 supply=supply,
                 authority=paid_authority)
 
-        repository.plan_and_publish_current.assert_called_once()
+        repository.plan_and_admit_current.assert_called_once()
         accept_reserved.assert_not_called()
         ctrl._replica_manager.scale_up_batch.assert_not_called()
         ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()
         ctrl._replica_manager.scale_down.assert_not_called()
-        scaler.install_committed_capacity_plan.assert_not_called()
+        installed = scaler.install_committed_capacity_projection.call_args
+        assert installed is not None
+        assert installed.kwargs['committed_candidate'].kind is (
+            capacity_planning.CapacityPlanKind.GATE_ACQUISITION)
         assert scaler.target_num_replicas == 1
         assert scaler.target_num_replicas_by_accelerator == {'L4': 1}
         notify.assert_not_called()
 
-    def test_gate_acquisition_then_exact_zero_allocation_launches_spot(self):
+    def test_gate_acquisition_then_zero_allocation_materializes_paid_receipt(
+            self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
         scaler = self._logical_durable_autoscaler(target=1, emit_scale_up=True)
@@ -5610,6 +5810,7 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler = scaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
+        witness = self._gate_demand_witness(scaler, ('L4',))
 
         unavailable = self._reserved_supply_projection(
             policy=(controller.capacity_admission.ReservedSupplyPolicy.
@@ -5620,7 +5821,6 @@ class TestAutoscalerRuntimeSnapshot:
                                       supply=unavailable)
         ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()
 
-        witness = self._gate_demand_witness(scaler, ('L4',))
         allocation, _ = self._reserved_fill_allocation(
             grant=0,
             utilization_gate_armed=True,
@@ -5641,29 +5841,28 @@ class TestAutoscalerRuntimeSnapshot:
             target_capacity_by_accelerator=(('L4', 1),),
             accelerator_shapes=(('L4', 1),),
             launch_priority=0,
+            launch_priority_by_accelerator=(('L4', 0),),
             cold_launch_authority_by_accelerator=(('L4', 1),))
         scaler.generate_scaling_decisions.side_effect = None
         scaler.generate_scaling_decisions.return_value = [
             autoscalers.AutoscalerDecision(
                 autoscalers.AutoscalerDecisionOperator.SCALE_UP, target)
         ]
-        ctrl._replica_manager.scale_up_to_logical_capacity.side_effect = [[],
-                                                                          []]
+        prepared_specs = (object(),)
+        receipt = types.SimpleNamespace(members=(object(),))
 
-        repository = self._run_promoted_reconciles(ctrl,
-                                                   [self._durable_snapshot()],
-                                                   supply=settled_zero)
+        with mock.patch.object(ctrl,
+                               '_prepare_current_paid_launch_specs',
+                               return_value=prepared_specs):
+            repository = self._run_promoted_reconciles(
+                ctrl, [self._durable_snapshot()],
+                supply=settled_zero,
+                paid_launch_receipt=receipt)
 
-        repository.plan_and_publish_current.assert_called_once()
-        calls = ctrl._replica_manager.scale_up_to_logical_capacity.call_args_list
-        assert len(calls) == 2
-        assert calls[0].kwargs['paid_launch_allowed'] is False
-        assert calls[1].kwargs['cold_launch_authority_by_accelerator'] == {
-            'L4': 1
-        }
-        authority = calls[1].kwargs['paid_launch_authority']
-        assert authority.economic_residual() == {'L4': 1}
-        assert authority.remaining_launch_capacity() == {'L4': 1}
+        repository.plan_and_admit_current.assert_called_once()
+        ctrl._replica_manager.materialize_paid_launch_receipt.assert_called_once_with(  # pylint: disable=line-too-long
+            receipt, prepared_specs)
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
 
     def test_matching_gate_witness_commits_reserved_then_spot_residual(self):
         ctrl = _make_controller()
@@ -5715,28 +5914,28 @@ class TestAutoscalerRuntimeSnapshot:
             target_capacity_by_accelerator=(('L4', 3),),
             accelerator_shapes=(('L4', 1),),
             launch_priority=0,
+            launch_priority_by_accelerator=(('L4', 0),),
             cold_launch_authority_by_accelerator=(('L4', 2),))
         scaler.generate_scaling_decisions.side_effect = None
         scaler.generate_scaling_decisions.return_value = [
             autoscalers.AutoscalerDecision(
                 autoscalers.AutoscalerDecisionOperator.SCALE_UP, target)
         ]
-        ctrl._replica_manager.scale_up_to_logical_capacity.side_effect = [[],
-                                                                          []]
+        prepared_specs = (object(),)
+        receipt = types.SimpleNamespace(members=(object(),))
 
-        repository = self._run_promoted_reconciles(
-            ctrl, [self._durable_snapshot(generation=4)], supply=materialized)
+        with mock.patch.object(ctrl,
+                               '_prepare_current_paid_launch_specs',
+                               return_value=prepared_specs):
+            repository = self._run_promoted_reconciles(
+                ctrl, [self._durable_snapshot(generation=4)],
+                supply=materialized,
+                paid_launch_receipt=receipt)
 
-        repository.plan_and_publish_current.assert_called_once()
-        calls = ctrl._replica_manager.scale_up_to_logical_capacity.call_args_list
-        assert len(calls) == 2
-        assert calls[0].kwargs['paid_launch_allowed'] is False
-        assert calls[1].kwargs['cold_launch_authority_by_accelerator'] == {
-            'L4': 2
-        }
-        authority = calls[1].kwargs['paid_launch_authority']
-        assert authority.economic_residual() == {'L4': 2}
-        assert authority.remaining_launch_capacity() == {'L4': 2}
+        repository.plan_and_admit_current.assert_called_once()
+        ctrl._replica_manager.materialize_paid_launch_receipt.assert_called_once_with(  # pylint: disable=line-too-long
+            receipt, prepared_specs)
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
 
     def test_usage_gate_off_statically_prefills_settled_reservation(self):
         ctrl = _make_controller()
@@ -5776,7 +5975,7 @@ class TestAutoscalerRuntimeSnapshot:
             repository = self._run_promoted_reconciles(
                 ctrl, [self._durable_snapshot()], supply=supply)
 
-        repository.plan_and_publish_current.assert_called_once()
+        repository.plan_and_admit_current.assert_called_once()
         accept_reserved.assert_called_once_with(allocation, scaler, 1, 0,
                                                 {'H200': 1})
         ctrl._replica_manager.scale_up_batch.assert_not_called()
@@ -5813,7 +6012,7 @@ class TestAutoscalerRuntimeSnapshot:
             repository = self._run_promoted_reconciles(
                 ctrl, [self._durable_snapshot()], supply=supply)
 
-        repository.plan_and_publish_current.assert_called_once()
+        repository.plan_and_admit_current.assert_called_once()
         accept_reserved.assert_not_called()
         assert len(plans) == 1
         snapshot = plans[0].envelope.snapshot
@@ -5874,7 +6073,7 @@ class TestAutoscalerRuntimeSnapshot:
             repository = self._run_promoted_reconciles(
                 ctrl, [self._durable_snapshot()], supply=supply)
 
-        repository.plan_and_publish_current.assert_called_once()
+        repository.plan_and_admit_current.assert_called_once()
         accept_reserved.assert_called_once_with(allocation, scaler, 1, 0,
                                                 {'L4': 1})
         assert len(plans) == 1
@@ -5893,15 +6092,15 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
         repository = mock.Mock()
-        repository.plan_and_publish_current.side_effect = (
+        repository.plan_and_admit_current.side_effect = (
             controller.capacity_admission.CapacityAdmissionConflict(
                 'capacity plan compare-and-swap lost'))
 
         self._run_promoted_reconciles(ctrl, [self._durable_snapshot()],
                                       repository=repository)
 
-        repository.plan_and_publish_current.assert_called_once()
-        scaler.install_committed_capacity_plan.assert_not_called()
+        repository.plan_and_admit_current.assert_called_once()
+        scaler.install_committed_capacity_projection.assert_not_called()
         ctrl._replica_manager.publish_target_num_replicas.assert_not_called()
         ctrl._replica_manager.scale_up_batch.assert_not_called()
         ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()
@@ -6071,10 +6270,10 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
         ctrl._replica_manager.max_live_paid_gpu_units = None
-        ctrl._ordinary_launch_binding_authority = types.SimpleNamespace(  # pylint: disable=protected-access
-            service_lifecycle_epoch=3)
+        ctrl._ordinary_launch_binding_authority = (  # pylint: disable=protected-access
+            _promoted_planning_binding_authority())
         repository = mock.Mock()
-        repository.plan_and_publish_current.side_effect = (
+        repository.plan_and_admit_current.side_effect = (
             controller.capacity_admission.CapacityAdmissionConflict(
                 'Current durable demand is unavailable.'))
 
@@ -6121,9 +6320,9 @@ class TestAutoscalerRuntimeSnapshot:
             mock.call('svc'), mock.call('svc')
         ]
         get_runtime.assert_called_once_with('svc', require_version=True)
-        repository.plan_and_publish_current.assert_called_once()
+        repository.plan_and_admit_current.assert_called_once()
         assert ('reserved_fill_allocation_map'
-                not in repository.plan_and_publish_current.call_args.kwargs)
+                not in repository.plan_and_admit_current.call_args.kwargs)
         ctrl._replica_manager.publish_target_num_replicas.assert_not_called()
         ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.scale_up_batch.assert_not_called()
@@ -6138,8 +6337,8 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
         ctrl._durable_demand_snapshot = self._durable_snapshot()  # pylint: disable=protected-access
-        ctrl._ordinary_launch_binding_authority = types.SimpleNamespace(  # pylint: disable=protected-access
-            service_lifecycle_epoch=3)
+        ctrl._ordinary_launch_binding_authority = (  # pylint: disable=protected-access
+            _promoted_planning_binding_authority())
         scaler = self._logical_durable_autoscaler(target=2, emit_scale_up=True)
         scaler.target_num_replicas_by_accelerator = {'L4': 2}
         scaler.capacity_target_by_accelerator = {'L4': 2}
@@ -6148,7 +6347,8 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
         ctrl._replica_manager.max_live_paid_gpu_units = None
-        projection = self._reserved_supply_projection()
+        projection = self._bind_policy_history(
+            self._reserved_supply_projection(), scaler)
         repository = mock.Mock()
         call_order = []
         decisions = []
@@ -6168,7 +6368,9 @@ class TestAutoscalerRuntimeSnapshot:
                 reservation_input,
                 source_fingerprint=source_fingerprint,
                 fresh_zero=fresh_zero,
-                generation=request_information['reconcile_generation'])
+                generation=request_information['reconcile_generation'],
+                scaling_decisions=self._scaling_decisions_at_generation(
+                    scaler, request_information['reconcile_generation']))
 
         def _plan_current(**kwargs):
             call_order.append('transaction')
@@ -6179,16 +6381,18 @@ class TestAutoscalerRuntimeSnapshot:
             planner_snapshot, candidate = decision.decode_planner()
             authority = _paid_authority(candidate.paid_residual.as_dict(),
                                         candidate.paid_launch_target.as_dict())
-            return types.SimpleNamespace(authority=authority,
-                                         demand_snapshot=snapshot,
-                                         planner_snapshot=planner_snapshot,
-                                         candidate=candidate,
-                                         allocation_map=None)
+            return types.SimpleNamespace(
+                authority=authority,
+                demand_snapshot=snapshot,
+                planner_snapshot=planner_snapshot,
+                candidate=candidate,
+                allocation_map=None,
+                paid_launch_receipt=(types.SimpleNamespace(members=())))
 
-        repository.plan_and_publish_current.side_effect = _plan_current
+        repository.plan_and_admit_current.side_effect = _plan_current
         scaler.plan_durable_capacity_reconcile.side_effect = _durable_plan
-        scaler.install_committed_capacity_plan.side_effect = (
-            lambda **_kwargs: True)
+        scaler.install_committed_capacity_projection.side_effect = (
+            lambda **_kwargs: None)
         ctrl._replica_manager.publish_target_num_replicas.side_effect = (
             lambda *_args, **_kwargs: call_order.append('local-target'))
         with mock.patch.object(
@@ -6227,7 +6431,7 @@ class TestAutoscalerRuntimeSnapshot:
         assert decisions[0].capacity_target_by_accelerator == {'L4': 2}
         assert decisions[0].normalized_demand_extensions[
             'autoscaler_target'] == 2
-        repository.plan_and_publish_current.assert_called_once()
+        repository.plan_and_admit_current.assert_called_once()
         repository.project_reserved_supply.assert_not_called()
 
     @pytest.mark.parametrize('utilization_gate', [False, True])
@@ -6275,9 +6479,9 @@ class TestAutoscalerRuntimeSnapshot:
                 ctrl, [self._durable_snapshot()], supply=locked_supply)
 
         optimistic_read.assert_not_called()
-        repository.plan_and_publish_current.assert_called_once()
+        repository.plan_and_admit_current.assert_called_once()
         assert ('reserved_fill_allocation_map'
-                not in repository.plan_and_publish_current.call_args.kwargs)
+                not in repository.plan_and_admit_current.call_args.kwargs)
         accept.assert_called_once()
         assert accept.call_args.args[0].identity == locked.identity
 
@@ -6325,6 +6529,7 @@ class TestAutoscalerRuntimeSnapshot:
                         DEMAND_GATED),
                 evidence_state=(controller.capacity_admission.
                                 ReservedSupplyEvidenceState.UNAVAILABLE))
+            unavailable = self._bind_policy_history(unavailable, scaler)
             acquisition = scaler.plan_durable_capacity_reconcile(
                 [],
                 snapshot.request_information,
@@ -6334,6 +6539,9 @@ class TestAutoscalerRuntimeSnapshot:
                 decision_inputs=prepared_inputs,
                 retirement_shelter=None,
                 max_live_paid_gpu_units=None,
+                prior_policy_state=unavailable.prior_policy_state,
+                prior_candidate=unavailable.prior_candidate,
+                planning_db_epoch=unavailable.planning_db_epoch,
                 configured_reservation_accelerators=('L4',),
                 demand_witness_scope_sha256=(
                     unavailable.demand_witness_scope_sha256))
@@ -6360,6 +6568,7 @@ class TestAutoscalerRuntimeSnapshot:
             authenticated={'L4': 1},
             eligible={'L4': 1},
             allocation=allocation)
+        supply = self._bind_policy_history(supply, scaler)
         repository = mock.Mock()
         planner_candidates = []
         committed_candidates = []
@@ -6374,15 +6583,17 @@ class TestAutoscalerRuntimeSnapshot:
             decision = kwargs['planner'](snapshot, supply)
             planner_snapshot, candidate = decision.decode_planner()
             committed_candidates.append(candidate)
-            return types.SimpleNamespace(authority=_paid_authority(
-                candidate.paid_residual.as_dict(),
-                candidate.paid_launch_target.as_dict()),
-                                         demand_snapshot=snapshot,
-                                         planner_snapshot=planner_snapshot,
-                                         candidate=candidate,
-                                         allocation_map=supply.allocation_map)
+            return types.SimpleNamespace(
+                authority=_paid_authority(
+                    candidate.paid_residual.as_dict(),
+                    candidate.paid_launch_target.as_dict()),
+                demand_snapshot=snapshot,
+                planner_snapshot=planner_snapshot,
+                candidate=candidate,
+                allocation_map=supply.allocation_map,
+                paid_launch_receipt=(types.SimpleNamespace(members=())))
 
-        repository.plan_and_publish_current.side_effect = _plan_current
+        repository.plan_and_admit_current.side_effect = _plan_current
         with mock.patch.object(
                 autoscalers,
                 'prepare_controller_scaling_decision_inputs',
@@ -6416,46 +6627,55 @@ class TestAutoscalerRuntimeSnapshot:
             expected_gate_policy)
         assert planned.reserved_launch_target.as_dict() == {'L4': 1}
         assert planned.paid_residual.as_dict() == {}
-        assert scaler.export_durable_capacity_policy_state() == (
-            planned.next_policy_state)
+        assert scaler.target_num_replicas == planned.aggregate_demand_target
+        assert scaler.target_num_replicas_by_accelerator == (
+            planned.demand_attribution.as_dict())
         accept_reserved.assert_called_once_with(allocation, scaler, 1, 0,
                                                 {'L4': 1})
 
-    def test_promoted_paid_launch_uses_post_zero_cost_plan_authority(self):
+    def test_promoted_scale_up_metadata_is_not_replayed_after_admission(self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
         ctrl._autoscaler = self._logical_durable_autoscaler(  # pylint: disable=protected-access
             target=1, emit_scale_up=True)
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
-        ctrl._replica_manager.scale_up_to_logical_capacity.side_effect = [[],
-                                                                          []]
-        authority = mock.Mock()
-        authority.economic_residual.return_value = {}
-        authority.remaining_launch_capacity.return_value = {}
-
         repository = self._run_promoted_reconciles(ctrl,
-                                                   [self._durable_snapshot()],
-                                                   authority=authority)
+                                                   [self._durable_snapshot()])
 
-        assert ctrl._replica_manager.scale_up_to_logical_capacity.call_args_list == [  # pylint: disable=line-too-long
-            mock.call(1,
-                      1,
-                      3,
-                      launch_priority=0,
-                      paid_launch_allowed=False,
-                      target_capacity_by_accelerator={'L4': 1},
-                      accelerator_shapes={'L4': 1}),
-            mock.call(1,
-                      1,
-                      3,
-                      launch_priority=0,
-                      cold_launch_authority_by_accelerator={},
-                      target_capacity_by_accelerator={'L4': 1},
-                      accelerator_shapes={'L4': 1},
-                      paid_launch_authority=authority),
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_up_batch.assert_not_called()
+        repository.plan_and_admit_current.assert_called_once()
+
+    def test_promoted_unknown_replacement_is_not_a_second_launch_path(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler(target=1)
+        scaler.generate_scaling_decisions.side_effect = None
+        scaler.generate_scaling_decisions.return_value = [
+            autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_UP,
+                autoscalers.LogicalScaleTarget(
+                    version=1,
+                    reconcile_generation=3,
+                    target_capacity=1,
+                    target_capacity_by_accelerator=(('L4', 1),),
+                    accelerator_shapes=(('L4', 1),),
+                    replace_unknown_replica_ids=(1,),
+                    launch_priority=20,
+                    launch_priority_by_accelerator=(('L4', 20),),
+                    cold_launch_authority_by_accelerator=(('L4', 1),)))
         ]
-        repository.plan_and_publish_current.assert_called_once()
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+
+        repository = self._run_promoted_reconciles(
+            ctrl, [self._durable_snapshot(unknown_replica_ids={1})])
+
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_up_batch.assert_not_called()
+        repository.plan_and_admit_current.assert_called_once()
 
     def test_additive_route_allows_scale_up_but_suppresses_scale_down(self):
         ctrl = _make_controller()
@@ -6500,58 +6720,9 @@ class TestAutoscalerRuntimeSnapshot:
         self._run_promoted_reconciles(ctrl, [snapshot], authority=authority)
 
         ctrl._replica_manager.scale_down_logically_batch.assert_not_called()
-        assert ctrl._replica_manager.scale_up_to_logical_capacity.call_count == 2
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
 
-    def test_promoted_mixed_logical_wave_forwards_paid_authority(self):
-        ctrl = _make_controller()
-        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
-        scaler = self._logical_durable_autoscaler(target=3)
-        scaler.logical_target_state = autoscalers.LogicalCapacityTarget(
-            1, 3, 3, (('L4', 3),), (('L4', 1),))
-        ctrl._autoscaler = scaler  # pylint: disable=protected-access
-        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
-        ctrl._replica_manager.spot_placer = None
-        authority = mock.Mock()
-        authority.economic_residual.return_value = {'l4': 3}
-        authority.remaining_launch_capacity.return_value = {'l4': 3}
-        target = autoscalers.LogicalScaleTarget(
-            version=1,
-            reconcile_generation=3,
-            target_capacity=3,
-            target_capacity_by_accelerator=(('L4', 3),),
-            accelerator_shapes=(('L4', 1),),
-            replace_unknown_replica_ids=(1,),
-            launch_budget=3,
-            launch_priority=20,
-            launch_priority_by_accelerator=(('L4', 20),),
-            cold_launch_authority_by_accelerator=(('L4', 3),))
-        decision = autoscalers.AutoscalerDecision(
-            autoscalers.AutoscalerDecisionOperator.SCALE_UP, target)
-        scaler.generate_scaling_decisions.side_effect = None
-        scaler.generate_scaling_decisions.return_value = [decision]
-
-        repository = self._run_promoted_reconciles(ctrl, [
-            self._durable_snapshot(observed_slots={1: 0},
-                                   in_flight={1: 0},
-                                   unknown_replica_ids={1})
-        ],
-                                                   authority=authority)
-
-        ctrl._replica_manager.scale_up_to_logical_capacity.assert_called_once_with(  # pylint: disable=line-too-long
-            3,
-            1,
-            3,
-            replace_unknown_replica_ids=(1,),
-            launch_budget=3,
-            launch_priority=20,
-            launch_priority_by_accelerator={'L4': 20},
-            cold_launch_authority_by_accelerator={'L4': 3},
-            target_capacity_by_accelerator={'L4': 3},
-            accelerator_shapes={'L4': 1},
-            paid_launch_authority=authority)
-        repository.plan_and_publish_current.assert_called_once()
-
-    def test_promoted_cost_rebalance_suppresses_on_demand_candidate(self):
+    def test_promoted_cost_rebalance_is_not_a_second_launch_path(self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
         scaler = self._logical_durable_autoscaler(target=0)
@@ -6589,9 +6760,8 @@ class TestAutoscalerRuntimeSnapshot:
                                                    [self._durable_snapshot()],
                                                    authority=authority)
 
-        ctrl._replica_manager.scale_up_batch.assert_called_once_with(
-            [spot], expected_version=1, launch_priority=50)
-        repository.plan_and_publish_current.assert_called_once()
+        ctrl._replica_manager.scale_up_batch.assert_not_called()
+        repository.plan_and_admit_current.assert_called_once()
 
     def test_promoted_zero_target_still_publishes_revoking_plan(self):
         ctrl = _make_controller()
@@ -6607,7 +6777,7 @@ class TestAutoscalerRuntimeSnapshot:
                                                    [self._durable_snapshot()],
                                                    authority=authority)
 
-        repository.plan_and_publish_current.assert_called_once()
+        repository.plan_and_admit_current.assert_called_once()
         ctrl._replica_manager.scale_up_batch.assert_not_called()
 
     def test_fresh_aggregate_zero_retires_paid_before_suppressing_scale_up(
@@ -6627,7 +6797,7 @@ class TestAutoscalerRuntimeSnapshot:
                                                    authority=authority)
 
         scaler.clear_paid_launch_authority_for_fresh_zero.assert_not_called()
-        repository.plan_and_publish_current.assert_called_once()
+        repository.plan_and_admit_current.assert_called_once()
         ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(
             0, expected_version=1)
         retirement_authority = (
@@ -6697,7 +6867,7 @@ class TestAutoscalerRuntimeSnapshot:
 
         repository = self._run_promoted_reconciles(ctrl, [snapshot])
 
-        repository.plan_and_publish_current.assert_called_once()
+        repository.plan_and_admit_current.assert_called_once()
         # The immutable planner owns fresh-zero retention; there is no second
         # mutable controller calculation after the commit.
         ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(
@@ -7294,9 +7464,10 @@ class TestAutoscalerRuntimeSnapshot:
         decision_autoscaler = self._logical_durable_autoscaler(target=0)
         ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
         ctrl._replica_manager.max_live_paid_gpu_units = None
-        ctrl._ordinary_launch_binding_authority = types.SimpleNamespace(  # pylint: disable=protected-access
-            service_lifecycle_epoch=3)
+        ctrl._ordinary_launch_binding_authority = (  # pylint: disable=protected-access
+            _promoted_planning_binding_authority())
         transaction_entered = threading.Event()
         release_transaction = threading.Event()
         actuation_epoch_held = threading.Event()
@@ -7306,7 +7477,8 @@ class TestAutoscalerRuntimeSnapshot:
         transition_acquired = threading.Event()
         repository = mock.Mock()
         result = []
-        projection = self._reserved_supply_projection()
+        projection = self._bind_policy_history(
+            self._reserved_supply_projection(), decision_autoscaler)
 
         def _durable_plan(_replica_infos, request_information,
                           reservation_input, *, source_fingerprint, fresh_zero,
@@ -7328,15 +7500,17 @@ class TestAutoscalerRuntimeSnapshot:
             planner_snapshot, candidate = decision.decode_planner()
             authority = _paid_authority(candidate.paid_residual.as_dict(),
                                         candidate.paid_launch_target.as_dict())
-            return types.SimpleNamespace(authority=authority,
-                                         demand_snapshot=snapshot,
-                                         planner_snapshot=planner_snapshot,
-                                         candidate=candidate,
-                                         allocation_map=None)
+            return types.SimpleNamespace(
+                authority=authority,
+                demand_snapshot=snapshot,
+                planner_snapshot=planner_snapshot,
+                candidate=candidate,
+                allocation_map=None,
+                paid_launch_receipt=(types.SimpleNamespace(members=())))
 
         def _publish():
             result.append(
-                ctrl._plan_and_publish_current_capacity(  # pylint: disable=protected-access
+                ctrl._plan_and_admit_current_capacity(  # pylint: disable=protected-access
                     decision_autoscaler,
                     1,
                     0,
@@ -7345,7 +7519,7 @@ class TestAutoscalerRuntimeSnapshot:
                     autoscalers.ScalingDecisionInputs(
                         replica_ids=(),
                         gpu_shape_handles={},
-                        historical_scaling_values={}),
+                        historical_scaling_values={}), [],
                     sequenced_reserved_fill=False))
 
         def _transition():
@@ -7358,11 +7532,11 @@ class TestAutoscalerRuntimeSnapshot:
                 actuation_epoch_held.set()
                 assert release_actuation_epoch.wait(timeout=5)
 
-        repository.plan_and_publish_current.side_effect = _plan_current
+        repository.plan_and_admit_current.side_effect = _plan_current
         decision_autoscaler.plan_durable_capacity_reconcile.side_effect = (
             _durable_plan)
-        decision_autoscaler.install_committed_capacity_plan.side_effect = (
-            lambda **_kwargs: True)
+        decision_autoscaler.install_committed_capacity_projection.side_effect = (
+            lambda **_kwargs: None)
         with mock.patch.object(controller.capacity_admission,
                                'CapacityAdmissionRepository',
                                return_value=repository):
@@ -7398,9 +7572,10 @@ class TestAutoscalerRuntimeSnapshot:
         scaler = self._logical_durable_autoscaler(target=1)
         ctrl._autoscaler = scaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
         ctrl._replica_manager.max_live_paid_gpu_units = None
-        ctrl._ordinary_launch_binding_authority = types.SimpleNamespace(  # pylint: disable=protected-access
-            service_lifecycle_epoch=3)
+        ctrl._ordinary_launch_binding_authority = (  # pylint: disable=protected-access
+            _promoted_planning_binding_authority())
         info = _FakeReplicaInfo(7,
                                 serve_state.ReplicaStatus.READY,
                                 accelerators={'L4': 1})
@@ -7414,6 +7589,7 @@ class TestAutoscalerRuntimeSnapshot:
             existing_zero_cost={'L4': 1},
             economic_replica_infos=(info,),
             economic_kueue_capacity=locked_kueue)
+        supply = self._bind_policy_history(supply, scaler)
         prepared = autoscalers.ScalingDecisionInputs(
             replica_ids=(7,),
             gpu_shape_handles={},
@@ -7442,25 +7618,27 @@ class TestAutoscalerRuntimeSnapshot:
             planner_snapshot, candidate = decision.decode_planner()
             authority = _paid_authority(candidate.paid_residual.as_dict(),
                                         candidate.paid_launch_target.as_dict())
-            return types.SimpleNamespace(authority=authority,
-                                         demand_snapshot=snapshot,
-                                         planner_snapshot=planner_snapshot,
-                                         candidate=candidate,
-                                         allocation_map=None)
+            return types.SimpleNamespace(
+                authority=authority,
+                demand_snapshot=snapshot,
+                planner_snapshot=planner_snapshot,
+                candidate=candidate,
+                allocation_map=None,
+                paid_launch_receipt=(types.SimpleNamespace(members=())))
 
-        repository.plan_and_publish_current.side_effect = _plan_current
+        repository.plan_and_admit_current.side_effect = _plan_current
         scaler.plan_durable_capacity_reconcile.side_effect = _durable_plan
-        scaler.install_committed_capacity_plan.return_value = True
+        scaler.install_committed_capacity_projection.return_value = None
         with mock.patch.object(controller.capacity_admission,
                                'CapacityAdmissionRepository',
                                return_value=repository):
-            result = ctrl._plan_and_publish_current_capacity(  # pylint: disable=protected-access
+            result = ctrl._plan_and_admit_current_capacity(  # pylint: disable=protected-access
                 scaler,
                 1,
                 0,
                 0,
                 'f' * 64,
-                prepared,
+                prepared, [info],
                 sequenced_reserved_fill=False)
 
         assert result is not None

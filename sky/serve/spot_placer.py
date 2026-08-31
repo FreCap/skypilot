@@ -72,6 +72,49 @@ _PLACEMENT_SNAPSHOT_ORDER_SEMANTICS = (
     'catalog_normalized_cost_then_location_identity')
 
 
+def encode_resources_override(
+    state: Mapping[str, Any] | None,) -> dict[str, Any] | None:
+    """Encode a resources override without losing regionless image keys."""
+    if state is None:
+        return None
+    encoded = dict(state)
+    image_id = encoded.get('image_id')
+    if isinstance(image_id, dict):
+        encoded['image_id'] = [
+            [region, image] for region, image in image_id.items()
+        ]
+    return encoded
+
+
+def decode_resources_override(
+    state: Mapping[str, Any] | None,) -> dict[str, Any] | None:
+    """Restore the canonical in-memory resources-override representation."""
+    if state is None:
+        return None
+    decoded = dict(state)
+    image_id = decoded.get('image_id')
+    if isinstance(image_id, list):
+        restored_image_id: dict[str | None, str] = {}
+        for item in image_id:
+            if not isinstance(item, list) or len(item) != 2:
+                raise ValueError('Invalid replica image_id storage state: '
+                                 f'{image_id!r}')
+            region, image = item
+            if (region is not None and
+                    not isinstance(region, str)) or not (isinstance(
+                        image, str)) or region in restored_image_id:
+                raise ValueError('Invalid replica image_id storage entry: '
+                                 f'{item!r}')
+            restored_image_id[region] = image
+        decoded['image_id'] = restored_image_id
+    elif isinstance(image_id, dict) and 'null' in image_id:
+        decoded['image_id'] = {
+            None if region == 'null' else region: image
+            for region, image in image_id.items()
+        }
+    return decoded
+
+
 def _normalize_image_id(
         image_id: dict[str | None, str] | None) -> dict[str | None, str] | None:
     """Region-independent form of a single-image dict.
@@ -722,6 +765,43 @@ class PlacementCatalog:
         """Return a mutable runtime map with one value for every location."""
         return dict(self.entries)
 
+    def ranked_entries(
+        self,
+        contract: placement_policy.PlacementContract,
+    ) -> tuple['RankedPlacementCatalogEntry', ...]:
+        """Return the immutable catalog in the selector's canonical order."""
+        ranked = sorted(self.entries,
+                        key=lambda item: (_normalized_hourly_cost(
+                            contract, item[0], item[1]), item[0].sort_key()))
+        return tuple(
+            RankedPlacementCatalogEntry(
+                rank=rank,
+                location=location,
+                hourly_cost=float(hourly_cost),
+                normalized_hourly_cost=_normalized_hourly_cost(
+                    contract, location, hourly_cost))
+            for rank, (location, hourly_cost) in enumerate(ranked))
+
+
+@dataclasses.dataclass(frozen=True)
+class RankedPlacementCatalogEntry:
+    """One catalog member with its sole canonical placement ordering facts."""
+
+    rank: int
+    location: Location
+    hourly_cost: float
+    normalized_hourly_cost: float
+
+
+def _normalized_hourly_cost(
+    contract: placement_policy.PlacementContract,
+    location: Location,
+    hourly_cost: float,
+) -> float:
+    slots = sum((location.accelerators or {}).values())
+    return contract.normalize_hourly_cost(hourly_cost,
+                                          float(slots) if slots > 0 else 1.0)
+
 
 def _shape_free_config(resources: 'resources_lib.Resources') -> dict[str, Any]:
     """Return the resource fields shared by every placement candidate."""
@@ -1009,6 +1089,8 @@ class SpotPlacer:
         else:
             catalog_value = PlacementCatalog.from_dict(placement_catalog)
         self.placement_catalog = catalog_value
+        self._ranked_catalog_entries = catalog_value.ranked_entries(
+            placement_contract)
         # Keep the durable service workspace so every launch-facing view can
         # re-evaluate current policy. Workspace policy may be narrowed while a
         # service is scaled to zero; constructor-only filtering would leave the
@@ -1149,6 +1231,11 @@ class SpotPlacer:
     def placement_contract(self) -> placement_policy.PlacementContract:
         return self._placement_contract
 
+    @property
+    def ranked_catalog_entries(self) -> tuple[RankedPlacementCatalogEntry, ...]:
+        """Return the immutable selector order computed at construction."""
+        return self._ranked_catalog_entries
+
     def select_next_location(
             self,
             *,
@@ -1205,11 +1292,13 @@ class SpotPlacer:
         catalog insertion order for ties while avoiding repeated minimum
         scans of a large catalog.
         """
-        active_locations = [
-            location for location in self.active_locations()
-            if allowed_locations is None or location in allowed_locations
+        active_locations = set(self.active_locations())
+        return [
+            entry.location
+            for entry in self.ranked_catalog_entries
+            if entry.location in active_locations and
+            (allowed_locations is None or entry.location in allowed_locations)
         ]
-        return sorted(active_locations, key=self._normalized_location_cost)
 
     def resolve_location(
             self,
@@ -1443,16 +1532,11 @@ class SpotPlacer:
     def mark_retry_state_persisted(self) -> None:
         self._retry_state_dirty = False
 
-    @staticmethod
-    def _accelerator_slots(location: Location) -> float:
-        slots = sum((location.accelerators or {}).values())
-        return float(slots) if slots > 0 else 1.0
-
     def _normalized_location_cost(self, location: Location) -> float:
         """Return the canonical placement-order key for one location."""
-        return self.placement_contract.normalize_hourly_cost(
-            self.location2cost.get(location, float('inf')),
-            self._accelerator_slots(location))
+        return _normalized_hourly_cost(
+            self.placement_contract, location,
+            self.location2cost.get(location, float('inf')))
 
     def _min_cost_location(self, locations: list[Location]) -> Location:
         return min(locations, key=self._normalized_location_cost)

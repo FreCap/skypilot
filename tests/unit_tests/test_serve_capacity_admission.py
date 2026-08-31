@@ -221,6 +221,7 @@ def _planner_decision(
         expected_paid_residual_by_accelerator={'L4': 2},
         expected_paid_launch_target_by_accelerator={'L4': 2},
         static_reserved_fill_target_by_accelerator={},
+        paid_launch_priority_by_accelerator={'l4': 50},
         planner_payload=envelope)
 
 
@@ -618,6 +619,8 @@ def test_capacity_decision_cannot_diverge_from_planner_envelope(
             decision.expected_paid_launch_target_by_accelerator,
         'static_reserved_fill_target_by_accelerator':
             decision.static_reserved_fill_target_by_accelerator,
+        'paid_launch_priority_by_accelerator':
+            decision.paid_launch_priority_by_accelerator,
         'planner_payload': decision.planner_payload,
     }
     values[field] = replacement

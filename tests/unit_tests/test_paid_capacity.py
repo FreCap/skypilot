@@ -1,18 +1,29 @@
 """Tests for centralized SkyServe paid-capacity policy."""
 # pylint: disable=protected-access
+import dataclasses
+import hashlib
 import json
 from unittest import mock
 
 import pytest
 from spot_placer_test_utils import make_location
-from spot_placer_test_utils import make_placer
+from spot_placer_test_utils import make_placer as _make_placer
 
 from sky.serve import capacity_admission
 from sky.serve import capacity_planning
 from sky.serve import constants
 from sky.serve import paid_capacity
 from sky.serve import replica_managers
+from sky.serve import serve_utils
+from sky.serve import spot_placer
 from sky.utils import common_utils
+
+
+def make_placer(*args, **kwargs):
+    placer = _make_placer(*args, **kwargs)
+    placer._ranked_catalog_entries = (  # pylint: disable=protected-access
+        placer.placement_catalog.ranked_entries(placer.placement_contract))
+    return placer
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +70,197 @@ def _pending_info(replica_id, location):
                                         location=location,
                                         version=1,
                                         resources_override=location.to_dict())
+
+
+def _provider_free_launch_spec() -> paid_capacity.PaidLaunchSpec:
+    location = make_location('us-central1', {'L4': 1}, cloud_name='GCP')
+    location.instance_type = 'g2-standard-4'
+    pool_key = paid_capacity.pool_key(location,
+                                      workspace='default',
+                                      num_nodes=1)
+    info = _pending_info(7, location)
+    info.cluster_name = serve_utils.generate_replica_cluster_name(
+        'svc', 7, 'hash')
+    info.replica_record_id = '11111111-1111-4111-8111-111111111111'
+    info.created_at = None
+    info.paid_capacity_pool_key = pool_key
+    override = info.to_storage_dict()['resources_override']
+    frozen_override = paid_capacity.freeze_paid_launch_payload(override)
+    worker = paid_capacity.freeze_paid_launch_payload({
+        'schema_version': 1,
+        'launch_yaml_content': 'resources: {}\n',
+        'cluster_name': info.cluster_name,
+        'log_file_name': serve_utils.generate_replica_launch_log_file_name(
+            'svc', 7, 'hash'),
+        'resources_override': override,
+        'retry_until_up': False,
+        'frozen_controller_config_path':
+            (serve_utils.generate_versioned_config_yaml_file_name(
+                'svc', 1, 'hash')),
+    })
+    service_spec_bytes = b'immutable-service-spec'
+    controller_config = b'active_workspace: default\n'
+    placement_catalog = spot_placer.PlacementCatalog(((location, 0.10),),
+                                                     num_nodes=1).to_dict()
+    return paid_capacity.PaidLaunchSpec(
+        ordinal=0,
+        service_name='svc',
+        service_hash='hash',
+        service_lifecycle_epoch=2,
+        service_version=1,
+        replica_id=7,
+        replica_record_id=info.replica_record_id,
+        cluster_name_seed=info.cluster_name,
+        worker_construction=worker,
+        provider_account=None,
+        cloud='gcp',
+        workspace='default',
+        region='us-central1',
+        zone=None,
+        instance_type='g2-standard-4',
+        pool_key=pool_key,
+        frontier_key=('l4',),
+        accelerator='l4',
+        gpu_units_per_node=1,
+        num_nodes=1,
+        resources_override=frozen_override,
+        catalog_evidence=paid_capacity.PaidLaunchCatalogEvidence(
+            placement_catalog_sha256=(
+                paid_capacity.paid_launch_payload_sha256(placement_catalog)),
+            catalog_rank=0,
+            exploration_round=0,
+            slot_within_pool_window=0,
+            version_authority=paid_capacity.PaidLaunchVersionAuthority(
+                service_spec=service_spec_bytes,
+                service_spec_sha256=hashlib.sha256(
+                    service_spec_bytes).hexdigest(),
+                controller_config=controller_config,
+                controller_config_digest=hashlib.sha256(
+                    controller_config).hexdigest(),
+                controller_config_snapshot_id='c' * 64)))
+
+
+def test_paid_launch_spec_is_deeply_immutable_and_provider_free():
+    source = {'nested': {'items': [1, 2]}}
+    frozen = paid_capacity.freeze_paid_launch_payload(source)
+    source['nested']['items'].append(3)
+    assert paid_capacity.thaw_paid_launch_payload(frozen) == {
+        'nested': {
+            'items': [1, 2]
+        }
+    }
+
+    spec = _provider_free_launch_spec()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.replica_id = 8
+    forbidden = {
+        'replica_info', 'location', 'callback', 'worker', 'claim',
+        'capacity_plan_generation', 'demand_feed_generation', 'priority',
+        'created_at', 'initial_replica_state'
+    }
+    assert forbidden.isdisjoint(
+        field.name for field in dataclasses.fields(spec))
+    assert all(not isinstance(value, (dict, list, set))
+               for value in vars(spec).values())
+
+
+def test_paid_launch_spec_decodes_only_inside_persistence_adapter():
+    spec = _provider_free_launch_spec()
+    persistence = spec.persistence_spec(priority=17,
+                                        frontier_limit=3,
+                                        replica_port='8080',
+                                        planned_capacity=1,
+                                        created_at=123.0)
+
+    assert persistence.candidate.replica_id == spec.replica_id
+    assert persistence.candidate.replica_info.replica_record_id == (
+        spec.replica_record_id)
+    assert persistence.candidate.location.to_pickleable() == (
+        persistence.candidate.replica_info.location)
+    assert persistence.candidate.capacity_plan_claim is None
+    assert persistence.candidate.replica_info.created_at == 123.0
+    assert persistence.pool_key == spec.pool_key
+    assert persistence.frontier_key == ('l4',)
+    assert persistence.frontier_limit == 3
+
+
+def test_pristine_paid_replica_state_owns_every_lifecycle_default():
+    spec = _provider_free_launch_spec()
+    state = paid_capacity.build_pristine_paid_replica_state(spec,
+                                                            replica_port='8080',
+                                                            planned_capacity=1,
+                                                            created_at=123.0)
+
+    assert state['replica_port'] == '8080'
+    assert state['created_at'] == 123.0
+    assert state['planned_capacity'] == 1
+    assert state['is_spot'] is True
+    assert state['is_zero_cost'] is False
+    assert state['reserved_fill'] is False
+    assert state['unknown_capacity_replacement'] is False
+    assert state['system_recovery_disposition'] == 'ORDINARY'
+    assert state['system_recovery_revision'] == 0
+    assert state['system_recovery'] is None
+    assert state['system_recovery_quarantine'] is None
+    assert state['launch_request_id'] is None
+    assert state['service_job_id'] is None
+    assert state['ordinary_release_not_before'] is None
+    assert state['status_property'] == {
+        'sky_launch_status': 'SCHEDULED',
+        'user_app_failed': False,
+        'service_ready_now': False,
+        'first_ready_time': None,
+        'sky_down_status': None,
+        'is_scale_down': False,
+        'preempted': False,
+        'purged': False,
+        'failed_spot_availability': False,
+        'drain_cap_seconds': None,
+        'drain_started_at': None,
+        'wait_for_idle_before_termination': False,
+        'logical_retirement_version': None,
+        'logical_retirement_controller_epoch': None,
+        'logical_retirement_generation': None,
+        'logical_retirement_target_capacity': None,
+        'logical_retirement_confirmed_generation': None,
+        'logical_retirement_bounded_deadline': False,
+        'logical_retirement_committed': False,
+    }
+
+    # A caller can mutate only its returned copy; rebuilding from the typed
+    # seed always restores the server-owned pristine lifecycle state.
+    state['status_property']['is_scale_down'] = True
+    rebuilt = paid_capacity.build_pristine_paid_replica_state(
+        spec, replica_port='8080', planned_capacity=1, created_at=123.0)
+    assert rebuilt['status_property']['is_scale_down'] is False
+
+
+def test_paid_launch_receipt_is_sparse_accepted_identity_only():
+    spec = _provider_free_launch_spec()
+    member = paid_capacity.PaidLaunchReceiptMember(
+        replica_id=spec.replica_id,
+        replica_record_id=spec.replica_record_id,
+        pool_key=spec.pool_key,
+        priority=50,
+        accelerator='l4',
+        plan_units=1,
+        physical_gpu_units=1)
+    receipt = paid_capacity.PaidLaunchReceipt(service_name='svc',
+                                              service_hash='hash',
+                                              service_lifecycle_epoch=2,
+                                              service_version=1,
+                                              capacity_plan_generation=4,
+                                              capacity_plan_sha256='a' * 64,
+                                              capacity_unit='logical-gpu',
+                                              members=(member,))
+
+    assert receipt.members == (member,)
+    assert 'outcome' not in {field.name for field in dataclasses.fields(member)}
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        receipt.members = ()
+    with pytest.raises(ValueError, match='canonical'):
+        dataclasses.replace(spec,
+                            replica_record_id=f'{{{spec.replica_record_id}}}')
 
 
 def _paid_launch_authority(
@@ -1904,7 +2106,7 @@ def test_local_window_debits_ambiguous_legacy_row_from_cheapest_type(
     }
 
 
-def test_claim_clamps_priority_and_returns_typed_result():
+def test_claim_rejects_out_of_range_priority():
     location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     location.instance_type = 'g6.xlarge'
     budget = paid_capacity.LaunchBudget(
@@ -1925,32 +2127,15 @@ def test_claim_clamps_priority_and_returns_typed_result():
         frontier_key_by_location={location: ('l4',)},
         frontier_limit_overrides={('l4',): 3})
     info = _pending_info(1, location)
-    with mock.patch.object(paid_capacity.serve_state,
-                           'try_add_replicas_with_paid_capacity_claims',
-                           return_value=['acquired']) as claim:
-        result = paid_capacity.try_persist_claim(service_name='svc',
-                                                 service_hash='hash',
-                                                 controller_owner=(1,
-                                                                   '10.0.0.1'),
-                                                 replica_id=1,
-                                                 replica_info=info,
-                                                 location=location,
-                                                 budget=budget,
-                                                 priority=1000)
-
-    assert result is paid_capacity.ClaimResult.ACQUIRED
-    persistence_specs = claim.call_args.args[2]
-    assert len(persistence_specs) == 1
-    assert persistence_specs[0].candidate.priority == (
-        constants.LB_REQUEST_PRIORITY_MAX)
-    assert persistence_specs[0].pool_key == budget.pool_key_by_location[
-        location]
-    assert claim.call_args.kwargs['service_limit'] == 24
-    assert claim.call_args.kwargs['max_live_paid_gpu_units'] == 8
-    assert persistence_specs[0].frontier_key == ('l4',)
-    assert persistence_specs[0].frontier_limit == 3
-    assert claim.call_args.kwargs['frontier_default_limit'] == 2
-    assert claim.call_args.kwargs['frontier_limits_by_key'] == {('l4',): 3}
+    with pytest.raises(ValueError, match='priority must be exact'):
+        paid_capacity.try_persist_claim(service_name='svc',
+                                        service_hash='hash',
+                                        controller_owner=(1, '10.0.0.1'),
+                                        replica_id=1,
+                                        replica_info=info,
+                                        location=location,
+                                        budget=budget,
+                                        priority=1000)
 
 
 def test_claim_batch_returns_exact_typed_members_and_publishes_only_committed():

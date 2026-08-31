@@ -24,12 +24,16 @@ from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy import orm
 from sqlalchemy.sql import dml
 
+from sky import clouds
 from sky.serve import constants as serve_constants
+from sky.serve import paid_capacity
 from sky.serve import pool_capacity_observation
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import reserved_fill_reclaim_attestation as reclaim
 from sky.serve import serve_state
+from sky.serve import service_spec
+from sky.serve import spot_placer
 from sky.serve import zero_cost_actuation
 from sky.utils import common_utils
 from sky.utils import locks
@@ -482,6 +486,240 @@ def _broker_db(broker_engine, monkeypatch, clock):  # pylint: disable=unused-arg
     broker.clear_caches()
     yield engine
     broker.clear_caches()
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestConnectionLocalPaidAdmission:
+    """The extracted insertion core owns neither validation nor transaction."""
+
+    @staticmethod
+    def _add_service() -> None:
+        spec = service_spec.SkyServiceSpec(readiness_path='/health',
+                                           initial_delay_seconds=60,
+                                           readiness_timeout_seconds=30,
+                                           endpoint_probe_interval_seconds=10,
+                                           lb_stream_timeout_seconds=60,
+                                           min_replicas=1,
+                                           max_replicas=1,
+                                           lb_high_availability=False)
+        assert serve_state.add_service(name='paid-core-svc',
+                                       controller_job_id=1,
+                                       policy='policy',
+                                       requested_resources_str='1x[AWS(L4):1]',
+                                       load_balancing_policy='round_robin',
+                                       status=serve_state.ServiceStatus.READY,
+                                       tls_encrypted=False,
+                                       pool=False,
+                                       controller_pid=11,
+                                       entrypoint='entry',
+                                       spec=spec,
+                                       yaml_content='service: {}',
+                                       controller_ip='10.0.0.1',
+                                       service_hash='paid-core-hash',
+                                       resource_scope='paid-core-scope')
+
+    @staticmethod
+    def _spec() -> paid_capacity.PaidClaimPersistenceSpec:
+        location = spot_placer.Location(cloud=clouds.GCP(),
+                                        region='us-central1',
+                                        zone=None,
+                                        accelerators={'L4': 1},
+                                        use_spot=True,
+                                        instance_type='g2-standard-4')
+        info = replica_managers.ReplicaInfo(
+            replica_id=1,
+            cluster_name='paid-core-svc-1',
+            replica_port='8080',
+            is_spot=True,
+            location=location,
+            version=1,
+            resources_override=location.to_dict())
+        candidate = paid_capacity.PaidClaimCandidate(replica_id=1,
+                                                     replica_info=info,
+                                                     location=location,
+                                                     priority=20,
+                                                     capacity_plan_claim=None)
+        return paid_capacity.PaidClaimPersistenceSpec(
+            candidate=candidate,
+            pool_key=paid_capacity.pool_key(location,
+                                            workspace='default',
+                                            num_nodes=1),
+            frontier_key=paid_capacity.frontier_key(location),
+            frontier_limit=1)
+
+    @staticmethod
+    def _legacy_admit(
+            spec: paid_capacity.PaidClaimPersistenceSpec) -> list[str]:
+        return serve_state.try_add_replicas_with_paid_capacity_claims(
+            'paid-core-svc',
+            'paid-core-hash', [spec],
+            base_limit=1,
+            max_limit=1,
+            service_limit=1,
+            now=100,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1'),
+            frontier_default_limit=1)
+
+    def test_core_uses_caller_transaction_and_skips_plan_validation(
+            self, broker_engine, monkeypatch):
+        self._add_service()
+        spec = self._spec()
+        candidate_info = spec.candidate.replica_info
+        validators = [
+            mock.Mock(side_effect=AssertionError('validator entered core')),
+            mock.Mock(
+                side_effect=AssertionError('batch validator entered core')),
+        ]
+        monkeypatch.setattr(serve_state.capacity_admission,
+                            'validate_paid_claim_in_connection', validators[0])
+        monkeypatch.setattr(
+            serve_state.capacity_admission,
+            'validate_prospective_paid_claim_batch_in_connection',
+            validators[1])
+
+        with orm.Session(broker_engine) as session:
+            serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+                session.connection())
+            owner = serve_state._lock_service_owner_row_in_session(
+                session,
+                'paid-core-svc',
+                'paid-core-hash', (11, '10.0.0.1'),
+                require_launch_allowed=True)
+            assert owner is not None
+            cap_readable, cap = (
+                serve_state._current_max_live_paid_gpu_units_in_session(
+                    session, 'paid-core-svc', owner.current_version))
+            assert cap_readable and cap is None
+            upstream = serve_state._PaidCapacityAdmissionUpstreamContext(
+                service_hash='paid-core-hash',
+                service_version=owner.current_version,
+                max_live_paid_gpu_units=cap)
+            census = serve_state._paid_capacity_admission_census_in_session(
+                session,
+                'paid-core-svc',
+                'paid-core-hash', [spec],
+                max_live_paid_gpu_units=cap)
+            assert census is not None
+            locked_context = (
+                serve_state._lock_paid_capacity_admission_context_in_session(
+                    session,
+                    broker_engine,
+                    'paid-core-svc', [spec],
+                    upstream=upstream,
+                    census=census,
+                    base_limit=1,
+                    now=100))
+
+            commit = mock.Mock(
+                side_effect=AssertionError('connection-local core committed'))
+            rollback = mock.Mock(
+                side_effect=AssertionError('connection-local core rolled back'))
+            with mock.patch.object(session, 'commit',
+                                   commit), mock.patch.object(
+                                       session, 'rollback', rollback):
+                decision = (
+                    serve_state.
+                    _admit_replicas_with_paid_capacity_claims_in_session(
+                        session,
+                        broker_engine,
+                        'paid-core-svc', [spec],
+                        locked_context=locked_context,
+                        base_limit=1,
+                        max_limit=1,
+                        service_limit=1,
+                        success_ttl_seconds=60,
+                        failure_cooldown_seconds=60,
+                        waiter_ttl_seconds=30))
+                claims = serve_state._capacity_plan_claims_for_paid_admission(
+                    [spec], decision, {1: None})
+                assert serve_state._persist_paid_capacity_admission_in_session(
+                    session,
+                    broker_engine,
+                    'paid-core-svc', [spec],
+                    decision,
+                    locked_context=locked_context,
+                    capacity_plan_claims_by_replica_id=claims)
+
+            assert decision.result_values == ('acquired',)
+            assert decision.accepted_indices == (0,)
+            assert decision.ownership_valid
+            assert session.in_transaction()
+            assert session.execute(
+                sqlalchemy.select(
+                    serve_state.replicas_table.c.replica_id)).scalar_one() == 1
+            assert candidate_info.paid_capacity_pool_key is None
+            commit.assert_not_called()
+            rollback.assert_not_called()
+            for validator in validators:
+                validator.assert_not_called()
+            session.rollback()
+
+        # Caller rollback owns every pool/waiter/replica/claim write.
+        with orm.Session(broker_engine) as session:
+            for table in (serve_state.paid_capacity_pools_table,
+                          serve_state.paid_capacity_waiters_table,
+                          serve_state.replicas_table,
+                          serve_state.paid_capacity_claims_table):
+                assert session.execute(
+                    sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                                     ).select_from(table)).scalar_one() == 0
+
+    def test_legacy_wrapper_validates_before_persisting(self, broker_engine,
+                                                        monkeypatch):
+        self._add_service()
+        spec = self._spec()
+
+        def _validate(connection, *_args, **_kwargs):
+            assert connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    serve_state.replicas_table)).scalar_one() == 0
+
+        validate = mock.Mock(side_effect=_validate)
+        monkeypatch.setattr(serve_state.capacity_admission,
+                            'validate_paid_claim_in_connection', validate)
+        validate_batch = mock.Mock(
+            side_effect=AssertionError('unexpected batch validator'))
+        monkeypatch.setattr(
+            serve_state.capacity_admission,
+            'validate_prospective_paid_claim_batch_in_connection',
+            validate_batch)
+
+        assert self._legacy_admit(spec) == ['acquired']
+        validate.assert_called_once()
+        validate_batch.assert_not_called()
+        with orm.Session(broker_engine) as session:
+            assert session.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    serve_state.replicas_table)).scalar_one() == 1
+            assert session.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    serve_state.paid_capacity_claims_table)).scalar_one() == 1
+
+    def test_legacy_validator_failure_rolls_back_arbitration(
+            self, broker_engine, monkeypatch):
+        self._add_service()
+        spec = self._spec()
+        monkeypatch.setattr(
+            serve_state.capacity_admission, 'validate_paid_claim_in_connection',
+            mock.Mock(side_effect=serve_state.capacity_admission.
+                      CapacityAdmissionConflict('stale plan')))
+
+        with pytest.raises(
+                serve_state.capacity_admission.CapacityAdmissionConflict,
+                match='stale plan'):
+            self._legacy_admit(spec)
+
+        with orm.Session(broker_engine) as session:
+            for table in (serve_state.paid_capacity_pools_table,
+                          serve_state.paid_capacity_waiters_table,
+                          serve_state.replicas_table,
+                          serve_state.paid_capacity_claims_table):
+                assert session.execute(
+                    sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                                     ).select_from(table)).scalar_one() == 0
 
 
 def _upsert(name,
@@ -2818,7 +3056,10 @@ class TestClaimLifecycle:
         engine = serve_state._db_manager.get_engine()
         with orm.Session(engine) as session:
             session.execute(serve_state.services_table.insert().values(
-                name='svc-a', hash='incarnation-a', lifecycle_epoch=1))
+                name='svc-a',
+                hash='incarnation-a',
+                lifecycle_epoch=1,
+                status=serve_state.ServiceStatus.SHUTTING_DOWN.value))
             session.commit()
         assert serve_state.remove_service_completely('svc-a', 'incarnation-a')
         live = {
@@ -3354,11 +3595,12 @@ class TestAtomicPersistFence:
         assert alloc is not None
         carried = alloc.epoch
         assert broker.current_epoch(_POOL) == carried  # pre-check passes
-        real_execute = orm.Session.execute
+        real_session_execute = orm.Session.execute
+        real_connection_execute = sqlalchemy.engine.Connection.execute
         raced = {'done': False}
         rounds_table = serve_state.reserved_fill_rounds_table
 
-        def racing_execute(session, statement, *args, **kwargs):
+        def _publish_racing_round(statement):
             fence_statement = ((isinstance(statement, sqlalchemy.Select) and
                                 'reserved_fill_rounds' in str(statement)) or
                                (isinstance(statement, dml.Insert) and
@@ -3367,15 +3609,25 @@ class TestAtomicPersistFence:
                 raced['done'] = True
                 engine = serve_state._db_manager.get_engine()
                 with orm.Session(engine) as other:
-                    real_execute(
+                    real_session_execute(
                         other,
                         sqlalchemy.update(rounds_table).where(
                             rounds_table.c.pool_key == _POOL).values(
                                 epoch=carried + 1))
                     other.commit()
-            return real_execute(session, statement, *args, **kwargs)
 
-        monkeypatch.setattr(orm.Session, 'execute', racing_execute)
+        def racing_session_execute(session, statement, *args, **kwargs):
+            _publish_racing_round(statement)
+            return real_session_execute(session, statement, *args, **kwargs)
+
+        def racing_connection_execute(connection, statement, *args, **kwargs):
+            _publish_racing_round(statement)
+            return real_connection_execute(connection, statement, *args,
+                                           **kwargs)
+
+        monkeypatch.setattr(orm.Session, 'execute', racing_session_execute)
+        monkeypatch.setattr(sqlalchemy.engine.Connection, 'execute',
+                            racing_connection_execute)
         assert not _add_replica_if_round_epoch(
             'svc-a', 1, self._STUB_INFO, pool_key=_POOL, expected_epoch=carried)
         assert raced['done']
