@@ -1913,7 +1913,8 @@ def test_prepare_paid_launch_specs_is_bounded_cost_ordered_and_io_free():
     assert all(spec.accelerator == 'l4' and spec.physical_gpu_units == 1
                for spec in specs)
     assert all(
-        paid_capacity.thaw_paid_launch_payload(spec.initial_replica_state)
+        paid_capacity.build_pristine_paid_replica_state(
+            spec, replica_port='8080', planned_capacity=1, created_at=None)
         ['planned_capacity'] == 1 for spec in specs)
     assert all(not isinstance(value, (dict, list, set))
                for spec in specs

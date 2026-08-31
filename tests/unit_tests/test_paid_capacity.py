@@ -84,8 +84,6 @@ def _provider_free_launch_spec() -> paid_capacity.PaidLaunchSpec:
     info.replica_record_id = '11111111-1111-4111-8111-111111111111'
     info.created_at = None
     info.paid_capacity_pool_key = pool_key
-    initial_state = paid_capacity.freeze_paid_launch_payload(
-        info.to_storage_dict())
     override = info.to_storage_dict()['resources_override']
     frozen_override = paid_capacity.freeze_paid_launch_payload(override)
     worker = paid_capacity.freeze_paid_launch_payload({
@@ -113,7 +111,6 @@ def _provider_free_launch_spec() -> paid_capacity.PaidLaunchSpec:
         replica_id=7,
         replica_record_id=info.replica_record_id,
         cluster_name_seed=info.cluster_name,
-        initial_replica_state=initial_state,
         worker_construction=worker,
         provider_account=None,
         cloud='gcp',
@@ -159,7 +156,7 @@ def test_paid_launch_spec_is_deeply_immutable_and_provider_free():
     forbidden = {
         'replica_info', 'location', 'callback', 'worker', 'claim',
         'capacity_plan_generation', 'demand_feed_generation', 'priority',
-        'created_at'
+        'created_at', 'initial_replica_state'
     }
     assert forbidden.isdisjoint(
         field.name for field in dataclasses.fields(spec))
@@ -169,7 +166,11 @@ def test_paid_launch_spec_is_deeply_immutable_and_provider_free():
 
 def test_paid_launch_spec_decodes_only_inside_persistence_adapter():
     spec = _provider_free_launch_spec()
-    persistence = spec.persistence_spec(priority=17, frontier_limit=3)
+    persistence = spec.persistence_spec(priority=17,
+                                        frontier_limit=3,
+                                        replica_port='8080',
+                                        planned_capacity=1,
+                                        created_at=123.0)
 
     assert persistence.candidate.replica_id == spec.replica_id
     assert persistence.candidate.replica_info.replica_record_id == (
@@ -177,9 +178,61 @@ def test_paid_launch_spec_decodes_only_inside_persistence_adapter():
     assert persistence.candidate.location.to_pickleable() == (
         persistence.candidate.replica_info.location)
     assert persistence.candidate.capacity_plan_claim is None
+    assert persistence.candidate.replica_info.created_at == 123.0
     assert persistence.pool_key == spec.pool_key
     assert persistence.frontier_key == ('l4',)
     assert persistence.frontier_limit == 3
+
+
+def test_pristine_paid_replica_state_owns_every_lifecycle_default():
+    spec = _provider_free_launch_spec()
+    state = paid_capacity.build_pristine_paid_replica_state(spec,
+                                                            replica_port='8080',
+                                                            planned_capacity=1,
+                                                            created_at=123.0)
+
+    assert state['replica_port'] == '8080'
+    assert state['created_at'] == 123.0
+    assert state['planned_capacity'] == 1
+    assert state['is_spot'] is True
+    assert state['is_zero_cost'] is False
+    assert state['reserved_fill'] is False
+    assert state['unknown_capacity_replacement'] is False
+    assert state['system_recovery_disposition'] == 'ORDINARY'
+    assert state['system_recovery_revision'] == 0
+    assert state['system_recovery'] is None
+    assert state['system_recovery_quarantine'] is None
+    assert state['launch_request_id'] is None
+    assert state['service_job_id'] is None
+    assert state['ordinary_release_not_before'] is None
+    assert state['status_property'] == {
+        'sky_launch_status': 'SCHEDULED',
+        'user_app_failed': False,
+        'service_ready_now': False,
+        'first_ready_time': None,
+        'sky_down_status': None,
+        'is_scale_down': False,
+        'preempted': False,
+        'purged': False,
+        'failed_spot_availability': False,
+        'drain_cap_seconds': None,
+        'drain_started_at': None,
+        'wait_for_idle_before_termination': False,
+        'logical_retirement_version': None,
+        'logical_retirement_controller_epoch': None,
+        'logical_retirement_generation': None,
+        'logical_retirement_target_capacity': None,
+        'logical_retirement_confirmed_generation': None,
+        'logical_retirement_bounded_deadline': False,
+        'logical_retirement_committed': False,
+    }
+
+    # A caller can mutate only its returned copy; rebuilding from the typed
+    # seed always restores the server-owned pristine lifecycle state.
+    state['status_property']['is_scale_down'] = True
+    rebuilt = paid_capacity.build_pristine_paid_replica_state(
+        spec, replica_port='8080', planned_capacity=1, created_at=123.0)
+    assert rebuilt['status_property']['is_scale_down'] is False
 
 
 def test_paid_launch_receipt_is_sparse_accepted_identity_only():

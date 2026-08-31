@@ -166,6 +166,180 @@ def _paid_write_counts(
                     table)).scalar_one() for table in tables)
 
 
+def _insert_old_incarnation_tombstone(
+    engine: sqlalchemy.engine.Engine,) -> dict[str, object]:
+    """Insert one settled, quiesced, replica-free protocol-v1 tombstone."""
+    association_id = uuid.uuid4()
+    replica_record_id = uuid.uuid4()
+    request_id = f'old-request-{uuid.uuid4()}'
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with engine.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).mappings().one()
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        connection.execute(
+            sqlalchemy.insert(associations).values(
+                association_id=association_id,
+                submission_id=uuid.uuid4(),
+                tenant_scope='tenant-a',
+                service_name='svc',
+                service_hash='retained-old-hash',
+                service_workspace='workspace-a',
+                service_lifecycle_epoch=2,
+                service_binding_epoch=2,
+                service_version=1,
+                replica_id=140,
+                replica_record_id=replica_record_id,
+                launch_generation=1,
+                cluster_name='svc-old-140',
+                request_id=request_id,
+                input_digest='a' * 64,
+                owner_controller_incarnation=service['controller_incarnation'],
+                owner_controller_epoch=service['controller_owner_epoch'],
+                effect_phase=(
+                    ordinary_launch_binding.EffectPhase.NOT_STARTED.value),
+                resolution=(ordinary_launch_binding.Resolution.
+                            PRE_EFFECT_TERMINAL.value),
+                terminal_status=(
+                    ordinary_launch_binding.TerminalStatus.FAILED.value),
+                terminal_cause='request_never_executed',
+                terminal_execution_generation=0,
+                execution_quiescence_required=True,
+                execution_quiesced_generation=0,
+                execution_quiesced_at=now,
+                projected_at=now,
+                pin_released_at=now,
+                tombstone_not_before=(now + datetime.timedelta(days=60)),
+                created_at=now,
+                updated_at=now))
+        row = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.association_id ==
+                association_id)).mappings().one()
+        assert ordinary_launch_binding.settled_association_proves_execution_quiescence(
+            row)
+    return {
+        'association_id': association_id,
+        'replica_id': 140,
+        'replica_record_id': replica_record_id,
+        'request_id': request_id,
+    }
+
+
+def _insert_old_tombstone_reference(
+    engine: sqlalchemy.engine.Engine,
+    tombstone: dict[str, object],
+    reference_kind: str,
+) -> None:
+    """Attach one otherwise-forbidden retained authority reference."""
+    association_id = tombstone['association_id']
+    replica_id = tombstone['replica_id']
+    replica_record_id = tombstone['replica_record_id']
+    request_id = tombstone['request_id']
+    with engine.begin() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        if reference_kind == 'replica':
+            values = _replica_values(int(replica_id), zero_cost=True)
+            values['replica_state']['replica_record_id'] = str(
+                replica_record_id)
+            values['ordinary_launch_association_id'] = association_id
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.replicas_table).values(**values))
+        elif reference_kind == 'request':
+            connection.execute(
+                sqlalchemy.insert(request_postgres.REQUESTS).values(
+                    request_id=request_id,
+                    name='sky.launch',
+                    handler_name='sky.server.requests.ordinary_launch:launch',
+                    payload_type='test-payload',
+                    payload_format='json',
+                    payload_version=1,
+                    producer_version='test',
+                    payload_json={},
+                    execution_class='normal',
+                    status='CANCELLED',
+                    created_at=now,
+                    schedule_type='short',
+                    user_id='tenant-a',
+                    should_retry=False,
+                    ignore_return_value=False,
+                    retryable=False,
+                    execution_generation=0,
+                    ordinary_launch_association_id=association_id,
+                    updated_at=now))
+        elif reference_kind == 'queue':
+            connection.execute(
+                sqlalchemy.insert(request_postgres.QUEUE).values(
+                    request_id=request_id,
+                    schedule_type='short',
+                    priority=0,
+                    available_at=now,
+                    enqueued_at=now,
+                    ignore_return_value=False,
+                    retryable=False,
+                    precondition_attempts=0,
+                    delivery_state='queued',
+                    updated_at=now))
+        elif reference_kind == 'pin':
+            connection.execute(
+                sqlalchemy.insert(
+                    request_postgres.REQUEST_RETENTION_PINS).values(
+                        pin_kind='ordinary-launch',
+                        pin_id=association_id,
+                        request_id=request_id,
+                        created_at=now))
+        elif reference_kind == 'kueue':
+            identity = kueue_lane_lineage.KueueAdmissionIdentity(
+                service_name='svc',
+                service_hash='svc-hash',
+                service_lifecycle_epoch=3,
+                service_version=1,
+                pool_key='retained-kueue-pool',
+                pool_epoch=1,
+                physical_cluster_uid='retained-cluster',
+                kubernetes_context='retained-context',
+                accelerator='l4',
+                accelerator_count=1,
+                worker_projection_sha256='b' * 64)
+            connection.execute(
+                sqlalchemy.insert(
+                    kueue_lane_lineage_schema.serve_kueue_admissions_table).
+                values(intent_idempotency_key='7' * 64,
+                       service_name='svc',
+                       unresolved_domain_sha256=(
+                           identity.unresolved_domain_sha256),
+                       service_hash='svc-hash',
+                       service_lifecycle_epoch=3,
+                       service_version=1,
+                       pool_key=identity.pool_key,
+                       pool_epoch=identity.pool_epoch,
+                       physical_cluster_uid=(identity.physical_cluster_uid),
+                       kubernetes_context=(identity.kubernetes_context),
+                       accelerator='l4',
+                       accelerator_count=1,
+                       worker_projection_sha256='b' * 64,
+                       capacity_unit='physical',
+                       planned_capacity=1,
+                       state='INTENT_PENDING',
+                       replica_id=replica_id,
+                       replica_record_id=replica_record_id,
+                       provider_cluster_generation=1,
+                       association_id=association_id,
+                       created_at=now,
+                       updated_at=now))
+        else:
+            raise AssertionError(f'unsupported reference: {reference_kind}')
+
+
 def _capacity_service_spec(
     reserved_fill_enabled: bool,
     *,
@@ -178,6 +352,7 @@ def _capacity_service_spec(
     assert replica_unit in ('physical_backend', 'logical')
     return service_spec.SkyServiceSpec(
         readiness_path='/health',
+        ports='8000',
         initial_delay_seconds=0,
         readiness_timeout_seconds=5,
         endpoint_probe_interval_seconds=1,
@@ -921,8 +1096,6 @@ def _paid_launch_spec(
     info.created_at = None
     info.is_zero_cost = False
     info.paid_capacity_pool_key = exact_pool_key
-    initial_state = paid_capacity.freeze_paid_launch_payload(
-        info.to_storage_dict())
     frozen_override = paid_capacity.freeze_paid_launch_payload(
         info.to_storage_dict()['resources_override'])
     worker = paid_capacity.freeze_paid_launch_payload({
@@ -947,7 +1120,6 @@ def _paid_launch_spec(
         replica_id=replica_id,
         replica_record_id=info.replica_record_id,
         cluster_name_seed=info.cluster_name,
-        initial_replica_state=initial_state,
         worker_construction=worker,
         provider_account=None,
         cloud='gcp',
@@ -1285,6 +1457,7 @@ def test_paid_plan_claimed_units_projection_is_exact_and_fails_closed(
     pools = serve_state_schema.paid_capacity_pools_table
     claims = serve_state_schema.paid_capacity_claims_table
     digest = 'a' * 64
+    pool_key = _paid_pool_key()
 
     def _claim_values(*,
                       replica_id,
@@ -1297,7 +1470,7 @@ def test_paid_plan_claimed_units_projection_is_exact_and_fails_closed(
             'service_name': service_name,
             'service_hash': service_hash,
             'replica_id': replica_id,
-            'pool_key': 'gcp:L4',
+            'pool_key': pool_key,
             'priority': 50,
             'claimed_at': time.time(),
             'capacity_plan_generation': generation,
@@ -1311,7 +1484,7 @@ def test_paid_plan_claimed_units_projection_is_exact_and_fails_closed(
     with engine.begin() as connection:
         connection.execute(
             postgresql.insert(pools).values(
-                pool_key='gcp:L4',
+                pool_key=pool_key,
                 current_limit=10,
                 successes_since_resize=0,
                 updated_at=time.time()).on_conflict_do_nothing())
@@ -1319,11 +1492,21 @@ def test_paid_plan_claimed_units_projection_is_exact_and_fails_closed(
             _replica_values(replica_id, zero_cost=False)
             for replica_id in (101, 102, 103)
         ]
+        retained_association_id = uuid.uuid4()
         retained = _replica_values(108, zero_cost=False)
         retained.update(status='READY',
-                        ordinary_launch_association_id=uuid.uuid4())
+                        ordinary_launch_association_id=retained_association_id)
+        # Build a deliberately inconsistent historical debit ledger.  Current
+        # writes cannot create these rows because their capacity-plan parents
+        # are mandatory; this read-path test must still fail closed if an old
+        # or externally corrupted database contains them.
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
         connection.execute(sqlalchemy.insert(serve_state_schema.replicas_table),
-                           [*valid_replicas, retained])
+                           valid_replicas)
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.replicas_table).values(**retained))
         connection.execute(
             sqlalchemy.insert(claims),
             [
@@ -1341,6 +1524,18 @@ def test_paid_plan_claimed_units_projection_is_exact_and_fails_closed(
                 _claim_values(replica_id=108, units=2),
             ])
 
+    with engine.connect() as connection:
+        retained_row = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.status,
+                serve_state_schema.replicas_table.c.paid_capacity_pool_key,
+                serve_state_schema.replicas_table.c.
+                ordinary_launch_association_id).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id ==
+                    108)).one()
+    assert retained_row == ('READY', pool_key, retained_association_id)
+
     assert serve_state.get_paid_capacity_plan_claimed_units(
         'svc', 'svc-hash', 8, digest) == {
             'l4': 14
@@ -1352,6 +1547,8 @@ def test_paid_plan_claimed_units_projection_is_exact_and_fails_closed(
         connection.execute(
             sqlalchemy.insert(serve_state_schema.replicas_table).values(
                 **_replica_values(106, zero_cost=False)))
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
         connection.execute(
             sqlalchemy.insert(claims).values(**_claim_values(
                 replica_id=106, units=1, content_sha256='b' * 64)))
@@ -1981,6 +2178,19 @@ def test_current_planner_commits_regionless_image_paid_authority(
         replica_state['resources_override'])['image_id'] == {
             None: 'skypilot:test-regionless-image'
         }
+    expected_state = paid_capacity.build_pristine_paid_replica_state(
+        spec,
+        replica_port='8000',
+        planned_capacity=1,
+        created_at=replica_state['created_at'])
+    assert replica_state == expected_state
+    status = replica_state['status_property']
+    assert status['sky_launch_status'] == 'SCHEDULED'
+    assert status['sky_down_status'] is None
+    assert status['service_ready_now'] is False
+    assert status['is_scale_down'] is False
+    assert replica_state['system_recovery'] is None
+    assert replica_state['system_recovery_quarantine'] is None
 
 
 @pytest.mark.parametrize('mutation', [
@@ -2104,7 +2314,9 @@ def test_current_planner_stale_controller_aba_rolls_back_every_write(
             sqlalchemy.update(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name == 'svc').values(
                     controller_incarnation=replacement_incarnation,
-                    controller_owner_epoch=5))
+                    controller_owner_epoch=5,
+                    non_pool_launch_controller_incarnation=(
+                        replacement_incarnation)))
     before = _paid_write_counts(engine)
 
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
@@ -2112,6 +2324,66 @@ def test_current_planner_stale_controller_aba_rolls_back_every_write(
         capacity_admission.CapacityAdmissionRepository(
             engine).plan_and_admit_current(
                 **stale_authority,
+                service_name='svc',
+                service_hash='svc-hash',
+                service_lifecycle_epoch=3,
+                service_version=1,
+                accounting_cards={'l4': 1},
+                backend_num_nodes=1,
+                sequenced_reserved_fill=False,
+                planner=lambda snapshot, supply: _current_decision(
+                    snapshot, supply, 1),
+                prepared_paid_launch_specs=(spec,))
+
+    assert _paid_write_counts(engine) == before
+
+
+@pytest.mark.parametrize('mutation', ['port', 'retirement', 'recovery'])
+def test_current_planner_rolls_back_tampered_pristine_paid_state(
+        capacity_database, monkeypatch, mutation):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    spec = _paid_launch_spec(engine, 0, 122)
+    persist = serve_state._persist_paid_capacity_admission_in_session
+
+    def _tampering_persist(connection, *args, **kwargs):
+        result = persist(connection, *args, **kwargs)
+        state = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.replica_state).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id ==
+                    122).with_for_update()).scalar_one()
+        state = copy.deepcopy(state)
+        if mutation == 'port':
+            state['replica_port'] = '9999'
+        elif mutation == 'retirement':
+            state['status_property']['is_scale_down'] = True
+        else:
+            state['system_recovery'] = {
+                'disposition': 'tampered',
+            }
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id == 122).values(
+                    replica_state=state))
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'origin'")
+        return result
+
+    monkeypatch.setattr(serve_state,
+                        '_persist_paid_capacity_admission_in_session',
+                        _tampering_persist)
+    before = _paid_write_counts(engine)
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='changed during readback'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(
+                **_current_owner_kwargs(engine),
                 service_name='svc',
                 service_hash='svc-hash',
                 service_lifecycle_epoch=3,
@@ -2235,7 +2507,7 @@ def test_current_planner_recomputes_prior_claims_after_stale_cleanup(
         sequenced_reserved_fill=False,
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 1),
         prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 160),))
-    assert len(first.paid_launch_receipt.members) == 1
+    assert len(first_commit.paid_launch_receipt.members) == 1
     replicas = serve_state_schema.replicas_table
     with engine.begin() as connection:
         state = connection.execute(
@@ -2347,6 +2619,61 @@ def test_current_planner_empty_wave_fails_closed_on_old_incarnation_graph(
 
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
                        match='retained authority graph'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner)
+
+    planner.assert_not_called()
+
+
+def test_current_planner_clean_recreation_ignores_detached_old_tombstone(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    tombstone = _insert_old_incarnation_tombstone(engine)
+    planner = mock.Mock(side_effect=lambda snapshot, supply: _current_decision(
+        snapshot, supply, 0))
+
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
+                                       service_hash='svc-hash',
+                                       service_lifecycle_epoch=3,
+                                       service_version=1,
+                                       accounting_cards={'l4': 1},
+                                       backend_num_nodes=1,
+                                       sequenced_reserved_fill=False,
+                                       planner=planner)
+
+    planner.assert_called_once()
+    assert committed.paid_launch_receipt.members == ()
+    with engine.connect() as connection:
+        retained = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == tombstone['association_id'])).scalar_one()
+    assert retained == 1
+
+
+@pytest.mark.parametrize('reference_kind',
+                         ['replica', 'request', 'queue', 'pin', 'kueue'])
+def test_current_planner_clean_recreation_rejects_referenced_old_tombstone(
+        capacity_database, reference_kind):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    tombstone = _insert_old_incarnation_tombstone(engine)
+    _insert_old_tombstone_reference(engine, tombstone, reference_kind)
+    planner = mock.Mock()
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict):
         capacity_admission.CapacityAdmissionRepository(
             engine).plan_and_admit_current(**_current_owner_kwargs(engine),
                                            service_name='svc',
@@ -2983,6 +3310,7 @@ def test_fill_demand_witness_retains_only_older_deadline_lower_bound(
     _enable_durable_intent(engine,
                            incarnation,
                            reserved_fill_enabled=True,
+                           max_replicas=1000,
                            utilization_gate=True)
     allocation = _allocation_map({'l4': 1},
                                  utilization_gate_armed=True,
@@ -3228,7 +3556,7 @@ def test_committed_reservation_survives_gated_entitlement_change(
         backend_num_nodes=1,
         sequenced_reserved_fill=True,
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2))
-    assert first.candidate.new_reserved_capacity_committed.as_dict() == {
+    assert first_commit.candidate.new_reserved_capacity_committed.as_dict() == {
         'l4': 1
     }
 
@@ -3311,7 +3639,8 @@ def test_committed_reservation_survives_gated_entitlement_change(
         assert candidate.reserved_launch_target.total() == 0
         assert candidate.paid_launch_target.total() == 0
 
-    assert successor.authority.generation == first.authority.generation + 1
+    assert (
+        successor.authority.generation == first_commit.authority.generation + 1)
     if allocation_state in ('disappeared', 'held-grant'):
         assert successor.authority.remaining_launch_capacity() == {'l4': 1}
         with pytest.raises(capacity_admission.CapacityAdmissionConflict,
