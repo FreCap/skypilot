@@ -592,8 +592,7 @@ class GcpObserver:
             self._scope.project_id, '--format=json'
         ],
                                 check=False,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
+                                capture_output=True,
                                 text=True,
                                 timeout=45)
         if result.returncode != 0:
