@@ -2454,7 +2454,7 @@ def _project_capacity_inventory(
     locked: _LockedCapacityRows,
     *,
     service_version: int,
-    capacity_unit: reserved_fill_planner.FillCapacityUnit,
+    capacity_unit: FillCapacityUnit,
     accounting_cards: set[str],
     now: datetime.datetime,
     lane_projection: kueue_lane_capacity.KueueAdmissionCapacityProjection,
