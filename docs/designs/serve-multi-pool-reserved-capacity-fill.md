@@ -2064,6 +2064,34 @@ its counters, clocks and ceilings start at zero/``None``. The same transaction
 may then plan current positive demand. A missing head beside any live graph is
 ``RECREATE_REQUIRED`` and never permission to synthesize state.
 
+That exhaustive cross-incarnation census occurs only while the format-5 head
+is absent. Each strict-valid current head is an inductive durable receipt:
+genesis performed the census, and every supported successor writer validated
+its predecessor under the same service/head locks before replacing it. The
+current receipt is trusted only after the strict service/hash/lifecycle/version/
+envelope decoder succeeds. Supported association creation, owner transfer,
+effect transition, cancellation, terminal reduction, reconciliation and
+projection writers serialize on that service lock; the request root is created
+in the same transaction before that lock is released. Later request execution
+updates may lock only the request suffix, but can only reduce an active root to
+terminal/quiesced state: the supported request repository rejects terminal
+reopening, while association resolution, terminal evidence and identity are
+database-guarded as monotonic/immutable. Settled detached rows therefore cannot
+reacquire effect authority. A steady-state reconciliation therefore
+locks only the indexed unresolved association set, exact locked replica and
+Kueue attachment identities, and exact prepared replica-record collision
+identities; lifecycle-local numeric replica collision checks are restricted to
+the current service hash. Request-root lookup uses the request primary key and
+the existing API009 unique partial association index. Every UUID comparison is
+bound as PostgreSQL's native UUID type. Any old-hash row in that
+live/attached/collision scope remains a fail-closed conflict. Settled detached
+60-day tombstones and their closed request roots do not enter the steady
+transaction, so the association/request portion of admission latency and lock
+volume is independent of retained association campaign history. Replica and
+zero-cost-intent census scalability remains a separate bound; this receipt does
+not make claims about those tables. No new table or index is required for the
+association bound.
+
 The repository returns one explicit transaction disposition:
 
 - ``COMMIT_PLAN`` writes one complete positive plan/head, finalized policy

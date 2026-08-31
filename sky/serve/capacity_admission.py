@@ -2219,6 +2219,7 @@ def _lock_capacity_rows(
         sqlalchemy.select(
             _REPLICAS.c.replica_id, _REPLICAS.c.status, _REPLICAS.c.version,
             _REPLICAS.c.reserved_fill_intent_idempotency_key,
+            _REPLICAS.c.ordinary_launch_association_id,
             _REPLICAS.c.paid_capacity_pool_key, _REPLICAS.c.sky_down_status,
             _REPLICAS.c.replica_state_version, _REPLICAS.c.replica_state,
             replica_state_sha256).where(
@@ -3384,6 +3385,266 @@ def _inert_recreated_service_association(
             association))
 
 
+@dataclasses.dataclass(frozen=True)
+class _LockedAssociationAuthorityGraph:
+    """Bounded association authority locked for one planning transaction."""
+
+    association_rows: tuple[Mapping[str, Any], ...]
+    active_association_rows: tuple[Mapping[str, Any], ...]
+    request_rows: tuple[Mapping[str, Any], ...]
+    queue_rows: tuple[Mapping[str, Any], ...]
+    pin_rows: tuple[Mapping[str, Any], ...]
+    blocking_request_count: int
+
+
+def _lock_association_authority_graph(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    ordinary_associations: sqlalchemy.Table,
+    request_rows_table: sqlalchemy.Table,
+    request_queue_table: sqlalchemy.Table,
+    request_pins_table: sqlalchemy.Table,
+    service_name: str,
+    service_hash: str,
+    exhaustive_history_census: bool,
+    prepared_specs: Sequence[serve_paid_capacity.PaidLaunchSpec],
+    locked_capacity: _LockedCapacityRows,
+    lane_projection: kueue_lane_capacity.KueueAdmissionCapacityProjection,
+) -> _LockedAssociationAuthorityGraph:
+    """Lock either genesis history or the bounded live authority frontier.
+
+    Format-5 genesis performs an exhaustive service-wide census.  Each strict-
+    valid current head is then an inductive receipt: every successor validated
+    its predecessor under the service lock back to that genesis census.
+    Association resolution is monotonic and supported writers serialize on the
+    already-held service row, so later ticks need only lock unresolved rows,
+    current attachment pointers, and exact prepared-candidate collisions.
+    """
+    replica_records = {(replica_id, str(record_id)) for replica_id, record_id in
+                       locked_capacity.provider_present_replica_record_ids}
+    live_record_ids = {
+        record_id
+        for _, record_id in locked_capacity.provider_present_replica_record_ids
+    }
+    pointed_association_identities: dict[uuid.UUID, tuple[int, uuid.UUID]] = {}
+
+    def _remember_pointer(association_id: uuid.UUID, replica_id: int,
+                          replica_record_id: uuid.UUID) -> None:
+        expected = (replica_id, replica_record_id)
+        previous = pointed_association_identities.setdefault(
+            association_id, expected)
+        if previous != expected:
+            raise CapacityAdmissionConflict(
+                'Locked association pointers carry conflicting replica '
+                'identities.')
+
+    for replica_row in locked_capacity.replica_rows:
+        pointer = replica_row.get('ordinary_launch_association_id')
+        if isinstance(pointer, uuid.UUID):
+            state = replica_row.get('replica_state')
+            try:
+                record_id = uuid.UUID(str(state['replica_record_id']))
+            except (KeyError, TypeError, ValueError, AttributeError) as error:
+                raise CapacityAdmissionConflict(
+                    'Locked replica association pointer has no record identity.'
+                ) from error
+            _remember_pointer(pointer, int(replica_row['replica_id']),
+                              record_id)
+    for lane_row in lane_projection.rows:
+        pointer = lane_row.association_id
+        if pointer is None:
+            continue
+        if (not isinstance(pointer, uuid.UUID) or
+                type(lane_row.replica_id) is not int or
+                not isinstance(lane_row.replica_record_id, uuid.UUID)):
+            raise CapacityAdmissionConflict(
+                'Locked Kueue association pointer has no replica identity.')
+        _remember_pointer(pointer, lane_row.replica_id,
+                          lane_row.replica_record_id)
+    pointed_association_ids = set(pointed_association_identities)
+
+    if exhaustive_history_census:
+        association_statement = sqlalchemy.select(ordinary_associations).where(
+            ordinary_associations.c.service_name == service_name)
+    else:
+        # Keep every selector independently indexable.  In particular, the
+        # unresolved selector uses uq_serve_ordinary_binding_unsettled instead
+        # of forcing PostgreSQL through retained settled tombstones.
+        scope_selects = [
+            sqlalchemy.select(ordinary_associations.c.association_id).where(
+                ordinary_associations.c.service_name == service_name,
+                ordinary_associations.c.resolution.in_(
+                    tuple(value.value for value in
+                          ordinary_launch_binding.UNSETTLED_RESOLUTIONS)))
+        ]
+        if pointed_association_ids:
+            scope_selects.append(
+                sqlalchemy.select(ordinary_associations.c.association_id).where(
+                    ordinary_associations.c.service_name == service_name,
+                    ordinary_associations.c.association_id.in_(
+                        tuple(sorted(pointed_association_ids, key=str)))))
+        # ``replica_record_id`` is PostgreSQL Uuid(as_uuid=True).  Keep every
+        # bind typed as ``uuid.UUID`` instead of relying on driver-specific
+        # coercion of canonical strings.  PaidLaunchSpec already rejects a
+        # noncanonical spelling at its immutable input boundary.
+        candidate_record_ids = tuple(
+            sorted(
+                {uuid.UUID(spec.replica_record_id) for spec in prepared_specs} |
+                live_record_ids,
+                key=str))
+        if candidate_record_ids:
+            scope_selects.append(
+                sqlalchemy.select(ordinary_associations.c.association_id).where(
+                    ordinary_associations.c.service_name == service_name,
+                    ordinary_associations.c.replica_record_id.in_(
+                        candidate_record_ids)))
+        candidate_replica_ids = tuple(
+            sorted({spec.replica_id for spec in prepared_specs}))
+        if candidate_replica_ids:
+            # Replica numbers are lifecycle-local.  Old inert incarnations may
+            # legitimately reuse them, so numeric collision scope is current-
+            # hash only.  UUID record identities remain cross-incarnation.
+            scope_selects.append(
+                sqlalchemy.select(ordinary_associations.c.association_id).where(
+                    ordinary_associations.c.service_name == service_name,
+                    ordinary_associations.c.service_hash == service_hash,
+                    ordinary_associations.c.replica_id.in_(
+                        candidate_replica_ids)))
+        scope_query = (scope_selects[0] if len(scope_selects) == 1 else
+                       sqlalchemy.union(*scope_selects))
+        scope = scope_query.subquery('bounded_association_authority_scope')
+        association_statement = sqlalchemy.select(ordinary_associations).join(
+            scope,
+            scope.c.association_id == ordinary_associations.c.association_id)
+    association_rows = tuple(
+        connection.execute(
+            association_statement.order_by(
+                ordinary_associations.c.association_id).with_for_update(
+                    of=ordinary_associations)).mappings())
+    association_ids = tuple(row['association_id'] for row in association_rows)
+    association_request_ids = tuple(
+        sorted({str(row['request_id']) for row in association_rows}))
+
+    request_rows: tuple[Mapping[str, Any], ...] = ()
+    queue_rows: tuple[Mapping[str, Any], ...] = ()
+    pin_rows: tuple[Mapping[str, Any], ...] = ()
+    if association_ids:
+        # Both sides are bounded/indexed identity probes: request_id is the
+        # primary key and API009 installs the unique partial
+        # uq_api_requests_ordinary_launch_association index.  Retain the latter
+        # on steady ticks too so a malformed divergent root still fails closed
+        # without scanning historical requests.
+        request_predicate = sqlalchemy.or_(
+            request_rows_table.c.request_id.in_(association_request_ids),
+            request_rows_table.c.ordinary_launch_association_id.in_(
+                association_ids))
+        request_rows = tuple(
+            connection.execute(
+                sqlalchemy.select(
+                    request_rows_table.c.request_id,
+                    request_rows_table.c.ordinary_launch_association_id,
+                    request_rows_table.c.handler_name,
+                    request_rows_table.c.status,
+                    request_rows_table.c.terminal_cause,
+                    request_rows_table.c.finished_at,
+                    request_rows_table.c.execution_generation,
+                    request_rows_table.c.execution_quiescence_required,
+                    request_rows_table.c.execution_quiesced_generation,
+                    request_rows_table.c.execution_quiesced_at,
+                    request_rows_table.c.resource_action_id,
+                    request_rows_table.c.resource_action_attempt,
+                    request_rows_table.c.binding_protocol_version,
+                    request_rows_table.c.profile_kind,
+                    request_rows_table.c.profile_version,
+                    request_rows_table.c.profile_digest,
+                    request_rows_table.c.capability_cohort_epoch,
+                    request_rows_table.c.capability_profile_set_digest,
+                    request_rows_table.c.receipt_protocol_version).where(
+                        request_predicate).order_by(
+                            request_rows_table.c.request_id).with_for_update()).
+            mappings())
+        queue_rows = tuple(
+            connection.execute(
+                sqlalchemy.select(request_queue_table.c.request_id).where(
+                    request_queue_table.c.request_id.in_(
+                        association_request_ids)).order_by(
+                            request_queue_table.c.request_id).with_for_update()
+            ).mappings())
+        pin_rows = tuple(
+            connection.execute(
+                sqlalchemy.select(
+                    request_pins_table.c.pin_kind, request_pins_table.c.pin_id,
+                    request_pins_table.c.request_id).where(
+                        sqlalchemy.or_(
+                            request_pins_table.c.request_id.in_(
+                                association_request_ids),
+                            request_pins_table.c.pin_id.in_(association_ids))).
+                order_by(
+                    request_pins_table.c.pin_kind,
+                    request_pins_table.c.pin_id).with_for_update()).mappings())
+
+    association_by_id = {row['association_id']: row for row in association_rows}
+    for association_id, expected in pointed_association_identities.items():
+        association = association_by_id.get(association_id)
+        if (association is None or
+                association.get('service_name') != service_name or
+                association.get('service_hash') != service_hash or
+                association.get('replica_id') != expected[0] or
+                association.get('replica_record_id') != expected[1]):
+            raise CapacityAdmissionConflict(
+                'Locked association pointer is missing or has a mismatched '
+                'service/replica identity.')
+    blocking_request_association_ids: set[uuid.UUID] = set()
+    blocking_request_ids: set[str] = set()
+    for request_row in request_rows:
+        association_id = request_row['ordinary_launch_association_id']
+        association = association_by_id.get(association_id)
+        if association is None:
+            raise CapacityAdmissionConflict(
+                'Retained ordinary launch request root is malformed.')
+        root_state = _retained_request_root_state(request_row, association)
+        if root_state is _RetainedRequestRootState.MALFORMED:
+            raise CapacityAdmissionConflict(
+                'Retained ordinary launch request root is malformed.')
+        if root_state is _RetainedRequestRootState.BLOCKING:
+            blocking_request_association_ids.add(association_id)
+            blocking_request_ids.add(str(request_row['request_id']))
+
+    if exhaustive_history_census:
+        retained_association_ids = set(blocking_request_association_ids)
+        retained_association_ids.update(pointed_association_ids)
+        retained_association_ids.update({
+            row['pin_id']
+            for row in pin_rows
+            if isinstance(row['pin_id'], uuid.UUID)
+        })
+        retained_request_ids = set(blocking_request_ids)
+        retained_request_ids.update(
+            {str(row['request_id']) for row in queue_rows})
+        retained_request_ids.update({
+            str(row['request_id'])
+            for row in pin_rows
+            if row['request_id'] is not None
+        })
+        active_rows = tuple(
+            row for row in association_rows
+            if not (str(row['service_hash']) != service_hash and
+                    _inert_recreated_service_association(
+                        row,
+                        replica_records=replica_records,
+                        retained_association_ids=retained_association_ids,
+                        retained_request_ids=retained_request_ids)))
+    else:
+        active_rows = association_rows
+    return _LockedAssociationAuthorityGraph(
+        association_rows=association_rows,
+        active_association_rows=active_rows,
+        request_rows=request_rows,
+        queue_rows=queue_rows,
+        pin_rows=pin_rows,
+        blocking_request_count=len(blocking_request_ids))
+
+
 def _canonical_prepared_paid_launch_specs(
     value: Sequence[serve_paid_capacity.PaidLaunchSpec],
     *,
@@ -3502,9 +3763,8 @@ def _canonical_prepared_paid_launch_specs(
                                      workspace=spec.workspace,
                                      num_nodes=spec.num_nodes,
                                      aws_account_id=spec.provider_account))
-            expected_frontier_key = (
-                None if location is None else
-                serve_paid_capacity.frontier_key(location))
+            expected_frontier_key = (None if location is None else
+                                     serve_paid_capacity.frontier_key(location))
             expected_cluster_name = serve_utils.generate_replica_cluster_name(
                 service_name, spec.replica_id, resource_scope)
             expected_log_file_name = (
@@ -3540,8 +3800,8 @@ def _canonical_prepared_paid_launch_specs(
                 catalog_entry.normalized_hourly_cost <= 0 or
                 evidence.slot_within_pool_window >= pool_window or
                 expected_pool_key != spec.pool_key or
-                expected_frontier_key != spec.frontier_key
-                or worker.get('resources_override') != stored_override or
+                expected_frontier_key != spec.frontier_key or
+                worker.get('resources_override') != stored_override or
                 not isinstance(replica_port, str) or not replica_port):
             raise CapacityAdmissionConflict(
                 'Prepared paid launch disagrees with the elected catalog.')
@@ -3688,6 +3948,48 @@ def _resolve_locked_policy_history(
     except ValueError as error:
         raise CapacityAdmissionConflict(
             'Clean capacity-policy genesis is malformed.') from error
+
+
+def _resolve_validated_format_5_head(
+    *,
+    history: _LockedPlanHistory,
+    config: _ReservedFillServiceConfig,
+    snapshot: demand_state.DurableAutoscalingSnapshot,
+    service_name: str,
+    service_hash: str,
+    service_lifecycle_epoch: int,
+    service_version: int,
+    accounting_cards: Mapping[str, int],
+    backend_num_nodes: int,
+    locked_capacity: _LockedCapacityRows,
+    lane_projection: kueue_lane_capacity.KueueAdmissionCapacityProjection,
+    allocation_reserved: Mapping[str, int],
+) -> tuple[capacity_planning.CapacityPolicyState,
+           capacity_planning.CapacityPlanCandidate] | None:
+    """Strict-decode the trust anchor before using a bounded history scope.
+
+    Authority counts are inputs only to headless genesis.  This wrapper enters
+    the prior-head branch exclusively, making it impossible for a placeholder
+    zero count to authorize genesis or bypass its exhaustive census.
+    """
+    if history.previous is None:
+        return None
+    return _resolve_locked_policy_history(
+        history=history,
+        config=config,
+        snapshot=snapshot,
+        service_name=service_name,
+        service_hash=service_hash,
+        service_lifecycle_epoch=service_lifecycle_epoch,
+        service_version=service_version,
+        accounting_cards=accounting_cards,
+        backend_num_nodes=backend_num_nodes,
+        locked_capacity=locked_capacity,
+        lane_projection=lane_projection,
+        allocation_reserved=allocation_reserved,
+        raw_claim_count=0,
+        raw_waiter_count=0,
+        dependent_effect_count=0)
 
 
 def _clip_prepared_paid_admission(
@@ -4859,125 +5161,39 @@ class CapacityAdmissionRepository:
             raw_waiter_rows = connection.execute(
                 sqlalchemy.select(_PAID_WAITERS.c.service_hash).where(
                     _PAID_WAITERS.c.service_name == service_name)).all()
-            association_statement = sqlalchemy.select(
-                ordinary_associations).where(
-                    ordinary_associations.c.service_name ==
-                    service_name).order_by(
-                        ordinary_associations.c.association_id)
-            dependent_effect_rows = connection.execute(
-                association_statement.with_for_update()).mappings().all()
-            association_ids = tuple(
-                row['association_id'] for row in dependent_effect_rows)
-            association_request_ids = tuple(
-                sorted(
-                    {str(row['request_id']) for row in dependent_effect_rows}))
-            dependent_request_rows = []
-            dependent_queue_rows = []
-            dependent_pin_rows = []
-            if association_ids:
-                dependent_request_rows = connection.execute(
-                    sqlalchemy.select(
-                        request_rows_table.c.request_id,
-                        request_rows_table.c.ordinary_launch_association_id,
-                        request_rows_table.c.handler_name,
-                        request_rows_table.c.status,
-                        request_rows_table.c.terminal_cause,
-                        request_rows_table.c.finished_at,
-                        request_rows_table.c.execution_generation,
-                        request_rows_table.c.execution_quiescence_required,
-                        request_rows_table.c.execution_quiesced_generation,
-                        request_rows_table.c.execution_quiesced_at,
-                        request_rows_table.c.resource_action_id,
-                        request_rows_table.c.resource_action_attempt,
-                        request_rows_table.c.binding_protocol_version,
-                        request_rows_table.c.profile_kind,
-                        request_rows_table.c.profile_version,
-                        request_rows_table.c.profile_digest,
-                        request_rows_table.c.capability_cohort_epoch,
-                        request_rows_table.c.capability_profile_set_digest,
-                        request_rows_table.c.receipt_protocol_version).where(
-                            sqlalchemy.or_(
-                                request_rows_table.c.
-                                ordinary_launch_association_id.in_(
-                                    association_ids),
-                                request_rows_table.c.request_id.in_(
-                                    association_request_ids))).order_by(
-                                        request_rows_table.c.request_id).
-                    with_for_update()).mappings().all()
-                dependent_queue_rows = connection.execute(
-                    sqlalchemy.select(request_queue_table.c.request_id).where(
-                        request_queue_table.c.request_id.in_(
-                            association_request_ids)).order_by(
-                                request_queue_table.c.request_id).
-                    with_for_update()).mappings().all()
-                dependent_pin_rows = connection.execute(
-                    sqlalchemy.select(
-                        request_pins_table.c.pin_kind,
-                        request_pins_table.c.pin_id,
-                        request_pins_table.c.request_id).where(
-                            sqlalchemy.or_(
-                                request_pins_table.c.request_id.in_(
-                                    association_request_ids),
-                                request_pins_table.c.pin_id.in_(
-                                    association_ids))).order_by(
-                                        request_pins_table.c.pin_kind,
-                                        request_pins_table.c.pin_id).
-                    with_for_update()).mappings().all()
-            association_by_id = {
-                row['association_id']: row for row in dependent_effect_rows
-            }
-            blocking_request_association_ids: set[uuid.UUID] = set()
-            blocking_request_ids: set[str] = set()
-            for request_row in dependent_request_rows:
-                association_id = request_row['ordinary_launch_association_id']
-                association = association_by_id.get(association_id)
-                if association is None:
-                    raise CapacityAdmissionConflict(
-                        'Retained ordinary launch request root is malformed.')
-                root_state = _retained_request_root_state(
-                    request_row, association)
-                if root_state is _RetainedRequestRootState.MALFORMED:
-                    raise CapacityAdmissionConflict(
-                        'Retained ordinary launch request root is malformed.')
-                if root_state is _RetainedRequestRootState.BLOCKING:
-                    blocking_request_association_ids.add(association_id)
-                    blocking_request_ids.add(str(request_row['request_id']))
-            replica_records: set[tuple[int, str]] = set()
-            for replica_row in locked_capacity.replica_rows:
-                state = replica_row['replica_state']
-                if isinstance(state, Mapping):
-                    record_id = state.get('replica_record_id')
-                    if isinstance(record_id, str):
-                        replica_records.add(
-                            (int(replica_row['replica_id']), record_id))
-            retained_association_ids = set(blocking_request_association_ids)
-            retained_association_ids.update({
-                row.association_id
-                for row in lane_projection.rows
-                if isinstance(row.association_id, uuid.UUID)
-            })
-            retained_association_ids.update({
-                row['pin_id']
-                for row in dependent_pin_rows
-                if isinstance(row['pin_id'], uuid.UUID)
-            })
-            retained_request_ids = set(blocking_request_ids)
-            retained_request_ids.update(
-                {str(row['request_id']) for row in dependent_queue_rows})
-            retained_request_ids.update({
-                str(row['request_id'])
-                for row in dependent_pin_rows
-                if row['request_id'] is not None
-            })
-            active_effect_rows = [
-                row for row in dependent_effect_rows
-                if not (str(row['service_hash']) != service_hash and
-                        _inert_recreated_service_association(
-                            row,
-                            replica_records=replica_records,
-                            retained_association_ids=retained_association_ids,
-                            retained_request_ids=retained_request_ids))
-            ]
+            validated_policy_head = _resolve_validated_format_5_head(
+                history=locked_history,
+                config=fill_config,
+                snapshot=snapshot,
+                service_name=service_name,
+                service_hash=service_hash,
+                service_lifecycle_epoch=service_lifecycle_epoch,
+                service_version=service_version,
+                accounting_cards=canonical_cards,
+                backend_num_nodes=backend_num_nodes,
+                locked_capacity=locked_capacity,
+                lane_projection=lane_projection,
+                allocation_reserved=allocation_reserved)
+            has_validated_format_5_head = validated_policy_head is not None
+            if validated_policy_head is None:
+                prior_policy_state = None
+                prior_candidate = None
+            else:
+                prior_policy_state, prior_candidate = validated_policy_head
+
+            dependent_graph = _lock_association_authority_graph(
+                connection,
+                ordinary_associations=ordinary_associations,
+                request_rows_table=request_rows_table,
+                request_queue_table=request_queue_table,
+                request_pins_table=request_pins_table,
+                service_name=service_name,
+                service_hash=service_hash,
+                exhaustive_history_census=not has_validated_format_5_head,
+                prepared_specs=prepared_specs,
+                locked_capacity=locked_capacity,
+                lane_projection=lane_projection)
+            active_effect_rows = dependent_graph.active_association_rows
             if (any(str(row[1]) != service_hash for row in raw_claim_rows) or
                     any(str(row[0]) != service_hash for row in raw_waiter_rows)
                     or any(
@@ -4991,7 +5207,8 @@ class CapacityAdmissionRepository:
                 int(row['replica_id']) for row in active_effect_rows
             }
             association_record_ids = {
-                str(row['replica_record_id']) for row in active_effect_rows
+                str(row['replica_record_id'])
+                for row in dependent_graph.association_rows
             }
             if any(spec.replica_id in raw_claim_ids or
                    spec.replica_id in association_replica_ids or
@@ -5001,26 +5218,30 @@ class CapacityAdmissionRepository:
                     'Prepared paid launch collides with a retained authority '
                     'graph.')
 
-            prior_policy_state, prior_candidate = (
-                _resolve_locked_policy_history(
-                    history=locked_history,
-                    config=fill_config,
-                    snapshot=snapshot,
-                    service_name=service_name,
-                    service_hash=service_hash,
-                    service_lifecycle_epoch=service_lifecycle_epoch,
-                    service_version=service_version,
-                    accounting_cards=canonical_cards,
-                    backend_num_nodes=backend_num_nodes,
-                    locked_capacity=locked_capacity,
-                    lane_projection=lane_projection,
-                    allocation_reserved=allocation_reserved,
-                    raw_claim_count=len(raw_claim_rows),
-                    raw_waiter_count=len(raw_waiter_rows),
-                    dependent_effect_count=(len(active_effect_rows) +
-                                            len(dependent_request_rows) +
-                                            len(dependent_queue_rows) +
-                                            len(dependent_pin_rows))))
+            if not has_validated_format_5_head:
+                prior_policy_state, prior_candidate = (
+                    _resolve_locked_policy_history(
+                        history=locked_history,
+                        config=fill_config,
+                        snapshot=snapshot,
+                        service_name=service_name,
+                        service_hash=service_hash,
+                        service_lifecycle_epoch=service_lifecycle_epoch,
+                        service_version=service_version,
+                        accounting_cards=canonical_cards,
+                        backend_num_nodes=backend_num_nodes,
+                        locked_capacity=locked_capacity,
+                        lane_projection=lane_projection,
+                        allocation_reserved=allocation_reserved,
+                        raw_claim_count=len(raw_claim_rows),
+                        raw_waiter_count=len(raw_waiter_rows),
+                        dependent_effect_count=(
+                            len(active_effect_rows) +
+                            dependent_graph.blocking_request_count +
+                            len(dependent_graph.queue_rows) +
+                            len(dependent_graph.pin_rows))))
+            assert prior_policy_state is not None
+            assert prior_candidate is not None
             planning_db_epoch = paid_context.transaction_now
             supply_projection = dataclasses.replace(
                 supply_projection,
