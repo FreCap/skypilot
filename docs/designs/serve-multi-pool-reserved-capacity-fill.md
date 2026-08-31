@@ -3,8 +3,9 @@
 Last updated: 2026-08-31
 
 Status: **the exact-card compatible and statically disjoint edges are
-production-qualified; the fixed-wave atomic paid-admission source candidate is
-implemented and undergoing PostgreSQL qualification, but is not deployed**. One
+production-qualified; fixed-wave atomic paid admission is merged and deployed,
+but final production qualification is blocked by an old-incarnation teardown
+authority defect**. One
 PostgreSQL-authoritative planner is the canonical source path for both
 reservation-aware actuation and paid Spot residual. Historical production runs
 proved complete East occupancy,
@@ -15,10 +16,34 @@ goal: the current service uses `utilization_gate: true`, so it consumes only
 capacity justified by demand and returns that capacity to the unchanged
 scheduler when idle.
 
-Release `1.1.1575`, source merge
-`b1517869e47a9ebc36fc070440eb30f09928093d`, deployed PR #1806 homogeneously at
-Helm revision 691. Lifecycle 148 then accepted a sustained exact-L4 pressure
-test: 270,000 attempts over 184.8 seconds produced a raw logical target of
+Release `1.1.1576`, source merge
+`2ca979f74cd9e7287ca32846c7ef6278aa2f8de4`, deployed PR #1807 homogeneously at
+Helm revision 692. The fixed-wave policy and one-transaction
+plan/head/policy/replica/claim admission path passed the focused PostgreSQL
+suite and a 100-replica atomic admission wave. The first clean-recreation
+production proof then failed closed before provider admission: two detached
+old-incarnation associations were the only non-inert rows in an 8,994-row
+history, so no paid claim, Spot VM, disk, or provider request was created.
+
+The failure exposed a lifecycle-boundary defect outside the planner. Final
+service deletion settles and quiesces associations discovered through current
+`ReplicaInfo` rows, then removes the service and replica rows without one final
+transaction-local census of that incarnation's ordinary-launch authority.
+A detached or contradictory association can therefore outlive an apparently
+successful teardown and correctly block the next format-6 genesis. The
+canonical correction is to make final deletion conditional on the existing
+association, terminal-request, execution-quiescence, provider-evidence,
+queue/pin, claim/waiter, replica, and Kueue proofs for the exact retiring
+service name. Unlike steady planning, deletion cannot assume that a strict
+format-6 genesis receipt exists, so it performs the complete retained-history
+census that the next genesis would perform. It adds no table or blanket
+teardown receipt and does not weaken genesis. Existing malformed orphan history
+is adjudicated separately using its exact immutable provider identity and fresh
+provider absence; service-row absence, age, or a successor hash never
+manufactures safety.
+
+Lifecycle 148 on the preceding `1.1.1575` release accepted a sustained
+exact-L4 pressure test: 270,000 attempts over 184.8 seconds produced a raw logical target of
 1,000 and only Spot L4 placement. It exposed two remaining violations of the
 single-authority contract. First, the durable demand-feed controller returns
 before the legacy mutable pressure reducer. The durable planner therefore sees
@@ -2066,6 +2091,58 @@ its counters, clocks and ceilings start at zero/``None``. The same transaction
 may then plan current positive demand. A missing head beside any live graph is
 ``RECREATE_REQUIRED`` and never permission to synthesize state.
 
+Normal teardown must make that genesis condition inductive. Before deleting
+the exact retiring service row, its final PostgreSQL transaction locks and
+validates the complete same-name retained authority graph:
+every remaining nonterminal zero-cost intent belongs to the exact retiring
+lifecycle and has a bijective committed edge to a locked replica;
+every remaining association is canonically settled and execution-quiescent;
+every retained request either carries the same terminal/quiescence receipt or
+has already been collected after copying it; no request queue, retention pin,
+resource-action link, paid claim, waiter, replica/Kueue pointer, or unresolved
+provider effect remains. A normal `SERVICE_JOB_RECORDED` tombstone may retain
+`NOT_QUERIED`; a provider-effect path without a recorded service job must carry
+the existing exact, post-quiescence typed `ABSENT` evidence. A failed barrier
+rolls the transaction back and leaves the service in retryable cleanup state.
+Audit tombstones remain for ordinary retention and become naturally inert to a
+successor; deletion does not relabel, rewrite, or erase them.
+
+A materialized Kueue graph may instead carry the existing same-transaction
+retirement proof produced by its exact Pod/admission cleanup. The census
+accepts only that proof's exact service lifecycle, replica record, association,
+and association revision in the transaction that issued it; it never weakens
+the generic provider-absence validator. Likewise, a pre-effect terminal graph
+is accepted only when its inert receipt matches the complete locked service and
+replica snapshot, not merely its own association fields.
+
+The barrier is one exhaustive same-name relationship census, not
+independent best-effort probes. It locks requests reached by either the
+association's immutable request ID or a request's association pointer, and it
+locks every retention pin reached by either request ID or association ID. A
+divergent reverse pointer, any pin kind, or any queue row fails closed. The
+census applies to every PostgreSQL non-pool service and cannot be bypassed by
+changing its mutable ordinary-launch binding-mode field. A missing lifecycle
+fence or noncanonical pool discriminator fails closed. The barrier uses the
+same terminal request-root classifier as clean genesis so teardown and
+recreation cannot disagree about whether retained history is inert.
+
+Teardown first locks the complete same-name intent domain once in immutable
+intent-key order. It terminalizes only exact-current, provider-free pending
+intents and returns the remaining nonterminal rows as one typed census for the
+replica bijection check. It does not acquire an exact-incarnation subset and
+then a broader subset: that would invert row order when an old low key and a
+current high key coexist. Paid-claim readers likewise use one shared
+pool/service/hash/replica lock order, matching paid admission even when replica
+IDs and pool keys sort oppositely.
+
+Legacy controller launch rows with an exact, valid different service name are
+outside this service's census. An unscoped or malformed legacy launch remains
+globally ambiguous and blocks deletion even when its request executor is
+terminal and quiesced: executor death does not prove that an already-started
+provider effect is absent. Such a row requires independent evidence-backed
+provider adjudication; it is never reclassified as safe from age or request
+status alone.
+
 That exhaustive cross-incarnation census occurs until a strict-valid format-6
 head exists. Each strict-valid current head is an inductive durable receipt:
 genesis performed the census, and every supported successor writer validated
@@ -3170,23 +3247,23 @@ and keep only the latest result in the current-state table.
 
 ## Remaining convergence gates
 
-Releases through `1.1.1575` close the compatible exact-A100 reserved edge,
+Releases through `1.1.1576` close the compatible exact-A100 reserved edge,
 statically disjoint exact-L4 Spot edge, joint matcher, additive-route relation,
-and saturated-demand attribution. Historical runs separately prove
+saturated-demand attribution, immutable fixed-wave planning, and atomic
+plan/head/policy/replica/claim admission. Historical runs separately prove
 at-least-100 Spot scale-out, 10,000-request warm transport, mixed
 reserved-plus-Spot execution, and exact provider drain. They do not replace
 these remaining current-writer acceptance gates:
 
-1. Finish source qualification of the implemented format-6 minimal DB-epoch
-   policy memory, fixed 100-percent/minimum-50/60-second paid wave,
-   repository-wide lock order, deeply immutable provider-free launch specs,
-   final-DB-clock fence, atomic plan/head/policy/replica/claim/debit commit, and
-   exact individual recovery. Complete the real-PostgreSQL mutation, rollback,
-   clean-recreation, stale-owner/ABA and concurrent-reducer tests plus the final
-   adversarial review. Audit the probe/launch/cleanup paths so no
-   provider/URL/Kubernetes/join work or SQL entry occurs under a
-   manager/actuation lock.
-2. From complete service/provider exact zero, merge and build one immutable
+1. Merge and deploy the final-deletion authority census. Its real-PostgreSQL
+   gate includes current and old-incarnation associations, exact Kueue Pod and
+   admissionless provider-absence proofs, ordinary-paid and reserved-fill
+   pre-effect receipts, reverse request edges, all pin kinds, ambiguous legacy
+   launches, unknown intent states, transaction rollback, and the deliberately
+   reversed intent-key and paid-pool lock-order schedules. Then use exact
+   provider absence to adjudicate the two contradictory historical rows; never
+   manufacture safety by deleting them directly.
+2. From complete service/provider exact zero, build one immutable
    image, keep Serve writes stopped, and deploy every API/controller/executor
    role homogeneously with Helm. Strictly reject formats 1--5 and verify the
    exact runtime digest before recreation.

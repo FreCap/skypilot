@@ -3076,13 +3076,10 @@ class KueueAdmissionRepository:
 
         linked_replica_ids = tuple(sorted(linked_keys_by_replica))
         linked_keys = tuple(sorted(set(linked_keys_by_replica.values())))
-        paid_claims = serve_state_schema.paid_capacity_claims_table
-        paid_claim_rows = connection.execute(
-            sqlalchemy.select(paid_claims).where(
-                paid_claims.c.service_name == service_name,
-                paid_claims.c.replica_id.in_(linked_replica_ids)).order_by(
-                    paid_claims.c.replica_id).with_for_update()).mappings().all(
-                    )
+        paid_claim_rows = (serve_state.lock_paid_capacity_claims_in_connection(
+            connection,
+            service_name=service_name,
+            replica_ids=linked_replica_ids))
         intent_rows = connection.execute(
             sqlalchemy.select(_INTENTS).where(
                 _INTENTS.c.intent_idempotency_key.in_(linked_keys)).order_by(

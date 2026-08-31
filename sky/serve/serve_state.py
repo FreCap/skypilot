@@ -78,6 +78,7 @@ if typing.TYPE_CHECKING:
     from sky.serve import route_projection
     from sky.serve import service_spec
     from sky.serve import zero_cost_actuation
+    from sky.server.requests import postgres as request_postgres
 else:
     demand_state = adaptors_common.LazyImport('sky.serve.demand_state')
     ordinary_launch_binding = adaptors_common.LazyImport(
@@ -98,6 +99,8 @@ else:
     service_spec = adaptors_common.LazyImport('sky.serve.service_spec')
     zero_cost_actuation = adaptors_common.LazyImport(
         'sky.serve.zero_cost_actuation')
+    request_postgres = adaptors_common.LazyImport(
+        'sky.server.requests.postgres')
 
 replica_info_lib = adaptors_common.LazyImport('sky.serve.replica_info')
 reserved_capacity = adaptors_common.LazyImport('sky.serve.reserved_capacity')
@@ -188,6 +191,32 @@ create_table = serve_state_schema.create_table
 _db_manager = serve_state_schema._db_manager  # pylint: disable=protected-access
 ensure_tables_initialized = serve_state_schema.ensure_tables_initialized
 get_database_engine = serve_state_schema.get_database_engine
+
+
+def lock_paid_capacity_claims_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    replica_ids: tuple[int, ...] | None = None,
+) -> tuple[Mapping[str, Any], ...]:
+    """Lock one paid-claim subset in the global pool-first order."""
+    if not isinstance(service_name, str) or not service_name:
+        raise ValueError('Paid-claim locking requires a service name.')
+    if replica_ids is not None and not replica_ids:
+        return ()
+    statement = sqlalchemy.select(paid_capacity_claims_table).where(
+        paid_capacity_claims_table.c.service_name == service_name)
+    if replica_ids is not None:
+        statement = statement.where(
+            paid_capacity_claims_table.c.replica_id.in_(replica_ids))
+    return tuple(
+        connection.execute(
+            statement.order_by(paid_capacity_claims_table.c.pool_key,
+                               paid_capacity_claims_table.c.service_name,
+                               paid_capacity_claims_table.c.service_hash,
+                               paid_capacity_claims_table.c.replica_id).
+            with_for_update()).mappings())
+
 
 _PLACEMENT_PROJECTION_COLUMN_NAMES = frozenset({
     'controller_job_projection',
@@ -1478,6 +1507,15 @@ def remove_service_completely(
     """
     if not expected_service_hash:
         return False
+    # Resolve the request backend before any correctness lock is acquired.
+    # The final transaction composes its canonical legacy-request census.
+    legacy_request_census = (
+        request_postgres.legacy_ordinary_launch_requests_drained_in_transaction)
+    retiring_authority_tables = (
+        capacity_admission.FinalDeletionAuthorityTables(
+            requests=request_postgres_schema.REQUESTS,
+            queue=request_postgres_schema.QUEUE,
+            pins=request_postgres_schema.REQUEST_RETENTION_PINS))
     with _replica_launch_authority_write_session(service_name) as (engine,
                                                                    session):
         _begin_immediate_if_sqlite(session, engine, expected_lifecycle_epoch
@@ -1519,12 +1557,13 @@ def remove_service_completely(
             # publication and cleanup retry-safe.  COMMITTED/materialized
             # intents are deliberately left for the evidence-backed path
             # below.
-            (zero_cost_actuation.
-             terminalize_unmaterialized_service_intents_in_connection)(
-                 session.connection(),
-                 service_name=service_name,
-                 service_hash=expected_service_hash,
-                 service_lifecycle_epoch=service_lifecycle_epoch)
+            nonterminal_intents = (
+                zero_cost_actuation.
+                terminalize_unmaterialized_service_intents_in_connection)(
+                    session.connection(),
+                    service_name=service_name,
+                    service_hash=expected_service_hash,
+                    service_lifecycle_epoch=service_lifecycle_epoch)
             # Discover immutable record IDs without taking replica locks; the
             # repository then acquires intent -> replica -> association ->
             # request/queue/pin -> admission locks and revalidates the complete
@@ -1533,17 +1572,53 @@ def remove_service_completely(
                 sqlalchemy.select(
                     replicas_table.c.replica_id,
                     replicas_table.c.replica_state_version,
-                    replicas_table.c.replica_state).where(
-                        replicas_table.c.service_name == service_name).order_by(
-                            replicas_table.c.replica_id)).all()
+                    replicas_table.c.replica_state,
+                    replicas_table.c.reserved_fill_intent_idempotency_key).
+                where(replicas_table.c.service_name == service_name).order_by(
+                    replicas_table.c.replica_id)).all()
             expected_record_ids: dict[int, str] = {}
+            materialized_intents: dict[str, tuple[int, str]] = {}
             for replica_row in replica_rows:
                 replica_info = _replica_from_state(
                     replica_row.replica_state_version,
                     replica_row.replica_state)
                 record_id = replica_info.replica_record_id
                 _validate_expected_replica_record_id(record_id)
-                expected_record_ids[int(replica_row.replica_id)] = record_id
+                replica_id = int(replica_row.replica_id)
+                expected_record_ids[replica_id] = record_id
+                intent_key = (replica_row.reserved_fill_intent_idempotency_key)
+                if intent_key is None:
+                    continue
+                if (not isinstance(intent_key, str) or
+                        intent_key in materialized_intents):
+                    raise zero_cost_actuation.ZeroCostActuationConflict(
+                        'Whole-service teardown found a malformed materialized '
+                        'intent edge.')
+                materialized_intents[intent_key] = (replica_id, record_id)
+            retained_intent_keys: set[str] = set()
+            for intent in nonterminal_intents:
+                if intent.state not in (
+                        zero_cost_actuation_schema.NONTERMINAL_INTENT_STATES):
+                    raise zero_cost_actuation.ZeroCostActuationConflict(
+                        'Whole-service teardown found an unknown retained '
+                        'intent state.')
+                intent_key = intent.intent_idempotency_key
+                retained_intent_keys.add(intent_key)
+                materialized_identity = materialized_intents.get(intent_key)
+                if (materialized_identity is None or
+                        intent.service_hash != expected_service_hash or
+                        intent.service_lifecycle_epoch
+                        != service_lifecycle_epoch or
+                        intent.state != 'COMMITTED' or
+                        intent.replica_id != materialized_identity[0] or
+                        str(intent.replica_record_id)
+                        != materialized_identity[1]):
+                    raise zero_cost_actuation.ZeroCostActuationConflict(
+                        'Whole-service teardown retains a nonterminal intent '
+                        'without exact materialized authority.')
+            if retained_intent_keys != set(materialized_intents):
+                raise zero_cost_actuation.ZeroCostActuationConflict(
+                    'Whole-service teardown lost a committed intent edge.')
             kueue_repository, kueue_retirement_proofs = (
                 _prelock_and_delete_materialized_kueue_admissions(
                     session,
@@ -1564,13 +1639,59 @@ def remove_service_completely(
             remaining_admission = session.execute(
                 sqlalchemy.select(sqlalchemy.literal(True)).
                 select_from(serve_kueue_admissions_table).where(
-                    serve_kueue_admissions_table.c.service_name == service_name,
-                    serve_kueue_admissions_table.c.service_hash ==
-                    expected_service_hash).limit(1)).scalar_one_or_none()
+                    serve_kueue_admissions_table.c.service_name == service_name
+                ).limit(1).with_for_update()).scalar_one_or_none()
             if remaining_admission is not None:
                 raise kueue_lane_lineage.KueueAdmissionConflict(
                     'Whole-service teardown retains unresolved Kueue '
                     'admission authority.')
+            service_authority = session.execute(
+                sqlalchemy.select(services_table).where(
+                    services_table.c.name ==
+                    service_name).with_for_update()).mappings().one()
+            if service_authority['pool'] not in (0, 1):
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Final service deletion found a noncanonical pool '
+                    'discriminator.')
+            if service_authority['pool'] == 0:
+                lifecycle = session.execute(
+                    sqlalchemy.select(service_lifecycle_fences_table).where(
+                        service_lifecycle_fences_table.c.name == service_name).
+                    with_for_update()).mappings().one_or_none()
+                if (lifecycle is None or
+                        lifecycle['epoch'] != service_lifecycle_epoch):
+                    raise (
+                        ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                            'Final service deletion lost its lifecycle '
+                            'fence.'))
+                provider_clean_graphs = tuple(
+                    capacity_admission.FinalDeletionProviderCleanGraph(
+                        transaction_id=proof.transaction_id,
+                        service_name=proof.service_name,
+                        service_hash=proof.service_hash,
+                        service_lifecycle_epoch=(proof.service_lifecycle_epoch),
+                        replica_id=proof.replica_id,
+                        replica_record_id=proof.replica_record_id,
+                        association_id=proof.association_id,
+                        association_updated_at=proof.association_updated_at)
+                    for proof in kueue_retirement_proofs)
+                if not (capacity_admission.
+                        service_name_has_terminal_absence_authority_in_connection(
+                            session.connection(),
+                            lifecycle=lifecycle,
+                            service=service_authority,
+                            tables=retiring_authority_tables,
+                            provider_clean_graphs=provider_clean_graphs)):
+                    raise (
+                        ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                            'Final service deletion retains unresolved '
+                            'authority for the retiring incarnation.'))
+                if not legacy_request_census(session.connection(),
+                                             service_name):
+                    raise (
+                        ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                            'Final service deletion retains unresolved legacy '
+                            'request authority.'))
         session.execute(
             sqlalchemy.delete(replicas_table).where(
                 replicas_table.c.service_name == service_name))
