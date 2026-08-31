@@ -500,6 +500,7 @@ def _demand_report(now: float,
         'route_source_epoch': 1,
         'queue_depth': 0,
         'queued_requests_by_compatibility': [],
+        'queued_request_deadline_buckets': [],
         'rejected_requests_by_compatibility': [],
         'queue_depth_by_priority': {},
         'rejected_in_window': 0,
@@ -3787,7 +3788,7 @@ def test_usage_gate_publishes_no_effect_acquisition_for_noncausal_evidence(
     assert candidate.kind is (
         capacity_planning.CapacityPlanKind.GATE_ACQUISITION)
     assert candidate.demand_witness_sha256 == exact_witness
-    assert candidate.next_policy_state is None
+    assert candidate.next_policy_state == positive.candidate.next_policy_state
     no_effect_fields = (
         'supply_aware_demand_target',
         'reserved_capacity_committed',
