@@ -9,4 +9,4 @@ __version__ = '0.0.0'
 # Keeping this independent from an unrelated SkyPilot release lets an unchanged
 # policy continue heartbeating claims while the canonical activation command
 # rotates the writer-cohort receipt.
-POLICY_REVISION = '1.1.1491'
+POLICY_REVISION = '1.1.1578'
