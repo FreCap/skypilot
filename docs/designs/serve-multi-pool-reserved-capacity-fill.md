@@ -1,6 +1,6 @@
 # SkyServe multi-pool reserved-capacity admission
 
-Last updated: 2026-08-30
+Last updated: 2026-08-31
 
 Status: **the exact-card compatible and statically disjoint edges are
 production-qualified; the fixed-wave atomic paid-admission source candidate is
@@ -49,11 +49,15 @@ disjoint Spot target eligible;
 samples the DB clock; finalizes policy state from the accepted subset; writes
 the new plan/head and exact replica/claim wave; then resamples the DB clock and
 revalidates every TTL before committing them together.
-Only after commit may workers be constructed or provider I/O begin. A report
-committed before the service-row lock is included in planning; a report
-arriving after the lock is causally after the committed wave. Fresh zero
-therefore prevents every uncommitted provider effect without racing a
-separately published plan.
+Only after commit may workers be constructed or a provider mutation/launch
+effect begin. Bounded read-only identity, catalog, and ranking preflight may run
+before the transaction, but it freezes only scalar inputs and grants no launch
+authority. The pure planner and transaction consume only those frozen values;
+before exact-token ``RunInstances`` the postcommit path rechecks that the live
+AWS account equals the committed account identity. A report committed before
+the service-row lock is included in planning; a report arriving after the lock
+is causally after the committed wave. Fresh zero therefore prevents every
+uncommitted provider effect without racing a separately published plan.
 
 Format 5 is an envelope-format cutover, not a relational migration or a new
 authority protocol: it adds no
@@ -400,9 +404,11 @@ prune/overlap and immutable preparation -> begin PostgreSQL transaction ->
 protocol-first, owner, version/projection, and complete current-write-set locks
 -> reconstruct exact scope -> read proactively renewed PostgreSQL receipts ->
 emit proof observability -> mint exact authorization -> validate/write/commit``.
-Provider proof renewal and all provider I/O remain outside the transaction. No
-nonessential work or contended lock acquisition may run after the short-lived
-authorization is minted. PR #1750 merged this correction as
+Provider proof renewal and bounded read-only provider observation remain
+outside the transaction. They freeze identity and proof scalars only; no worker
+construction, provider mutation, or launch effect may begin before the fused
+commit. No nonessential work or contended lock acquisition may run after the
+short-lived authorization is minted. PR #1750 merged this correction as
 `f22c459d53749e0d3a707d45621b633f6528073e`; release `1.1.1519` deployed it as
 Helm revision 639. Eight consecutive observed post-rollout claim/publish rounds
 succeeded without a rejected claim-set heartbeat.
@@ -2043,13 +2049,16 @@ Every committed format-5 head, including ``GATE_ACQUISITION`` and
 genesis may be synthesized only when the locked service has no retained
 provider-effect authority: no prior plan/head authority, provider-possible
 replica, unsettled or still-referenced association, live zero-cost intent,
-cross-incarnation reserved claim/debit, paid claim/waiter, API request,
-queue/pin, retention pin, unresolved provider operation, live VM/disk, or other
-format-bearing effect. A current, fully validated allocation observation may
-seed reserved-first planning because it is supply evidence rather than a
-provider effect. Detached old-incarnation association tombstones are ignored
-only after PostgreSQL proves terminal execution quiescence and the absence of
-replica, request, queue, pin and Kueue references. Genesis binds the
+cross-incarnation reserved claim/debit, paid claim/waiter, active or ambiguous
+API request, queue/pin, retention pin, unresolved provider operation, live
+VM/disk, or other format-bearing effect. A current, fully validated allocation
+observation may seed reserved-first planning because it is supply evidence
+rather than a provider effect. Detached old-incarnation association tombstones
+and their immutable API request roots are ignored only after PostgreSQL proves
+an exact terminal status and canonical cause, request completion, matching
+execution-generation quiescence, no resource-action linkage, and the absence
+of replica, queue, pin and Kueue references. The association must independently
+retain its settled terminal/quiescence proof. Genesis binds the
 immutable service incarnation, elected version, ``CapacityUnit`` and maximum;
 its counters, clocks and ceilings start at zero/``None``. The same transaction
 may then plan current positive demand. A missing head beside any live graph is
@@ -2108,6 +2117,13 @@ writing can never produce an already-expired committed authority.
 Raw deadline buckets from the exact locked generation are always replanned; an
 older tightening-compatible plan may be a free/reserved-capacity lower-bound
 witness only and never authorizes a paid template.
+
+Before that lock union, a bounded read-only preflight may resolve provider
+identity, catalog offerings, and deterministic ranking into immutable scalar
+templates. Neither the planner nor the transaction constructs a provider
+worker or performs provider I/O. After commit, materialization revalidates the
+committed provider identity; the AWS path specifically rechecks account
+equality before the exact idempotency-token ``RunInstances`` call.
 
 For durable logical services, the adapter converts the existing public
 ``max_scale_up_rate_percentage``, ``scale_up_rate_min_replicas``,
@@ -2784,8 +2800,11 @@ on-demand spill.
   generation. Inject a SQL failure at every write boundary and prove plan head,
   policy state, replicas, claims, waiters and pool debits all roll back
   together. Delay the maximum cohort beyond each report, route, deadline, pool,
-  and owner horizon; the post-write DB-clock resample must roll everything back. No
-  provider construction or I/O may occur before commit.
+  and owner horizon; the post-write DB-clock resample must roll everything back.
+  Bounded read-only identity/catalog/ranking preflight may precede the
+  transaction, but no worker construction, provider mutation, or launch effect
+  may occur before commit. Prove the postcommit AWS account-equality recheck
+  precedes exact-token ``RunInstances``.
 - Repeat with fewer preparable specs than the authorized wave. Commit only the
   accepted subset, charge only that subset, and prove there is no complete-cohort
   rejection, proposal identity, underfill state, or fabricated replacement

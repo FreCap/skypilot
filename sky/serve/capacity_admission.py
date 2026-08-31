@@ -26,6 +26,7 @@ import sqlalchemy
 from sqlalchemy.dialects import postgresql
 
 from sky.adaptors import common as adaptors_common
+from sky.events import api_models as event_api_models
 from sky.serve import autoscaler_compatibility
 from sky.serve import capacity_admission_schema
 from sky.serve import capacity_planning
@@ -84,6 +85,17 @@ _REPLICAS = serve_state_schema.replicas_table
 _ZERO_COST_INTENTS = (
     zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
 _PENDING_ZERO_COST_INTENT_STATES = ('GRANTED', 'ACTUATING', 'RETRYABLE')
+_BOUND_NON_POOL_LAUNCH_HANDLER = ('sky.server.requests.non_pool_launch:launch')
+_BOUND_REQUEST_PROFILE_FIELDS = (
+    'binding_protocol_version',
+    'profile_kind',
+    'profile_version',
+    'profile_digest',
+    'capability_cohort_epoch',
+    'capability_profile_set_digest',
+    'receipt_protocol_version',
+)
+_TERMINAL_REQUEST_STATUSES = frozenset(('SUCCEEDED', 'FAILED', 'CANCELLED'))
 _TERMINAL_REPLICA_STATUSES = frozenset({
     'SHUTTING_DOWN',
     'FAILED',
@@ -140,6 +152,14 @@ class ReservedSupplyEvidenceState(str, enum.Enum):
     AUTHENTICATED_SETTLED = 'AUTHENTICATED_SETTLED'
     AUTHENTICATED_UNSETTLED = 'AUTHENTICATED_UNSETTLED'
     UNAVAILABLE = 'UNAVAILABLE'
+
+
+class _RetainedRequestRootState(enum.Enum):
+    """Pure classification of one locked historical request root."""
+
+    CLOSED_QUIESCED = enum.auto()
+    BLOCKING = enum.auto()
+    MALFORMED = enum.auto()
 
 
 class CapacityAdmissionError(RuntimeError):
@@ -3244,6 +3264,102 @@ class _PreparedPaidAdmission:
     physical_gpu_units: int
 
 
+def _retained_request_root_state(
+    request: Mapping[str, Any],
+    association: Mapping[str, Any],
+) -> _RetainedRequestRootState:
+    """Classify one request/association root without reading mutable state.
+
+    A retained terminal API request is audit evidence, not live launch
+    authority, only when it copies the association's immutable identity and
+    terminal receipt exactly and proves completion of the same execution
+    generation.  This is deliberately stricter than request-store retention
+    safety: a linked resource action remains blocking even if its attempt is
+    settled.  Queue, pin, Kueue, and replica references are deliberately
+    outside this pure classifier and remain independent blockers.
+    """
+    if not isinstance(request, Mapping) or not isinstance(association, Mapping):
+        return _RetainedRequestRootState.MALFORMED
+    try:
+        request_id = request['request_id']
+        association_request_id = association['request_id']
+        request_association_id = request['ordinary_launch_association_id']
+        association_id = association['association_id']
+    except KeyError:
+        return _RetainedRequestRootState.MALFORMED
+    if (not isinstance(request_id, str) or not request_id or
+            not isinstance(association_request_id, str) or
+            not association_request_id or
+            not isinstance(request_association_id, uuid.UUID) or
+            not isinstance(association_id, uuid.UUID) or
+            request_id != association_request_id or
+            request_association_id != association_id):
+        return _RetainedRequestRootState.MALFORMED
+
+    association_profile = tuple(
+        association.get(field) for field in _BOUND_REQUEST_PROFILE_FIELDS)
+    request_profile = tuple(
+        request.get(field) for field in _BOUND_REQUEST_PROFILE_FIELDS)
+    if all(value is None for value in association_profile):
+        # Protocol-v1 history has no immutable generic profile to compare.
+        return _RetainedRequestRootState.BLOCKING
+    if not all(value is not None for value in association_profile):
+        return _RetainedRequestRootState.MALFORMED
+    if (request.get('handler_name') != _BOUND_NON_POOL_LAUNCH_HANDLER or
+            request_profile != association_profile):
+        return _RetainedRequestRootState.MALFORMED
+
+    status = request.get('status')
+    if not isinstance(status, str):
+        return _RetainedRequestRootState.MALFORMED
+    if status not in _TERMINAL_REQUEST_STATUSES:
+        return _RetainedRequestRootState.BLOCKING
+    terminal_status = association.get('terminal_status')
+    terminal_cause = request.get('terminal_cause')
+    association_terminal_cause = association.get('terminal_cause')
+    execution_generation = request.get('execution_generation')
+    association_generation = association.get('terminal_execution_generation')
+    try:
+        canonical_cause = event_api_models.EventCause(terminal_cause)
+        canonical_association_cause = event_api_models.EventCause(
+            association_terminal_cause)
+    except (TypeError, ValueError):
+        return _RetainedRequestRootState.MALFORMED
+    if (terminal_status != status or
+            canonical_cause is not canonical_association_cause or
+            type(execution_generation) is not int or execution_generation < 0 or
+            type(association_generation) is not int or
+            association_generation != execution_generation):
+        return _RetainedRequestRootState.MALFORMED
+
+    finished_at = request.get('finished_at')
+    if finished_at is None:
+        return _RetainedRequestRootState.BLOCKING
+    if not isinstance(finished_at, datetime.datetime):
+        return _RetainedRequestRootState.MALFORMED
+    if (request.get('resource_action_id') is not None or
+            request.get('resource_action_attempt') is not None):
+        return _RetainedRequestRootState.BLOCKING
+    if (request.get('execution_quiescence_required') is not True or
+            association.get('execution_quiescence_required') is not True):
+        return _RetainedRequestRootState.BLOCKING
+    quiesced_generation = request.get('execution_quiesced_generation')
+    quiesced_at = request.get('execution_quiesced_at')
+    association_quiesced_generation = association.get(
+        'execution_quiesced_generation')
+    association_quiesced_at = association.get('execution_quiesced_at')
+    if quiesced_generation is None or quiesced_at is None:
+        return _RetainedRequestRootState.BLOCKING
+    if (type(quiesced_generation) is not int or
+            quiesced_generation != execution_generation or
+            association_quiesced_generation != quiesced_generation or
+            not isinstance(quiesced_at, datetime.datetime) or
+            not isinstance(association_quiesced_at, datetime.datetime) or
+            association_quiesced_at != quiesced_at):
+        return _RetainedRequestRootState.MALFORMED
+    return _RetainedRequestRootState.CLOSED_QUIESCED
+
+
 def _inert_recreated_service_association(
     association: Mapping[str, Any],
     *,
@@ -4762,14 +4878,31 @@ class CapacityAdmissionRepository:
                 dependent_request_rows = connection.execute(
                     sqlalchemy.select(
                         request_rows_table.c.request_id,
-                        request_rows_table.c.ordinary_launch_association_id).
-                    where(
-                        sqlalchemy.or_(
-                            request_rows_table.c.ordinary_launch_association_id.
-                            in_(association_ids),
-                            request_rows_table.c.request_id.in_(
-                                association_request_ids))).order_by(
-                                    request_rows_table.c.request_id).
+                        request_rows_table.c.ordinary_launch_association_id,
+                        request_rows_table.c.handler_name,
+                        request_rows_table.c.status,
+                        request_rows_table.c.terminal_cause,
+                        request_rows_table.c.finished_at,
+                        request_rows_table.c.execution_generation,
+                        request_rows_table.c.execution_quiescence_required,
+                        request_rows_table.c.execution_quiesced_generation,
+                        request_rows_table.c.execution_quiesced_at,
+                        request_rows_table.c.resource_action_id,
+                        request_rows_table.c.resource_action_attempt,
+                        request_rows_table.c.binding_protocol_version,
+                        request_rows_table.c.profile_kind,
+                        request_rows_table.c.profile_version,
+                        request_rows_table.c.profile_digest,
+                        request_rows_table.c.capability_cohort_epoch,
+                        request_rows_table.c.capability_profile_set_digest,
+                        request_rows_table.c.receipt_protocol_version).where(
+                            sqlalchemy.or_(
+                                request_rows_table.c.
+                                ordinary_launch_association_id.in_(
+                                    association_ids),
+                                request_rows_table.c.request_id.in_(
+                                    association_request_ids))).order_by(
+                                        request_rows_table.c.request_id).
                     with_for_update()).mappings().all()
                 dependent_queue_rows = connection.execute(
                     sqlalchemy.select(request_queue_table.c.request_id).where(
@@ -4793,13 +4926,22 @@ class CapacityAdmissionRepository:
             association_by_id = {
                 row['association_id']: row for row in dependent_effect_rows
             }
+            blocking_request_association_ids: set[uuid.UUID] = set()
+            blocking_request_ids: set[str] = set()
             for request_row in dependent_request_rows:
                 association_id = request_row['ordinary_launch_association_id']
                 association = association_by_id.get(association_id)
-                if (association is None or str(request_row['request_id'])
-                        != str(association['request_id'])):
+                if association is None:
                     raise CapacityAdmissionConflict(
                         'Retained ordinary launch request root is malformed.')
+                root_state = _retained_request_root_state(
+                    request_row, association)
+                if root_state is _RetainedRequestRootState.MALFORMED:
+                    raise CapacityAdmissionConflict(
+                        'Retained ordinary launch request root is malformed.')
+                if root_state is _RetainedRequestRootState.BLOCKING:
+                    blocking_request_association_ids.add(association_id)
+                    blocking_request_ids.add(str(request_row['request_id']))
             replica_records: set[tuple[int, str]] = set()
             for replica_row in locked_capacity.replica_rows:
                 state = replica_row['replica_state']
@@ -4808,11 +4950,7 @@ class CapacityAdmissionRepository:
                     if isinstance(record_id, str):
                         replica_records.add(
                             (int(replica_row['replica_id']), record_id))
-            retained_association_ids = {
-                row['ordinary_launch_association_id']
-                for row in dependent_request_rows
-                if isinstance(row['ordinary_launch_association_id'], uuid.UUID)
-            }
+            retained_association_ids = set(blocking_request_association_ids)
             retained_association_ids.update({
                 row.association_id
                 for row in lane_projection.rows
@@ -4823,9 +4961,7 @@ class CapacityAdmissionRepository:
                 for row in dependent_pin_rows
                 if isinstance(row['pin_id'], uuid.UUID)
             })
-            retained_request_ids = {
-                str(row['request_id']) for row in dependent_request_rows
-            }
+            retained_request_ids = set(blocking_request_ids)
             retained_request_ids.update(
                 {str(row['request_id']) for row in dependent_queue_rows})
             retained_request_ids.update({
