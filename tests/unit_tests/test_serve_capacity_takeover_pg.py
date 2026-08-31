@@ -15,7 +15,9 @@ from test_serve_capacity_admission_pg import _route_response
 from test_serve_capacity_admission_pg import capacity_database
 from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
+from test_zero_cost_actuation_pg import _commit_and_insert_replica
 from test_zero_cost_actuation_pg import _grant_plan as _grant_zero_cost_plan
+from test_zero_cost_actuation_pg import _install_fresh_provider_proofs
 from test_zero_cost_actuation_pg import _plan as _zero_cost_plan
 from test_zero_cost_actuation_pg import _replica_for_intent
 from test_zero_cost_actuation_pg import actuation_database
@@ -25,7 +27,6 @@ from sky.serve import demand_state
 from sky.serve import demand_state_schema
 from sky.serve import ordinary_launch_binding
 from sky.serve import route_projection
-from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import zero_cost_actuation
 from sky.serve import zero_cost_actuation_schema
@@ -285,10 +286,6 @@ def test_takeover_retires_pre_row_intents_before_new_demand(
             sqlalchemy.select(services.c.controller_incarnation).where(
                 services.c.name == 'svc')).scalar_one()
         connection.execute(
-            sqlalchemy.insert(
-                serve_state_schema.service_lifecycle_fences_table).values(
-                    name='svc', epoch=3))
-        connection.execute(
             sqlalchemy.update(services).where(services.c.name == 'svc').values(
                 demand_source_mode='DURABLE_FEED',
                 demand_source_epoch=1,
@@ -322,22 +319,18 @@ def test_takeover_wins_uncommitted_replica_handoff_and_rolls_back_row(
     repository = zero_cost_actuation.ZeroCostActuationRepository(engine)
     plan = _zero_cost_plan(free_slots=1)
     _grant_zero_cost_plan(repository, plan, max_capacity=1)
+    _install_fresh_provider_proofs(engine, plan.intents)
     lease = repository.lease_next(service_name='svc',
                                   pool_key=plan.intents[0].pool_key,
                                   owner=uuid.uuid4(),
                                   lease_seconds=30)
     assert lease is not None
     info = _replica_for_intent(lease.intent, 1)
-    record_id = uuid.UUID(info.replica_record_id)
     services = serve_state_schema.services_table
     with engine.begin() as connection:
         incarnation = connection.execute(
             sqlalchemy.select(services.c.controller_incarnation).where(
                 services.c.name == 'svc')).scalar_one()
-        connection.execute(
-            sqlalchemy.insert(
-                serve_state_schema.service_lifecycle_fences_table).values(
-                    name='svc', epoch=3))
         connection.execute(
             sqlalchemy.update(services).where(services.c.name == 'svc').values(
                 demand_source_mode='DURABLE_FEED',
@@ -348,7 +341,7 @@ def test_takeover_wins_uncommitted_replica_handoff_and_rolls_back_row(
 
     takeover_locked = threading.Event()
     release_takeover = threading.Event()
-    replica_inserted = threading.Event()
+    handoff_started = threading.Event()
     replacement = uuid.uuid4()
 
     def _takeover():
@@ -370,17 +363,8 @@ def test_takeover_wins_uncommitted_replica_handoff_and_rolls_back_row(
     def _commit_handoff():
         try:
             with engine.begin() as connection:
-                connection.execute(
-                    sqlalchemy.insert(serve_state_schema.replicas_table).values(
-                        **serve_state._replica_row_values('svc', 1, info)))
-                replica_inserted.set()
-                zero_cost_actuation.commit_lease_in_connection(
-                    connection,
-                    lease,
-                    service_name='svc',
-                    replica_id=1,
-                    replica_record_id=record_id,
-                    replica_info=info)
+                handoff_started.set()
+                _commit_and_insert_replica(connection, lease, info)
         except Exception as error:  # pylint: disable=broad-except
             return error
         return None
@@ -389,7 +373,7 @@ def test_takeover_wins_uncommitted_replica_handoff_and_rolls_back_row(
         takeover = executor.submit(_takeover)
         assert takeover_locked.wait(5)
         handoff = executor.submit(_commit_handoff)
-        assert replica_inserted.wait(5)
+        assert handoff_started.wait(5)
         assert not handoff.done()
         release_takeover.set()
         assert takeover.result(timeout=5).controller_incarnation == replacement
@@ -418,10 +402,6 @@ def test_takeover_rejects_unpersisted_plan_after_transport_fingerprint_aba(
         predecessor_incarnation = connection.execute(
             sqlalchemy.select(services.c.controller_incarnation).where(
                 services.c.name == 'svc')).scalar_one()
-        connection.execute(
-            sqlalchemy.insert(
-                serve_state_schema.service_lifecycle_fences_table).values(
-                    name='svc', epoch=3))
         connection.execute(
             sqlalchemy.update(services).where(services.c.name == 'svc').values(
                 demand_source_mode='DURABLE_FEED',
@@ -472,6 +452,7 @@ def test_handoff_wins_takeover_and_committed_replica_survives(
     repository = zero_cost_actuation.ZeroCostActuationRepository(engine)
     plan = _zero_cost_plan(free_slots=1)
     _grant_zero_cost_plan(repository, plan, max_capacity=1)
+    _install_fresh_provider_proofs(engine, plan.intents)
     lease = repository.lease_next(service_name='svc',
                                   pool_key=plan.intents[0].pool_key,
                                   owner=uuid.uuid4(),
@@ -484,10 +465,6 @@ def test_handoff_wins_takeover_and_committed_replica_survives(
         incarnation = connection.execute(
             sqlalchemy.select(services.c.controller_incarnation).where(
                 services.c.name == 'svc')).scalar_one()
-        connection.execute(
-            sqlalchemy.insert(
-                serve_state_schema.service_lifecycle_fences_table).values(
-                    name='svc', epoch=3))
         connection.execute(
             sqlalchemy.update(services).where(services.c.name == 'svc').values(
                 demand_source_mode='DURABLE_FEED',
@@ -506,16 +483,7 @@ def test_handoff_wins_takeover_and_committed_replica_survives(
             connection.execute(
                 sqlalchemy.select(services.c.name).where(
                     services.c.name == 'svc').with_for_update()).scalar_one()
-            connection.execute(
-                sqlalchemy.insert(serve_state_schema.replicas_table).values(
-                    **serve_state._replica_row_values('svc', 1, info)))
-            zero_cost_actuation.commit_lease_in_connection(
-                connection,
-                lease,
-                service_name='svc',
-                replica_id=1,
-                replica_record_id=record_id,
-                replica_info=info)
+            _commit_and_insert_replica(connection, lease, info)
             handoff_locked.set()
             assert release_handoff.wait(5)
 
