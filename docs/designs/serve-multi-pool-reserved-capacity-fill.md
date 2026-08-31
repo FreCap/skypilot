@@ -5,9 +5,10 @@ Last updated: 2026-08-31
 Status: **the exact-card compatible and statically disjoint edges are
 production-qualified; fixed-wave atomic paid admission, the final-deletion
 authority census, both read-side corrections, and confirmed typed-zero broker
-publication are deployed. Format-6 genesis now has two known immediate
-blockers: a stale service pacing mode and one case-only PostgreSQL/YAML
-card-domain mismatch, whose source correction is under qualification**. One
+publication are deployed. The clean fixed-policy service and prior-history
+card-domain correction are deployed; format-6 genesis now has one known
+immediate blocker at the final provider-free paid-candidate clipping boundary,
+whose case-only correction is under qualification**. One
 PostgreSQL-authoritative planner is the canonical source path for both
 reservation-aware actuation and paid Spot residual. Historical production runs
 proved complete East occupancy, Kueue-bounded PHX occupancy, reclaim, mixed
@@ -84,6 +85,31 @@ would have caught both the service-policy drift and the case-only induction
 failure before deployment. Positive reserved-first/paid-residual behavior and
 provider effects remain live campaign gates rather than claims from this
 fresh-zero regression.
+
+PR #1811 then deployed the history-domain correction as release `1.1.1580` at
+Helm revision 699. The old service was already at exact zero; the single-version
+logical protocol correctly rejected an in-place update, so it was deleted
+without purge and recreated from the validated fixed-policy definition. The new
+incarnation `64aeb479-0d57-4316-9ffb-991a0d247244` has `min_replicas: 0`, zero
+fill floor, `utilization_gate: true`, paid cap 100, no task-owned Kubernetes
+override, and no adaptive policy. Both HA load balancers became ready on the new
+endpoint; PostgreSQL remains authoritative and Helm storage remains disabled.
+
+That replay passed the history adapters and exposed the next case-only boundary.
+Provider-free paid candidates deliberately use lowercase accounting-card keys,
+while the now-canonical planner candidate carries configured display spelling.
+`_clip_prepared_paid_admission()` compared those maps case-sensitively before it
+could discard the unused candidates at fresh zero, so every round failed closed
+with `Prepared paid launch contradicts the planned backend shape.` The correction
+folds only the lookup identity for physical widths, remaining paid units, and
+priority; immutable candidate evidence, exact widths, node count, catalog order,
+and every downstream authority check remain unchanged. The composed PostgreSQL
+regression now includes a real prepared lowercase Spot candidate so this seam is
+exercised even under a zero paid target. A positive PostgreSQL regression also
+requires display-case `L4` planning plus a lowercase provider candidate to
+commit exactly one replica, paid claim, and receipt with the planned priority
+and debit width; planner identity remains display-canonical through finalization
+while the provider pool and persisted claim remain lowercase.
 
 Lifecycle 148 on the preceding `1.1.1575` release accepted a sustained
 exact-L4 pressure test: 270,000 attempts over 184.8 seconds produced a raw logical target of
@@ -3343,36 +3369,37 @@ these remaining current-writer acceptance gates:
    correction homogeneously at Helm revision 698. The three-pool allocation is
    complete: both East cards are authoritative zero and PHX H200 is positive;
    SQL `NULL` remains blackout-only.
-4. Deploy the case-only prior-candidate canonicalization, then update lifecycle
-   150 with the clean fixed pacing policy (100 percent, minimum 50, period 60;
-   no `adaptive_scale_up`). Require its first strict format-6 genesis without
-   changing or deleting the two retained historical rows. Verify the service
-   still has `min_replicas: 0`, fill floor 0, `utilization_gate: true`,
-   Spot-only paid candidates, no task-owned Kubernetes override, and
-   PostgreSQL-only state.
-5. Prove one format-6 demand generation survives multiple additive route
+4. **Complete:** PR #1811 deployed the case-only prior-history correction as
+   release `1.1.1580` at Helm revision 699. The exact-zero old lifecycle was
+   deleted without purge and the service was recreated with fixed pacing (100
+   percent, minimum 50, period 60; no `adaptive_scale_up`). It retains
+   `min_replicas: 0`, fill floor 0, `utilization_gate: true`, Spot-only paid
+   candidates, no task-owned Kubernetes override, and PostgreSQL-only state.
+5. Deploy the case-only provider-free paid-candidate clipping correction and
+   require the first strict format-6 genesis plus at least one successor head.
+6. Prove one format-6 demand generation survives multiple additive route
    expansions and produces at least two actuation waves. Under flexible/mixed
    demand, require new compatible reserved intents to commit and appear in
    durable inventory before any paid row; separately prove a complete
    statically disjoint exact-card target remains eligible for Spot.
-6. Under positive demand, prove East consumes every healthy compatible physical
+7. Under positive demand, prove East consumes every healthy compatible physical
    GPU and PHX consumes every slot actually admitted by Simone's unchanged
    Kueue policy. Record Kueue admission, Pod readiness, PostgreSQL inventory and
    every physical GPU child; idle capacity need not be occupied with the usage
    gate enabled.
-7. Run a fresh protocol-covered 10,000-request campaign and drive the configured
+8. Run a fresh protocol-covered 10,000-request campaign and drive the configured
    roughly-100-Spot limit within a few minutes, subject to real provider
    availability/cooldowns. Capture current queued, processing, in-flight and
    terminal ledger/UI evidence; require zero ordinary on-demand and zero
    wrong-shape capacity.
-8. Complete a controller-child restart and controller-Pod HA takeover while a
+9. Complete a controller-child restart and controller-Pod HA takeover while a
    wave is live. Require restart-safe fixed pacing, no duplicate provider effect,
    exact ambiguous-commit recovery, and preserved generation/fingerprint
    fences.
-9. Stop demand without lowering the paid cap and prove natural drain to exact
+10. Stop demand without lowering the paid cap and prove natural drain to exact
    PostgreSQL, VM, Spot-request and disk zero immediately, at +10, +30, and
    through the full stale/quiescence horizon.
-10. Retain the live multi-node paid physical-backend case as a full-design gate:
+11. Retain the live multi-node paid physical-backend case as a full-design gate:
    charged paid units must equal per-node GPU width times task-authoritative node
    count while the pacing cursor advances in plan units.
 

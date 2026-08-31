@@ -3330,6 +3330,7 @@ def get_service_source_mode(
 class _PreparedPaidAdmission:
     launch_spec: serve_paid_capacity.PaidLaunchSpec
     persistence_spec: serve_paid_capacity.PaidClaimPersistenceSpec
+    plan_accelerator: str
     plan_units: int
     physical_gpu_units: int
 
@@ -4181,11 +4182,21 @@ def _clip_prepared_paid_admission(
     """Clip immutable cheapest-first specs to one planner paid target."""
     if candidate.reserved_launch_target.total() > 0:
         return ()
-    remaining = candidate.paid_launch_target.as_dict()
-    physical_widths = candidate.physical_gpu_width_by_accelerator.as_dict()
+    remaining = {
+        card.casefold(): count
+        for card, count in candidate.paid_launch_target.entries
+    }
+    plan_accelerators = {
+        card.casefold(): card
+        for card, _ in candidate.paid_launch_target.entries
+    }
+    physical_widths = {
+        card.casefold(): width
+        for card, width in candidate.physical_gpu_width_by_accelerator.entries
+    }
     clipped = []
     for launch_spec in prepared_specs:
-        card = launch_spec.accelerator
+        card = launch_spec.accelerator.casefold()
         if (physical_widths.get(card) != launch_spec.gpu_units_per_node or
                 candidate.backend_num_nodes != launch_spec.num_nodes):
             raise CapacityAdmissionConflict(
@@ -4208,6 +4219,7 @@ def _clip_prepared_paid_admission(
             _PreparedPaidAdmission(
                 launch_spec=launch_spec,
                 persistence_spec=persistence_spec,
+                plan_accelerator=plan_accelerators[card],
                 plan_units=plan_units,
                 physical_gpu_units=launch_spec.physical_gpu_units))
         remaining[card] -= plan_units
@@ -5580,7 +5592,7 @@ class CapacityAdmissionRepository:
             accepted_plan_units: dict[str, int] = {}
             accepted_paid_gpu_units = 0
             for item in accepted:
-                card = item.launch_spec.accelerator
+                card = item.plan_accelerator
                 accepted_plan_units[card] = (accepted_plan_units.get(card, 0) +
                                              item.plan_units)
                 accepted_paid_gpu_units += item.physical_gpu_units

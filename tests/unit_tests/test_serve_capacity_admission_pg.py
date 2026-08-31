@@ -2222,6 +2222,53 @@ def test_current_planner_atomically_commits_sparse_multi_node_paid_wave(
                        committed.authority.content_sha256, 1)]
 
 
+def test_current_planner_clips_folded_paid_spec_to_display_card(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    prepared = _paid_launch_spec(engine, 0, 117)
+    planner = mock.Mock(
+        side_effect=lambda snapshot, supply: dataclasses.replace(
+            _current_decision(snapshot, supply, 1, accelerator='L4'),
+            paid_launch_priority_by_accelerator={'l4': 71}))
+
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
+                                       service_hash='svc-hash',
+                                       service_lifecycle_epoch=3,
+                                       service_version=1,
+                                       accounting_cards={'L4': 1},
+                                       backend_num_nodes=1,
+                                       sequenced_reserved_fill=False,
+                                       planner=planner,
+                                       prepared_paid_launch_specs=(prepared,))
+
+    planner.assert_called_once()
+    assert committed.candidate.paid_launch_target.as_dict() == {'L4': 1}
+    assert [(member.replica_id, member.plan_units, member.physical_gpu_units)
+            for member in committed.paid_launch_receipt.members] == [(117, 1, 1)
+                                                                    ]
+    assert committed.authority.remaining_launch_capacity() == {'l4': 1}
+    with engine.connect() as connection:
+        replica = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.replica_id).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    'svc')).scalar_one()
+        claim = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.paid_capacity_claims_table.c.
+                capacity_plan_accelerator,
+                serve_state_schema.paid_capacity_claims_table.c.priority,
+                serve_state_schema.paid_capacity_claims_table.c.
+                capacity_plan_units).where(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == 'svc')).one()
+    assert replica == 117
+    assert claim == ('l4', 71, 1)
+
+
 def test_current_planner_commits_regionless_image_paid_authority(
         capacity_database):
     engine, incarnation, _ = capacity_database
@@ -3678,7 +3725,8 @@ def test_fresh_zero_multi_pool_admission_accepts_yaml_card_casing(
         max_live_paid_gpu_units=100,
         workspace='workspace-a',
         spot_placer=None,
-        prepare_paid_launch_specs=mock.Mock(return_value=()))
+        prepare_paid_launch_specs=mock.Mock(
+            return_value=(_paid_launch_spec(engine, 0, 101),)))
     ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
     ctrl._service_name = 'svc'
     ctrl._service_hash = 'svc-hash'
