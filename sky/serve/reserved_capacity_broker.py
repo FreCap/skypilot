@@ -2741,13 +2741,13 @@ def _apply_occupancy_to_exact_card_observation(
     return sum(spendable.values()), spendable
 
 
-def _normalize_persisted_accelerator_counts(
+def _validate_persisted_accelerator_counts(
     raw_counts: Any,
     pool_key: str,
     *,
     expected_total: int | None = None,
 ) -> dict[str, int]:
-    """Validate one exact-card mapping read from a published round."""
+    """Validate one closed exact-card mapping read from a published round."""
     if not isinstance(raw_counts, dict):
         raise TypeError('exact-card entry must be an object')
     allowed_cards = set(parse_pool_identity(pool_key).gpu_names)
@@ -2763,8 +2763,7 @@ def _normalize_persisted_accelerator_counts(
                 f'exact-card entry {card!r} is outside pool {pool_key!r}')
         if card in normalized:
             raise ValueError('duplicate exact-card entry')
-        if raw_count > 0:
-            normalized[card] = raw_count
+        normalized[card] = raw_count
     if expected_total is not None and sum(
             normalized.values()) != expected_total:
         raise ValueError('exact-card observation does not sum to its '
@@ -3550,8 +3549,16 @@ def _allocation_from_round(
             feed_by_accelerator = {}
         if all_feed_by_accelerator is not None:
             try:
-                feed_by_accelerator = _normalize_persisted_accelerator_counts(
+                closed_service_counts = _validate_persisted_accelerator_counts(
                     all_feed_by_accelerator[service_name], pool_key)
+                # Service feeds are sparse positive launch authority.  The
+                # closed observation projection below deliberately retains
+                # zero-valued card keys as physical evidence.
+                feed_by_accelerator = {
+                    card: count
+                    for card, count in closed_service_counts.items()
+                    if count > 0
+                }
             except (KeyError, TypeError, ValueError,
                     json.JSONDecodeError) as error:
                 # Parse service launch authority independently from the raw
@@ -3588,7 +3595,7 @@ def _allocation_from_round(
                         raise ValueError('observation timestamp does not match '
                                          'the round snapshot')
                     observed_free_slots_by_accelerator = (
-                        _normalize_persisted_accelerator_counts(
+                        _validate_persisted_accelerator_counts(
                             raw_observation,
                             pool_key,
                             expected_total=raw_observed_free))
@@ -4198,8 +4205,8 @@ def _run_round_locked(
                         f'Reserved-fill broker: pool {pool_key} is phantom '
                         '(the realtime query reports no such accelerator in '
                         f'the context, {phantom_streak} consecutive rounds). '
-                        'Blackouting this pool while retaining its complete '
-                        'service claim sets.')
+                        'Publishing exact zero capacity while retaining its '
+                        'complete service claim sets.')
                     confirmed_phantom = True
                 else:
                     logger.error(
@@ -4208,17 +4215,16 @@ def _run_round_locked(
                         f'the context, {phantom_streak} consecutive rounds). '
                         'Rejecting all claims on it.')
                     _remove_legacy_claims_for_pool(pool_key)
-                # Fall through and PUBLISH an empty (blackout) round
-                # instead of returning here: without a published round
-                # the freshness gate never engages, so every claimant's
-                # poller re-drives the full cluster query each interval
-                # forever (N x duplication). Protocol v1 retains its legacy
-                # claim-rejection behavior. Protocol v2 must retain the
-                # complete normalized edge set: deleting this one edge would
-                # advance the whole service generation mid-poll and fence
-                # healthy sibling rounds. Instead the branch below publishes
-                # zero grants/feeds under the unchanged generation. A later
-                # healthy observation resets the streak and resumes normally.
+                # Fall through and PUBLISH a zero round instead of returning
+                # here: without a published round the freshness gate never
+                # engages, so every claimant's poller re-drives the full
+                # cluster query each interval forever (N x duplication).
+                # Protocol v1 retains its legacy claim-rejection/blackout
+                # behavior. Protocol v2 must retain the complete normalized
+                # edge set and its exact-zero observation: deleting this edge
+                # would advance the whole service generation mid-poll and
+                # fence healthy siblings. A later healthy observation resets
+                # the streak and resumes normally.
                 if protocol_version == PROTOCOL_V1:
                     claim_rows = {}
                     claim_generations = {}
@@ -4230,7 +4236,18 @@ def _run_round_locked(
                     f'{constants.RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS} to '
                     'reject claims); treating the round as a measurement '
                     'blackout.')
-            query_ok = False
+            if confirmed_phantom:
+                # A confirmed protocol-v2 phantom is a successful, closed
+                # observation of zero capacity for every exact card in the
+                # physical pool.  Preserve that typed zero through the round
+                # envelope so a complete multi-pool allocation can include
+                # this edge.  Only the preceding suspect observations remain
+                # blackouts; they must not manufacture zero-card authority.
+                measured_by_accelerator = {
+                    card: 0 for card in parse_pool_identity(pool_key).gpu_names
+                }
+            else:
+                query_ok = False
 
     claims = {name: _claim_input(row) for name, row in claim_rows.items()}
     activity = {name: _activity_input(row) for name, row in claim_rows.items()}

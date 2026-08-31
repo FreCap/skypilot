@@ -3,9 +3,10 @@
 Last updated: 2026-08-31
 
 Status: **the exact-card compatible and statically disjoint edges are
-production-qualified; fixed-wave atomic paid admission and the final-deletion
-authority census are deployed, while two source-qualified read-side
-corrections still require one immutable deployment and production proof**. One
+production-qualified; fixed-wave atomic paid admission, the final-deletion
+authority census, and the two read-side corrections are deployed, while one
+typed-zero broker correction still requires qualification and immutable
+deployment**. One
 PostgreSQL-authoritative planner is the canonical source path for both
 reservation-aware actuation and paid Spot residual. Historical production runs
 proved complete East occupancy, Kueue-bounded PHX occupancy, reclaim, mixed
@@ -15,11 +16,12 @@ longer a steady-state goal: the current service uses `utilization_gate: true`,
 so it consumes only capacity justified by demand and returns that capacity to
 the unchanged scheduler when idle.
 
-Release `1.1.1577`, source merge
-`96cb18f63827bf128f846ed4970325f788652754`, deployed PR #1808 homogeneously.
-The active Helm revision 695 is a rollback to the exact revision-693 values and
-image after a later failed upgrade; all API/controller/executor roles still run
-the immutable `1.1.1577` digest. The fixed-wave policy and one-transaction
+Release `1.1.1578`, source merge
+`c52a4dde95bc80036801d2d8bfb96d5bd8d43473`, deployed PR #1809 homogeneously
+at Helm revision 697. All two API, two controller, three executor, and GCP login
+init roles run immutable image digest
+`sha256:a582ad0f9a8f2437ac5e7bc5d62103f382c44fba190e3bde7ddcbd0bbe4f29bf`.
+The fixed-wave policy and one-transaction
 plan/head/policy/replica/claim admission path passed the focused PostgreSQL
 suite and a 100-replica atomic admission wave. The final-deletion census now
 makes future teardown conditional on the complete same-name authority graph.
@@ -30,16 +32,28 @@ detached old-incarnation associations retained canonical post-quiescence
 `UNKNOWN` observations even though their durable effect boundary was
 `PRE_EFFECT_TERMINAL`/`NOT_STARTED`. The shared final-deletion/genesis
 classifier treated every non-`NOT_QUERIED` observation as provider-possible.
-The source-qualified correction accepts only the exact neutral historical
+The deployed correction accepts only the exact neutral historical
 shape described below; it does not infer provider absence or weaken any
 provider-effect path. Second, the reclaim-policy renewal treated East's exact
 zero matching GPU nodes as topology nonconformance, aborting otherwise healthy
-PHX receipt renewal. The source-qualified correction records typed zero for an
-empty context, while concrete launch authority still requires positive capacity
-for the target flavor. Neither correction adds a schema, migration, Kueue
-object, infrastructure object, EFS path, or alternate planner. Immutable image
-deployment, reclaim-gate reauthorization, fresh receipt proof, format-6 genesis
-and the current mixed/Spot campaigns remain open.
+PHX receipt renewal. The deployed correction records typed zero for an empty
+context, while concrete launch authority still requires positive capacity for
+the target flavor. Generation 41 then renewed simultaneous provider proofs:
+PHX reported 64 non-deleting eight-H200 nodes and East reported zero matching
+A100 and A100-80GB nodes.
+
+That production proof exposed one remaining cross-layer mismatch. The broker
+still classified East's confirmed successful zero-card observation as a
+legacy blackout and stored a SQL `NULL` exact-card feed. Whole-map allocation
+correctly rejected that incomplete pool, which also withheld healthy PHX and
+format-6 genesis. The canonical correction preserves the existing transient
+phantom debounce, but after confirmation publishes an authenticated exact-card
+zero envelope (`observed={card: 0}`, `spendable={card: 0}`, service feed empty,
+and the exact slot width). SQL `NULL` remains reserved for provider failure,
+malformed evidence, or a not-yet-confirmed transient observation. Neither
+correction adds a schema, migration, Kueue object, infrastructure object, EFS
+path, or alternate planner. Typed-zero broker deployment, format-6 genesis and
+the current mixed/Spot campaigns remain open.
 
 Lifecycle 148 on the preceding `1.1.1575` release accepted a sustained
 exact-L4 pressure test: 270,000 attempts over 184.8 seconds produced a raw logical target of
@@ -1844,6 +1858,16 @@ reviewed flavor. A returned node that violates the exact selector, product,
 resource name or per-node GPU width remains hard nonconformance rather than
 being silently skipped.
 
+The broker must preserve the same distinction. Before the configured phantom
+debounce completes, a successful empty result shelters existing authority as a
+bounded transient observation and publishes no exact-card launch evidence.
+After confirmation, it is authoritative zero capacity rather than a blackout:
+the round keeps the normalized claim edge, withdraws grants and feeds, and
+publishes the requested accelerator with count zero. A true observation
+failure or malformed split continues to publish no exact-card envelope. This
+lets a complete multi-pool allocation authenticate a zero sibling without
+letting that sibling suppress or poison healthy capacity.
+
 Starting an observation consumes no capacity. Admission and first successful
 materialization advance separate PostgreSQL sequences. These commit-order
 sequences, not wall clocks or readiness guesses, prevent an observation from
@@ -3278,15 +3302,15 @@ at-least-100 Spot scale-out, 10,000-request warm transport, mixed
 reserved-plus-Spot execution, and exact provider drain. They do not replace
 these remaining current-writer acceptance gates:
 
-1. Merge the exact pre-effect-neutral and zero-capacity-context corrections,
-   build one immutable image, and deploy every API/controller/executor and GCP
-   login-init role homogeneously with Helm. Verify the exact runtime digest,
-   PostgreSQL-only state and absence of Kueue/platform/infrastructure changes.
-2. Reauthorize one reclaim-policy generation for revision `1.1.1578`. Require
-   fresh simultaneous East-zero and PHX-positive receipts, successful complete
-   claim renewal, zero East launch authority, and a positive target-flavor
-   receipt before any concrete reserved launch.
-3. Require recreated lifecycle 150 to commit its first strict format-6 genesis
+1. **Complete:** PR #1809 deployed the exact pre-effect-neutral and
+   zero-capacity-context corrections homogeneously as release `1.1.1578` at
+   Helm revision 697. PostgreSQL remains the only central store; Kueue,
+   platform and infrastructure configuration were unchanged.
+2. **Complete:** reclaim-policy generation 41 has fresh simultaneous
+   East-zero and PHX-positive revision-`1.1.1578` receipts. East grants no
+   concrete launch authority; PHX attests the reviewed positive H200 flavor.
+3. Merge and homogeneously deploy the confirmed typed-zero broker correction.
+   Require recreated lifecycle 150 to commit its first strict format-6 genesis
    without changing or deleting the two retained historical rows. Verify the
    service still has `min_replicas: 0`, fill floor 0,
    `utilization_gate: true`, Spot-only paid candidates, no task-owned
