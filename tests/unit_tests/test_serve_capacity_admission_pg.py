@@ -752,6 +752,8 @@ def _seed_committed_plan_for_consumer(
 def _plan_and_admit_target(
     engine: sqlalchemy.engine.Engine,
     target: int,
+    *,
+    accelerator: str = 'l4',
 ) -> capacity_admission.PaidLaunchAuthority:
     """Commit a simple target through the sole production plan writer."""
     return capacity_admission.CapacityAdmissionRepository(
@@ -762,12 +764,12 @@ def _plan_and_admit_target(
             service_lifecycle_epoch=3,
             service_version=1,
             accounting_cards={
-                'l4': 1
+                accelerator: 1
             },
             backend_num_nodes=1,
             sequenced_reserved_fill=False,
             planner=lambda snapshot, supply: _current_decision(
-                snapshot, supply, target)).authority
+                snapshot, supply, target, accelerator=accelerator)).authority
 
 
 def _current_decision(
@@ -3846,8 +3848,9 @@ def test_usage_gate_publishes_no_effect_acquisition_for_noncausal_evidence(
 def test_shutting_down_paid_row_leaves_baseline_only_after_cleanup_proof(
         capacity_database, row_status, down_status, expected_existing,
         expected_residual):
-    engine, incarnation, _ = capacity_database
+    engine, incarnation, route_receipt = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    _plan_and_admit_target(engine, 0)
     replica = _replica_values(101, zero_cost=False)
     replica['status'] = row_status
     replica['replica_state']['status_property'][
@@ -3859,6 +3862,9 @@ def test_shutting_down_paid_row_leaves_baseline_only_after_cleanup_proof(
         connection.execute(
             sqlalchemy.insert(
                 serve_state_schema.replicas_table).values(**replica))
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=1))
 
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(**_current_owner_kwargs(engine),
@@ -3886,11 +3892,12 @@ def test_shutting_down_paid_row_leaves_baseline_only_after_cleanup_proof(
 
 
 @pytest.mark.parametrize('down_status, expected_charged, expected_launch',
-                         [('SCHEDULED', 1, 0), ('SUCCEEDED', 0, 1)])
-def test_old_version_paid_row_charges_cap_without_covering_current_demand(
+                         [('SCHEDULED', 1, 1), ('SUCCEEDED', 0, 1)])
+def test_old_version_paid_row_is_charged_without_covering_current_demand(
         capacity_database, down_status, expected_charged, expected_launch):
-    engine, incarnation, _ = capacity_database
+    engine, incarnation, route_receipt = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    _plan_and_admit_target(engine, 0)
     replica = _replica_values(102, zero_cost=False)
     replica['version'] = 2
     replica['replica_state']['version'] = 2
@@ -3904,19 +3911,21 @@ def test_old_version_paid_row_charges_cap_without_covering_current_demand(
         connection.execute(
             sqlalchemy.insert(
                 serve_state_schema.replicas_table).values(**replica))
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=1))
 
     committed = (capacity_admission.CapacityAdmissionRepository(
-        engine).plan_and_admit_current(
-            **_current_owner_kwargs(engine),
-            service_name='svc',
-            service_hash='svc-hash',
-            service_lifecycle_epoch=3,
-            service_version=1,
-            accounting_cards={'l4': 1},
-            backend_num_nodes=1,
-            sequenced_reserved_fill=False,
-            planner=lambda snapshot, supply: _current_decision(
-                snapshot, supply, 1, max_live_paid_gpu_units=1)))
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
+                                       service_hash='svc-hash',
+                                       service_lifecycle_epoch=3,
+                                       service_version=1,
+                                       accounting_cards={'l4': 1},
+                                       backend_num_nodes=1,
+                                       sequenced_reserved_fill=False,
+                                       planner=lambda snapshot, supply:
+                                       _current_decision(snapshot, supply, 1)))
 
     assert committed.candidate.paid_residual.as_dict() == {'l4': 1}
     assert committed.candidate.paid_cap.charged_paid_gpu_units == (
@@ -4095,8 +4104,9 @@ def test_locked_paid_replica_relational_authority_rejects_json_contradiction(
 
 def test_noncurrent_removed_reserved_card_is_retirement_only_inventory(
         capacity_database):
-    engine, incarnation, _ = capacity_database
+    engine, incarnation, route_receipt = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    _plan_and_admit_target(engine, 0, accelerator='a100')
     replica = _replica_values(103, zero_cost=True, accelerator='L4')
     replica['version'] = 2
     replica['replica_state']['version'] = 2
@@ -4104,6 +4114,9 @@ def test_noncurrent_removed_reserved_card_is_retirement_only_inventory(
         connection.execute(
             sqlalchemy.insert(
                 serve_state_schema.replicas_table).values(**replica))
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=1))
 
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
@@ -4126,9 +4139,13 @@ def test_noncurrent_removed_reserved_card_is_retirement_only_inventory(
 
 def test_disabled_fill_keeps_surviving_pending_intent_in_economic_baseline(
         capacity_database):
-    engine, incarnation, _ = capacity_database
+    engine, incarnation, route_receipt = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    _plan_and_admit_target(engine, 0)
     _install_pending_east_capacity(engine)
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=1))
 
     committed = capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(**_current_owner_kwargs(engine),
