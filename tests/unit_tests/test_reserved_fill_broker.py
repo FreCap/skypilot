@@ -24,6 +24,7 @@ from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy import orm
 from sqlalchemy.sql import dml
 
+from sky import clouds
 from sky.serve import constants as serve_constants
 from sky.serve import paid_capacity
 from sky.serve import pool_capacity_observation
@@ -32,6 +33,7 @@ from sky.serve import reserved_capacity_broker as broker
 from sky.serve import reserved_fill_reclaim_attestation as reclaim
 from sky.serve import serve_state
 from sky.serve import service_spec
+from sky.serve import spot_placer
 from sky.serve import zero_cost_actuation
 from sky.utils import common_utils
 from sky.utils import locks
@@ -518,24 +520,32 @@ class TestConnectionLocalPaidAdmission:
 
     @staticmethod
     def _spec() -> paid_capacity.PaidClaimPersistenceSpec:
+        location = spot_placer.Location(cloud=clouds.GCP(),
+                                        region='us-central1',
+                                        zone=None,
+                                        accelerators={'L4': 1},
+                                        use_spot=True,
+                                        instance_type='g2-standard-4')
         info = replica_managers.ReplicaInfo(
             replica_id=1,
             cluster_name='paid-core-svc-1',
             replica_port='8080',
             is_spot=True,
-            location=None,
+            location=location,
             version=1,
-            resources_override={'use_spot': True})
-        candidate = paid_capacity.PaidClaimCandidate(
-            replica_id=1,
-            replica_info=info,
-            location=None,  # type: ignore[arg-type]
-            priority=20,
-            capacity_plan_claim=None)
-        return paid_capacity.PaidClaimPersistenceSpec(candidate=candidate,
-                                                      pool_key='pool',
-                                                      frontier_key=('l4',),
-                                                      frontier_limit=1)
+            resources_override=location.to_dict())
+        candidate = paid_capacity.PaidClaimCandidate(replica_id=1,
+                                                     replica_info=info,
+                                                     location=location,
+                                                     priority=20,
+                                                     capacity_plan_claim=None)
+        return paid_capacity.PaidClaimPersistenceSpec(
+            candidate=candidate,
+            pool_key=paid_capacity.pool_key(location,
+                                            workspace='default',
+                                            num_nodes=1),
+            frontier_key=paid_capacity.frontier_key(location),
+            frontier_limit=1)
 
     @staticmethod
     def _legacy_admit(

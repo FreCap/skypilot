@@ -3484,7 +3484,9 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         autoscaler._logical_adopted_paid_target_by_accelerator = {'L4': 40}
         autoscaler._snap_target_on_next_recompute = False
 
-        paid_l4 = [_replica(replica_id, card='L4') for replica_id in range(31)]
+        paid_l4 = [
+            _replica(replica_id, card='L4') for replica_id in range(1, 32)
+        ]
         zero_cost_a100 = [
             _replica(replica_id, card='A100', reserved_fill=True)
             for replica_id in range(100, 136)
