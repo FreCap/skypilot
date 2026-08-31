@@ -47,7 +47,6 @@ from sky import clouds
 from sky import estimated_spend
 from sky import global_user_state
 from sky import global_user_state_schema
-from sky.serve import capacity_admission_schema
 from sky.serve import constants
 from sky.serve import lb_ha
 from sky.serve import paid_capacity
@@ -501,6 +500,19 @@ class TestPaidCapacityAuthorityPG:
                                                 aws_account_id='123456789012')
 
     @classmethod
+    def _test_pool(cls,
+                   alias: str,
+                   *,
+                   accelerator: str = 'L4',
+                   accelerator_count: int = 1) -> str:
+        """Return a canonical exact provider pool for a readable test alias."""
+        _, pool_key = cls._paid_pool(f'test-zone-{alias}',
+                                     f'test-instance-{alias}',
+                                     accelerator=accelerator,
+                                     accelerator_count=accelerator_count)
+        return pool_key
+
+    @classmethod
     def _paid_batch_spec(
         cls,
         replica_id: int,
@@ -536,34 +548,13 @@ class TestPaidCapacityAuthorityPG:
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
         serve_state.Base.metadata.create_all(broker_engine)
         self._add_service('svc', 'hash', 11)
-        with sqlalchemy.orm.Session(broker_engine) as session:
-            session.execute(
-                capacity_admission_schema.serve_capacity_plans_table.insert().
-                values(service_name='svc',
-                       generation=1,
-                       service_hash='hash',
-                       service_lifecycle_epoch=1,
-                       service_version=1,
-                       demand_source_epoch=1,
-                       demand_feed_generation=1,
-                       route_generation=1,
-                       route_sha256='b' * 64,
-                       route_source_epoch=1,
-                       protocol_version=1,
-                       content_sha256='a' * 64,
-                       payload={},
-                       created_at=datetime.datetime.now(datetime.timezone.utc)))
-            session.commit()
         specs = [
-            self._paid_batch_spec(replica_id, 'pool', planner_bound=True)
+            self._paid_batch_spec(replica_id, self._test_pool('pool'))
             for replica_id in range(1, 101)
         ]
-        validate = mock.Mock(
-            return_value=datetime.datetime.now(datetime.timezone.utc) +
-            datetime.timedelta(minutes=1))
-        monkeypatch.setattr(
-            serve_state.capacity_admission,
-            'validate_prospective_paid_claim_batch_in_connection', validate)
+        validate = mock.Mock()
+        monkeypatch.setattr(serve_state.capacity_admission,
+                            'validate_paid_claim_in_connection', validate)
         results = serve_state.try_add_replicas_with_paid_capacity_claims(
             'svc',
             'hash',
@@ -578,8 +569,7 @@ class TestPaidCapacityAuthorityPG:
             frontier_default_limit=100)
 
         assert results == ['acquired'] * 100
-        validate.assert_called_once()
-        assert len(validate.call_args.args[2]) == 100
+        assert validate.call_count == 100
         with sqlalchemy.orm.Session(broker_engine) as session:
             replica_count = session.execute(
                 sqlalchemy.select(
@@ -601,10 +591,12 @@ class TestPaidCapacityAuthorityPG:
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
         serve_state.Base.metadata.create_all(broker_engine)
         self._add_service('svc', 'hash', 11)
+        pool_a = self._test_pool('pool-a')
+        pool_b = self._test_pool('pool-b')
         specs = [
-            self._paid_batch_spec(1, 'pool-b'),
-            self._paid_batch_spec(2, 'pool-b'),
-            self._paid_batch_spec(3, 'pool-a'),
+            self._paid_batch_spec(1, pool_b),
+            self._paid_batch_spec(2, pool_b),
+            self._paid_batch_spec(3, pool_a),
         ]
         lock_order = []
         lock_pool = serve_state._paid_capacity_pool_row_for_update
@@ -630,7 +622,7 @@ class TestPaidCapacityAuthorityPG:
             frontier_default_limit=100)
 
         assert results == ['acquired', 'saturated', 'acquired']
-        assert lock_order == ['pool-a', 'pool-b']
+        assert lock_order == [pool_a, pool_b]
         with sqlalchemy.orm.Session(broker_engine) as session:
             claims = session.execute(
                 sqlalchemy.select(
@@ -644,17 +636,19 @@ class TestPaidCapacityAuthorityPG:
                         serve_state.paid_capacity_waiters_table.c.service_name
                         == 'svc')).scalars().all()
         assert claims == [1, 3]
-        assert waiters == ['pool-b']
+        assert waiters == [pool_b]
 
     def test_atomic_paid_batch_locks_all_pools_before_stale_claim_cleanup(
             self, broker_engine, monkeypatch):
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
         serve_state.Base.metadata.create_all(broker_engine)
         self._add_service('svc', 'hash', 11)
+        pool_a = self._test_pool('pool-a')
+        pool_z = self._test_pool('pool-z')
         with sqlalchemy.orm.Session(broker_engine) as session:
             session.execute(
                 serve_state.paid_capacity_pools_table.insert().values(
-                    pool_key='pool-z',
+                    pool_key=pool_z,
                     current_limit=1,
                     successes_since_resize=0,
                     updated_at=1))
@@ -663,7 +657,7 @@ class TestPaidCapacityAuthorityPG:
                     service_name='svc',
                     service_hash='hash',
                     replica_id=999,
-                    pool_key='pool-z',
+                    pool_key=pool_z,
                     priority=20,
                     claimed_at=1))
             session.commit()
@@ -689,7 +683,7 @@ class TestPaidCapacityAuthorityPG:
 
         results = serve_state.try_add_replicas_with_paid_capacity_claims(
             'svc',
-            'hash', [self._paid_batch_spec(1, 'pool-a')],
+            'hash', [self._paid_batch_spec(1, pool_a)],
             base_limit=1,
             max_limit=1,
             service_limit=10,
@@ -700,20 +694,21 @@ class TestPaidCapacityAuthorityPG:
             frontier_default_limit=100)
 
         assert results == ['acquired']
-        assert events[:3] == ['lock:pool-a', 'lock:pool-z', 'delete']
+        assert events[:3] == [f'lock:{pool_a}', f'lock:{pool_z}', 'delete']
 
     def test_atomic_paid_batch_plan_conflict_rolls_back_phase_a(
             self, broker_engine, monkeypatch):
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
         serve_state.Base.metadata.create_all(broker_engine)
         self._add_service('svc', 'hash', 11)
+        pool_a = self._test_pool('pool-a')
+        pool_b = self._test_pool('pool-b')
         specs = [
-            self._paid_batch_spec(1, 'pool-b', planner_bound=True),
-            self._paid_batch_spec(2, 'pool-a', planner_bound=True),
+            self._paid_batch_spec(1, pool_b),
+            self._paid_batch_spec(2, pool_a),
         ]
         monkeypatch.setattr(
-            serve_state.capacity_admission,
-            'validate_prospective_paid_claim_batch_in_connection',
+            serve_state.capacity_admission, 'validate_paid_claim_in_connection',
             mock.Mock(side_effect=serve_state.capacity_admission.
                       CapacityAdmissionConflict('stale plan')))
 
@@ -800,7 +795,7 @@ class TestPaidCapacityAuthorityPG:
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
         serve_state.Base.metadata.create_all(broker_engine)
         self._add_service('svc', 'hash', 11)
-        existing = self._paid_batch_spec(1, 'pool-z')
+        existing = self._paid_batch_spec(1, self._test_pool('pool-z'))
         assert serve_state.try_add_replicas_with_paid_capacity_claims(
             'svc',
             'hash', [existing],
@@ -860,7 +855,7 @@ class TestPaidCapacityAuthorityPG:
                 order_by(serve_state.paid_capacity_waiters_table.c.pool_key
                         )).scalars().all()
 
-        fresh = self._paid_batch_spec(2, 'pool-a')
+        fresh = self._paid_batch_spec(2, self._test_pool('pool-a'))
         with pytest.raises(ValueError, match='zero-cost or reserved-fill row'):
             serve_state.try_add_replicas_with_paid_capacity_claims(
                 'svc',
@@ -917,6 +912,8 @@ class TestPaidCapacityAuthorityPG:
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
         serve_state.Base.metadata.create_all(broker_engine)
         self._add_service('svc', 'hash', 11)
+        pool_a = self._test_pool('pool-a')
+        pool_b = self._test_pool('pool-b')
         replica_inserts = 0
 
         def _fail_second_replica_insert(conn, cursor, statement, parameters,
@@ -936,8 +933,8 @@ class TestPaidCapacityAuthorityPG:
                 serve_state.try_add_replicas_with_paid_capacity_claims(
                     'svc',
                     'hash', [
-                        self._paid_batch_spec(1, 'pool-b'),
-                        self._paid_batch_spec(2, 'pool-a'),
+                        self._paid_batch_spec(1, pool_b),
+                        self._paid_batch_spec(2, pool_a),
                     ],
                     base_limit=2,
                     max_limit=2,
@@ -1031,7 +1028,7 @@ class TestPaidCapacityAuthorityPG:
         serve_state.Base.metadata.create_all(broker_engine)
         self._add_service('low', 'hash-low', 11)
         self._add_service('high', 'hash-high', 22)
-        pool_key = 'aws/us-east-1a/g6.xlarge/spot'
+        pool_key = self._test_pool('priority-ramp')
 
         def _claim(service_name, service_hash, pid, replica_id, priority, now):
             return serve_state.try_add_replica_with_paid_capacity_claim(
@@ -1151,7 +1148,7 @@ class TestPaidCapacityAuthorityPG:
                 service_hash,
                 replica_id,
                 self._info(name, replica_id),
-                pool_key='pool',
+                pool_key=self._test_pool('pool'),
                 priority=30,
                 base_limit=1,
                 max_limit=8,
@@ -1202,7 +1199,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             1,
             first,
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=2,
             max_limit=8,
@@ -1225,12 +1222,12 @@ class TestPaidCapacityAuthorityPG:
             expected_controller_owner=(11, '10.0.0.1'))
 
         closed = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=2,
             max_limit=8,
             now=115,
             success_ttl_seconds=60,
-            failure_cooldown_seconds=10)['pool']
+            failure_cooldown_seconds=10)[self._test_pool('pool')]
         assert closed['admission_state'] == 'cooldown'
         assert closed['admission_limit'] == 0
         assert closed['remaining'] == 0
@@ -1243,7 +1240,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             2,
             self._info('svc', 2),
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=2,
             max_limit=8,
@@ -1255,12 +1252,12 @@ class TestPaidCapacityAuthorityPG:
 
         # After the cooldown exactly one probe reopens.
         probing = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=2,
             max_limit=8,
             now=121,
             success_ttl_seconds=60,
-            failure_cooldown_seconds=10)['pool']
+            failure_cooldown_seconds=10)[self._test_pool('pool')]
         assert probing['admission_state'] == 'probe'
         assert probing['admission_limit'] == 1
         assert serve_state.try_add_replica_with_paid_capacity_claim(
@@ -1268,7 +1265,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             3,
             self._info('svc', 3),
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=2,
             max_limit=8,
@@ -1296,7 +1293,7 @@ class TestPaidCapacityAuthorityPG:
                         'hash',
                         replica_id,
                         self._info('svc', replica_id),
-                        pool_key=f'pool-{replica_id}',
+                        pool_key=self._test_pool(f'pool-{replica_id}'),
                         priority=20,
                         base_limit=4,
                         max_limit=8,
@@ -1359,7 +1356,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             1,
             self._info('svc', 1),
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=4,
             max_limit=8,
@@ -1374,7 +1371,7 @@ class TestPaidCapacityAuthorityPG:
                 'hash',
                 2,
                 self._info('svc', 2),
-                pool_key='pool',
+                pool_key=self._test_pool('pool'),
                 priority=20,
                 base_limit=4,
                 max_limit=8,
@@ -1400,7 +1397,7 @@ class TestPaidCapacityAuthorityPG:
                 ).select_from(
                     serve_state.paid_capacity_pools_table)).scalar_one() == 0
 
-    def test_paid_gpu_cap_conservatively_counts_legacy_json_and_width(
+    def test_paid_gpu_cap_fails_closed_on_unattributable_live_rows(
             self, broker_engine, monkeypatch):
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
         serve_state.Base.metadata.create_all(broker_engine)
@@ -1412,7 +1409,8 @@ class TestPaidCapacityAuthorityPG:
             assert serve_state.add_or_update_replica(
                 'svc', replica_id, self._info('svc', replica_id))
         retained_states = {
-            # Missing, null, string, and object provenance are all paid.
+            # Diverse malformed pre-attribution JSON shapes must all fail
+            # closed while provider cleanup remains unproven.
             1: {},
             2: {
                 'is_zero_cost': None,
@@ -1426,12 +1424,14 @@ class TestPaidCapacityAuthorityPG:
                 'is_zero_cost': {},
                 'planned_capacity': 3,
             },
-            # Only literal JSON true is zero-cost.
+            # A JSON-only zero-cost marker cannot override the relational
+            # attribution columns used by current replicas.
             5: {
                 'is_zero_cost': True,
                 'planned_capacity': 100,
             },
-            # Only durable provider teardown success releases a paid debit.
+            # The cleanup scalar alone is not proof without its matching JSON
+            # status copy.
             6: {
                 'is_zero_cost': False,
                 'planned_capacity': 100,
@@ -1460,7 +1460,7 @@ class TestPaidCapacityAuthorityPG:
                 'hash',
                 7,
                 candidate,
-                pool_key='pool',
+                pool_key=self._test_pool('pool'),
                 priority=20,
                 base_limit=8,
                 max_limit=16,
@@ -1470,18 +1470,26 @@ class TestPaidCapacityAuthorityPG:
                 waiter_ttl_seconds=30,
                 expected_controller_owner=(11, '10.0.0.1'))
 
-        # Live total is 1 + 2 + 1 + 3 = 7. The incoming two-GPU backend
-        # cannot fit; the malformed width contributes one rather than failing.
+        # Historical rows without an exact provider pool cannot be assigned a
+        # physical GPU debit, so admission fails closed while any remain live.
         assert _claim() == 'service_saturated'
         assert serve_state.get_replica_info_from_id('svc', 7) is None
 
         with sqlalchemy.orm.Session(broker_engine) as session:
-            session.execute(
-                sqlalchemy.update(serve_state.replicas_table).where(
-                    serve_state.replicas_table.c.service_name == 'svc',
-                    serve_state.replicas_table.c.replica_id == 4).values(
-                        sky_down_status=(
-                            common_utils.ProcessStatus.SUCCEEDED.value)))
+            for replica_id, replica_state in retained_states.items():
+                cleaned_state = dict(replica_state)
+                cleaned_state['status_property'] = {
+                    'sky_down_status':
+                        common_utils.ProcessStatus.SUCCEEDED.value,
+                }
+                session.execute(
+                    sqlalchemy.update(serve_state.replicas_table).where(
+                        serve_state.replicas_table.c.service_name == 'svc',
+                        serve_state.replicas_table.c.replica_id ==
+                        replica_id).values(
+                            replica_state=cleaned_state,
+                            sky_down_status=(
+                                common_utils.ProcessStatus.SUCCEEDED.value)))
             session.commit()
 
         assert _claim() == 'acquired'
@@ -1497,6 +1505,7 @@ class TestPaidCapacityAuthorityPG:
                           spec_override=_paid_cap_service_spec(8))
         first = self._info('svc', 1)
         first.planned_capacity = 8
+        pool_key = self._test_pool('eight-gpu', accelerator_count=8)
 
         def _claim(replica_id: int, info, limit: int) -> str:
             return serve_state.try_add_replica_with_paid_capacity_claim(
@@ -1504,7 +1513,7 @@ class TestPaidCapacityAuthorityPG:
                 'hash',
                 replica_id,
                 info,
-                pool_key=f'pool-{replica_id}',
+                pool_key=pool_key,
                 priority=20,
                 base_limit=8,
                 max_limit=16,
@@ -1549,7 +1558,8 @@ class TestPaidCapacityAuthorityPG:
                         'hash',
                         replica_id,
                         info,
-                        pool_key=f'pool-{replica_id}',
+                        pool_key=self._test_pool(f'pool-{replica_id}',
+                                                 accelerator_count=2),
                         priority=20,
                         base_limit=8,
                         max_limit=16,
@@ -1602,7 +1612,7 @@ class TestPaidCapacityAuthorityPG:
                 'hash',
                 replica_id,
                 self._info('svc', replica_id),
-                pool_key=f'pool-{replica_id}',
+                pool_key=self._test_pool(f'pool-{replica_id}'),
                 priority=20,
                 base_limit=4,
                 max_limit=8,
@@ -1659,7 +1669,7 @@ class TestPaidCapacityAuthorityPG:
                 'hash',
                 replica_id,
                 self._info('svc', replica_id),
-                pool_key=f'pool-{replica_id}',
+                pool_key=self._test_pool(f'pool-{replica_id}'),
                 priority=20,
                 base_limit=4,
                 max_limit=8,
@@ -1716,9 +1726,11 @@ class TestPaidCapacityAuthorityPG:
                 waiter_ttl_seconds=30,
                 expected_controller_owner=(pid, '10.0.0.1'))
 
-        assert _claim('low', 'hash-low', 11, 1, 'pool-a', 20) == 'acquired'
-        assert _claim('high', 'hash-high', 22, 1, 'pool-a', 50) == 'saturated'
-        assert _claim('high', 'hash-high', 22, 2, 'pool-b', 50) == 'acquired'
+        pool_a = self._test_pool('pool-a')
+        pool_b = self._test_pool('pool-b')
+        assert _claim('low', 'hash-low', 11, 1, pool_a, 20) == 'acquired'
+        assert _claim('high', 'hash-high', 22, 1, pool_a, 50) == 'saturated'
+        assert _claim('high', 'hash-high', 22, 2, pool_b, 50) == 'acquired'
 
         with sqlalchemy.orm.Session(broker_engine) as session:
             waiters = session.execute(
@@ -1741,7 +1753,7 @@ class TestPaidCapacityAuthorityPG:
                 service_hash,
                 replica_id,
                 self._info(service_name, replica_id),
-                pool_key='pool',
+                pool_key=self._test_pool('pool'),
                 priority=priority,
                 base_limit=1,
                 max_limit=4,
@@ -1768,7 +1780,7 @@ class TestPaidCapacityAuthorityPG:
             'hash-owner',
             1,
             self._info('owner', 1),
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=1,
             max_limit=4,
@@ -1802,7 +1814,7 @@ class TestPaidCapacityAuthorityPG:
             'hash-peer',
             1,
             self._info('peer', 1),
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=1,
             max_limit=4,
@@ -1833,7 +1845,7 @@ class TestPaidCapacityAuthorityPG:
                 'hash',
                 replica_id,
                 info,
-                pool_key='pool',
+                pool_key=self._test_pool('pool'),
                 priority=20,
                 base_limit=2,
                 max_limit=8,
@@ -1846,10 +1858,10 @@ class TestPaidCapacityAuthorityPG:
             session.execute(
                 sqlalchemy.update(serve_state.paid_capacity_pools_table).where(
                     serve_state.paid_capacity_pools_table.c.pool_key ==
-                    'pool').values(current_limit=4,
-                                   successes_since_resize=3,
-                                   last_success_at=100,
-                                   updated_at=100))
+                    self._test_pool('pool')).values(current_limit=4,
+                                                    successes_since_resize=3,
+                                                    last_success_at=100,
+                                                    updated_at=100))
             session.commit()
         infos[0][1].status_property.sky_launch_status = (
             common_utils.ProcessStatus.SUCCEEDED)
@@ -1870,11 +1882,11 @@ class TestPaidCapacityAuthorityPG:
             expected_controller_owner=(11, '10.0.0.1'))
 
         state = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=2,
             max_limit=8,
             now=110,
-            success_ttl_seconds=60)['pool']
+            success_ttl_seconds=60)[self._test_pool('pool')]
         assert state['current_limit'] == 2
         assert state['successes_since_resize'] == 0
         assert state['last_success_at'] is None
@@ -1898,7 +1910,7 @@ class TestPaidCapacityAuthorityPG:
             'hash-failed',
             1,
             failed,
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=2,
             max_limit=8,
@@ -1927,7 +1939,7 @@ class TestPaidCapacityAuthorityPG:
                 service_hash,
                 1,
                 self._info(name, 1),
-                pool_key='pool',
+                pool_key=self._test_pool('pool'),
                 priority=20,
                 base_limit=2,
                 max_limit=8,
@@ -1939,12 +1951,12 @@ class TestPaidCapacityAuthorityPG:
 
         assert _claim('probe-a', 119) == 'saturated'
         closed = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=2,
             max_limit=8,
             now=119,
             success_ttl_seconds=60,
-            failure_cooldown_seconds=10)['pool']
+            failure_cooldown_seconds=10)[self._test_pool('pool')]
         assert closed['admission_state'] == 'cooldown'
         assert closed['admission_limit'] == 0
         assert closed['remaining'] == 0
@@ -1976,12 +1988,12 @@ class TestPaidCapacityAuthorityPG:
         }
 
         probing = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=2,
             max_limit=8,
             now=120,
             success_ttl_seconds=60,
-            failure_cooldown_seconds=10)['pool']
+            failure_cooldown_seconds=10)[self._test_pool('pool')]
         assert probing['current_limit'] == 1
         assert probing['admission_state'] == 'probe'
         assert probing['admission_limit'] == 1
@@ -2006,12 +2018,12 @@ class TestPaidCapacityAuthorityPG:
             failure_cooldown_seconds=10,
             expected_controller_owner=(pid, '10.0.0.1'))
         reopened = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=2,
             max_limit=8,
             now=121,
             success_ttl_seconds=60,
-            failure_cooldown_seconds=10)['pool']
+            failure_cooldown_seconds=10)[self._test_pool('pool')]
         assert reopened['admission_state'] == 'active'
         assert reopened['admission_limit'] == 2
         assert reopened['current_limit'] == 2
@@ -2030,7 +2042,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             1,
             first,
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=2,
             max_limit=8,
@@ -2058,7 +2070,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             2,
             probe,
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=2,
             max_limit=8,
@@ -2081,12 +2093,12 @@ class TestPaidCapacityAuthorityPG:
             expected_controller_owner=(11, '10.0.0.1'))
 
         state = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=2,
             max_limit=8,
             now=130,
             success_ttl_seconds=60,
-            failure_cooldown_seconds=10)['pool']
+            failure_cooldown_seconds=10)[self._test_pool('pool')]
         assert state['last_failure_at'] == 121
         assert state['admission_state'] == 'cooldown'
         assert state['admission_limit'] == 0
@@ -2104,7 +2116,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             1,
             first,
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=2,
             max_limit=8,
@@ -2132,7 +2144,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             2,
             probe,
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=2,
             max_limit=8,
@@ -2155,12 +2167,12 @@ class TestPaidCapacityAuthorityPG:
             expected_controller_owner=(11, '10.0.0.1'))
 
         state = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=2,
             max_limit=8,
             now=121,
             success_ttl_seconds=60,
-            failure_cooldown_seconds=10)['pool']
+            failure_cooldown_seconds=10)[self._test_pool('pool')]
         assert state['last_failure_at'] == 110
         assert state['admission_state'] == 'probe'
         assert state['remaining'] == 1
@@ -2169,7 +2181,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             3,
             self._info('svc', 3),
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=2,
             max_limit=8,
@@ -2187,7 +2199,7 @@ class TestPaidCapacityAuthorityPG:
         with broker_engine.begin() as connection:
             connection.execute(
                 sqlalchemy.insert(serve_state.paid_capacity_pools_table).values(
-                    pool_key='legacy',
+                    pool_key=self._test_pool('legacy'),
                     current_limit=60,
                     successes_since_resize=59,
                     last_success_at=100,
@@ -2198,7 +2210,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             1,
             self._info('svc', 1),
-            pool_key='legacy',
+            pool_key=self._test_pool('legacy'),
             priority=20,
             base_limit=4,
             max_limit=480,
@@ -2207,11 +2219,11 @@ class TestPaidCapacityAuthorityPG:
             waiter_ttl_seconds=30,
             expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
         state = serve_state.get_paid_capacity_pool_states(
-            ['legacy'],
+            [self._test_pool('legacy')],
             base_limit=4,
             max_limit=480,
             now=101,
-            success_ttl_seconds=600)['legacy']
+            success_ttl_seconds=600)[self._test_pool('legacy')]
         assert state['current_limit'] == 4
         assert state['successes_since_resize'] == 0
         assert state['last_success_at'] is None
@@ -2230,7 +2242,7 @@ class TestPaidCapacityAuthorityPG:
                 'hash',
                 replica_id,
                 infos[replica_id],
-                pool_key='pool',
+                pool_key=self._test_pool('pool'),
                 priority=20,
                 base_limit=4,
                 max_limit=480,
@@ -2253,12 +2265,12 @@ class TestPaidCapacityAuthorityPG:
             expected_controller_owner=(11, '10.0.0.1'))
 
         overage = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=4,
             max_limit=480,
             now=120,
             success_ttl_seconds=600,
-            failure_cooldown_seconds=10)['pool']
+            failure_cooldown_seconds=10)[self._test_pool('pool')]
         assert overage['admission_limit'] == 1
         assert overage['active_claims'] == 3
         assert overage['legacy_overage'] == 2
@@ -2268,7 +2280,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             5,
             self._info('svc', 5),
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=4,
             max_limit=480,
@@ -2301,7 +2313,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             5,
             old_binary_probe,
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=4,
             max_limit=480,
@@ -2314,7 +2326,8 @@ class TestPaidCapacityAuthorityPG:
             connection.execute(
                 sqlalchemy.update(serve_state.paid_capacity_pools_table).where(
                     serve_state.paid_capacity_pools_table.c.pool_key ==
-                    'pool').values(current_limit=60, updated_at=122.5))
+                    self._test_pool('pool')).values(current_limit=60,
+                                                    updated_at=122.5))
         old_binary_probe.status_property.sky_launch_status = (
             common_utils.ProcessStatus.SUCCEEDED)
         assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
@@ -2328,12 +2341,12 @@ class TestPaidCapacityAuthorityPG:
             failure_cooldown_seconds=10,
             expected_controller_owner=(11, '10.0.0.1'))
         sticky = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=4,
             max_limit=480,
             now=123,
             success_ttl_seconds=600,
-            failure_cooldown_seconds=10)['pool']
+            failure_cooldown_seconds=10)[self._test_pool('pool')]
         assert sticky['current_limit'] == 60
         assert sticky['last_failure_at'] == 110
         assert sticky['active_claims'] == 0
@@ -2344,7 +2357,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             6,
             fresh_probe,
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=4,
             max_limit=480,
@@ -2366,12 +2379,12 @@ class TestPaidCapacityAuthorityPG:
             failure_cooldown_seconds=10,
             expected_controller_owner=(11, '10.0.0.1'))
         reopened = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=4,
             max_limit=480,
             now=125,
             success_ttl_seconds=600,
-            failure_cooldown_seconds=10)['pool']
+            failure_cooldown_seconds=10)[self._test_pool('pool')]
         assert reopened['current_limit'] == 4
         assert reopened['last_failure_at'] is None
 
@@ -2383,7 +2396,7 @@ class TestPaidCapacityAuthorityPG:
         with broker_engine.begin() as connection:
             connection.execute(
                 sqlalchemy.insert(serve_state.paid_capacity_pools_table).values(
-                    pool_key='pool',
+                    pool_key=self._test_pool('pool'),
                     current_limit=4,
                     successes_since_resize=0,
                     updated_at=0))
@@ -2409,7 +2422,7 @@ class TestPaidCapacityAuthorityPG:
                         'hash',
                         1,
                         self._info('svc', 1),
-                        pool_key='pool',
+                        pool_key=self._test_pool('pool'),
                         priority=20,
                         base_limit=4,
                         max_limit=480,
@@ -2425,12 +2438,12 @@ class TestPaidCapacityAuthorityPG:
             blocker.execute(
                 sqlalchemy.select(serve_state.paid_capacity_pools_table).where(
                     serve_state.paid_capacity_pools_table.c.pool_key ==
-                    'pool').with_for_update())
+                    self._test_pool('pool')).with_for_update())
             failure_at = float(
                 blocker.execute(
                     sqlalchemy.update(serve_state.paid_capacity_pools_table).
                     where(serve_state.paid_capacity_pools_table.c.pool_key ==
-                          'pool').values(
+                          self._test_pool('pool')).values(
                               last_failure_at=sqlalchemy.extract(
                                   'epoch', sqlalchemy.func.clock_timestamp()),
                               updated_at=sqlalchemy.extract(
@@ -2467,7 +2480,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             1,
             failed,
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=4,
             max_limit=480,
@@ -2512,7 +2525,7 @@ class TestPaidCapacityAuthorityPG:
             blocker.execute(
                 sqlalchemy.select(serve_state.paid_capacity_pools_table).where(
                     serve_state.paid_capacity_pools_table.c.pool_key ==
-                    'pool').with_for_update())
+                    self._test_pool('pool')).with_for_update())
             thread = threading.Thread(target=_record_failure)
             thread.start()
             assert entered_pool_lock.wait(timeout=20)
@@ -2530,12 +2543,12 @@ class TestPaidCapacityAuthorityPG:
         assert results == [True]
 
         state = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=4,
             max_limit=480,
             now=None,
             success_ttl_seconds=600,
-            failure_cooldown_seconds=1)['pool']
+            failure_cooldown_seconds=1)[self._test_pool('pool')]
         assert state['last_failure_at'] >= release_floor
         assert state['admission_state'] == 'cooldown'
 
@@ -2554,7 +2567,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             1,
             info,
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=2,
             max_limit=8,
@@ -2580,11 +2593,11 @@ class TestPaidCapacityAuthorityPG:
             success_ttl_seconds=60,
             expected_controller_owner=(11, '10.0.0.1'))
         state = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=2,
             max_limit=8,
             now=101,
-            success_ttl_seconds=60)['pool']
+            success_ttl_seconds=60)[self._test_pool('pool')]
         assert state['active_claims'] == 0
         assert state['successes_since_resize'] == 1
 
@@ -2601,7 +2614,7 @@ class TestPaidCapacityAuthorityPG:
                 'hash',
                 replica_id,
                 info,
-                pool_key='pool',
+                pool_key=self._test_pool('pool'),
                 priority=20,
                 base_limit=2,
                 max_limit=8,
@@ -2632,7 +2645,7 @@ class TestPaidCapacityAuthorityPG:
             'hash',
             1,
             slow,
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=20,
             base_limit=2,
             max_limit=8,
@@ -2661,11 +2674,11 @@ class TestPaidCapacityAuthorityPG:
             expected_controller_owner=(11, '10.0.0.1'))
 
         state = serve_state.get_paid_capacity_pool_states(
-            ['pool'],
+            [self._test_pool('pool')],
             base_limit=2,
             max_limit=8,
             now=130,
-            success_ttl_seconds=60)['pool']
+            success_ttl_seconds=60)[self._test_pool('pool')]
         assert state['current_limit'] == 2
         assert state['successes_since_resize'] == 0
         assert state['last_success_at'] is None
@@ -2711,7 +2724,7 @@ class TestPaidCapacityAuthorityPG:
                 service_hash,
                 index + 1,
                 self._info(service_name, index + 1),
-                pool_key='shared-pool',
+                pool_key=self._test_pool('shared-pool'),
                 priority=20,
                 base_limit=3,
                 max_limit=12,
@@ -2824,7 +2837,14 @@ class TestPaidCapacityAuthorityPG:
         assert set(replicas) == {1, winner_id}
         assert set(claims) == {(1, pool_a), (winner_id, winner_pool)}
         assert waiters == []
-        assert set(pools) == {pool_a, winner_pool}
+        if service_limit is None:
+            # Frontier arbitration materializes the full sorted candidate
+            # pool union, including the losing candidate's durable pool row.
+            assert set(pools) == {pool_a, pool_b, pool_c}
+        else:
+            # The service cap can fail from the owner-locked census before
+            # any downstream pool row is needed.
+            assert set(pools) == {pool_a, winner_pool}
 
     def test_expanded_frontier_race_admits_only_one_third_pool(
             self, broker_engine, monkeypatch):
@@ -2905,7 +2925,7 @@ class TestPaidCapacityAuthorityPG:
             (2, pool_b),
             (winner_id, winner_pool),
         }
-        assert set(pools) == {pool_a, pool_b, winner_pool}
+        assert set(pools) == {pool_a, pool_b, pool_c, pool_d}
 
     def test_paid_claim_redrive_cannot_change_exact_pool(
             self, broker_engine, monkeypatch):
@@ -2917,12 +2937,14 @@ class TestPaidCapacityAuthorityPG:
         frontier_key = paid_capacity.frontier_key(location)
         info = self._info('svc', 1)
 
-        def _claim(pool_key: str, now: float) -> str:
+        def _claim(pool_key: str,
+                   now: float,
+                   candidate_info: replica_managers.ReplicaInfo = info) -> str:
             return serve_state.try_add_replica_with_paid_capacity_claim(
                 'svc',
                 'hash',
                 1,
-                info,
+                candidate_info,
                 pool_key=pool_key,
                 priority=20,
                 base_limit=4,
@@ -2937,8 +2959,10 @@ class TestPaidCapacityAuthorityPG:
 
         assert _claim(pool_a, 100) == 'acquired'
         assert _claim(pool_a, 200) == 'acquired'
+        redrive = self._info('svc', 1)
+        redrive.replica_record_id = info.replica_record_id
         with pytest.raises(ValueError, match='cannot move between exact'):
-            _claim(pool_b, 300)
+            _claim(pool_b, 300, redrive)
 
         with sqlalchemy.orm.Session(broker_engine) as session:
             claims = session.execute(
@@ -2979,7 +3003,7 @@ class TestPaidCapacityAuthorityPG:
                 'hash',
                 1,
                 info,
-                pool_key='pool',
+                pool_key=self._test_pool('pool'),
                 priority=priority,
                 base_limit=1,
                 max_limit=4,
@@ -3011,7 +3035,7 @@ class TestPaidCapacityAuthorityPG:
                         'svc',
                         serve_state.paid_capacity_claims_table.c.replica_id ==
                         1)).one()
-        assert claim == ('pool', 21, 100)
+        assert claim == (self._test_pool('pool'), 21, 100)
 
     def test_frontier_fill_withdraws_ineligible_priority_waiter(
             self, broker_engine, monkeypatch):
@@ -3125,17 +3149,15 @@ class TestPaidCapacityAuthorityPG:
                                   pool_key)).scalars().all()
         assert waiters == [l4_waiter]
 
-    def test_post_commit_waiter_cleanup_failure_keeps_claim_durable(
+    def test_waiter_cleanup_failure_rolls_back_paid_claim_atomically(
             self, broker_engine, monkeypatch):
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
         serve_state.Base.metadata.create_all(broker_engine)
         self._add_service('low', 'hash-low', 11)
         self._add_service('high', 'hash-high', 22)
-        self._add_service('peer', 'hash-peer', 33)
         location, pool_a = self._paid_pool('us-east-1a', 'g6.xlarge')
         _, pool_b = self._paid_pool('us-east-1b', 'g6.2xlarge')
         _, pool_c = self._paid_pool('us-east-1c', 'g6.4xlarge')
-        _, pool_d = self._paid_pool('us-east-1d', 'g6.8xlarge')
         frontier_key = paid_capacity.frontier_key(location)
 
         def _claim(service_name: str,
@@ -3175,26 +3197,17 @@ class TestPaidCapacityAuthorityPG:
                       101,
                       frontier=True) == 'acquired'
 
-        original_reconcile = (
-            serve_state._reconcile_ineligible_paid_capacity_waiters)
+        original_withdraw = (
+            serve_state._withdraw_ineligible_frontier_waiters_in_session)
 
         def _fail_cleanup(*_args, **_kwargs):
             raise RuntimeError('simulated cleanup crash')
 
         monkeypatch.setattr(serve_state,
-                            '_reconcile_ineligible_paid_capacity_waiters',
+                            '_withdraw_ineligible_frontier_waiters_in_session',
                             _fail_cleanup)
-        assert _claim('high',
-                      'hash-high',
-                      22,
-                      3,
-                      pool_c,
-                      50,
-                      102,
-                      frontier=True) == 'acquired'
-        monkeypatch.setattr(serve_state,
-                            '_reconcile_ineligible_paid_capacity_waiters',
-                            original_reconcile)
+        with pytest.raises(RuntimeError, match='simulated cleanup crash'):
+            _claim('high', 'hash-high', 22, 3, pool_c, 50, 102, frontier=True)
 
         with sqlalchemy.orm.Session(broker_engine) as session:
             high_claims = session.execute(
@@ -3208,37 +3221,38 @@ class TestPaidCapacityAuthorityPG:
                     serve_state.paid_capacity_waiters_table.c.pool_key).where(
                         serve_state.paid_capacity_waiters_table.c.service_name
                         == 'high')).scalars().all()
-        assert set(high_claims) == {(2, pool_b), (3, pool_c)}
+        assert high_claims == [(2, pool_b)]
         assert high_waiters == [pool_a]
 
-        low = serve_state.get_replica_info_from_id('low', 1)
-        assert low is not None
-        low.status_property.sky_launch_status = (
-            common_utils.ProcessStatus.SUCCEEDED)
-        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
-            'low',
-            'hash-low', [(1, low)], {1: paid_capacity.LaunchOutcome.SUCCESS},
-            base_limit=1,
-            max_limit=4,
-            now=110,
-            success_ttl_seconds=60,
-            expected_controller_owner=(11, '10.0.0.1'))
-        assert _claim('peer', 'hash-peer', 33, 1, pool_a, 20,
-                      120) == 'higher_priority_waiting'
-        assert _claim('peer', 'hash-peer', 33, 1, pool_a, 20, 131) == 'acquired'
+        monkeypatch.setattr(serve_state,
+                            '_withdraw_ineligible_frontier_waiters_in_session',
+                            original_withdraw)
         assert _claim('high',
                       'hash-high',
                       22,
-                      4,
-                      pool_d,
+                      3,
+                      pool_c,
                       50,
-                      132,
-                      frontier=True) == 'feedback_pending'
-        assert serve_state.get_replica_info_from_id('high', 4) is None
+                      102,
+                      frontier=True) == 'acquired'
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            high_claims = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_claims_table.c.replica_id,
+                    serve_state.paid_capacity_claims_table.c.pool_key).where(
+                        serve_state.paid_capacity_claims_table.c.service_name ==
+                        'high')).all()
+            high_waiters = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_waiters_table.c.pool_key).where(
+                        serve_state.paid_capacity_waiters_table.c.service_name
+                        == 'high')).scalars().all()
+        assert set(high_claims) == {(2, pool_b), (3, pool_c)}
+        assert high_waiters == []
 
     def test_frontier_waiter_cleanup_avoids_cross_pool_deadlock(
             self, broker_engine, monkeypatch):
-        """Filling crossed frontiers never deletes waiters under pool locks."""
+        """Canonical pool-union locking serializes crossed cleanup safely."""
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
         serve_state.Base.metadata.create_all(broker_engine)
         self._add_service('svc-a', 'hash-a', 11)
@@ -3296,29 +3310,18 @@ class TestPaidCapacityAuthorityPG:
                     ]))
             session.commit()
 
-        pool_lock_barrier = threading.Barrier(2)
-        cleanup_barrier = threading.Barrier(2)
+        start_barrier = threading.Barrier(2)
         cleanup_calls = []
-        original_pool_lock = serve_state._paid_capacity_pool_row_for_update
         original_withdraw = (
             serve_state._withdraw_ineligible_frontier_waiters_in_session)
 
-        def _lock_candidate_pool(session, pool_key):
-            row = original_pool_lock(session, pool_key)
-            if pool_key in (pool_a2, pool_b2):
-                pool_lock_barrier.wait(timeout=20)
-            return row
-
-        def _withdraw_after_commit(*args, **kwargs):
+        def _record_withdraw(*args, **kwargs):
             cleanup_calls.append(args[1])
-            cleanup_barrier.wait(timeout=20)
             return original_withdraw(*args, **kwargs)
 
-        monkeypatch.setattr(serve_state, '_paid_capacity_pool_row_for_update',
-                            _lock_candidate_pool)
         monkeypatch.setattr(serve_state,
                             '_withdraw_ineligible_frontier_waiters_in_session',
-                            _withdraw_after_commit)
+                            _record_withdraw)
         results = {}
         errors = []
         result_lock = threading.Lock()
@@ -3326,6 +3329,7 @@ class TestPaidCapacityAuthorityPG:
         def _run(service_name: str, service_hash: str, pid: int,
                  pool_key: str) -> None:
             try:
+                start_barrier.wait(timeout=20)
                 result = _claim(service_name, service_hash, pid, 2, pool_key)
                 with result_lock:
                     results[service_name] = result
@@ -3432,7 +3436,7 @@ class TestPaidCapacityAuthorityPG:
         assert serve_state.get_replica_info_from_id('svc', 4) is None
         assert waiters == []
 
-    def test_unknown_claims_withdraw_waiters_on_every_card_frontier(
+    def test_unattributable_legacy_claims_fail_closed_before_waiter_cleanup(
             self, broker_engine, monkeypatch):
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
         serve_state.Base.metadata.create_all(broker_engine)
@@ -3464,8 +3468,17 @@ class TestPaidCapacityAuthorityPG:
                 frontier_key=frontier_key,
                 frontier_limit=frontier_limit)
 
-        assert _claim(1, 'legacy-pool-a') == 'acquired'
-        assert _claim(2, 'legacy-pool-b') == 'acquired'
+        legacy_a = self._info('svc', 1)
+        legacy_b = self._info('svc', 2)
+        assert serve_state.add_or_update_replica('svc', 1, legacy_a)
+        assert serve_state.add_or_update_replica('svc', 2, legacy_b)
+        assert serve_state.adopt_paid_capacity_claims(
+            'svc',
+            'hash', [(1, 'legacy-pool-a', 20, legacy_a),
+                     (2, 'legacy-pool-b', 20, legacy_b)],
+            base_limit=4,
+            now=100,
+            expected_controller_owner=(11, '10.0.0.1'))
         with sqlalchemy.orm.Session(broker_engine) as session:
             serve_state._ensure_paid_capacity_pool_in_session(
                 session, broker_engine, pool_l4, 4, 100)
@@ -3496,7 +3509,7 @@ class TestPaidCapacityAuthorityPG:
         assert _claim(3,
                       pool_l4,
                       frontier_key=paid_capacity.frontier_key(location_l4),
-                      frontier_limit=2) == 'feedback_pending'
+                      frontier_limit=2) == 'service_saturated'
         with sqlalchemy.orm.Session(broker_engine) as session:
             waiters = session.execute(
                 sqlalchemy.select(serve_state.paid_capacity_waiters_table.c.
@@ -3508,7 +3521,7 @@ class TestPaidCapacityAuthorityPG:
                         'svc').order_by(serve_state.paid_capacity_claims_table.
                                         c.replica_id)).scalars().all()
 
-        assert waiters == []
+        assert set(waiters) == {pool_l4, pool_a100}
         assert claim_ids == [1, 2]
         assert serve_state.get_replica_info_from_id('svc', 3) is None
 
@@ -3518,7 +3531,7 @@ class TestPaidCapacityAuthorityPG:
         serve_state.Base.metadata.create_all(broker_engine)
         self._add_service('svc-a', 'hash-a', 11)
         self._add_service('svc-b', 'hash-b', 22)
-        pool_key = 'shared-pool'
+        pool_key = self._test_pool('shared-pool')
 
         snapshot = serve_state.get_paid_capacity_pool_states(
             [pool_key],
@@ -3565,7 +3578,7 @@ class TestPaidCapacityAuthorityPG:
                 service_hash,
                 replica_id,
                 infos[identity],
-                pool_key='shared-pool',
+                pool_key=self._test_pool('shared-pool'),
                 priority=priority,
                 base_limit=1,
                 max_limit=4,
@@ -3598,7 +3611,7 @@ class TestPaidCapacityAuthorityPG:
             'hash-new',
             1,
             self._info('new', 1),
-            pool_key='shared-pool',
+            pool_key=self._test_pool('shared-pool'),
             priority=20,
             base_limit=1,
             max_limit=4,
@@ -3618,7 +3631,7 @@ class TestPaidCapacityAuthorityPG:
         assert serve_state.add_or_update_replica('svc', 1, info)
         assert serve_state.adopt_paid_capacity_claims(
             'svc',
-            'hash', [(1, 'pool', 20, info)],
+            'hash', [(1, self._test_pool('pool'), 20, info)],
             base_limit=60,
             now=100,
             expected_controller_owner=(11, '10.0.0.1'))
@@ -3632,18 +3645,18 @@ class TestPaidCapacityAuthorityPG:
             claims = session.execute(
                 sqlalchemy.select(
                     serve_state.paid_capacity_claims_table)).fetchall()
-        assert row[0] == 'pool'
+        assert row[0] == self._test_pool('pool')
         assert len(claims) == 1
         assert claims[0].claimed_at == 0
         restored = serve_state.get_replica_info_from_id('svc', 1)
         assert restored is not None
-        assert restored.paid_capacity_pool_key == 'pool'
+        assert restored.paid_capacity_pool_key == self._test_pool('pool')
         assert serve_state.try_add_replica_with_paid_capacity_claim(
             'svc',
             'hash',
             2,
             self._info('svc', 2),
-            pool_key='pool',
+            pool_key=self._test_pool('pool'),
             priority=50,
             base_limit=60,
             max_limit=480,

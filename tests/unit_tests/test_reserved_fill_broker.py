@@ -3056,7 +3056,10 @@ class TestClaimLifecycle:
         engine = serve_state._db_manager.get_engine()
         with orm.Session(engine) as session:
             session.execute(serve_state.services_table.insert().values(
-                name='svc-a', hash='incarnation-a', lifecycle_epoch=1))
+                name='svc-a',
+                hash='incarnation-a',
+                lifecycle_epoch=1,
+                status=serve_state.ServiceStatus.SHUTTING_DOWN.value))
             session.commit()
         assert serve_state.remove_service_completely('svc-a', 'incarnation-a')
         live = {
@@ -3592,11 +3595,12 @@ class TestAtomicPersistFence:
         assert alloc is not None
         carried = alloc.epoch
         assert broker.current_epoch(_POOL) == carried  # pre-check passes
-        real_execute = orm.Session.execute
+        real_session_execute = orm.Session.execute
+        real_connection_execute = sqlalchemy.engine.Connection.execute
         raced = {'done': False}
         rounds_table = serve_state.reserved_fill_rounds_table
 
-        def racing_execute(session, statement, *args, **kwargs):
+        def _publish_racing_round(statement):
             fence_statement = ((isinstance(statement, sqlalchemy.Select) and
                                 'reserved_fill_rounds' in str(statement)) or
                                (isinstance(statement, dml.Insert) and
@@ -3605,15 +3609,25 @@ class TestAtomicPersistFence:
                 raced['done'] = True
                 engine = serve_state._db_manager.get_engine()
                 with orm.Session(engine) as other:
-                    real_execute(
+                    real_session_execute(
                         other,
                         sqlalchemy.update(rounds_table).where(
                             rounds_table.c.pool_key == _POOL).values(
                                 epoch=carried + 1))
                     other.commit()
-            return real_execute(session, statement, *args, **kwargs)
 
-        monkeypatch.setattr(orm.Session, 'execute', racing_execute)
+        def racing_session_execute(session, statement, *args, **kwargs):
+            _publish_racing_round(statement)
+            return real_session_execute(session, statement, *args, **kwargs)
+
+        def racing_connection_execute(connection, statement, *args, **kwargs):
+            _publish_racing_round(statement)
+            return real_connection_execute(connection, statement, *args,
+                                           **kwargs)
+
+        monkeypatch.setattr(orm.Session, 'execute', racing_session_execute)
+        monkeypatch.setattr(sqlalchemy.engine.Connection, 'execute',
+                            racing_connection_execute)
         assert not _add_replica_if_round_epoch(
             'svc-a', 1, self._STUB_INFO, pool_key=_POOL, expected_epoch=carried)
         assert raced['done']
