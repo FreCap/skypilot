@@ -2191,11 +2191,11 @@ class _LockedCapacityRows:
     live_intent_keys: frozenset[str]
     planned_capacity_by_intent_key: Mapping[str, int]
     capacity_unit_by_intent_key: Mapping[str, str]
-    # Complete same-name intent census across service hashes.  The economic
-    # projection consumes only ``intent_rows`` for the current incarnation,
-    # while recreate fencing must also see a late handler retained by an old
-    # incarnation.
-    all_service_intent_rows: tuple[Mapping[str, Any], ...] = ()
+    # Complete same-name nonterminal intent census across service hashes.  The
+    # economic projection consumes only ``intent_rows`` for the current
+    # incarnation, while recreate fencing must also see a late handler retained
+    # by an old incarnation.  DB-constrained terminal history is inert.
+    all_service_nonterminal_intent_rows: tuple[Mapping[str, Any], ...] = ()
 
 
 def _lock_capacity_rows(
@@ -2205,13 +2205,24 @@ def _lock_capacity_rows(
     service_hash: str,
     now: datetime.datetime,
 ) -> _LockedCapacityRows:
-    """Lock the complete capacity graph before sorted Kueue admission rows."""
-    all_service_intent_rows = connection.execute(
+    """Lock the live capacity graph before sorted Kueue admission rows."""
+    all_service_nonterminal_intent_rows = connection.execute(
         sqlalchemy.select(_ZERO_COST_INTENTS).where(
-            _ZERO_COST_INTENTS.c.service_name == service_name).order_by(
-                _ZERO_COST_INTENTS.c.intent_idempotency_key).with_for_update()
-    ).mappings().all()
-    intent_rows = tuple(row for row in all_service_intent_rows
+            _ZERO_COST_INTENTS.c.service_name == service_name,
+            _ZERO_COST_INTENTS.c.state.in_(
+                zero_cost_actuation_schema.NONTERMINAL_INTENT_STATES)).order_by(
+                    _ZERO_COST_INTENTS.c.intent_idempotency_key).
+        with_for_update()).mappings().all()
+    for row in all_service_nonterminal_intent_rows:
+        row_hash = row.get('service_hash')
+        if not isinstance(row_hash, str) or not row_hash:
+            raise CapacityAdmissionConflict(
+                'Capacity plan retains an unattributed nonterminal intent.')
+        if row_hash != service_hash:
+            raise CapacityAdmissionConflict(
+                'Capacity plan retains a nonterminal intent from a prior '
+                'lifecycle.')
+    intent_rows = tuple(row for row in all_service_nonterminal_intent_rows
                         if row['service_hash'] == service_hash)
     replica_state_sha256 = replica_state_semantic_sha256_expression(
         _REPLICAS.c.replica_state).label('_replica_state_sha256')
@@ -2278,7 +2289,8 @@ def _lock_capacity_rows(
         live_intent_keys=frozenset(live_intent_keys),
         planned_capacity_by_intent_key=planned_capacity_by_intent_key,
         capacity_unit_by_intent_key=capacity_unit_by_intent_key,
-        all_service_intent_rows=tuple(all_service_intent_rows))
+        all_service_nonterminal_intent_rows=tuple(
+            all_service_nonterminal_intent_rows))
 
 
 def _locked_planning_state_fingerprint(service: Mapping[str, Any],
@@ -2359,8 +2371,8 @@ def _require_recreated_logical_version_is_clean(
     mixed-version migration.  A same-version controller restart must retain
     its rows, but a new version cannot plan while an older provider-possible
     replica, nonterminal zero-cost intent, or unresolved Kueue admission still
-    exists.  This check runs after the complete graph is locked and before the
-    planner callback or any capacity-plan write.
+    exists.  This check runs after the complete live/provider-possible graph is
+    locked and before the planner callback or any capacity-plan write.
     """
     if (service.get('demand_source_mode') != DemandSourceMode.DURABLE_FEED.value
             or config.capacity_unit
@@ -2394,7 +2406,7 @@ def _require_recreated_logical_version_is_clean(
         raise CapacityAdmissionConflict(
             'Recreated logical service has no exact lifecycle identity.')
 
-    for row in locked.all_service_intent_rows:
+    for row in locked.all_service_nonterminal_intent_rows:
         row_hash = row.get('service_hash')
         row_lifecycle_epoch = row.get('service_lifecycle_epoch')
         version = row.get('service_version')
@@ -2407,20 +2419,17 @@ def _require_recreated_logical_version_is_clean(
         same_incarnation = (row_hash == current_hash and
                             row_lifecycle_epoch == current_lifecycle_epoch)
         if not same_incarnation:
-            if row.get('state') != 'TERMINAL':
-                raise CapacityAdmissionConflict(
-                    'Recreated logical service retains a nonterminal intent '
-                    'from a prior lifecycle.')
-            continue
+            raise CapacityAdmissionConflict(
+                'Recreated logical service retains a nonterminal intent '
+                'from a prior lifecycle.')
         if version == current_version:
             continue
         if version > current_version:
             raise CapacityAdmissionConflict(
                 'Recreated logical service has a future-version intent.')
-        if row.get('state') != 'TERMINAL':
-            raise CapacityAdmissionConflict(
-                'Recreated logical service retains a nonterminal intent '
-                'from a prior version.')
+        raise CapacityAdmissionConflict(
+            'Recreated logical service retains a nonterminal intent from a '
+            'prior version.')
 
     for row in lane_projection.rows:
         version = getattr(row, 'service_version', None)
@@ -2445,11 +2454,15 @@ def _project_capacity_inventory(
     locked: _LockedCapacityRows,
     *,
     service_version: int,
+    capacity_unit: reserved_fill_planner.FillCapacityUnit,
     accounting_cards: set[str],
     now: datetime.datetime,
     lane_projection: kueue_lane_capacity.KueueAdmissionCapacityProjection,
 ) -> tuple[dict[str, int], dict[str, int], dict[str, int], int]:
     """Project demand supply from one locked replica/admission snapshot."""
+    if not isinstance(capacity_unit, reserved_fill_planner.FillCapacityUnit):
+        raise CapacityAdmissionConflict(
+            'Capacity inventory has no exact accounting unit.')
     if not accounting_cards:
         raise CapacityAdmissionConflict(
             'Capacity plan has no accounting class.')
@@ -2565,6 +2578,7 @@ def _project_capacity_inventory(
             paid[card] += planned_capacity
 
     pending_zero_cost = {card: 0 for card in accounting_cards}
+    accounted_intent_keys = set(counted_zero_cost_intents)
     for row in locked.intent_rows:
         intent_key = row['intent_idempotency_key']
         lane_assigned = lane_projection.assigned_gpu_for_intent(intent_key)
@@ -2593,6 +2607,48 @@ def _project_capacity_inventory(
             raise CapacityAdmissionConflict(
                 'Pending zero-cost intent accounting is malformed.')
         pending_zero_cost[card] += planned_capacity
+        accounted_intent_keys.add(intent_key)
+
+    # An intent absent from the current live lock (normally TERMINAL) has no
+    # usable intent authority. Its retained Kueue row is nevertheless unresolved
+    # scheduler authority. That row immutably copied the exact capacity shape at
+    # grant time, so use it only as a conservative debit when the lane projection
+    # has already classified the missing intent as UNKNOWN. It never becomes
+    # demand supply or admission authority, and no Kueue -> intent lock inversion
+    # is needed.
+    for lane_row in lane_projection.rows:
+        intent_key = lane_row.intent_idempotency_key
+        if (intent_key in accounted_intent_keys or
+                intent_key not in lane_projection.unknown_intent_keys or
+                intent_key not in lane_projection.assigned_gpu_intent_keys):
+            continue
+        raw_accelerator = lane_row.accelerator
+        planned_capacity = lane_row.planned_capacity
+        accelerator_count = lane_row.accelerator_count
+        row_capacity_unit = lane_row.capacity_unit
+        if (not isinstance(raw_accelerator, str) or not raw_accelerator or
+                row_capacity_unit not in ('physical', 'logical') or
+                type(accelerator_count) is not int or accelerator_count < 1 or
+                type(planned_capacity) is not int or planned_capacity < 1):
+            raise CapacityAdmissionConflict(
+                'Retained Kueue capacity debit is malformed.')
+        expected_capacity = (1 if row_capacity_unit == 'physical' else
+                             accelerator_count)
+        if (row_capacity_unit != capacity_unit.value or
+                planned_capacity != expected_capacity):
+            raise CapacityAdmissionConflict(
+                'Retained Kueue capacity debit is malformed.')
+        accelerator = raw_accelerator.casefold()
+        card = AGGREGATE_ACCELERATOR if aggregate else accelerator
+        if card not in pending_zero_cost:
+            if not lane_projection.unbounded_unknown:
+                # A bounded exact-shape UNKNOWN cannot suppress unrelated paid
+                # demand.
+                continue
+            raise CapacityAdmissionConflict(
+                'Retained Kueue capacity debit is outside the accounting set.')
+        pending_zero_cost[card] += planned_capacity
+        accounted_intent_keys.add(intent_key)
     return zero_cost, paid, pending_zero_cost, charged_paid_gpu_units
 
 
@@ -3932,7 +3988,7 @@ def _resolve_locked_policy_history(
     # authority graph can never be relabelled as a clean recreation.
     clean = bool(history.head is None and history.maximum_generation is None and
                  not locked_capacity.replica_rows and
-                 not locked_capacity.all_service_intent_rows and
+                 not locked_capacity.all_service_nonterminal_intent_rows and
                  not lane_projection.rows and raw_claim_count == 0 and
                  raw_waiter_count == 0 and dependent_effect_count == 0)
     if not clean:
@@ -4645,6 +4701,7 @@ class CapacityAdmissionRepository:
             full_zero_cost, full_paid, pending, charged_paid = (
                 _project_capacity_inventory(locked,
                                             service_version=service_version,
+                                            capacity_unit=config.capacity_unit,
                                             accounting_cards=cards,
                                             now=now,
                                             lane_projection=lane_projection))
@@ -5027,11 +5084,13 @@ class CapacityAdmissionRepository:
                                                         locked_capacity,
                                                         lane_projection)
             full_zero_cost, full_paid, pending_zero_cost, charged_paid = (
-                _project_capacity_inventory(locked_capacity,
-                                            service_version=service_version,
-                                            accounting_cards=card_set,
-                                            now=now,
-                                            lane_projection=lane_projection))
+                _project_capacity_inventory(
+                    locked_capacity,
+                    service_version=service_version,
+                    capacity_unit=(fill_config.capacity_unit),
+                    accounting_cards=card_set,
+                    now=now,
+                    lane_projection=lane_projection))
             allocation_reserved = _project_allocation_reserved_capacity(
                 validated_allocation,
                 locked_capacity,
@@ -6092,6 +6151,7 @@ def validate_paid_claim_in_connection(
         _project_capacity_inventory(locked_capacity,
                                     service_version=int(
                                         service['current_version']),
+                                    capacity_unit=fill_config.capacity_unit,
                                     accounting_cards=accounting_cards,
                                     now=now,
                                     lane_projection=lane_projection))

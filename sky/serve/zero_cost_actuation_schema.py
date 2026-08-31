@@ -5,6 +5,8 @@ from sqlalchemy.dialects import postgresql
 
 metadata = sqlalchemy.MetaData()
 
+NONTERMINAL_INTENT_STATES = ('GRANTED', 'ACTUATING', 'COMMITTED', 'RETRYABLE')
+
 serve_zero_cost_actuation_intents_table = sqlalchemy.Table(
     'serve_zero_cost_actuation_intents',
     metadata,

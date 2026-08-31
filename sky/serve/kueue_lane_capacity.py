@@ -473,9 +473,10 @@ def lock_capacity_projection_in_connection(
 
     # Callers additionally name retained replica ownership, but liveness of
     # an unmaterialized intent is PostgreSQL state, not a process-local
-    # replica snapshot.  Derive it while the complete intent set is locked so
-    # a missing admission cannot disappear from autoscaler retirement merely
-    # because no ReplicaInfo exists yet.
+    # replica snapshot.  Derive it while the complete nonterminal intent set is
+    # locked so a missing admission cannot disappear from autoscaler retirement
+    # merely because no ReplicaInfo exists yet. A terminal intent is inert, but
+    # any retained admission that named it remains conservative UNKNOWN below.
     effective_live_intent_keys = set(live_intent_keys)
     for intent_key, intent in intents.items():
         state = intent.get('state')
@@ -731,9 +732,9 @@ def snapshot_replica_capacity_classes(
         engine = repository.engine
         with engine.begin() as connection:
             # This read-only snapshot shares the same prefix as Kueue
-            # materialization observers.  Taking it before the all-intent
-            # scan removes the historical intent -> service inversion while
-            # still fencing protocol, lifecycle, and service writers.
+            # materialization observers. Taking it before the nonterminal
+            # intent scan removes the historical intent -> service inversion
+            # while still fencing protocol, lifecycle, and service writers.
             serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
                 connection)
             lifecycle = connection.execute(
@@ -754,9 +755,11 @@ def snapshot_replica_capacity_classes(
             intent_rows = connection.execute(
                 sqlalchemy.select(_INTENTS).where(
                     _INTENTS.c.service_name == service_name,
-                    _INTENTS.c.service_hash == service['hash']).order_by(
-                        _INTENTS.c.intent_idempotency_key).with_for_update()
-            ).mappings().all()
+                    _INTENTS.c.service_hash == service['hash'],
+                    _INTENTS.c.state.in_(
+                        zero_cost_actuation_schema.NONTERMINAL_INTENT_STATES)).
+                order_by(_INTENTS.c.intent_idempotency_key).with_for_update(
+                )).mappings().all()
             planned_by_intent: dict[str, int] = {}
             capacity_unit_by_intent: dict[str, str] = {}
             for row in intent_rows:

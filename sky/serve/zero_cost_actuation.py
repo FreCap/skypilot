@@ -996,10 +996,11 @@ def terminalize_unmaterialized_service_intents_in_connection(
                 _INTENTS.c.service_lifecycle_epoch ==
                 service_lifecycle_epoch).order_by(
                     _INTENTS.c.intent_idempotency_key).with_for_update()).all()
-    # Lock the complete exact-lifecycle intent set before filtering.  Teardown
-    # subsequently locks replica/association/admission graph rows; taking only
-    # a pending subset here would invert with a reconciler that locks all
-    # intents in key order before following those graph edges.
+    # Lock the complete exact-lifecycle intent set before filtering. Teardown
+    # subsequently locks replica/association/admission graph rows; its
+    # nonterminal overlap with reconciliation must retain the same key order.
+    # Teardown may additionally lock terminal rows for suffix cleanup without
+    # making terminal audit history part of the reconciler's live census.
     keys = tuple(
         str(row.intent_idempotency_key)
         for row in rows

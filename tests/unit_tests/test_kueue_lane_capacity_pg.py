@@ -19,6 +19,7 @@ from test_kueue_lane_lineage_pg import _install_historical_v5_worker_projections
 from test_kueue_lane_lineage_pg import _install_retirable_materialized_graph
 from test_kueue_lane_lineage_pg import _materialize
 from test_kueue_lane_lineage_pg import _receipt
+from test_kueue_lane_lineage_pg import _reserved_location_state
 from test_kueue_lane_lineage_pg import admission_database  # noqa: F401
 from test_kueue_lane_lineage_pg import postgres_engine  # noqa: F401
 from test_serve_resource_actions_pg import empty_postgres  # noqa: F401
@@ -30,6 +31,7 @@ from sky.serve import kueue_lane_lineage
 from sky.serve import kueue_lane_lineage_schema
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker
+from sky.serve import reserved_fill_planner
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import spot_placer
@@ -179,8 +181,10 @@ def _locked_projection(
     connection: sqlalchemy.engine.Connection,
     *,
     accounting_cards: set[str] | None = None,
+    capacity_unit: reserved_fill_planner.
+    FillCapacityUnit = reserved_fill_planner.FillCapacityUnit.PHYSICAL,
 ) -> tuple[kueue_lane_capacity.KueueAdmissionCapacityProjection, tuple[dict[
-        str, int], dict[str, int], dict[str, int]]]:
+        str, int], dict[str, int], dict[str, int], int]]:
     cards = {'h200'} if accounting_cards is None else accounting_cards
     now = connection.execute(
         sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
@@ -199,6 +203,7 @@ def _locked_projection(
     inventory = capacity_admission._project_capacity_inventory(
         locked,
         service_version=_SERVICE_VERSION,
+        capacity_unit=capacity_unit,
         accounting_cards=cards,
         now=now,
         lane_projection=projection)
@@ -249,7 +254,7 @@ def test_fresh_waiting_is_neither_demand_supply_nor_assigned_capacity(
     assert projection.demand_supply_for_intent(key) is False
     assert projection.assigned_gpu_for_intent(key) is False
     assert projection.fresh_waiting_replica_record_ids == {(1, record_id)}
-    assert inventory == ({'h200': 0}, {'h200': 0}, {'h200': 0})
+    assert inventory == ({'h200': 0}, {'h200': 0}, {'h200': 0}, 0)
 
 
 def test_policy_admitted_is_supply_and_assigned_before_replica_ready(
@@ -266,7 +271,7 @@ def test_policy_admitted_is_supply_and_assigned_before_replica_ready(
     assert projection.demand_supply_for_intent(key) is True
     assert projection.assigned_gpu_for_intent(key) is True
     assert projection.admitted_replica_record_ids == {(1, record_id)}
-    assert inventory == ({'h200': 1}, {'h200': 0}, {'h200': 0})
+    assert inventory == ({'h200': 1}, {'h200': 0}, {'h200': 0}, 0)
 
 
 def test_missing_kueue_admission_is_exact_shape_unknown(
@@ -287,7 +292,7 @@ def test_missing_kueue_admission_is_exact_shape_unknown(
     assert projection.unknown_intent_keys == {key}
     assert projection.unknown_shapes == {('h200', 1)}
     assert not projection.unbounded_unknown
-    assert inventory == ({'h200': 1}, {'h200': 0}, {'h200': 0})
+    assert inventory == ({'h200': 1}, {'h200': 0}, {'h200': 0}, 0)
 
 
 def test_historical_v5_live_intent_is_exact_shape_unknown(
@@ -308,7 +313,7 @@ def test_historical_v5_live_intent_is_exact_shape_unknown(
     assert projection.unknown_intent_keys == {key}
     assert projection.unknown_shapes == {('h200', 1)}
     assert not projection.unbounded_unknown
-    assert inventory == ({'h200': 0}, {'h200': 0}, {'h200': 1})
+    assert inventory == ({'h200': 0}, {'h200': 0}, {'h200': 1}, 0)
 
 
 @pytest.mark.parametrize(('field', 'value'), _COPIED_ADMISSION_MUTATIONS)
@@ -338,7 +343,7 @@ def test_each_copied_admission_identity_mismatch_is_exact_shape_unknown(
     assert key in projection.unknown_intent_keys
     assert projection.unknown_shapes == {('h200', 1)}
     assert not projection.unbounded_unknown
-    assert inventory == ({'h200': 1}, {'h200': 0}, {'h200': 0})
+    assert inventory == ({'h200': 1}, {'h200': 0}, {'h200': 0}, 0)
 
 
 def test_proven_east_intent_without_admission_retains_legacy_accounting(
@@ -382,7 +387,7 @@ def test_proven_east_intent_without_admission_retains_legacy_accounting(
     assert projection.demand_supply_for_intent(key) is None
     assert projection.assigned_gpu_for_intent(key) is None
     assert not projection.has_unknown
-    assert inventory == ({'h200': 0}, {'h200': 0}, {'h200': 1})
+    assert inventory == ({'h200': 0}, {'h200': 0}, {'h200': 1}, 0)
 
 
 def test_missing_admission_real_projection_blocks_autoscaler_retirement(
@@ -530,10 +535,20 @@ def test_real_east_no_admission_keeps_ordinary_autoscaler_retirement(
 def test_terminal_never_materialized_admission_is_conservative_debit(
         admission_database) -> None:
     key = '3' * 64
-    _insert_intent(admission_database, key)
+    accelerator_count = 8
+    identity = _identity(accelerator_count=accelerator_count)
+    _insert_intent(admission_database,
+                   key,
+                   accelerator_count=accelerator_count,
+                   allowed_locations=[{
+                       **_reserved_location_state(),
+                       'accelerators': {
+                           'h200': accelerator_count,
+                       },
+                   }])
     repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
     with admission_database.begin() as connection:
-        repository.insert_intent_pending_in_connection(connection, _identity(),
+        repository.insert_intent_pending_in_connection(connection, identity,
                                                        key)
         now = connection.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
@@ -552,9 +567,18 @@ def test_terminal_never_materialized_admission_is_conservative_debit(
 
     assert projection.demand_supply_for_intent(key) is False
     assert projection.assigned_gpu_for_intent(key) is True
-    assert projection.unknown_shapes == {('h200', 1)}
+    assert projection.unknown_shapes == {('h200', accelerator_count)}
     assert not projection.unbounded_unknown
-    assert inventory == ({'h200': 0}, {'h200': 0}, {'h200': 1})
+    assert inventory == ({'h200': 0}, {'h200': 0}, {'h200': 1}, 0)
+
+    # A retained physical one-machine debit must never under-debit a current
+    # logical service whose same machine represents eight GPU slots.
+    with admission_database.begin() as connection:
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='capacity debit is malformed'):
+            _locked_projection(
+                connection,
+                capacity_unit=reserved_fill_planner.FillCapacityUnit.LOGICAL)
 
 
 def test_bounded_unknown_shape_does_not_block_unrelated_paid_card(
@@ -570,7 +594,7 @@ def test_bounded_unknown_shape_does_not_block_unrelated_paid_card(
 
     assert projection.unknown_shapes == {('h200', 1)}
     assert not projection.unbounded_unknown
-    assert inventory == ({'l4': 0}, {'l4': 0}, {'l4': 0})
+    assert inventory == ({'l4': 0}, {'l4': 0}, {'l4': 0}, 0)
 
 
 def test_surge_lease_survives_shutting_down_until_provider_cleanup(
@@ -592,4 +616,4 @@ def test_surge_lease_survives_shutting_down_until_provider_cleanup(
     assert projection.replacement_surge_shapes == {('h200', 1)}
     assert projection.replacement_surge_replica_record_ids == {(1, record_id)}
     assert projection.assigned_gpu_for_intent(key) is True
-    assert inventory == ({'h200': 0}, {'h200': 0}, {'h200': 1})
+    assert inventory == ({'h200': 0}, {'h200': 0}, {'h200': 1}, 0)

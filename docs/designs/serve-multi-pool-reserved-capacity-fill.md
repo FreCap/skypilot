@@ -1380,7 +1380,7 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` is PR #1806 merge `b1517869e47a9ebc36fc070440eb30f09928093d`. It includes PR #1805's empty-secret preflight and PR #1806's linear, card-scoped saturated-demand reconciliation. Both are deployed in release `1.1.1575`. The successor source candidate is the `fix/serve-atomic-adaptive-admission` stack through retained-history bound `c56340fac`, plus the current format-6 trust-anchor correction recorded by this design. It is neither merged nor deployed. The prior broad adaptive-state design was rejected by the KISS review and replaced by the smaller fixed-wave, in-place plan/admit fusion. |
+| Source base | `origin/improvements` is PR #1806 merge `b1517869e47a9ebc36fc070440eb30f09928093d`. It includes PR #1805's empty-secret preflight and PR #1806's linear, card-scoped saturated-demand reconciliation. Both are deployed in release `1.1.1575`. The successor source candidate is the `fix/serve-atomic-adaptive-admission` stack through the format-6 trust anchor `03f406866`, plus the terminal-history correction recorded by this design. It is neither merged nor deployed. The prior broad adaptive-state design was rejected by the KISS review and replaced by the smaller fixed-wave, in-place plan/admit fusion. |
 | Immutable planner correction | **The fused source path is implemented; adversarial and real-PostgreSQL qualification are in progress.** One keyword-only frozen snapshot feeds one pure durable logical planner invocation. Its typed candidate separately records cold demand attribution, supply-aware actuation, warm/transition retention, reservation commitments and whole-backend padding, genuine paid residual and cap-bounded cold-launch authority, completeness/infeasibility, source generation, and snapshot/candidate fingerprints. The same transaction now locks the elected version, exact server-owned service YAML, semantic controller configuration, catalog ordering, controller incarnation/owner epoch, demand, route, allocation, capacity/Kueue, prior plan, pools and dependent effects; invokes the planner once; and commits plan/head/policy plus only the accepted replica/claim/request wave. Provider launch materialization consumes the exact committed spec/config/catalog evidence. Only a disposable process cache updates postcommit. PR #1786 already carries exact per-node width times task-authoritative node count for physical backends. |
 | Deployed control plane | Helm revision 691 runs SkyPilot `1.1.1575` homogeneously across two API, two controller, and three executor replicas on image `sha256:2ee45d2e5350c0c041ac4d32e0a338616024cbb5564b7d2871833a8266a08676`. The image contains source `b1517869e47a9ebc36fc070440eb30f09928093d`. PostgreSQL remains the sole central store; Helm storage is disabled; no SkyPilot PVC or EFS is present. |
 | Fixed paid pacing | **Implemented in the source candidate; PostgreSQL qualification and deployment remain.** Lifecycle 148 kept the durable target at the legacy ten-slot/60-second wave because the separate adaptive reducer was unreachable. Durable logical services now delete that mode and use one restart-safe configured fixed wave; the fleet uses 100 percent/minimum 50 per 60 seconds. PostgreSQL owns only the accepted paid-window cursor across takeover. |
@@ -2072,20 +2072,24 @@ genesis performed the census, and every supported successor writer validated
 its predecessor under the same service/head locks before replacing it. The
 current receipt is trusted only after the strict service/hash/lifecycle/version/
 envelope decoder succeeds. Format 5 is not such a receipt: intermediate local
-images emitted it before exhaustive genesis was required. A format-5,
-malformed, or missing head therefore always selects the exhaustive authority
-scope and can never unlock the bounded query. There is no format-5 decoder or
-in-place promotion. An otherwise clean format-5 head subsequently fails the
-strict format-6 policy decode and requires the authorized exact-zero
-test-service recreation; the activation gate deletes the old service-scoped
-head/history only after both PostgreSQL and provider authority are proven zero,
-then lets headless format-6 genesis perform its census. Supported association
-creation, owner transfer, effect transition, cancellation, terminal reduction,
+images emitted it before exhaustive genesis was required. A format-5, missing,
+or non-decodable-schema head therefore selects the exhaustive authority scope
+and can never unlock the bounded query. A payload that advertises format 6 but
+fails its content digest, service identity, or strict envelope decode instead
+fails closed immediately before either association scope; scanning audit
+history adds no safety to an already-invalid claimed receipt. There is no
+format-5 decoder or in-place promotion. An otherwise clean format-5 head
+subsequently fails the strict format-6 policy decode and requires the authorized
+exact-zero test-service recreation; the activation gate deletes the old
+service-scoped head/history only after both PostgreSQL and provider authority
+are proven zero, then lets headless format-6 genesis perform its census.
+Supported association creation, owner transfer, effect transition, cancellation,
+terminal reduction,
 reconciliation and projection writers serialize on that service lock; the
 request root is created in the same transaction before that lock is released.
-Later request execution
-updates may lock only the request suffix, but can only reduce an active root to
-terminal/quiesced state: the supported request repository rejects terminal
+Later request execution updates may lock only the request suffix, but can only
+reduce an active root to terminal/quiesced state: the supported request
+repository rejects terminal
 reopening, while association resolution, terminal evidence and identity are
 database-guarded as monotonic/immutable. Settled detached rows therefore cannot
 reacquire effect authority. A steady-state reconciliation therefore
@@ -2098,10 +2102,26 @@ bound as PostgreSQL's native UUID type. Any old-hash row in that
 live/attached/collision scope remains a fail-closed conflict. Settled detached
 60-day tombstones and their closed request roots do not enter the steady
 transaction, so the association/request portion of admission latency and lock
-volume is independent of retained association campaign history. Replica and
-zero-cost-intent census scalability remains a separate bound; this receipt does
-not make claims about those tables. No new table or index is required for the
-association bound.
+volume is independent of retained association campaign history.
+
+The zero-cost-intent census likewise locks only ``GRANTED``, ``ACTUATING``,
+``COMMITTED`` and ``RETRYABLE`` rows through the existing
+``ix_serve052_zero_cost_intent_service(service_name, state)`` index in both
+atomic admission and the read-only autoscaler snapshot. The
+database-constrained ``TERMINAL`` shape has no lease, replica ID, replica-record
+ID or commit pointer, and supported writers never reactivate it. Pointerless
+terminal rows are therefore inert for both headless genesis and cross-version/
+cross-incarnation fencing. A retained Kueue row that still names an intent
+absent from the live lock remains visible in the separately locked Kueue census
+as ``UNKNOWN``. Its immutable admission copy may provide only a conservative
+capacity debit after its unit exactly matches the current service
+``FillCapacityUnit``; it grants neither scheduler ownership nor demand supply,
+and a unit mismatch fails closed. Every nonterminal old-hash intent remains a
+fail-closed conflict. Retained terminal campaign history therefore does not
+enter either steady transaction. The replica census intentionally remains
+complete and unbounded in this stack: a provider-possible replica is live
+authority until exact cleanup evidence proves otherwise, not inert audit
+history. No new table or index is required for either history bound.
 
 The repository returns one explicit transaction disposition:
 

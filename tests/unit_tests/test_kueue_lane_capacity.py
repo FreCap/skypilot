@@ -9,6 +9,7 @@ import pytest
 from sky.serve import capacity_admission
 from sky.serve import kueue_lane_capacity
 from sky.serve import kueue_lane_lineage
+from sky.serve import reserved_fill_planner
 
 _NOW = datetime.datetime(2026, 8, 22, tzinfo=datetime.timezone.utc)
 _SERVICE_HASH = 'service-hash'
@@ -206,6 +207,8 @@ def test_proven_ordinary_scheduler_replica_is_economic_supply_across_n_minus_one
         replica_rows=({
             'status': 'READY',
             'version': replica_version,
+            'sky_down_status': None,
+            'paid_capacity_pool_key': None,
             'replica_state_version': 1,
             'replica_state': state,
             'reserved_fill_intent_idempotency_key': 'intent-1',
@@ -220,6 +223,7 @@ def test_proven_ordinary_scheduler_replica_is_economic_supply_across_n_minus_one
     inventory = capacity_admission._project_capacity_inventory(
         locked,
         service_version=3,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL,
         accounting_cards={'h200'},
         now=_NOW,
         lane_projection=projection)

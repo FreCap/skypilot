@@ -12,6 +12,7 @@ from test_serve_capacity_admission_pg import _current_decision
 from test_serve_capacity_admission_pg import _current_owner_kwargs
 from test_serve_capacity_admission_pg import _demand_report
 from test_serve_capacity_admission_pg import _enable_durable_intent
+from test_serve_capacity_admission_pg import _kueue_intent_values
 from test_serve_capacity_admission_pg import _paid_launch_spec
 from test_serve_capacity_admission_pg import _publish_successor_route
 from test_serve_capacity_admission_pg import _replica_values
@@ -21,9 +22,12 @@ from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
 from sky.serve import capacity_admission
 from sky.serve import capacity_admission_schema
+from sky.serve import capacity_planning
 from sky.serve import demand_state
+from sky.serve import kueue_lane_capacity
 from sky.serve import ordinary_launch_binding
 from sky.serve import serve_state_schema
+from sky.serve import zero_cost_actuation_schema
 
 pytestmark = pytest.mark.xdist_group(
     name='serve_capacity_admission_schema_052_pg')
@@ -124,10 +128,49 @@ def _insert_old_history(
     return values
 
 
+def _intent_values(intent_key: str,
+                   *,
+                   state: str,
+                   ordinal: int,
+                   service_hash: str = 'retained-old-hash') -> dict:
+    values = _kueue_intent_values(intent_key)
+    created_at = values['created_at']
+    values.update(
+        service_name='svc',
+        service_hash=service_hash,
+        service_lifecycle_epoch=(3 if service_hash == 'svc-hash' else 2),
+        service_version=1,
+        ordinal=ordinal,
+        state=state,
+        updated_at=created_at,
+        last_error=('retained_terminal_history'
+                    if state == 'TERMINAL' else None),
+        terminal_at=(created_at if state == 'TERMINAL' else None))
+    return values
+
+
+def _insert_terminal_intent_history(engine: sqlalchemy.engine.Engine,
+                                    count: int) -> None:
+    intents = (
+        zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
+    values = [
+        _intent_values(f'{ordinal + 1:064x}', state='TERMINAL', ordinal=ordinal)
+        for ordinal in range(count)
+    ]
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        for offset in range(0, count, 500):
+            connection.execute(sqlalchemy.insert(intents),
+                               values[offset:offset + 500])
+
+
 def _reconcile(engine: sqlalchemy.engine.Engine,
                target: int = 0,
                *,
-               prepared_specs=()):
+               prepared_specs=(),
+               capacity_unit: capacity_planning.
+               CapacityUnit = capacity_planning.CapacityUnit.LOGICAL_GPU):
     return capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
             **_current_owner_kwargs(engine),
@@ -139,7 +182,7 @@ def _reconcile(engine: sqlalchemy.engine.Engine,
             backend_num_nodes=1,
             sequenced_reserved_fill=False,
             planner=lambda snapshot, supply: _current_decision(
-                snapshot, supply, target),
+                snapshot, supply, target, capacity_unit=capacity_unit),
             prepared_paid_launch_specs=prepared_specs)
 
 
@@ -201,9 +244,40 @@ def _reset_capacity_history(engine: sqlalchemy.engine.Engine) -> None:
             sqlalchemy.delete(plans).where(plans.c.service_name == 'svc'))
 
 
+def test_physical_service_rejects_nonterminal_old_lifecycle_intent(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           replica_unit='physical_backend')
+    _refresh_authority(engine, incarnation, 2)
+    _reconcile(engine,
+               capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND)
+
+    intents = (
+        zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        connection.execute(
+            sqlalchemy.insert(intents).values(**_intent_values(
+                'f' * 64, state='GRANTED', ordinal=_HISTORY_SIZE)))
+    _refresh_authority(engine, incarnation, 3)
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='nonterminal intent from a prior lifecycle'):
+        _reconcile(
+            engine,
+            capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND)
+
+
 def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
     engine, incarnation, _ = capacity_database
-    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           replica_unit='logical')
 
     # Format 5 predates the exhaustive genesis census and can never serve as a
     # bounded-history receipt.  Even an otherwise authenticated clean head is
@@ -253,6 +327,7 @@ def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
     _reset_capacity_history(engine)
 
     _insert_old_history(engine, _HISTORY_SIZE)
+    _insert_terminal_intent_history(engine, _HISTORY_SIZE)
 
     # Headless format-6 genesis is the one exhaustive history census.
     _refresh_authority(engine, incarnation, 5)
@@ -260,12 +335,16 @@ def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
     _refresh_authority(engine, incarnation, 6)
 
     observed = []
+    observed_intents = []
 
     def _capture(_connection, cursor, statement, parameters, _context,
                  _executemany):
         if ('bounded_association_authority_scope' in statement and
                 'FOR UPDATE' in statement):
             observed.append((statement, parameters, cursor.rowcount))
+        if ('FROM serve_zero_cost_actuation_intents' in statement and
+                'state IN' in statement and 'FOR UPDATE' in statement):
+            observed_intents.append((statement, parameters, cursor.rowcount))
 
     sqlalchemy.event.listen(engine, 'after_cursor_execute', _capture)
     try:
@@ -284,7 +363,12 @@ def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
                 ordinary_launch_binding.ordinary_launch_associations_table)
         ).scalar_one()
+        retained_terminal_intents = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table)).scalar_one()
     assert retained == _HISTORY_SIZE
+    assert retained_terminal_intents == _HISTORY_SIZE
     assert len(observed) == 2
     statement, parameters, locked_count = observed[0]
     assert 'resolution IN' in statement
@@ -307,6 +391,83 @@ def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
     assert candidate_locked_count == 0
     assert uuid.UUID(numeric_reuse.replica_record_id) in set(
         candidate_parameters.values())
+    assert len(observed_intents) == 2
+    intent_statement, intent_parameters, intent_locked_count = (
+        observed_intents[0])
+    assert 'state IN' in intent_statement
+    assert len(intent_parameters) < 10
+    assert intent_locked_count == 0
+    with engine.connect() as connection:
+        intent_plan_document = connection.exec_driver_sql(
+            f'EXPLAIN (FORMAT JSON) {intent_statement}',
+            intent_parameters).scalar_one()
+    intent_plan_nodes = _postgres_plan_nodes(intent_plan_document)
+    assert not any(
+        node.get('Node Type') == 'Seq Scan' and
+        node.get('Relation Name') == 'serve_zero_cost_actuation_intents'
+        for node in intent_plan_nodes)
+    assert any(
+        node.get('Index Name') == 'ix_serve052_zero_cost_intent_service'
+        for node in intent_plan_nodes)
+
+    # The read-only autoscaler snapshot uses the same bounded intent-state
+    # contract; retained terminal campaigns must not reappear on that path.
+    snapshot_intents = []
+
+    def _capture_snapshot_intents(_connection, cursor, statement, parameters,
+                                  _context, _executemany):
+        if ('FROM serve_zero_cost_actuation_intents' in statement and
+                'state IN' in statement and 'FOR UPDATE' in statement):
+            snapshot_intents.append((statement, parameters, cursor.rowcount))
+
+    sqlalchemy.event.listen(engine, 'after_cursor_execute',
+                            _capture_snapshot_intents)
+    try:
+        snapshot = kueue_lane_capacity.snapshot_replica_capacity_classes(
+            'svc', [])
+    finally:
+        sqlalchemy.event.remove(engine, 'after_cursor_execute',
+                                _capture_snapshot_intents)
+    assert not snapshot.by_replica_id
+    assert len(snapshot_intents) == 1
+    snapshot_statement, snapshot_parameters, snapshot_locked_count = (
+        snapshot_intents[0])
+    assert len(snapshot_parameters) < 10
+    assert snapshot_locked_count == 0
+    with engine.connect() as connection:
+        snapshot_plan_document = connection.exec_driver_sql(
+            f'EXPLAIN (FORMAT JSON) {snapshot_statement}',
+            snapshot_parameters).scalar_one()
+    snapshot_plan_nodes = _postgres_plan_nodes(snapshot_plan_document)
+    assert not any(
+        node.get('Node Type') == 'Seq Scan' and
+        node.get('Relation Name') == 'serve_zero_cost_actuation_intents'
+        for node in snapshot_plan_nodes)
+    assert any(
+        node.get('Index Name') == 'ix_serve052_zero_cost_intent_service'
+        for node in snapshot_plan_nodes)
+
+    # Pointerless TERMINAL history is inert, but every active old-incarnation
+    # intent remains in the indexed census and blocks reconciliation.
+    _refresh_authority(engine, incarnation, 7)
+    active_old_intent_key = f'{_HISTORY_SIZE + 1:064x}'
+    intents = (
+        zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        connection.execute(
+            sqlalchemy.insert(intents).values(**_intent_values(
+                active_old_intent_key, state='GRANTED', ordinal=_HISTORY_SIZE)))
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='nonterminal intent from a prior lifecycle'):
+        _reconcile(engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        connection.execute(
+            sqlalchemy.delete(intents).where(
+                intents.c.intent_idempotency_key == active_old_intent_key))
 
     # A settled old row becomes active again only if corrupt retained state
     # attaches it to a live graph.  The scalar pointer is selected even when
@@ -418,7 +579,7 @@ def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
 
     # RESULT_RECORDED is still provider-possible/unsettled authority and must
     # never disappear behind the settled-history optimization.
-    _refresh_authority(engine, incarnation, 7)
+    _refresh_authority(engine, incarnation, 8)
     result_recorded = _insert_old_history(
         engine,
         1,
@@ -438,7 +599,7 @@ def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
 
     # Exact UUID collision scope is cross-incarnation; lifecycle-local numeric
     # replica IDs are intentionally not.
-    _refresh_authority(engine, incarnation, 8)
+    _refresh_authority(engine, incarnation, 9)
     spec = _paid_launch_spec(engine, 0, 420)
     _insert_old_history(engine,
                         1,
