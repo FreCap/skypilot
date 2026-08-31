@@ -580,7 +580,7 @@ def test_policy_generation_advances_once_and_round_trips_with_envelope(
     assert decoded_candidate == candidate
 
 
-def test_format_five_policy_state_contains_only_reducer_memory() -> None:
+def test_format_six_policy_state_contains_only_reducer_memory() -> None:
     state = _policy_state()
 
     assert {field.name for field in dataclasses.fields(state)} == {
@@ -2558,8 +2558,8 @@ def test_planner_envelope_rejects_invalid_schema_and_digests(
         capacity_planning.decode_planner_envelope(payload)
 
 
-@pytest.mark.parametrize('old_schema', (1, 2, 3, 4))
-def test_format_five_strictly_rejects_old_envelopes(old_schema: int) -> None:
+@pytest.mark.parametrize('old_schema', (1, 2, 3, 4, 5))
+def test_format_six_strictly_rejects_old_envelopes(old_schema: int) -> None:
     payload = _planner_payload()
     payload['schema_version'] = old_schema
     snapshot = payload['snapshot']
@@ -2574,7 +2574,7 @@ def test_format_five_strictly_rejects_old_envelopes(old_schema: int) -> None:
 
 
 @pytest.mark.parametrize('record', ('snapshot', 'candidate'))
-def test_format_five_requires_backend_node_count(record: str) -> None:
+def test_format_six_requires_backend_node_count(record: str) -> None:
     payload = _planner_payload()
     nested = payload[record]
     assert isinstance(nested, dict)
@@ -2584,7 +2584,7 @@ def test_format_five_requires_backend_node_count(record: str) -> None:
         capacity_planning.decode_planner_envelope(payload)
 
 
-def test_format_five_requires_acquisition_classes() -> None:
+def test_format_six_requires_acquisition_classes() -> None:
     payload = _planner_payload()
     candidate = payload['candidate']
     assert isinstance(candidate, dict)

@@ -1,14 +1,16 @@
-"""PostgreSQL contracts for bounded format-5 association history locks."""
+"""PostgreSQL contracts for bounded format-6 authority-history locks."""
 # pylint: disable=not-callable,protected-access,redefined-outer-name,unused-import
 
 import datetime
 import json
+import time
 import uuid
 
 import pytest
 import sqlalchemy
 from test_serve_capacity_admission_pg import _current_decision
 from test_serve_capacity_admission_pg import _current_owner_kwargs
+from test_serve_capacity_admission_pg import _demand_report
 from test_serve_capacity_admission_pg import _enable_durable_intent
 from test_serve_capacity_admission_pg import _paid_launch_spec
 from test_serve_capacity_admission_pg import _publish_successor_route
@@ -18,6 +20,8 @@ from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
 from sky.serve import capacity_admission
+from sky.serve import capacity_admission_schema
+from sky.serve import demand_state
 from sky.serve import ordinary_launch_binding
 from sky.serve import serve_state_schema
 
@@ -151,14 +155,109 @@ def _postgres_plan_nodes(document) -> list[dict]:
     return nodes
 
 
+def _refresh_authority(engine: sqlalchemy.engine.Engine, incarnation: uuid.UUID,
+                       sequence: int) -> None:
+    """Refresh the causally paired route and demand leases for a long test."""
+    route = _publish_successor_route(engine, incarnation, 9000 + sequence)
+    demand_state.ingest_report(
+        'svc', 'svc-hash', _demand_report(time.time(), route,
+                                          sequence=sequence))
+
+
+def _rewrite_current_head_as_format_5(engine: sqlalchemy.engine.Engine) -> None:
+    """Install an authenticated head emitted by the pre-census format."""
+    plans = capacity_admission_schema.serve_capacity_plans_table
+    heads = capacity_admission_schema.serve_capacity_plan_heads_table
+    with engine.begin() as connection:
+        head = connection.execute(
+            sqlalchemy.select(heads).where(
+                heads.c.service_name == 'svc')).mappings().one()
+        plan = connection.execute(
+            sqlalchemy.select(plans).where(
+                plans.c.service_name == 'svc',
+                plans.c.generation == head['generation'])).mappings().one()
+        payload = json.loads(json.dumps(plan['payload']))
+        payload['planner']['schema_version'] = 5
+        digest = capacity_admission.capacity_plan_content_sha256(payload)
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        connection.execute(
+            sqlalchemy.update(plans).where(
+                plans.c.service_name == 'svc',
+                plans.c.generation == head['generation']).values(
+                    payload=payload, content_sha256=digest))
+
+
+def _reset_capacity_history(engine: sqlalchemy.engine.Engine) -> None:
+    """Model the authorized exact-zero test-service recreation cutover."""
+    plans = capacity_admission_schema.serve_capacity_plans_table
+    heads = capacity_admission_schema.serve_capacity_plan_heads_table
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        connection.execute(
+            sqlalchemy.delete(heads).where(heads.c.service_name == 'svc'))
+        connection.execute(
+            sqlalchemy.delete(plans).where(plans.c.service_name == 'svc'))
+
+
 def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+
+    # Format 5 predates the exhaustive genesis census and can never serve as a
+    # bounded-history receipt.  Even an otherwise authenticated clean head is
+    # scanned exhaustively and then strict-rejected; it is never upgraded in
+    # place.  A retained old-incarnation effect is found by that full census.
+    _refresh_authority(engine, incarnation, 2)
+    _reconcile(engine)
+    _rewrite_current_head_as_format_5(engine)
+    legacy_scopes = []
+
+    def _capture_legacy_scope(_connection, _cursor, statement, _parameters,
+                              _context, _executemany):
+        if ('FROM serve_ordinary_launch_associations' in statement and
+                'FOR UPDATE' in statement):
+            legacy_scopes.append(statement)
+
+    sqlalchemy.event.listen(engine, 'after_cursor_execute',
+                            _capture_legacy_scope)
+    try:
+        _refresh_authority(engine, incarnation, 3)
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='not strict format 6'):
+            _reconcile(engine)
+        _refresh_authority(engine, incarnation, 4)
+        retained_authority = _insert_old_history(
+            engine,
+            1,
+            start_ordinal=_HISTORY_SIZE + 20,
+            resolution=ordinary_launch_binding.Resolution.RESULT_RECORDED)[0]
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='belongs to another service incarnation'):
+            _reconcile(engine)
+    finally:
+        sqlalchemy.event.remove(engine, 'after_cursor_execute',
+                                _capture_legacy_scope)
+    assert len(legacy_scopes) == 2
+    assert all('bounded_association_authority_scope' not in statement
+               for statement in legacy_scopes)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        connection.execute(
+            sqlalchemy.delete(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == retained_authority['association_id']))
+    _reset_capacity_history(engine)
+
     _insert_old_history(engine, _HISTORY_SIZE)
 
-    # Headless format-5 genesis is the one exhaustive history census.
+    # Headless format-6 genesis is the one exhaustive history census.
+    _refresh_authority(engine, incarnation, 5)
     _reconcile(engine)
-    _publish_successor_route(engine, incarnation, 9000)
+    _refresh_authority(engine, incarnation, 6)
 
     observed = []
 
@@ -319,7 +418,7 @@ def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
 
     # RESULT_RECORDED is still provider-possible/unsettled authority and must
     # never disappear behind the settled-history optimization.
-    _publish_successor_route(engine, incarnation, 9001)
+    _refresh_authority(engine, incarnation, 7)
     result_recorded = _insert_old_history(
         engine,
         1,
@@ -339,7 +438,7 @@ def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
 
     # Exact UUID collision scope is cross-incarnation; lifecycle-local numeric
     # replica IDs are intentionally not.
-    _publish_successor_route(engine, incarnation, 9002)
+    _refresh_authority(engine, incarnation, 8)
     spec = _paid_launch_spec(engine, 0, 420)
     _insert_old_history(engine,
                         1,

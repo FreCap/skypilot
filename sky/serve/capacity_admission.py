@@ -3413,7 +3413,7 @@ def _lock_association_authority_graph(
 ) -> _LockedAssociationAuthorityGraph:
     """Lock either genesis history or the bounded live authority frontier.
 
-    Format-5 genesis performs an exhaustive service-wide census.  Each strict-
+    Format-6 genesis performs an exhaustive service-wide census.  Each strict-
     valid current head is then an inductive receipt: every successor validated
     its predecessor under the service lock back to that genesis census.
     Association resolution is monotonic and supported writers serialize on the
@@ -3442,6 +3442,10 @@ def _lock_association_authority_graph(
         pointer = replica_row.get('ordinary_launch_association_id')
         if isinstance(pointer, uuid.UUID):
             state = replica_row.get('replica_state')
+            if not isinstance(state, Mapping):
+                raise CapacityAdmissionConflict(
+                    'Locked replica association pointer has no record identity.'
+                )
             try:
                 record_id = uuid.UUID(str(state['replica_record_id']))
             except (KeyError, TypeError, ValueError, AttributeError) as error:
@@ -3843,7 +3847,7 @@ def _resolve_locked_policy_history(
     dependent_effect_count: int,
 ) -> tuple[capacity_planning.CapacityPolicyState,
            capacity_planning.CapacityPlanCandidate]:
-    """Strict-decode format 5, or construct its unique clean genesis."""
+    """Strict-decode format 6, or construct its unique clean genesis."""
     capacity_unit = (capacity_planning.CapacityUnit.LOGICAL_GPU
                      if config.capacity_unit
                      is reserved_fill_planner.FillCapacityUnit.LOGICAL else
@@ -3877,7 +3881,7 @@ def _resolve_locked_policy_history(
                 payload.get('planner'))
         except ValueError as error:
             raise CapacityAdmissionConflict(
-                'Current capacity policy is not strict format 5.') from error
+                'Current capacity policy is not strict format 6.') from error
         payload_service = payload.get('service')
         payload_source = payload.get('source')
         state = candidate.next_policy_state
@@ -3950,7 +3954,7 @@ def _resolve_locked_policy_history(
             'Clean capacity-policy genesis is malformed.') from error
 
 
-def _resolve_validated_format_5_head(
+def _resolve_validated_format_6_head(
     *,
     history: _LockedPlanHistory,
     config: _ReservedFillServiceConfig,
@@ -3972,7 +3976,21 @@ def _resolve_validated_format_5_head(
     the prior-head branch exclusively, making it impossible for a placeholder
     zero count to authorize genesis or bypass its exhaustive census.
     """
-    if history.previous is None:
+    previous = history.previous
+    if previous is None:
+        return None
+    payload = previous.get('payload')
+    planner = payload.get('planner') if isinstance(payload, Mapping) else None
+    # Schema 5 existed before the exhaustive census was part of genesis.  It
+    # therefore cannot be an inductive receipt, even when it is otherwise a
+    # valid planner envelope.  There is deliberately no transition decoder:
+    # any non-current head first takes the exhaustive authority scope and then
+    # fails the strict current-only decode below, requiring the authorized
+    # exact-zero service reset.
+    if (not isinstance(planner, Mapping) or
+            type(planner.get('schema_version')) is not int or
+            planner['schema_version']
+            != capacity_planning.CAPACITY_PLANNING_ENVELOPE_SCHEMA_VERSION):
         return None
     return _resolve_locked_policy_history(
         history=history,
@@ -5161,7 +5179,7 @@ class CapacityAdmissionRepository:
             raw_waiter_rows = connection.execute(
                 sqlalchemy.select(_PAID_WAITERS.c.service_hash).where(
                     _PAID_WAITERS.c.service_name == service_name)).all()
-            validated_policy_head = _resolve_validated_format_5_head(
+            validated_policy_head = _resolve_validated_format_6_head(
                 history=locked_history,
                 config=fill_config,
                 snapshot=snapshot,
@@ -5174,7 +5192,7 @@ class CapacityAdmissionRepository:
                 locked_capacity=locked_capacity,
                 lane_projection=lane_projection,
                 allocation_reserved=allocation_reserved)
-            has_validated_format_5_head = validated_policy_head is not None
+            has_validated_format_6_head = validated_policy_head is not None
             if validated_policy_head is None:
                 prior_policy_state = None
                 prior_candidate = None
@@ -5189,7 +5207,7 @@ class CapacityAdmissionRepository:
                 request_pins_table=request_pins_table,
                 service_name=service_name,
                 service_hash=service_hash,
-                exhaustive_history_census=not has_validated_format_5_head,
+                exhaustive_history_census=not has_validated_format_6_head,
                 prepared_specs=prepared_specs,
                 locked_capacity=locked_capacity,
                 lane_projection=lane_projection)
@@ -5218,7 +5236,7 @@ class CapacityAdmissionRepository:
                     'Prepared paid launch collides with a retained authority '
                     'graph.')
 
-            if not has_validated_format_5_head:
+            if not has_validated_format_6_head:
                 prior_policy_state, prior_candidate = (
                     _resolve_locked_policy_history(
                         history=locked_history,
@@ -5753,12 +5771,12 @@ def validate_paid_claim_in_connection(
             'Capacity plan has no immutable backend claim shape.') from error
     if (prospective and service.get('demand_source_mode')
             == DemandSourceMode.DURABLE_FEED.value):
-        # Format-5 policy memory and its accepted effect rows are one atomic
+        # Format-6 policy memory and its accepted effect rows are one atomic
         # graph. A later prospective validator cannot safely spend that
         # committed candidate again; only plan_and_admit_current may insert a
         # fresh claim. Committed recovery/provider checks remain valid below.
         raise CapacityAdmissionConflict(
-            'Format-5 paid claims require fused plan admission.')
+            'Format-6 paid claims require fused plan admission.')
     if _batch_member_pool_keys is None:
         _validate_planner_claim_pool_shape(claim, planner_candidate,
                                            accelerator)

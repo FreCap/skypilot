@@ -11,7 +11,7 @@ from typing import Mapping, TypeVar
 from sky.serve import autoscaler_compatibility
 from sky.serve import compatibility_matching
 
-CAPACITY_PLANNING_ENVELOPE_SCHEMA_VERSION = 5
+CAPACITY_PLANNING_ENVELOPE_SCHEMA_VERSION = 6
 _MAX_EXACT_ACCOUNTING_INTEGER = (1 << 63) - 1
 
 _EnumT = TypeVar('_EnumT', bound=enum.Enum)

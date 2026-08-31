@@ -33,10 +33,12 @@ The accepted correction removes the unused adaptive mode instead of making its
 second state machine durable. Durable logical services use one configured fast
 paid-wave policy; `boltz-l4-fleet` uses 100 percent/minimum 50 per 60 seconds,
 bounded by its hard paid-GPU cap and pool feedback. Capacity-planning envelope
-format 5 replaces format 4 at an exact-zero homogeneous cutover solely because
-portable DB epochs cannot be decoded as process-monotonic format-4 clocks. Its
-minimal `CapacityPolicyState` retains only irreducible hysteresis/adoption
-counters plus the paid-window DB start and accepted per-card ceiling. Prior
+format 6 replaces format 4 at an exact-zero homogeneous cutover because
+portable DB epochs cannot be decoded as process-monotonic format-4 clocks and
+the census receipt must be distinguishable from intermediate local format-5
+heads. Its minimal `CapacityPolicyState` retains only irreducible
+hysteresis/adoption counters plus the paid-window DB start and accepted
+per-card ceiling. Prior
 targets and every effect projection are read from the prior committed candidate,
 not duplicated in policy state. The one pure reducer consumes those values plus
 the current locked demand and returns a policy transition and proposed wave. Provider-free
@@ -59,13 +61,13 @@ the service-row lock is included in planning; a report arriving after the lock
 is causally after the committed wave. Fresh zero therefore prevents every
 uncommitted provider effect without racing a separately published plan.
 
-Format 5 is an envelope-format cutover, not a relational migration or a new
+Format 6 is an envelope-format cutover, not a relational migration or a new
 authority protocol: it adds no
 table, column, row rewrite, dual decoder, EFS, Kueue object, infrastructure
 component, or alternate allocator. The test-only service is first brought to
 supported PostgreSQL and provider exact zero, all API/controller/executor roles
-then move to one format-5-capable image, and only then is the service recreated.
-A format-4 writer and format-5 writer are never an accepted mixed cohort.
+then move to one format-6-capable image, and only then is the service recreated.
+A format-4 writer and format-6 writer are never an accepted mixed cohort.
 
 The deployed source contains one canonical compatibility matcher. It
 replaces the greedy finite-supply path that could leave compatible reservation
@@ -211,7 +213,7 @@ paid launch. The deadline-completeness bit remains normalized so a missing
 gauge still fails closed. PR #1806 deployed the saturated-demand correction in
 `1.1.1575`: lifecycle 148 reached raw target 1,000 and 49 Spot-L4 commitments,
 then exposed the unreachable secondary pacing reducer and two-transaction
-plan/admission defects addressed by capacity-envelope format 5.
+plan/admission defects addressed by capacity-envelope format 6.
 
 The steady-state implementation is one deterministic counted subset-rank
 matcher, shared by capacity planning and the reserved-pool broker.  The pure planner
@@ -763,7 +765,7 @@ temporarily clear or restore warm retention. Reserved supply and both
 ``utilization_gate`` modes enter the same ``ReservationPlanningInput`` and the
 same planner. Production later proved that the surrounding policy state and
 paid admission were still split across process memory and two transactions.
-Format 5 and the combined transition in this design are therefore required
+Format 6 and the combined transition in this design are therefore required
 source work, not qualification-only cleanup. They add neither a duplicate
 allocator nor a relational migration.
 
@@ -795,7 +797,7 @@ the tagged ``GATE_ACQUISITION`` variant. It preserves the immutable demand
 attribution and target as a witness, but its provider capacity target,
 reservation commitment, reserved launch target, paid residual, paid launch
 target, local actuation, and retirement authorities are all zero. Every
-  format-5 head carries non-null policy state: this no-effect result copies the
+  format-6 head carries non-null policy state: this no-effect result copies the
   prior minimal hysteresis, adoption, and paid-window values without reducing
   the demand generation or consuming paid-window authority. It may advance
   envelope source identity only. The repository commits the
@@ -1378,13 +1380,13 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` is PR #1806 merge `b1517869e47a9ebc36fc070440eb30f09928093d`. It includes PR #1805's empty-secret preflight and PR #1806's linear, card-scoped saturated-demand reconciliation. Both are deployed in release `1.1.1575`. The successor source candidate is the `fix/serve-atomic-adaptive-admission` stack through `0df81898c`, plus the final qualification corrections recorded by this design. It is neither merged nor deployed. The prior broad adaptive-state design was rejected by the KISS review and replaced by the smaller fixed-wave, in-place plan/admit fusion. |
+| Source base | `origin/improvements` is PR #1806 merge `b1517869e47a9ebc36fc070440eb30f09928093d`. It includes PR #1805's empty-secret preflight and PR #1806's linear, card-scoped saturated-demand reconciliation. Both are deployed in release `1.1.1575`. The successor source candidate is the `fix/serve-atomic-adaptive-admission` stack through retained-history bound `c56340fac`, plus the current format-6 trust-anchor correction recorded by this design. It is neither merged nor deployed. The prior broad adaptive-state design was rejected by the KISS review and replaced by the smaller fixed-wave, in-place plan/admit fusion. |
 | Immutable planner correction | **The fused source path is implemented; adversarial and real-PostgreSQL qualification are in progress.** One keyword-only frozen snapshot feeds one pure durable logical planner invocation. Its typed candidate separately records cold demand attribution, supply-aware actuation, warm/transition retention, reservation commitments and whole-backend padding, genuine paid residual and cap-bounded cold-launch authority, completeness/infeasibility, source generation, and snapshot/candidate fingerprints. The same transaction now locks the elected version, exact server-owned service YAML, semantic controller configuration, catalog ordering, controller incarnation/owner epoch, demand, route, allocation, capacity/Kueue, prior plan, pools and dependent effects; invokes the planner once; and commits plan/head/policy plus only the accepted replica/claim/request wave. Provider launch materialization consumes the exact committed spec/config/catalog evidence. Only a disposable process cache updates postcommit. PR #1786 already carries exact per-node width times task-authoritative node count for physical backends. |
 | Deployed control plane | Helm revision 691 runs SkyPilot `1.1.1575` homogeneously across two API, two controller, and three executor replicas on image `sha256:2ee45d2e5350c0c041ac4d32e0a338616024cbb5564b7d2871833a8266a08676`. The image contains source `b1517869e47a9ebc36fc070440eb30f09928093d`. PostgreSQL remains the sole central store; Helm storage is disabled; no SkyPilot PVC or EFS is present. |
 | Fixed paid pacing | **Implemented in the source candidate; PostgreSQL qualification and deployment remain.** Lifecycle 148 kept the durable target at the legacy ten-slot/60-second wave because the separate adaptive reducer was unreachable. Durable logical services now delete that mode and use one restart-safe configured fixed wave; the fleet uses 100 percent/minimum 50 per 60 seconds. PostgreSQL owns only the accepted paid-window cursor across takeover. |
 | Atomic plan and paid admission | **Implemented in the source candidate; PostgreSQL qualification and deployment remain.** Deadline heartbeats previously advanced between plan publication and Phase-A replica/claim insertion. The fused transaction invokes the one planner and inserts its exact accepted wave before releasing the service-row lock; no freshness comparator or TTL is relaxed. The obsolete prospective publisher and separate Phase-A recovery path have been removed from the promoted path and their alternate-writer tests deleted. |
-| Format-4 activation | **Complete from empty Serve state and still current through `1.1.1575`.** No older capacity plan, claim, or provider effect crossed the strict-current decoder boundary. There was no row rewrite, compatibility decoder, storage migration, or infrastructure change. Format 5 is the pending current-only cutover; formats 1--4 will be strict failures after it activates. |
-| Format-5 activation | **Pending.** It requires complete PostgreSQL/provider exact zero, stopped Serve writes, one homogeneous API/controller/executor image, strict rejection of formats 1--4, and service recreation only after the exact runtime digest is verified. It changes the envelope codec only, not relational schema, authority topology, or infrastructure. |
+| Format-4 activation | **Complete from empty Serve state and still current through `1.1.1575`.** No older capacity plan, claim, or provider effect crossed the strict-current decoder boundary. There was no row rewrite, compatibility decoder, storage migration, or infrastructure change. Format 6 is the pending current-only cutover; formats 1--5 will be strict failures after it activates. |
+| Format-6 activation | **Pending.** It requires complete PostgreSQL/provider exact zero, stopped Serve writes, one homogeneous API/controller/executor image, strict rejection of formats 1--5, and service recreation only after the exact runtime digest is verified. It changes the envelope codec only, not relational schema, authority topology, or infrastructure. Intermediate local format-5 heads are not census receipts and cannot cross this boundary. |
 | Lifecycle-137 evidence | Release `1.1.1554` reached exactly 100 provider-`RUNNING` GCP Spot one-L4 workers with zero ordinary on-demand and zero wrong-shape capacity. All 10,000 authenticated warm requests returned first-attempt HTTP 200. Normal down converged service, replica, claim, waiter, VM, and disk state to exact zero before the schema-3 cutover. |
 | Lifecycle-136 evidence | Run `9462207b-e026-4c5e-b610-acaba61e9b0a` on `1.1.1550` reached exactly 100 provider-`RUNNING` GCP Spot L4 VMs, with zero on-demand and zero non-L4 VMs. It accepted the 10,000-ID continuation and subsequent 5,000-ID extension. Normal teardown reached provider zero in about 3 minutes 16 seconds and full PostgreSQL/provider/disk zero in about 3 minutes 45 seconds. The immutable bundle records SHA-256 `audit.jsonl` `51807331f170d1352e9001324bd2e66f169a8a04867b7ca9bf94d8c4b953a8d7`, `arm.json` `92542d925ad50f0916cd8dcdc3977d27aa7f6a5e27b269445e03b70eadc36e70`, and `guard.json` `54a503e1f83eaa4899bce38bcc254591f885587ba87e81241fe3332a4188a649`. |
 | Cold-scale timing | **Count is proven; the 3--5 minute performance objective remains open.** Lifecycle 137 took roughly 9.5 minutes to reach 100 because durable recent-failure/cooldown evidence limited many pools. Clean pools did use the configured base launch window of four. The follow-up must distinguish a clean-frontier benchmark from correctly fenced recently failed pools; it must not erase durable cooldown evidence to improve the number. |
@@ -1827,7 +1829,7 @@ read-only scheduler/provider observation
 
 locked demand + route + reserved allocation/inventory + policy head + paid pools
     -> one pure reserved-first/paid-residual plan
-    -> atomic format-5 plan/head/policy/replica/claim/debit commit
+    -> atomic format-6 plan/head/policy/replica/claim/debit commit
     -> postcommit binding and exact provider guard
     -> exact Spot provider effect
 ```
@@ -2019,12 +2021,12 @@ reserved allocation, retirement, and teardown. The standalone Phase-A wrapper
 remains only for legacy/non-promoted service classes; it may not lock pools and
 then invoke a validator that locks demand, route, allocation, or plan state.
 
-#### Format-5 policy state and dispositions
+#### Format-6 policy state and dispositions
 
 The current head supplies the prior committed candidate and its minimal reducer
-memory; it is not a lease a later transaction races to consume. Format 5
-strictly replaces formats 1--4, whose process-monotonic clocks are never
-reinterpreted. ``CapacityPolicyState`` contains only:
+memory; it is not a lease a later transaction races to consume. Format 6
+strictly replaces formats 1--5, whose process-monotonic clocks or missing
+census receipt are never reinterpreted. ``CapacityPolicyState`` contains only:
 
 - the last demand generation actually reduced and the upscale-observation
   counter;
@@ -2043,7 +2045,7 @@ deleted. Current pressure remains a planner input and observability signal, not
 a second pacing state machine. The autoscaler stores only a disposable
 postcommit projection of the committed candidate/state.
 
-Every committed format-5 head, including ``GATE_ACQUISITION`` and
+Every committed format-6 head, including ``GATE_ACQUISITION`` and
 ``FRESH_ZERO``, contains non-null policy state. Stale or incomplete evidence is
 ``ABORT_RETRY`` and publishes no successor head. With no prior head, a clean
 genesis may be synthesized only when the locked service has no retained
@@ -2064,15 +2066,24 @@ its counters, clocks and ceilings start at zero/``None``. The same transaction
 may then plan current positive demand. A missing head beside any live graph is
 ``RECREATE_REQUIRED`` and never permission to synthesize state.
 
-That exhaustive cross-incarnation census occurs only while the format-5 head
-is absent. Each strict-valid current head is an inductive durable receipt:
+That exhaustive cross-incarnation census occurs until a strict-valid format-6
+head exists. Each strict-valid current head is an inductive durable receipt:
 genesis performed the census, and every supported successor writer validated
 its predecessor under the same service/head locks before replacing it. The
 current receipt is trusted only after the strict service/hash/lifecycle/version/
-envelope decoder succeeds. Supported association creation, owner transfer,
-effect transition, cancellation, terminal reduction, reconciliation and
-projection writers serialize on that service lock; the request root is created
-in the same transaction before that lock is released. Later request execution
+envelope decoder succeeds. Format 5 is not such a receipt: intermediate local
+images emitted it before exhaustive genesis was required. A format-5,
+malformed, or missing head therefore always selects the exhaustive authority
+scope and can never unlock the bounded query. There is no format-5 decoder or
+in-place promotion. An otherwise clean format-5 head subsequently fails the
+strict format-6 policy decode and requires the authorized exact-zero
+test-service recreation; the activation gate deletes the old service-scoped
+head/history only after both PostgreSQL and provider authority are proven zero,
+then lets headless format-6 genesis perform its census. Supported association
+creation, owner transfer, effect transition, cancellation, terminal reduction,
+reconciliation and projection writers serialize on that service lock; the
+request root is created in the same transaction before that lock is released.
+Later request execution
 updates may lock only the request suffix, but can only reduce an active root to
 terminal/quiesced state: the supported request repository rejects terminal
 reopening, while association resolution, terminal evidence and identity are
@@ -2313,7 +2324,7 @@ be treated as absent or released for paid residual or scale-down. A promoted
 create a second prospective paid-admission path and require the replica-manager
 lock to enter PostgreSQL. The predecessor remains protected until a fresh probe
 or exact cleanup evidence resolves it. Legacy replacement rows remain readable
-and cleanable, but the format-5 happy path creates no new replacement.
+and cleanable, but the format-6 happy path creates no new replacement.
 
 Every AWS paid association uses a stable provider idempotency token bound to
 the immutable association and exact instance parameters. A lost provider
@@ -2599,7 +2610,7 @@ missing telemetry.
 24. **Gate acquisition has no provider authority:** the first plan for a clean
     gated positive target may durably witness demand, but it grants zero
     reserved launch, paid launch, local actuation, or retirement. It installs
-    one non-null format-5 policy state that copies the minimal hysteresis,
+    one non-null format-6 policy state that copies the minimal hysteresis,
     adoption, and paid-window memory and advances source identity while
     reducing no demand generation and consuming no paid window. Only a later
     plan bound to the causally covering settled
@@ -2670,7 +2681,7 @@ container. Do not update a `boltz-platform` runtime pin.
 
 Before provider effects resume, prove all two API, two controller, and three
 executor Pods are Ready on that exact tag-and-digest reference and their
-runtime image IDs resolve to that digest. During the format-5 transition, keep
+runtime image IDs resolve to that digest. During the format-6 transition, keep
 Serve writes and service traffic stopped from the pre-rollout zero census until
 that homogeneous readback succeeds. If the reclaim-policy or writer identity
 changes, invoke the existing PostgreSQL transition command to authorize one
@@ -2705,22 +2716,22 @@ supported exact zero and remains the homogeneous current format through
 release `1.1.1575`; no old envelope or claim was rewritten, and a mixed
 schema-3/schema-4 cohort was never accepted.
 
-Format 5 is another hard current-only envelope cutover, not a relational
+Format 6 is another hard current-only envelope cutover, not a relational
 migration. Before Helm, normally down lifecycle 148 and prove service-scoped
 plans/heads, replicas, associations, zero-cost intents, reserved claim edges,
 paid claims/waiters, retention pins, request/provider operations, VMs, disks,
 and every other schema-bearing authority are exact zero. Keep Serve writes
-stopped, deploy the exact same format-5-capable image to every API, controller, and
+stopped, deploy the exact same format-6-capable image to every API, controller, and
 executor, and verify every runtime digest before recreating the service. The
-format-5 decoder strictly rejects formats 1--4; there is no row rewrite, dual
+format-6 decoder strictly rejects formats 1--5; there is no row rewrite, dual
 decoder, EFS/PVC state, or mixed-writer interval. Rollback is permitted only
-before any format-5 head exists. After the first format-5 head, recovery is
-fix-forward on a newer homogeneous format-5-capable image.
+before any format-6 head exists. After the first format-6 head, recovery is
+fix-forward on a newer homogeneous format-6-capable image.
 
 ### Failure and rollback
 
 The capacity-authority transition is one-way. After activation or the first
-format-5 head/authority commit, repair by deploying a newer homogeneous image and reauthorizing
+format-6 head/authority commit, repair by deploying a newer homogeneous image and reauthorizing
 forward. Do not demote authority, restore old database rows, or roll back to a
 binary that cannot decode the current head.
 
@@ -2901,10 +2912,10 @@ on-demand spill.
   same-numeric-ID/different-UUID or claim mismatch fails closed. Never build
   from a precommit template after ambiguous acknowledgement, and never replay a
   historical batch.
-- Encode a format-5 plan with DB-epoch policy fields and prove formats 1--4 are
+- Encode a format-6 plan with DB-epoch policy fields and prove formats 1--5 are
   strict failures. Before qualification, down to the complete service/provider
   zero inventory, hold Serve writes, deploy every role homogeneously, and only
-  then recreate. Prove rollback is allowed before the first format-5 head and
+  then recreate. Prove rollback is allowed before the first format-6 head and
   fix-forward is required afterward; there is no row rewrite or mixed decoder.
 - Hold the routing epoch, then hold the pure planner after the transaction has
   locked protocol, lifecycle/owner/version, demand/reports, route, reserved
@@ -3146,7 +3157,7 @@ at-least-100 Spot scale-out, 10,000-request warm transport, mixed
 reserved-plus-Spot execution, and exact provider drain. They do not replace
 these remaining current-writer acceptance gates:
 
-1. Finish source qualification of the implemented format-5 minimal DB-epoch
+1. Finish source qualification of the implemented format-6 minimal DB-epoch
    policy memory, fixed 100-percent/minimum-50/60-second paid wave,
    repository-wide lock order, deeply immutable provider-free launch specs,
    final-DB-clock fence, atomic plan/head/policy/replica/claim/debit commit, and
@@ -3157,12 +3168,12 @@ these remaining current-writer acceptance gates:
    manager/actuation lock.
 2. From complete service/provider exact zero, merge and build one immutable
    image, keep Serve writes stopped, and deploy every API/controller/executor
-   role homogeneously with Helm. Strictly reject formats 1--4 and verify the
+   role homogeneously with Helm. Strictly reject formats 1--5 and verify the
    exact runtime digest before recreation.
 3. Recreate `boltz-l4-fleet` with the reviewed heterogeneous YAML,
    `min_replicas: 0`, fill floor 0, `utilization_gate: true`, Spot-only paid
    candidates, no task-owned Kubernetes override, and PostgreSQL-only state.
-4. Prove one format-5 demand generation survives multiple additive route
+4. Prove one format-6 demand generation survives multiple additive route
    expansions and produces at least two actuation waves. Under flexible/mixed
    demand, require new compatible reserved intents to commit and appear in
    durable inventory before any paid row; separately prove a complete
