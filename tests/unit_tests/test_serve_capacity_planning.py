@@ -615,6 +615,26 @@ def test_genesis_policy_builds_one_valid_zero_prior_pair() -> None:
     assert candidate.paid_launch_target.total() == 0
 
 
+@pytest.mark.parametrize('configured_accelerators', [
+    ('L4',),
+    ('L4', 'A100', 'H200'),
+    ('L4', 'l4', 'A100'),
+])
+def test_policy_history_reprojection_rejects_card_domain_changes(
+        configured_accelerators: tuple[str, ...]) -> None:
+    state, candidate = capacity_planning.genesis_capacity_policy(
+        service_name='svc',
+        service_version=3,
+        last_reduced_demand_generation=6,
+        capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+        maximum_capacity=20,
+        physical_gpu_width_by_accelerator=_capacity(l4=1, a100=8))
+
+    with pytest.raises(ValueError, match='identity|accelerator domain'):
+        capacity_planning.reproject_capacity_policy_history(
+            state, candidate, configured_accelerators=configured_accelerators)
+
+
 def test_fixed_paid_wave_uses_db_epoch_and_prior_committed_candidate() -> None:
     demand = (_demand(50, ('L4',), 5),)
     state = _policy_state(paid_window_started_db_epoch=95.0,

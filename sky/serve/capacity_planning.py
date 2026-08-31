@@ -995,30 +995,17 @@ class CapacityPlanningSnapshot:
 
         if self.prior_policy_state is not None:
             policy_state = self.prior_policy_state
-            paid_ceiling = policy_state.paid_window_ceiling_by_accelerator
-            if any(card.casefold() not in canonical
-                   for card, _ in paid_ceiling.entries):
-                raise ValueError(
-                    'Capacity policy state names an unknown accelerator.')
-            normalized_policy_state = dataclasses.replace(
-                policy_state,
-                paid_window_ceiling_by_accelerator=canonical_capacity(
-                    paid_ceiling))
-            object.__setattr__(self, 'prior_policy_state',
-                               normalized_policy_state)
             prior_candidate = self.prior_candidate
             assert prior_candidate is not None
-            for field in _CANDIDATE_CAPACITY_FIELDS:
-                values = getattr(prior_candidate, field)
-                if any(card.casefold() not in canonical or
-                       canonical[card.casefold()] != card
-                       for card, _ in values.entries):
-                    raise ValueError(
-                        'Prior capacity candidate names a noncanonical card.')
-            object.__setattr__(
-                self, 'prior_candidate',
-                dataclasses.replace(prior_candidate,
-                                    next_policy_state=normalized_policy_state))
+            normalized_policy_state, normalized_prior_candidate = (
+                reproject_capacity_policy_history(
+                    policy_state,
+                    prior_candidate,
+                    configured_accelerators=configured))
+            object.__setattr__(self, 'prior_policy_state',
+                               normalized_policy_state)
+            object.__setattr__(self, 'prior_candidate',
+                               normalized_prior_candidate)
             assert self.policy_input is not None
             policy_input = self.policy_input
             latest_committed = policy_input.latest_committed_by_accelerator
@@ -2065,6 +2052,61 @@ _CANDIDATE_FIELDS = frozenset({
     'reservation_demand_relation', 'statically_disjoint_demand_accelerators',
     *_CANDIDATE_CAPACITY_FIELDS
 })
+
+
+def reproject_capacity_policy_history(
+    policy_state: CapacityPolicyState,
+    candidate: CapacityPlanCandidate,
+    *,
+    configured_accelerators: tuple[str, ...],
+) -> tuple[CapacityPolicyState, CapacityPlanCandidate]:
+    """Move case-equivalent policy history into one configured card domain.
+
+    Accelerator names are case-insensitive identifiers. PostgreSQL accounting
+    deliberately stores folded keys, while a task catalog retains display
+    spellings such as ``A100``. Reprojection is safe only when every historical
+    card resolves to exactly one current configured card. Additions, removals,
+    and duplicates fail here; shape-width changes fail at the caller, which
+    owns the current physical-width map.
+    """
+    canonical = {
+        card.casefold(): card
+        for card in configured_accelerators
+        if isinstance(card, str) and card
+    }
+    if (len(canonical) != len(configured_accelerators) or
+            candidate.next_policy_state != policy_state):
+        raise ValueError('Capacity policy history identity is malformed.')
+    physical_entries = candidate.physical_gpu_width_by_accelerator.entries
+    physical_cards = {card.casefold() for card, _ in physical_entries}
+    if (len(physical_entries) != len(canonical) or
+            physical_cards != set(canonical)):
+        raise ValueError(
+            'Capacity policy history has a different accelerator domain.')
+
+    def _capacity(value: AcceleratorCapacity) -> AcceleratorCapacity:
+        if any(card.casefold() not in canonical for card, _ in value.entries):
+            raise ValueError(
+                'Capacity policy history names an unknown accelerator.')
+        return AcceleratorCapacity(entries=tuple(
+            (canonical[card.casefold()], count)
+            for card, count in value.entries))
+
+    normalized_state = dataclasses.replace(
+        policy_state,
+        paid_window_ceiling_by_accelerator=_capacity(
+            policy_state.paid_window_ceiling_by_accelerator))
+    normalized_capacities = {
+        field: _capacity(getattr(candidate, field))
+        for field in _CANDIDATE_CAPACITY_FIELDS
+    }
+    normalized_candidate = dataclasses.replace(
+        candidate,
+        **typing.cast(typing.Any, normalized_capacities),
+        next_policy_state=normalized_state)
+    return normalized_state, normalized_candidate
+
+
 _ENVELOPE_FIELDS = frozenset({
     'schema_version', 'snapshot', 'candidate', 'snapshot_fingerprint',
     'candidate_fingerprint'

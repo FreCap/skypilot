@@ -1459,14 +1459,27 @@ def _validate_planner_against_locked_supply(
          supply_projection.prior_candidate is not None or
          supply_projection.planning_db_epoch is not None)):
         policy_input = planner_snapshot.policy_input
-        if (supply_projection.prior_policy_state is None or
-                supply_projection.prior_candidate is None or
-                supply_projection.planning_db_epoch is None or
-                planner_snapshot.prior_policy_state
-                != supply_projection.prior_policy_state or
-                planner_snapshot.prior_candidate
-                != supply_projection.prior_candidate or policy_input is None or
-                policy_input.planning_db_epoch
+        prior_policy_state = supply_projection.prior_policy_state
+        prior_candidate = supply_projection.prior_candidate
+        if (prior_policy_state is None or prior_candidate is None or
+                supply_projection.planning_db_epoch is None):
+            raise CapacityAdmissionConflict(
+                'Planner policy history or PostgreSQL epoch changed under lock.'
+            )
+        try:
+            expected_policy_state, expected_candidate = (
+                capacity_planning.reproject_capacity_policy_history(
+                    prior_policy_state,
+                    prior_candidate,
+                    configured_accelerators=(
+                        planner_snapshot.configured_accelerators)))
+        except ValueError as error:
+            raise CapacityAdmissionConflict(
+                'Locked capacity policy history cannot be projected into the '
+                'current card domain.') from error
+        if (planner_snapshot.prior_policy_state != expected_policy_state or
+                planner_snapshot.prior_candidate != expected_candidate or
+                policy_input is None or policy_input.planning_db_epoch
                 != supply_projection.planning_db_epoch or
                 planner_snapshot.max_live_paid_gpu_units
                 != supply_projection.max_live_paid_gpu_units):
@@ -4023,6 +4036,12 @@ def _resolve_locked_policy_history(
         try:
             prior_snapshot, candidate = capacity_planning.decode_planner_envelope(
                 payload.get('planner'))
+            prior_shapes = _canonical_counts(
+                prior_snapshot.physical_gpu_width_by_accelerator.as_dict(),
+                'prior planner physical_gpu_width_by_accelerator')
+            candidate_shapes = _canonical_counts(
+                candidate.physical_gpu_width_by_accelerator.as_dict(),
+                'prior candidate physical_gpu_width_by_accelerator')
         except ValueError as error:
             raise CapacityAdmissionConflict(
                 'Current capacity policy is not strict format 6.') from error
@@ -4051,13 +4070,9 @@ def _resolve_locked_policy_history(
                 } != set(accounting_cards) or
                 prior_snapshot.capacity_unit is not capacity_unit or
                 prior_snapshot.maximum_capacity != config.max_capacity or
-                prior_snapshot.physical_gpu_width_by_accelerator.as_dict()
-                != dict(accounting_cards) or
+                prior_shapes != dict(accounting_cards) or
                 prior_snapshot.backend_num_nodes != backend_num_nodes or
-                set(candidate.physical_gpu_width_by_accelerator.as_dict())
-                != set(accounting_cards) or
-                candidate.physical_gpu_width_by_accelerator
-                != prior_snapshot.physical_gpu_width_by_accelerator or
+                candidate_shapes != dict(accounting_cards) or
                 candidate.backend_num_nodes != prior_snapshot.backend_num_nodes
                 or state is None or state.service_name != service_name or
                 state.service_version != service_version or

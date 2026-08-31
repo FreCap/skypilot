@@ -4,9 +4,10 @@ Last updated: 2026-08-31
 
 Status: **the exact-card compatible and statically disjoint edges are
 production-qualified; fixed-wave atomic paid admission, the final-deletion
-authority census, and the two read-side corrections are deployed, while one
-typed-zero broker correction still requires qualification and immutable
-deployment**. One
+authority census, both read-side corrections, and confirmed typed-zero broker
+publication are deployed. Format-6 genesis now has two known immediate
+blockers: a stale service pacing mode and one case-only PostgreSQL/YAML
+card-domain mismatch, whose source correction is under qualification**. One
 PostgreSQL-authoritative planner is the canonical source path for both
 reservation-aware actuation and paid Spot residual. Historical production runs
 proved complete East occupancy, Kueue-bounded PHX occupancy, reclaim, mixed
@@ -42,7 +43,7 @@ the target flavor. Generation 41 then renewed simultaneous provider proofs:
 PHX reported 64 non-deleting eight-H200 nodes and East reported zero matching
 A100 and A100-80GB nodes.
 
-That production proof exposed one remaining cross-layer mismatch. The broker
+That production proof exposed another cross-layer mismatch. The broker
 still classified East's confirmed successful zero-card observation as a
 legacy blackout and stored a SQL `NULL` exact-card feed. Whole-map allocation
 correctly rejected that incomplete pool, which also withheld healthy PHX and
@@ -52,8 +53,37 @@ zero envelope (`observed={card: 0}`, `spendable={card: 0}`, service feed empty,
 and the exact slot width). SQL `NULL` remains reserved for provider failure,
 malformed evidence, or a not-yet-confirmed transient observation. Neither
 correction adds a schema, migration, Kueue object, infrastructure object, EFS
-path, or alternate planner. Typed-zero broker deployment, format-6 genesis and
-the current mixed/Spot campaigns remain open.
+path, or alternate planner. Release `1.1.1579` deployed that correction at Helm
+revision 698. The broker now publishes a complete three-pool allocation with
+authoritative East zero and PHX-positive observations.
+
+The first live format-6 replay then exposed two service/planner composition
+errors that component tests did not cover. The recreated service retained the
+legacy process-local `adaptive_scale_up` block even though the canonical durable
+planner intentionally supports only the fixed PostgreSQL policy. Removing that
+block reveals a case-only identity mismatch: genesis history is stored in the
+lowercase accounting-card domain while the YAML catalog retains display names
+such as `A100` and `H200`. Accelerator identity is case-insensitive throughout
+the public contract. The snapshot adapter therefore reprojects a prior
+candidate's exact-card capacity fields into the current configured display
+domain after proving the folded name and width sets are identical; unknown,
+added, removed, duplicate, or width-changing cards still fail closed. The clean
+fleet definition removes `adaptive_scale_up` and uses the sole supported fixed
+policy of 100 percent, minimum 50, per 60 seconds. Format-6 genesis and the
+current mixed/Spot campaigns remain open until that source and service update
+are deployed and proved.
+
+A composed PostgreSQL regression now invokes the production controller
+`_plan_and_admit_current_capacity()` path for two consecutive fresh-zero
+generations. It loads a persisted fixed-policy service spec, combines lowercase
+repository genesis with display-case configured cards, consumes East exact-zero
+and PHX-positive allocation evidence, commits the first candidate, then proves
+the committed display-case head remains valid on the next reconciliation.
+Together with the fleet repository's exact service-definition validator, this
+would have caught both the service-policy drift and the case-only induction
+failure before deployment. Positive reserved-first/paid-residual behavior and
+provider effects remain live campaign gates rather than claims from this
+fresh-zero regression.
 
 Lifecycle 148 on the preceding `1.1.1575` release accepted a sustained
 exact-L4 pressure test: 270,000 attempts over 184.8 seconds produced a raw logical target of
@@ -303,7 +333,7 @@ gaining a compatibility path.
 
 PRs #1794, #1795, and #1796 closed the defects exposed by the exact-card
 production matrix: exact-card budgets are no longer assigned by pool iteration
-order, configured card casing is canonicalized at admission, and statically
+order, current admission maps canonicalize configured card casing, and statically
 disjoint paid demand is not fenced by unrelated reservation-allocation
 generations. Release `1.1.1565` first qualified those edges. PRs #1798 through
 #1803 then carried the schema-4 matcher and paid-wave boundaries into release
@@ -3309,35 +3339,40 @@ these remaining current-writer acceptance gates:
 2. **Complete:** reclaim-policy generation 41 has fresh simultaneous
    East-zero and PHX-positive revision-`1.1.1578` receipts. East grants no
    concrete launch authority; PHX attests the reviewed positive H200 flavor.
-3. Merge and homogeneously deploy the confirmed typed-zero broker correction.
-   Require recreated lifecycle 150 to commit its first strict format-6 genesis
-   without changing or deleting the two retained historical rows. Verify the
-   service still has `min_replicas: 0`, fill floor 0,
-   `utilization_gate: true`, Spot-only paid candidates, no task-owned
-   Kubernetes override, and PostgreSQL-only state.
-4. Prove one format-6 demand generation survives multiple additive route
+3. **Complete:** release `1.1.1579` deployed the confirmed typed-zero broker
+   correction homogeneously at Helm revision 698. The three-pool allocation is
+   complete: both East cards are authoritative zero and PHX H200 is positive;
+   SQL `NULL` remains blackout-only.
+4. Deploy the case-only prior-candidate canonicalization, then update lifecycle
+   150 with the clean fixed pacing policy (100 percent, minimum 50, period 60;
+   no `adaptive_scale_up`). Require its first strict format-6 genesis without
+   changing or deleting the two retained historical rows. Verify the service
+   still has `min_replicas: 0`, fill floor 0, `utilization_gate: true`,
+   Spot-only paid candidates, no task-owned Kubernetes override, and
+   PostgreSQL-only state.
+5. Prove one format-6 demand generation survives multiple additive route
    expansions and produces at least two actuation waves. Under flexible/mixed
    demand, require new compatible reserved intents to commit and appear in
    durable inventory before any paid row; separately prove a complete
    statically disjoint exact-card target remains eligible for Spot.
-5. Under positive demand, prove East consumes every healthy compatible physical
+6. Under positive demand, prove East consumes every healthy compatible physical
    GPU and PHX consumes every slot actually admitted by Simone's unchanged
    Kueue policy. Record Kueue admission, Pod readiness, PostgreSQL inventory and
    every physical GPU child; idle capacity need not be occupied with the usage
    gate enabled.
-6. Run a fresh protocol-covered 10,000-request campaign and drive the configured
+7. Run a fresh protocol-covered 10,000-request campaign and drive the configured
    roughly-100-Spot limit within a few minutes, subject to real provider
    availability/cooldowns. Capture current queued, processing, in-flight and
    terminal ledger/UI evidence; require zero ordinary on-demand and zero
    wrong-shape capacity.
-7. Complete a controller-child restart and controller-Pod HA takeover while a
+8. Complete a controller-child restart and controller-Pod HA takeover while a
    wave is live. Require restart-safe fixed pacing, no duplicate provider effect,
    exact ambiguous-commit recovery, and preserved generation/fingerprint
    fences.
-8. Stop demand without lowering the paid cap and prove natural drain to exact
+9. Stop demand without lowering the paid cap and prove natural drain to exact
    PostgreSQL, VM, Spot-request and disk zero immediately, at +10, +30, and
    through the full stale/quiescence horizon.
-9. Retain the live multi-node paid physical-backend case as a full-design gate:
+10. Retain the live multi-node paid physical-backend case as a full-design gate:
    charged paid units must equal per-node GPU width times task-authoritative node
    count while the pacing cursor advances in plan units.
 

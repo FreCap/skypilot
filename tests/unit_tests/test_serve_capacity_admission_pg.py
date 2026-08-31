@@ -25,10 +25,12 @@ from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
 from sky.serve import autoscaler_compatibility
+from sky.serve import autoscalers
 from sky.serve import capacity_admission
 from sky.serve import capacity_admission_schema
 from sky.serve import capacity_planning
 from sky.serve import constants
+from sky.serve import controller
 from sky.serve import demand_state
 from sky.serve import demand_state_schema
 from sky.serve import kubernetes_identity
@@ -410,6 +412,9 @@ def _capacity_service_spec(
     lb_high_availability: bool = False,
     utilization_gate: bool = False,
     max_live_paid_gpu_units: int | None = None,
+    max_scale_up_rate_percentage: int | None = None,
+    scale_up_rate_min_replicas: int | None = None,
+    scale_up_rate_period_seconds: int | None = None,
 ) -> service_spec.SkyServiceSpec:
     assert replica_unit in ('physical_backend', 'logical')
     return service_spec.SkyServiceSpec(
@@ -422,6 +427,9 @@ def _capacity_service_spec(
         min_replicas=0,
         max_replicas=max_replicas,
         target_concurrency_per_replica=1,
+        max_scale_up_rate_percentage=max_scale_up_rate_percentage,
+        scale_up_rate_min_replicas=scale_up_rate_min_replicas,
+        scale_up_rate_period_seconds=scale_up_rate_period_seconds,
         spot_placer=('dynamic_fallback_per_gpu'
                      if replica_unit == 'logical' else 'dynamic_fallback'),
         max_live_paid_gpu_units=max_live_paid_gpu_units,
@@ -1779,6 +1787,9 @@ def _enable_durable_intent(engine,
                            replica_unit: str = 'physical_backend',
                            utilization_gate: bool = False,
                            max_live_paid_gpu_units: int | None = None,
+                           max_scale_up_rate_percentage: int | None = None,
+                           scale_up_rate_min_replicas: int | None = None,
+                           scale_up_rate_period_seconds: int | None = None,
                            paid_backend_num_nodes: int = 1) -> None:
     with engine.begin() as connection:
         result = connection.execute(
@@ -1798,7 +1809,12 @@ def _enable_durable_intent(engine,
                         max_replicas=max_replicas,
                         replica_unit=replica_unit,
                         utilization_gate=utilization_gate,
-                        max_live_paid_gpu_units=max_live_paid_gpu_units),
+                        max_live_paid_gpu_units=max_live_paid_gpu_units,
+                        max_scale_up_rate_percentage=(
+                            max_scale_up_rate_percentage),
+                        scale_up_rate_min_replicas=(scale_up_rate_min_replicas),
+                        scale_up_rate_period_seconds=(
+                            scale_up_rate_period_seconds)),
                                       protocol=4),
                     placement_catalog=_paid_placement_catalog(
                         paid_backend_num_nodes)))
@@ -1846,6 +1862,8 @@ def _allocation_map(
     free_by_accelerator: dict[str, int],
     *,
     accelerator_count: int = 1,
+    kubernetes_context: str = 'east',
+    physical_cluster_uid: str = 'cluster-east',
     grant: int | None = None,
     edge_cap: int | None = None,
     valid_until: float | None = None,
@@ -1858,10 +1876,10 @@ def _allocation_map(
     """Build one exact fresh allocation for paid-admission contracts."""
     cards = tuple(card.casefold() for card in free_by_accelerator)
     pool_key = reserved_capacity_broker.make_pool_key(
-        'east',
+        kubernetes_context,
         cards,
         protocol_version=reserved_capacity_broker.PROTOCOL_V2,
-        physical_cluster_uid='cluster-east')
+        physical_cluster_uid=physical_cluster_uid)
     free_slots = sum(free_by_accelerator.values())
     if grant is None:
         grant = free_slots
@@ -1870,7 +1888,7 @@ def _allocation_map(
     snapshot = reserved_fill_planner.PoolFillSnapshot.from_mapping({
         'protocol_version': reserved_capacity_broker.PROTOCOL_V2,
         'pool_key': pool_key,
-        'physical_cluster_uid': 'cluster-east',
+        'physical_cluster_uid': physical_cluster_uid,
         'service_generation': 7,
         'worker_projection_sha256_by_accelerator': {
             card: f'{index + 1:064x}' for index, card in enumerate(cards)
@@ -1888,7 +1906,7 @@ def _allocation_map(
             (time.time() + 60 if valid_until is None else valid_until),
         'zero_cost_location_keys': [{
             'cloud': 'Kubernetes',
-            'region': 'east',
+            'region': kubernetes_context,
             'zone': None,
             'accelerators': {
                 card: accelerator_count,
@@ -3547,6 +3565,193 @@ def test_current_planner_callback_failure_rolls_back(capacity_database):
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
                 capacity_admission_schema.serve_capacity_plan_heads_table)
         ).scalar_one() == 0
+
+
+def test_fresh_zero_multi_pool_admission_accepts_yaml_card_casing(
+        capacity_database, monkeypatch):
+    """Repository genesis and the production autoscaler share one card domain."""
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=True,
+                           max_replicas=1000,
+                           replica_unit='logical',
+                           utilization_gate=True,
+                           max_live_paid_gpu_units=100,
+                           max_scale_up_rate_percentage=100,
+                           scale_up_rate_min_replicas=50,
+                           scale_up_rate_period_seconds=60)
+
+    # Publish the clean service's empty current route under protocol 2, then
+    # replace the retained nonzero fixture report with authoritative fresh zero.
+    route_response = _route_response()
+    route_response.update(replica_info={}, num_ready_replicas=0)
+    route_response['capacity_hint']['replica_unit'] = 'logical'
+    route = _publish_route_snapshot(engine, incarnation, route_response, {},
+                                    set())
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_snapshots_table).where(
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    service_name == 'svc').values(producer_protocol_version=2))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_projection_protocol_version=2,
+                    route_projection_controller_incarnation=incarnation))
+
+    def _zero_report(sequence):
+        report = _demand_report(time.time(),
+                                route,
+                                sequence=sequence,
+                                request_count=0)
+        report.update(
+            http_in_flight={},
+            async_occupancy={},
+            occupancy_sample_generation={},
+            occupancy_sample_age_seconds={},
+            occupancy_sampled_urls=[],
+            total_slots_by_url={},
+            routing_urls=[],
+            configured_accelerators=['A100', 'A100-80GB', 'H200', 'L4'])
+        return report
+
+    demand_state.ingest_report('svc', 'svc-hash', _zero_report(2))
+
+    east_a100 = _allocation_map(
+        {
+            'A100': 0
+        },
+        kubernetes_context='east',
+        physical_cluster_uid='cluster-east').pool_snapshots[0]
+    east_a100_80gb = _allocation_map(
+        {
+            'A100-80GB': 0
+        },
+        kubernetes_context='east',
+        physical_cluster_uid='cluster-east').pool_snapshots[0]
+    phx_h200 = _allocation_map(
+        {
+            'H200': 55
+        },
+        kubernetes_context='phx',
+        physical_cluster_uid='cluster-phx').pool_snapshots[0]
+    allocation = reserved_fill_planner.AuthenticatedAllocationMap.create(
+        allocation_generation=5,
+        allocation_claim_generation=11,
+        service_version=1,
+        ordinary_zero_cost_admission_sequence_high_water=17,
+        reconciliation_gate_generation=19,
+        reclaim_fleet_bundle_sha256='a' * 64,
+        reclaim_policy_revision='test-policy',
+        reclaim_provider_inventory_sha256='b' * 64,
+        utilization_gate_armed=True,
+        utilization_demonstrated_need=55,
+        utilization_demand_witness_sha256=None,
+        utilization_ceiling=55,
+        upward_grants_settled=True,
+        pool_snapshots=(east_a100, east_a100_80gb, phx_h200))
+    _mock_current_allocation(monkeypatch, allocation)
+
+    spec = serve_state.get_spec('svc', 1)
+    assert spec is not None
+    assert spec.adaptive_scale_up is None
+    assert spec.max_scale_up_rate_percentage == 100
+    assert spec.scale_up_rate_min_replicas == 50
+    assert spec.scale_up_rate_period_seconds == 60
+    autoscaler = autoscalers.Autoscaler.from_spec('svc', spec, version=1)
+    assert isinstance(autoscaler, autoscalers.ConcurrencyAutoscaler)
+    autoscaler.set_configured_accelerator_shapes({
+        'L4': 1,
+        'A100': 1,
+        'A100-80GB': 1,
+        'H200': 1,
+    })
+    prepared_inputs = autoscalers.ScalingDecisionInputs(
+        replica_ids=(),
+        gpu_shape_handles={},
+        historical_scaling_values={},
+        cold_paid_accelerator_order=('L4',),
+        prospective_paid_accelerator_order=('L4',))
+    manager = types.SimpleNamespace(
+        max_live_paid_gpu_units=100,
+        workspace='workspace-a',
+        spot_placer=None,
+        prepare_paid_launch_specs=mock.Mock(return_value=()))
+    ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
+    ctrl._service_name = 'svc'
+    ctrl._service_hash = 'svc-hash'
+    ctrl._replica_manager = manager
+    ctrl._autoscaler = autoscaler
+    ctrl._routing_state_lock = threading.RLock()
+    ctrl._actuation_epoch_lock = threading.RLock()
+    ctrl._actuation_generation = 0
+    ctrl._actuation_stop = threading.Event()
+    ctrl._reconcile_generation = 0
+    ctrl._durable_demand_snapshot = None
+    ctrl._scale_reconcile_coordinator = types.SimpleNamespace(generation=0,
+                                                              notify=lambda: 0)
+    ctrl._ordinary_launch_binding_authority = (
+        ordinary_launch_binding.ControllerBindingAuthority(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_workspace='workspace-a',
+            service_lifecycle_epoch=3,
+            controller_pid=123,
+            controller_ip='10.0.0.5',
+            controller_incarnation=incarnation,
+            controller_owner_epoch=4,
+            capable=True,
+            binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=3,
+            non_pool_capable=True,
+            non_pool_binding_protocol_version=(
+                ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+            non_pool_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            non_pool_capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+            non_pool_receipt_protocol_version=(
+                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)))
+
+    def _admit():
+        planning_fingerprint = (
+            serve_state.get_scale_planning_state_fingerprint(
+                'svc', require_version=True))
+        assert planning_fingerprint is not None
+        result = ctrl._plan_and_admit_current_capacity(
+            autoscaler,
+            1,
+            0,
+            0,
+            planning_fingerprint,
+            prepared_inputs, [],
+            sequenced_reserved_fill=True)
+        assert result is not None
+        return result[0]
+
+    first = _admit()
+    demand_state.ingest_report('svc', 'svc-hash', _zero_report(3))
+    committed = _admit()
+
+    assert committed.candidate.source_generation > first.candidate.source_generation
+    assert committed.candidate.kind is (
+        capacity_planning.CapacityPlanKind.FRESH_ZERO_RETENTION)
+    assert committed.candidate.wave_limited_actuation_target.total() == 0
+    assert committed.candidate.reserved_launch_target.total() == 0
+    assert committed.authority.remaining_launch_capacity() == {}
+    assert committed.planner_snapshot.configured_accelerators == ('L4', 'A100',
+                                                                  'A100-80GB',
+                                                                  'H200')
+    assert (committed.planner_snapshot.prior_candidate.
+            physical_gpu_width_by_accelerator.as_dict() == {
+                'A100': 1,
+                'A100-80GB': 1,
+                'H200': 1,
+                'L4': 1,
+            })
 
 
 def test_gate_covered_plan_commits_reservation_before_paid_residual(
