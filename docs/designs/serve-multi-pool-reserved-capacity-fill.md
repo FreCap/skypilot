@@ -3,44 +3,43 @@
 Last updated: 2026-08-31
 
 Status: **the exact-card compatible and statically disjoint edges are
-production-qualified; fixed-wave atomic paid admission is merged and deployed,
-but final production qualification is blocked by an old-incarnation teardown
-authority defect**. One
+production-qualified; fixed-wave atomic paid admission and the final-deletion
+authority census are deployed, while two source-qualified read-side
+corrections still require one immutable deployment and production proof**. One
 PostgreSQL-authoritative planner is the canonical source path for both
 reservation-aware actuation and paid Spot residual. Historical production runs
-proved complete East occupancy,
-Kueue-bounded PHX occupancy, reclaim, mixed reserved-plus-Spot execution,
-at-least-100 Spot scale-out, 10,000 authenticated warm requests, and exact
-provider teardown. Full idle research occupancy is no longer a steady-state
-goal: the current service uses `utilization_gate: true`, so it consumes only
-capacity justified by demand and returns that capacity to the unchanged
-scheduler when idle.
+proved complete East occupancy, Kueue-bounded PHX occupancy, reclaim, mixed
+reserved-plus-Spot execution, at-least-100 Spot scale-out, 10,000 authenticated
+warm requests, and exact provider teardown. Full idle research occupancy is no
+longer a steady-state goal: the current service uses `utilization_gate: true`,
+so it consumes only capacity justified by demand and returns that capacity to
+the unchanged scheduler when idle.
 
-Release `1.1.1576`, source merge
-`2ca979f74cd9e7287ca32846c7ef6278aa2f8de4`, deployed PR #1807 homogeneously at
-Helm revision 692. The fixed-wave policy and one-transaction
+Release `1.1.1577`, source merge
+`96cb18f63827bf128f846ed4970325f788652754`, deployed PR #1808 homogeneously.
+The active Helm revision 695 is a rollback to the exact revision-693 values and
+image after a later failed upgrade; all API/controller/executor roles still run
+the immutable `1.1.1577` digest. The fixed-wave policy and one-transaction
 plan/head/policy/replica/claim admission path passed the focused PostgreSQL
-suite and a 100-replica atomic admission wave. The first clean-recreation
-production proof then failed closed before provider admission: two detached
-old-incarnation associations were the only non-inert rows in an 8,994-row
-history, so no paid claim, Spot VM, disk, or provider request was created.
+suite and a 100-replica atomic admission wave. The final-deletion census now
+makes future teardown conditional on the complete same-name authority graph.
 
-The failure exposed a lifecycle-boundary defect outside the planner. Final
-service deletion settles and quiesces associations discovered through current
-`ReplicaInfo` rows, then removes the service and replica rows without one final
-transaction-local census of that incarnation's ordinary-launch authority.
-A detached or contradictory association can therefore outlive an apparently
-successful teardown and correctly block the next format-6 genesis. The
-canonical correction is to make final deletion conditional on the existing
-association, terminal-request, execution-quiescence, provider-evidence,
-queue/pin, claim/waiter, replica, and Kueue proofs for the exact retiring
-service name. Unlike steady planning, deletion cannot assume that a strict
-format-6 genesis receipt exists, so it performs the complete retained-history
-census that the next genesis would perform. It adds no table or blanket
-teardown receipt and does not weaken genesis. Existing malformed orphan history
-is adjudicated separately using its exact immutable provider identity and fresh
-provider absence; service-row absence, age, or a successor hash never
-manufactures safety.
+Clean recreation then produced lifecycle 150 and failed closed before provider
+admission for two independent read-side reasons. First, exactly two of 8,994
+detached old-incarnation associations retained canonical post-quiescence
+`UNKNOWN` observations even though their durable effect boundary was
+`PRE_EFFECT_TERMINAL`/`NOT_STARTED`. The shared final-deletion/genesis
+classifier treated every non-`NOT_QUERIED` observation as provider-possible.
+The source-qualified correction accepts only the exact neutral historical
+shape described below; it does not infer provider absence or weaken any
+provider-effect path. Second, the reclaim-policy renewal treated East's exact
+zero matching GPU nodes as topology nonconformance, aborting otherwise healthy
+PHX receipt renewal. The source-qualified correction records typed zero for an
+empty context, while concrete launch authority still requires positive capacity
+for the target flavor. Neither correction adds a schema, migration, Kueue
+object, infrastructure object, EFS path, or alternate planner. Immutable image
+deployment, reclaim-gate reauthorization, fresh receipt proof, format-6 genesis
+and the current mixed/Spot campaigns remain open.
 
 Lifecycle 148 on the preceding `1.1.1575` release accepted a sustained
 exact-L4 pressure test: 270,000 attempts over 184.8 seconds produced a raw logical target of
@@ -1836,6 +1835,15 @@ timestamped at observation start and expires after the conservative authority
 horizon, currently 180 seconds. A newer blackout prevents fallback to an older
 success.
 
+An exact empty or deletion-only Kubernetes NodeList is successful typed
+topology evidence with zero matching nodes; it is not topology nonconformance.
+It contributes zero capacity and may participate in whole-fleet proof renewal
+without suppressing a healthy sibling context. A launch authorization still
+requires at least one positive matching node for the target accelerator's
+reviewed flavor. A returned node that violates the exact selector, product,
+resource name or per-node GPU width remains hard nonconformance rather than
+being silently skipped.
+
 Starting an observation consumes no capacity. Admission and first successful
 materialization advance separate PostgreSQL sequences. These commit-order
 sequences, not wall clocks or readiness guesses, prevent an observation from
@@ -2114,6 +2122,21 @@ and association revision in the transaction that issued it; it never weakens
 the generic provider-absence validator. Likewise, a pre-effect terminal graph
 is accepted only when its inert receipt matches the complete locked service and
 replica snapshot, not merely its own association fields.
+
+``PRE_EFFECT_TERMINAL`` with effect phase ``NOT_STARTED`` is itself the
+provider-free authority boundary: the supported executor must durably compare
+and swap that phase to ``PROVIDER_IO`` before entering provider I/O. The normal
+closed evidence is therefore ``NOT_QUERIED``. Historical generic-profile
+writers could additionally record ``UNKNOWN`` after quiescence when that
+profile had no durable provider UID. That observation is neutral, not provider
+absence, only when its exact six-field
+``immutable-provider-identity-v1``/``profile-has-no-durable-provider-uid``
+payload is bound to the association, cluster, profile and replica record, its
+digest is canonical, and it postdates exact executor quiescence. Any other
+``UNKNOWN`` shape, ``PRESENT``/``REPLACED`` evidence, provider-effect phase,
+malformed envelope or live reference remains blocking. Final deletion and
+headless genesis consume this same classifier; neither rewrites the retained
+audit row.
 
 The barrier is one exhaustive same-name relationship census, not
 independent best-effort probes. It locks requests reached by either the
@@ -3255,21 +3278,19 @@ at-least-100 Spot scale-out, 10,000-request warm transport, mixed
 reserved-plus-Spot execution, and exact provider drain. They do not replace
 these remaining current-writer acceptance gates:
 
-1. Merge and deploy the final-deletion authority census. Its real-PostgreSQL
-   gate includes current and old-incarnation associations, exact Kueue Pod and
-   admissionless provider-absence proofs, ordinary-paid and reserved-fill
-   pre-effect receipts, reverse request edges, all pin kinds, ambiguous legacy
-   launches, unknown intent states, transaction rollback, and the deliberately
-   reversed intent-key and paid-pool lock-order schedules. Then use exact
-   provider absence to adjudicate the two contradictory historical rows; never
-   manufacture safety by deleting them directly.
-2. From complete service/provider exact zero, build one immutable
-   image, keep Serve writes stopped, and deploy every API/controller/executor
-   role homogeneously with Helm. Strictly reject formats 1--5 and verify the
-   exact runtime digest before recreation.
-3. Recreate `boltz-l4-fleet` with the reviewed heterogeneous YAML,
-   `min_replicas: 0`, fill floor 0, `utilization_gate: true`, Spot-only paid
-   candidates, no task-owned Kubernetes override, and PostgreSQL-only state.
+1. Merge the exact pre-effect-neutral and zero-capacity-context corrections,
+   build one immutable image, and deploy every API/controller/executor and GCP
+   login-init role homogeneously with Helm. Verify the exact runtime digest,
+   PostgreSQL-only state and absence of Kueue/platform/infrastructure changes.
+2. Reauthorize one reclaim-policy generation for revision `1.1.1578`. Require
+   fresh simultaneous East-zero and PHX-positive receipts, successful complete
+   claim renewal, zero East launch authority, and a positive target-flavor
+   receipt before any concrete reserved launch.
+3. Require recreated lifecycle 150 to commit its first strict format-6 genesis
+   without changing or deleting the two retained historical rows. Verify the
+   service still has `min_replicas: 0`, fill floor 0,
+   `utilization_gate: true`, Spot-only paid candidates, no task-owned
+   Kubernetes override, and PostgreSQL-only state.
 4. Prove one format-6 demand generation survives multiple additive route
    expansions and produces at least two actuation waves. Under flexible/mixed
    demand, require new compatible reserved intents to commit and appear in

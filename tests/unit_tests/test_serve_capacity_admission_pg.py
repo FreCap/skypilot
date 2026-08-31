@@ -232,6 +232,67 @@ def _insert_old_incarnation_tombstone(
     }
 
 
+def _insert_old_pre_effect_unknown_tombstone(
+    engine: sqlalchemy.engine.Engine,) -> dict[str, object]:
+    """Insert an exact detached v2 pre-effect UNKNOWN observation."""
+    tombstone = _insert_old_incarnation_tombstone(engine)
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+        authorization_reference='paid-capacity:old-plan',
+        authorization_generation=1,
+        authorization_payload={'capacity_plan_generation': 1})
+    payload = {
+        'association_id': str(tombstone['association_id']),
+        'cluster_name': 'svc-old-140',
+        'probe_contract': 'immutable-provider-identity-v1',
+        'profile_kind': profile.kind.value,
+        'reason': 'profile-has-no-durable-provider-uid',
+        'replica_record_id': str(tombstone['replica_record_id']),
+    }
+    digest = ordinary_launch_binding._canonical_sha256({
+        'association_id': str(tombstone['association_id']),
+        'evidence': ordinary_launch_binding.ProviderEvidence.UNKNOWN.value,
+        'payload': payload,
+        'profile_digest': profile.digest,
+    })
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with engine.begin() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        connection.execute(
+            sqlalchemy.update(associations).where(
+                associations.c.association_id ==
+                tombstone['association_id']).values(
+                    binding_protocol_version=2,
+                    profile_kind=profile.kind.value,
+                    profile_version=profile.version,
+                    profile_digest=profile.digest,
+                    capability_cohort_epoch=10,
+                    capability_profile_set_digest='c' * 64,
+                    receipt_protocol_version=1,
+                    authorization_kind=profile.authorization_kind.value,
+                    authorization_reference=profile.authorization_reference,
+                    authorization_generation=(profile.authorization_generation),
+                    authorization_digest=profile.authorization_digest,
+                    reconciliation_outcome=(
+                        ordinary_launch_binding.ReconciliationOutcome.
+                        PRE_EFFECT_TERMINAL.value),
+                    provider_evidence=(
+                        ordinary_launch_binding.ProviderEvidence.UNKNOWN.value),
+                    provider_evidence_observed_at=now,
+                    provider_evidence_payload=payload,
+                    provider_evidence_digest=digest))
+        row = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.association_id ==
+                tombstone['association_id'])).mappings().one()
+        assert ordinary_launch_binding.settled_association_proves_execution_quiescence(
+            row)
+    return tombstone
+
+
 def _insert_old_tombstone_reference(
     engine: sqlalchemy.engine.Engine,
     tombstone: dict[str, object],
@@ -2667,6 +2728,106 @@ def test_current_planner_clean_recreation_ignores_detached_old_tombstone(
     assert retained == 1
 
 
+def test_current_planner_clean_recreation_ignores_exact_pre_effect_unknown(
+        capacity_database):
+    """A canonical UNKNOWN cannot weaken definitive pre-effect authority."""
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    tombstone = _insert_old_pre_effect_unknown_tombstone(engine)
+    planner = mock.Mock(side_effect=lambda snapshot, supply: _current_decision(
+        snapshot, supply, 0))
+
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
+                                       service_hash='svc-hash',
+                                       service_lifecycle_epoch=3,
+                                       service_version=1,
+                                       accounting_cards={'l4': 1},
+                                       backend_num_nodes=1,
+                                       sequenced_reserved_fill=False,
+                                       planner=planner)
+
+    planner.assert_called_once()
+    assert committed.authority.generation == 1
+    assert committed.paid_launch_receipt.members == ()
+    with engine.connect() as connection:
+        retained = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == tombstone['association_id'])).scalar_one()
+    assert retained == 1
+
+
+@pytest.mark.parametrize(
+    'malformation',
+    ['identity', 'digest', 'present', 'timestamp', 'contract', 'reason'])
+def test_current_planner_rejects_noncanonical_pre_effect_observation(
+        capacity_database, malformation):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    tombstone = _insert_old_pre_effect_unknown_tombstone(engine)
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        row = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.association_id ==
+                tombstone['association_id'])).mappings().one()
+        values: dict[str, object]
+        if malformation == 'timestamp':
+            values = {
+                'provider_evidence_observed_at': row['execution_quiesced_at'] -
+                                                 datetime.timedelta(seconds=1)
+            }
+        elif malformation == 'digest':
+            values = {'provider_evidence_digest': 'f' * 64}
+        else:
+            payload = dict(row['provider_evidence_payload'])
+            evidence = row['provider_evidence']
+            if malformation == 'identity':
+                payload['replica_record_id'] = str(uuid.uuid4())
+            elif malformation == 'present':
+                evidence = ordinary_launch_binding.ProviderEvidence.PRESENT.value
+            elif malformation == 'contract':
+                payload['probe_contract'] = 'noncanonical-provider-proof-v1'
+            else:
+                payload['reason'] = 'ambiguous-provider-state'
+            values = {
+                'provider_evidence': evidence,
+                'provider_evidence_payload': payload,
+                'provider_evidence_digest':
+                    ordinary_launch_binding._canonical_sha256({
+                        'association_id': str(row['association_id']),
+                        'evidence': evidence,
+                        'payload': payload,
+                        'profile_digest': row['profile_digest'],
+                    }),
+            }
+        connection.execute(
+            sqlalchemy.update(associations).where(
+                associations.c.association_id ==
+                tombstone['association_id']).values(**values))
+    planner = mock.Mock()
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='retained authority graph'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner)
+
+    planner.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ('association_hash', 'association_epoch', 'binding_mode'),
     [('svc-hash', 3, 'bound'), ('retained-old-hash', 2, 'legacy')])
@@ -2714,10 +2875,14 @@ def test_final_service_delete_rejects_noninert_same_name_association(
                     tombstone['association_id'])).scalar_one() == 1
 
 
-def test_final_service_delete_preserves_inert_old_history(capacity_database):
+@pytest.mark.parametrize('pre_effect_unknown', [False, True])
+def test_final_service_delete_preserves_inert_old_history(
+        capacity_database, pre_effect_unknown):
     """A complete census accepts and retains detached inert audit history."""
     engine, _, _ = capacity_database
-    tombstone = _insert_old_incarnation_tombstone(engine)
+    tombstone = (_insert_old_pre_effect_unknown_tombstone(engine)
+                 if pre_effect_unknown else
+                 _insert_old_incarnation_tombstone(engine))
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).where(

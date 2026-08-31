@@ -521,7 +521,7 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
             expected_node = expected_nodes[node.flavor]
             if (type(node.flavor) is not str or
                     type(node.non_deleting_node_count) is not int or
-                    node.non_deleting_node_count <= 0 or
+                    node.non_deleting_node_count < 0 or
                     type(node.product_label_value) is not str or
                     node.product_label_value !=
                     expected_node['product_label_value'] or
@@ -602,11 +602,11 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                 ReclaimProviderProofUnavailableError) as error:
             raise reclaim.ReclaimProviderProofUnavailableError(
                 'The Boltz deployment has no fresh exact reclaim-provider '
-                'receipt for this launch.') from error
+                f'receipt for context {context_name!r}.') from error
         except reserved_fill_reclaim_proofs.ReclaimProviderProofError as error:
             raise reclaim.ReclaimAttestationError(
                 'The Boltz deployment reclaim-provider receipt is invalid '
-                'for this launch.') from error
+                f'for context {context_name!r}.') from error
         self._require_launch_deadline(deadline_monotonic)
         proof = self._decode_context_proof_summary(receipt.proof_payload,
                                                    context_name=context_name)
@@ -624,6 +624,22 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
     ) -> tuple[_ContextProof, reclaim.ReclaimProviderProofReference]:
         return self._read_launch_context(context_name, identity,
                                          gate_generation, deadline_monotonic)
+
+    @staticmethod
+    def _require_positive_launch_flavor(
+        context: Mapping[str, Any],
+        accelerator: str,
+        proof: _ContextProof,
+    ) -> None:
+        """Require present hardware only at the terminal launch boundary."""
+        target_flavors = set(context['accelerators'][accelerator]['flavors'])
+        if not any(node.flavor in target_flavors and
+                   node.non_deleting_node_count > 0
+                   for node in proof.kubernetes.node_flavors):
+            raise reclaim.ReclaimProviderProofUnavailableError(
+                'The fresh exact reclaim-provider receipt has no '
+                f'non-deleting reviewed Node for accelerator {accelerator!r} '
+                f'in context {context["kubernetes_context"]!r}.')
 
     def _proof_payload(self, operation: str, proofs: Mapping[str,
                                                              _ContextProof],
@@ -878,6 +894,7 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         proof, reference = self._attest_launch_context(
             scope.kubernetes_context, expected_identity,
             expected_gate_generation, deadline_monotonic)
+        self._require_positive_launch_flavor(context, scope.accelerator, proof)
         completed = time.monotonic()
         self._require_launch_deadline(deadline_monotonic)
         authorization = reclaim.ReclaimLaunchAuthorization(

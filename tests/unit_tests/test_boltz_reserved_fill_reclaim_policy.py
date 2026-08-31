@@ -108,7 +108,7 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
         'namespace_uid'] == '44f8d097-6591-46cf-9b8e-59deea8777e7'
     assert bundle.policy_revision == (
         f'boltz-reserved-fill-reclaim-policy/{POLICY_REVISION}')
-    assert POLICY_REVISION == '1.1.1491'
+    assert POLICY_REVISION == '1.1.1578'
 
 
 def test_policy_exposes_provider_free_physical_pool_inventory():
@@ -350,18 +350,21 @@ def _edge(context: dict, accelerator: str = 'h200') -> reclaim.ReclaimClaimEdge:
 
 def _launch_scope(
     policy: policy_lib.BoltzReservedFillReclaimPolicy,
+    context_name: str = 'phx_research_cluster_eks',
+    accelerator: str = 'h200',
 ) -> reclaim.ReclaimLaunchScope:
-    context = policy._bundle.fleet_context('phx_research_cluster_eks')
+    context = policy._bundle.fleet_context(context_name)
     return reclaim.ReclaimLaunchScope(
         service_name='service',
         service_version=1,
-        pool_key=json.dumps(['v2', context['physical_cluster_uid'], 'h200']),
+        pool_key=json.dumps(
+            ['v2', context['physical_cluster_uid'], accelerator]),
         service_generation=1,
         physical_cluster_uid=context['physical_cluster_uid'],
         kubernetes_context=context['kubernetes_context'],
-        accelerator='h200',
-        accelerator_count=1,
-        projected_admission=_admission(context, 'h200'))
+        accelerator=accelerator,
+        accelerator_count=context['accelerators'][accelerator]['count'],
+        projected_admission=_admission(context, accelerator))
 
 
 def _claim(context: dict,
@@ -421,6 +424,22 @@ def _context_proof(context: dict, provider: dict) -> policy_lib._ContextProof:
                 for node in provider['node_inventory'])))
 
 
+def _context_proof_with_node_counts(
+        context: dict, provider: dict,
+        counts: dict[str, int]) -> policy_lib._ContextProof:
+    proof = _context_proof(context, provider)
+    return dataclasses.replace(
+        proof,
+        kubernetes=dataclasses.replace(
+            proof.kubernetes,
+            node_flavors=tuple(
+                dataclasses.replace(node,
+                                    non_deleting_node_count=counts.get(
+                                        node.flavor,
+                                        node.non_deleting_node_count))
+                for node in proof.kubernetes.node_flavors)))
+
+
 def _set_summary_path(summary: dict, path: tuple[str | int, ...],
                       value: object) -> None:
     target: Any = summary
@@ -441,7 +460,7 @@ def _set_summary_path(summary: dict, path: tuple[str | int, ...],
         ('kubernetes', ('custom_scheduler_deployment_proven',), 'yes'),
         ('kubernetes',
          ('resource_flavor_topology_names', 0, 1), 'wrong-topology'),
-        ('kubernetes', ('node_flavors', 0, 'non_deleting_node_count'), 0),
+        ('kubernetes', ('node_flavors', 0, 'non_deleting_node_count'), -1),
         ('kubernetes',
          ('node_flavors', 0, 'product_label_value'), 'wrong-product'),
     ),
@@ -471,6 +490,22 @@ def test_cached_provider_summary_is_bound_to_exact_reviewed_context(
         else:
             policy._decode_kubernetes_proof_summary(summary,
                                                     context_name=context_name)
+
+
+def test_cached_provider_summary_accepts_exact_zero_node_count():
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    context_name = 'phx_research_cluster_eks'
+    context = policy._bundle.fleet_context(context_name)
+    provider = policy._bundle.provider_context(context_name)
+    proof = _context_proof_with_node_counts(context, provider,
+                                            {'ml.p5e.48xlarge': 0})
+    summary, _ = reclaim_proofs.canonical_proof_payload(
+        dataclasses.asdict(proof.kubernetes))
+
+    decoded = policy._decode_kubernetes_proof_summary(summary,
+                                                      context_name=context_name)
+
+    assert decoded.node_flavors[0].non_deleting_node_count == 0
 
 
 def _fake_attest(policy: policy_lib.BoltzReservedFillReclaimPolicy):
@@ -529,6 +564,53 @@ def test_two_arbitrary_services_share_one_canonical_claim_path(monkeypatch):
         assert authorization.identity == identity
 
 
+def test_zero_capacity_context_does_not_block_positive_claim_peer(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    identity = policy.policy_identity()
+    east_name = 'prod_research_cluster_eks'
+    phx_name = 'phx_research_cluster_eks'
+    east = policy._bundle.fleet_context(east_name)
+    phx = policy._bundle.fleet_context(phx_name)
+    proofs = {
+        east_name: _context_proof_with_node_counts(
+            east, policy._bundle.provider_context(east_name), {
+                'ml.p4d.24xlarge': 0,
+                'ml.p4de.24xlarge': 0,
+            }),
+        phx_name: _context_proof(phx,
+                                 policy._bundle.provider_context(phx_name)),
+    }
+
+    def read(context_name, expected_identity, gate_generation, _deadline):
+        return proofs[context_name], reclaim.ReclaimProviderProofReference(
+            receipt_nonce=hashlib.sha256(context_name.encode()).hexdigest(),
+            proof_sha256='d' * 64,
+            identity=expected_identity,
+            gate_generation=gate_generation,
+            kubernetes_context=context_name,
+            completed_monotonic=time.monotonic())
+
+    receipt_read = mock.Mock(side_effect=read)
+    monkeypatch.setattr(policy, '_read_launch_context', receipt_read)
+    monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
+    scope = reclaim.ReclaimClaimSetScope(
+        service_name='mixed-capacity-service',
+        service_incarnation='mixed-capacity-incarnation',
+        service_version=1,
+        semantic_hash='mixed-capacity-semantic',
+        edges=tuple(sorted((_edge(east, 'a100'), _edge(phx, 'h200')))))
+
+    authorization = policy.authorize_claim_set(
+        scope,
+        expected_identity=identity,
+        expected_gate_generation=7,
+        deadline_monotonic=time.monotonic() + 5)
+
+    assert authorization.scope == scope
+    assert {call.args[0] for call in receipt_read.call_args_list
+           } == {east_name, phx_name}
+
+
 def test_claim_ticket_is_minted_after_proof_logging(monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
     clock = [100.0]
@@ -565,7 +647,7 @@ def test_unchanged_policy_authorizes_current_service_version_refresh(
     context = policy._bundle.fleet_context('phx_research_cluster_eks')
     identity = policy.policy_identity()
     assert identity.policy_revision == (
-        'boltz-reserved-fill-reclaim-policy/1.1.1491')
+        'boltz-reserved-fill-reclaim-policy/1.1.1578')
 
     authorizations = []
     for service_version in (63, 64):
@@ -799,6 +881,47 @@ def test_launch_rejects_accelerator_scheduling_mismatch(monkeypatch):
     provider_calls.assert_not_called()
 
 
+def test_launch_requires_positive_capacity_for_target_flavor(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    context_name = 'prod_research_cluster_eks'
+    context = policy._bundle.fleet_context(context_name)
+    provider = policy._bundle.provider_context(context_name)
+    proof = _context_proof_with_node_counts(context, provider, {
+        'ml.p4d.24xlarge': 0,
+        'ml.p4de.24xlarge': 1,
+    })
+    identity = policy.policy_identity()
+    reference = reclaim.ReclaimProviderProofReference(
+        receipt_nonce='c' * 64,
+        proof_sha256='d' * 64,
+        identity=identity,
+        gate_generation=1,
+        kubernetes_context=context_name,
+        completed_monotonic=time.monotonic())
+    receipt_read = mock.Mock(return_value=(proof, reference))
+    emit_proof = mock.Mock()
+    monkeypatch.setattr(policy, '_attest_launch_context', receipt_read)
+    monkeypatch.setattr(policy, '_emit_proof', emit_proof)
+
+    with pytest.raises(reclaim.ReclaimProviderProofUnavailableError,
+                       match="accelerator 'a100'"):
+        policy.authorize_launch(_launch_scope(policy, context_name, 'a100'),
+                                expected_identity=identity,
+                                expected_gate_generation=1,
+                                deadline_monotonic=time.monotonic() + 5)
+
+    emit_proof.assert_not_called()
+    authorization = policy.authorize_launch(
+        _launch_scope(policy, context_name, 'a100-80gb'),
+        expected_identity=identity,
+        expected_gate_generation=1,
+        deadline_monotonic=time.monotonic() + 5)
+
+    assert authorization.scope.accelerator == 'a100-80gb'
+    assert authorization.provider_proof_reference == reference
+    emit_proof.assert_called_once()
+
+
 @pytest.mark.parametrize('deadline', (True, float('nan'), float('inf')))
 def test_launch_malformed_deadline_is_permanent(monkeypatch, deadline):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
@@ -922,6 +1045,49 @@ def test_activation_attests_whole_fleet_with_zero_current_claims(monkeypatch):
     assert not evidence.claimed_contexts
     assert evidence.identity == policy.policy_identity()
     assert attest.call_args.args[0] == policy._bundle.contexts
+
+
+def test_activation_accepts_zero_capacity_context_and_positive_peer(
+        monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    east_name = 'prod_research_cluster_eks'
+    phx_name = 'phx_research_cluster_eks'
+    east = policy._bundle.fleet_context(east_name)
+    phx = policy._bundle.fleet_context(phx_name)
+    proofs = {
+        east_name: _context_proof_with_node_counts(
+            east, policy._bundle.provider_context(east_name), {
+                'ml.p4d.24xlarge': 0,
+                'ml.p4de.24xlarge': 0,
+            }),
+        phx_name: _context_proof(phx,
+                                 policy._bundle.provider_context(phx_name)),
+    }
+    attest = mock.Mock(return_value=(
+        proofs, {context_name: time.monotonic() for context_name in proofs}))
+    emit_proof = mock.Mock()
+    monkeypatch.setattr(policy, '_attest_contexts', attest)
+    monkeypatch.setattr(policy, '_emit_proof', emit_proof)
+    claims = (_claim(phx, 'h200'),)
+
+    evidence = policy.attest_activation(claims,
+                                        writer_image_digest='sha256:' +
+                                        'b' * 64,
+                                        deadline_monotonic=time.monotonic() + 5)
+
+    assert evidence.claimed_contexts == claims
+    assert attest.call_args.args[0] == policy._bundle.contexts
+    payload_by_context = {
+        context['kubernetes_context']: context
+        for context in emit_proof.call_args.args[0]['contexts']
+    }
+    assert {
+        node['non_deleting_node_count']
+        for node in payload_by_context[east_name]['kubernetes']['node_flavors']
+    } == {0}
+    assert all(
+        node['non_deleting_node_count'] > 0
+        for node in payload_by_context[phx_name]['kubernetes']['node_flavors'])
 
 
 def test_activation_accepts_managed_phx_claim(monkeypatch):
@@ -1061,6 +1227,52 @@ def test_renewal_context_negative_wins_over_never_returning_peer(monkeypatch):
     finally:
         release_peer.set()
     assert _wait_for_no_thread('boltz-reclaim-renew')
+
+
+def test_renewal_accepts_zero_capacity_context_and_positive_peer(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    east_name = 'prod_research_cluster_eks'
+    published = {}
+
+    def attest(names, _deadline):
+        context_name, = tuple(names)
+        context = policy._bundle.fleet_context(context_name)
+        provider = policy._bundle.provider_context(context_name)
+        if context_name == east_name:
+            proof = _context_proof_with_node_counts(context, provider, {
+                'ml.p4d.24xlarge': 0,
+                'ml.p4de.24xlarge': 0,
+            })
+        else:
+            proof = _context_proof(context, provider)
+        completed = time.monotonic()
+        return {context_name: proof}, {context_name: completed}
+
+    class _Repository:
+        """Exercise the production proof and validation callbacks."""
+
+        @staticmethod
+        def renew(**kwargs):
+            candidate = kwargs['prove']()
+            payload, _ = reclaim_proofs.canonical_proof_payload(
+                candidate.proof_payload)
+            assert kwargs['validate'](payload)
+            published[kwargs['kubernetes_context']] = payload
+            return types.SimpleNamespace(proof_payload=payload,
+                                         publication_observed=False)
+
+    monkeypatch.setattr(policy, '_attest_contexts', attest)
+    monkeypatch.setattr(reclaim_proofs, 'ReclaimProviderProofRepository',
+                        _Repository)
+
+    assert not policy.renew_provider_proofs(
+        expected_identity=policy.policy_identity(),
+        expected_gate_generation=7,
+        deadline_monotonic=time.monotonic() + 5)
+
+    assert set(published) == set(policy._bundle.contexts)
+    east_nodes = published[east_name]['kubernetes']['node_flavors']
+    assert {node['non_deleting_node_count'] for node in east_nodes} == {0}
 
 
 def test_renewal_uses_distinct_refresh_and_handoff_reserves(monkeypatch):
@@ -2109,17 +2321,22 @@ def test_kubernetes_snapshot_fails_closed_on_drift(mutation, match):
         },
     }],
 ])
-def test_kubernetes_snapshot_requires_a_non_deleting_node(nodes):
+def test_kubernetes_snapshot_records_exact_zero_non_deleting_nodes(nodes):
     bundle = bundle_lib.load_embedded_bundle()
     context = bundle.fleet_context('phx_research_cluster_eks')
     provider = bundle.provider_context('phx_research_cluster_eks')
     snapshot = _kubernetes_snapshot(context, provider)
     snapshot['nodes']['ml.p5e.48xlarge']['items'] = nodes
 
-    with pytest.raises(
-            kubernetes_attestation.KubernetesAttestationNonconformanceError,
-            match='no non-deleting Node'):
-        kubernetes_attestation.validate_snapshot(context, provider, snapshot)
+    proof = kubernetes_attestation.validate_snapshot(context, provider,
+                                                     snapshot)
+
+    assert proof.node_flavors == (kubernetes_attestation.NodeFlavorProof(
+        flavor='ml.p5e.48xlarge',
+        non_deleting_node_count=0,
+        product_label_value='NVIDIA-H200',
+        resource_name='nvidia.com/gpu',
+        capacity_per_node=8),)
 
 
 def test_kubernetes_snapshot_requires_complete_node_selector_match():

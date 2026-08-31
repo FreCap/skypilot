@@ -505,7 +505,13 @@ def _validate_node_inventory(
             if any(
                     labels.get(key) != value
                     for key, value in selector_labels.items()):
-                continue
+                # The API read was issued with this exact selector.  A
+                # non-deleting out-of-selector item is therefore a malformed
+                # completed inventory, not evidence that the flavor is
+                # currently empty.
+                raise KubernetesAttestationError(
+                    f'Node {name!r} does not match the complete reviewed '
+                    'ResourceFlavor instance selector.')
             capacity = _dict(
                 _dict(node.get('status'),
                       f'{name} Node status').get('capacity'),
@@ -518,10 +524,6 @@ def _validate_node_inventory(
                     f'Node {name!r} does not match the reviewed GPU product '
                     'and capacity contract.')
             non_deleting_count += 1
-        if non_deleting_count == 0:
-            raise KubernetesAttestationError(
-                f'Flavor {flavor!r} has no non-deleting Node matching its '
-                'complete reviewed ResourceFlavor instance selector.')
         proofs.append(
             NodeFlavorProof(flavor=flavor,
                             non_deleting_node_count=non_deleting_count,

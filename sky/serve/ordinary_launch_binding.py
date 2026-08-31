@@ -5889,6 +5889,47 @@ def _has_no_retained_association_graphs(
     return replica_records.isdisjoint(association_records)
 
 
+def _neutral_pre_effect_unknown_observation_is_inert(
+    association: Mapping[str, Any],
+    profile: NonPoolLaunchProfile,
+) -> bool:
+    """Validate a row-bound UNKNOWN observation after pre-effect quiescence.
+
+    A provider observation cannot weaken a definitive NOT_STARTED effect
+    boundary.  Older reconcilers nevertheless recorded UNKNOWN while
+    adjudicating some already-quiesced pre-effect launches.  Treat that
+    observation as neutral only when its canonical envelope is bound to this
+    exact association and was recorded after executor quiescence.
+    """
+    observed_at = association.get('provider_evidence_observed_at')
+    quiesced_at = association.get('execution_quiesced_at')
+    payload = association.get('provider_evidence_payload')
+    digest = association.get('provider_evidence_digest')
+    if (not isinstance(observed_at, datetime.datetime) or
+            not isinstance(quiesced_at, datetime.datetime) or
+            observed_at < quiesced_at or not isinstance(payload, Mapping) or
+            not isinstance(digest, str) or
+            _SHA256_RE.fullmatch(digest) is None):
+        return False
+    expected_payload = {
+        'association_id': str(association.get('association_id')),
+        'cluster_name': association.get('cluster_name'),
+        'probe_contract': 'immutable-provider-identity-v1',
+        'profile_kind': profile.kind.value,
+        'reason': 'profile-has-no-durable-provider-uid',
+        'replica_record_id': str(association.get('replica_record_id')),
+    }
+    if dict(payload) != expected_payload:
+        return False
+    expected_digest = _canonical_sha256({
+        'association_id': expected_payload['association_id'],
+        'evidence': ProviderEvidence.UNKNOWN.value,
+        'payload': expected_payload,
+        'profile_digest': profile.digest,
+    })
+    return digest == expected_digest
+
+
 def _replica_free_association_is_inert(association: Mapping[str, Any],) -> bool:
     """Validate history that no longer has a matching replica record.
 
@@ -6025,7 +6066,9 @@ def _replica_free_association_is_inert(association: Mapping[str, Any],) -> bool:
         return (observed_at is None and evidence_payload is None and
                 evidence_digest is None)
     if resolution is Resolution.PRE_EFFECT_TERMINAL:
-        return False
+        return bool(provider_evidence is ProviderEvidence.UNKNOWN and
+                    _neutral_pre_effect_unknown_observation_is_inert(
+                        association, profile))
     if not (isinstance(observed_at, datetime.datetime) and
             isinstance(evidence_payload, Mapping) and bool(evidence_payload) and
             isinstance(evidence_digest, str) and
