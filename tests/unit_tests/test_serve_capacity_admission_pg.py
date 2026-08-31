@@ -47,6 +47,7 @@ from sky.serve import serve_state_schema
 from sky.serve import serve_utils
 from sky.serve import service_spec
 from sky.serve import spot_placer
+from sky.serve import zero_cost_actuation
 from sky.serve import zero_cost_actuation_schema
 from sky.server.requests import postgres as request_postgres
 from sky.utils import common_utils
@@ -2664,6 +2665,300 @@ def test_current_planner_clean_recreation_ignores_detached_old_tombstone(
             where(ordinary_launch_binding.ordinary_launch_associations_table.c.
                   association_id == tombstone['association_id'])).scalar_one()
     assert retained == 1
+
+
+@pytest.mark.parametrize(
+    ('association_hash', 'association_epoch', 'binding_mode'),
+    [('svc-hash', 3, 'bound'), ('retained-old-hash', 2, 'legacy')])
+def test_final_service_delete_rejects_noninert_same_name_association(
+        capacity_database, association_hash, association_epoch, binding_mode):
+    """Teardown cannot orphan authority that the successor must reject."""
+    engine, _, _ = capacity_database
+    tombstone = _insert_old_incarnation_tombstone(engine)
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        connection.execute(
+            sqlalchemy.update(associations).where(
+                associations.c.association_id ==
+                tombstone['association_id']).values(
+                    service_hash=association_hash,
+                    service_lifecycle_epoch=association_epoch,
+                    resolution=ordinary_launch_binding.Resolution.BOUND.value,
+                    projected_at=None,
+                    pin_released_at=None,
+                    tombstone_not_before=None))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    status='SHUTTING_DOWN',
+                    ordinary_launch_binding_mode=binding_mode))
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='retains unresolved authority'):
+        serve_state.remove_service_completely('svc',
+                                              'svc-hash',
+                                              expected_lifecycle_epoch=3)
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc')).scalar_one() == 1
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(associations).where(
+                    associations.c.association_id ==
+                    tombstone['association_id'])).scalar_one() == 1
+
+
+def test_final_service_delete_preserves_inert_old_history(capacity_database):
+    """A complete census accepts and retains detached inert audit history."""
+    engine, _, _ = capacity_database
+    tombstone = _insert_old_incarnation_tombstone(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    status='SHUTTING_DOWN'))
+
+    assert serve_state.remove_service_completely('svc',
+                                                 'svc-hash',
+                                                 expected_lifecycle_epoch=3)
+
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc')).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(associations).where(
+                    associations.c.association_id ==
+                    tombstone['association_id'])).scalar_one() == 1
+
+
+def test_final_service_delete_rejects_same_name_kueue_authority(
+        capacity_database):
+    """A Kueue row from any incarnation blocks final name reuse."""
+    engine, _, _ = capacity_database
+    tombstone = _insert_old_incarnation_tombstone(engine)
+    _insert_old_tombstone_reference(engine, tombstone, 'kueue')
+    admissions = (kueue_lane_lineage_schema.serve_kueue_admissions_table)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    status='SHUTTING_DOWN'))
+
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict):
+        serve_state.remove_service_completely('svc',
+                                              'svc-hash',
+                                              expected_lifecycle_epoch=3)
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc')).scalar_one() == 1
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(admissions).where(
+                    admissions.c.service_name == 'svc')).scalar_one() == 1
+
+
+def _insert_final_delete_legacy_request(
+    engine: sqlalchemy.engine.Engine,
+    candidate_service_name: str | None,
+) -> str:
+    """Insert one controller-originated legacy launch request."""
+    request_id = f'legacy-request-{uuid.uuid4()}'
+    launch_context = {}
+    if candidate_service_name is not None:
+        launch_context[constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY] = (
+            candidate_service_name)
+    with engine.begin() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        connection.execute(
+            sqlalchemy.insert(request_postgres.REQUESTS).values(
+                request_id=request_id,
+                name='sky.launch',
+                handler_name='sky.execution:launch',
+                payload_type='sky.server.requests.payloads:LaunchBody',
+                payload_format='json',
+                payload_version=1,
+                producer_version='test',
+                payload_json={
+                    'is_launched_by_sky_serve_controller': True,
+                    'extra_launch_context': launch_context,
+                },
+                execution_class='normal',
+                status='RUNNING',
+                created_at=now,
+                schedule_type='short',
+                user_id='tenant-a',
+                should_retry=False,
+                ignore_return_value=False,
+                retryable=False,
+                execution_generation=1,
+                updated_at=now))
+    return request_id
+
+
+@pytest.mark.parametrize('candidate_service_name', ['svc', None])
+def test_final_service_delete_rejects_unbound_legacy_request(
+        capacity_database, candidate_service_name):
+    """A pre-binding request cannot survive deletion and act for a successor."""
+    engine, _, _ = capacity_database
+    request_id = _insert_final_delete_legacy_request(engine,
+                                                     candidate_service_name)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    status='SHUTTING_DOWN'))
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='legacy request authority'):
+        serve_state.remove_service_completely('svc',
+                                              'svc-hash',
+                                              expected_lifecycle_epoch=3)
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc')).scalar_one() == 1
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    request_id)).scalar_one() == 1
+
+
+def test_final_service_delete_rejects_quiesced_unscoped_legacy_launch(
+        capacity_database):
+    """Executor quiescence alone cannot prove an unscoped VM is absent."""
+    engine, _, _ = capacity_database
+    request_id = _insert_final_delete_legacy_request(engine, None)
+    with engine.begin() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id).values(
+                    status='SUCCEEDED',
+                    terminal_cause='handler_succeeded',
+                    finished_at=now,
+                    execution_quiescence_required=True,
+                    execution_quiesced_generation=1,
+                    execution_quiesced_at=now,
+                    updated_at=now))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    status='SHUTTING_DOWN'))
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='legacy request authority'):
+        serve_state.remove_service_completely('svc',
+                                              'svc-hash',
+                                              expected_lifecycle_epoch=3)
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc')).scalar_one() == 1
+
+
+def test_final_service_delete_ignores_attributed_other_service_legacy_request(
+        capacity_database):
+    """An exact other-service request does not poison this service's drain."""
+    engine, _, _ = capacity_database
+    request_id = _insert_final_delete_legacy_request(engine, 'other-service')
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    status='SHUTTING_DOWN'))
+
+    assert serve_state.remove_service_completely('svc',
+                                                 'svc-hash',
+                                                 expected_lifecycle_epoch=3)
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    request_id)).scalar_one() == 1
+
+
+@pytest.mark.parametrize(
+    'intent_kind',
+    ['same_hash_prior_lifecycle', 'orphan_committed', 'unknown_state'])
+def test_final_service_delete_rejects_orphan_nonterminal_intent(
+        capacity_database, intent_kind):
+    """Deletion cannot erase a nonterminal intent lacking its exact replica."""
+    engine, _, _ = capacity_database
+    intent_key = '6' * 64
+    intent_values = _kueue_intent_values(
+        intent_key,
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=(2 if intent_kind == 'same_hash_prior_lifecycle'
+                                 else 3))
+    if intent_kind == 'orphan_committed':
+        record_id = uuid.uuid4()
+        intent_values.update(state='COMMITTED',
+                             replica_id=98,
+                             replica_record_id=record_id,
+                             committed_at=intent_values['created_at'])
+    with engine.begin() as connection:
+        if intent_kind == 'unknown_state':
+            connection.exec_driver_sql(
+                'ALTER TABLE serve_zero_cost_actuation_intents '
+                'DROP CONSTRAINT serve052_zero_cost_intent_state_ck')
+            connection.exec_driver_sql(
+                'ALTER TABLE serve_zero_cost_actuation_intents '
+                'DROP CONSTRAINT serve052_zero_cost_intent_state_shape_ck')
+            intent_values['state'] = 'FUTURE_ACTIVE'
+        connection.execute(
+            sqlalchemy.insert(zero_cost_actuation_schema.
+                              serve_zero_cost_actuation_intents_table).values(
+                                  **intent_values))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    status='SHUTTING_DOWN'))
+
+    with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict,
+                       match='intent'):
+        serve_state.remove_service_completely('svc',
+                                              'svc-hash',
+                                              expected_lifecycle_epoch=3)
+
+    intents = (
+        zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc')).scalar_one() == 1
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(intents).where(
+                    intents.c.intent_idempotency_key ==
+                    intent_key)).scalar_one() == 1
 
 
 @pytest.mark.parametrize('reference_kind',

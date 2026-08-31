@@ -215,6 +215,20 @@ class ProviderEvidence(str, enum.Enum):
     REPLACED = 'REPLACED'
 
 
+@dataclasses.dataclass(frozen=True)
+class RetainedAuthorityCensus:
+    """Locked provider-safe association history for one service name."""
+
+    association_rows: tuple[Mapping[str, Any], ...]
+
+
+class _TerminalCensusPolicy(enum.Enum):
+    """Supported consumers of the retained terminal graph census."""
+
+    N2_TRANSFER = enum.auto()
+    FINAL_DELETION = enum.auto()
+
+
 class LegacyReconciliationResolution(str, enum.Enum):
     """Monotonic disposition for a scoped historical unbound launch."""
 
@@ -5917,8 +5931,18 @@ def _replica_free_association_is_inert(association: Mapping[str, Any],) -> bool:
             return False
 
     if resolution is Resolution.PRE_EFFECT_TERMINAL:
+        cancel_reason = association.get('cancel_reason')
+        cancel_requested_at = association.get('cancel_requested_at')
+        cancel_shape_valid = bool(
+            (cancel_reason is None and cancel_requested_at is None) or
+            (isinstance(cancel_reason, str) and bool(cancel_reason) and
+             len(cancel_reason) <= 128 and
+             isinstance(cancel_requested_at, datetime.datetime)))
         if (effect_phase is not EffectPhase.NOT_STARTED or
-                association.get('service_job_id') is not None):
+                association.get('service_job_id') is not None or
+                association.get('result_recorded_at') is not None or
+                association.get('ambiguity_code') is not None or
+                quiescence_required is not True or not cancel_shape_valid):
             return False
     elif effect_phase is EffectPhase.SERVICE_JOB_RECORDED:
         service_job_id = association.get('service_job_id')
@@ -6032,11 +6056,99 @@ def settled_association_proves_execution_quiescence(
     return _replica_free_association_is_inert(association)
 
 
-def _retained_graphs_have_terminal_absence_authority(
+def _final_deletion_graph_context(
     connection: sqlalchemy.engine.Connection,
     lifecycle: Mapping[str, Any],
     service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    association: Mapping[str, Any],
+) -> BoundNonPoolLaunchContext | None:
+    """Authenticate one current generic graph before final deletion."""
+    try:
+        current_epoch = service['lifecycle_epoch']
+        if (type(current_epoch) is not int or
+                lifecycle['epoch'] != current_epoch or
+                association['service_lifecycle_epoch'] != current_epoch or
+                service['name'] != association['service_name'] or
+                service['hash'] != association['service_hash'] or
+                service['workspace'] != association['service_workspace'] or
+                service['ordinary_launch_binding_epoch']
+                != association['service_binding_epoch'] or
+                service['pool'] != 0 or
+                replica['ordinary_launch_association_id'] is not None or
+                not _replica_snapshot_matches_association(
+                    replica, association, require_launch_authorized=False)):
+            return None
+        context = bound_context_from_association(association)
+        if not isinstance(context, BoundNonPoolLaunchContext):
+            return None
+        if context.profile.kind is NonPoolLaunchProfileKind.RESERVED_FILL:
+            _validate_reserved_fill_cleanup_profile_in_connection(
+                connection, service, replica, context.profile)
+        _validate_terminal_generic_cleanup_capability(
+            service,
+            capability_cohort_epoch=context.capability_cohort_epoch,
+            capability_profile_set_digest=(
+                context.capability_profile_set_digest),
+            receipt_protocol_version=context.receipt_protocol_version)
+    except (KeyError, TypeError, ValueError, OrdinaryLaunchBindingConflict):
+        return None
+    return context
+
+
+def _pre_effect_terminal_retirement_matches_locked_rows(
+    connection: sqlalchemy.engine.Connection,
+    lifecycle: Mapping[str, Any],
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    association: Mapping[str, Any],
 ) -> bool:
+    """Prove an inert no-effect receipt belongs to the locked replica."""
+    return bool(
+        _final_deletion_graph_context(connection, lifecycle, service, replica,
+                                      association) and
+        _replica_free_association_is_inert(association))
+
+
+def _provider_clean_graph_matches_locked_rows(
+    connection: sqlalchemy.engine.Connection,
+    lifecycle: Mapping[str, Any],
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    association: Mapping[str, Any],
+    proof: capacity_admission.FinalDeletionProviderCleanGraph,
+) -> bool:
+    """Validate one exact same-transaction Kueue retirement proof."""
+    try:
+        context = _final_deletion_graph_context(connection, lifecycle, service,
+                                                replica, association)
+        if not (isinstance(
+                proof, capacity_admission.FinalDeletionProviderCleanGraph) and
+                type(proof.transaction_id) is int and
+                isinstance(context, BoundNonPoolLaunchContext) and
+                context.profile.kind is NonPoolLaunchProfileKind.RESERVED_FILL
+                and proof.service_name == service['name'] and
+                proof.service_hash == service['hash'] and
+                proof.service_lifecycle_epoch == service['lifecycle_epoch'] and
+                proof.replica_id == association['replica_id'] and
+                proof.replica_record_id == association['replica_record_id'] and
+                proof.association_id == association['association_id'] and
+                proof.association_updated_at == association['updated_at']):
+            return False
+    except (KeyError, TypeError, ValueError, OrdinaryLaunchBindingConflict):
+        return False
+    return True
+
+
+def _lock_and_validate_retained_terminal_absence_authority(
+    connection: sqlalchemy.engine.Connection,
+    lifecycle: Mapping[str, Any],
+    service: Mapping[str, Any],
+    *,
+    policy: _TerminalCensusPolicy,
+    provider_clean_graphs: tuple[
+        capacity_admission.FinalDeletionProviderCleanGraph, ...] = (),
+) -> RetainedAuthorityCensus | None:
     """Lock and validate every retained graph for terminal N-2 takeover.
 
     The caller already owns lifecycle and service locks.  This census acquires
@@ -6053,14 +6165,8 @@ def _retained_graphs_have_terminal_absence_authority(
                     serve_state_schema.replicas_table.c.replica_id).
             with_for_update()).mappings())
     claims = list(
-        connection.execute(
-            sqlalchemy.select(serve_state_schema.paid_capacity_claims_table).
-            where(
-                serve_state_schema.paid_capacity_claims_table.c.service_name ==
-                service_name).order_by(
-                    serve_state_schema.paid_capacity_claims_table.c.replica_id,
-                    serve_state_schema.paid_capacity_claims_table.c.pool_key).
-            with_for_update()).mappings())
+        serve_state.lock_paid_capacity_claims_in_connection(
+            connection, service_name=service_name))
     associations = list(
         connection.execute(
             sqlalchemy.select(ordinary_launch_associations_table).where(
@@ -6073,7 +6179,27 @@ def _retained_graphs_have_terminal_absence_authority(
     # It is therefore available only to a completely zero-live-claim terminal
     # census, including replicas whose association history is missing.
     if claims:
-        return False
+        return None
+    if (not isinstance(provider_clean_graphs, tuple) or
+        (policy is _TerminalCensusPolicy.N2_TRANSFER and
+         provider_clean_graphs)):
+        return None
+    provider_clean_by_replica: dict[tuple[
+        int, str], capacity_admission.FinalDeletionProviderCleanGraph] = {
+            (proof.replica_id, str(proof.replica_record_id)): proof
+            for proof in provider_clean_graphs
+            if isinstance(proof,
+                          capacity_admission.FinalDeletionProviderCleanGraph)
+        }
+    if len(provider_clean_by_replica) != len(provider_clean_graphs):
+        return None
+    if provider_clean_graphs:
+        transaction_id = int(
+            connection.execute(sqlalchemy.select(
+                sqlalchemy.func.txid_current())).scalar_one())
+        if any(proof.transaction_id != transaction_id
+               for proof in provider_clean_graphs):
+            return None
 
     try:
         replica_records: dict[tuple[int, str], Mapping[str, Any]] = {}
@@ -6082,11 +6208,11 @@ def _retained_graphs_have_terminal_absence_authority(
             # mismatched, or merely unresolved pointer must never be mistaken
             # for the permitted no-graph shape.
             if replica['ordinary_launch_association_id'] is not None:
-                return False
+                return None
             info = _locked_replica_info(replica)
             key = (int(replica['replica_id']), str(info.replica_record_id))
             if key in replica_records:
-                return False
+                return None
             replica_records[key] = replica
         retained_associations: dict[tuple[int, str], list[Mapping[str,
                                                                   Any]]] = {}
@@ -6099,35 +6225,90 @@ def _retained_graphs_have_terminal_absence_authority(
             else:
                 replica_free_associations.append(association)
     except (KeyError, TypeError, ValueError):
-        return False
+        return None
 
     # An empty service is the sole legitimate no-graph shape.  Every retained
     # replica row must otherwise resolve to exactly one current-record graph;
     # an unassociated or historically mismatched row may still need ordinary
     # takeover/recovery and cannot enter the non-mutating N-2 branch.
     if set(retained_associations) != set(replica_records):
-        return False
+        return None
     if any(not _replica_free_association_is_inert(association)
            for association in replica_free_associations):
-        return False
+        return None
 
     for key, candidates in retained_associations.items():
         if (len(candidates) != 1 or
                 candidates[0].get('binding_protocol_version')
                 != NON_POOL_BINDING_PROTOCOL_VERSION):
-            return False
+            return None
+        candidate = candidates[0]
+        provider_clean = provider_clean_by_replica.pop(key, None)
+        if provider_clean is not None:
+            if (policy is not _TerminalCensusPolicy.FINAL_DELETION or
+                    not _provider_clean_graph_matches_locked_rows(
+                        connection, lifecycle, service, replica_records[key],
+                        candidate, provider_clean)):
+                return None
+            continue
+        if (policy is _TerminalCensusPolicy.FINAL_DELETION and
+                candidate.get('resolution')
+                == Resolution.PRE_EFFECT_TERMINAL.value and
+                _pre_effect_terminal_retirement_matches_locked_rows(
+                    connection, lifecycle, service, replica_records[key],
+                    candidate)):
+            # No provider-effect boundary was crossed.  The replica is only a
+            # retained logical record after Kueue/request retirement and can
+            # be deleted without manufacturing an ABSENT provider receipt.
+            continue
         try:
             projected, info = (
                 _validate_projected_provider_absence_retirement_locked_rows(
                     connection, lifecycle, service, replica_records[key], (),
-                    candidates))
+                    (candidate,)))
         except (OrdinaryLaunchBindingConflict, TypeError, ValueError):
-            return False
-        if (projected['association_id'] != candidates[0]['association_id'] or
+            return None
+        if (projected['association_id'] != candidate['association_id'] or
                 not replica_has_projected_provider_absence_cleanup_marker(info)
            ):
-            return False
-    return True
+            return None
+    if provider_clean_by_replica:
+        return None
+    return RetainedAuthorityCensus(tuple(associations))
+
+
+def _retained_graphs_have_terminal_absence_authority(
+    connection: sqlalchemy.engine.Connection,
+    lifecycle: Mapping[str, Any],
+    service: Mapping[str, Any],
+) -> bool:
+    """Return whether complete retained name history is provider-safe."""
+    return _lock_and_validate_retained_terminal_absence_authority(
+        connection,
+        lifecycle,
+        service,
+        policy=_TerminalCensusPolicy.N2_TRANSFER) is not None
+
+
+def lock_retained_terminal_absence_authority_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    lifecycle: Mapping[str, Any],
+    service: Mapping[str, Any],
+    *,
+    provider_clean_graphs: tuple[
+        capacity_admission.FinalDeletionProviderCleanGraph, ...] = (),
+) -> RetainedAuthorityCensus | None:
+    """Lock complete retained provider authority for final deletion.
+
+    Deletion cannot assume a format-6 genesis receipt exists, so it repeats the
+    complete same-name census that the next clean genesis would require.
+    """
+    return _lock_and_validate_retained_terminal_absence_authority(
+        connection,
+        lifecycle,
+        service,
+        policy=_TerminalCensusPolicy.FINAL_DELETION,
+        provider_clean_graphs=provider_clean_graphs)
 
 
 def promote_service_in_connection(

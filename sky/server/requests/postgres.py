@@ -5586,46 +5586,90 @@ def _legacy_ordinary_launch_requests_drained_in_transaction(
     # before upgrading to ROW EXCLUSIVE for its status write, which would form a
     # lock cycle if promotion held a compatible SHARE lock while waiting for
     # that same row.
+    launch_context = REQUESTS.c.payload_json['extra_launch_context']
+    candidate_service = launch_context[
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY]
+    candidate_service_name = candidate_service.as_string()
+    ambiguous_service_identity = sqlalchemy.or_(
+        sqlalchemy.func.coalesce(
+            sqlalchemy.func.jsonb_typeof(REQUESTS.c.payload_json),
+            'missing') != 'object',
+        sqlalchemy.func.coalesce(sqlalchemy.func.jsonb_typeof(launch_context),
+                                 'missing') != 'object',
+        sqlalchemy.func.coalesce(
+            sqlalchemy.func.jsonb_typeof(candidate_service), 'missing')
+        != 'string', candidate_service_name == '')
     rows = connection.execute(
         sqlalchemy.select(REQUESTS).where(
             REQUESTS.c.handler_name == _LEGACY_ORDINARY_LAUNCH_HANDLER_NAME,
             REQUESTS.c.payload_type == _LEGACY_ORDINARY_LAUNCH_PAYLOAD_TYPE,
             REQUESTS.c.payload_json['is_launched_by_sky_serve_controller'].
-            as_boolean().is_(True)).order_by(
-                REQUESTS.c.request_id).with_for_update()).mappings().all()
+            as_boolean().is_(True),
+            sqlalchemy.or_(
+                candidate_service_name == service_name,
+                ambiguous_service_identity)).order_by(
+                    REQUESTS.c.request_id).with_for_update()).mappings().all()
+    request_ids = tuple(str(row['request_id']) for row in rows)
+    if request_ids:
+        queue_rows = connection.execute(
+            sqlalchemy.select(QUEUE.c.request_id).where(
+                QUEUE.c.request_id.in_(request_ids)).order_by(
+                    QUEUE.c.request_id).with_for_update()).all()
+        pin_rows = connection.execute(
+            sqlalchemy.select(REQUEST_RETENTION_PINS.c.request_id).where(
+                REQUEST_RETENTION_PINS.c.request_id.in_(request_ids)).order_by(
+                    REQUEST_RETENTION_PINS.c.request_id,
+                    REQUEST_RETENTION_PINS.c.pin_kind,
+                    REQUEST_RETENTION_PINS.c.pin_id).with_for_update()).all()
+        if queue_rows or pin_rows:
+            return False
     for row in rows:
-        payload_json = row['payload_json']
-        if not isinstance(payload_json, dict):
+        if (row['ordinary_launch_association_id'] is not None or
+                row['resource_action_id'] is not None or
+                row['resource_action_attempt'] is not None):
             return False
-        context = payload_json.get('extra_launch_context')
-        if not isinstance(context, dict):
+        try:
+            status = requests_lib.RequestStatus(str(row['status']))
+        except ValueError:
             return False
-        candidate_service = context.get(
-            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
-        if not isinstance(candidate_service, str) or not candidate_service:
-            return False
-        if candidate_service != service_name:
-            continue
-        status = requests_lib.RequestStatus(str(row['status']))
         if status not in requests_lib.RequestStatus.finished_status():
             return False
-        queue_exists = connection.execute(
-            sqlalchemy.select(sqlalchemy.literal(True)).where(
-                sqlalchemy.exists().where(
-                    QUEUE.c.request_id ==
-                    row['request_id']))).scalar_one_or_none()
-        if queue_exists:
-            return False
-        has_request_receipt = (row['execution_quiescence_required'] is True and
+        has_request_receipt = (row['finished_at'] is not None and
+                               row['execution_quiescence_required'] is True and
                                row['execution_generation'] is not None and
                                row['execution_quiesced_generation']
                                == row['execution_generation'] and
                                row['execution_quiesced_at'] is not None)
+        payload_json = row['payload_json']
+        if not isinstance(payload_json, dict):
+            # Quiescence proves only that the request handler stopped.  An
+            # unscoped legacy launch may already have crossed the provider
+            # effect boundary, so it cannot be attributed away safely.
+            return False
+        context = payload_json.get('extra_launch_context')
+        if not isinstance(context, dict):
+            return False
+        candidate_service_name_value = context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        if (not isinstance(candidate_service_name_value, str) or
+                not candidate_service_name_value):
+            return False
+        if candidate_service_name_value != service_name:
+            return False
         if (not has_request_receipt and
                 not _legacy_projected_cleanup_drains_request_in_transaction(
                     connection, row, context, service_name)):
             return False
     return True
+
+
+def legacy_ordinary_launch_requests_drained_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    service_name: str,
+) -> bool:
+    """Expose the canonical legacy request census to final Serve deletion."""
+    return _legacy_ordinary_launch_requests_drained_in_transaction(
+        connection, service_name)
 
 
 def _bound_ordinary_launch_requests_clear_in_transaction(

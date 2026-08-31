@@ -73,6 +73,18 @@ class ZeroCostActuationUnavailable(ZeroCostActuationError):
 
 
 @dataclasses.dataclass(frozen=True)
+class ServiceTeardownIntent:
+    """One locked nonterminal intent retained after provider-free cleanup."""
+
+    intent_idempotency_key: str
+    service_hash: str
+    service_lifecycle_epoch: int
+    state: str
+    replica_id: int | None
+    replica_record_id: uuid.UUID | None
+
+
+@dataclasses.dataclass(frozen=True)
 class IntentLease:
     """Exact lease token for one per-pool executor attempt."""
 
@@ -958,7 +970,7 @@ def terminalize_unmaterialized_service_intents_in_connection(
     service_name: str,
     service_hash: str,
     service_lifecycle_epoch: int,
-) -> tuple[str, ...]:
+) -> tuple[ServiceTeardownIntent, ...]:
     """Retire provider-free intent leases during exact service teardown.
 
     ``ACTUATING`` is still provider-free in this protocol: execution may do
@@ -989,46 +1001,53 @@ def terminalize_unmaterialized_service_intents_in_connection(
             'Intent teardown lost the SHUTTING_DOWN service lifecycle.')
     rows = connection.execute(
         sqlalchemy.select(
-            _INTENTS.c.intent_idempotency_key, _INTENTS.c.state,
+            _INTENTS.c.intent_idempotency_key, _INTENTS.c.service_hash,
+            _INTENTS.c.service_lifecycle_epoch, _INTENTS.c.state,
             _INTENTS.c.replica_id, _INTENTS.c.replica_record_id).where(
-                _INTENTS.c.service_name == service_name,
-                _INTENTS.c.service_hash == service_hash,
-                _INTENTS.c.service_lifecycle_epoch ==
-                service_lifecycle_epoch).order_by(
+                _INTENTS.c.service_name == service_name).order_by(
                     _INTENTS.c.intent_idempotency_key).with_for_update()).all()
-    # Lock the complete exact-lifecycle intent set before filtering. Teardown
-    # subsequently locks replica/association/admission graph rows; its
-    # nonterminal overlap with reconciliation must retain the same key order.
-    # Teardown may additionally lock terminal rows for suffix cleanup without
-    # making terminal audit history part of the reconciler's live census.
+    # Lock the complete same-name intent set before filtering.  A retained old
+    # incarnation and the current one must never be acquired by two scoped
+    # scans in opposite key order.
     keys = tuple(
         str(row.intent_idempotency_key)
         for row in rows
-        if row.state in _PENDING_STATES and row.replica_id is None and
-        row.replica_record_id is None)
-    if not keys:
-        return ()
-    now = connection.execute(
-        sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-    result = connection.execute(
-        sqlalchemy.update(_INTENTS).where(
-            _INTENTS.c.intent_idempotency_key.in_(keys),
-            _INTENTS.c.service_name == service_name,
-            _INTENTS.c.service_hash == service_hash,
-            _INTENTS.c.service_lifecycle_epoch == service_lifecycle_epoch,
-            _INTENTS.c.state.in_(tuple(_PENDING_STATES)),
-            _INTENTS.c.replica_id.is_(None),
-            _INTENTS.c.replica_record_id.is_(None)).values(
-                state=IntentState.TERMINAL.value,
-                lease_owner=None,
-                lease_expires_at=None,
-                last_error='service_teardown',
-                updated_at=now,
-                terminal_at=now))
-    if result.rowcount != len(keys):
-        raise ZeroCostActuationConflict(
-            'An unmaterialized intent changed during service teardown.')
-    return keys
+        if row.service_hash == service_hash and row.service_lifecycle_epoch ==
+        service_lifecycle_epoch and row.state in _PENDING_STATES and
+        row.replica_id is None and row.replica_record_id is None)
+    if keys:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        result = connection.execute(
+            sqlalchemy.update(_INTENTS).where(
+                _INTENTS.c.intent_idempotency_key.in_(keys),
+                _INTENTS.c.service_name == service_name,
+                _INTENTS.c.service_hash == service_hash,
+                _INTENTS.c.service_lifecycle_epoch == service_lifecycle_epoch,
+                _INTENTS.c.state.in_(tuple(_PENDING_STATES)),
+                _INTENTS.c.replica_id.is_(None),
+                _INTENTS.c.replica_record_id.is_(None)).values(
+                    state=IntentState.TERMINAL.value,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    last_error='service_teardown',
+                    updated_at=now,
+                    terminal_at=now))
+        if result.rowcount != len(keys):
+            raise ZeroCostActuationConflict(
+                'An unmaterialized intent changed during service teardown.')
+    terminalized = frozenset(keys)
+    return tuple(
+        ServiceTeardownIntent(
+            intent_idempotency_key=str(row.intent_idempotency_key),
+            service_hash=str(row.service_hash),
+            service_lifecycle_epoch=int(row.service_lifecycle_epoch),
+            state=str(row.state),
+            replica_id=row.replica_id,
+            replica_record_id=row.replica_record_id)
+        for row in rows
+        if row.intent_idempotency_key not in terminalized and
+        row.state != IntentState.TERMINAL.value)
 
 
 def _locked_grant_intent_rows(

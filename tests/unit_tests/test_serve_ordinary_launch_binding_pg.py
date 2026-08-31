@@ -899,6 +899,54 @@ def test_current_paid_effect_accepts_current_worker_projection(
     _assert_current_paid_provider_effect_is_permitted(binding_database)
 
 
+def test_final_census_accepts_quiesced_paid_pre_effect_graph(
+        binding_database) -> None:
+    """The shared final census retains the ordinary paid no-effect path."""
+    identity, context, _ = _admit_generic_paid(binding_database)
+    assert identity.profile.kind is (
+        binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    with binding_database.begin() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        evidence = binding.TerminalEvidence(
+            status=binding.TerminalStatus.FAILED,
+            cause='dispatcher_submit_failed',
+            execution_generation=1,
+            quiescence_required=True,
+            quiesced_generation=1,
+            quiesced_at=now)
+        assert binding.record_terminal_in_connection(
+            connection, context,
+            evidence) is binding.StartupClassification.PRE_EFFECT_TERMINALIZE
+        assert binding.project_in_connection(connection,
+                                             context,
+                                             pre_effect_terminal=True,
+                                             service_job_id=None)
+        assert binding.release_projected_paid_capacity_claim_in_connection(
+            connection, context)
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    status='SHUTTING_DOWN'))
+
+    with binding_database.begin() as connection:
+        lifecycle = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.service_lifecycle_fences_table).where(
+                    serve_state_schema.service_lifecycle_fences_table.c.name ==
+                    'svc').with_for_update()).mappings().one()
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        census = binding.lock_retained_terminal_absence_authority_in_connection(
+            connection, lifecycle, service)
+
+    assert census is not None
+    assert [row['association_id'] for row in census.association_rows
+           ] == [identity.association_id]
+
+
 def test_current_paid_effect_reenters_same_provider_io_after_pause(
         binding_database) -> None:
     """A quiesced proof-outage retry reuses, rather than widens, authority."""

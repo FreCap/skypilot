@@ -3453,6 +3453,98 @@ class _LockedAssociationAuthorityGraph:
     blocking_request_count: int
 
 
+@dataclasses.dataclass(frozen=True)
+class FinalDeletionAuthorityTables:
+    """Request tables resolved before final-deletion locks are acquired."""
+
+    requests: sqlalchemy.Table
+    queue: sqlalchemy.Table
+    pins: sqlalchemy.Table
+
+
+@dataclasses.dataclass(frozen=True)
+class FinalDeletionProviderCleanGraph:
+    """Transaction-bound external proof for one provider-clean replica."""
+
+    transaction_id: int
+    service_name: str
+    service_hash: str
+    service_lifecycle_epoch: int
+    replica_id: int
+    replica_record_id: uuid.UUID
+    association_id: uuid.UUID
+    association_updated_at: datetime.datetime
+
+
+@dataclasses.dataclass(frozen=True)
+class _LockedRequestRetentionRoots:
+    """Complete request-layer roots for one locked association set."""
+
+    request_rows: tuple[Mapping[str, Any], ...]
+    queue_rows: tuple[Mapping[str, Any], ...]
+    pin_rows: tuple[Mapping[str, Any], ...]
+
+
+def _lock_request_retention_roots(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    association_rows: Sequence[Mapping[str, Any]],
+    tables: FinalDeletionAuthorityTables,
+) -> _LockedRequestRetentionRoots:
+    """Lock every request, queue and pin root reachable from associations."""
+    association_ids = tuple(row['association_id'] for row in association_rows)
+    association_request_ids = tuple(
+        sorted({str(row['request_id']) for row in association_rows}))
+    if not association_ids:
+        return _LockedRequestRetentionRoots((), (), ())
+
+    request_predicate = sqlalchemy.or_(
+        tables.requests.c.request_id.in_(association_request_ids),
+        tables.requests.c.ordinary_launch_association_id.in_(association_ids))
+    request_rows = tuple(
+        connection.execute(
+            sqlalchemy.select(
+                tables.requests.c.request_id,
+                tables.requests.c.ordinary_launch_association_id,
+                tables.requests.c.handler_name, tables.requests.c.status,
+                tables.requests.c.terminal_cause, tables.requests.c.finished_at,
+                tables.requests.c.execution_generation,
+                tables.requests.c.execution_quiescence_required,
+                tables.requests.c.execution_quiesced_generation,
+                tables.requests.c.execution_quiesced_at,
+                tables.requests.c.resource_action_id,
+                tables.requests.c.resource_action_attempt,
+                tables.requests.c.binding_protocol_version,
+                tables.requests.c.profile_kind,
+                tables.requests.c.profile_version,
+                tables.requests.c.profile_digest,
+                tables.requests.c.capability_cohort_epoch,
+                tables.requests.c.capability_profile_set_digest,
+                tables.requests.c.receipt_protocol_version).
+            where(request_predicate).order_by(
+                tables.requests.c.request_id).with_for_update()).mappings())
+    discovered_request_ids = tuple(
+        sorted(
+            set(association_request_ids) |
+            {str(row['request_id']) for row in request_rows}))
+    queue_rows = tuple(
+        connection.execute(
+            sqlalchemy.select(tables.queue.c.request_id).where(
+                tables.queue.c.request_id.in_(discovered_request_ids)).order_by(
+                    tables.queue.c.request_id).with_for_update()).mappings())
+    pin_rows = tuple(
+        connection.execute(
+            sqlalchemy.select(
+                tables.pins.c.pin_kind, tables.pins.c.pin_id,
+                tables.pins.c.request_id).where(
+                    sqlalchemy.or_(
+                        tables.pins.c.request_id.in_(discovered_request_ids),
+                        tables.pins.c.pin_id.in_(association_ids))).order_by(
+                            tables.pins.c.pin_kind,
+                            tables.pins.c.pin_id).with_for_update()).mappings())
+    return _LockedRequestRetentionRoots(request_rows, queue_rows, pin_rows)
+
+
 def _lock_association_authority_graph(
     connection: sqlalchemy.engine.Connection,
     *,
@@ -3581,67 +3673,15 @@ def _lock_association_authority_graph(
             association_statement.order_by(
                 ordinary_associations.c.association_id).with_for_update(
                     of=ordinary_associations)).mappings())
-    association_ids = tuple(row['association_id'] for row in association_rows)
-    association_request_ids = tuple(
-        sorted({str(row['request_id']) for row in association_rows}))
-
-    request_rows: tuple[Mapping[str, Any], ...] = ()
-    queue_rows: tuple[Mapping[str, Any], ...] = ()
-    pin_rows: tuple[Mapping[str, Any], ...] = ()
-    if association_ids:
-        # Both sides are bounded/indexed identity probes: request_id is the
-        # primary key and API009 installs the unique partial
-        # uq_api_requests_ordinary_launch_association index.  Retain the latter
-        # on steady ticks too so a malformed divergent root still fails closed
-        # without scanning historical requests.
-        request_predicate = sqlalchemy.or_(
-            request_rows_table.c.request_id.in_(association_request_ids),
-            request_rows_table.c.ordinary_launch_association_id.in_(
-                association_ids))
-        request_rows = tuple(
-            connection.execute(
-                sqlalchemy.select(
-                    request_rows_table.c.request_id,
-                    request_rows_table.c.ordinary_launch_association_id,
-                    request_rows_table.c.handler_name,
-                    request_rows_table.c.status,
-                    request_rows_table.c.terminal_cause,
-                    request_rows_table.c.finished_at,
-                    request_rows_table.c.execution_generation,
-                    request_rows_table.c.execution_quiescence_required,
-                    request_rows_table.c.execution_quiesced_generation,
-                    request_rows_table.c.execution_quiesced_at,
-                    request_rows_table.c.resource_action_id,
-                    request_rows_table.c.resource_action_attempt,
-                    request_rows_table.c.binding_protocol_version,
-                    request_rows_table.c.profile_kind,
-                    request_rows_table.c.profile_version,
-                    request_rows_table.c.profile_digest,
-                    request_rows_table.c.capability_cohort_epoch,
-                    request_rows_table.c.capability_profile_set_digest,
-                    request_rows_table.c.receipt_protocol_version).where(
-                        request_predicate).order_by(
-                            request_rows_table.c.request_id).with_for_update()).
-            mappings())
-        queue_rows = tuple(
-            connection.execute(
-                sqlalchemy.select(request_queue_table.c.request_id).where(
-                    request_queue_table.c.request_id.in_(
-                        association_request_ids)).order_by(
-                            request_queue_table.c.request_id).with_for_update()
-            ).mappings())
-        pin_rows = tuple(
-            connection.execute(
-                sqlalchemy.select(
-                    request_pins_table.c.pin_kind, request_pins_table.c.pin_id,
-                    request_pins_table.c.request_id).where(
-                        sqlalchemy.or_(
-                            request_pins_table.c.request_id.in_(
-                                association_request_ids),
-                            request_pins_table.c.pin_id.in_(association_ids))).
-                order_by(
-                    request_pins_table.c.pin_kind,
-                    request_pins_table.c.pin_id).with_for_update()).mappings())
+    roots = _lock_request_retention_roots(connection,
+                                          association_rows=association_rows,
+                                          tables=FinalDeletionAuthorityTables(
+                                              requests=request_rows_table,
+                                              queue=request_queue_table,
+                                              pins=request_pins_table))
+    request_rows = roots.request_rows
+    queue_rows = roots.queue_rows
+    pin_rows = roots.pin_rows
 
     association_by_id = {row['association_id']: row for row in association_rows}
     for association_id, expected in pointed_association_identities.items():
@@ -3703,6 +3743,54 @@ def _lock_association_authority_graph(
         queue_rows=queue_rows,
         pin_rows=pin_rows,
         blocking_request_count=len(blocking_request_ids))
+
+
+def service_name_has_terminal_absence_authority_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    lifecycle: Mapping[str, Any],
+    service: Mapping[str, Any],
+    tables: FinalDeletionAuthorityTables,
+    provider_clean_graphs: tuple[FinalDeletionProviderCleanGraph, ...],
+) -> bool:
+    """Lock and validate complete same-name final-deletion authority."""
+    if (service.get('pool') != 0 or
+            lifecycle.get('epoch') != service.get('lifecycle_epoch')):
+        return False
+    provider_census = (ordinary_launch_binding.
+                       lock_retained_terminal_absence_authority_in_connection(
+                           connection,
+                           lifecycle,
+                           service,
+                           provider_clean_graphs=provider_clean_graphs))
+    if provider_census is None:
+        return False
+
+    roots = _lock_request_retention_roots(
+        connection,
+        association_rows=provider_census.association_rows,
+        tables=tables)
+    associations_by_id = {
+        row['association_id']: row for row in provider_census.association_rows
+    }
+    for request_row in roots.request_rows:
+        association = associations_by_id.get(
+            request_row['ordinary_launch_association_id'])
+        if (association is None or
+                _retained_request_root_state(request_row, association)
+                is not _RetainedRequestRootState.CLOSED_QUIESCED):
+            return False
+    if roots.queue_rows or roots.pin_rows:
+        return False
+
+    service_name = str(service['name'])
+    waiters = tuple(
+        connection.execute(
+            sqlalchemy.select(_PAID_WAITERS).where(
+                _PAID_WAITERS.c.service_name == service_name).order_by(
+                    _PAID_WAITERS.c.pool_key,
+                    _PAID_WAITERS.c.service_hash).with_for_update()).mappings())
+    return not waiters
 
 
 def _canonical_prepared_paid_launch_specs(
