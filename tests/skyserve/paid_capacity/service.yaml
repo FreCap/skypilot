@@ -1,0 +1,42 @@
+service:
+  readiness_probe:
+    path: /health
+    initial_delay_seconds: 10
+  graceful_drain_async_occupancy: true
+  load_balancer:
+    stream_timeout_seconds: 180
+    request_queue:
+      min_size: 4
+      size_per_replica: 1
+      max_size: 32
+      max_concurrency_per_replica: 1
+      max_concurrency: 4
+      timeout_seconds: 600
+      max_request_body_bytes: 65536
+      use_async_occupancy: true
+  replica_policy:
+    min_replicas: 0
+    max_replicas: 2
+    target_concurrency_per_replica: 1
+    target_utilization_percentage: 100
+    expected_request_duration_seconds: 10
+    max_scale_up_rate_percentage: 100
+    scale_up_rate_min_replicas: 2
+    scale_up_rate_period_seconds: 10
+    max_scale_down_rate_percentage: 100
+    upscale_delay_seconds: 0
+    downscale_delay_seconds: 60
+    spot_placer: dynamic_fallback_per_gpu
+    max_live_paid_gpu_units: 2
+    cost_rebalance: false
+
+resources:
+  infra: gcp/us-central1
+  instance_type: g2-standard-4
+  accelerators: L4:1
+  use_spot: true
+  ports: 8080
+
+workdir: tests/skyserve/paid_capacity
+
+run: python3 server.py --port 8080

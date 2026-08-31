@@ -215,6 +215,14 @@ def pytest_addoption(parser):
         help='Run tests for Postgres Backend',
     )
     parser.addoption(
+        '--serve-paid-provider-e2e',
+        choices=('small', 'scale'),
+        default=None,
+        help=('Explicitly enable the billable SkyServe paid-Spot E2E. '
+              'small launches at most two L4 VMs; scale arms 120 and requires '
+              'at least 100 concurrently RUNNING.'),
+    )
+    parser.addoption(
         '--no-resource-heavy',
         action='store_true',
         default=False,
