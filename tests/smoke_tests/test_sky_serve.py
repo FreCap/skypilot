@@ -26,6 +26,7 @@ import inspect
 import json
 import os
 import shlex
+import sys
 import tempfile
 from typing import Dict, List, Tuple
 
@@ -421,6 +422,77 @@ def test_skyserve_spot_recovery():
         f'{_TEARDOWN_SERVICE.format(name=name)}',
         env=smoke_tests_utils.LOW_CONTROLLER_RESOURCE_ENV,
         timeout=20 * 60,
+    )
+    smoke_tests_utils.run_one_test(test)
+
+
+@pytest.mark.gcp
+@pytest.mark.serve
+@pytest.mark.slow
+@pytest.mark.resource_heavy
+@pytest.mark.exclusive
+@pytest.mark.no_auto_retry
+def test_skyserve_paid_spot_postgres_e2e(request: pytest.FixtureRequest):
+    """Prove authenticated PostgreSQL admission through natural Spot drain.
+
+    This is intentionally absent from ordinary test selection because even the
+    small profile creates billable cloud resources.  Both profiles execute the
+    same checked-in qualifier; only their bounded scale values differ.
+    """
+    profile = request.config.getoption('--serve-paid-provider-e2e')
+    if profile is None:
+        pytest.skip('requires --serve-paid-provider-e2e={small,scale}')
+    if not pytest.terminate_on_failure:
+        pytest.fail('billable E2E forbids --no-terminate-on-failure')
+    if not smoke_tests_utils.is_postgres_backend_test():
+        pytest.fail('--serve-paid-provider-e2e requires --postgres')
+    auth_token = os.environ.get('SKYPILOT_SERVE_E2E_AUTH_TOKEN')
+    auth_token_file = os.environ.get('SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE')
+    if not auth_token and not auth_token_file:
+        pytest.fail('paid E2E requires an explicit data-plane token or the '
+                    'API server projected token ring')
+    name = common_utils.make_cluster_name_on_cloud(
+        f'paid-e2e-{smoke_tests_utils.test_id}', 24)
+    qualifier = 'tests/skyserve/paid_capacity/qualify.py'
+    rendered = f'/tmp/{name}-{profile}.yaml'
+    receipt = f'/tmp/{name}-{profile}-receipt.json'
+    scope_receipt = f'/tmp/{name}-{profile}-scope.json'
+    python = shlex.quote(sys.executable)
+    render_command = (f'{python} {shlex.quote(qualifier)} render '
+                      f'--profile {shlex.quote(profile)} '
+                      f'--output {shlex.quote(rendered)}')
+    qualify_command = (f'{_SERVE_ENDPOINT_WAIT.format(name=name)}; '
+                       f'{python} {shlex.quote(qualifier)} run '
+                       f'--profile {shlex.quote(profile)} '
+                       f'--service-name {shlex.quote(name)} '
+                       '--endpoint "$endpoint" '
+                       f'--receipt {shlex.quote(receipt)} '
+                       f'--scope {shlex.quote(scope_receipt)}')
+    freeze_scope_command = (f'{python} {shlex.quote(qualifier)} freeze-scope '
+                            f'--service-name {shlex.quote(name)} '
+                            f'--output {shlex.quote(scope_receipt)}')
+    wait_cleanup_command = (f'{python} {shlex.quote(qualifier)} wait-cleanup '
+                            f'--service-name {shlex.quote(name)} '
+                            f'--scope {shlex.quote(scope_receipt)}')
+    env = dict(smoke_tests_utils.LOW_CONTROLLER_RESOURCE_ENV)
+    if auth_token:
+        # A local API server started by this test must pass the same token to
+        # its external load balancer.  A remote API pod instead reads its
+        # already-projected token ring and never exports that token to a
+        # client command or receipt.
+        env['SKYPILOT_SERVE_LB_AUTH_TOKEN'] = auth_token
+    test = smoke_tests_utils.Test(
+        f'test-skyserve-paid-spot-postgres-{profile}',
+        [
+            render_command,
+            f'sky serve up -n {name} -y {shlex.quote(rendered)}',
+            freeze_scope_command,
+            qualify_command,
+        ],
+        smoke_tests_utils.command_with_cleanup(
+            _TEARDOWN_SERVICE.format(name=name), wait_cleanup_command),
+        env=env,
+        timeout=90 * 60,
     )
     smoke_tests_utils.run_one_test(test)
 

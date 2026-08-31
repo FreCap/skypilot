@@ -403,6 +403,15 @@ class Test(NamedTuple):
         print(message, file=sys.stderr, flush=True)
 
 
+def command_with_cleanup(primary_command: str, cleanup_command: str) -> str:
+    """Run cleanup unconditionally without masking the primary exit status."""
+    return (f'({primary_command}); _sky_primary_rc=$?; '
+            f'({cleanup_command}); _sky_cleanup_rc=$?; '
+            'if [ "$_sky_primary_rc" -ne 0 ]; then '
+            'exit "$_sky_primary_rc"; fi; '
+            'exit "$_sky_cleanup_rc"')
+
+
 def get_timeout(generic_cloud: str,
                 override_timeout: int = DEFAULT_CMD_TIMEOUT):
     timeouts = {
