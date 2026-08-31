@@ -497,7 +497,8 @@ class TestPaidCapacityAuthorityPG:
             instance_type=instance_type)
         return location, paid_capacity.pool_key(location,
                                                 workspace='workspace',
-                                                num_nodes=1)
+                                                num_nodes=1,
+                                                aws_account_id='123456789012')
 
     @classmethod
     def _paid_batch_spec(
@@ -749,6 +750,50 @@ class TestPaidCapacityAuthorityPG:
             assert session.execute(
                 sqlalchemy.select(
                     serve_state.paid_capacity_pools_table)).first() is None
+
+    def test_legacy_paid_batch_rejects_promoted_service_without_writes(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        with broker_engine.begin() as connection:
+            controller_incarnation = connection.execute(
+                sqlalchemy.select(
+                    serve_state.services_table.c.controller_incarnation).
+                where(serve_state.services_table.c.name == 'svc')).scalar_one()
+            connection.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == 'svc').values(
+                        demand_source_mode='DURABLE_FEED',
+                        demand_source_epoch=1,
+                        demand_authority_capable=True,
+                        demand_authority_controller_incarnation=(
+                            controller_incarnation),
+                        demand_authority_protocol_version=1))
+        _, pool_key = self._paid_pool('us-east-1a', 'g6.xlarge')
+
+        with pytest.raises(
+                ValueError,
+                match='Prospective durable paid capacity requires fused '
+                'admission'):
+            serve_state.try_add_replicas_with_paid_capacity_claims(
+                'svc',
+                'hash', [self._paid_batch_spec(1, pool_key)],
+                base_limit=1,
+                max_limit=1,
+                service_limit=10,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1'),
+                frontier_default_limit=100)
+
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            for table in (serve_state.replicas_table,
+                          serve_state.paid_capacity_claims_table,
+                          serve_state.paid_capacity_waiters_table,
+                          serve_state.paid_capacity_pools_table):
+                assert session.execute(sqlalchemy.select(table)).first() is None
 
     def test_atomic_paid_batch_replay_rejects_reserved_row_and_rolls_back(
             self, broker_engine, monkeypatch):
