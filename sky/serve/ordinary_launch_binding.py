@@ -7720,21 +7720,14 @@ def _ordinary_paid_provider_evidence(
     return payload, digest
 
 
-def replica_has_provider_present_cleanup_marker(
+def _replica_has_provider_cleanup_marker(
     replica_info: Any,
-    *,
-    require_scheduled: bool = False,
+    allowed_down_statuses: set[common_utils.ProcessStatus],
 ) -> bool:
-    """Whether one ReplicaInfo is the closed immediate-cleanup marker."""
+    """Whether one ReplicaInfo has the exact immediate-cleanup shape."""
     status = getattr(replica_info, 'status_property', None)
     if status is None:
         return False
-    allowed_down_statuses = ({common_utils.ProcessStatus.SCHEDULED}
-                             if require_scheduled else {
-                                 common_utils.ProcessStatus.SCHEDULED,
-                                 common_utils.ProcessStatus.RUNNING,
-                                 common_utils.ProcessStatus.FAILED,
-                             })
     reserved_shape = bool(
         getattr(replica_info, 'reserved_fill', None) is True and
         getattr(replica_info, 'is_zero_cost', None) is True and
@@ -7768,12 +7761,37 @@ def replica_has_provider_present_cleanup_marker(
         status.logical_retirement_committed is False)
 
 
+def replica_has_provider_present_cleanup_marker(
+    replica_info: Any,
+    *,
+    require_scheduled: bool = False,
+) -> bool:
+    """Whether one ReplicaInfo is the closed immediate-cleanup marker."""
+    allowed_down_statuses = ({common_utils.ProcessStatus.SCHEDULED}
+                             if require_scheduled else {
+                                 common_utils.ProcessStatus.SCHEDULED,
+                                 common_utils.ProcessStatus.RUNNING,
+                                 common_utils.ProcessStatus.FAILED,
+                             })
+    return _replica_has_provider_cleanup_marker(replica_info,
+                                                allowed_down_statuses)
+
+
 def replica_has_projected_provider_absence_cleanup_marker(
         replica_info: Any) -> bool:
     """Whether a row is the closed DB-only post-ABSENT retirement marker."""
-    if replica_has_provider_present_cleanup_marker(replica_info):
+    if _replica_has_provider_cleanup_marker(
+            replica_info, {
+                common_utils.ProcessStatus.SCHEDULED,
+                common_utils.ProcessStatus.RUNNING,
+                common_utils.ProcessStatus.FAILED,
+                common_utils.ProcessStatus.SUCCEEDED,
+            }):
         # Reserved fill uses this same immediate-cleanup marker before and
         # after projection; the settled association distinguishes the latter.
+        # A purge may persist SUCCEEDED after the exact ABSENT projection and
+        # before final row deletion.  Provider-present consumers deliberately
+        # keep rejecting that completed state.
         return True
     status = getattr(replica_info, 'status_property', None)
     pool_key = getattr(replica_info, 'paid_capacity_pool_key', None)

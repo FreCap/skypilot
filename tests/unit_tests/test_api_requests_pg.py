@@ -3812,6 +3812,30 @@ def test_cancelled_gcp_paid_present_cleanup_then_absence_retires_atomically(
     assert replica['ordinary_launch_association_id'] is None
     assert claim_count == pin_count == 0
 
+    # The generic purge path may finish the provider down call after ABSENT
+    # was projected but before the final service transaction retires this row.
+    # That monotonic terminal update must remain valid deletion authority.
+    info = replica_managers.ReplicaInfo.from_storage_dict(
+        replica['replica_state'])
+    info.status_property.sky_down_status = common_utils.ProcessStatus.SUCCEEDED
+    with graph.engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'gc-service',
+                serve_state_schema.replicas_table.c.replica_id == 3).values(
+                    replica_state=info.to_storage_dict(),
+                    sky_down_status='SUCCEEDED'))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'gc-service').values(status='SHUTTING_DOWN'))
+    assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+        info)
+    assert serve_state.remove_service_completely('gc-service',
+                                                 'gc-service-hash',
+                                                 expected_lifecycle_epoch=4)
+
 
 def _cancelled_aws_absence_payload(
     graph: _PaidProviderAbsenceGraph,) -> dict[str, object]:

@@ -3699,6 +3699,23 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         manager._handle_sky_down_finish.assert_called_once_with(info,
                                                                 format_exc=None)
 
+    def test_projected_paid_absence_accepts_completed_down_marker(self):
+        """A purge can finish down before the exact row is retired."""
+        info = _fake_replica_info(
+            3, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.is_spot = True
+        info.paid_capacity_pool_key = _canonical_paid_pool_key()
+        status = info.status_property
+        status.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+        status.sky_down_status = common_utils.ProcessStatus.SUCCEEDED
+        status.is_scale_down = True
+        status.drain_cap_seconds = 0
+
+        assert not ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+            info)
+        assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+            info)
+
     def test_projected_reserved_1516_absence_cleanup_is_database_only(self):
         manager = _make_manager()
         runtime = manager._legacy_mutation_runtime_state()
