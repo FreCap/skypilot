@@ -3017,6 +3017,80 @@ def test_final_service_delete_preserves_inert_old_history(
                     tombstone['association_id'])).scalar_one() == 1
 
 
+def _insert_final_delete_paid_waiter(engine: sqlalchemy.engine.Engine,
+                                     service_hash: str) -> None:
+    """Install one fairness-only paid waiter for final-deletion tests."""
+    pool_key = _paid_launch_spec(engine, 0, 141).pool_key
+    now = time.time()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.paid_capacity_pools_table).values(
+                    pool_key=pool_key,
+                    current_limit=4,
+                    successes_since_resize=0,
+                    updated_at=now))
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.paid_capacity_waiters_table).values(
+                    pool_key=pool_key,
+                    service_name='svc',
+                    service_hash=service_hash,
+                    priority=50,
+                    first_wait_at=now,
+                    heartbeat_at=now))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    status='SHUTTING_DOWN'))
+
+
+def test_final_service_delete_retires_current_paid_waiter(
+        capacity_database):
+    """A fairness heartbeat cannot strand a provider-clean incarnation."""
+    engine, _, _ = capacity_database
+    _insert_final_delete_paid_waiter(engine, 'svc-hash')
+
+    assert serve_state.remove_service_completely(
+        'svc', 'svc-hash', expected_lifecycle_epoch=3)
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc')).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_waiters_table).where(
+                    serve_state_schema.paid_capacity_waiters_table.c.
+                    service_name == 'svc')).scalar_one() == 0
+
+
+def test_final_service_delete_rejects_foreign_paid_waiter(
+        capacity_database):
+    """A waiter from another hash remains a same-name authority conflict."""
+    engine, _, _ = capacity_database
+    _insert_final_delete_paid_waiter(engine, 'retained-old-hash')
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='retains unresolved authority'):
+        serve_state.remove_service_completely(
+            'svc', 'svc-hash', expected_lifecycle_epoch=3)
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc')).scalar_one() == 1
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_waiters_table).where(
+                    serve_state_schema.paid_capacity_waiters_table.c.
+                    service_name == 'svc')).scalar_one() == 1
+
+
 def test_final_service_delete_rejects_same_name_kueue_authority(
         capacity_database):
     """A Kueue row from any incarnation blocks final name reuse."""
