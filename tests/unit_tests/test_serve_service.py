@@ -32,6 +32,7 @@ from sky.serve import serve_state
 from sky.serve import service
 from sky.serve import service_spec as service_spec_lib
 from sky.skylet import constants as skylet_constants
+from sky.utils import status_lib
 
 
 @pytest.fixture(autouse=True)
@@ -82,6 +83,55 @@ def _admit_cleanup_from(infos):
         return admitted
 
     return _reserve
+
+
+def _provider_absent_paid_cleanup_info():
+    record_id = uuid.UUID('22222222-2222-4222-8222-222222222222')
+    status = types.SimpleNamespace(
+        sky_launch_status=service.common_utils.ProcessStatus.INTERRUPTED,
+        sky_down_status=service.common_utils.ProcessStatus.FAILED,
+        service_ready_now=False,
+        is_scale_down=True,
+        preempted=False,
+        purged=False,
+        failed_spot_availability=False,
+        wait_for_idle_before_termination=False,
+        drain_cap_seconds=0,
+        drain_started_at=None,
+        logical_retirement_version=None,
+        logical_retirement_controller_epoch=None,
+        logical_retirement_generation=None,
+        logical_retirement_target_capacity=None,
+        logical_retirement_confirmed_generation=None,
+        logical_retirement_bounded_deadline=False,
+        logical_retirement_committed=False)
+    paid_pool_key = json.dumps(
+        {
+            'accelerators': [['l4', 1]],
+            'cloud': 'gcp',
+            'instance_type': 'g2-standard-4',
+            'num_nodes': 1,
+            'region': 'us-central1',
+            'use_spot': True,
+            'version': 1,
+            'workspace': 'w',
+            'zone': 'us-central1-a',
+        },
+        sort_keys=True,
+        separators=(',', ':'))
+    info = mock.Mock(replica_id=3,
+                     replica_record_id=str(record_id),
+                     cluster_name='svc-a-r3',
+                     reserved_fill=False,
+                     is_zero_cost=False,
+                     is_spot=True,
+                     service_job_id=None,
+                     paid_capacity_pool_key=paid_pool_key,
+                     zero_cost_materialization_sequence=None,
+                     status_property=status)
+    assert (service.ordinary_launch_binding.
+            replica_has_projected_provider_absence_cleanup_marker(info))
+    return info
 
 
 def _binding_authority(
@@ -1998,6 +2048,101 @@ def test_failed_cleanup_retires_only_authorized_absent_reserved_1516_replica(
         remove.assert_not_called()
         persist.assert_called_once()
     remove_many.assert_not_called()
+    parse_fence.assert_not_called()
+    provider_down.assert_not_called()
+
+
+@pytest.mark.parametrize(('authorized', 'cluster_records', 'expected_removed',
+                          'expected_metadata_removal'), [
+                              (True, [{
+                                  'status': status_lib.ClusterStatus.INIT,
+                                  'cluster_hash': 'old-generation',
+                              }, None], True, True),
+                              (False, [], False, False),
+                              (True, [{
+                                  'status': status_lib.ClusterStatus.INIT,
+                                  'cluster_hash': 'old-generation',
+                              }, {
+                                  'status': status_lib.ClusterStatus.INIT,
+                                  'cluster_hash': 'replacement-generation',
+                              }], False, True),
+                              (True, [{
+                                  'status': status_lib.ClusterStatus.UP,
+                                  'cluster_hash': 'old-generation',
+                              }], False, False),
+                          ])
+def test_failed_cleanup_retires_hash_fenced_provider_absent_paid_replica(
+        authorized, cluster_records, expected_removed,
+        expected_metadata_removal):
+    info = _provider_absent_paid_cleanup_info()
+    lifecycle_lock = mock.Mock(epoch=31)
+    expected_owner = (4242, '10.4.7.7')
+
+    with mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=[info]), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(service.serve_utils,
+                           'get_existing_replica_cluster_names',
+                           return_value={'svc-a-r3'}), \
+         mock.patch.object(
+             service.request_postgres,
+             'bound_non_pool_projected_provider_absence_is_authorized',
+             return_value=authorized) as authorize, \
+         mock.patch.object(
+             service.global_user_state,
+             'get_cluster_from_name', side_effect=cluster_records) \
+             as get_cluster, \
+         mock.patch.object(service.global_user_state,
+                           'remove_cluster') as remove_cluster, \
+         mock.patch.object(serve_state,
+                           'add_or_update_replica', return_value=True) \
+             as persist, \
+         mock.patch.object(serve_state, 'remove_replica') as remove, \
+         mock.patch.object(serve_state,
+                           'remove_replicas', return_value=True) \
+             as remove_many, \
+         mock.patch.object(service.reserved_capacity,
+                           'parse_protocol_v2_cleanup_fence') as parse_fence, \
+         mock.patch.object(service.replica_managers,
+                           'terminate_cluster') as provider_down, \
+         mock.patch.object(service,
+                           'cleanup_storage_intents', return_value=True):
+        failed = service._cleanup('svc', False, 'incarnation-a',
+                                  expected_owner[0], expected_owner[1],
+                                  lifecycle_lock)
+
+    assert failed is (not expected_removed)
+    authorize.assert_called_once_with('svc', 3, info.replica_record_id)
+    if expected_metadata_removal:
+        remove_cluster.assert_called_once_with(
+            info.cluster_name,
+            terminate=True,
+            existing_cluster_hash='old-generation')
+    else:
+        remove_cluster.assert_not_called()
+    if authorized:
+        assert get_cluster.call_count == len(cluster_records)
+    else:
+        get_cluster.assert_not_called()
+    if expected_removed:
+        remove_many.assert_called_once_with(
+            'svc', [3],
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=31,
+            expected_controller_owner=expected_owner,
+            expected_replica_record_ids={3: info.replica_record_id})
+        persist.assert_not_called()
+    else:
+        remove_many.assert_not_called()
+        persist.assert_called_once()
+    remove.assert_not_called()
     parse_fence.assert_not_called()
     provider_down.assert_not_called()
 

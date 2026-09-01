@@ -30,6 +30,7 @@ import uuid
 import filelock
 
 from sky import exceptions
+from sky import global_user_state
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
@@ -55,6 +56,7 @@ from sky.skylet import constants as skylet_constants
 from sky.utils import auth_utils
 from sky.utils import common_utils
 from sky.utils import controller_utils
+from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import thread_utils
 from sky.utils import ux_utils
@@ -464,6 +466,40 @@ class _BoundLaunchTeardownSettlement:
     provider_reconciliation_failures: dict[tuple[int, str], str]
 
 
+def _retire_stale_paid_projected_absence_cluster_record(
+        cluster_name: str) -> str | None:
+    """Retire one hash-fenced INIT row after exact paid provider absence.
+
+    The bound association is the provider authority.  A legacy cluster-table
+    row can survive a failed launch even after that authority has durably
+    projected ABSENT.  Removing that metadata is safe only for the observed
+    INIT generation; a same-name replacement must remain untouched.
+    """
+    cluster_record = global_user_state.get_cluster_from_name(
+        cluster_name, include_user_info=False, summary_response=True)
+    if cluster_record is None:
+        return None
+    if cluster_record.get('status') is not status_lib.ClusterStatus.INIT:
+        return ('exact provider absence was projected but its fenced SkyPilot '
+                'cluster record is not stale INIT metadata')
+    cluster_hash = cluster_record.get('cluster_hash')
+    if not isinstance(cluster_hash, str) or not cluster_hash:
+        return ('exact provider absence was projected but its stale INIT '
+                'SkyPilot cluster record has no generation fence')
+    global_user_state.remove_cluster(cluster_name,
+                                     terminate=True,
+                                     existing_cluster_hash=cluster_hash)
+    replacement = global_user_state.get_cluster_from_name(
+        cluster_name, include_user_info=False, summary_response=True)
+    if replacement is not None:
+        return ('exact provider absence was projected but its hash-fenced '
+                'stale INIT SkyPilot cluster record changed or remained')
+    logger.info(
+        'Removed stale INIT cluster metadata for provider-absent paid '
+        'replica %r.', cluster_name)
+    return None
+
+
 def _prepare_provider_present_cleanup(
     service_name: str,
     authority: ordinary_launch_binding.ControllerBindingAuthority | None,
@@ -505,9 +541,25 @@ def _prepare_provider_present_cleanup(
                     bound_non_pool_projected_provider_absence_is_authorized(
                         service_name, info.replica_id, info.replica_record_id)):
                 if info.cluster_name in existing_cluster_names:
-                    failures[key] = (
-                        'exact provider absence was projected but its fenced '
-                        'SkyPilot cluster record is still present')
+                    if getattr(info, 'reserved_fill', None) is not False:
+                        failures[key] = (
+                            'exact provider absence was projected but its '
+                            'fenced SkyPilot cluster record is still present')
+                        continue
+                    try:
+                        retirement_failure = (
+                            _retire_stale_paid_projected_absence_cluster_record(
+                                info.cluster_name))
+                    except Exception as error:  # pylint: disable=broad-except
+                        retirement_failure = (
+                            'exact provider absence was projected but its '
+                            'stale INIT SkyPilot cluster record could not be '
+                            'hash-fenced retired '
+                            f'({common_utils.format_exception(error)})')
+                    if retirement_failure is not None:
+                        failures[key] = retirement_failure
+                    else:
+                        projected_absence_keys.add(key)
                 else:
                     projected_absence_keys.add(key)
             else:
