@@ -163,6 +163,79 @@ def _basename(value: object) -> str:
     return str(value or '').rstrip('/').rsplit('/', 1)[-1]
 
 
+def _normalized_operation_group_id(
+        operation: collections.abc.Mapping[str, Any]) -> str | None:
+    """Return one provider-issued GCP operation lineage identifier."""
+    raw_group_id = operation.get('operationGroupId')
+    if not isinstance(raw_group_id, str):
+        return None
+    try:
+        return str(uuid.UUID(raw_group_id))
+    except ValueError:
+        return None
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _GcpInsertLineage:
+    """Exact child target that proves one service-owned insert lineage."""
+
+    target_link: str
+    target_name: str
+    operation_group_id: str | None
+
+
+def _scoped_inflight_gcp_insert_lineages(
+    service_name: str,
+    operations: collections.abc.Sequence[object],
+) -> tuple[_GcpInsertLineage, ...]:
+    """Reduce child inserts and their project-scoped bulk parents once."""
+    scoped_children: list[_GcpInsertLineage] = []
+    active_lineages: list[_GcpInsertLineage] = []
+    active_child_groups: set[str] = set()
+    for operation in operations:
+        if (not isinstance(operation, dict) or
+                not str(operation.get('operationType',
+                                      '')).casefold().endswith('insert') or
+                not _generated_name_in_service_scope(
+                    operation.get('targetLink'), service_name)):
+            continue
+        target_link = str(operation.get('targetLink', ''))
+        lineage = _GcpInsertLineage(
+            target_link=target_link,
+            target_name=_basename(target_link),
+            operation_group_id=_normalized_operation_group_id(operation))
+        scoped_children.append(lineage)
+        if str(operation.get('status', '')).upper() == 'DONE':
+            continue
+        active_lineages.append(lineage)
+        if lineage.operation_group_id is not None:
+            active_child_groups.add(lineage.operation_group_id)
+
+    service_operation_group_ids = {
+        child.operation_group_id
+        for child in scoped_children
+        if child.operation_group_id is not None
+    }
+    active_parent_groups: set[str] = set()
+    for operation in operations:
+        if (not isinstance(operation, dict) or
+                str(operation.get('operationType',
+                                  '')).casefold() != 'bulkinsert' or
+                str(operation.get('status', '')).upper() == 'DONE'):
+            continue
+        operation_group_id = _normalized_operation_group_id(operation)
+        if (operation_group_id in service_operation_group_ids and
+                operation_group_id not in active_child_groups):
+            active_parent_groups.add(operation_group_id)
+
+    # A terminal child remains immutable lineage evidence while its parent is
+    # active.  If a child is itself active, it is already present above and the
+    # parent must not add a second effect.
+    active_lineages.extend(child for child in scoped_children
+                           if child.operation_group_id in active_parent_groups)
+    return tuple(active_lineages)
+
+
 def _numeric_total(value: object) -> int:
     if isinstance(value, bool) or value is None:
         return 0
@@ -551,23 +624,16 @@ def parse_gcp_state(*,
                                            service_name=service_name,
                                            kind='disk')
     owned_inflight_operation_targets: dict[str, str] = {}
-    for operation in operations:
-        if (not isinstance(operation, dict) or
-                not str(operation.get('operationType',
-                                      '')).casefold().endswith('insert') or
-                str(operation.get('status', '')).upper() == 'DONE' or
-                not _generated_name_in_service_scope(
-                    operation.get('targetLink'), service_name)):
-            continue
-        target_link = str(operation.get('targetLink', ''))
+    for lineage in _scoped_inflight_gcp_insert_lineages(service_name,
+                                                        operations):
+        target_link = lineage.target_link
         zone_match = re.search(r'/zones/([^/]+)/', target_link)
         if (zone_match is None or
                 _gcp_region_from_zone(zone_match.group(1)) is None):
             raise GuardViolation(
                 'GCP create operation has no exact provider zone.')
-        target_name = _basename(target_link)
         previous_zone = owned_inflight_operation_targets.setdefault(
-            target_name, zone_match.group(1))
+            lineage.target_name, zone_match.group(1))
         if previous_zone != zone_match.group(1):
             raise GuardViolation(
                 'GCP create operation has contradictory zone evidence.')
@@ -687,13 +753,12 @@ def parse_gcp_cleanup_state(*, service_name: str, instances: object,
     owned_disks = _unique_scoped_resources(disks,
                                            service_name=service_name,
                                            kind='disk')
+    # Project-scoped bulkInsert parents have no service name in targetLink.
+    # The shared reducer attributes them only through the provider's durable
+    # operationGroupId/child edge; operation-name prefixes are never trusted.
     operation_targets = {
-        _basename(item.get('targetLink'))
-        for item in operations
-        if isinstance(item, dict) and
-        str(item.get('operationType', '')).casefold().endswith('insert') and
-        str(item.get('status', '')).upper() != 'DONE' and
-        _generated_name_in_service_scope(item.get('targetLink'), service_name)
+        lineage.target_name for lineage in _scoped_inflight_gcp_insert_lineages(
+            service_name, operations)
     }
     cluster_names = frozenset(
         cluster_name for item in owned_instances
