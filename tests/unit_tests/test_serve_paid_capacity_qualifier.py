@@ -145,7 +145,7 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
     source = _FIXTURE_DIR / 'service.yaml'
     for name, expected_units, expected_first_wave, expected_period in (
         ('small', 2, 2, 10),
-        ('scale', 120, 100, 60),
+        ('scale', 120, 120, 60),
     ):
         output = tmp_path / f'{name}.yaml'
         args = type('Args', (), {
