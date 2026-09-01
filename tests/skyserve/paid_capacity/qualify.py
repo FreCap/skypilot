@@ -570,14 +570,40 @@ def _pool_l4_width(pool_identity: collections.abc.Mapping[str, Any]) -> int:
     return width
 
 
+def _canonical_qualification_resources(
+        resources: dict[str, Any]) -> dict[str, Any]:
+    """Expand the user shorthand into the API's persisted branch shape."""
+    branches = resources.get('any_of')
+    if (resources.get('accelerators') != 'L4:1' or
+            resources.get('use_spot') is not True or
+            not isinstance(branches, list) or len(branches) != 2 or not all(
+                isinstance(branch, dict) and set(branch) == {'infra'}
+                for branch in branches)):
+        return resources
+    result = {
+        key: value
+        for key, value in resources.items()
+        if key not in ('accelerators', 'use_spot')
+    }
+    result['any_of'] = [{
+        **branch,
+        'accelerators': {
+            'L4': 1,
+        },
+        'use_spot': True,
+    } for branch in branches]
+    return result
+
+
 def _validate_cross_cloud_service_config(config: object) -> tuple[int, int]:
-    """Require the one generic logical-L4 qualification contract."""
+    """Require the canonical persisted logical-L4 qualification contract."""
     if not isinstance(config, dict):
         raise ValueError('service YAML is not a mapping')
     service = config.get('service')
     resources = config.get('resources')
     if (not isinstance(service, dict) or not isinstance(resources, dict)):
         raise ValueError('service YAML is incomplete')
+    resources = _canonical_qualification_resources(resources)
     policy = service.get('replica_policy')
     load_balancer = service.get('load_balancer')
     queue = (load_balancer.get('request_queue') if isinstance(
@@ -586,6 +612,33 @@ def _validate_cross_cloud_service_config(config: object) -> tuple[int, int]:
         policy, dict) else None)
     per_replica_concurrency = (queue.get('max_concurrency_per_replica')
                                if isinstance(queue, dict) else None)
+    resource_branches = resources.get('any_of')
+    canonical_clouds: set[str] = set()
+    canonical_resources = (isinstance(resource_branches, list) and
+                           len(resource_branches) == 2 and
+                           all(key not in resources
+                               for key in ('infra', 'instance_type', 'region',
+                                           'zone', 'accelerators', 'use_spot')))
+    if canonical_resources:
+        for branch in resource_branches:
+            if not isinstance(branch, dict):
+                canonical_resources = False
+                break
+            cloud = branch.get('infra')
+            try:
+                width = _whole_l4_width(branch.get('accelerators'))
+            except ValueError:
+                canonical_resources = False
+                break
+            if (cloud not in ('aws', 'gcp') or cloud in canonical_clouds or
+                    width != 1 or branch.get('use_spot') is not True or
+                    any(key in branch
+                        for key in ('instance_type', 'region', 'zone'))):
+                canonical_resources = False
+                break
+            canonical_clouds.add(cloud)
+        canonical_resources = (canonical_resources and
+                               canonical_clouds == {'aws', 'gcp'})
     if (service.get('load_balancing_policy') != 'instance_aware_least_load' or
             not isinstance(policy, dict) or
             policy.get('spot_placer') != 'dynamic_fallback_per_gpu' or
@@ -594,14 +647,7 @@ def _validate_cross_cloud_service_config(config: object) -> tuple[int, int]:
             type(per_replica_concurrency) is not int or
             per_replica_concurrency < 1 or
             type(queue.get('max_concurrency')) is not int or
-            queue['max_concurrency'] < 1 or
-            resources.get('accelerators') != 'L4:1' or
-            resources.get('use_spot') is not True or
-            resources.get('any_of') != [{
-                'infra': 'aws'
-            }, {
-                'infra': 'gcp'
-            }] or 'infra' in resources or 'instance_type' in resources):
+            queue['max_concurrency'] < 1 or not canonical_resources):
         raise ValueError('service YAML is not generic cross-cloud L4')
     return max_paid_units, per_replica_concurrency
 

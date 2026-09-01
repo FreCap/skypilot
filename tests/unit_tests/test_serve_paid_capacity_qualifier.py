@@ -282,6 +282,84 @@ def _request_telemetry(*,
     return qualifier.request_telemetry_from_summary(summary, state_counts or {})
 
 
+def _qualification_config(*, persisted: bool, reverse: bool = False):
+    config = yaml.safe_load(
+        (_FIXTURE_DIR / 'service.yaml').read_text(encoding='utf-8'))
+    branches = list(config['resources']['any_of'])
+    if reverse:
+        branches.reverse()
+    if persisted:
+        branches = [{
+            **branch,
+            'accelerators': {
+                'L4': 1,
+            },
+            'use_spot': True,
+        } for branch in branches]
+        config['resources'] = {'any_of': branches}
+    else:
+        config['resources']['any_of'] = branches
+    return config
+
+
+@pytest.mark.parametrize('persisted', [False, True])
+@pytest.mark.parametrize('reverse', [False, True])
+def test_cross_cloud_service_contract_normalizes_one_canonical_shape(
+        persisted, reverse):
+    config = _qualification_config(persisted=persisted, reverse=reverse)
+    assert qualifier._validate_cross_cloud_service_config(config) == (2, 8)
+
+
+@pytest.mark.parametrize('mutation', [
+    'top_region',
+    'branch_region',
+    'branch_zone',
+    'branch_instance_type',
+    'duplicate_cloud',
+    'missing_cloud',
+    'extra_cloud',
+    'wrong_width',
+    'wrong_card',
+    'on_demand',
+    'accelerators_string',
+    'boolean_width',
+    'spot_string',
+    'malformed_branch',
+])
+def test_cross_cloud_service_contract_rejects_scope_drift(mutation):
+    config = _qualification_config(persisted=True)
+    resources = config['resources']
+    branches = resources['any_of']
+    if mutation == 'top_region':
+        resources['region'] = 'us-east-1'
+    elif mutation in ('branch_region', 'branch_zone', 'branch_instance_type'):
+        branches[0][mutation.removeprefix('branch_')] = 'pinned'
+    elif mutation == 'duplicate_cloud':
+        branches[1]['infra'] = branches[0]['infra']
+    elif mutation == 'missing_cloud':
+        resources['any_of'] = branches[:1]
+    elif mutation == 'extra_cloud':
+        branches[1]['infra'] = 'azure'
+    elif mutation == 'wrong_width':
+        branches[0]['accelerators']['L4'] = 2
+    elif mutation == 'wrong_card':
+        branches[0]['accelerators'] = {'A100': 1}
+    elif mutation == 'on_demand':
+        branches[0]['use_spot'] = False
+    elif mutation == 'accelerators_string':
+        branches[0]['accelerators'] = 'L4:1'
+    elif mutation == 'boolean_width':
+        branches[0]['accelerators']['L4'] = True
+    elif mutation == 'spot_string':
+        branches[0]['use_spot'] = 'true'
+    elif mutation == 'malformed_branch':
+        branches[0] = 'aws'
+    else:
+        raise AssertionError(mutation)
+    with pytest.raises(ValueError, match='not generic cross-cloud L4'):
+        qualifier._validate_cross_cloud_service_config(config)
+
+
 def test_render_profiles_share_one_spot_only_service(tmp_path):
     source = _FIXTURE_DIR / 'service.yaml'
     for name, expected_units, expected_first_wave, expected_period in (
@@ -405,7 +483,26 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
                                                  instance_type='g2-standard-4'),
                   0.2)),
         num_nodes=1).to_dict()
-    service_yaml = (_FIXTURE_DIR / 'service.yaml').read_text(encoding='utf-8')
+    user_service_yaml = (_FIXTURE_DIR /
+                         'service.yaml').read_text(encoding='utf-8')
+    persisted_service = yaml.safe_load(user_service_yaml)
+    user_resources = persisted_service['resources']
+    # The API stores effective resources inside each ``any_of`` branch and may
+    # canonicalize their order.  Provider scope must validate that durable
+    # form, not the pre-submission shorthand.
+    persisted_service['resources'] = {
+        'any_of': [{
+            **branch,
+            'accelerators': {
+                'L4': 1,
+            },
+            'use_spot': True,
+            'disk_size': 256,
+            'ports': ['8080'],
+        } for branch in reversed(user_resources['any_of'])],
+    }
+    persisted_service['_user_specified_yaml'] = user_service_yaml
+    service_yaml = yaml.safe_dump(persisted_service, sort_keys=False)
     authority = {
         'service_hash': 'incarnation',
         'service_lifecycle_epoch': 7,
