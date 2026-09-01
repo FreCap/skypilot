@@ -17,6 +17,10 @@ on:
 jobs:
   python-test:
     strategy:
+      # A failing sibling shard (for example the load-sensitive reclaim
+      # proofs) must not cancel the Unit Tests shard: that shard is the only
+      # CI execution of tests/unit_tests, so its verdict has to complete.
+      fail-fast: false
       matrix:
         python-version: ["3.14"]
         test-path:

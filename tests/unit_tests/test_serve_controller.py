@@ -5829,6 +5829,51 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._replica_manager.end_paid_launch_materialization.assert_called_once_with(  # pylint: disable=line-too-long
             handoff)
 
+    @pytest.mark.parametrize(
+        'kind, has_snapshot, reserved, has_members, expected', (
+            (None, True, {}, True, False),
+            (capacity_planning.CapacityPlanKind.DEMAND, False, {}, True, False),
+            (capacity_planning.CapacityPlanKind.GATE_ACQUISITION, True, {},
+             False, False),
+            (capacity_planning.CapacityPlanKind.GATE_ACQUISITION, True, {},
+             True, RuntimeError),
+            (capacity_planning.CapacityPlanKind.DEMAND, True, {
+                'l4': 1
+            }, False, False),
+            (capacity_planning.CapacityPlanKind.DEMAND, True, {
+                'l4': 1
+            }, True, RuntimeError),
+            (capacity_planning.CapacityPlanKind.DEMAND, True, {
+                'l4': 0
+            }, True, True),
+            (capacity_planning.CapacityPlanKind.DEMAND, True, {}, False, False),
+            (capacity_planning.CapacityPlanKind.STATIC_PREFILL, True, {}, True,
+             True),
+        ))
+    def test_paid_launch_receipt_materializes_only_exclusive_paid_effects(
+            self, kind, has_snapshot, reserved, has_members, expected):
+        receipt = types.SimpleNamespace(
+            members=(mock.sentinel.member,) if has_members else ())
+        committed = types.SimpleNamespace(paid_launch_receipt=receipt)
+        candidate = None
+        if kind is not None:
+            candidate = mock.Mock()
+            candidate.kind = kind
+            candidate.reserved_launch_target.as_dict.return_value = dict(
+                reserved)
+        planned = types.SimpleNamespace(
+            capacity_plan_candidate=candidate,
+            capacity_planning_snapshot=(mock.sentinel.planning_snapshot
+                                        if has_snapshot else None))
+        can_materialize = (
+            controller.SkyServeController._paid_launch_receipt_can_materialize)  # pylint: disable=protected-access
+
+        if expected is RuntimeError:
+            with pytest.raises(RuntimeError):
+                can_materialize(committed, planned)
+        else:
+            assert can_materialize(committed, planned) is expected
+
     def test_settled_usage_gate_commits_whole_reserved_backend_before_paid(
             self):
         ctrl = _make_controller()
