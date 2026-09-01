@@ -1011,6 +1011,27 @@ def _project_prepared_paid_provider_absence_graph(
     return graph
 
 
+def _persist_paid_projected_absence_down_succeeded(
+        graph: _PaidProviderAbsenceGraph) -> None:
+    replicas = serve_state_schema.replicas_table
+    with graph.engine.begin() as connection:
+        stored_state = connection.execute(
+            sqlalchemy.select(replicas.c.replica_state).where(
+                replicas.c.service_name == 'gc-service',
+                replicas.c.replica_id == 3)).scalar_one()
+        info = replica_managers.ReplicaInfo.from_storage_dict(stored_state)
+        info.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        connection.execute(
+            sqlalchemy.update(replicas).where(
+                replicas.c.service_name == 'gc-service',
+                replicas.c.replica_id == 3).values(
+                    status=info.status.value,
+                    replica_state=info.to_storage_dict()))
+    assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+        info)
+
+
 def _insert_paid_retirement(
     graph: _PaidProviderAbsenceGraph,
     *,
@@ -4193,10 +4214,11 @@ def test_paid_provider_absence_projection_constraint_rejects_near_miss_rows(
                     graph.context.association_id).values(**values))
 
 
-def test_projected_paid_provider_absence_retires_only_the_exact_row(
+def test_projected_paid_provider_absence_succeeded_marker_retires_exact_row(
         bound_request_database, monkeypatch) -> None:
     graph = _project_paid_provider_absence_graph(bound_request_database,
                                                  monkeypatch)
+    _persist_paid_projected_absence_down_succeeded(graph)
 
     assert not request_postgres.retire_bound_non_pool_projected_paid_provider_absence(
         'gc-service', 3, str(uuid.uuid4()))
@@ -4522,10 +4544,11 @@ def test_projected_paid_provider_absence_survives_request_gc_before_retirement(
     'non_handler_failed',
     'receipt_tamper',
 ])
-def test_projected_paid_provider_absence_retirement_fails_closed_on_new_edges(
+def test_projected_paid_provider_absence_succeeded_marker_fails_closed(
         bound_request_database, monkeypatch, blocker) -> None:
     graph = _project_paid_provider_absence_graph(bound_request_database,
                                                  monkeypatch)
+    _persist_paid_projected_absence_down_succeeded(graph)
     now = datetime.datetime.now(datetime.timezone.utc)
     with graph.engine.begin() as connection:
         if blocker == 'new_claim':

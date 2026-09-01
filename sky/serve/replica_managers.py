@@ -14657,9 +14657,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                                             _ReplicaLaunchOwnershipLostError)
                 remaining = request_postgres.inspect_bound_ordinary_launch(
                     self._service_name, replica_id, info.replica_record_id)
-                unresolved = bool(
-                    isinstance(t.exception, _BoundOrdinaryLaunchUnresolvedError)
-                    or remaining is not None)
                 if ownership_lost:
                     logger.info(
                         'Discarding bound ordinary-launch worker for replica '
@@ -14669,6 +14666,36 @@ class SkyPilotReplicaManager(ReplicaManager):
                     legacy_runtime.replica_to_logical_launch_fence.pop(
                         replica_id)
                     continue
+                pre_admission_paid_failure = bool(
+                    t.exception is not None and not isinstance(
+                        t.exception, _BoundOrdinaryLaunchUnresolvedError) and
+                    remaining is None and
+                    legacy_runtime.replica_to_request_id.get(replica_id) is None
+                    and isinstance(t, _ReplicaLaunchThread) and
+                    _bound_ordinary_paid_claim_owns_provider_effect(
+                        info, launch_thread=t))
+                if pre_admission_paid_failure:
+                    # Phase A committed the replica and paid claim, but this
+                    # worker failed before publishing any bound request.  A
+                    # provider effect requires that association, so hand the
+                    # exact identity to the existing provider-free retirement
+                    # loop instead of manufacturing a sky.down operation and
+                    # retaining a terminal row with an unresolved claim.
+                    legacy_runtime.launch_thread_pool.pop(replica_id)
+                    legacy_runtime.replica_to_request_id.pop(replica_id)
+                    legacy_runtime.replica_to_logical_launch_fence.pop(
+                        replica_id)
+                    self._enqueue_paid_phase_a_recovery_identities(
+                        (_PaidPhaseARecoveryIdentity(replica_id,
+                                                     info.replica_record_id),))
+                    logger.warning(
+                        'Paid launch worker for replica %s failed before '
+                        'bound request admission; queued exact provider-free '
+                        'Phase-A retirement.', replica_id)
+                    continue
+                unresolved = bool(
+                    isinstance(t.exception, _BoundOrdinaryLaunchUnresolvedError)
+                    or remaining is not None)
                 if unresolved:
                     remaining_classification = (
                         None if remaining is None else

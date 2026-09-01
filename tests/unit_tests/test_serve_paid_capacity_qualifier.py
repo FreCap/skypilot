@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import time
+import types
 import urllib.error
 import urllib.request
 import uuid
@@ -145,7 +146,7 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
     source = _FIXTURE_DIR / 'service.yaml'
     for name, expected_units, expected_first_wave, expected_period in (
         ('small', 2, 2, 10),
-        ('scale', 120, 120, 60),
+        ('scale', 240, 240, 60),
     ):
         output = tmp_path / f'{name}.yaml'
         args = type('Args', (), {
@@ -173,7 +174,7 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
         assert queue['max_concurrency'] == min(128,
                                                profile.pressure_concurrency)
         assert resources['use_spot'] is True
-        assert resources['infra'] == 'gcp/us-central1'
+        assert resources['infra'] == 'gcp'
         assert resources['instance_type'] == 'g2-standard-4'
         assert resources['accelerators'] == 'L4:1'
         assert 'workdir' not in config
@@ -229,12 +230,124 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
         'controller_config_digest': hashlib.sha256(config_bytes).hexdigest(),
         'controller_config_snapshot_id': 'a' * 64,
     }
-    scope = qualifier.provider_scope_from_controller_config(
-        authority, expected_region='us-central1')
+    scope = qualifier.provider_scope_from_controller_config(authority)
     assert scope.project_id == 'durable-project'
+    assert (scope.location_scope is qualifier.GcpLocationScope.PROJECT_WIDE)
     receipt = tmp_path / 'scope.json'
     qualifier.write_provider_scope(receipt, 'paid-e2e', scope)
     assert qualifier.read_provider_scope(receipt, 'paid-e2e') == scope
+
+
+def test_provider_scope_commands_are_regionless_by_default():
+    freeze = qualifier._parser().parse_args([
+        'freeze-scope', '--service-name', 'paid-e2e', '--output',
+        '/tmp/scope.json'
+    ])
+    run = qualifier._parser().parse_args([
+        'run', '--profile', 'small', '--service-name', 'paid-e2e', '--endpoint',
+        'https://example.test', '--receipt', '/tmp/receipt.json', '--scope',
+        '/tmp/scope.json'
+    ])
+    assert not hasattr(freeze, 'region')
+    assert not hasattr(run, 'region')
+
+
+def test_retained_request_accepts_cross_region_and_rejects_scope_drift(
+        monkeypatch):
+    scope = qualifier.ProviderScope(
+        service_hash='incarnation',
+        lifecycle_epoch=7,
+        service_version=11,
+        project_id='durable-project',
+        workspace='workspace-a',
+        location_scope=qualifier.GcpLocationScope.PROJECT_WIDE,
+        controller_config_digest='a' * 64,
+        controller_config_snapshot_id='b' * 64)
+    association_id = uuid.UUID('11111111-1111-4111-8111-111111111111')
+    binding = {
+        'association_id': association_id,
+        'request_id': 'request-1',
+        'tenant_scope': 'tenant-a',
+        'cluster_name': 'paid-e2e-1',
+        'service_workspace': 'workspace-a',
+    }
+    for index, field in enumerate(qualifier._BOUND_REQUEST_PROFILE_FIELDS):
+        binding[field] = f'profile-{index}'
+    request_row = {
+        **{
+            field: binding[field] for field in qualifier._BOUND_REQUEST_PROFILE_FIELDS
+        },
+        'ordinary_launch_association_id': association_id,
+        'request_id': 'request-1',
+        'handler_name': qualifier.non_pool_launch.NON_POOL_LAUNCH_HANDLER_NAME,
+        'user_id': 'tenant-a',
+        'cluster_name': 'paid-e2e-1',
+    }
+    retained_request = [None]
+    monkeypatch.setattr(qualifier.request_postgres, 'request_from_mapping',
+                        lambda _row: retained_request[0])
+    context = object()
+    monkeypatch.setattr(qualifier.ordinary_launch_binding,
+                        'bound_context_from_association', lambda _row: context)
+    monkeypatch.setattr(qualifier.ordinary_launch_binding,
+                        'parse_bound_non_pool_launch_context',
+                        lambda _row: context)
+
+    def configure(*,
+                  project_id='durable-project',
+                  region='us-east1',
+                  zone='us-east1-b',
+                  accelerator='l4',
+                  instance_type='g2-standard-4'):
+        pool_payload = {
+            'accelerators': [[accelerator, 1]],
+            'cloud': 'gcp',
+            'instance_type': instance_type,
+            'num_nodes': 1,
+            'region': region,
+            'use_spot': True,
+            'version': 1,
+            'workspace': 'workspace-a',
+            'zone': zone,
+        }
+        binding['paid_capacity_pool_key'] = json.dumps(pool_payload,
+                                                       sort_keys=True,
+                                                       separators=(',', ':'))
+        retained_request[0] = types.SimpleNamespace(
+            request_body=types.SimpleNamespace(
+                extra_launch_context={},
+                override_skypilot_config={
+                    'active_workspace': 'workspace-a',
+                    'workspaces': {
+                        'workspace-a': {
+                            'gcp': {
+                                'project_id': project_id,
+                            },
+                        },
+                    },
+                }))
+
+    configure()
+    identity = qualifier.gcp_identity_from_retained_request(
+        binding, request_row, scope)
+    assert identity['region'] == 'us-east1'
+    assert identity['zone'] == 'us-east1-b'
+
+    for overrides in ({
+            'project_id': 'different-project'
+    }, {
+            'region': 'us-east1',
+            'zone': 'us-west1-a'
+    }, {
+            'instance_type': 'g2-standard-8'
+    }, {
+            'accelerator': 'a100'
+    }):
+        configure(**overrides)
+        with pytest.raises(qualifier.GuardViolation,
+                           match='retained-request GCP identity'):
+            qualifier.gcp_identity_from_retained_request(
+                binding, request_row, scope)
 
 
 def test_gcp_observer_uses_compute_api_adc_and_paginates(monkeypatch):
@@ -273,7 +386,7 @@ def test_gcp_observer_uses_compute_api_adc_and_paginates(monkeypatch):
         },
         'next-instances': {
             'items': {
-                'zones/us-central1-b': {
+                'zones/us-east1-b': {
                     'instances': [{
                         'name': 'second'
                     }],
@@ -322,14 +435,15 @@ def test_gcp_observer_uses_compute_api_adc_and_paginates(monkeypatch):
         return Compute()
 
     monkeypatch.setattr(qualifier.gcp_adaptor, 'build', build)
-    scope = qualifier.ProviderScope(service_hash='incarnation',
-                                    lifecycle_epoch=7,
-                                    service_version=11,
-                                    project_id='durable-project',
-                                    workspace='workspace-a',
-                                    region='us-central1',
-                                    controller_config_digest='a' * 64,
-                                    controller_config_snapshot_id='b' * 64)
+    scope = qualifier.ProviderScope(
+        service_hash='incarnation',
+        lifecycle_epoch=7,
+        service_version=11,
+        project_id='durable-project',
+        workspace='workspace-a',
+        location_scope=(qualifier.GcpLocationScope.PROJECT_WIDE),
+        controller_config_digest='a' * 64,
+        controller_config_snapshot_id='b' * 64)
     observer = qualifier.GcpObserver(service_name='paid-e2e',
                                      scope=scope,
                                      profile=qualifier.PROFILES['small'])
@@ -371,14 +485,15 @@ def test_gcp_observer_sanitizes_api_failures():
         def instances(self):
             return Collection()
 
-    scope = qualifier.ProviderScope(service_hash='incarnation',
-                                    lifecycle_epoch=7,
-                                    service_version=11,
-                                    project_id='durable-project',
-                                    workspace='workspace-a',
-                                    region='us-central1',
-                                    controller_config_digest='a' * 64,
-                                    controller_config_snapshot_id='b' * 64)
+    scope = qualifier.ProviderScope(
+        service_hash='incarnation',
+        lifecycle_epoch=7,
+        service_version=11,
+        project_id='durable-project',
+        workspace='workspace-a',
+        location_scope=(qualifier.GcpLocationScope.PROJECT_WIDE),
+        controller_config_digest='a' * 64,
+        controller_config_snapshot_id='b' * 64)
     observer = qualifier.GcpObserver(service_name='paid-e2e',
                                      scope=scope,
                                      profile=qualifier.PROFILES['small'],
@@ -397,8 +512,7 @@ def test_provider_guard_rejects_on_demand_wrong_shape_and_overshoot():
         expected_cluster_zones={'paid-e2e-1': 'us-central1-a'},
         profile=profile,
         instances=[valid],
-        disks=[],
-        expected_region='us-central1')
+        disks=[])
     assert state.running_count == 1
     assert state.cluster_names == frozenset({'paid-e2e-1'})
 
@@ -409,8 +523,7 @@ def test_provider_guard_rejects_on_demand_wrong_shape_and_overshoot():
             expected_cluster_zones={'paid-e2e-1': 'us-central1-a'},
             profile=profile,
             instances=[on_demand],
-            disks=[],
-            expected_region='us-central1')
+            disks=[])
 
     wrong_shape = {**valid, 'machineType': 'machineTypes/g2-standard-8'}
     with pytest.raises(qualifier.QualificationError, match='wrong shape'):
@@ -419,8 +532,7 @@ def test_provider_guard_rejects_on_demand_wrong_shape_and_overshoot():
             expected_cluster_zones={'paid-e2e-1': 'us-central1-a'},
             profile=profile,
             instances=[wrong_shape],
-            disks=[],
-            expected_region='us-central1')
+            disks=[])
 
     instances = [
         _instance(cluster_name=f'paid-e2e-{index}') for index in range(1, 4)
@@ -433,8 +545,7 @@ def test_provider_guard_rejects_on_demand_wrong_shape_and_overshoot():
             },
             profile=profile,
             instances=instances,
-            disks=[],
-            expected_region='us-central1')
+            disks=[])
 
 
 def test_provider_guard_ignores_preexisting_unrelated_resources():
@@ -447,8 +558,7 @@ def test_provider_guard_ignores_preexisting_unrelated_resources():
         ],
         disks=[{
             'name': 'unrelated-1-head'
-        }],
-        expected_region='us-central1')
+        }])
     assert state == qualifier.ProviderState(instance_count=0,
                                             running_count=0,
                                             disk_count=0,
@@ -463,8 +573,7 @@ def test_provider_guard_rejects_unbound_service_effects():
                                   expected_cluster_zones={},
                                   profile=qualifier.PROFILES['small'],
                                   instances=[_instance()],
-                                  disks=[],
-                                  expected_region='us-central1')
+                                  disks=[])
 
 
 @pytest.mark.parametrize('labels', ({}, {'ray-cluster-name': 'paid-e2e-2'}))
@@ -481,8 +590,7 @@ def test_provider_guard_discovers_instance_with_missing_or_corrupt_label(
                                   },
                                   profile=qualifier.PROFILES['small'],
                                   instances=[instance],
-                                  disks=[],
-                                  expected_region='us-central1')
+                                  disks=[])
 
 
 def test_provider_guard_rejects_duplicate_and_multiple_instance_effects():
@@ -494,8 +602,7 @@ def test_provider_guard_rejects_duplicate_and_multiple_instance_effects():
             expected_cluster_zones={'paid-e2e-1': 'us-central1-a'},
             profile=qualifier.PROFILES['small'],
             instances=[instance, dict(instance)],
-            disks=[],
-            expected_region='us-central1')
+            disks=[])
 
     with pytest.raises(qualifier.GuardViolation,
                        match='multiple GCP instance effects'):
@@ -504,8 +611,7 @@ def test_provider_guard_rejects_duplicate_and_multiple_instance_effects():
             expected_cluster_zones={'paid-e2e-1': 'us-central1-a'},
             profile=qualifier.PROFILES['small'],
             instances=[instance, _instance(suffix='87654321')],
-            disks=[],
-            expected_region='us-central1')
+            disks=[])
 
 
 def test_provider_guard_discovers_orphan_disk_without_metadata():
@@ -520,8 +626,7 @@ def test_provider_guard_discovers_orphan_disk_without_metadata():
             expected_cluster_zones={'paid-e2e-1': 'us-central1-a'},
             profile=qualifier.PROFILES['small'],
             instances=[],
-            disks=[orphan],
-            expected_region='us-central1')
+            disks=[orphan])
 
     cleanup = qualifier.parse_gcp_cleanup_state(service_name='paid-e2e',
                                                 instances=[],
@@ -542,8 +647,7 @@ def test_provider_guard_discovers_orphan_disk_without_metadata():
             expected_cluster_zones={'paid-e2e-1': 'us-central1-a'},
             profile=qualifier.PROFILES['small'],
             instances=[_instance()],
-            disks=[labelled_orphan],
-            expected_region='us-central1')
+            disks=[labelled_orphan])
 
 
 def test_provider_guard_rejects_multiple_disks_for_one_binding():
@@ -565,24 +669,22 @@ def test_provider_guard_rejects_multiple_disks_for_one_binding():
             expected_cluster_zones={'paid-e2e-1': 'us-central1-a'},
             profile=qualifier.PROFILES['small'],
             instances=[],
-            disks=[disk('1234abcd'), disk('87654321')],
-            expected_region='us-central1')
+            disks=[disk('1234abcd'), disk('87654321')])
 
 
-def test_provider_guard_accepts_region_but_enforces_each_binding_zone():
-    zone_b = {
+def test_provider_guard_accepts_cross_region_but_enforces_binding_zone():
+    east_zone_b = {
         **_instance(cluster_name='paid-e2e-2'),
-        'zone': 'zones/us-central1-b',
+        'zone': 'zones/us-east1-b',
     }
     state = qualifier.parse_gcp_state(service_name='paid-e2e',
                                       expected_cluster_zones={
                                           'paid-e2e-1': 'us-central1-a',
-                                          'paid-e2e-2': 'us-central1-b',
+                                          'paid-e2e-2': 'us-east1-b',
                                       },
                                       profile=qualifier.PROFILES['small'],
-                                      instances=[_instance(), zone_b],
-                                      disks=[],
-                                      expected_region='us-central1')
+                                      instances=[_instance(), east_zone_b],
+                                      disks=[])
     assert state.instance_count == 2
 
     with pytest.raises(qualifier.GuardViolation, match='binding zone'):
@@ -590,9 +692,8 @@ def test_provider_guard_accepts_region_but_enforces_each_binding_zone():
             service_name='paid-e2e',
             expected_cluster_zones={'paid-e2e-2': 'us-central1-a'},
             profile=qualifier.PROFILES['small'],
-            instances=[zone_b],
-            disks=[],
-            expected_region='us-central1')
+            instances=[east_zone_b],
+            disks=[])
 
 
 def test_cleanup_census_counts_unbound_scoped_provider_effects():
@@ -639,8 +740,7 @@ def test_provider_census_uses_binding_derived_tenant_hashed_name():
             'targetLink': ('https://compute.googleapis.com/compute/v1/projects/'
                            'project/zones/us-central1-a/instances/'
                            f'{generated_name}'),
-        }],
-        expected_region='us-central1')
+        }])
     assert state.instance_count == 1
     assert state.disk_count == 1
     assert state.inflight_operation_count == 1
@@ -827,7 +927,7 @@ def test_request_telemetry_uses_observer_postgres_engine(monkeypatch):
         service_version=1,
         workspace='workspace-a',
         project_id='project-a',
-        region='us-central1',
+        location_scope=qualifier.GcpLocationScope.PROJECT_WIDE,
         controller_config_digest='a' * 64,
         controller_config_snapshot_id='b' * 64)
     seen = {}
