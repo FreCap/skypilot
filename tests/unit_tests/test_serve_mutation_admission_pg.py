@@ -36,8 +36,9 @@ pytestmark = pytest.mark.xdist_group(name='reserved_fill_atomic_admission_pg')
 _LIFECYCLE_EPOCH = 4
 
 
-def _replica(replica_id: int, *, teardown: bool = False
-            ) -> replica_managers.ReplicaInfo:
+def _replica(replica_id: int,
+             *,
+             teardown: bool = False) -> replica_managers.ReplicaInfo:
     info = replica_managers.ReplicaInfo(
         replica_id=replica_id,
         cluster_name=f'{_SERVICE}-mutation-{replica_id}',
@@ -69,22 +70,21 @@ def _persist(info: replica_managers.ReplicaInfo,
         expected_replica_exists=expected_exists)
 
 
-def _launch(info: replica_managers.ReplicaInfo,
-            *,
-            limit: int,
-            require_bound: bool = False,
-            ) -> dict[int, replica_managers.ReplicaInfo]:
+def _launch(
+    info: replica_managers.ReplicaInfo,
+    *,
+    limit: int,
+    require_bound: bool = False,
+) -> dict[int, replica_managers.ReplicaInfo]:
     return serve_state.reserve_replica_launches_running_if_capacity(
-        _SERVICE,
-        [(info.replica_id, info.replica_record_id, require_bound)],
+        _SERVICE, [(info.replica_id, info.replica_record_id, require_bound)],
         launch_limit=limit,
         expected_service_hash=_SERVICE_HASH,
         expected_lifecycle_epoch=_LIFECYCLE_EPOCH,
         expected_controller_owner=_OWNER)
 
 
-def _down(info: replica_managers.ReplicaInfo,
-          *,
+def _down(info: replica_managers.ReplicaInfo, *,
           limit: int) -> dict[int, replica_managers.ReplicaInfo]:
     return serve_state.reserve_replica_teardowns_running_if_capacity(
         _SERVICE, [(info.replica_id, info.replica_record_id)],
@@ -103,8 +103,7 @@ def _stored_row(engine: sqlalchemy.engine.Engine,
                 serve_state_schema.replicas_table.c.replica_state_version,
                 serve_state_schema.replicas_table.c.replica_state).where(
                     serve_state_schema.replicas_table.c.service_name ==
-                    _SERVICE,
-                    serve_state_schema.replicas_table.c.replica_id ==
+                    _SERVICE, serve_state_schema.replicas_table.c.replica_id ==
                     replica_id)).one()
     return row.status, serve_state.decode_replica_state_for_authority(
         row.replica_state_version, row.replica_state)
@@ -133,9 +132,8 @@ def test_two_connections_serialize_one_p_slot_and_charge_running_row(
                     serve_state_schema.replicas_table.c.replica_state_version,
                     serve_state_schema.replicas_table.c.replica_state).where(
                         serve_state_schema.replicas_table.c.service_name ==
-                        _SERVICE,
-                        serve_state_schema.replicas_table.c.replica_id ==
-                        infos[0].replica_id).with_for_update()).one()
+                        _SERVICE, serve_state_schema.replicas_table.c.replica_id
+                        == infos[0].replica_id).with_for_update()).one()
             current = serve_state.decode_replica_state_for_authority(*row)
             current.status_property.sky_launch_status = (
                 common_utils.ProcessStatus.RUNNING)
@@ -165,8 +163,7 @@ def test_two_connections_serialize_one_p_slot_and_charge_running_row(
     # Once the first transaction commits, the second request is rejected by
     # the exact committed P count rather than by stale process-local state.
     assert _launch(infos[1], limit=1) == {}
-    scalar_status, persisted = _stored_row(atomic_database,
-                                           infos[0].replica_id)
+    scalar_status, persisted = _stored_row(atomic_database, infos[0].replica_id)
     assert scalar_status == serve_state.ReplicaStatus.PROVISIONING.value
     assert (persisted.status_property.sky_launch_status ==
             common_utils.ProcessStatus.RUNNING)
@@ -184,15 +181,19 @@ def test_killing_gate_transaction_backend_rolls_back_status_and_charge(
         session)
     assert serve_state.try_acquire_replica_launch_authority_in_transaction(
         session, atomic_database, _SERVICE)
-    assert serve_state._prelock_serve_mutation_rows(
-        session, atomic_database, _SERVICE, _SERVICE_HASH, _LIFECYCLE_EPOCH,
-        _OWNER)
+    assert serve_state._prelock_serve_mutation_rows(session, atomic_database,
+                                                    _SERVICE, _SERVICE_HASH,
+                                                    _LIFECYCLE_EPOCH, _OWNER)
     current = serve_state.get_replica_info_from_id(_SERVICE, info.replica_id)
     assert current is not None
     current.status_property.sky_launch_status = (
         common_utils.ProcessStatus.RUNNING)
     assert serve_state._update_exact_locked_replica_in_session(
-        session, _SERVICE, info.replica_id, info.replica_record_id, current,
+        session,
+        _SERVICE,
+        info.replica_id,
+        info.replica_record_id,
+        current,
         require_no_association=True)
     with atomic_database.begin() as killer:
         assert killer.execute(
@@ -243,8 +244,7 @@ def test_d_and_p_budgets_are_independent_in_reverse_order(
     assert serve_state.get_replica_mutation_counts() == (1, 1)
 
 
-def test_same_row_cannot_cross_from_p_to_d_or_d_to_p(
-        atomic_database) -> None:
+def test_same_row_cannot_cross_from_p_to_d_or_d_to_p(atomic_database) -> None:
     del atomic_database
     launch_row = _replica(129)
     down_row = _replica(130, teardown=True)
@@ -287,8 +287,7 @@ def test_shared_provider_guard_allows_unrelated_p_and_d(
     assert serve_state.get_replica_mutation_counts() == (1, 1)
 
 
-def test_exclusive_service_invalidator_defers_p_and_d(
-        atomic_database) -> None:
+def test_exclusive_service_invalidator_defers_p_and_d(atomic_database) -> None:
     launch = _replica(141)
     down = _replica(142, teardown=True)
     _persist(launch)
@@ -309,12 +308,11 @@ def test_atomic_v2_saturation_leaves_second_graph_absent(
     first, second = _atomic_specs(atomic_database, 2)
     first = dataclasses.replace(first, launch_limit=1)
     second = dataclasses.replace(second, launch_limit=1)
-    _, receipt = reserved_fill_admission._transaction(
-        first, 7, require_existing=False)
+    _, receipt = reserved_fill_admission._transaction(first,
+                                                      7,
+                                                      require_existing=False)
     with pytest.raises(reserved_fill_admission._Rejected):
-        reserved_fill_admission._transaction(second,
-                                              7,
-                                              require_existing=False)
+        reserved_fill_admission._transaction(second, 7, require_existing=False)
     assert receipt.replica_id == first.replica_info.replica_id
     with atomic_database.connect() as connection:
         assert connection.execute(
@@ -371,8 +369,7 @@ def test_launch_admission_requires_exact_association_shape(
                 serve_state_schema.replicas_table.c.
                 ordinary_launch_association_id).where(
                     serve_state_schema.replicas_table.c.service_name ==
-                    _SERVICE,
-                    serve_state_schema.replicas_table.c.replica_id ==
+                    _SERVICE, serve_state_schema.replicas_table.c.replica_id ==
                     spec.replica_info.replica_id).with_for_update()).one()
         associated = serve_state.decode_replica_state_for_authority(
             row.replica_state_version, row.replica_state)
@@ -396,8 +393,9 @@ def test_projected_cancelled_bound_launch_consumes_d_slot(
         atomic_database) -> None:
     """A normal exact cancellation must not strand provider cleanup."""
     spec = dataclasses.replace(_atomic_spec(atomic_database), launch_limit=2)
-    _, receipt = reserved_fill_admission._transaction(
-        spec, 7, require_existing=False)
+    _, receipt = reserved_fill_admission._transaction(spec,
+                                                      7,
+                                                      require_existing=False)
     with atomic_database.connect() as connection:
         request_row = connection.execute(
             sqlalchemy.select(request_postgres.REQUESTS).where(
@@ -434,8 +432,7 @@ def test_projected_cancelled_bound_launch_consumes_d_slot(
         'replica-teardown',
         project_replica_result=_project)
     assert reduction.disposition is (
-        request_postgres.OrdinaryLaunchReductionDisposition.
-        PRE_EFFECT_TERMINAL)
+        request_postgres.OrdinaryLaunchReductionDisposition.PRE_EFFECT_TERMINAL)
     assert reduction.projected
 
     with atomic_database.connect() as connection:
@@ -443,16 +440,14 @@ def test_projected_cancelled_bound_launch_consumes_d_slot(
             sqlalchemy.select(
                 ordinary_launch_binding.ordinary_launch_associations_table.c.
                 resolution).where(
-                    ordinary_launch_binding.
-                    ordinary_launch_associations_table.c.association_id ==
-                    context.association_id)).scalar_one()
+                    ordinary_launch_binding.ordinary_launch_associations_table.
+                    c.association_id == context.association_id)).scalar_one()
         pointer = connection.execute(
             sqlalchemy.select(
                 serve_state_schema.replicas_table.c.
                 ordinary_launch_association_id).where(
                     serve_state_schema.replicas_table.c.service_name ==
-                    _SERVICE,
-                    serve_state_schema.replicas_table.c.replica_id ==
+                    _SERVICE, serve_state_schema.replicas_table.c.replica_id ==
                     receipt.replica_id)).scalar_one()
         queue_count = connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
@@ -471,7 +466,7 @@ def test_projected_cancelled_bound_launch_consumes_d_slot(
     assert pin_count == 0
 
     persisted = serve_state.get_replica_info_from_id(_SERVICE,
-                                                      receipt.replica_id)
+                                                     receipt.replica_id)
     assert persisted is not None
     assert set(_down(persisted, limit=1)) == {receipt.replica_id}
     _, running = _stored_row(atomic_database, receipt.replica_id)

@@ -5163,11 +5163,11 @@ class TestAutoscalerRuntimeSnapshot:
             'return_value': None
         })
 
-        with mock.patch.object(
-                controller.serve_state, 'get_paid_launch_version_authority',
-                **patch_kwargs), mock.patch.object(
-                    controller.paid_capacity,
-                    'build_launch_budget') as build_budget:
+        with mock.patch.object(controller.serve_state,
+                               'get_paid_launch_version_authority',
+                               **patch_kwargs), mock.patch.object(
+                                   controller.paid_capacity,
+                                   'build_launch_budget') as build_budget:
             prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
                 scaler, 1, [], None)
 

@@ -516,8 +516,8 @@ def _validate_node_inventory(
                 _dict(node.get('status'),
                       f'{name} Node status').get('capacity'),
                 f'{name} Node capacity')
-            if (labels.get(contract['product_label_key']) !=
-                    contract['product_label_value'] or
+            if (labels.get(contract['product_label_key'])
+                    != contract['product_label_value'] or
                     capacity.get(contract['resource_name']) != str(
                         contract['capacity_per_node'])):
                 raise KubernetesAttestationError(
@@ -645,8 +645,8 @@ def _validate_snapshot(fleet_context: Mapping[str, Any],
     _metadata(priority, name=fleet_context['priority_class']['name'])
     if (priority.get('value') != fleet_context['priority_class']['value'] or
             priority.get('globalDefault') not in (None, False) or
-            priority.get('preemptionPolicy') !=
-            fleet_context['priority_class']['preemption_policy']):
+            priority.get('preemptionPolicy')
+            != fleet_context['priority_class']['preemption_policy']):
         raise KubernetesAttestationError(
             'The Pod PriorityClass reclaim contract is invalid.')
     local_queue_name: str | None = None
@@ -837,12 +837,12 @@ def attest_context(fleet_context: Mapping[str,
                             deadline_monotonic, cancellation)),
                                    subject='Pod PriorityClass')),
                 'resource_flavors': {
-                    flavor['name']:
-                    _get_kueue_object(custom,
-                                      plural='resourceflavors',
-                                      name=flavor['name'],
-                                      deadline_monotonic=(deadline_monotonic),
-                                      cancellation=(cancellation))
+                    flavor['name']: _get_kueue_object(
+                        custom,
+                        plural='resourceflavors',
+                        name=flavor['name'],
+                        deadline_monotonic=(deadline_monotonic),
+                        cancellation=(cancellation))
                     for flavor in provider_context['resource_flavors']
                 },
                 'nodes': {

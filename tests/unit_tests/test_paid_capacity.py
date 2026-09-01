@@ -868,15 +868,19 @@ def test_prospective_budget_is_spot_only_state_aware_and_target_bounded():
         on_demand: 0.05,
     })
     keys = {
-        location: paid_capacity.pool_key(location,
-                                         workspace='w',
-                                         num_nodes=1)
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
         for location in (cheap, probe, fallback)
     }
     states = {
-        keys[cheap]: {'remaining': 60},
-        keys[probe]: {'remaining': 1},
-        keys[fallback]: {'remaining': 59},
+        keys[cheap]: {
+            'remaining': 60
+        },
+        keys[probe]: {
+            'remaining': 1
+        },
+        keys[fallback]: {
+            'remaining': 59
+        },
     }
     with mock.patch.object(paid_capacity,
                            'central_authority_available',
@@ -941,22 +945,20 @@ def test_prospective_budget_rejects_committed_authority_and_nonstring_cards():
             **kwargs, prospective_backend_claims_by_accelerator={1: 1})
 
 
-def test_prospective_budget_does_not_spend_global_cap_across_card_alternatives():
+def test_prospective_budget_does_not_spend_global_cap_across_card_alternatives(
+):
     l4 = make_location('us-central1-a', {'L4': 1}, cloud_name='GCP')
     a100 = make_location('us-central1-b', {'A100': 1}, cloud_name='GCP')
     placer = make_placer({l4: 0.10, a100: 0.20})
     keys = {
-        location: paid_capacity.pool_key(location,
-                                         workspace='w',
-                                         num_nodes=1)
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
         for location in (l4, a100)
     }
     states = {
         key: {
             'remaining': 4,
             'admission_state': 'active',
-        }
-        for key in keys.values()
+        } for key in keys.values()
     }
     with mock.patch.object(paid_capacity,
                            'central_authority_available',
@@ -2466,30 +2468,28 @@ def _managed_equal_cost_budget(
         location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
         for location in (first, second)
     }
-    budget = paid_capacity.LaunchBudget(
-        remaining_by_location={
-            first: first_remaining,
-            second: second_remaining,
-        },
-        pool_key_by_location=pool_keys,
-        states_by_pool_key={
-            pool_key: {
-                'remaining': 60,
-                'admission_state': 'active',
-            } for pool_key in pool_keys.values()
-        },
-        globally_managed=True,
-        service_remaining=first_remaining + second_remaining)
+    budget = paid_capacity.LaunchBudget(remaining_by_location={
+        first: first_remaining,
+        second: second_remaining,
+    },
+                                        pool_key_by_location=pool_keys,
+                                        states_by_pool_key={
+                                            pool_key: {
+                                                'remaining': 60,
+                                                'admission_state': 'active',
+                                            } for pool_key in pool_keys.values()
+                                        },
+                                        globally_managed=True,
+                                        service_remaining=first_remaining +
+                                        second_remaining)
     return budget, first, second
 
 
 def test_equal_normalized_cost_does_not_balance_across_purchase_market():
-    spot = make_location('us-central1-a',
-                         {'L4': 1},
+    spot = make_location('us-central1-a', {'L4': 1},
                          cloud_name='GCP',
                          use_spot=True)
-    on_demand = make_location('us-central1-b',
-                              {'L4': 1},
+    on_demand = make_location('us-central1-b', {'L4': 1},
                               cloud_name='GCP',
                               use_spot=False)
     placer = make_placer({spot: 0.424, on_demand: 0.424})
@@ -2505,7 +2505,10 @@ def test_equal_normalized_cost_does_not_balance_across_backend_shape():
     eight_gpu = make_location('us-central1-b', {'L4': 8}, cloud_name='GCP')
     contract = placement_policy.resolve_fresh_contract(
         placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
-    placer = make_placer({one_gpu: 0.424, eight_gpu: 3.392},
+    placer = make_placer({
+        one_gpu: 0.424,
+        eight_gpu: 3.392
+    },
                          placement_contract=contract)
     budget, canonical, noncanonical = _managed_equal_cost_budget(placer)
 
@@ -2537,8 +2540,7 @@ def test_equal_cost_tier_balances_across_cloud_and_region():
     assert balanced != canonical
 
 
-def test_managed_balancing_reserves_retry_for_exact_returned_pool(
-        monkeypatch):
+def test_managed_balancing_reserves_retry_for_exact_returned_pool(monkeypatch):
     locations = [
         make_location(f'us-central1-{zone}', {'L4': 1}, cloud_name='GCP')
         for zone in ('a', 'b')
@@ -2553,8 +2555,7 @@ def test_managed_balancing_reserves_retry_for_exact_returned_pool(
 
     assert placer.preview_next_location() == canonical
     with mock.patch.object(
-            placer,
-            'preview_next_location',
+            placer, 'preview_next_location',
             wraps=placer.preview_next_location) as preview, mock.patch.object(
                 placer,
                 'select_next_location',

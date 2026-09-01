@@ -1253,9 +1253,8 @@ def _validate_prepared_paid_specs(
                 serve_state_schema.version_specs_table.c.placement_catalog,
                 serve_state_schema.version_specs_table.c.controller_config,
                 serve_state_schema.version_specs_table.c.
-                controller_config_digest,
-                serve_state_schema.version_specs_table.c.
-                controller_config_snapshot_id).where(
+                controller_config_digest, serve_state_schema.
+                version_specs_table.c.controller_config_snapshot_id).where(
                     serve_state_schema.version_specs_table.c.service_name ==
                     'svc', serve_state_schema.version_specs_table.c.version ==
                     1)).mappings().one()
@@ -3169,9 +3168,8 @@ def test_paid_launch_validator_rejects_inexact_interleaved_rank_occurrence(
                 serve_state_schema.version_specs_table.c.service_name == 'svc',
                 serve_state_schema.version_specs_table.c.version == 1).values(
                     placement_catalog=catalog.to_dict()))
-    ranks = tuple(
-        entry.rank for entry in catalog.ranked_entries(
-            _capacity_service_spec(False).placement_contract))
+    ranks = tuple(entry.rank for entry in catalog.ranked_entries(
+        _capacity_service_spec(False).placement_contract))
     specs = (_paid_launch_spec(engine,
                                0,
                                1115,
@@ -3191,9 +3189,7 @@ def test_paid_launch_validator_rejects_inexact_interleaved_rank_occurrence(
 
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
                        match='catalog traversal is noncanonical'):
-        _validate_prepared_paid_specs(engine,
-                                      specs,
-                                      accounting_cards={'l4': 1})
+        _validate_prepared_paid_specs(engine, specs, accounting_cards={'l4': 1})
 
     assert _paid_write_counts(engine) == before
 
@@ -3204,8 +3200,7 @@ def _install_equal_cost_shape_catalog(
     l4 = _paid_location(1)
     l4.region = 'us-central1-a'
     l4.instance_type = 'test-l4-exact-tier'
-    a100 = make_location('us-central1-b',
-                         {'A100': 1},
+    a100 = make_location('us-central1-b', {'A100': 1},
                          cloud_name='GCP',
                          instance_type='test-a100-exact-tier')
     a100.image_id = {None: 'skypilot:test-regionless-image'}
@@ -3248,9 +3243,8 @@ def _equal_cost_shape_specs(
     return tuple(specs)
 
 
-@pytest.mark.parametrize(
-    'card_order',
-    [('l4', 'l4', 'a100', 'a100'), ('a100', 'a100', 'l4', 'l4')])
+@pytest.mark.parametrize('card_order', [('l4', 'l4', 'a100', 'a100'),
+                                        ('a100', 'a100', 'l4', 'l4')])
 def test_paid_launch_validator_accepts_contiguous_same_cost_tier_blocks(
         capacity_database, card_order):
     engine, incarnation, _ = capacity_database
@@ -3262,8 +3256,12 @@ def test_paid_launch_validator_accepts_contiguous_same_cost_tier_blocks(
                                     first_replica_id=1120)
     before = _paid_write_counts(engine)
 
-    validated, replica_port = _validate_prepared_paid_specs(
-        engine, specs, accounting_cards={'l4': 1, 'a100': 1})
+    validated, replica_port = _validate_prepared_paid_specs(engine,
+                                                            specs,
+                                                            accounting_cards={
+                                                                'l4': 1,
+                                                                'a100': 1
+                                                            })
 
     assert validated == specs
     assert replica_port == '8000'

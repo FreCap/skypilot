@@ -634,7 +634,9 @@ class TestEconomicDecisions:
                   cost_rebalance_max_parallel_replacements=1))
         placer = make_placer({
             paid: 1.0,
-            **{location: 0.0 for location in cheap_locations},
+            **{
+                location: 0.0 for location in cheap_locations
+            },
         })
         scaler.set_spot_placer(placer)
         replicas = [
@@ -755,8 +757,9 @@ class TestPinnedReplacementLaunch:
             'kwargs',
         }
         runtime = manager._legacy_mutation_runtime_state()
-        assert (construction.kwargs['target'] is
-                replica_managers.launch_cluster_with_frozen_controller_config)
+        assert (
+            construction.kwargs['target']
+            is replica_managers.launch_cluster_with_frozen_controller_config)
         assert construction.kwargs['replica_id'] == 8
         assert construction.kwargs[
             'replica_record_id'] == info.replica_record_id
@@ -764,10 +767,10 @@ class TestPinnedReplacementLaunch:
         assert construction.kwargs['controller_owner'] is None
         teardown_requested = construction.kwargs['teardown_requested']
         assert isinstance(teardown_requested, threading.Event)
-        assert (construction.kwargs['completion_queue'] is
-                runtime.launch_completion_queue)
-        assert (construction.kwargs['completion_event'] is
-                runtime.launch_completion_event)
+        assert (construction.kwargs['completion_queue']
+                is runtime.launch_completion_queue)
+        assert (construction.kwargs['completion_event']
+                is runtime.launch_completion_event)
         assert construction.kwargs['bound_ordinary_launch'] is False
         assert construction.kwargs['ordinary_legacy_launch'] is False
         assert construction.kwargs['args'] == (
@@ -803,18 +806,18 @@ class TestPinnedReplacementLaunch:
         assert launch_kwargs['exact_resources_override'] is True
         pre_launch_guard = launch_kwargs['pre_launch_guard']
         assert pre_launch_guard.__self__ is manager
-        assert (pre_launch_guard.__func__ is
-                type(manager)._service_is_launch_authorized)
+        assert (pre_launch_guard.__func__
+                is type(manager)._service_is_launch_authorized)
         assert launch_kwargs['cloud_launch_guard']() == (True, 'authorized')
         assert launch_kwargs['supersession_guard']() == (True, 'authorized')
         continue_guard = launch_kwargs['continue_guard']
         assert continue_guard.__self__ is manager
-        assert (continue_guard.__func__ is
-                type(manager)._launch_owner_watchdog_allows_continue)
+        assert (continue_guard.__func__
+                is type(manager)._launch_owner_watchdog_allows_continue)
         cleanup_continue_guard = launch_kwargs['cleanup_continue_guard']
         assert cleanup_continue_guard.__self__ is manager
-        assert (cleanup_continue_guard.__func__ is
-                type(manager)._service_is_cleanup_authorized)
+        assert (cleanup_continue_guard.__func__
+                is type(manager)._service_is_cleanup_authorized)
         assert launch_kwargs['launch_fence'] is None
         assert launch_kwargs['service_spec'] is manager._version_specs[1]
         assert launch_kwargs['service_name'] == 'svc'

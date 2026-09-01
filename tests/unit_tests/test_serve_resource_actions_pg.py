@@ -79,8 +79,7 @@ def empty_postgres(postgres_engine):
     with postgres_engine.begin() as connection:
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
         connection.exec_driver_sql('CREATE SCHEMA public')
-    global_user_state_schema.user_table.create(postgres_engine,
-                                               checkfirst=True)
+    global_user_state_schema.user_table.create(postgres_engine, checkfirst=True)
     return postgres_engine
 
 

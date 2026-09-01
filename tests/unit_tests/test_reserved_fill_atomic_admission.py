@@ -162,12 +162,11 @@ def test_broker_lock_exit_timeout_after_commit_hydrates_not_rejects(
         launch_generation=1,
         context=mock.sentinel.context)
     staged = mock.Mock()
-    lock = SimpleNamespace(
-        acquire=mock.Mock(side_effect=(_ExitTimeout(),
-                                       contextlib.nullcontext())))
-    monkeypatch.setattr(reserved_fill_admission, '_frozen_identity',
-                        lambda _spec: (mock.sentinel.body,
-                                       mock.sentinel.intent))
+    lock = SimpleNamespace(acquire=mock.Mock(
+        side_effect=(_ExitTimeout(), contextlib.nullcontext())))
+    monkeypatch.setattr(
+        reserved_fill_admission, '_frozen_identity', lambda _spec:
+        (mock.sentinel.body, mock.sentinel.intent))
     monkeypatch.setattr(reserved_fill_admission.request_postgres,
                         'non_pool_launch_binding_fleet_capable', lambda: True)
     monkeypatch.setattr(reserved_fill_admission.reserved_capacity_broker.locks,
@@ -205,9 +204,9 @@ def test_broker_lock_acquisition_timeout_is_definite_rejection(
     acquisition = mock.MagicMock()
     acquisition.__enter__.side_effect = locks.LockTimeout('busy')
     lock = SimpleNamespace(acquire=mock.Mock(return_value=acquisition))
-    monkeypatch.setattr(reserved_fill_admission, '_frozen_identity',
-                        lambda _spec: (mock.sentinel.body,
-                                       mock.sentinel.intent))
+    monkeypatch.setattr(
+        reserved_fill_admission, '_frozen_identity', lambda _spec:
+        (mock.sentinel.body, mock.sentinel.intent))
     monkeypatch.setattr(reserved_fill_admission.request_postgres,
                         'non_pool_launch_binding_fleet_capable', lambda: True)
     monkeypatch.setattr(reserved_fill_admission.reserved_capacity_broker.locks,
@@ -235,8 +234,8 @@ def test_connection_close_error_cannot_mask_transaction_interrupt(
 
     with pytest.raises(_InjectedInterrupt) as raised:
         reserved_fill_admission._transaction(mock.sentinel.spec,
-                                              37,
-                                              require_existing=False)
+                                             37,
+                                             require_existing=False)
 
     assert isinstance(raised.value.__cause__, RuntimeError)
     connection.begin.return_value.rollback.assert_called_once_with()
@@ -254,8 +253,8 @@ def test_nonexception_baseexception_is_re_raised_after_evidence_handling(
         context=mock.sentinel.context)
     staged = mock.Mock()
     if point == 'commit':
-        transaction = mock.Mock(side_effect=(_InjectedFault(),
-                                             (staged, receipt)))
+        transaction = mock.Mock(side_effect=(_InjectedFault(), (staged,
+                                                                receipt)))
     elif point == 'hydration':
         transaction = mock.Mock(side_effect=(_InjectedFault(),
                                              _InjectedFault()))
