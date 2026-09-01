@@ -3786,99 +3786,6 @@ def _validate_reserved_fill_cleanup_profile_in_connection(
             'authority.')
 
 
-def _validate_historical_paid_priority_cleanup_profile_in_connection(
-    connection: sqlalchemy.engine.Connection,
-    service: Mapping[str, Any],
-    replica: Mapping[str, Any],
-    association: Mapping[str, Any],
-    expected: NonPoolLaunchProfile,
-) -> None:
-    """Accept only the known historical paid-priority clobber at cleanup.
-
-    Old recovery adoption rewrote an existing claim's priority even though the
-    complete claim had already been hashed into the bound profile.  Enumerate
-    the closed priority domain and require one otherwise byte-exact current
-    claim+placement reconstruction to match the frozen profile.  This is
-    compatibility for already-corrupted post-effect rows; it grants no launch
-    authority and tolerates no plan, pool, claim, or placement drift.
-    """
-    info = _locked_replica_info(replica)
-    kind = classify_non_pool_launch_profile(info)
-    pool_key, paid_claim = _paid_claim_payload(connection, service, replica,
-                                               info)
-    expected_reference = (
-        f'paid-capacity:{service["hash"]}:{info.replica_record_id}:{pool_key}')
-    if (kind is not NonPoolLaunchProfileKind.ORDINARY_PAID or
-            expected.kind is not NonPoolLaunchProfileKind.ORDINARY_PAID or
-            expected.authorization_kind
-            is not NonPoolLaunchAuthorizationKind.PAID_CAPACITY_CLAIM or
-            expected.authorization_generation != 0 or
-            expected.authorization_reference != expected_reference or
-            paid_claim is None or
-            info.replica_id != association.get('replica_id') or
-            info.replica_record_id != str(association.get('replica_record_id'))
-            or info.version != association.get('service_version') or
-            info.cluster_name != association.get('cluster_name') or
-            info.paid_capacity_pool_key != pool_key or
-            association.get('paid_capacity_pool_key') != pool_key or
-            info.is_spot is not True or info.is_zero_cost is not False or
-            info.reserved_fill is not False or
-            info.service_job_id is not None or
-            type(info.planned_capacity) is not int or
-            info.planned_capacity < 1):
-        raise OrdinaryLaunchBindingConflict(
-            'Paid-provider cleanup lost its frozen ordinary-paid admission.')
-    current_priority = paid_claim.get('priority')
-    if (type(current_priority) is not int or
-            current_priority != serve_constants.LB_REQUEST_PRIORITY_MIN):
-        raise OrdinaryLaunchBindingConflict(
-            'Paid-provider cleanup is not the historical minimum-priority '
-            'corruption.')
-    placement = _replica_placement_payload(info)
-    matches = 0
-    for historical_priority in range(
-            serve_constants.LB_REQUEST_PRIORITY_MIN,
-            serve_constants.LB_REQUEST_PRIORITY_MAX + 1):
-        historical_claim = {**paid_claim, 'priority': historical_priority}
-        candidate = NonPoolLaunchProfile.create(
-            NonPoolLaunchProfileKind.ORDINARY_PAID,
-            authorization_reference=expected_reference,
-            authorization_generation=0,
-            authorization_payload={
-                'claim': historical_claim,
-                'placement': placement,
-            })
-        matches += int(candidate == expected)
-    if matches != 1:
-        raise OrdinaryLaunchBindingConflict(
-            'Paid-provider cleanup no longer matches its frozen admission '
-            'outside the historical priority repair.')
-
-
-def _validate_ordinary_paid_cleanup_profile_in_connection(
-    connection: sqlalchemy.engine.Connection,
-    service: Mapping[str, Any],
-    replica: Mapping[str, Any],
-    association: Mapping[str, Any],
-    expected: NonPoolLaunchProfile,
-) -> None:
-    """Prefer strict cleanup; isolate the temporary priority repair path."""
-    try:
-        _validate_profile_authority_in_connection(
-            connection,
-            service,
-            replica,
-            expected,
-            validate_paid_provider_start=False)
-        return
-    except OrdinaryLaunchBindingConflict:
-        # Transitional compatibility for claims corrupted by the old restart
-        # adoption UPSERT.  Remove this fallback after that cohort drains;
-        # immutable claims must always pass the strict validator above.
-        _validate_historical_paid_priority_cleanup_profile_in_connection(
-            connection, service, replica, association, expected)
-
-
 def validate_reserved_fill_cleanup_association_in_connection(
     connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
@@ -7241,12 +7148,18 @@ def provider_absence_projection_authority_in_connection(
                 'Paid-provider absence requires a freshly extracted '
                 'locked-request receipt.')
         # A replacement's predecessor/observation is mutable planner state and
-        # may legitimately change after provider I/O.  Ordinary paid accepts
-        # only the historical recovery-priority clobber described by its
-        # compatibility validator.
+        # may legitimately change after provider I/O.  Cleanup instead relies
+        # on the immutable admitted association/profile, exact replica snapshot,
+        # paid claim, retained request, pin, and quiescence receipt validated by
+        # this transaction.  Ordinary paid has no predecessor and requires
+        # byte-exact immutable admission-profile revalidation.
         if profile_kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
-            _validate_ordinary_paid_cleanup_profile_in_connection(
-                connection, service, replica, association, context.profile)
+            _validate_profile_authority_in_connection(
+                connection,
+                service,
+                replica,
+                context.profile,
+                validate_paid_provider_start=False)
         expected_payload, expected_digest = _ordinary_paid_provider_evidence(
             association,
             info.cluster_name,
@@ -7924,12 +7837,15 @@ def provider_presence_cleanup_authority_in_connection(
                 != association['paid_capacity_pool_key']):
             raise OrdinaryLaunchBindingConflict(
                 'Provider-present cleanup lost its exact paid GCP profile.')
-        # Do not re-consult today's mutable plan after provider I/O.  The
-        # frozen cleanup graph and byte-exact priority compatibility check are
-        # the non-authorizing proof.
+        # Do not re-consult a replacement predecessor after provider I/O; the
+        # frozen cleanup graph above is the non-authorizing settlement proof.
         if profile_kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
-            _validate_ordinary_paid_cleanup_profile_in_connection(
-                connection, service, replica, association, context.profile)
+            _validate_profile_authority_in_connection(
+                connection,
+                service,
+                replica,
+                context.profile,
+                validate_paid_provider_start=False)
         expected_payload, expected_digest = _ordinary_paid_provider_evidence(
             association, info.cluster_name, ProviderEvidence.PRESENT)
     if association['provider_evidence_payload'] != expected_payload:

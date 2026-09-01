@@ -890,27 +890,6 @@ def _project_prepared_paid_provider_absence_graph(
     return graph
 
 
-def _stage_historical_priority_paid_provider_absence_graph(
-        bound_request_database,
-        monkeypatch: pytest.MonkeyPatch) -> _PaidProviderAbsenceGraph:
-    """Stage the production restart-priority corruption before cleanup."""
-    graph = _prepare_paid_provider_absence_graph(bound_request_database,
-                                                 monkeypatch)
-    with graph.engine.begin() as connection:
-        claims = serve_state_schema.paid_capacity_claims_table
-        original_priority = connection.execute(
-            sqlalchemy.select(claims.c.priority).where(
-                claims.c.service_name == 'gc-service',
-                claims.c.replica_id == 3)).scalar_one()
-        assert original_priority > serve_constants.LB_REQUEST_PRIORITY_MIN
-        connection.execute(
-            sqlalchemy.update(claims).where(
-                claims.c.service_name == 'gc-service',
-                claims.c.replica_id == 3).values(
-                    priority=serve_constants.LB_REQUEST_PRIORITY_MIN))
-    return graph
-
-
 def _insert_paid_retirement(
     graph: _PaidProviderAbsenceGraph,
     *,
@@ -4054,8 +4033,8 @@ def test_projected_paid_provider_absence_retires_only_the_exact_row(
 @pytest.mark.parametrize('requires_idle_proof', [False, True])
 def test_projected_paid_provider_absence_consumes_exact_committed_retirement(
         bound_request_database, monkeypatch, requires_idle_proof) -> None:
-    graph = _stage_historical_priority_paid_provider_absence_graph(
-        bound_request_database, monkeypatch)
+    graph = _prepare_paid_provider_absence_graph(bound_request_database,
+                                                 monkeypatch)
     _insert_paid_retirement(graph, requires_idle_proof=requires_idle_proof)
     _project_prepared_paid_provider_absence_graph(graph)
 
@@ -4103,8 +4082,8 @@ def test_projected_paid_provider_absence_consumes_exact_committed_retirement(
 ])
 def test_projected_paid_provider_absence_rejects_inexact_retirement(
         bound_request_database, monkeypatch, mutation) -> None:
-    graph = _stage_historical_priority_paid_provider_absence_graph(
-        bound_request_database, monkeypatch)
+    graph = _prepare_paid_provider_absence_graph(bound_request_database,
+                                                 monkeypatch)
     kwargs = {}
     if mutation == 'active':
         kwargs['state'] = paid_retirement.PaidRetirementState.ACTIVE
@@ -4144,8 +4123,8 @@ def test_projected_paid_provider_absence_rejects_inexact_retirement(
 
 def test_projected_paid_provider_absence_row_cas_rolls_back_retirement_delete(
         bound_request_database, monkeypatch) -> None:
-    graph = _stage_historical_priority_paid_provider_absence_graph(
-        bound_request_database, monkeypatch)
+    graph = _prepare_paid_provider_absence_graph(bound_request_database,
+                                                 monkeypatch)
     _insert_paid_retirement(graph)
     _project_prepared_paid_provider_absence_graph(graph)
     replicas = serve_state_schema.replicas_table
