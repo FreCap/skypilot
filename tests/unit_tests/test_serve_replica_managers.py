@@ -2435,20 +2435,25 @@ def test_materialize_paid_launch_receipt_builds_only_sparse_members():
         assert service_name == 'svc'
         return [info]
 
-    with mock.patch.object(replica_managers.serve_state,
-                           'get_replica_infos',
-                           side_effect=_read_committed) as read, \
-         mock.patch.object(manager,
-                           '_build_paid_launch_worker_postcommit',
-                           return_value=(worker, launch_result)) as build, \
-         mock.patch.object(manager._spot_placer,
-                           'reserve_retry') as reserve_retry, \
-         mock.patch.object(
-             manager,
-             '_persist_spot_placement_state_if_dirty') as persist_retry, \
-         mock.patch.object(request_postgres,
-                           'inspect_bound_ordinary_launch') as inspect:
-        materialized = manager.materialize_paid_launch_receipt(receipt, specs)
+    handoff = manager.begin_paid_launch_materialization(specs)
+    try:
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               side_effect=_read_committed) as read, \
+             mock.patch.object(manager,
+                               '_build_paid_launch_worker_postcommit',
+                               return_value=(worker, launch_result)) as build, \
+             mock.patch.object(manager._spot_placer,
+                               'reserve_retry') as reserve_retry, \
+             mock.patch.object(
+                 manager,
+                 '_persist_spot_placement_state_if_dirty') as persist_retry, \
+             mock.patch.object(request_postgres,
+                               'inspect_bound_ordinary_launch') as inspect:
+            materialized = manager.materialize_paid_launch_receipt(
+                receipt, handoff)
+    finally:
+        manager.end_paid_launch_materialization(handoff)
 
     assert materialized == (launch_result,)
     read.assert_called_once_with('svc')
@@ -2460,6 +2465,243 @@ def test_materialize_paid_launch_receipt_builds_only_sparse_members():
     assert manager._next_replica_id == selected.replica_id + 1
     worker.start.assert_not_called()
     assert specs[0].replica_id not in manager._launch_thread_pool
+    assert not manager._paid_launch_materialization_identities
+
+
+def test_paid_materialization_handoff_blocks_only_exact_unowned_row():
+    manager, cheap, _ = _provider_free_paid_manager()
+    with mock.patch.object(manager,
+                           '_task_template_for_version',
+                           return_value=mock.Mock()), \
+         mock.patch.object(replica_managers,
+                           '_get_resources_ports',
+                           return_value='8080'), \
+         mock.patch.object(replica_managers.skypilot_config,
+                           'to_dict',
+                           return_value={}):
+        specs = manager.prepare_paid_launch_specs(
+            accelerator_shapes={'l4': 1},
+            max_gpu_units_by_accelerator={'l4': 1},
+            max_candidates=1,
+            occupied_replica_ids=(),
+            version_authority=_paid_version_authority(manager),
+            paid_location_launch_budget=_provider_free_paid_budget(
+                manager, {cheap: 1}, service_remaining=1))
+    assert len(specs) == 1
+    spec = specs[0]
+    protected = _fake_replica_info(
+        spec.replica_id, replica_managers.serve_state.ReplicaStatus.PENDING)
+    protected.replica_record_id = spec.replica_record_id
+    protected.paid_capacity_pool_key = spec.pool_key
+    unrelated = _fake_replica_info(
+        spec.replica_id, replica_managers.serve_state.ReplicaStatus.PENDING)
+    unrelated.replica_record_id = str(uuid.uuid4())
+    unrelated.paid_capacity_pool_key = spec.pool_key
+    retirement = ordinary_launch_binding.PreAdmissionRetirement(
+        ordinary_launch_binding.PreAdmissionRetirementDisposition.RETIRED)
+
+    with mock.patch.object(
+            request_postgres,
+            'inspect_bound_ordinary_launch',
+            return_value=None) as inspect, \
+         mock.patch.object(
+             ordinary_launch_binding,
+             'retire_pre_admission_non_pool_launch_intent',
+             return_value=retirement) as retire:
+        handoff = manager.begin_paid_launch_materialization(specs)
+        try:
+            manager._reconcile_unowned_bound_non_pool_launches(
+                [protected, unrelated])
+        finally:
+            manager.end_paid_launch_materialization(handoff)
+
+        inspect.assert_called_once_with('svc', unrelated.replica_id,
+                                        unrelated.replica_record_id)
+        retire.assert_called_once_with(
+            manager._ordinary_launch_binding_authority, unrelated.replica_id,
+            unrelated.replica_record_id)
+        manager._reconcile_unowned_bound_non_pool_launches([protected])
+
+    assert inspect.call_args_list[-1] == mock.call('svc', protected.replica_id,
+                                                   protected.replica_record_id)
+    assert retire.call_args_list[-1] == mock.call(
+        manager._ordinary_launch_binding_authority, protected.replica_id,
+        protected.replica_record_id)
+    assert not manager._paid_launch_materialization_identities
+
+
+def test_paid_materialization_failure_recovers_complete_sparse_receipt():
+    manager, _, _ = _provider_free_paid_manager()
+    with mock.patch.object(manager,
+                           '_task_template_for_version',
+                           return_value=mock.Mock()), \
+         mock.patch.object(replica_managers,
+                           '_get_resources_ports',
+                           return_value='8080'), \
+         mock.patch.object(replica_managers.skypilot_config,
+                           'to_dict',
+                           return_value={}):
+        specs = manager.prepare_paid_launch_specs(
+            accelerator_shapes={'l4': 1},
+            max_gpu_units_by_accelerator={'l4': 2},
+            max_candidates=2,
+            occupied_replica_ids=(),
+            version_authority=_paid_version_authority(manager),
+            paid_location_launch_budget=_provider_free_paid_budget(
+                manager, {
+                    location: 1
+                    for location in manager._spot_placer.active_locations()
+                },
+                service_remaining=2))
+    assert len(specs) == 2
+    members = tuple(
+        paid_capacity.PaidLaunchReceiptMember(
+            replica_id=spec.replica_id,
+            replica_record_id=spec.replica_record_id,
+            pool_key=spec.pool_key,
+            priority=50,
+            accelerator=spec.accelerator,
+            plan_units=1,
+            physical_gpu_units=1) for spec in specs)
+    receipt = paid_capacity.PaidLaunchReceipt(service_name='svc',
+                                              service_hash='hash',
+                                              service_lifecycle_epoch=1,
+                                              service_version=1,
+                                              capacity_plan_generation=9,
+                                              capacity_plan_sha256='a' * 64,
+                                              capacity_unit='physical-backend',
+                                              members=members)
+    infos = [
+        mock.Mock(replica_id=spec.replica_id,
+                  replica_record_id=spec.replica_record_id) for spec in specs
+    ]
+    worker = mock.Mock(replica_record_id=specs[0].replica_record_id)
+    launch_result = replica_managers._ReplicaLaunchResult(
+        replica_id=specs[0].replica_id,
+        planned_capacity=1,
+        funding=replica_managers._ReplicaLaunchFunding.PAID)
+    handoff = manager.begin_paid_launch_materialization(specs)
+    try:
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=infos), \
+             mock.patch.object(
+                 manager,
+                 '_build_paid_launch_worker_postcommit',
+                 side_effect=[(worker, launch_result),
+                              RuntimeError('blocked suffix')]):
+            with pytest.raises(RuntimeError, match='blocked suffix'):
+                manager.materialize_paid_launch_receipt(receipt, handoff)
+    finally:
+        manager.end_paid_launch_materialization(handoff)
+
+    expected = {
+        replica_managers._PaidPhaseARecoveryIdentity(spec.replica_id,
+                                                     spec.replica_record_id)
+        for spec in specs
+    }
+    with manager._paid_phase_a_recovery_lock:
+        assert set(manager._paid_phase_a_recoveries) == expected
+    assert not manager._launch_thread_pool
+    assert not manager._paid_launch_materialization_identities
+
+
+def test_paid_materialization_handoff_survives_blocked_worker_build():
+    manager, cheap, _ = _provider_free_paid_manager()
+    with mock.patch.object(manager,
+                           '_task_template_for_version',
+                           return_value=mock.Mock()), \
+         mock.patch.object(replica_managers,
+                           '_get_resources_ports',
+                           return_value='8080'), \
+         mock.patch.object(replica_managers.skypilot_config,
+                           'to_dict',
+                           return_value={}):
+        specs = manager.prepare_paid_launch_specs(
+            accelerator_shapes={'l4': 1},
+            max_gpu_units_by_accelerator={'l4': 1},
+            max_candidates=1,
+            occupied_replica_ids=(),
+            version_authority=_paid_version_authority(manager),
+            paid_location_launch_budget=_provider_free_paid_budget(
+                manager, {cheap: 1}, service_remaining=1))
+    spec = specs[0]
+    member = paid_capacity.PaidLaunchReceiptMember(
+        replica_id=spec.replica_id,
+        replica_record_id=spec.replica_record_id,
+        pool_key=spec.pool_key,
+        priority=50,
+        accelerator=spec.accelerator,
+        plan_units=1,
+        physical_gpu_units=1)
+    receipt = paid_capacity.PaidLaunchReceipt(service_name='svc',
+                                              service_hash='hash',
+                                              service_lifecycle_epoch=1,
+                                              service_version=1,
+                                              capacity_plan_generation=9,
+                                              capacity_plan_sha256='a' * 64,
+                                              capacity_unit='physical-backend',
+                                              members=(member,))
+    info = _fake_replica_info(
+        spec.replica_id, replica_managers.serve_state.ReplicaStatus.PENDING)
+    info.replica_record_id = spec.replica_record_id
+    info.paid_capacity_pool_key = spec.pool_key
+    worker = mock.Mock(replica_record_id=spec.replica_record_id)
+    launch_result = replica_managers._ReplicaLaunchResult(
+        replica_id=spec.replica_id,
+        planned_capacity=1,
+        funding=replica_managers._ReplicaLaunchFunding.PAID)
+    build_entered = threading.Event()
+    release_build = threading.Event()
+    outcome = []
+
+    def _build(*_args):
+        build_entered.set()
+        assert release_build.wait(timeout=5)
+        return worker, launch_result
+
+    def _materialize(handoff):
+        try:
+            outcome.append(
+                manager.materialize_paid_launch_receipt(receipt, handoff))
+        except Exception as error:  # pragma: no cover - asserted below
+            outcome.append(error)
+
+    retirement = ordinary_launch_binding.PreAdmissionRetirement(
+        ordinary_launch_binding.PreAdmissionRetirementDisposition.RETIRED)
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=[info]), \
+         mock.patch.object(manager,
+                           '_build_paid_launch_worker_postcommit',
+                           side_effect=_build), \
+         mock.patch.object(manager._spot_placer, 'reserve_retry'), \
+         mock.patch.object(manager,
+                           '_persist_spot_placement_state_if_dirty'), \
+         mock.patch.object(
+             request_postgres,
+             'inspect_bound_ordinary_launch',
+             return_value=None) as inspect, \
+         mock.patch.object(
+             ordinary_launch_binding,
+             'retire_pre_admission_non_pool_launch_intent',
+             return_value=retirement) as retire:
+        handoff = manager.begin_paid_launch_materialization(specs)
+        materializer = threading.Thread(target=_materialize, args=(handoff,))
+        materializer.start()
+        assert build_entered.wait(timeout=5)
+        with manager.lock:
+            manager._reconcile_unowned_bound_non_pool_launches([info])
+        inspect.assert_not_called()
+        retire.assert_not_called()
+        release_build.set()
+        materializer.join(timeout=5)
+        manager.end_paid_launch_materialization(handoff)
+
+    assert not materializer.is_alive()
+    assert outcome == [(launch_result,)]
+    assert manager._launch_thread_pool[spec.replica_id] is worker
+    assert not manager._paid_launch_materialization_identities
 
 
 def _fake_replica_info(replica_id, status=None):
