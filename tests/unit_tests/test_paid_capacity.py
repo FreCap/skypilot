@@ -853,6 +853,148 @@ def test_global_snapshot_uses_shared_headroom_by_exact_pool():
     get_states.assert_called_once()
 
 
+def test_prospective_budget_is_spot_only_state_aware_and_target_bounded():
+    cheap = make_location('us-central1-a', {'L4': 1}, cloud_name='GCP')
+    probe = make_location('us-central1-b', {'L4': 1}, cloud_name='GCP')
+    fallback = make_location('us-central1-c', {'L4': 1}, cloud_name='GCP')
+    on_demand = make_location('us-central1-d', {'L4': 1},
+                              use_spot=False,
+                              cloud_name='GCP')
+    placer = make_placer({
+        cheap: 0.10,
+        probe: 0.20,
+        fallback: 0.30,
+        on_demand: 0.05,
+    })
+    keys = {
+        location: paid_capacity.pool_key(location,
+                                         workspace='w',
+                                         num_nodes=1)
+        for location in (cheap, probe, fallback)
+    }
+    states = {
+        keys[cheap]: {'remaining': 60},
+        keys[probe]: {'remaining': 1},
+        keys[fallback]: {'remaining': 59},
+    }
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), \
+         mock.patch.object(paid_capacity.serve_state,
+                           'get_paid_capacity_pool_states',
+                           return_value=states), \
+         mock.patch.object(paid_capacity,
+                           'max_service_exploration_frontier',
+                           return_value=36):
+        budget = paid_capacity.build_launch_budget(
+            placer,
+            workspace='w',
+            service_name='svc',
+            service_hash='hash',
+            existing_replica_infos=[],
+            globally_managed=True,
+            prospective_backend_claims_by_accelerator={'L4': 120})
+
+    assert budget.service_remaining == 120
+    assert budget.service_claim_limit == 120
+    assert budget.frontier_limit == 36
+    assert budget.max_frontier_limit == 36
+    assert on_demand not in budget.pool_key_by_location
+    selected = []
+    for _ in range(120):
+        location = paid_capacity.select_location(
+            placer,
+            budget,
+            skip_zero_cost_preference=True,
+            allowed_locations={cheap, probe, fallback})
+        assert location is not None
+        selected.append(location)
+        paid_capacity.debit(budget, location)
+    assert selected.count(cheap) == 60
+    assert selected.count(probe) == 1
+    assert selected.count(fallback) == 59
+    assert paid_capacity.select_location(
+        placer,
+        budget,
+        skip_zero_cost_preference=True,
+        allowed_locations={cheap, probe, fallback}) is None
+
+
+def test_prospective_budget_rejects_committed_authority_and_nonstring_cards():
+    location = make_location('us-central1-a', {'L4': 1}, cloud_name='GCP')
+    placer = make_placer({location: 0.10})
+    authority = _paid_launch_authority({'l4': 1}, widths={'l4': 1})
+    kwargs = dict(placer=placer,
+                  workspace='w',
+                  service_name='svc',
+                  service_hash='hash',
+                  existing_replica_infos=[],
+                  globally_managed=True)
+    with pytest.raises(ValueError, match='mutually exclusive'):
+        paid_capacity.build_launch_budget(
+            **kwargs,
+            paid_launch_authority=authority,
+            prospective_backend_claims_by_accelerator={'l4': 1})
+    with pytest.raises(ValueError, match='string accelerator keys'):
+        paid_capacity.build_launch_budget(
+            **kwargs, prospective_backend_claims_by_accelerator={1: 1})
+
+
+def test_prospective_budget_does_not_spend_global_cap_across_card_alternatives():
+    l4 = make_location('us-central1-a', {'L4': 1}, cloud_name='GCP')
+    a100 = make_location('us-central1-b', {'A100': 1}, cloud_name='GCP')
+    placer = make_placer({l4: 0.10, a100: 0.20})
+    keys = {
+        location: paid_capacity.pool_key(location,
+                                         workspace='w',
+                                         num_nodes=1)
+        for location in (l4, a100)
+    }
+    states = {
+        key: {
+            'remaining': 4,
+            'admission_state': 'active',
+        }
+        for key in keys.values()
+    }
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), \
+         mock.patch.object(paid_capacity.serve_state,
+                           'get_paid_capacity_pool_states',
+                           return_value=states), \
+         mock.patch.object(paid_capacity,
+                           'max_service_exploration_frontier',
+                           return_value=36):
+        budget = paid_capacity.build_launch_budget(
+            placer,
+            workspace='w',
+            service_name='svc',
+            service_hash='hash',
+            existing_replica_infos=[],
+            globally_managed=True,
+            max_live_paid_gpu_units=4,
+            prospective_backend_claims_by_accelerator={
+                'L4': 4,
+                'A100': 4,
+            })
+
+    assert budget.max_live_paid_gpu_units == 4
+    assert budget.paid_gpu_units_remaining is None
+    selected = []
+    for _ in range(8):
+        location = paid_capacity.preview_location(
+            placer,
+            budget,
+            skip_zero_cost_preference=True,
+            allowed_locations={l4, a100})
+        assert location is not None
+        selected.append(location)
+        paid_capacity.debit(budget, location)
+    assert selected.count(l4) == 4
+    assert selected.count(a100) == 4
+
+
 def _plan_bound_budget(
         placer,
         states,
@@ -861,6 +1003,7 @@ def _plan_bound_budget(
         widths,
         capacity_unit=(capacity_planning.CapacityUnit.LOGICAL_GPU),
         backend_num_nodes=1,
+        max_live_paid_gpu_units=None,
         claimed=None,
         infos=None):
     authority = _paid_launch_authority(target,
@@ -884,6 +1027,7 @@ def _plan_bound_budget(
             existing_replica_infos=[] if infos is None else infos,
             globally_managed=True,
             requested_frontier_keys={(card.casefold(),) for card in target},
+            max_live_paid_gpu_units=max_live_paid_gpu_units,
             paid_launch_authority=authority)
 
 
@@ -968,6 +1112,58 @@ def test_plan_target_opens_minimum_cold_frontier_in_first_wave():
     assert persist.call_args.kwargs['service_limit'] == 100
     assert persist.call_args.kwargs['frontier_limits_by_key'] == {('l4',): 25}
     assert len(persist.call_args.args[2]) == 100
+
+
+def test_three_location_cold_wave_uses_full_forty_slot_windows():
+    locations = [
+        make_location(f'us-central1-{zone}', {'L4': 1}, cloud_name='GCP')
+        for zone in ('a', 'b', 'c')
+    ]
+    placer = make_placer({
+        location: float(index + 1) for index, location in enumerate(locations)
+    })
+    keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in locations
+    }
+    states = {
+        key: {
+            'remaining': 40,
+            'admission_state': 'active',
+            'admission_limit': 40,
+            'last_success_at': None,
+        } for key in keys.values()
+    }
+
+    budget = _plan_bound_budget(placer,
+                                states,
+                                target={'l4': 100},
+                                widths={'l4': 1},
+                                max_live_paid_gpu_units=120)
+
+    assert budget.service_remaining == 100
+    assert budget.paid_gpu_units_remaining == 120
+    assert budget.frontier_limit_overrides == {('l4',): 3}
+
+    selected = []
+    for _ in range(100):
+        location = paid_capacity.select_location(
+            placer,
+            budget,
+            skip_zero_cost_preference=True,
+            allowed_locations=set(locations))
+        assert location is not None
+        selected.append(location)
+        paid_capacity.debit(budget, location)
+
+    assert [selected.count(location) for location in locations] == [40, 40, 20]
+    assert budget.service_remaining == 0
+    assert budget.paid_gpu_units_remaining == 20
+    assert paid_capacity.select_location(
+        placer,
+        budget,
+        skip_zero_cost_preference=True,
+        allowed_locations=set(locations)) is None
 
 
 def test_plan_cohort_converts_gpu_units_to_exact_backend_claims():

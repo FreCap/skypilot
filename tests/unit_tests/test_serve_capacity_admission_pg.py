@@ -17,6 +17,7 @@ import uuid
 from alembic import command as alembic_command
 import pytest
 from spot_placer_test_utils import make_location
+from spot_placer_test_utils import make_placer
 import sqlalchemy
 from sqlalchemy.dialects import postgresql
 from test_kueue_lane_lineage_pg import _intent_values as _kueue_intent_values
@@ -51,7 +52,11 @@ from sky.serve import service_spec
 from sky.serve import spot_placer
 from sky.serve import zero_cost_actuation
 from sky.serve import zero_cost_actuation_schema
+from sky.server.requests import non_pool_launch as non_pool_launch_request
+from sky.server.requests import payloads as request_payloads
 from sky.server.requests import postgres as request_postgres
+from sky.server.requests import requests as request_lib
+from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
@@ -1117,6 +1122,8 @@ def _paid_launch_spec(
     accelerator_count: int = 1,
     num_nodes: int = 1,
     planned_capacity: int = 1,
+    pool_rank: int | None = None,
+    pool_occurrence: int | None = None,
 ) -> paid_capacity.PaidLaunchSpec:
     """Build one deeply immutable, provider-free paid launch candidate."""
     assert accelerator.casefold() == 'l4'
@@ -1145,10 +1152,17 @@ def _paid_launch_spec(
     assert isinstance(placement_catalog, dict)
     persisted_spec = pickle.loads(serialized_spec)
     catalog = spot_placer.PlacementCatalog.from_dict(placement_catalog)
-    catalog_entry = next(
-        entry
-        for entry in catalog.ranked_entries(persisted_spec.placement_contract)
-        if entry.location.instance_type == f'test-l4-{accelerator_count}')
+    matching_entries = tuple(
+        entry for entry in catalog.ranked_entries(
+            persisted_spec.placement_contract)
+        if entry.location.accelerators == {accelerator: accelerator_count})
+    if pool_rank is None:
+        catalog_entry = next(
+            entry for entry in matching_entries
+            if entry.location.instance_type == f'test-l4-{accelerator_count}')
+    else:
+        catalog_entry = next(
+            entry for entry in matching_entries if entry.rank == pool_rank)
     location = catalog_entry.location
     instance_type = location.instance_type
     assert instance_type is not None
@@ -1184,6 +1198,7 @@ def _paid_launch_spec(
                 'svc', 1, 'svc-hash')),
     })
     card = accelerator.casefold()
+    occurrence = ordinal if pool_occurrence is None else pool_occurrence
     return paid_capacity.PaidLaunchSpec(
         ordinal=ordinal,
         service_name='svc',
@@ -1195,10 +1210,10 @@ def _paid_launch_spec(
         cluster_name_seed=info.cluster_name,
         worker_construction=worker,
         provider_account=None,
-        cloud='gcp',
+        cloud=str(location.cloud).casefold(),
         workspace='workspace-a',
-        region='us-central1',
-        zone=None,
+        region=location.region,
+        zone=location.zone,
         instance_type=instance_type,
         pool_key=exact_pool_key,
         frontier_key=(card,),
@@ -1210,8 +1225,8 @@ def _paid_launch_spec(
             placement_catalog_sha256=(
                 paid_capacity.paid_launch_payload_sha256(placement_catalog)),
             catalog_rank=catalog_entry.rank,
-            exploration_round=ordinal // paid_capacity.base_limit(),
-            slot_within_pool_window=ordinal % paid_capacity.base_limit(),
+            exploration_round=occurrence // paid_capacity.base_limit(),
+            slot_within_pool_window=occurrence % paid_capacity.base_limit(),
             version_authority=paid_capacity.PaidLaunchVersionAuthority(
                 service_spec=serialized_spec,
                 service_spec_sha256=hashlib.sha256(serialized_spec).hexdigest(),
@@ -2613,6 +2628,155 @@ def test_current_planner_existing_paid_wave_prevents_duplicate_launch(
                     'svc')).scalar_one() == 2
 
 
+def test_current_planner_admits_residual_while_terminal_request_awaits_reducer(
+        capacity_database):
+    """A charged predecessor's cross-transaction receipt gap is not global."""
+    engine, incarnation, route_receipt = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    first = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 1},
+        backend_num_nodes=1,
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 1),
+        prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 180),))
+    assert [member.replica_id for member in first.paid_launch_receipt.members
+           ] == [180]
+
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with engine.begin() as connection:
+        serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+            connection)
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id ==
+                180)).mappings().one()
+        profile = (ordinary_launch_binding.
+                   resolve_non_pool_launch_profile_in_connection(
+                       connection,
+                       service,
+                       replica,
+                       protocol_and_service_prelocked=True))
+        info = replica_managers.ReplicaInfo.from_storage_dict(
+            replica['replica_state'])
+        intent = ordinary_launch_binding.BindingIntent(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_version=1,
+            replica_id=180,
+            replica_record_id=uuid.UUID(info.replica_record_id),
+            lifecycle_epoch=3,
+            binding_epoch=service['ordinary_launch_binding_epoch'],
+            controller_incarnation=service['controller_incarnation'],
+            controller_owner_epoch=service['controller_owner_epoch'],
+            controller_pid=service['controller_pid'],
+            controller_ip=service['controller_ip'])
+        launch_body = request_payloads.LaunchBody(
+            task='name: paid-launch\nrun: echo bound\n',
+            cluster_name=info.cluster_name,
+            is_launched_by_sky_serve_controller=True,
+            env_vars={skylet_constants.USER_ID_ENV_VAR: 'tenant-a'},
+            extra_launch_context={})
+        identity = ordinary_launch_binding.build_non_pool_binding_identity(
+            intent,
+            submission_id=uuid.uuid4(),
+            tenant_scope='tenant-a',
+            service_workspace='workspace-a',
+            cluster_name=info.cluster_name,
+            input_digest=(
+                ordinary_launch_binding.canonical_launch_digest(launch_body)),
+            profile=profile,
+            capability_cohort_epoch=(
+                service['non_pool_launch_capability_cohort_epoch']),
+            capability_profile_set_digest=(
+                service['non_pool_launch_capability_profile_set_digest']),
+            receipt_protocol_version=(
+                service['non_pool_launch_receipt_protocol_version']))
+        admission = ordinary_launch_binding.insert_or_get_locked(
+            connection, identity)
+        assert admission.created
+        ordinary_launch_binding.install_bound_non_pool_context(
+            launch_body, identity, admission.launch_generation)
+        bound_request = request_lib.Request(
+            request_id=identity.request_id,
+            name='sky.launch',
+            entrypoint=non_pool_launch_request.launch,
+            request_body=launch_body,
+            status=request_lib.RequestStatus.PENDING,
+            created_at=time.time(),
+            user_id='tenant-a',
+            cluster_name=info.cluster_name,
+            schedule_type=request_lib.ScheduleType.LONG,
+            retryable=False,
+            should_enqueue=True)
+        assert request_postgres.insert_bound_non_pool_request_and_queue_in_transaction(
+            connection, bound_request, identity=identity)
+        association = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.association_id ==
+                identity.association_id).with_for_update()).mappings().one()
+        assert association['resolution'] == 'BOUND'
+        assert association['terminal_status'] is None
+        request = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                association['request_id']).with_for_update()).mappings().one()
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                association['request_id']).values(
+                    status='FAILED',
+                    terminal_cause='handler_failed',
+                    finished_at=now,
+                    execution_quiescence_required=True,
+                    execution_quiesced_generation=(
+                        request['execution_generation']),
+                    execution_quiesced_at=now,
+                    updated_at=now))
+        connection.execute(
+            sqlalchemy.delete(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id ==
+                association['request_id']))
+
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=2))
+
+    successor = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 1},
+        backend_num_nodes=1,
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2),
+        prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 181),))
+
+    assert [
+        member.replica_id for member in successor.paid_launch_receipt.members
+    ] == [181]
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table).where(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == 'svc')).scalar_one() == 2
+
+
 def test_current_planner_enforces_exact_multi_gpu_paid_cap(
         capacity_database, monkeypatch):
     engine, incarnation, _ = capacity_database
@@ -2664,6 +2828,224 @@ def test_current_planner_enforces_exact_multi_gpu_paid_cap(
     assert sum(member.physical_gpu_units
                for member in committed.paid_launch_receipt.members) == 16
     assert committed.candidate.paid_launch_target.as_dict() == {'l4': 16}
+
+
+def test_manager_prepared_heterogeneous_wave_cannot_starve_a100_at_global_cap(
+        capacity_database):
+    """Cheaper L4 alternatives cannot consume A100's locked paid authority."""
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           max_replicas=8,
+                           replica_unit='logical',
+                           max_live_paid_gpu_units=4)
+
+    l4 = make_location('us-central1-a', {'L4': 1},
+                       cloud_name='GCP',
+                       instance_type='test-l4-cheap')
+    a100 = make_location('us-central1-b', {'A100': 1},
+                         cloud_name='GCP',
+                         instance_type='test-a100-required')
+    for location in (l4, a100):
+        location.image_id = {None: 'skypilot:test-regionless-image'}
+    service = serve_state.get_spec('svc', 1)
+    assert service is not None
+    placer = make_placer({
+        l4: 0.10,
+        a100: 0.20,
+    }, service.placement_contract)
+    catalog = placer.placement_catalog.to_dict()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    placement_catalog=catalog))
+
+    authority = ordinary_launch_binding.ControllerBindingAuthority(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_workspace='workspace-a',
+        service_lifecycle_epoch=3,
+        controller_pid=123,
+        controller_ip='10.0.0.5',
+        controller_incarnation=incarnation,
+        controller_owner_epoch=4,
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        binding_epoch=3,
+        non_pool_capable=True,
+        non_pool_binding_protocol_version=(
+            ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+        non_pool_profile_set_digest=(
+            ordinary_launch_binding.supported_non_pool_profile_set_digest()),
+        non_pool_capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+        non_pool_receipt_protocol_version=(
+            ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager.lock = threading.RLock()
+    manager._update_recovery_required = False
+    manager._is_pool = False
+    manager._service_name = 'svc'
+    manager._service_hash = 'svc-hash'
+    manager._resource_scope = 'svc-hash'
+    manager._workspace = 'workspace-a'
+    manager._ordinary_launch_binding_authority = authority
+    manager._spot_placer = placer
+    manager._next_replica_id = 2000
+    manager.latest_version = 1
+    manager._version_specs = {1: service}
+    manager.yaml_content = _PAID_LAUNCH_YAML
+    manager._uses_logical_replicas = True
+
+    version_authority = serve_state.get_paid_launch_version_authority('svc', 1)
+    assert version_authority is not None
+    budget = paid_capacity.build_launch_budget(
+        placer,
+        workspace='workspace-a',
+        existing_replica_infos=[],
+        globally_managed=True,
+        service_name='svc',
+        service_hash='svc-hash',
+        requested_frontier_keys={('l4',), ('a100',)},
+        max_live_paid_gpu_units=4,
+        prospective_backend_claims_by_accelerator={
+            'l4': 4,
+            'a100': 4,
+        })
+    prepared = manager.prepare_paid_launch_specs(
+        accelerator_shapes={
+            'l4': 1,
+            'a100': 1,
+        },
+        max_gpu_units_by_accelerator={
+            'l4': 4,
+            'a100': 4,
+        },
+        max_candidates=8,
+        occupied_replica_ids=(),
+        version_authority=version_authority,
+        paid_location_launch_budget=budget)
+
+    assert [spec.accelerator for spec in prepared] == ['l4'] * 4 + ['a100'] * 4
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={
+                'l4': 1,
+                'a100': 1,
+            },
+            backend_num_nodes=1,
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot,
+                supply,
+                4,
+                accelerator='a100',
+                target_by_accelerator={
+                    'l4': 0,
+                    'a100': 4,
+                },
+                prospective_paid_accelerators=('a100', 'l4'),
+                cold_accelerator_order=('a100', 'l4'),
+                capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+                max_live_paid_gpu_units=4),
+            prepared_paid_launch_specs=prepared)
+
+    assert committed.candidate.paid_launch_target.as_dict() == {'a100': 4}
+    assert [
+        member.accelerator for member in committed.paid_launch_receipt.members
+    ] == ['a100'] * 4
+    assert sum(member.physical_gpu_units
+               for member in committed.paid_launch_receipt.members) == 4
+    with engine.connect() as connection:
+        persisted = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.replica_state).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    'svc')).scalars().all()
+    assert [state['resources_override']['accelerators'] for state in persisted
+           ] == [{
+               'A100': 1
+           }] * 4
+
+
+def test_current_planner_scans_third_pool_until_accepted_target(
+        capacity_database, monkeypatch):
+    """A probe-limited middle pool cannot truncate a 100-member wave."""
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           max_replicas=120)
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 60)
+    locations = []
+    for index, cost in enumerate((0.10, 0.20, 0.30)):
+        location = _paid_location(1)
+        location.region = f'us-central1-{chr(ord("a") + index)}'
+        location.instance_type = f'test-l4-pool-{index}'
+        locations.append((location, cost))
+    catalog = spot_placer.PlacementCatalog(tuple(locations),
+                                           num_nodes=1).to_dict()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    placement_catalog=catalog))
+
+    specs = []
+    replica_id = 1000
+    for pool_rank in range(3):
+        for occurrence in range(60):
+            specs.append(
+                _paid_launch_spec(engine,
+                                  len(specs),
+                                  replica_id,
+                                  pool_rank=pool_rank,
+                                  pool_occurrence=occurrence))
+            replica_id += 1
+    middle_pool_key = specs[60].pool_key
+    now = time.time()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.paid_capacity_pools_table).values(
+                    pool_key=middle_pool_key,
+                    current_limit=1,
+                    successes_since_resize=0,
+                    last_failure_at=(now -
+                                     paid_capacity.failure_cooldown_seconds() -
+                                     1),
+                    updated_at=now))
+
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
+                                       service_hash='svc-hash',
+                                       service_lifecycle_epoch=3,
+                                       service_version=1,
+                                       accounting_cards={'l4': 1},
+                                       backend_num_nodes=1,
+                                       sequenced_reserved_fill=False,
+                                       planner=lambda snapshot, supply:
+                                       _current_decision(snapshot, supply, 100),
+                                       prepared_paid_launch_specs=tuple(specs))
+
+    accepted = committed.paid_launch_receipt.members
+    assert len(accepted) == 100
+    accepted_pool_keys = [member.pool_key for member in accepted]
+    assert accepted_pool_keys.count(specs[0].pool_key) == 60
+    assert accepted_pool_keys.count(middle_pool_key) == 1
+    assert accepted_pool_keys.count(specs[120].pool_key) == 39
+    assert committed.candidate.paid_launch_target.as_dict() == {'l4': 100}
 
 
 def test_current_planner_recomputes_prior_claims_after_stale_cleanup(
@@ -3045,14 +3427,14 @@ def _insert_final_delete_paid_waiter(engine: sqlalchemy.engine.Engine,
                     status='SHUTTING_DOWN'))
 
 
-def test_final_service_delete_retires_current_paid_waiter(
-        capacity_database):
+def test_final_service_delete_retires_current_paid_waiter(capacity_database):
     """A fairness heartbeat cannot strand a provider-clean incarnation."""
     engine, _, _ = capacity_database
     _insert_final_delete_paid_waiter(engine, 'svc-hash')
 
-    assert serve_state.remove_service_completely(
-        'svc', 'svc-hash', expected_lifecycle_epoch=3)
+    assert serve_state.remove_service_completely('svc',
+                                                 'svc-hash',
+                                                 expected_lifecycle_epoch=3)
 
     with engine.connect() as connection:
         assert connection.execute(
@@ -3067,16 +3449,16 @@ def test_final_service_delete_retires_current_paid_waiter(
                     service_name == 'svc')).scalar_one() == 0
 
 
-def test_final_service_delete_rejects_foreign_paid_waiter(
-        capacity_database):
+def test_final_service_delete_rejects_foreign_paid_waiter(capacity_database):
     """A waiter from another hash remains a same-name authority conflict."""
     engine, _, _ = capacity_database
     _insert_final_delete_paid_waiter(engine, 'retained-old-hash')
 
     with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
                        match='retains unresolved authority'):
-        serve_state.remove_service_completely(
-            'svc', 'svc-hash', expected_lifecycle_epoch=3)
+        serve_state.remove_service_completely('svc',
+                                              'svc-hash',
+                                              expected_lifecycle_epoch=3)
 
     with engine.connect() as connection:
         assert connection.execute(
@@ -3557,7 +3939,7 @@ def test_current_planner_rejects_stale_prepared_fingerprint(capacity_database):
     planner = mock.Mock(side_effect=lambda snapshot, supply: _current_decision(
         snapshot, supply, 1, source_fingerprint=planning_fingerprint))
 
-    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+    with pytest.raises(capacity_admission.CapacityAdmissionRetryableConflict,
                        match='Prepared planning state changed'):
         (capacity_admission.CapacityAdmissionRepository(
             engine).plan_and_admit_current(

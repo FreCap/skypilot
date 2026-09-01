@@ -101,6 +101,45 @@ def test_fully_linked_resource_action_request_root_blocks():
         association) is capacity_admission._RetainedRequestRootState.BLOCKING  # pylint: disable=protected-access
 
 
+@pytest.mark.parametrize('resolution',
+                         ['BOUND', 'CANCEL_REQUESTED', 'AMBIGUOUS'])
+def test_terminal_request_awaiting_association_reduction_blocks(resolution):
+    request, association = _closed_rows()
+    association.update({
+        'resolution': resolution,
+        'terminal_status': None,
+        'terminal_cause': None,
+        'terminal_execution_generation': None,
+    })
+
+    assert capacity_admission._retained_request_root_state(  # pylint: disable=protected-access
+        request,
+        association) is capacity_admission._RetainedRequestRootState.BLOCKING  # pylint: disable=protected-access
+
+
+@pytest.mark.parametrize(('resolution', 'terminal_updates'), [
+    ('BOUND', {
+        'terminal_status': 'SUCCEEDED'
+    }),
+    ('RESULT_RECORDED', {}),
+    ('PROJECTED', {}),
+])
+def test_incomplete_association_terminal_tuple_is_malformed(
+        resolution, terminal_updates):
+    request, association = _closed_rows()
+    association.update({
+        'resolution': resolution,
+        'terminal_status': None,
+        'terminal_cause': None,
+        'terminal_execution_generation': None,
+        **terminal_updates,
+    })
+
+    assert capacity_admission._retained_request_root_state(  # pylint: disable=protected-access
+        request,
+        association) is capacity_admission._RetainedRequestRootState.MALFORMED  # pylint: disable=protected-access
+
+
 @pytest.mark.parametrize(('request_updates', 'association_updates'), [
     ({
         'request_id': 'request-b'

@@ -5932,6 +5932,30 @@ class _PaidCapacityAdmissionDecision:
         return tuple(member.claim_result.value for member in self.members)
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _PaidCapacityAdmissionPlanBudget:
+    """New accepted plan units allowed across an alternative cohort."""
+
+    target_units_by_group: tuple[tuple[str, int], ...]
+    member_debits: tuple[tuple[str, int], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.target_units_by_group, tuple):
+            raise ValueError('Paid plan targets must be an immutable tuple.')
+        target = dict(self.target_units_by_group)
+        if (len(target) != len(self.target_units_by_group) or
+                self.target_units_by_group != tuple(sorted(target.items())) or
+                any(not isinstance(group, str) or not group or
+                    type(units) is not int or units < 1
+                    for group, units in self.target_units_by_group)):
+            raise ValueError('Paid plan targets are noncanonical.')
+        if (not isinstance(self.member_debits, tuple) or any(
+                not isinstance(group, str) or group not in target or
+                type(units) is not int or units < 1
+                for group, units in self.member_debits)):
+            raise ValueError('Paid plan member debits are malformed.')
+
+
 def _validate_paid_capacity_admission_inputs(
     persistence_specs: list[paid_capacity.PaidClaimPersistenceSpec],
     *,
@@ -6072,20 +6096,20 @@ def _paid_capacity_admission_is_immediately_saturated(
     existing_replica_ids = {
         replica_id for replica_id, _ in census.service_claims
     }
-    first_new_index = next(
-        (index for index, spec in enumerate(persistence_specs)
-         if spec.candidate.replica_id not in existing_replica_ids), None)
+    new_indices = tuple(
+        index for index, spec in enumerate(persistence_specs)
+        if spec.candidate.replica_id not in existing_replica_ids)
     has_existing_candidate = any(
         spec.candidate.replica_id in existing_replica_ids
         for spec in persistence_specs)
-    if has_existing_candidate or first_new_index is None:
+    if has_existing_candidate or not new_indices:
         return False
     return bool(
         (service_limit is not None and
          len(census.service_claims) >= service_limit) or
         (max_live_paid_gpu_units is not None and census.live_paid_gpu_units +
-         census.paid_gpu_units_by_index[first_new_index]
-         > max_live_paid_gpu_units))
+         min(census.paid_gpu_units_by_index[index] for index in new_indices) >
+         max_live_paid_gpu_units))
 
 
 def _lock_paid_capacity_admission_context_in_session(
@@ -6175,6 +6199,7 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
     waiter_ttl_seconds: float,
     frontier_default_limit: int | None = None,
     frontier_limits_by_key: dict[paid_capacity.FrontierKey, int] | None = None,
+    plan_budget: _PaidCapacityAdmissionPlanBudget | None = None,
 ) -> _PaidCapacityAdmissionDecision:
     """Arbitrate one ordered batch using only already-locked paid state.
 
@@ -6189,6 +6214,25 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
     census = locked_context.census
     if len(census.paid_gpu_units_by_index) != len(persistence_specs):
         raise ValueError('Paid admission census does not match the batch.')
+    if (plan_budget is not None and
+            len(plan_budget.member_debits) != len(persistence_specs)):
+        raise ValueError('Paid plan budget does not match the batch.')
+    accepted_plan_units = ({}
+                           if plan_budget is None else {
+                               group: 0
+                               for group, _ in
+                               plan_budget.target_units_by_group
+                           })
+    plan_targets = ({}
+                    if plan_budget is None else
+                    dict(plan_budget.target_units_by_group))
+    if plan_budget is not None:
+        for spec, (group, units) in zip(persistence_specs,
+                                        plan_budget.member_debits):
+            if (spec.frontier_key != (group,) or
+                    spec.candidate.replica_info.planned_capacity != units):
+                raise ValueError('Paid plan debit contradicts its exact '
+                                 'candidate shape.')
 
     retained_service_pool_keys = set(
         session.execute(
@@ -6318,12 +6362,26 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
         identity = (service_name, service_hash, replica_id)
         is_existing = replica_id in existing_replica_ids_at_start
         if is_existing:
+            if plan_budget is not None:
+                raise ValueError('A paid plan alternative cannot be an '
+                                 'existing claim.')
             accepted_indices.append(index)
             results[index] = paid_capacity.ClaimResult.ACQUIRED
             continue
         if service_stopped:
             results[index] = paid_capacity.ClaimResult.SERVICE_SATURATED
             continue
+        plan_debit = (None if plan_budget is None else
+                      plan_budget.member_debits[index])
+        if plan_debit is not None:
+            plan_group, plan_units = plan_debit
+            if (accepted_plan_units[plan_group] + plan_units >
+                    plan_targets[plan_group]):
+                # The plan target applies to accepted units, not to the first
+                # N alternatives inspected.  Continue scanning so a later
+                # exact pool may provide capacity rejected by this pool.
+                results[index] = paid_capacity.ClaimResult.SERVICE_SATURATED
+                continue
 
         paid_gpu_units = census.paid_gpu_units_by_index[index]
         if (service_limit is not None and service_claim_count >= service_limit):
@@ -6335,9 +6393,11 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
             locked_context.upstream.max_live_paid_gpu_units)
         if (max_live_paid_gpu_units is not None and
                 live_paid_gpu_units + paid_gpu_units > max_live_paid_gpu_units):
-            service_stopped = True
             reconcile_waiters = True
             results[index] = paid_capacity.ClaimResult.SERVICE_SATURATED
+            # The cap is measured in physical GPU units.  A later narrower
+            # heterogeneous candidate may still fit, so this member cannot
+            # terminate the alternative scan.
             continue
 
         stopped_result = stopped_frontiers.get(spec.frontier_key)
@@ -6405,6 +6465,9 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
         service_claims.append((replica_id, spec.pool_key))
         service_claim_count += 1
         live_paid_gpu_units += paid_gpu_units
+        if plan_debit is not None:
+            plan_group, plan_units = plan_debit
+            accepted_plan_units[plan_group] += plan_units
         owned_by_frontier[spec.frontier_key].add(spec.pool_key)
         accepted_indices.append(index)
         results[index] = paid_capacity.ClaimResult.ACQUIRED
@@ -6418,6 +6481,35 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
         if (len(owned_by_frontier[spec.frontier_key] | unknown_owned_pool_keys)
                 >= spec.frontier_limit):
             reconcile_waiters = True
+
+    if plan_budget is not None:
+        filled_groups = {
+            group for group, target in plan_targets.items()
+            if accepted_plan_units[group] == target
+        }
+        if filled_groups:
+            filled_frontiers = {(group,) for group in filled_groups}
+            waiter_pool_keys = session.execute(
+                sqlalchemy.select(
+                    paid_capacity_waiters_table.c.pool_key).where(
+                        paid_capacity_waiters_table.c.service_name ==
+                        service_name,
+                        paid_capacity_waiters_table.c.service_hash ==
+                        service_hash)).scalars().all()
+            filled_pool_keys = [
+                pool_key for pool_key in waiter_pool_keys
+                if paid_capacity.frontier_key_from_pool_key(pool_key) in
+                filled_frontiers
+            ]
+            if filled_pool_keys:
+                session.execute(
+                    sqlalchemy.delete(paid_capacity_waiters_table).where(
+                        paid_capacity_waiters_table.c.service_name ==
+                        service_name,
+                        paid_capacity_waiters_table.c.service_hash ==
+                        service_hash,
+                        paid_capacity_waiters_table.c.pool_key.in_(
+                            filled_pool_keys)))
 
     if reconcile_waiters:
         if service_limit is not None and service_claim_count >= service_limit:

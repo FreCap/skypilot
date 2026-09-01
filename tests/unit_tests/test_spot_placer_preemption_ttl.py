@@ -197,6 +197,20 @@ class TestPreemptionTtlRetry:
         # The first real selection still gets the one probe.
         assert placer.select_next_location() == cheap
 
+    def test_preview_does_not_consume_retry(self, placer_and_locations,
+                                            monkeypatch):
+        placer, cheap, other, third = placer_and_locations
+        now = [1000.0]
+        monkeypatch.setattr(spot_placer.time, 'time', lambda: now[0])
+        placer.set_preemptive(cheap)
+        now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
+
+        assert placer.preview_next_location() == cheap
+        assert placer.preview_next_location() == cheap
+        assert cheap not in placer.location2retry_reserved_at
+        assert placer.select_next_location() == cheap
+        assert placer.location2retry_reserved_at[cheap] == now[0]
+
     def test_snapshot_uses_only_catalog_prices(self, placer_and_locations):
         placer, cheap, other, third = placer_and_locations
 

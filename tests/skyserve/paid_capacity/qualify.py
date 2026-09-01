@@ -935,12 +935,19 @@ def _is_selectable_settled_paid_binding(
             binding))
 
 
-def _is_exact_associationless_paid_phase_a_pair(
+def _is_exact_provider_free_paid_pending_pair(
     replica: collections.abc.Mapping[str, Any],
     claim: collections.abc.Mapping[str, Any] | None,
     bindings: collections.abc.Sequence[collections.abc.Mapping[str, Any]],
 ) -> bool:
-    """Whether one debit is an exact paid pre-association Phase-A pair."""
+    """Whether one debit is exact paid state with no possible provider I/O.
+
+    This includes both the initial claim+replica Phase-A pair and the short
+    recovery interval after a pre-effect attempt is durably settled, its
+    pointer is cleared, and generation+1 has not yet been admitted.  The
+    retained claim funds that retry.  Provider-present or ambiguous history
+    never enters this path.
+    """
     record_id = replica.get('replica_record_id')
     try:
         canonical_record_id = str(uuid.UUID(str(record_id)))
@@ -964,10 +971,26 @@ def _is_exact_associationless_paid_phase_a_pair(
         str(binding.get('replica_record_id')) == canonical_record_id
     ]
     pool_key = replica.get('paid_capacity_pool_key')
+    history_is_provider_free = not exact_history
+    if len(exact_history) == 1:
+        predecessor = exact_history[0]
+        history_is_provider_free = bool(
+            predecessor.get('paid_capacity_pool_key') == pool_key and
+            type(predecessor.get('launch_generation')) is int and
+            predecessor.get('launch_generation') == 1 and
+            predecessor.get('cancel_reason') is None and
+            predecessor.get('cancel_requested_at') is None and
+            predecessor.get('resolution')
+            == ordinary_launch_binding.Resolution.PRE_EFFECT_TERMINAL.value and
+            predecessor.get('reconciliation_outcome') == ordinary_launch_binding
+            .ReconciliationOutcome.PRE_EFFECT_TERMINAL.value and
+            ordinary_launch_binding.
+            settled_association_proves_execution_quiescence(predecessor))
     return bool(
         canonical_record_id == str(record_id) and
         replica.get('ordinary_launch_association_id') is None and
-        not exact_history and isinstance(claim, collections.abc.Mapping) and
+        history_is_provider_free and
+        isinstance(claim, collections.abc.Mapping) and
         claim.get('replica_id') == replica.get('replica_id') and
         claim.get('pool_key') == pool_key and
         replica.get('status') in ('PENDING', 'PROVISIONING') and
@@ -1290,7 +1313,7 @@ class PostgresObserver:
                 binding = select_replica_binding(replica, bindings)
             except GuardViolation:
                 claim = claim_by_replica_id.get(replica['replica_id'])
-                if not _is_exact_associationless_paid_phase_a_pair(
+                if not _is_exact_provider_free_paid_pending_pair(
                         replica, claim, bindings):
                     raise
                 phase_a_pending_replica_ids.append(replica['replica_id'])

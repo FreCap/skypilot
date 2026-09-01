@@ -1764,6 +1764,7 @@ def build_launch_budget(
     allow_provider_identity_lookup: bool = True,
     paid_launch_authority:
     'capacity_admission.PaidLaunchAuthority | None' = None,
+    prospective_backend_claims_by_accelerator: Mapping[str, int] | None = None,
 ) -> LaunchBudget:
     """Read one advisory shared-capacity snapshot for all active paid pools."""
     if (max_live_paid_gpu_units is not None and
@@ -1771,12 +1772,30 @@ def build_launch_budget(
          not isinstance(max_live_paid_gpu_units, int) or
          max_live_paid_gpu_units < 0)):
         raise ValueError('max_live_paid_gpu_units must be an integer >= 0.')
+    if (paid_launch_authority is not None and
+            prospective_backend_claims_by_accelerator is not None):
+        raise ValueError('Prospective and committed paid targets are mutually '
+                         'exclusive.')
+    prospective_claims = None
+    if prospective_backend_claims_by_accelerator is not None:
+        prospective_claims = {}
+        for raw_card, raw_count in (
+                prospective_backend_claims_by_accelerator.items()):
+            if not isinstance(raw_card, str):
+                raise ValueError('Prospective paid backend claims require '
+                                 'string accelerator keys.')
+            card = raw_card.casefold()
+            if (not card or card in prospective_claims or
+                    type(raw_count) is not int or raw_count < 0):  # pylint: disable=unidiomatic-typecheck
+                raise ValueError('Prospective paid backend claims are '
+                                 'malformed.')
+            prospective_claims[card] = raw_count
     zero_cost = set(placer.zero_cost_locations())
     paid_locations = [
         location for location in placer.ranked_active_locations()
         if location not in zero_cost
     ]
-    if paid_launch_authority is not None:
+    if paid_launch_authority is not None or prospective_claims is not None:
         # Planner purchase authority is prospective Spot-only. On-demand
         # locations must not affect either cohort sizing or later selection.
         paid_locations = [
@@ -1792,12 +1811,16 @@ def build_launch_budget(
                        'has no exact physical GPU debit: '
                        f'{common_utils.format_exception(error)}')
     central_available = globally_managed and central_authority_available()
-    if paid_launch_authority is not None:
-        identity_matches = (
-            isinstance(service_name, str) and bool(service_name) and
-            isinstance(service_hash, str) and bool(service_hash) and
-            paid_launch_authority.service_name == service_name and
-            paid_launch_authority.service_hash == service_hash)
+    if paid_launch_authority is not None or prospective_claims is not None:
+        identity_matches = (isinstance(service_name, str) and
+                            bool(service_name) and
+                            isinstance(service_hash, str) and
+                            bool(service_hash))
+        if paid_launch_authority is not None:
+            identity_matches = (
+                identity_matches and
+                paid_launch_authority.service_name == service_name and
+                paid_launch_authority.service_hash == service_hash)
         if not central_available or not identity_matches:
             # A committed planner target can only be spent through the shared
             # PostgreSQL Phase-A transaction for its exact service
@@ -1951,7 +1974,23 @@ def build_launch_budget(
         service_hash=service_hash)
     cohort = None
     frontier_limit_overrides: dict[FrontierKey, int] = {}
-    if paid_launch_authority is None:
+    if prospective_claims is not None:
+        service_remaining = sum(prospective_claims.values())
+        service_claim_limit = max(1, service_claims + service_remaining)
+        # The fused repository revalidates this advisory selection against
+        # the same configured ceiling while holding every exact pool lock.
+        # Starting at that ceiling avoids manufacturing target x catalog
+        # alternatives merely to discover a viable fallback pool.
+        configured_frontier = configured_max_frontier
+        requested = {
+            (card,) for card, count in prospective_claims.items() if count > 0
+        }
+        remaining = {
+            location:
+            (location_remaining if frontier_keys[location] in requested else 0)
+            for location, location_remaining in remaining.items()
+        }
+    elif paid_launch_authority is None:
         service_claim_limit = _evidence_aware_service_limit(
             paid_locations=paid_locations,
             states_by_pool_key=states,
@@ -2013,17 +2052,24 @@ def build_launch_budget(
                 configured_max_frontier = max(
                     configured_frontier, *frontier_limit_overrides.values())
     paid_gpu_units_remaining = None
-    if max_live_paid_gpu_units is not None:
-        if paid_gpu_attribution_complete:
-            assert live_paid_gpu_units is not None
-            paid_gpu_units_remaining = max(
-                0, max_live_paid_gpu_units - live_paid_gpu_units)
-        else:
-            # Advisory reads must not guess a legacy/malformed row's node
-            # cardinality. Preserve zero-cost placement, but close the paid
-            # service envelope until exact attribution is repaired.
-            paid_gpu_units_remaining = 0
-            service_remaining = 0
+    if (max_live_paid_gpu_units is not None and
+            not paid_gpu_attribution_complete):
+        # Advisory reads must not guess a legacy/malformed row's node
+        # cardinality. Preserve zero-cost placement, but close the paid
+        # service envelope until exact attribution is repaired.
+        paid_gpu_units_remaining = 0
+        service_remaining = 0
+    elif prospective_claims is not None:
+        # These are alternatives for several possible exact-card targets, not
+        # committed capacity. Spending one global physical cap while preparing
+        # them would let a cheap card erase every candidate for another card.
+        # Each card is already bounded by its prospective backend ceiling; the
+        # locked PostgreSQL arbitration remains the sole global-cap authority.
+        paid_gpu_units_remaining = None
+    elif max_live_paid_gpu_units is not None:
+        assert live_paid_gpu_units is not None
+        paid_gpu_units_remaining = max(
+            0, max_live_paid_gpu_units - live_paid_gpu_units)
     _log_admission_summary(states,
                            service_claims=service_claims,
                            service_claim_limit=service_claim_limit,
@@ -2142,14 +2188,17 @@ def _record_selection_stop(budget: LaunchBudget) -> None:
     budget.stop_sequence += 1
 
 
-def select_location(
+def _select_location(
     placer: spot_placer.SpotPlacer,
     budget: LaunchBudget,
     *,
     skip_zero_cost_preference: bool = False,
     allowed_locations: set[spot_placer.Location] | None = None,
+    reserve_retry: bool,
 ) -> spot_placer.Location | None:
-    """Select the cheapest location that still has advisory paid headroom."""
+    """Select from one budget, optionally reserving an expired-bench retry."""
+    select_next = (placer.select_next_location
+                   if reserve_retry else placer.preview_next_location)
     active = [
         location for location in placer.active_locations()
         if allowed_locations is None or location in allowed_locations
@@ -2160,7 +2209,7 @@ def select_location(
             selection_kwargs['skip_zero_cost_preference'] = True
         if allowed_locations is not None:
             selection_kwargs['allowed_locations'] = set()
-        selected = placer.select_next_location(**selection_kwargs)
+        selected = select_next(**selection_kwargs)
         if selected is None:
             _record_selection_stop(budget)
         return selected
@@ -2241,9 +2290,8 @@ def select_location(
     if not candidates:
         _record_selection_stop(budget)
         return None
-    selected = placer.select_next_location(
-        skip_zero_cost_preference=skip_zero_cost_preference,
-        allowed_locations=candidates)
+    selected = select_next(skip_zero_cost_preference=skip_zero_cost_preference,
+                           allowed_locations=candidates)
     if selected is None:
         _record_selection_stop(budget)
         return None
@@ -2272,6 +2320,36 @@ def select_location(
                     f'candidate_cloud={str(selected.cloud).casefold()}, '
                     f'candidate_region={selected.region}.')
     return selected
+
+
+def preview_location(
+    placer: spot_placer.SpotPlacer,
+    budget: LaunchBudget,
+    *,
+    skip_zero_cost_preference: bool = False,
+    allowed_locations: set[spot_placer.Location] | None = None,
+) -> spot_placer.Location | None:
+    """Observe the next budgeted location without reserving a retry probe."""
+    return _select_location(placer,
+                            budget,
+                            skip_zero_cost_preference=skip_zero_cost_preference,
+                            allowed_locations=allowed_locations,
+                            reserve_retry=False)
+
+
+def select_location(
+    placer: spot_placer.SpotPlacer,
+    budget: LaunchBudget,
+    *,
+    skip_zero_cost_preference: bool = False,
+    allowed_locations: set[spot_placer.Location] | None = None,
+) -> spot_placer.Location | None:
+    """Select the next budgeted location and reserve its retry probe."""
+    return _select_location(placer,
+                            budget,
+                            skip_zero_cost_preference=skip_zero_cost_preference,
+                            allowed_locations=allowed_locations,
+                            reserve_retry=True)
 
 
 def admission_snapshot_by_location(

@@ -170,6 +170,10 @@ class CapacityAdmissionConflict(CapacityAdmissionError):
     """Planner inputs no longer match locked durable state."""
 
 
+class CapacityAdmissionRetryableConflict(CapacityAdmissionConflict):
+    """An optimistic preload changed and must be rebuilt from durable rows."""
+
+
 class CapacityAdmissionUnavailable(CapacityAdmissionError):
     """Ordered admission cannot be proven on this installation."""
 
@@ -3385,20 +3389,45 @@ def _retained_request_root_state(
         return _RetainedRequestRootState.MALFORMED
     if status not in _TERMINAL_REQUEST_STATUSES:
         return _RetainedRequestRootState.BLOCKING
-    terminal_status = association.get('terminal_status')
     terminal_cause = request.get('terminal_cause')
-    association_terminal_cause = association.get('terminal_cause')
     execution_generation = request.get('execution_generation')
-    association_generation = association.get('terminal_execution_generation')
     try:
         canonical_cause = event_api_models.EventCause(terminal_cause)
+    except (TypeError, ValueError):
+        return _RetainedRequestRootState.MALFORMED
+    if type(execution_generation) is not int or execution_generation < 0:
+        return _RetainedRequestRootState.MALFORMED
+
+    terminal_status = association.get('terminal_status')
+    association_terminal_cause = association.get('terminal_cause')
+    association_generation = association.get('terminal_execution_generation')
+    association_terminal = (terminal_status, association_terminal_cause,
+                            association_generation)
+    if all(value is None for value in association_terminal):
+        try:
+            resolution = ordinary_launch_binding.Resolution(
+                str(association.get('resolution')))
+        except (TypeError, ValueError):
+            return _RetainedRequestRootState.MALFORMED
+        if resolution in (ordinary_launch_binding.Resolution.BOUND,
+                          ordinary_launch_binding.Resolution.CANCEL_REQUESTED,
+                          ordinary_launch_binding.Resolution.AMBIGUOUS):
+            # Request execution and Serve reduction are intentionally separate
+            # transactions. A terminal API receipt can therefore be visible
+            # while the association still carries its complete pre-reduction
+            # tuple. Its replica and claim remain charged during this gap, so
+            # it blocks only this root and grants no additional effect.
+            return _RetainedRequestRootState.BLOCKING
+        return _RetainedRequestRootState.MALFORMED
+    if any(value is None for value in association_terminal):
+        return _RetainedRequestRootState.MALFORMED
+    try:
         canonical_association_cause = event_api_models.EventCause(
             association_terminal_cause)
     except (TypeError, ValueError):
         return _RetainedRequestRootState.MALFORMED
     if (terminal_status != status or
             canonical_cause is not canonical_association_cause or
-            type(execution_generation) is not int or execution_generation < 0 or
             type(association_generation) is not int or
             association_generation != execution_generation):
         return _RetainedRequestRootState.MALFORMED
@@ -3896,7 +3925,7 @@ def _canonical_prepared_paid_launch_specs(
     identities = set()
     record_ids = set()
     occurrences_by_rank: dict[int, int] = {}
-    previous_order: tuple[int, int, int] | None = None
+    previous_order: tuple[int, int] | None = None
     pool_window = serve_paid_capacity.base_limit()
     expected_worker_fields = {
         'schema_version', 'launch_yaml_content', 'cluster_name',
@@ -3975,8 +4004,7 @@ def _canonical_prepared_paid_launch_specs(
                 'Prepared paid launch disagrees with the elected catalog.')
         occurrence = occurrences_by_rank.get(evidence.catalog_rank, 0)
         expected_round, expected_slot = divmod(occurrence, pool_window)
-        order = (evidence.exploration_round, evidence.catalog_rank,
-                 evidence.slot_within_pool_window)
+        order = (evidence.catalog_rank, occurrence)
         if ((evidence.exploration_round, evidence.slot_within_pool_window)
                 != (expected_round, expected_slot) or
             (previous_order is not None and order <= previous_order)):
@@ -4176,7 +4204,7 @@ def _resolve_validated_format_6_head(
         dependent_effect_count=0)
 
 
-def _clip_prepared_paid_admission(
+def _prepare_paid_admission_candidates(
     prepared_specs: tuple[serve_paid_capacity.PaidLaunchSpec, ...],
     *,
     candidate: capacity_planning.CapacityPlanCandidate,
@@ -4185,10 +4213,10 @@ def _clip_prepared_paid_admission(
     replica_port: str,
     created_at: float,
 ) -> tuple[_PreparedPaidAdmission, ...]:
-    """Clip immutable cheapest-first specs to one planner paid target."""
+    """Materialize the state-aware target-compatible launch candidates."""
     if candidate.reserved_launch_target.total() > 0:
         return ()
-    remaining = {
+    target = {
         card.casefold(): count
         for card, count in candidate.paid_launch_target.entries
     }
@@ -4200,7 +4228,7 @@ def _clip_prepared_paid_admission(
         card.casefold(): width
         for card, width in candidate.physical_gpu_width_by_accelerator.entries
     }
-    clipped = []
+    candidates = []
     for launch_spec in prepared_specs:
         card = launch_spec.accelerator.casefold()
         if (physical_widths.get(card) != launch_spec.gpu_units_per_node or
@@ -4210,7 +4238,7 @@ def _clip_prepared_paid_admission(
         plan_units = (1 if candidate.capacity_unit
                       is capacity_planning.CapacityUnit.PHYSICAL_BACKEND else
                       launch_spec.gpu_units_per_node)
-        if remaining.get(card, 0) < plan_units:
+        if target.get(card, 0) < plan_units:
             continue
         persistence_spec = launch_spec.persistence_spec(
             priority=decision.paid_launch_priority(card),
@@ -4221,15 +4249,14 @@ def _clip_prepared_paid_admission(
         if persistence_spec.candidate.replica_info.planned_capacity != plan_units:
             raise CapacityAdmissionConflict(
                 'Prepared paid launch has the wrong planner debit width.')
-        clipped.append(
+        candidates.append(
             _PreparedPaidAdmission(
                 launch_spec=launch_spec,
                 persistence_spec=persistence_spec,
                 plan_accelerator=plan_accelerators[card],
                 plan_units=plan_units,
                 physical_gpu_units=launch_spec.physical_gpu_units))
-        remaining[card] -= plan_units
-    return tuple(clipped)
+    return tuple(candidates)
 
 
 def _read_paid_launch_receipt(
@@ -5190,7 +5217,7 @@ class CapacityAdmissionRepository:
             if (expected_planning_state_fingerprint is not None and
                     _locked_planning_state_fingerprint(service, locked_capacity)
                     != expected_planning_state_fingerprint):
-                raise CapacityAdmissionConflict(
+                raise CapacityAdmissionRetryableConflict(
                     'Prepared planning state changed before its rows were '
                     'locked.')
             lane_projection = _lock_kueue_projection(
@@ -5549,7 +5576,7 @@ class CapacityAdmissionRepository:
             else:
                 final_authority = ReservedFillPlanAuthority.not_applicable()
 
-            clipped = _clip_prepared_paid_admission(
+            paid_candidates = _prepare_paid_admission_candidates(
                 prepared_specs,
                 candidate=candidate,
                 decision=decision,
@@ -5560,28 +5587,37 @@ class CapacityAdmissionRepository:
                 spec.candidate.replica_id: index
                 for index, spec in enumerate(temporary_persistence_specs)
             }
-            clipped_indices = tuple(temporary_index[item.launch_spec.replica_id]
-                                    for item in clipped)
-            clipped_census = serve_state._PaidCapacityAdmissionCensus(  # pylint: disable=protected-access
+            candidate_indices = tuple(
+                temporary_index[item.launch_spec.replica_id]
+                for item in paid_candidates)
+            candidate_census = serve_state._PaidCapacityAdmissionCensus(  # pylint: disable=protected-access
                 service_claims=paid_census.service_claims,
                 paid_gpu_units_by_index=tuple(
                     paid_census.paid_gpu_units_by_index[index]
-                    for index in clipped_indices),
+                    for index in candidate_indices),
                 live_paid_gpu_units=paid_census.live_paid_gpu_units)
-            clipped_context = serve_state._LockedPaidCapacityAdmissionContext(  # pylint: disable=protected-access
+            candidate_context = serve_state._LockedPaidCapacityAdmissionContext(  # pylint: disable=protected-access
                 upstream=paid_context.upstream,
-                census=clipped_census,
+                census=candidate_census,
                 pool_rows=paid_context.pool_rows,
                 transaction_now=paid_context.transaction_now)
-            clipped_persistence_specs = [
-                item.persistence_spec for item in clipped
+            candidate_persistence_specs = [
+                item.persistence_spec for item in paid_candidates
             ]
+            positive_paid_target = tuple(
+                sorted((card.casefold(), count) for card, count in
+                       candidate.paid_launch_target.entries if count > 0))
+            plan_budget = serve_state._PaidCapacityAdmissionPlanBudget(  # pylint: disable=protected-access
+                target_units_by_group=positive_paid_target,
+                member_debits=tuple(
+                    (item.plan_accelerator.casefold(), item.plan_units)
+                    for item in paid_candidates))
             paid_decision = serve_state._admit_replicas_with_paid_capacity_claims_in_session(  # pylint: disable=protected-access
                 connection,
                 self.engine,
                 service_name,
-                clipped_persistence_specs,
-                locked_context=clipped_context,
+                candidate_persistence_specs,
+                locked_context=candidate_context,
                 base_limit=serve_paid_capacity.base_limit(),
                 max_limit=serve_paid_capacity.max_limit(),
                 service_limit=None,
@@ -5589,12 +5625,14 @@ class CapacityAdmissionRepository:
                 failure_cooldown_seconds=(
                     serve_paid_capacity.failure_cooldown_seconds()),
                 waiter_ttl_seconds=serve_paid_capacity.waiter_ttl_seconds(),
-                frontier_default_limit=frontier_limit)
+                frontier_default_limit=frontier_limit,
+                plan_budget=plan_budget)
             if paid_decision.existing_indices:
                 raise CapacityAdmissionConflict(
                     'Fresh prepared paid launch resolved to an existing claim.')
             accepted = tuple(
-                clipped[index] for index in paid_decision.accepted_indices)
+                paid_candidates[index]
+                for index in paid_decision.accepted_indices)
             accepted_plan_units: dict[str, int] = {}
             accepted_paid_gpu_units = 0
             for item in accepted:
@@ -5703,14 +5741,14 @@ class CapacityAdmissionRepository:
                     item.plan_units) for item in accepted
             }
             claims = serve_state._capacity_plan_claims_for_paid_admission(  # pylint: disable=protected-access
-                clipped_persistence_specs, paid_decision, supplied_claims)
+                candidate_persistence_specs, paid_decision, supplied_claims)
             if not serve_state._persist_paid_capacity_admission_in_session(  # pylint: disable=protected-access
                     connection,
                     self.engine,
                     service_name,
-                    clipped_persistence_specs,
+                    candidate_persistence_specs,
                     paid_decision,
-                    locked_context=clipped_context,
+                    locked_context=candidate_context,
                     capacity_plan_claims_by_replica_id=claims):
                 raise CapacityAdmissionConflict(
                     'Prepared paid launch identity changed during admission.')
