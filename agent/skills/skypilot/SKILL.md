@@ -309,6 +309,29 @@ sky jobs cancel <job_id>
 
 **Checkpoint pattern**: Your training script should save checkpoints to persistent storage (cloud bucket or volume) and resume from the latest checkpoint on restart. SkyPilot handles the cluster recovery; your script handles the state recovery.
 
+### Managed Job completion and teardown invariant
+
+For a multi-node task, SkyPilot executes `run:` on every node. Every node's
+branch must eventually return successfully before the Managed Job can reach
+`SUCCEEDED` and automatic teardown can begin. Never invoke
+`ray start --block` from any Managed Job `run:` branch or use another
+foreground daemon as the task's process supervisor. For Ray workloads, invoke
+`~/sky_templates/ray/start_cluster` on every node, run the finite driver only
+on rank 0, and let all other branches return.
+
+An output artifact or a finished head-node driver proves only application-level
+completion. Do not report a billable Managed Job as complete, or assume its
+resources were automatically removed, until both conditions hold:
+
+1. `sky jobs queue -o json` reports the job in the expected terminal state.
+2. The workload cluster is absent from SkyPilot and, for costly fleets, its
+   instances are absent or terminal in the cloud provider.
+
+If useful work is complete but the job remains non-terminal past a bounded
+drain period, treat that as a teardown incident and reconcile it immediately.
+See [Advanced Patterns](references/advanced-patterns.md#24-ray-train-integration)
+for the canonical multi-node Ray pattern.
+
 ## SkyServe: Model Serving
 
 ```yaml
@@ -422,6 +445,7 @@ When using SkyPilot programmatically, follow this loop:
 | Polling job status with `sleep` + `sky queue` | Wastes tokens, introduces timing bugs, fragile | Use `sky logs CLUSTER JOB_ID --status` to block until done |
 | Assuming workdir sync removes remote files | rsync is additive; old remote files persist across `sky exec` calls | SSH and manually clean `~/sky_workdir`, or clean in `run:` script |
 | Not using `--tail` when only last output matters | Streaming full logs wastes tokens for long jobs | Use `sky logs CLUSTER JOB_ID --tail 50` for last N lines |
+| Running `ray start --block` in a Managed Job | Every node's `run:` must return before the job succeeds and automatic teardown starts | Use SkyPilot's cluster helper, run the finite driver on rank 0, and let worker branches return |
 
 ## Common Issues Quick Reference
 

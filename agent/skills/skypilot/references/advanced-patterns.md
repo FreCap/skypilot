@@ -398,6 +398,18 @@ run: |
   fi
 ```
 
+`~/sky_templates/ray/start_cluster` starts Ray without making the task's shell
+the daemon supervisor. Never invoke `ray start --block` from a Managed Job
+`run:` branch. In a multi-node Managed Job, `run:` executes on every node and
+the job cannot reach `SUCCEEDED` until every branch exits. A blocking branch
+therefore keeps the fleet billable even after the head-node driver and output
+artifacts finish.
+
+Only rank 0 should run the finite driver. Worker branches should return after
+joining the Ray cluster. After the driver completes, verify the Managed Job's
+terminal state and workload-cluster teardown; artifact completion alone is not
+teardown evidence.
+
 ### 2.5 FSDP Configuration
 
 PyTorch Fully Sharded Data Parallel (FSDP) with SkyPilot:
@@ -501,6 +513,11 @@ run: |
 6. **Setup runs on ALL nodes**: The `setup:` section also runs on all nodes.
    This is typically correct (install dependencies everywhere), but be aware
    of it when doing one-time data preparation.
+
+7. **Every Managed Job branch must terminate**: Never invoke
+   `ray start --block` from a Managed Job `run:` branch. Use SkyPilot's cluster
+   helper and make every branch finite so job completion can trigger automatic
+   teardown.
 
 ---
 
