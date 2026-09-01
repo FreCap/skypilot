@@ -41,7 +41,6 @@ from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
 from sky.serve import autoscaler_decisions
-from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
 from sky.serve import drain_observability
 from sky.serve import non_pool_launch_reconciliation
@@ -883,7 +882,7 @@ def _bound_reduction_request_id(reduction: Any) -> str:
 
 def _wait_for_bound_ordinary_launch(
     replica_id: int,
-    cluster_name: str,
+    cluster_name: str,  # pylint: disable=unused-argument
     request_id: str,
     stream_logs: bool,
     launch_cloud: clouds.Cloud | None,

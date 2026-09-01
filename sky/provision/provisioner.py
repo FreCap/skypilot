@@ -267,6 +267,8 @@ def bulk_provision(
                 # Re-canonicalize the attached receipt and preserve the typed
                 # rejection; a generic teardown would add provider I/O that
                 # can mask this durable evidence with StopFailoverError.
+                assert isinstance(exc,
+                                  provision_common.ProviderCreateRejectedError)
                 exc.provider_negative_ack = provider_negative_ack
                 raise
             if provider_effect_guard_factory is not None:

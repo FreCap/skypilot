@@ -4598,7 +4598,6 @@ def test_controller_installs_finalized_partial_paid_wave_and_successor(
             0,
             planning_fingerprint,
             prepared_inputs,
-            replica_infos,
             sequenced_reserved_fill=False,
             prepared_paid_launch_specs=prepared_specs)
         assert result is not None
@@ -4762,7 +4761,7 @@ def test_fresh_zero_multi_pool_admission_accepts_yaml_card_casing(
             0,
             0,
             planning_fingerprint,
-            prepared_inputs, [],
+            prepared_inputs,
             sequenced_reserved_fill=True,
             prepared_paid_launch_specs=prepared_specs)
         assert result is not None

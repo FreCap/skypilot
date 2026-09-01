@@ -7691,7 +7691,7 @@ class TestAutoscalerRuntimeSnapshot:
                     autoscalers.ScalingDecisionInputs(
                         replica_ids=(),
                         gpu_shape_handles={},
-                        historical_scaling_values={}), [],
+                        historical_scaling_values={}),
                     sequenced_reserved_fill=False,
                     prepared_paid_launch_specs=()))
 
@@ -7811,7 +7811,7 @@ class TestAutoscalerRuntimeSnapshot:
                 0,
                 0,
                 'f' * 64,
-                prepared, [info],
+                prepared,
                 sequenced_reserved_fill=False,
                 prepared_paid_launch_specs=())
 

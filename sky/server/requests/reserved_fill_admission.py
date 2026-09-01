@@ -76,8 +76,8 @@ def _frozen_identity(
                               zero_cost_actuation.IntentLease) or
             type(spec.launch_limit) is not int or spec.launch_limit < 1):
         raise ValueError('Reserved-fill admission input is malformed.')
-    if (spec.replica_info.status_property.sky_launch_status !=
-            common_utils.ProcessStatus.RUNNING or
+    if (spec.replica_info.status_property.sky_launch_status
+            != common_utils.ProcessStatus.RUNNING or
             spec.replica_info.status_property.sky_down_status is not None):
         raise ValueError('Reserved-fill admission must reserve a RUNNING '
                          'launch without teardown intent.')
@@ -108,8 +108,8 @@ def _frozen_identity(
             intent.controller_pid != authority.controller_pid or
             intent.controller_ip != authority.controller_ip or
             intent.replica_id != spec.replica_info.replica_id or
-            str(intent.replica_record_id) !=
-            spec.replica_info.replica_record_id):
+            str(intent.replica_record_id)
+            != spec.replica_info.replica_record_id):
         raise ValueError('Frozen launch does not match controller authority.')
     return body, intent
 

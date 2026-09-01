@@ -144,8 +144,7 @@ class EqualCostBalancingTier:
         if (not isinstance(self.normalized_cost, (int, float)) or
                 isinstance(self.normalized_cost, bool) or
                 not math.isfinite(float(self.normalized_cost)) or
-                self.normalized_cost <= 0 or
-                type(self.use_spot) is not bool or  # pylint: disable=unidiomatic-typecheck
+                self.normalized_cost <= 0 or type(self.use_spot) is not bool or  # pylint: disable=unidiomatic-typecheck
                 not isinstance(self.physical_backend_shape,
                                PhysicalBackendShape)):
             raise PaidGPUAttributionError(
@@ -1215,7 +1214,6 @@ def _active_aws_account_id_for_workspace(workspace: str,
 def _provider_identity_for_location(
     location: spot_placer.Location,
     *,
-    workspace: str,
     aws_account_id: str | None = None,
 ) -> dict[str, str] | None:
     if not isinstance(location.cloud, clouds.AWS):
@@ -1276,7 +1274,7 @@ def pool_key(location: spot_placer.Location,
     }
     if isinstance(location.cloud, clouds.AWS):
         payload['provider_identity'] = _provider_identity_for_location(
-            location, workspace=workspace, aws_account_id=aws_account_id)
+            location, aws_account_id=aws_account_id)
     return json.dumps(payload, sort_keys=True, separators=(',', ':'))
 
 
@@ -1540,15 +1538,14 @@ def equal_cost_balancing_tier(
     if type(location.use_spot) is not bool:  # pylint: disable=unidiomatic-typecheck
         raise PaidGPUAttributionError(
             'Equal-cost balancing requires an exact purchase market.')
-    card, width = _exact_whole_gpu_shape(
-        location.accelerators, field='equal-cost balancing location')
-    return EqualCostBalancingTier(
-        normalized_cost=normalized_cost,
-        use_spot=location.use_spot,
-        physical_backend_shape=PhysicalBackendShape(
-            accelerator=card,
-            gpu_units_per_node=width,
-            num_nodes=num_nodes))
+    card, width = _exact_whole_gpu_shape(location.accelerators,
+                                         field='equal-cost balancing location')
+    return EqualCostBalancingTier(normalized_cost=normalized_cost,
+                                  use_spot=location.use_spot,
+                                  physical_backend_shape=PhysicalBackendShape(
+                                      accelerator=card,
+                                      gpu_units_per_node=width,
+                                      num_nodes=num_nodes))
 
 
 def _paid_pool_gpu_shape(pool_key_value: Any) -> PhysicalBackendShape:
@@ -2428,8 +2425,8 @@ def _balanced_equal_cost_location(
             selected,
             normalized_cost=selected_entry.normalized_hourly_cost,
             num_nodes=placer.num_nodes)
-        if (paid_pool_gpu_shape(selected_pool) !=
-                selected_tier.physical_backend_shape):
+        if (paid_pool_gpu_shape(selected_pool)
+                != selected_tier.physical_backend_shape):
             return selected
     except PaidGPUAttributionError:
         return selected
@@ -2444,9 +2441,8 @@ def _balanced_equal_cost_location(
                 location,
                 normalized_cost=entry.normalized_hourly_cost,
                 num_nodes=placer.num_nodes)
-            if (candidate_tier != selected_tier or
-                    paid_pool_gpu_shape(pool) !=
-                    candidate_tier.physical_backend_shape):
+            if (candidate_tier != selected_tier or paid_pool_gpu_shape(pool)
+                    != candidate_tier.physical_backend_shape):
                 continue
         except PaidGPUAttributionError:
             continue
@@ -2461,8 +2457,8 @@ def _balanced_equal_cost_location(
         current = budget.remaining_by_location.get(location)
         state = budget.states_by_pool_key.get(pool)
         initial = state.get('remaining') if isinstance(state, Mapping) else None
-        if (pool in seen_pool_keys or
-                type(current) is not int or current <= 0 or  # pylint: disable=unidiomatic-typecheck
+        if (pool in seen_pool_keys or type(current) is not int or
+                current <= 0 or  # pylint: disable=unidiomatic-typecheck
                 type(initial) is not int or initial < current or  # pylint: disable=unidiomatic-typecheck
                 initial <= 0):
             # Partial or contradictory evidence must not invent a new

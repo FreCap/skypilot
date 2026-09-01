@@ -136,8 +136,8 @@ class _TruncatingLogFile:
         self._bytes_since_disk_check %= self._disk_check_interval_bytes
         # Include this pending write in the decision so a single large output
         # chunk cannot cross the reserve after observing a healthy snapshot.
-        return (shutil.disk_usage(self._path.parent).free - incoming_bytes <
-                self._min_free_bytes)
+        return (shutil.disk_usage(self._path.parent).free - incoming_bytes
+                < self._min_free_bytes)
 
     def _replace_with_disk_pressure_marker(self, fd: int) -> None:
         """Release this spool's payload and leave a follower-visible marker."""

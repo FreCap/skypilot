@@ -609,15 +609,15 @@ class ReservedFillPlanAuthority:
                              'fill reservation evidence.')
 
     @classmethod
-    def not_applicable(cls) -> 'ReservedFillPlanAuthority':
+    def not_applicable(cls) -> ReservedFillPlanAuthority:
         return cls(ReservedFillPlanAuthorityMode.NOT_APPLICABLE)
 
     @classmethod
-    def zero_revocation(cls) -> 'ReservedFillPlanAuthority':
+    def zero_revocation(cls) -> ReservedFillPlanAuthority:
         return cls(ReservedFillPlanAuthorityMode.UNBOUND_ZERO_REVOCATION)
 
     @classmethod
-    def bound(cls, identity: Any) -> 'ReservedFillPlanAuthority':
+    def bound(cls, identity: Any) -> ReservedFillPlanAuthority:
         if not isinstance(identity,
                           reserved_fill_planner.ReservedFillAllocationIdentity):
             raise ValueError(
@@ -628,7 +628,7 @@ class ReservedFillPlanAuthority:
     def gate_ineligible(
         cls,
         reservation_evidence_sha256: str,
-    ) -> 'ReservedFillPlanAuthority':
+    ) -> ReservedFillPlanAuthority:
         """Compatibility spelling for unavailable reservation evidence."""
         return cls.reservation_ineligible(reservation_evidence_sha256)
 
@@ -636,7 +636,7 @@ class ReservedFillPlanAuthority:
     def reservation_ineligible(
         cls,
         reservation_evidence_sha256: str,
-    ) -> 'ReservedFillPlanAuthority':
+    ) -> ReservedFillPlanAuthority:
         """Bind paid authority to exact unavailable reservation evidence."""
         return cls(ReservedFillPlanAuthorityMode.GATE_INELIGIBLE,
                    reservation_evidence_sha256=(reservation_evidence_sha256))
@@ -646,14 +646,14 @@ class ReservedFillPlanAuthority:
         cls,
         accelerators: Sequence[str],
         worker_projection_sha256: str,
-    ) -> 'ReservedFillPlanAuthority':
+    ) -> ReservedFillPlanAuthority:
         canonical = tuple(sorted({card.casefold() for card in accelerators}))
         return cls(ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE,
                    incompatible_accelerators=canonical,
                    worker_projection_sha256=worker_projection_sha256)
 
     @classmethod
-    def from_mapping(cls, value: Any) -> 'ReservedFillPlanAuthority':
+    def from_mapping(cls, value: Any) -> ReservedFillPlanAuthority:
         allowed = {
             'mode', 'allocation', 'incompatible_accelerators',
             'worker_projection_sha256', 'reservation_evidence_sha256'
@@ -1360,8 +1360,9 @@ def autoscaler_history_snapshot_from_committed_plan(
 @contextlib.contextmanager
 def _capacity_admission_transaction(
     engine: sqlalchemy.engine.Engine,
-    history_writer: Callable[[sqlalchemy.engine.Connection,
-                              serve_history.AutoscalerHistorySnapshot], int],
+    history_writer: Callable[
+        [sqlalchemy.engine.Connection, serve_history.AutoscalerHistorySnapshot],
+        int],
 ):
     """Commit authority, then project history on the same connection."""
     history_snapshot = None
@@ -4185,7 +4186,6 @@ def _canonical_prepared_paid_launch_specs(
             if current_balancing_tier is not None:
                 closed_balancing_tiers.add(current_balancing_tier)
             current_balancing_tier = balancing_tier
-        identity = (spec.replica_id, spec.replica_record_id)
         if spec.replica_id in identities or spec.replica_record_id in record_ids:
             raise ValueError('Prepared paid launch identities are duplicated.')
         identities.add(spec.replica_id)
@@ -4206,7 +4206,7 @@ def _resolve_locked_policy_history(
     backend_num_nodes: int,
     locked_capacity: _LockedCapacityRows,
     lane_projection: kueue_lane_capacity.KueueAdmissionCapacityProjection,
-    allocation_reserved: Mapping[str, int],
+    allocation_reserved: Mapping[str, int],  # pylint: disable=unused-argument
     raw_claim_count: int,
     raw_waiter_count: int,
     dependent_effect_count: int,
@@ -5103,9 +5103,9 @@ class CapacityAdmissionRepository:
         authority_valid_until: datetime.datetime,
     ) -> _WrittenCapacityPlan:
         """Persist one plan without reacquiring its prelocked history."""
-        capacity_target = _canonical_counts(plan.capacity_target_by_accelerator,
-                                            'capacity_target_by_accelerator')
-        accounting_cards = set(capacity_target)
+        # Validation only: a noncanonical target must still fail closed here.
+        _canonical_counts(plan.capacity_target_by_accelerator,
+                          'capacity_target_by_accelerator')
         watermark_sha256 = _sha256(_canonical_watermark(plan.receipt_watermark))
         previous = locked_history.previous
         duplicate_payload = None

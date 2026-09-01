@@ -6524,7 +6524,6 @@ class SkyServeController:
         notification_generation: int,
         planning_state_fingerprint: str | None,
         prepared_decision_inputs: autoscalers.ScalingDecisionInputs,
-        replica_infos: list[replica_managers.ReplicaInfo],
         *,
         sequenced_reserved_fill: bool,
         prepared_paid_launch_specs: tuple[paid_capacity.PaidLaunchSpec, ...],
@@ -6993,7 +6992,6 @@ class SkyServeController:
                 notification_generation,
                 planning_state_fingerprint,
                 prepared_decision_inputs,
-                replica_infos,
                 sequenced_reserved_fill=sequenced_reserved_fill,
                 prepared_paid_launch_specs=prepared_specs)
             if current_plan is None:

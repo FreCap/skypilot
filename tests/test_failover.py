@@ -58,8 +58,10 @@ def test_aws_region_failover(enable_all_clouds, _mock_db_conn, mock_aws_backend,
                               count,
                               associate_public_ip_address,
                               max_efa_interfaces,
-                              is_single_zone_request=False):
+                              is_single_zone_request=False,
+                              provider_create_idempotency_token=None):
         assert not is_single_zone_request
+        del provider_create_idempotency_token
         region = ec2_fail_fast.meta.client.meta.region_name
         region_attempt_count['count'] += 1
         if region == 'us-east-1' and region_attempt_count['count'] == 1:
