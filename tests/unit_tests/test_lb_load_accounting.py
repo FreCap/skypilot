@@ -498,6 +498,33 @@ class TestProxySlotRelease:
         assert t.connect == 10
         assert t.read == 3700
 
+    def test_proxy_preserves_path_and_only_forwards_nonempty_query(self):
+        policy = mock.MagicMock()
+        client = mock.MagicMock()
+        captured_urls = []
+
+        def _build_request(_method, url, **_kwargs):
+            captured_urls.append(url)
+            raise httpx.RequestError('stop after URL construction')
+
+        client.build_request = _build_request
+        balancer = _make_lb(policy, client_pool={'http://a:8080': client})
+
+        request = self._request()
+        request.url.path = '/v1/models/model:predict'
+        request.url.query = ''
+        asyncio.run(balancer._proxy_request_to('http://a:8080', request))
+
+        request = self._request()
+        request.url.path = '/v1/models/model:predict'
+        request.url.query = 'request_id=one'
+        asyncio.run(balancer._proxy_request_to('http://a:8080', request))
+
+        assert [url.raw_path for url in captured_urls] == [
+            b'/v1/models/model:predict',
+            b'/v1/models/model:predict?request_id=one',
+        ]
+
 
 class TestDrainPrunedClients(unittest.TestCase):
     """Pruning a replica must not abort its in-flight requests.

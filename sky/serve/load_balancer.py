@@ -5571,8 +5571,12 @@ class SkyServeLoadBalancer:
             self._release_client_refcount(client)
 
         try:
+            # httpx treats b'' as an explicit empty query and appends '?'.
+            # ASGI exposes both no query and an empty query as '', so use None
+            # to preserve the normal no-query request target exactly.
             worker_url = httpx.URL(path=request.url.path,
-                                   query=request.url.query.encode('utf-8'))
+                                   query=(request.url.query.encode('utf-8') or
+                                          None))
             request_body = await self._request_body(request)
             if self._request_has_stable_job_id(request):
                 request_action = None
