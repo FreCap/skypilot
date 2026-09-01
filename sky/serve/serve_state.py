@@ -6645,30 +6645,33 @@ def _persist_paid_capacity_admission_in_session(
                 for replica_id in existing_replica_ids):
             raise ValueError('A zero-cost or reserved-fill row cannot be '
                              'replayed through a paid-capacity claim.')
-        persisted_infos = _upsert_replica_rows_in_session(
-            session,
-            engine,
-            service_name,
-            existing_infos,
-            expected_replica_exists=True)
-        if persisted_infos is None:
-            return False
-        if any(
-                _replica_has_zero_cost_authority(info)
-                for _, info in persisted_infos):
-            raise ValueError('A zero-cost or reserved-fill row cannot be '
-                             'replayed through a paid-capacity claim.')
+        expected_pool_by_replica_id = {
+            persistence_specs[index].candidate.replica_id:
+                persistence_specs[index].pool_key
+            for index in decision.existing_indices
+        }
+        if any(current_by_replica_id[replica_id].paid_capacity_pool_key !=
+               expected_pool_by_replica_id[replica_id]
+               for replica_id in existing_replica_ids):
+            raise ValueError('A paid-capacity replica cannot change its exact '
+                             'provider pool during a recovery re-drive.')
+        # Existing claim replay is validation-only.  The replica and claim are
+        # one immutable admission receipt for their lifetime; status updates
+        # use the dedicated replica bookkeeping paths after launch.
 
     existing_index_set = set(decision.existing_indices)
     for index in decision.accepted_indices:
         spec = persistence_specs[index]
         candidate = spec.candidate
-        if index not in existing_index_set:
-            replica_insert = _upsert_insert_func(engine)(replicas_table).values(
-                **_initial_replica_row_values(engine, service_name,
-                                              candidate.replica_id,
-                                              transaction_infos[index]))
-            session.execute(replica_insert)
+        if index in existing_index_set:
+            # The claim is admission evidence, not mutable scheduling state.
+            # An exact recovery re-drive validates the immutable replica and
+            # claim receipt but must not rewrite either row.
+            continue
+        replica_insert = _upsert_insert_func(engine)(replicas_table).values(
+            **_initial_replica_row_values(engine, service_name, candidate.
+                                          replica_id, transaction_infos[index]))
+        session.execute(replica_insert)
         claim_values = {
             'service_name': service_name,
             'service_hash': locked_context.upstream.service_hash,
@@ -6680,13 +6683,7 @@ def _persist_paid_capacity_admission_in_session(
         }
         claim_insert = _upsert_insert_func(engine)(
             paid_capacity_claims_table).values(**claim_values)
-        session.execute(
-            claim_insert.on_conflict_do_update(
-                index_elements=['service_name', 'service_hash', 'replica_id'],
-                set_={
-                    'pool_key': spec.pool_key,
-                    'priority': claim_values['priority'],
-                }))
+        session.execute(claim_insert)
     return True
 
 
@@ -6913,14 +6910,42 @@ def adopt_paid_capacity_claims(
                                               require_launch_allowed=False):
             session.rollback()
             return False
-        for pool_key in sorted({pool_key for _, pool_key, _, _ in claims}):
-            _ensure_paid_capacity_pool_in_session(session, engine, pool_key,
-                                                  base_limit, now)
-            _paid_capacity_pool_row_for_update(session, pool_key)
         claims_by_replica_id = {
             replica_id: (pool_key, priority)
             for replica_id, pool_key, priority, _ in claims
         }
+        replica_ids = sorted(claims_by_replica_id)
+        # The service mutex makes this non-locking pre-read stable.  Include
+        # retained pools before taking the globally ordered pool locks, then
+        # lock the exact claim rows only after every pool is locked.
+        retained_pool_keys = set(
+            session.execute(
+                sqlalchemy.select(paid_capacity_claims_table.c.pool_key).where(
+                    paid_capacity_claims_table.c.service_name == service_name,
+                    paid_capacity_claims_table.c.service_hash == service_hash,
+                    paid_capacity_claims_table.c.replica_id.in_(
+                        replica_ids))).scalars())
+        pool_keys = ({pool_key for _, pool_key, _, _ in claims} |
+                     retained_pool_keys)
+        for pool_key in sorted(pool_keys):
+            _ensure_paid_capacity_pool_in_session(session, engine, pool_key,
+                                                  base_limit, now)
+            _paid_capacity_pool_row_for_update(session, pool_key)
+        retained_claims = {
+            int(row['replica_id']): row for row in session.execute(
+                sqlalchemy.select(paid_capacity_claims_table).where(
+                    paid_capacity_claims_table.c.service_name == service_name,
+                    paid_capacity_claims_table.c.service_hash == service_hash,
+                    paid_capacity_claims_table.c.replica_id.in_(replica_ids)).
+                order_by(paid_capacity_claims_table.c.pool_key,
+                         paid_capacity_claims_table.c.replica_id).
+                with_for_update()).mappings()
+        }
+        if any(retained_claims[replica_id]['pool_key'] != pool_key
+               for replica_id, (pool_key, _) in claims_by_replica_id.items()
+               if replica_id in retained_claims):
+            raise ValueError('An adopted paid-capacity claim cannot move '
+                             'between exact provider pools.')
         merged_infos = _lock_and_merge_existing_replica_rows_in_session(
             session, engine, service_name,
             [(replica_id, replica_info)
@@ -6936,11 +6961,26 @@ def adopt_paid_capacity_claims(
         for replica_id, replica_info in merged_infos:
             pool_key, priority = claims_by_replica_id[replica_id]
             row = session.execute(
-                sqlalchemy.select(replicas_table.c.status).where(
-                    replicas_table.c.service_name == service_name,
-                    replicas_table.c.replica_id == replica_id)).fetchone()
+                sqlalchemy.select(
+                    replicas_table.c.status,
+                    replicas_table.c.replica_state_version,
+                    replicas_table.c.replica_state).where(
+                        replicas_table.c.service_name == service_name,
+                        replicas_table.c.replica_id == replica_id)).fetchone()
             if (row is None or
                     row.status not in _PAID_CAPACITY_UNRESOLVED_STATUSES):
+                continue
+            current_info = _replica_from_state(row.replica_state_version,
+                                               row.replica_state)
+            if replica_id in retained_claims:
+                if (current_info.paid_capacity_pool_key != pool_key or
+                        _replica_has_zero_cost_authority(current_info)):
+                    raise ValueError(
+                        'An adopted paid-capacity replica lost its exact '
+                        'provider-pool identity.')
+                # Existing restart adoption is validation-only.  Do not let a
+                # stale recovery snapshot rewrite either side of the immutable
+                # replica+claim admission receipt.
                 continue
             replica_info.paid_capacity_pool_key = pool_key
             row_values = _replica_row_values(service_name, replica_id,
@@ -6958,14 +6998,7 @@ def adopt_paid_capacity_claims(
                                                    pool_key=pool_key,
                                                    priority=priority,
                                                    claimed_at=0)
-            session.execute(
-                claim_insert.on_conflict_do_update(index_elements=[
-                    'service_name', 'service_hash', 'replica_id'
-                ],
-                                                   set_={
-                                                       'pool_key': pool_key,
-                                                       'priority': priority,
-                                                   }))
+            session.execute(claim_insert)
         session.commit()
     return True
 
