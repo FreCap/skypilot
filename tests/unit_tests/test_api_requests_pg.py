@@ -866,6 +866,12 @@ def _project_paid_provider_absence_graph(
         monkeypatch: pytest.MonkeyPatch) -> _PaidProviderAbsenceGraph:
     graph = _prepare_paid_provider_absence_graph(bound_request_database,
                                                  monkeypatch)
+
+    return _project_prepared_paid_provider_absence_graph(graph)
+
+
+def _project_prepared_paid_provider_absence_graph(
+        graph: _PaidProviderAbsenceGraph) -> _PaidProviderAbsenceGraph:
     payload = request_postgres.bound_non_pool_terminal_provider_absence_payload(
         graph.context, graph.authority)
     assert payload is not None
@@ -882,6 +888,77 @@ def _project_paid_provider_absence_graph(
         project_replica_result=lambda connection, projection: manager.
         _project_bound_ordinary_launch(None, connection, projection))
     return graph
+
+
+def _stage_historical_priority_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch: pytest.MonkeyPatch) -> _PaidProviderAbsenceGraph:
+    """Stage the production restart-priority corruption before cleanup."""
+    graph = _prepare_paid_provider_absence_graph(bound_request_database,
+                                                 monkeypatch)
+    with graph.engine.begin() as connection:
+        claims = serve_state_schema.paid_capacity_claims_table
+        original_priority = connection.execute(
+            sqlalchemy.select(claims.c.priority).where(
+                claims.c.service_name == 'gc-service',
+                claims.c.replica_id == 3)).scalar_one()
+        assert original_priority > serve_constants.LB_REQUEST_PRIORITY_MIN
+        connection.execute(
+            sqlalchemy.update(claims).where(
+                claims.c.service_name == 'gc-service',
+                claims.c.replica_id == 3).values(
+                    priority=serve_constants.LB_REQUEST_PRIORITY_MIN))
+    return graph
+
+
+def _insert_paid_retirement(
+    graph: _PaidProviderAbsenceGraph,
+    *,
+    state: paid_retirement.PaidRetirementState = (
+        paid_retirement.PaidRetirementState.COMMITTED),
+    service_hash: str = 'gc-service-hash',
+    replica_record_id: uuid.UUID = _GC_REPLICA_RECORD_ID,
+    service_lifecycle_epoch: int = 4,
+    service_version: int = 2,
+    requires_idle_proof: bool = False,
+) -> None:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    connection_values = {
+        'service_name': 'gc-service',
+        'replica_id': 3,
+        'service_hash': service_hash,
+        'replica_record_id': replica_record_id,
+        'service_lifecycle_epoch': service_lifecycle_epoch,
+        # COMMITTED authority survives the controller restart that later
+        # reconciles provider absence and consumes this exact row.
+        'controller_incarnation':
+            uuid.UUID('11111111-1111-4111-8111-111111111111'),
+        'controller_owner_epoch': 5,
+        'controller_pid': 122,
+        'controller_ip': '10.0.0.1',
+        'service_version': service_version,
+        'demand_source_epoch': 1,
+        'demand_feed_generation': 1,
+        'capacity_plan_generation': 1,
+        'capacity_plan_sha256': 'b' * 64,
+        'route_generation': 1,
+        'route_url': ('http://10.0.0.3:8080' if requires_idle_proof else None),
+        'requires_idle_proof': requires_idle_proof,
+        'state': state.value,
+        'created_at': now,
+        'updated_at': now,
+        'committed_at':
+            (now if state is paid_retirement.PaidRetirementState.COMMITTED else
+             None),
+        'cancelled_at':
+            (now if state is paid_retirement.PaidRetirementState.CANCELLED else
+             None),
+    }
+    with graph.engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                paid_retirement.serve_paid_replica_retirements_table).values(
+                    **connection_values))
 
 
 def _gc_legacy_identity(
@@ -3972,6 +4049,154 @@ def test_projected_paid_provider_absence_retires_only_the_exact_row(
                   association_id == graph.context.association_id)).scalar_one()
     assert replica_count == 0
     assert association_count == 1
+
+
+@pytest.mark.parametrize('requires_idle_proof', [False, True])
+def test_projected_paid_provider_absence_consumes_exact_committed_retirement(
+        bound_request_database, monkeypatch, requires_idle_proof) -> None:
+    graph = _stage_historical_priority_paid_provider_absence_graph(
+        bound_request_database, monkeypatch)
+    _insert_paid_retirement(graph, requires_idle_proof=requires_idle_proof)
+    _project_prepared_paid_provider_absence_graph(graph)
+
+    with graph.engine.connect() as connection:
+        claims = serve_state_schema.paid_capacity_claims_table
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(claims)).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(
+                request_postgres.REQUEST_RETENTION_PINS)).scalar_one() == 0
+
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    assert manager._finalize_projected_provider_absence_cleanup(3)
+    with graph.engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'gc-service', serve_state_schema.replicas_table.c.replica_id ==
+                3)).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(
+                paid_retirement.serve_paid_replica_retirements_table).where(
+                    paid_retirement.serve_paid_replica_retirements_table.c.
+                    service_name == 'gc-service',
+                    paid_retirement.serve_paid_replica_retirements_table.c.
+                    replica_id == 3)).scalar_one() == 0
+
+
+@pytest.mark.parametrize('mutation', [
+    'active',
+    'cancelled',
+    'service_hash',
+    'replica_record_id',
+    'lifecycle_epoch',
+    'service_version',
+])
+def test_projected_paid_provider_absence_rejects_inexact_retirement(
+        bound_request_database, monkeypatch, mutation) -> None:
+    graph = _stage_historical_priority_paid_provider_absence_graph(
+        bound_request_database, monkeypatch)
+    kwargs = {}
+    if mutation == 'active':
+        kwargs['state'] = paid_retirement.PaidRetirementState.ACTIVE
+    elif mutation == 'cancelled':
+        kwargs['state'] = paid_retirement.PaidRetirementState.CANCELLED
+    elif mutation == 'service_hash':
+        kwargs['service_hash'] = 'other-hash'
+    elif mutation == 'replica_record_id':
+        kwargs['replica_record_id'] = uuid.uuid4()
+    elif mutation == 'lifecycle_epoch':
+        kwargs['service_lifecycle_epoch'] = 5
+    else:
+        kwargs['service_version'] = 3
+    _insert_paid_retirement(graph, **kwargs)
+    _project_prepared_paid_provider_absence_graph(graph)
+
+    assert not request_postgres.retire_bound_non_pool_projected_paid_provider_absence(
+        'gc-service', 3, str(_GC_REPLICA_RECORD_ID))
+    with graph.engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'gc-service', serve_state_schema.replicas_table.c.replica_id ==
+                3)).scalar_one() == 1
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(
+                paid_retirement.serve_paid_replica_retirements_table).where(
+                    paid_retirement.serve_paid_replica_retirements_table.c.
+                    service_name == 'gc-service',
+                    paid_retirement.serve_paid_replica_retirements_table.c.
+                    replica_id == 3)).scalar_one() == 1
+
+
+def test_projected_paid_provider_absence_row_cas_rolls_back_retirement_delete(
+        bound_request_database, monkeypatch) -> None:
+    graph = _stage_historical_priority_paid_provider_absence_graph(
+        bound_request_database, monkeypatch)
+    _insert_paid_retirement(graph)
+    _project_prepared_paid_provider_absence_graph(graph)
+    replicas = serve_state_schema.replicas_table
+    retirements = paid_retirement.serve_paid_replica_retirements_table
+    with graph.engine.connect() as connection:
+        original_replica_state = connection.execute(
+            sqlalchemy.select(replicas.c.replica_state).where(
+                replicas.c.service_name == 'gc-service',
+                replicas.c.replica_id == 3)).scalar_one()
+        original_retirement = dict(
+            connection.execute(
+                sqlalchemy.select(retirements).where(
+                    retirements.c.service_name == 'gc-service',
+                    retirements.c.replica_id == 3)).mappings().one())
+
+    original_authority = (
+        ordinary_launch_binding.
+        projected_provider_absence_cleanup_authority_in_connection)
+
+    def _change_row_after_authority(connection, *args):
+        authority = original_authority(connection, *args)
+        changed_state = {
+            **original_replica_state,
+            'replica_record_id': str(uuid.uuid4()),
+        }
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        connection.execute(
+            sqlalchemy.update(replicas).where(
+                replicas.c.service_name == 'gc-service',
+                replicas.c.replica_id == 3).values(replica_state=changed_state))
+        return authority
+
+    monkeypatch.setattr(
+        ordinary_launch_binding,
+        'projected_provider_absence_cleanup_authority_in_connection',
+        _change_row_after_authority)
+    assert not request_postgres.retire_bound_non_pool_projected_paid_provider_absence(
+        'gc-service', 3, str(_GC_REPLICA_RECORD_ID))
+
+    with graph.engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(replicas.c.replica_state).where(
+                replicas.c.service_name == 'gc-service', replicas.c.replica_id
+                == 3)).scalar_one() == original_replica_state
+        assert dict(
+            connection.execute(
+                sqlalchemy.select(retirements).where(
+                    retirements.c.service_name == 'gc-service',
+                    retirements.c.replica_id ==
+                    3)).mappings().one()) == original_retirement
 
 
 def test_projected_paid_provider_absence_survives_request_gc_before_retirement(
