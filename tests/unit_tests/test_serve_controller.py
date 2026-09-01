@@ -8566,6 +8566,7 @@ class TestAuthoritativeLbReportIngestion:
             peak_queue_depth=4,
             accelerator_breakdown=None,
             timestamp=None,
+            required_source_mode='LEGACY_CONTROLLER',
         )
 
     def test_autoscaler_history_keeps_exact_card_capacity_distinct(self):

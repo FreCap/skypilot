@@ -66,6 +66,8 @@ import {
 } from '@/data/connectors/services';
 import ServiceDetailsPage, {
   AcceleratorCapacityCard,
+  applyCurrentCapacityPlanHistory,
+  currentCapacityPlanLocalDeadline,
   getReplicaPlacementBreakdown,
   ReplicaPlacementCard,
   ReplicasCard,
@@ -81,6 +83,59 @@ import ServiceDetailsPage, {
   useServiceReplicaData,
   useServiceSummaryBootstrap,
 } from '@/pages/services/[service]';
+
+function committedPlanHistory({
+  demandTarget = 2,
+  observedAt = 99,
+  validUntil = 110,
+  windowEnd = 100,
+  receivedAt = 100,
+} = {}) {
+  return {
+    available: true,
+    serviceHash: 'hash-a',
+    windowEnd,
+    receivedAt,
+    autoscalerProjectionMode: 'DURABLE_FEED',
+    autoscalerProjectionModeMalformed: false,
+    autoscalerLatestSampleMalformed: false,
+    autoscalerSamples: [
+      {
+        timestamp: 60,
+        observedAt,
+        controllerSessionId: 'a'.repeat(32),
+        version: 1,
+        replicaUnit: 'physical_backend',
+        demandTarget,
+        capacityTarget: demandTarget,
+        readyCapacity: 0,
+        provisioningCapacity: 0,
+        totalCapacity: 0,
+        peakInFlight: demandTarget,
+        peakQueueDepth: demandTarget,
+        acceleratorBreakdown: {
+          capacitySemanticsVersion: 2,
+          configuredAccelerators: ['L4'],
+          minReplicas: { L4: 0 },
+          demandTarget: { L4: demandTarget },
+          warmRetentionTarget: { L4: 0 },
+          coldLaunchAuthority: { L4: demandTarget },
+          readyCapacity: { L4: 0 },
+          provisioningCapacity: { L4: 0 },
+          totalCapacity: { L4: 0 },
+          zeroCostReadyCapacity: { L4: 0 },
+          fillTarget: { L4: 0 },
+          freeReservedSlots: { L4: 0 },
+          capacityPlan: {
+            generation: 7,
+            sha256: 'a'.repeat(64),
+            validUntil,
+          },
+        },
+      },
+    ],
+  };
+}
 
 describe('AcceleratorCapacityCard', () => {
   it('renders exact cards and separates demand floors from reserved supply', () => {
@@ -130,6 +185,108 @@ describe('AcceleratorCapacityCard', () => {
     expect(screen.getByText('Committed / unready')).toBeInTheDocument();
     expect(screen.queryByText('Provisioning')).not.toBeInTheDocument();
   });
+
+  it('renders unavailable planned values as n/a without hiding realized capacity', () => {
+    const serviceData = applyCurrentCapacityPlanHistory(
+      {
+        targetReplicas: 9,
+        acceleratorCapacity: [
+          {
+            card: 'L4',
+            ready: 1,
+            provisioning: 2,
+            total: 3,
+            demandTarget: 9,
+          },
+        ],
+      },
+      { available: false, reason: 'provider_timeout' }
+    );
+    render(<AcceleratorCapacityCard serviceData={serviceData} />);
+
+    expect(
+      screen.getByText(/Current committed plan unavailable/)
+    ).toBeVisible();
+    const row = screen.getByText('L4').closest('tr');
+    expect(within(row).getAllByText('n/a')).toHaveLength(7);
+    expect(within(row).getByText('1')).toBeVisible();
+    expect(within(row).getByText('2')).toBeVisible();
+    expect(within(row).getByText('3')).toBeVisible();
+  });
+});
+
+describe('current committed capacity-plan history', () => {
+  const service = {
+    name: 'svc',
+    serviceHash: 'hash-a',
+    version: 1,
+    targetReplicas: 99,
+    acceleratorCapacity: [{ card: 'L4', ready: 0, total: 0 }],
+  };
+
+  it('uses a fresh exact plan and preserves an authoritative zero target', () => {
+    const history = committedPlanHistory({ demandTarget: 0 });
+    expect(currentCapacityPlanLocalDeadline(history)).toBe(110);
+
+    expect(
+      applyCurrentCapacityPlanHistory(service, history, 100)
+    ).toMatchObject({
+      targetReplicas: 0,
+      fillTarget: 0,
+      freeReservedSlots: 0,
+      capacityPlanSummary: { status: 'AVAILABLE' },
+      acceleratorCapacity: [
+        {
+          card: 'L4',
+          demandTarget: 0,
+          warmRetentionTarget: 0,
+          coldLaunchAuthority: 0,
+        },
+      ],
+    });
+  });
+
+  it('retains a failed refresh only until the DB-relative lease expires', () => {
+    const history = {
+      ...committedPlanHistory(),
+      refreshUnavailable: true,
+    };
+    expect(
+      applyCurrentCapacityPlanHistory(service, history, 109).capacityPlanSummary
+    ).toMatchObject({ status: 'AVAILABLE', refreshUnavailable: true });
+    expect(
+      applyCurrentCapacityPlanHistory(service, history, 110).capacityPlanSummary
+        .status
+    ).toBe('STALE');
+  });
+
+  it.each([
+    [
+      'unavailable',
+      { available: false, reason: 'history_unavailable' },
+      'UNAVAILABLE',
+      100,
+    ],
+    [
+      'malformed',
+      {
+        ...committedPlanHistory(),
+        autoscalerLatestSampleMalformed: true,
+      },
+      'MALFORMED',
+      100,
+    ],
+    ['stale', committedPlanHistory(), 'STALE', 111],
+  ])(
+    'fails %s plan state closed without fabricating zero',
+    (_name, history, status, now) => {
+      const result = applyCurrentCapacityPlanHistory(service, history, now);
+      expect(result.targetReplicas).toBeNull();
+      expect(result.capacityPlanSummary.status).toBe(status);
+      expect(result.acceleratorCapacity[0].demandTarget).toBeNull();
+      expect(result.acceleratorCapacity[0].coldLaunchAuthority).toBeNull();
+    }
+  );
 });
 
 function deferred() {
@@ -3221,6 +3378,8 @@ describe('ServiceDetails route ownership rendering', () => {
 
   it('shows persisted request activity while controller enrichment is stalled', async () => {
     const controllerPending = deferred();
+    const consoleError = jest.spyOn(console, 'error').mockImplementation();
+    const now = Date.now() / 1000;
     mockUseRouter.mockReturnValue({
       isReady: true,
       query: { service: 'svc' },
@@ -3239,9 +3398,9 @@ describe('ServiceDetails route ownership rendering', () => {
           policy: 'fixed',
           requestedResources: 'L4:1',
           replicaUnit: 'physical',
-          replicaStatusCounts: { READY: 2 },
-          replicasReady: 2,
-          replicasTotal: 2,
+          replicaStatusCounts: {},
+          replicasReady: null,
+          replicasTotal: null,
           replicasFailed: 0,
           currentOrUncertainCount: 2,
           pastAttemptCount: 0,
@@ -3277,55 +3436,82 @@ describe('ServiceDetails route ownership rendering', () => {
       rejectedRequests: 0,
       requestStatsAgeSeconds: 2,
     });
-    getServiceHistory.mockResolvedValue({
+    const fullHistory = {
+      ...committedPlanHistory({
+        demandTarget: 240,
+        observedAt: now - 1,
+        validUntil: now + 30,
+        windowEnd: now,
+        receivedAt: now,
+      }),
       available: true,
       serviceHash: 'hash-a',
       bucketSeconds: 60,
       windowStart: 0,
-      windowEnd: 3600,
+      windowEnd: now,
       samples: [],
       requestSamples: [],
       predictionTimeHistogramVersion: 1,
-      predictionTimeLatestHourReportedAt: 3598,
+      predictionTimeLatestHourReportedAt: now - 2,
       predictionTimeBucketUpperBoundsSeconds: [1],
       predictionTimeSamples: [
         {
-          timestamp: 3600,
+          timestamp: now,
           outcomeCounts: {
             succeeded: [2, 0],
             failed: [0, 1],
           },
         },
       ],
-      autoscalerSamples: [],
-    });
+    };
+    getServiceHistory.mockResolvedValue(fullHistory);
 
-    render(<ServiceDetailsPage />);
+    try {
+      render(<ServiceDetailsPage />);
 
-    expect(
-      await screen.findByText('2 confirmed async processing')
-    ).toBeVisible();
-    expect(screen.getByText('3 confirmed in flight')).toBeVisible();
-    expect(screen.getByText('1 queued / unassigned')).toBeVisible();
-    expect(getDetailValue('Endpoint')).toHaveTextContent('Loading...');
-    expect(
-      screen.getByText(
-        'complete reporter-set snapshot · unassigned, selecting, or retry-backoff work · 0.50 req/s recent · 30 requests in 60s · 0 rejected · activity report 2s old'
-      )
-    ).toBeVisible();
-    expect(
-      getDetailValue('Compatibility terminal observations (last hour)')
-    ).toHaveTextContent('3 recorded');
-    expect(
-      screen.getByText(
-        '2 succeeded · 1 failed · latest terminal-observation report was 2s old at this history snapshot · load-balancer observations, not unique logical requests'
-      )
-    ).toBeVisible();
-    expect(getServiceDemand).toHaveBeenCalledWith({
-      serviceName: 'svc',
-      serviceHash: 'hash-a',
-    });
-    expect(dashboardCache.get).toHaveBeenCalled();
+      expect(
+        await screen.findByText('2 confirmed async processing')
+      ).toBeVisible();
+      expect(screen.getByText('3 confirmed in flight')).toBeVisible();
+      expect(screen.getByText('1 queued / unassigned')).toBeVisible();
+      expect(await screen.findByText('(target: 240)')).toBeVisible();
+      expect(screen.getByText('Loading replica health...')).toBeVisible();
+      expect(screen.getByText('L4')).toBeVisible();
+      expect(getDetailValue('Endpoint')).toHaveTextContent('Loading...');
+      expect(
+        screen.getByText(
+          'complete reporter-set snapshot · unassigned, selecting, or retry-backoff work · 0.50 req/s recent · 30 requests in 60s · 0 rejected · activity report 2s old'
+        )
+      ).toBeVisible();
+      expect(
+        getDetailValue('Compatibility terminal observations (last hour)')
+      ).toHaveTextContent('3 recorded');
+      expect(
+        screen.getByText(
+          '2 succeeded · 1 failed · latest terminal-observation report was 2s old at this history snapshot · load-balancer observations, not unique logical requests'
+        )
+      ).toBeVisible();
+
+      await act(async () => {
+        controllerPending.reject(new Error('provider route/status timeout'));
+        await controllerPending.promise.catch(() => {});
+      });
+      await waitFor(() =>
+        expect(getDetailValue('Endpoint')).toHaveTextContent('Unavailable')
+      );
+      expect(screen.getByText('(target: 240)')).toBeVisible();
+      expect(screen.getByText('Replica health unavailable.')).toBeVisible();
+      expect(screen.getByText('2 confirmed async processing')).toBeVisible();
+      expect(screen.getByText('3 confirmed in flight')).toBeVisible();
+      expect(screen.getByText('1 queued / unassigned')).toBeVisible();
+      expect(getServiceDemand).toHaveBeenCalledWith({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+      });
+      expect(dashboardCache.get).toHaveBeenCalled();
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it('clears controller request counts when durable telemetry is unavailable', async () => {

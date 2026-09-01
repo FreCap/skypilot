@@ -758,6 +758,7 @@ export function useServiceHistory({
   metadataReady,
   enabled = true,
   onServiceHashMismatch,
+  refreshIntervalMs = 60 * 1000,
 }) {
   const hasMetadata = metadataReady ?? Boolean(serviceHash);
   const [replicaHistory, setReplicaHistory] = useState(null);
@@ -806,6 +807,7 @@ export function useServiceHistory({
 
       const requestVersion = requestVersionRef.current + 1;
       requestVersionRef.current = requestVersion;
+      const requestStartedAt = Date.now() / 1000;
       setHistoryLoading(true);
       const isCurrentRequest = () =>
         requestVersionRef.current === requestVersion &&
@@ -855,7 +857,11 @@ export function useServiceHistory({
             throw error;
           }
           if (!isCurrentRequest()) return;
-          const ownedHistory = { ...history, serviceHash };
+          const ownedHistory = {
+            ...history,
+            serviceHash,
+            receivedAt: requestStartedAt,
+          };
           visibleHistoryRef.current = ownedHistory;
           loadedHoursRef.current = requestedHours;
           setReplicaHistory(ownedHistory);
@@ -963,7 +969,7 @@ export function useServiceHistory({
 
   useVisibleRefreshInterval(
     Boolean(enabled && serviceName && hasMetadata),
-    60 * 1000,
+    refreshIntervalMs,
     refreshWhenVisible
   );
 
@@ -2142,7 +2148,19 @@ function ServiceDetails() {
         Object.prototype.hasOwnProperty.call(serviceData, 'serviceHash'),
       enabled: activeTab === 'overview',
       onServiceHashMismatch: refreshIdentity,
+      refreshIntervalMs: 10 * 1000,
     });
+  const [capacityPlanExpiryTick, setCapacityPlanExpiryTick] = useState(0);
+  useEffect(() => {
+    const deadline = currentCapacityPlanLocalDeadline(replicaHistory);
+    if (deadline == null) return undefined;
+    const delayMs = Math.max(0, deadline * 1000 - Date.now()) + 1;
+    const timer = setTimeout(
+      () => setCapacityPlanExpiryTick((value) => value + 1),
+      Math.min(delayMs, 2 ** 31 - 1)
+    );
+    return () => clearTimeout(timer);
+  }, [replicaHistory]);
 
   useEffect(() => {
     if (activeServiceNameRef.current !== serviceName) {
@@ -2263,7 +2281,7 @@ function ServiceDetails() {
           recentRejectedRequests: directDemand.recentRejectedRequests ?? null,
         }
       : {};
-    const enriched = {
+    let enriched = {
       ...serviceData,
       ...(liveSummary || {}),
       // PostgreSQL owns lifecycle and replica counts. Same-incarnation
@@ -2288,6 +2306,7 @@ function ServiceDetails() {
         !legacy && pricingData.aggregateUnavailableReason,
       serviceYamlUnavailable: !legacy && Boolean(anchoredHash),
     };
+    enriched = applyCurrentCapacityPlanHistory(enriched, replicaHistory);
     if (persistedPricing.estimatedHourlyCost != null) {
       enriched.costPerThousandRequests =
         enriched.requestRate > 0
@@ -2306,10 +2325,12 @@ function ServiceDetails() {
     }
     return enriched;
   }, [
+    capacityPlanExpiryTick,
     demand.demandData,
     ownsRouteState,
     pricingData,
     replicaData,
+    replicaHistory,
     serviceData,
     serviceName,
     legacyFallback,
@@ -2537,9 +2558,165 @@ function ServiceDetails() {
   );
 }
 
+function latestAutoscalerSample(history) {
+  const samples = history?.autoscalerSamples;
+  return Array.isArray(samples) && samples.length
+    ? samples[samples.length - 1]
+    : null;
+}
+
+export function currentCapacityPlanLocalDeadline(history) {
+  const sample = latestAutoscalerSample(history);
+  const validUntil = sample?.acceleratorBreakdown?.capacityPlan?.validUntil;
+  if (
+    !Number.isFinite(validUntil) ||
+    !Number.isFinite(history?.windowEnd) ||
+    !Number.isFinite(history?.receivedAt)
+  ) {
+    return null;
+  }
+  return history.receivedAt + (validUntil - history.windowEnd);
+}
+
+function withoutCurrentCapacityPlan(serviceData, status, reason) {
+  const rows = Array.isArray(serviceData.acceleratorCapacity)
+    ? serviceData.acceleratorCapacity
+    : [];
+  const unavailableFields = [
+    'demandTarget',
+    'warmRetentionTarget',
+    'coldLaunchAuthority',
+    'hardFloor',
+    'zeroCostReady',
+    'fillTarget',
+    'freeReserved',
+  ];
+  return {
+    ...serviceData,
+    targetReplicas: null,
+    fillTarget: null,
+    freeReservedSlots: null,
+    capacityPlanSummary: {
+      status,
+      reason,
+      source: 'postgresql_autoscaler_history',
+    },
+    acceleratorCapacity: rows.map((row) => ({
+      ...row,
+      ...Object.fromEntries(unavailableFields.map((field) => [field, null])),
+    })),
+  };
+}
+
+function sumCounts(counts) {
+  return Object.values(counts).reduce((total, count) => total + count, 0);
+}
+
+export function applyCurrentCapacityPlanHistory(
+  serviceData,
+  history,
+  nowSeconds = Date.now() / 1000
+) {
+  if (!history) return serviceData;
+  if (history.legacyFallback === true) return serviceData;
+  const fail = (status, reason) =>
+    withoutCurrentCapacityPlan(serviceData, status, reason);
+  if (history.available !== true)
+    return fail(
+      'UNAVAILABLE',
+      history.reason || 'capacity_plan_history_unavailable'
+    );
+  if (history.autoscalerProjectionModeMalformed)
+    return fail('MALFORMED', 'capacity_plan_source_malformed');
+  if (history.autoscalerProjectionMode == null) {
+    // A server from before the projection-mode field retains its controller
+    // display contract. Current servers always classify this boundary.
+    return serviceData;
+  }
+  if (history.autoscalerProjectionMode === 'LEGACY_CONTROLLER')
+    return { ...serviceData, capacityPlanSummary: null };
+  if (history.autoscalerProjectionMode !== 'DURABLE_FEED')
+    return fail('MALFORMED', 'capacity_plan_source_malformed');
+  if (history.autoscalerLatestSampleMalformed)
+    return fail('MALFORMED', 'capacity_plan_history_malformed');
+  const sample = latestAutoscalerSample(history);
+  if (!sample) return fail('UNAVAILABLE', 'capacity_plan_not_projected');
+  const breakdown = sample.acceleratorBreakdown;
+  const plan = breakdown?.capacityPlan;
+  if (!breakdown)
+    return fail('MALFORMED', 'capacity_plan_projection_malformed');
+  if (!plan) return fail('UNAVAILABLE', 'capacity_plan_not_projected');
+  const cards = breakdown.configuredAccelerators;
+  const expectedVersion =
+    serviceData.electedVersion ?? serviceData.version ?? null;
+  const aggregateMaps = [
+    [breakdown.demandTarget, sample.demandTarget],
+    [breakdown.readyCapacity, sample.readyCapacity],
+    [breakdown.provisioningCapacity, sample.provisioningCapacity],
+    [breakdown.totalCapacity, sample.totalCapacity],
+  ];
+  if (
+    breakdown.capacitySemanticsVersion !== 2 ||
+    !breakdown.warmRetentionTarget ||
+    !breakdown.coldLaunchAuthority ||
+    aggregateMaps.some(([counts, total]) => sumCounts(counts) !== total) ||
+    sample.capacityTarget !==
+      Math.max(sample.demandTarget, sumCounts(breakdown.fillTarget)) ||
+    cards.some(
+      (card) =>
+        breakdown.totalCapacity[card] !==
+        breakdown.readyCapacity[card] + breakdown.provisioningCapacity[card]
+    ) ||
+    !Number.isFinite(history.windowEnd) ||
+    sample.observedAt > history.windowEnd ||
+    plan.validUntil <= sample.observedAt
+  ) {
+    return fail('MALFORMED', 'capacity_plan_projection_malformed');
+  }
+  if (Number.isInteger(expectedVersion) && sample.version !== expectedVersion)
+    return fail('STALE', 'capacity_plan_service_version_changed');
+  const localDeadline = currentCapacityPlanLocalDeadline(history);
+  if (
+    plan.validUntil <= history.windowEnd ||
+    localDeadline === null ||
+    localDeadline <= nowSeconds
+  ) {
+    return fail('STALE', 'capacity_plan_expired');
+  }
+  return {
+    ...serviceData,
+    targetReplicas: sample.demandTarget,
+    fillTarget: sumCounts(breakdown.fillTarget),
+    freeReservedSlots: sumCounts(breakdown.freeReservedSlots),
+    capacityPlanSummary: {
+      status: 'AVAILABLE',
+      reason: 'complete',
+      source: 'postgresql_autoscaler_history',
+      capacityPlanGeneration: plan.generation,
+      capacityPlanSha256: plan.sha256,
+      observedAt: sample.observedAt,
+      validUntil: plan.validUntil,
+      refreshUnavailable: history.refreshUnavailable === true,
+    },
+    acceleratorCapacity: cards.map((card) => ({
+      card,
+      ready: breakdown.readyCapacity[card],
+      provisioning: breakdown.provisioningCapacity[card],
+      total: breakdown.totalCapacity[card],
+      demandTarget: breakdown.demandTarget[card],
+      warmRetentionTarget: breakdown.warmRetentionTarget[card],
+      coldLaunchAuthority: breakdown.coldLaunchAuthority[card],
+      hardFloor: breakdown.minReplicas[card],
+      zeroCostReady: breakdown.zeroCostReadyCapacity[card],
+      fillTarget: breakdown.fillTarget[card],
+      freeReserved: breakdown.freeReservedSlots[card],
+    })),
+  };
+}
+
 export function AcceleratorCapacityCard({ serviceData }) {
   const rows = serviceData.acceleratorCapacity || [];
-  if (!rows.length) return null;
+  if (!rows.length && !serviceData.capacityPlanSummary) return null;
   return (
     <Card className="mb-6 overflow-hidden">
       <div className="flex items-start justify-between border-b px-4 py-3">
@@ -2554,6 +2731,24 @@ export function AcceleratorCapacityCard({ serviceData }) {
             it includes queued, provider-launching, initializing, and not-ready
             work.
           </p>
+          {serviceData.capacityPlanSummary?.status === 'AVAILABLE' ? (
+            <p className="mt-1 text-xs text-gray-500">
+              PostgreSQL committed plan generation{' '}
+              {serviceData.capacityPlanSummary.capacityPlanGeneration}; valid
+              until{' '}
+              {formatFullTimestamp(
+                new Date(serviceData.capacityPlanSummary.validUntil * 1000)
+              )}
+              .
+            </p>
+          ) : serviceData.capacityPlanSummary ? (
+            <p className="mt-1 text-xs text-amber-700">
+              Current committed plan{' '}
+              {serviceData.capacityPlanSummary.status.toLowerCase()}:{' '}
+              {serviceData.capacityPlanSummary.reason}. Planned values are
+              unavailable, not zero.
+            </p>
+          ) : null}
         </div>
         {(serviceData.fillTarget != null ||
           serviceData.freeReservedSlots != null) && (
@@ -2589,23 +2784,31 @@ export function AcceleratorCapacityCard({ serviceData }) {
           {rows.map((row) => (
             <TableRow key={row.card}>
               <TableCell className="font-medium">{row.card}</TableCell>
-              <TableCell className="text-right">{row.ready}</TableCell>
-              <TableCell className="text-right">{row.provisioning}</TableCell>
-              <TableCell className="text-right">{row.total}</TableCell>
-              <TableCell className="text-right">{row.demandTarget}</TableCell>
+              <TableCell className="text-right">{row.ready ?? 'n/a'}</TableCell>
+              <TableCell className="text-right">
+                {row.provisioning ?? 'n/a'}
+              </TableCell>
+              <TableCell className="text-right">{row.total ?? 'n/a'}</TableCell>
+              <TableCell className="text-right">
+                {row.demandTarget ?? 'n/a'}
+              </TableCell>
               <TableCell className="text-right">
                 {row.warmRetentionTarget ?? 'n/a'}
               </TableCell>
               <TableCell className="text-right">
                 {row.coldLaunchAuthority ?? 'n/a'}
               </TableCell>
-              <TableCell className="text-right">{row.hardFloor}</TableCell>
-              <TableCell className="text-right">{row.zeroCostReady}</TableCell>
               <TableCell className="text-right">
-                {row.fillTarget ?? '—'}
+                {row.hardFloor ?? 'n/a'}
               </TableCell>
               <TableCell className="text-right">
-                {row.freeReserved ?? '—'}
+                {row.zeroCostReady ?? 'n/a'}
+              </TableCell>
+              <TableCell className="text-right">
+                {row.fillTarget ?? 'n/a'}
+              </TableCell>
+              <TableCell className="text-right">
+                {row.freeReserved ?? 'n/a'}
               </TableCell>
             </TableRow>
           ))}
@@ -3143,13 +3346,13 @@ export function ServiceDetailCard({
                 ) : (
                   <>
                     {serviceData.replicasReady}/{serviceData.replicasTotal}
-                    {serviceData.targetReplicas != null && (
-                      <span className="text-gray-500">
-                        {' '}
-                        (target: {serviceData.targetReplicas})
-                      </span>
-                    )}
                   </>
+                )}
+                {serviceData.targetReplicas != null && (
+                  <span className="text-gray-500">
+                    {' '}
+                    (target: {serviceData.targetReplicas})
+                  </span>
                 )}
               </div>
               {pastAttemptCount > 0 && (

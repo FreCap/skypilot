@@ -12,6 +12,31 @@ from sky.serve import serve_history
 from sky.serve import serve_state
 
 
+def _service_result(service_hash='hash-a',
+                    *,
+                    source_mode='LEGACY_CONTROLLER',
+                    database_now=None,
+                    **overrides):
+    result = mock.MagicMock()
+    row = None
+    if service_hash is not None:
+        row = {
+            'hash': service_hash,
+            'demand_source_mode': source_mode,
+            'current_version': 1,
+            'capacity_plan_generation': None,
+            'capacity_plan_valid_until': None,
+            'capacity_plan_sha256': None,
+            'capacity_plan_service_hash': None,
+            'capacity_plan_service_version': None,
+            'database_now': database_now or datetime.datetime.fromtimestamp(
+                120, datetime.timezone.utc),
+        }
+        row.update(overrides)
+    result.mappings.return_value.one_or_none.return_value = row
+    return result
+
+
 def test_status_bucket_mapping_is_exhaustive():
     expected = {
         serve_state.ReplicaStatus.PENDING: 'provisioning_count',
@@ -124,8 +149,7 @@ def test_history_sections_are_validated_before_database_access(sections):
 def test_selected_history_sections_skip_unrequested_queries(monkeypatch):
     engine = mock.MagicMock()
     monkeypatch.setattr(serve_history, '_postgres_engine', lambda: engine)
-    service_result = mock.MagicMock()
-    service_result.scalar_one_or_none.return_value = 'hash-a'
+    service_result = _service_result()
     request_result = mock.MagicMock()
     request_result.all.return_value = []
     session = mock.MagicMock()
@@ -155,6 +179,123 @@ def test_selected_history_sections_skip_unrequested_queries(monkeypatch):
     assert history['async_request_summary']['coverage'] == 'none'
 
 
+def test_history_window_uses_postgresql_clock(monkeypatch):
+    engine = mock.MagicMock()
+    monkeypatch.setattr(serve_history, '_postgres_engine', lambda: engine)
+    database_now = datetime.datetime(2026,
+                                     9,
+                                     1,
+                                     12,
+                                     34,
+                                     56,
+                                     tzinfo=datetime.timezone.utc)
+    autoscaler_result = mock.MagicMock()
+    autoscaler_result.mappings.return_value.all.return_value = []
+    session = mock.MagicMock()
+    session.__enter__.return_value = session
+    session.execute.side_effect = [
+        _service_result(database_now=database_now), autoscaler_result
+    ]
+    monkeypatch.setattr(serve_history.orm, 'Session', lambda unused: session)
+
+    history = serve_history.get_status_history('svc', sections={'autoscaler'})
+
+    assert history['window_end'] == database_now.timestamp()
+    assert history['autoscaler_projection_mode'] == 'LEGACY_CONTROLLER'
+
+
+@pytest.mark.parametrize(
+    ('service_overrides', 'keeps_provenance'),
+    [
+        ({}, True),
+        ({
+            'capacity_plan_generation': 8
+        }, False),
+        ({
+            'capacity_plan_sha256': 'f' * 64
+        }, False),
+        ({
+            'capacity_plan_valid_until': datetime.datetime.fromtimestamp(
+                201, datetime.timezone.utc)
+        }, False),
+        ({
+            'capacity_plan_service_hash': 'other-hash'
+        }, False),
+        ({
+            'capacity_plan_service_version': 2
+        }, False),
+    ],
+)
+def test_history_plan_provenance_matches_current_head(monkeypatch,
+                                                      service_overrides,
+                                                      keeps_provenance):
+    engine = mock.MagicMock()
+    monkeypatch.setattr(serve_history, '_postgres_engine', lambda: engine)
+    observed_at = datetime.datetime.fromtimestamp(100, datetime.timezone.utc)
+    snapshot = serve_history.AutoscalerHistorySnapshot(
+        service_name='svc',
+        service_hash='hash-a',
+        controller_session_id='a' * 32,
+        version=1,
+        replica_unit='physical_backend',
+        demand_target=3,
+        capacity_target=3,
+        ready_capacity=0,
+        provisioning_capacity=0,
+        total_capacity=0,
+        observed_at=observed_at,
+        accelerator_breakdown={
+            'configured_accelerators': ['L4'],
+            'demand_target': {
+                'L4': 3
+            },
+            'capacity_plan_generation': 7,
+            'capacity_plan_sha256': 'a' * 64,
+            'capacity_plan_valid_until': 200,
+        })
+    autoscaler_result = mock.MagicMock()
+    autoscaler_result.mappings.return_value.all.return_value = [{
+        'bucket_start': observed_at.replace(second=0),
+        'observed_at': observed_at,
+        'controller_session_id': 'a' * 32,
+        'version': 1,
+        'replica_unit': 'physical_backend',
+        'demand_target': 3,
+        'capacity_target': 3,
+        'ready_capacity': 0,
+        'provisioning_capacity': 0,
+        'total_capacity': 0,
+        'peak_in_flight': None,
+        'peak_queue_depth': None,
+        'accelerator_breakdown': snapshot.accelerator_breakdown,
+        'accelerator_breakdown_observed_at': observed_at,
+    }]
+    service_fields = {
+        'capacity_plan_generation': 7,
+        'capacity_plan_sha256': 'a' * 64,
+        'capacity_plan_valid_until': datetime.datetime.fromtimestamp(
+            200, datetime.timezone.utc),
+        'capacity_plan_service_hash': 'hash-a',
+        'capacity_plan_service_version': 1,
+        **service_overrides,
+    }
+    service_result = _service_result(source_mode='DURABLE_FEED',
+                                     **service_fields)
+    session = mock.MagicMock()
+    session.__enter__.return_value = session
+    session.execute.side_effect = [service_result, autoscaler_result]
+    monkeypatch.setattr(serve_history.orm, 'Session', lambda unused: session)
+
+    history = serve_history.get_status_history('svc',
+                                               timestamp=120,
+                                               sections={'autoscaler'})
+    breakdown = history['autoscaler_samples'][0]['accelerator_breakdown']
+
+    assert ('capacity_plan_generation' in breakdown) is keeps_provenance
+    assert ('capacity_plan_sha256' in breakdown) is keeps_provenance
+    assert ('capacity_plan_valid_until' in breakdown) is keeps_provenance
+
+
 def test_history_never_reads_ledger_before_schema(monkeypatch):
     engine = mock.MagicMock()
     monkeypatch.setattr(serve_history, '_postgres_engine', lambda: engine)
@@ -163,8 +304,7 @@ def test_history_never_reads_ledger_before_schema(monkeypatch):
     repository = mock.Mock()
     monkeypatch.setattr(serve_history.async_request_ledger,
                         'AsyncRequestLedgerRepository', repository)
-    service_result = mock.MagicMock()
-    service_result.scalar_one_or_none.return_value = 'hash-a'
+    service_result = _service_result()
     request_result = mock.MagicMock()
     request_result.all.return_value = []
     session = mock.MagicMock()
@@ -183,8 +323,7 @@ def test_history_never_reads_ledger_before_schema(monkeypatch):
 def test_default_history_sections_keep_all_queries_and_fields(monkeypatch):
     engine = mock.MagicMock()
     monkeypatch.setattr(serve_history, '_postgres_engine', lambda: engine)
-    service_result = mock.MagicMock()
-    service_result.scalar_one_or_none.return_value = 'hash-a'
+    service_result = _service_result()
 
     def empty_mapped_result():
         result = mock.MagicMock()
@@ -219,8 +358,7 @@ def test_prediction_latest_hour_report_excludes_older_selected_rows(
         monkeypatch):
     engine = mock.MagicMock()
     monkeypatch.setattr(serve_history, '_postgres_engine', lambda: engine)
-    service_result = mock.MagicMock()
-    service_result.scalar_one_or_none.return_value = 'hash-a'
+    service_result = _service_result()
     observed_at = datetime.datetime.fromtimestamp(7200, datetime.timezone.utc)
     zero_counts = [0] * constants.LB_PREDICTION_TIME_BUCKET_COUNT
     one_count = list(zero_counts)
@@ -260,7 +398,7 @@ def test_expected_service_hash_mismatch_is_distinct(monkeypatch):
     monkeypatch.setattr(serve_history, '_postgres_engine', lambda: engine)
     session = mock.MagicMock()
     session.__enter__.return_value = session
-    session.execute.return_value.scalar_one_or_none.return_value = 'hash-new'
+    session.execute.return_value = _service_result('hash-new')
     monkeypatch.setattr(serve_history.orm, 'Session', lambda unused: session)
 
     history = serve_history.get_status_history('svc',
@@ -277,7 +415,7 @@ def test_missing_central_service_is_unavailable(monkeypatch):
     monkeypatch.setattr(serve_history, '_postgres_engine', lambda: mock_engine)
     session = mock.MagicMock()
     session.__enter__.return_value = session
-    session.execute.return_value.scalar_one_or_none.return_value = None
+    session.execute.return_value = _service_result(None)
     monkeypatch.setattr(serve_history.orm, 'Session',
                         lambda unused_engine: session)
 
@@ -293,6 +431,7 @@ def test_missing_central_service_is_unavailable(monkeypatch):
         'prediction_time_samples': [],
         'prediction_time_latest_hour_reported_at': None,
         'autoscaler_samples': [],
+        'autoscaler_projection_mode': None,
         'prediction_time_histogram_version': 1,
         'prediction_time_bucket_upper_bounds_seconds': list(
             constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),

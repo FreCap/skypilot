@@ -309,6 +309,7 @@ def _record_autoscaler_history(
         peak_queue_depth=peak_queue_depth,
         accelerator_breakdown=accelerator_breakdown,
         timestamp=timestamp,
+        required_source_mode='LEGACY_CONTROLLER',
     )
 
 

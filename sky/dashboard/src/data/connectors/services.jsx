@@ -130,6 +130,12 @@ const OPTIONAL_ACCELERATOR_HISTORY_FIELDS = [
   ['cold_launch_authority', 'coldLaunchAuthority'],
 ];
 
+const CAPACITY_PLAN_HISTORY_FIELDS = [
+  'capacity_plan_generation',
+  'capacity_plan_sha256',
+  'capacity_plan_valid_until',
+];
+
 const PREDICTION_TIME_OUTCOMES = ['succeeded', 'failed'];
 
 export function normalizeAcceleratorBreakdown(value) {
@@ -152,7 +158,7 @@ export function normalizeAcceleratorBreakdown(value) {
     value.capacity_semantics_version !== undefined &&
     value.capacity_semantics_version !== null
   ) {
-    const capacitySemanticsVersion = Number(value.capacity_semantics_version);
+    const capacitySemanticsVersion = value.capacity_semantics_version;
     if (
       !Number.isInteger(capacitySemanticsVersion) ||
       capacitySemanticsVersion < 1
@@ -164,9 +170,15 @@ export function normalizeAcceleratorBreakdown(value) {
   for (const [source, target] of ACCELERATOR_HISTORY_FIELDS) {
     const raw = value[source];
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    if (
+      Object.keys(raw).length !== cards.length ||
+      cards.some((card) => !Object.hasOwn(raw, card))
+    ) {
+      return null;
+    }
     const counts = {};
     for (const card of cards) {
-      const count = Number(raw[card]);
+      const count = raw[card];
       if (!Number.isInteger(count) || count < 0) return null;
       counts[card] = count;
     }
@@ -178,13 +190,45 @@ export function normalizeAcceleratorBreakdown(value) {
       continue;
     }
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    if (
+      Object.keys(raw).length !== cards.length ||
+      cards.some((card) => !Object.hasOwn(raw, card))
+    ) {
+      return null;
+    }
     const counts = {};
     for (const card of cards) {
-      const count = Number(raw[card]);
+      const count = raw[card];
       if (!Number.isInteger(count) || count < 0) return null;
       counts[card] = count;
     }
     normalized[target] = counts;
+  }
+  const presentPlanFields = CAPACITY_PLAN_HISTORY_FIELDS.filter(
+    (field) => value[field] !== undefined
+  );
+  if (presentPlanFields.length > 0) {
+    if (presentPlanFields.length !== CAPACITY_PLAN_HISTORY_FIELDS.length) {
+      return null;
+    }
+    const generation = value.capacity_plan_generation;
+    const validUntil = value.capacity_plan_valid_until;
+    const sha256 = value.capacity_plan_sha256;
+    if (
+      !Number.isInteger(generation) ||
+      generation < 1 ||
+      !Number.isFinite(validUntil) ||
+      validUntil <= 0 ||
+      typeof sha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(sha256)
+    ) {
+      return null;
+    }
+    normalized.capacityPlan = {
+      generation,
+      sha256,
+      validUntil,
+    };
   }
   return normalized;
 }
@@ -326,69 +370,67 @@ export function normalizeReplicaHistory(history) {
           })
           .filter(Boolean)
       : [];
-  const autoscalerSamples = Array.isArray(history.autoscaler_samples)
-    ? history.autoscaler_samples
-        .map((sample) => {
-          const timestamp = Number(sample.timestamp);
-          const observedAt = Number(sample.observed_at);
-          const version = Number(sample.version);
-          const requiredCounts = [
-            sample.demand_target,
-            sample.capacity_target,
-            sample.ready_capacity,
-            sample.provisioning_capacity,
-            sample.total_capacity,
-          ].map(Number);
-          if (
-            !Number.isFinite(timestamp) ||
-            !Number.isFinite(observedAt) ||
-            !Number.isInteger(version) ||
-            version < 1 ||
-            !['physical_backend', 'logical_slot'].includes(
-              sample.replica_unit
-            ) ||
-            requiredCounts.some(
-              (value) => !Number.isInteger(value) || value < 0
-            )
-          ) {
-            return null;
-          }
-          const [
-            demandTarget,
-            capacityTarget,
-            readyCapacity,
-            provisioningCapacity,
-            totalCapacity,
-          ] = requiredCounts;
-          if (capacityTarget < demandTarget) return null;
-          const optionalCount = (value) => {
-            if (value === null || value === undefined) return null;
-            const count = Number(value);
-            return Number.isInteger(count) && count >= 0 ? count : null;
-          };
-          return {
-            timestamp,
-            observedAt,
-            controllerSessionId:
-              typeof sample.controller_session_id === 'string'
-                ? sample.controller_session_id
-                : null,
-            version,
-            replicaUnit: sample.replica_unit,
-            demandTarget,
-            capacityTarget,
-            readyCapacity,
-            provisioningCapacity,
-            totalCapacity,
-            peakInFlight: optionalCount(sample.peak_in_flight),
-            peakQueueDepth: optionalCount(sample.peak_queue_depth),
-            acceleratorBreakdown: normalizeAcceleratorBreakdown(
-              sample.accelerator_breakdown
-            ),
-          };
-        })
-        .filter(Boolean)
+  const normalizedAutoscalerSamples = Array.isArray(history.autoscaler_samples)
+    ? history.autoscaler_samples.map((sample) => {
+        const timestamp = sample.timestamp;
+        const observedAt = sample.observed_at;
+        const version = sample.version;
+        const requiredCounts = [
+          sample.demand_target,
+          sample.capacity_target,
+          sample.ready_capacity,
+          sample.provisioning_capacity,
+          sample.total_capacity,
+        ];
+        if (
+          !Number.isFinite(timestamp) ||
+          !Number.isFinite(observedAt) ||
+          !Number.isInteger(version) ||
+          version < 1 ||
+          !['physical_backend', 'logical_slot'].includes(sample.replica_unit) ||
+          requiredCounts.some((value) => !Number.isInteger(value) || value < 0)
+        ) {
+          return null;
+        }
+        const [
+          demandTarget,
+          capacityTarget,
+          readyCapacity,
+          provisioningCapacity,
+          totalCapacity,
+        ] = requiredCounts;
+        if (capacityTarget < demandTarget) return null;
+        const optionalCount = (value) => {
+          if (value === null || value === undefined) return null;
+          return Number.isInteger(value) && value >= 0 ? value : null;
+        };
+        return {
+          timestamp,
+          observedAt,
+          controllerSessionId:
+            typeof sample.controller_session_id === 'string'
+              ? sample.controller_session_id
+              : null,
+          version,
+          replicaUnit: sample.replica_unit,
+          demandTarget,
+          capacityTarget,
+          readyCapacity,
+          provisioningCapacity,
+          totalCapacity,
+          peakInFlight: optionalCount(sample.peak_in_flight),
+          peakQueueDepth: optionalCount(sample.peak_queue_depth),
+          acceleratorBreakdown: normalizeAcceleratorBreakdown(
+            sample.accelerator_breakdown
+          ),
+        };
+      })
     : [];
+  const autoscalerLatestSampleMalformed =
+    normalizedAutoscalerSamples.length > 0 &&
+    normalizedAutoscalerSamples[normalizedAutoscalerSamples.length - 1] ===
+      null;
+  const autoscalerSamples = normalizedAutoscalerSamples.filter(Boolean);
   const requestsLastHour = Number(history.requests_last_hour);
   const asyncRequestSummary = normalizeAsyncRequestSummary(
     history.async_request_summary
@@ -399,8 +441,22 @@ export function normalizeReplicaHistory(history) {
     serviceHash: history.service_hash || null,
     bucketSeconds: Number(history.bucket_seconds) || 60,
     retentionHours: Number(history.retention_hours) || 72,
-    windowStart: Number(history.window_start) || null,
-    windowEnd: Number(history.window_end) || null,
+    windowStart: Number.isFinite(history.window_start)
+      ? history.window_start
+      : null,
+    windowEnd: Number.isFinite(history.window_end) ? history.window_end : null,
+    autoscalerProjectionMode: [
+      'LEGACY_CONTROLLER',
+      'DURABLE_FEED',
+      'MALFORMED',
+    ].includes(history.autoscaler_projection_mode)
+      ? history.autoscaler_projection_mode
+      : null,
+    autoscalerProjectionModeMalformed:
+      Object.hasOwn(history, 'autoscaler_projection_mode') &&
+      !['LEGACY_CONTROLLER', 'DURABLE_FEED', 'MALFORMED'].includes(
+        history.autoscaler_projection_mode
+      ),
     samples,
     requestSamples,
     predictionTimeHistogramVersion: predictionTimeHistogramSupported
@@ -412,6 +468,7 @@ export function normalizeReplicaHistory(history) {
     predictionTimeSamples,
     predictionTimeLatestHourReportedAt,
     autoscalerSamples,
+    autoscalerLatestSampleMalformed,
     rejectionHistoryAvailable: history.rejection_history_available === true,
     requestWindowSeconds:
       Number(history.request_window_seconds) > 0

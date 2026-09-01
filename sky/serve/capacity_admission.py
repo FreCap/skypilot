@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from collections.abc import Mapping
 from collections.abc import Sequence
+import contextlib
 import dataclasses
 import datetime
 import enum
@@ -25,6 +26,7 @@ import uuid
 import sqlalchemy
 from sqlalchemy.dialects import postgresql
 
+from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.events import api_models as event_api_models
 from sky.serve import autoscaler_compatibility
@@ -48,9 +50,12 @@ from sky.serve import zero_cost_actuation_schema
 from sky.utils.db import db_utils
 
 if TYPE_CHECKING:
+    from sky.serve import serve_history
     from sky.serve.reserved_fill_planner import AuthenticatedAllocationMap
     from sky.serve.reserved_fill_planner import FillCapacityUnit
     from sky.serve.reserved_fill_planner import ReservedFillAllocationIdentity
+else:
+    serve_history = adaptors_common.LazyImport('sky.serve.serve_history')
 
 reserved_fill_allocation = adaptors_common.LazyImport(
     'sky.serve.reserved_fill_allocation')
@@ -66,6 +71,8 @@ ordinary_launch_binding = adaptors_common.LazyImport(
     'sky.serve.ordinary_launch_binding')
 request_postgres_schema = adaptors_common.LazyImport(
     'sky.server.requests.postgres_schema')
+
+logger = sky_logging.init_logger(__name__)
 
 PROTOCOL_VERSION = 1
 CAPABILITY_COHORT_EPOCH = 1
@@ -1253,6 +1260,136 @@ class CommittedCapacityPlan:
                 self.allocation_map,
                 reserved_fill_planner.AuthenticatedAllocationMap):
             raise ValueError('Committed capacity plan allocation is malformed.')
+
+
+def autoscaler_history_snapshot_from_committed_plan(
+    committed: CommittedCapacityPlan,
+    *,
+    observed_at: datetime.datetime,
+    valid_until: datetime.datetime,
+) -> serve_history.AutoscalerHistorySnapshot:
+    """Build the one typed history projection of a finalized plan."""
+    if (not isinstance(committed, CommittedCapacityPlan) or
+            not isinstance(observed_at, datetime.datetime) or
+            observed_at.tzinfo is None or
+            not isinstance(valid_until, datetime.datetime) or
+            valid_until.tzinfo is None or valid_until <= observed_at):
+        raise ValueError('Committed capacity-plan projection is malformed.')
+    authority = committed.authority
+    planner_snapshot = committed.planner_snapshot
+    candidate = committed.candidate
+    configured = list(planner_snapshot.configured_accelerators)
+
+    def complete(
+        capacity: capacity_planning.AcceleratorCapacity,) -> dict[str, int]:
+        return {card: capacity.get(card) for card in configured}
+
+    ready = complete(planner_snapshot.ready)
+    provisioning = complete(planner_snapshot.provisioning)
+    total = {card: ready[card] + provisioning[card] for card in configured}
+    existing_zero_cost = complete(
+        planner_snapshot.reservation.existing_zero_cost_capacity)
+    pending_zero_cost = complete(
+        planner_snapshot.reservation.pending_zero_cost_capacity)
+    reserved_launch = complete(candidate.reserved_launch_target)
+    fill_target = {
+        card: (existing_zero_cost[card] + pending_zero_cost[card] +
+               reserved_launch[card]) for card in configured
+    }
+    replica_unit = {
+        capacity_planning.CapacityUnit.LOGICAL_GPU: 'logical_slot',
+        capacity_planning.CapacityUnit.PHYSICAL_BACKEND: 'physical_backend',
+    }.get(candidate.capacity_unit)
+    if replica_unit is None:
+        raise ValueError('Committed plan has no history capacity unit.')
+    demand_target = candidate.aggregate_demand_target
+    accelerator_breakdown = {
+        'capacity_semantics_version':
+            serve_history.ACCELERATOR_BREAKDOWN_CAPACITY_SEMANTICS_VERSION,
+        'configured_accelerators': configured,
+        'min_replicas': complete(planner_snapshot.floors),
+        'demand_target': complete(candidate.demand_attribution),
+        'warm_retention_target': complete(candidate.warm_retention_target),
+        'cold_launch_authority': complete(candidate.paid_launch_target),
+        'ready_capacity': ready,
+        'provisioning_capacity': provisioning,
+        'total_capacity': total,
+        'zero_cost_ready_capacity': complete(planner_snapshot.ready_zero_cost),
+        # Preserve the long-lived history meaning: desired zero-cost
+        # holdings, not the planner's total supply-aware actuation target.
+        'fill_target': fill_target,
+        'free_reserved_slots': complete(
+            planner_snapshot.reservation.eligible_capacity),
+        'capacity_plan_generation': authority.generation,
+        'capacity_plan_sha256': authority.content_sha256,
+        'capacity_plan_valid_until': valid_until.timestamp(),
+    }
+    normalized_demand = committed.demand_snapshot.normalized_demand
+    in_flight = normalized_demand.get('in_flight_by_replica_id')
+    queue_depth = normalized_demand.get('queue_depth')
+    if (not isinstance(in_flight, Mapping) or any(
+            not isinstance(count, int) or isinstance(count, bool) or count < 0
+            for count in in_flight.values()) or
+            not isinstance(queue_depth, int) or isinstance(queue_depth, bool) or
+            queue_depth < 0):
+        raise ValueError('Committed plan has malformed pressure demand.')
+    try:
+        controller_session_id = uuid.UUID(
+            committed.demand_snapshot.reconcile_authority.controller_incarnation
+        ).hex
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(
+            'Committed plan has malformed controller authority.') from error
+    return serve_history.AutoscalerHistorySnapshot(
+        service_name=committed.authority.service_name,
+        service_hash=committed.authority.service_hash,
+        controller_session_id=controller_session_id,
+        version=planner_snapshot.service_version,
+        replica_unit=replica_unit,
+        demand_target=demand_target,
+        capacity_target=max(demand_target, sum(fill_target.values())),
+        ready_capacity=sum(ready.values()),
+        provisioning_capacity=sum(provisioning.values()),
+        total_capacity=sum(total.values()),
+        peak_in_flight=sum(in_flight.values()),
+        peak_queue_depth=queue_depth,
+        accelerator_breakdown=accelerator_breakdown,
+        observed_at=observed_at)
+
+
+@contextlib.contextmanager
+def _capacity_admission_transaction(
+    engine: sqlalchemy.engine.Engine,
+    history_writer: Callable[[sqlalchemy.engine.Connection,
+                              serve_history.AutoscalerHistorySnapshot], int],
+):
+    """Commit authority, then project history on the same connection."""
+    history_snapshot = None
+
+    def project_history(
+            snapshot: serve_history.AutoscalerHistorySnapshot) -> None:
+        nonlocal history_snapshot
+        if history_snapshot is not None:
+            raise ValueError('Capacity-plan history was projected twice.')
+        history_snapshot = snapshot
+
+    with engine.connect() as connection:
+        with connection.begin():
+            yield connection, project_history
+        if history_snapshot is None:
+            return
+        try:
+            with connection.begin():
+                connection.execute(
+                    sqlalchemy.text("SET LOCAL lock_timeout = '250ms'"))
+                connection.execute(
+                    sqlalchemy.text("SET LOCAL statement_timeout = '1s'"))
+                history_writer(connection, history_snapshot)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Failed to project committed capacity plan %s '
+                'to autoscaler history: %s', history_snapshot.service_name,
+                error)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4032,9 +4169,9 @@ def _canonical_prepared_paid_launch_specs(
         occurrence = occurrences_by_rank.get(evidence.catalog_rank, 0)
         expected_round, expected_slot = divmod(occurrence, pool_window)
         tier_transition = balancing_tier != current_balancing_tier
-        invalid_tier_transition = (
-            tier_transition and current_balancing_tier is not None and
-            balancing_tier in closed_balancing_tiers)
+        invalid_tier_transition = (tier_transition and
+                                   current_balancing_tier is not None and
+                                   balancing_tier in closed_balancing_tiers)
         if ((evidence.exploration_round, evidence.slot_within_pool_window)
                 != (expected_round, expected_slot) or
             (previous_normalized_cost is not None and
@@ -5124,8 +5261,10 @@ class CapacityAdmissionRepository:
         request_rows_table = request_postgres_schema.REQUESTS
         request_queue_table = request_postgres_schema.QUEUE
         request_pins_table = request_postgres_schema.REQUEST_RETENTION_PINS
-
-        with self.engine.begin() as connection:
+        history_writer = (
+            serve_history.record_autoscaler_snapshot_in_connection)
+        with _capacity_admission_transaction(
+                self.engine, history_writer) as (connection, project_history):
             if sequenced_reserved_fill:
                 # Allocation writers use this protocol mutex before any
                 # service-local row.  Taking it even for a possible zero plan
@@ -5641,8 +5780,9 @@ class CapacityAdmissionRepository:
                 item.persistence_spec for item in paid_candidates
             ]
             positive_paid_target = tuple(
-                sorted((card.casefold(), count) for card, count in
-                       candidate.paid_launch_target.entries if count > 0))
+                sorted((card.casefold(), count)
+                       for card, count in candidate.paid_launch_target.entries
+                       if count > 0))
             plan_budget = serve_state._PaidCapacityAdmissionPlanBudget(  # pylint: disable=protected-access
                 target_units_by_group=positive_paid_target,
                 member_debits=tuple(
@@ -5666,9 +5806,8 @@ class CapacityAdmissionRepository:
             if paid_decision.existing_indices:
                 raise CapacityAdmissionConflict(
                     'Fresh prepared paid launch resolved to an existing claim.')
-            accepted = tuple(
-                paid_candidates[index]
-                for index in paid_decision.accepted_indices)
+            accepted = tuple(paid_candidates[index]
+                             for index in paid_decision.accepted_indices)
             accepted_plan_units: dict[str, int] = {}
             accepted_paid_gpu_units = 0
             for item in accepted:
@@ -5809,6 +5948,18 @@ class CapacityAdmissionRepository:
                 paid_launch_receipt=paid_launch_receipt)
             witness_semantic_sha256 = candidate.demand_witness_sha256
             assert witness_semantic_sha256 is not None
+            try:
+                history_snapshot = (
+                    autoscaler_history_snapshot_from_committed_plan(
+                        committed,
+                        observed_at=decision_now,
+                        valid_until=written.valid_until))
+                project_history(history_snapshot)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning(
+                    'Failed to prepare committed capacity plan '
+                    '%s/%s for autoscaler history: %s', service_name,
+                    committed.authority.generation, error)
         _notify_fill_demand_witness(service_name, witness_semantic_sha256)
         return committed
 
