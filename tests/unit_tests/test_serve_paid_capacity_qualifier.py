@@ -16,6 +16,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 import pytest
 from smoke_tests import smoke_tests_utils
@@ -851,6 +852,125 @@ def test_replica_binding_selection_accepts_retry_history():
     assert qualifier.select_replica_binding(
         pointed_replica,
         [terminal_retry, successful_retry, unresolved]) is unresolved
+
+
+def test_replica_binding_selection_accepts_settled_failed_provider_absence():
+    """A rejected Spot create retains exact evidence but has no service job."""
+    association_id = uuid.UUID('11111111-1111-4111-8111-111111111111')
+    replica_record_id = uuid.UUID('22222222-2222-4222-8222-222222222222')
+    profile = qualifier.ordinary_launch_binding.NonPoolLaunchProfile.create(
+        qualifier.ordinary_launch_binding.NonPoolLaunchProfileKind.
+        ORDINARY_PAID,
+        authorization_reference='paid-capacity:incarnation:record-1:pool',
+        authorization_generation=1,
+        authorization_payload={'capacity_plan_generation': 1})
+    pool_key = json.dumps(
+        {
+            'accelerators': [['l4', 1]],
+            'cloud': 'gcp',
+            'instance_type': 'g2-standard-4',
+            'num_nodes': 1,
+            'region': 'us-central1',
+            'use_spot': True,
+            'version': 1,
+            'workspace': 'workspace-a',
+            'zone': 'us-central1-a',
+        },
+        sort_keys=True,
+        separators=(',', ':'))
+    quiesced_at = datetime.datetime(2026,
+                                    9,
+                                    1,
+                                    1,
+                                    0,
+                                    tzinfo=datetime.timezone.utc)
+    binding = {
+        'association_id': association_id,
+        'request_id': 'request-1',
+        'service_name': 'paid-e2e',
+        'replica_id': 7,
+        'replica_record_id': replica_record_id,
+        'launch_generation': 1,
+        'input_digest': 'a' * 64,
+        'cluster_name': 'paid-e2e-7',
+        'tenant_scope': 'tenant-a',
+        'paid_capacity_pool_key': pool_key,
+        'effect_phase': 'PROVIDER_IO',
+        'resolution': 'PROJECTED',
+        'terminal_status': 'FAILED',
+        'terminal_cause': 'handler_failed',
+        'terminal_execution_generation': 1,
+        'execution_quiescence_required': True,
+        'execution_quiesced_generation': 1,
+        'execution_quiesced_at': quiesced_at,
+        'service_job_id': None,
+        'result_recorded_at': None,
+        'ambiguity_code': None,
+        'projected_at': quiesced_at,
+        'pin_released_at': quiesced_at,
+        'tombstone_not_before': quiesced_at + datetime.timedelta(days=60),
+        'binding_protocol_version': 2,
+        'profile_kind': profile.kind.value,
+        'profile_version': profile.version,
+        'profile_digest': profile.digest,
+        'capability_cohort_epoch':
+            (qualifier.ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+            ),
+        'capability_profile_set_digest':
+            (qualifier.ordinary_launch_binding.
+             supported_non_pool_profile_set_digest()),
+        'receipt_protocol_version': 1,
+        'authorization_kind': profile.authorization_kind.value,
+        'authorization_reference': profile.authorization_reference,
+        'authorization_generation': profile.authorization_generation,
+        'authorization_digest': profile.authorization_digest,
+        'reconciliation_outcome': 'PROJECTED',
+        'provider_evidence': 'ABSENT',
+        'provider_evidence_observed_at':
+            (quiesced_at + datetime.timedelta(seconds=1)),
+    }
+    provider_identity = (
+        qualifier.ordinary_launch_binding.ordinary_paid_gcp_provider_identity(
+            binding, project_id='test-project'))
+    binding['provider_evidence_payload'] = {
+        'association_id': str(association_id),
+        'cluster_name': 'paid-e2e-7',
+        'create_operation_targets': {
+            'failed': [],
+            'inflight': [],
+            'succeeded': [],
+        },
+        'disk_ids': [],
+        'instance_ids': [],
+        'probe_contract': 'gcp-vm-disk-operation-presence-v1',
+        'profile_kind': 'ORDINARY_PAID',
+        'provider_identity': provider_identity,
+        'replica_record_id': str(replica_record_id),
+        'result': 'ABSENT',
+    }
+    _, binding['provider_evidence_digest'] = (
+        qualifier.ordinary_launch_binding._ordinary_paid_provider_evidence(
+            binding, binding['cluster_name'],
+            qualifier.ordinary_launch_binding.ProviderEvidence.ABSENT))
+    replica = {
+        'replica_id': 7,
+        'replica_record_id': str(replica_record_id),
+        'ordinary_launch_association_id': None,
+    }
+
+    assert qualifier.select_replica_binding(replica, [binding]) is binding
+
+    malformed = {
+        **binding,
+        'resolution': 'AMBIGUOUS',
+        'reconciliation_outcome': 'POST_EFFECT_AMBIGUOUS',
+        'provider_evidence': 'UNKNOWN',
+        'ambiguity_code': 'provider_state_unknown',
+    }
+    assert not qualifier._is_selectable_settled_paid_binding(malformed)
+    with pytest.raises(qualifier.GuardViolation,
+                       match='unique current or latest settled'):
+        qualifier.select_replica_binding(replica, [malformed])
 
 
 def test_demand_projection_is_zero_sensitive():

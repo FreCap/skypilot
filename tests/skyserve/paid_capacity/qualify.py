@@ -912,6 +912,19 @@ def _is_projected_paid_success(
             binding.get('service_job_id') is not None)
 
 
+def _is_selectable_settled_paid_binding(
+        binding: collections.abc.Mapping[str, Any]) -> bool:
+    """Whether pointerless retained history identifies one paid attempt."""
+    if _is_projected_paid_success(binding):
+        return True
+    # An exact provider-absence projection deliberately clears the replica's
+    # current association pointer without recording a service job.  Delegate
+    # this exceptional shape to the production read-side validator instead of
+    # duplicating its quiescence and provider-evidence contract in the harness.
+    return ordinary_launch_binding.settled_association_proves_execution_quiescence(
+        binding)
+
+
 def select_replica_binding(
     replica: collections.abc.Mapping[str, Any],
     bindings: collections.abc.Sequence[collections.abc.Mapping[str, Any]],
@@ -932,7 +945,7 @@ def select_replica_binding(
     else:
         settled = [
             binding for binding in candidates
-            if _is_projected_paid_success(binding)
+            if _is_selectable_settled_paid_binding(binding)
         ]
         if not settled:
             selected = []
@@ -945,7 +958,7 @@ def select_replica_binding(
             ]
     if len(selected) != 1:
         raise GuardViolation(
-            'Paid replica has no unique current or latest successful binding.')
+            'Paid replica has no unique current or latest settled binding.')
     return selected[0]
 
 
