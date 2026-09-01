@@ -7246,6 +7246,95 @@ class TestLaunchClusterRetry:
         assert (wait.call_args.kwargs['api_auth_token_provider']
                 is replica_managers._required_controller_admin_auth_tokens)
 
+    def _run_bound_submission(self, tmp_path, submit_side_effect):
+        task = mock.MagicMock()
+        resource = mock.MagicMock()
+        resource.cloud = clouds.AWS()
+        task.resources = {resource}
+        prepared = types.SimpleNamespace(body=types.SimpleNamespace(
+            model_dump_json=lambda: '{}'))
+        inspect = mock.Mock(return_value=None)
+        backoff = mock.Mock()
+        backoff.current_backoff.return_value = 0
+        request_ids = thread_utils.ThreadSafeDict()
+        raised = None
+        with mock.patch.object(replica_managers,
+                               '_build_replica_launch_task',
+                               return_value=task), \
+             mock.patch.object(replica_managers.sdk,
+                               'prepare_launch_request',
+                               return_value=prepared), \
+             mock.patch.object(
+                 replica_managers.sdk,
+                 'submit_prepared_non_pool_launch_request',
+                 side_effect=submit_side_effect) as submit, \
+             mock.patch.object(replica_managers,
+                               '_wait_for_bound_ordinary_launch') as wait, \
+             mock.patch.object(replica_managers.common_utils,
+                               'Backoff',
+                               return_value=backoff) as backoff_constructor:
+            try:
+                replica_managers.launch_cluster(
+                    replica_id=1,
+                    yaml_content='dummy: yaml',
+                    cluster_name='svc-1',
+                    log_file=str(tmp_path / 'launch.log'),
+                    replica_to_request_id=request_ids,
+                    teardown_requested=threading.Event(),
+                    max_retry=2,
+                    launch_fence={
+                        replica_managers.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+                        replica_managers.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'hash',
+                    },
+                    ordinary_launch_submission_uuid=(
+                        '11111111-1111-4111-8111-111111111111'),
+                    non_pool_launch_profile_kind=(
+                        ordinary_launch_binding.NonPoolLaunchProfileKind.
+                        ORDINARY_PAID.value),
+                    inspect_bound_ordinary_launch=inspect,
+                    reduce_bound_ordinary_launch=mock.Mock(),
+                    cancel_bound_ordinary_launch=mock.Mock())
+            except Exception as error:  # pylint: disable=broad-except
+                raised = error
+        return (submit, inspect, backoff_constructor, backoff, wait, raised,
+                request_ids)
+
+    def test_bound_admission_lost_ack_uses_short_retry_backoff(self, tmp_path):
+        result = self._run_bound_submission(tmp_path, [
+            replica_managers.requests.exceptions.ConnectionError(
+                'lost acknowledgement'), 'request-id'
+        ])
+        submit, inspect, constructor, backoff, wait, raised, request_ids = result
+
+        assert raised is None
+        assert submit.call_count == 2
+        inspect.assert_called_once_with()
+        constructor.assert_called_once_with(
+            initial_backoff=(
+                replica_managers._BOUND_SUBMISSION_RETRY_INIT_GAP_SECONDS),
+            max_backoff_factor=(
+                replica_managers._BOUND_SUBMISSION_RETRY_MAX_BACKOFF_FACTOR))
+        assert (replica_managers._BOUND_SUBMISSION_RETRY_INIT_GAP_SECONDS == 1)
+        assert (
+            replica_managers._BOUND_SUBMISSION_RETRY_MAX_BACKOFF_FACTOR == 5)
+        assert replica_managers._RETRY_INIT_GAP_SECONDS == 60
+        backoff.current_backoff.assert_called_once_with()
+        assert request_ids[1] == 'request-id'
+        wait.assert_called_once()
+
+    def test_bound_admission_deterministic_4xx_is_not_retried(self, tmp_path):
+        rejection = replica_managers.requests.exceptions.HTTPError(
+            response=mock.Mock(status_code=409))
+        result = self._run_bound_submission(tmp_path, rejection)
+        submit, inspect, _, backoff, wait, raised, request_ids = result
+
+        assert raised is rejection
+        submit.assert_called_once()
+        inspect.assert_not_called()
+        backoff.current_backoff.assert_not_called()
+        wait.assert_not_called()
+        assert not request_ids
+
     def test_reserved_fill_profile_rejects_post_admission_worker_submission(
             self, tmp_path):
         task = mock.MagicMock()

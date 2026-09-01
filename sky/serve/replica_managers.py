@@ -128,6 +128,11 @@ _decode_replica_resource_state = (
 _JOB_STATUS_FETCH_INTERVAL = 30
 _PROCESS_POOL_REFRESH_INTERVAL = 20
 _RETRY_INIT_GAP_SECONDS = 60
+# Bound admission replays are exact, idempotent API submissions using the same
+# controller-generated UUID.  Recover a lost acknowledgement promptly without
+# changing the deliberately slower provider retry cadence above.
+_BOUND_SUBMISSION_RETRY_INIT_GAP_SECONDS = 1
+_BOUND_SUBMISSION_RETRY_MAX_BACKOFF_FACTOR = 5
 # Default number of launch attempts for launch_cluster. Spot replicas with a
 # spot placer cap resource availability (capacity) failures at one attempt so
 # the placer can fail over to a different location immediately instead of
@@ -1670,7 +1675,9 @@ def launch_cluster(
                 _extra_launch_context=launch_fence)
         expected_input_digest = ordinary_launch_binding.canonical_launch_digest(
             prepared_request.body)
-        submit_backoff = common_utils.Backoff(_RETRY_INIT_GAP_SECONDS)
+        submit_backoff = common_utils.Backoff(
+            initial_backoff=_BOUND_SUBMISSION_RETRY_INIT_GAP_SECONDS,
+            max_backoff_factor=_BOUND_SUBMISSION_RETRY_MAX_BACKOFF_FACTOR)
         request_id = None
         adopted_after_lost_ack = False
         for submit_attempt in range(1, max_retry + 1):
