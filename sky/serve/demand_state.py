@@ -134,8 +134,11 @@ class ValidatedReportRouteContext:
     relation: route_projection.DemandReportRouteRelation
 
 
-def _postgres_engine() -> sqlalchemy.engine.Engine:
-    engine = serve_state_schema.get_database_engine()
+def _postgres_engine(
+    engine: sqlalchemy.engine.Engine | None = None,
+) -> sqlalchemy.engine.Engine:
+    if engine is None:
+        engine = serve_state_schema.get_database_engine()
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
         raise DemandReportUnavailable(
             'The durable Serve demand feed requires PostgreSQL.')
@@ -427,8 +430,8 @@ def _normalize_demand_window_for_autoscaling(
         if effective_end <= now_epoch - window_seconds:
             continue
         count = int(bucket['request_count'])
-        if (effective_end >
-                now_epoch - constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS):
+        if (effective_end
+                > now_epoch - constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS):
             if len(timestamps) + count > timestamp_limit:
                 return None
             timestamps.extend([effective_end] * count)
@@ -1066,10 +1069,19 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
     }
 
 
-def get_request_summary(service_name: str, service_hash: str) -> dict[str, Any]:
-    """Return a provider- and controller-free current request projection."""
+def get_request_summary(
+    service_name: str,
+    service_hash: str,
+    *,
+    engine: sqlalchemy.engine.Engine | None = None,
+) -> dict[str, Any]:
+    """Return a provider- and controller-free current request projection.
+
+    ``engine`` lets standalone observers use the PostgreSQL authority they
+    already own without initializing the API-server database singleton.
+    """
     try:
-        engine = _postgres_engine()
+        engine = _postgres_engine(engine)
     except DemandReportUnavailable:
         return _empty_summary('unavailable', 'postgresql_required')
     reports = demand_state_schema.serve_lb_demand_reports_table

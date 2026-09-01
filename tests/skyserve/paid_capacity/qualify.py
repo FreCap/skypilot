@@ -1240,7 +1240,8 @@ class PostgresObserver:
         if scope is None:
             raise QualificationError('Provider scope was not frozen.')
         summary = demand_state.get_request_summary(self._service_name,
-                                                   scope.service_hash)
+                                                   scope.service_hash,
+                                                   engine=self._engine)
         ledger = async_request_ledger.get_summary(self._service_name,
                                                   scope.service_hash,
                                                   engine=self._engine)

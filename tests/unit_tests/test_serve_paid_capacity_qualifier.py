@@ -817,6 +817,62 @@ def test_data_plane_token_uses_projected_ring_without_exposing_it(monkeypatch):
         'SKYPILOT_SERVE_E2E_AUTH_TOKEN') == 'projected-secret'
 
 
+def test_request_telemetry_uses_observer_postgres_engine(monkeypatch):
+    observer = object.__new__(qualifier.PostgresObserver)
+    observer._engine = object()
+    observer._service_name = 'paid-e2e'
+    observer._provider_scope = qualifier.ProviderScope(
+        service_hash='service-hash',
+        lifecycle_epoch=1,
+        service_version=1,
+        workspace='workspace-a',
+        project_id='project-a',
+        region='us-central1',
+        controller_config_digest='a' * 64,
+        controller_config_snapshot_id='b' * 64)
+    seen = {}
+
+    def get_request_summary(service_name, service_hash, *, engine):
+        seen.update(service_name=service_name,
+                    service_hash=service_hash,
+                    engine=engine)
+        return {
+            'request_telemetry_observed_at': 1000.0,
+            'request_telemetry_state': 'fresh',
+            'request_telemetry_reason': 'complete',
+            'request_telemetry_compatibility_complete': True,
+            'request_queue_depth': 0,
+            'in_flight_requests': 0,
+            'processing_requests': 0,
+            'confirmed_in_flight_requests': 0,
+            'confirmed_processing_requests': 0,
+        }
+
+    monkeypatch.setattr(qualifier.demand_state, 'get_request_summary',
+                        get_request_summary)
+
+    def get_ledger_summary(*_args, **kwargs):
+        seen['ledger_engine'] = kwargs['engine']
+        return {
+            'available': True,
+            'service_hash': 'service-hash',
+            'state_counts': {},
+        }
+
+    monkeypatch.setattr(qualifier.async_request_ledger, 'get_summary',
+                        get_ledger_summary)
+
+    telemetry = observer.request_telemetry()
+
+    assert seen == {
+        'service_name': 'paid-e2e',
+        'service_hash': 'service-hash',
+        'engine': observer._engine,
+        'ledger_engine': observer._engine,
+    }
+    assert telemetry.is_exact_zero()
+
+
 def test_cleanup_command_preserves_primary_failure_and_still_cleans(tmp_path):
     marker = tmp_path / 'cleanup-ran'
     command = smoke_tests_utils.command_with_cleanup(
