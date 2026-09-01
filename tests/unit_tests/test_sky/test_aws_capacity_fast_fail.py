@@ -95,7 +95,8 @@ class _RequestSession:
             principal_arn=('arn:aws:sts::123456789012:assumed-role/test/run'),
             subnet_zones=None,
             identity_error: BaseException | None = None,
-            subnet_error: BaseException | None = None):
+            subnet_error: BaseException | None = None,
+            wait_error: BaseException | None = None):
         self.account_id = account_id
         self.principal_arn = principal_arn
         self.subnet_zones = ({
@@ -103,7 +104,9 @@ class _RequestSession:
         } if subnet_zones is None else subnet_zones)
         self.identity_error = identity_error
         self.subnet_error = subnet_error
+        self.wait_error = wait_error
         self.client_calls = []
+        self.wait_calls = []
 
     def client(self, service_name, region_name=None):
         assert region_name == 'us-east-1'
@@ -137,6 +140,9 @@ class _RequestSession:
                     'Instances': [{
                         'InstanceId': instance_id,
                         'InstanceType': 'g6.4xlarge',
+                        'State': {
+                            'Name': 'running',
+                        },
                         'Placement': {
                             'AvailabilityZone': 'us-east-1a'
                         },
@@ -145,8 +151,19 @@ class _RequestSession:
                 }]
             }
 
+        def _get_waiter(name):
+            assert name == 'instance_running'
+
+            def _wait(**kwargs):
+                self.wait_calls.append(kwargs)
+                if self.wait_error is not None:
+                    raise self.wait_error
+
+            return SimpleNamespace(wait=_wait)
+
         return SimpleNamespace(describe_subnets=_describe_subnets,
-                               describe_instances=_describe_instances)
+                               describe_instances=_describe_instances,
+                               get_waiter=_get_waiter)
 
 
 def _run_config(*,
@@ -457,6 +474,26 @@ def test_fresh_instance_node_tag_retries_eventual_not_found(monkeypatch):
     assert calls[0] == calls[1]
     assert len(sleeps) == 1
     assert sleeps[0] > 0
+
+
+def test_fresh_identity_wait_failure_is_optional_after_create(monkeypatch):
+    ec2 = _fresh_instance_ec2(lambda **_: None)
+    session = _RequestSession(
+        wait_error=RuntimeError('instance waiter unavailable'))
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    record = aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                        _run_config())
+
+    assert record.created_instance_ids == ['i-fresh']
+    assert record.fresh_aws_instance_identity is None
+    assert session.wait_calls == [{
+        'InstanceIds': ['i-fresh'],
+        'WaiterConfig': {
+            'Delay': 5,
+            'MaxAttempts': 120,
+        },
+    }]
 
 
 def test_fresh_instance_node_tag_does_not_retry_other_client_error(monkeypatch):

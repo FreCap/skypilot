@@ -553,6 +553,26 @@ class AWSInstanceIdentity:
             raise ValueError('market_type must be on_demand or spot.')
 
 
+@dataclasses.dataclass(frozen=True)
+class GCPInstanceIdentity:
+    """Closed GCP facts read from one exact fresh Compute instance."""
+
+    project_id: str
+    zone: str
+    instance_name: str
+    instance_type: str
+    market_type: str
+
+    def __post_init__(self) -> None:
+        for field_name in ('project_id', 'zone', 'instance_name',
+                           'instance_type'):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f'{field_name} must be a nonempty string.')
+        if self.market_type not in ('on_demand', 'spot'):
+            raise ValueError('market_type must be on_demand or spot.')
+
+
 @dataclasses.dataclass
 class ProvisionRecord:
     """Record for a provisioning process."""
@@ -579,6 +599,12 @@ class ProvisionRecord:
     # request-scoped credential session. It is optional operational evidence,
     # never provider lifecycle authority.
     fresh_aws_instance_identity: AWSInstanceIdentity | None = dataclasses.field(
+        default=None, kw_only=True, repr=False)
+    # Present only when one exact fresh GCP Compute instance was re-read as
+    # RUNNING in the requested project and zone with the requested machine and
+    # market type.  It is optional operational evidence, never provider
+    # lifecycle authority.
+    fresh_gcp_instance_identity: GCPInstanceIdentity | None = dataclasses.field(
         default=None, kw_only=True, repr=False)
 
     def is_instance_just_booted(self, instance_id: InstanceId) -> bool:

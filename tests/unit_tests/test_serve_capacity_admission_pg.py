@@ -3107,6 +3107,104 @@ def test_current_planner_recomputes_prior_claims_after_stale_cleanup(
     assert claims == [161]
 
 
+def test_provider_allocation_feedback_unblocks_next_reconcile_before_terminal(
+        capacity_database, monkeypatch):
+    """A provider-RUNNING checkpoint opens the next wave before runtime ends."""
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 1)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 4)
+    monkeypatch.setattr(paid_capacity, 'success_ttl_seconds', lambda: 600)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    first_spec = _paid_launch_spec(engine, 0, 160)
+    first = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 1},
+        backend_num_nodes=1,
+        sequenced_reserved_fill=False,
+        # The complete target is already two; only one provider-free candidate
+        # is supplied in this first reconciliation.
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2),
+        prepared_paid_launch_specs=(first_spec,))
+    assert [member.replica_id for member in first.paid_launch_receipt.members
+           ] == [160]
+
+    # Reproduce a one-slot cold frontier.  The first request and claim remain
+    # nonterminal, so the next reconcile is saturated until provider feedback
+    # expands this exact pool.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.paid_capacity_pools_table).where(
+                    serve_state_schema.paid_capacity_pools_table.c.pool_key ==
+                    first_spec.pool_key).values(current_limit=1,
+                                                successes_since_resize=0,
+                                                last_success_at=None,
+                                                last_failure_at=None))
+    second_spec = _paid_launch_spec(engine, 0, 161)
+    saturated = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 1},
+        backend_num_nodes=1,
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2),
+        prepared_paid_launch_specs=(second_spec,))
+    assert saturated.paid_launch_receipt.members == ()
+
+    with engine.begin() as connection:
+        assert serve_state.record_paid_provider_allocation_in_transaction(
+            connection,
+            service_name='svc',
+            service_hash='svc-hash',
+            replica_id=160,
+            pool_key=first_spec.pool_key,
+            receipt_sha256='a' * 64)
+
+    successor = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 1},
+        backend_num_nodes=1,
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2),
+        prepared_paid_launch_specs=(second_spec,))
+    assert [
+        member.replica_id for member in successor.paid_launch_receipt.members
+    ] == [161]
+    with engine.connect() as connection:
+        first_replica = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.replica_state).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id ==
+                    160)).scalar_one()
+        claims = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.paid_capacity_claims_table.c.replica_id,
+                serve_state_schema.paid_capacity_claims_table.c.
+                provider_allocation_recorded_at).where(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == 'svc').order_by(
+                        serve_state_schema.paid_capacity_claims_table.c.
+                        replica_id)).all()
+    # Provider-ready feedback must not synthesize a terminal sky.launch result.
+    assert first_replica['status_property']['sky_launch_status'] == 'SCHEDULED'
+    assert claims[0].replica_id == 160
+    assert claims[0].provider_allocation_recorded_at is not None
+    assert claims[1] == (161, None)
+
+
 @pytest.mark.parametrize('retained_kind', ['claim', 'waiter', 'association'])
 def test_current_planner_empty_wave_fails_closed_on_old_incarnation_graph(
         capacity_database, retained_kind):

@@ -75,6 +75,7 @@ _POOL_KEY_VERSION = 2
 _AWS_ACCOUNT_ID_RE = re.compile(r'[0-9]{12}')
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
 _MAX_EXACT_SHAPE_INTEGER = (1 << 63) - 1
+PAID_PROVIDER_ALLOCATION_CONTRACT = 'in-tree-full-fresh-running-v1'
 MAX_PREPARED_LAUNCH_SPECS = 512
 _UNRESOLVED_STATUS_VALUES = frozenset({'PENDING', 'PROVISIONING'})
 _admission_summary_log_lock = threading.Lock()
@@ -489,6 +490,166 @@ class PaidLaunchReceipt:
                            for member in self.members)
         if len(identities) != len(set(identities)):
             raise ValueError('Paid launch receipt members must be unique.')
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PaidProviderAllocationReceipt:
+    """Immutable evidence that one paid Spot backend fully materialized.
+
+    This receipt describes only an in-tree, full-fresh provider allocation.
+    Runtime setup and service readiness deliberately remain outside this
+    contract.  The exact paid pool and bound launch profile are supplied when
+    hashing so the same provider record cannot acknowledge another admission.
+    """
+
+    association_id: str
+    replica_record_id: str
+    provider: str
+    workspace: str
+    provider_identity: str | None
+    region: str
+    zone: str | None
+    instance_type: str
+    cluster_name_on_cloud: str
+    requested_num_nodes: int
+    head_instance_id: str
+    created_instance_ids: tuple[str, ...]
+    resumed_instance_ids: tuple[str, ...]
+    use_spot: bool
+    provider_project_id: str | None = None
+    contract: str = PAID_PROVIDER_ALLOCATION_CONTRACT
+
+    def __post_init__(self) -> None:
+        if self.contract != PAID_PROVIDER_ALLOCATION_CONTRACT:
+            raise ValueError('Paid provider allocation contract is unknown.')
+        for field_name in ('association_id', 'replica_record_id'):
+            value = getattr(self, field_name)
+            try:
+                canonical = str(uuid.UUID(value))
+            except (AttributeError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f'Paid provider allocation {field_name} is not a UUID.'
+                ) from error
+            if canonical != value:
+                raise ValueError(
+                    f'Paid provider allocation {field_name} is noncanonical.')
+        if self.provider not in ('aws', 'gcp'):
+            raise ValueError('Paid provider allocation provider is unknown.')
+        for field_name in ('workspace', 'region', 'instance_type',
+                           'cluster_name_on_cloud', 'head_instance_id'):
+            value = getattr(self, field_name)
+            if type(value) is not str or not value:  # pylint: disable=unidiomatic-typecheck
+                raise ValueError(
+                    f'Paid provider allocation {field_name} must be nonempty.')
+        if (self.zone is not None and
+            (type(self.zone) is not str or not self.zone)):  # pylint: disable=unidiomatic-typecheck
+            raise ValueError(
+                'Paid provider allocation zone must be nonempty or absent.')
+        if self.provider == 'aws':
+            if (type(self.provider_identity) is not str or  # pylint: disable=unidiomatic-typecheck
+                    _AWS_ACCOUNT_ID_RE.fullmatch(self.provider_identity)
+                    is None):
+                raise ValueError(
+                    'Paid AWS allocation requires one exact account ID.')
+            if self.provider_project_id is not None:
+                raise ValueError(
+                    'Paid AWS allocation cannot contain a GCP project ID.')
+        else:
+            if self.provider_identity is not None:
+                raise ValueError(
+                    'Paid GCP allocation has no AWS account identity.')
+            if (type(self.provider_project_id) is not str or  # pylint: disable=unidiomatic-typecheck
+                    not self.provider_project_id):
+                raise ValueError(
+                    'Paid GCP allocation requires one exact project ID.')
+        if (type(self.requested_num_nodes) is not int or  # pylint: disable=unidiomatic-typecheck
+                not 1 <= self.requested_num_nodes <= _MAX_EXACT_SHAPE_INTEGER):
+            raise ValueError(
+                'Paid provider allocation node count is malformed.')
+        if type(self.created_instance_ids) is not tuple:  # pylint: disable=unidiomatic-typecheck
+            raise ValueError(
+                'Paid provider allocation created IDs must be a tuple.')
+        if (any(
+                type(instance_id) is not str or not instance_id  # pylint: disable=unidiomatic-typecheck
+                for instance_id in self.created_instance_ids) or
+                self.created_instance_ids != tuple(
+                    sorted(set(self.created_instance_ids)))):
+            raise ValueError(
+                'Paid provider allocation created IDs are noncanonical.')
+        if len(self.created_instance_ids) != self.requested_num_nodes:
+            raise ValueError(
+                'Paid provider allocation is not a full fresh allocation.')
+        if (type(self.resumed_instance_ids) is not tuple or  # pylint: disable=unidiomatic-typecheck
+                self.resumed_instance_ids):
+            raise ValueError(
+                'Paid provider allocation cannot contain resumed instances.')
+        if self.head_instance_id not in self.created_instance_ids:
+            raise ValueError(
+                'Paid provider allocation head was not freshly created.')
+        if type(self.use_spot) is not bool or not self.use_spot:  # pylint: disable=unidiomatic-typecheck
+            raise ValueError('Paid provider allocation must be Spot.')
+
+    def validate_pool_key(  # pylint: disable=redefined-outer-name
+            self, pool_key: str) -> None:
+        """Require this provider allocation to match one exact Spot pool."""
+        pool = pool_key_payload(pool_key)
+        if pool is None:
+            raise ValueError(
+                'Paid provider allocation pool key is noncanonical.')
+        provider_identity = pool.get('provider_identity')
+        pool_provider_identity = (provider_identity.get('aws_account_id') if
+                                  isinstance(provider_identity, dict) else None)
+        provider_identity_disagrees = (
+            pool_provider_identity != self.provider_identity
+            if self.provider == 'aws' else pool_provider_identity is not None)
+        if (pool.get('cloud') != self.provider or
+                pool.get('workspace') != self.workspace or
+                pool.get('region') != self.region or
+                pool.get('zone') != self.zone or
+                pool.get('instance_type') != self.instance_type or
+                pool.get('num_nodes') != self.requested_num_nodes or
+                pool.get('use_spot') is not True or
+                provider_identity_disagrees):
+            raise ValueError(
+                'Paid provider allocation and exact Spot pool disagree.')
+
+    def canonical_payload(  # pylint: disable=redefined-outer-name
+            self, *, pool_key: str, profile_digest: str) -> dict[str, object]:
+        """Return the canonical provider receipt bound to launch authority."""
+        self.validate_pool_key(pool_key)
+        if (type(profile_digest) is not str or  # pylint: disable=unidiomatic-typecheck
+                _SHA256_RE.fullmatch(profile_digest) is None):
+            raise ValueError(
+                'Paid provider allocation profile digest is malformed.')
+        return {
+            'association_id': self.association_id,
+            'cluster_name_on_cloud': self.cluster_name_on_cloud,
+            'contract': self.contract,
+            'created_instance_ids': list(self.created_instance_ids),
+            'head_instance_id': self.head_instance_id,
+            'instance_type': self.instance_type,
+            'paid_capacity_pool_key': pool_key,
+            'profile_digest': profile_digest,
+            'provider': self.provider,
+            'provider_identity': self.provider_identity,
+            'provider_project_id': self.provider_project_id,
+            'region': self.region,
+            'replica_record_id': self.replica_record_id,
+            'requested_num_nodes': self.requested_num_nodes,
+            'resumed_instance_ids': list(self.resumed_instance_ids),
+            'use_spot': self.use_spot,
+            'workspace': self.workspace,
+            'zone': self.zone,
+        }
+
+    def sha256(  # pylint: disable=redefined-outer-name
+            self, *, pool_key: str, profile_digest: str) -> str:
+        """Hash the exact provider allocation and its bound authority."""
+        return hashlib.sha256(
+            freeze_paid_launch_payload(
+                self.canonical_payload(
+                    pool_key=pool_key,
+                    profile_digest=profile_digest))).hexdigest()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1986,9 +2147,9 @@ def build_launch_budget(
             (card,) for card, count in prospective_claims.items() if count > 0
         }
         remaining = {
-            location:
-            (location_remaining if frontier_keys[location] in requested else 0)
-            for location, location_remaining in remaining.items()
+            location: (location_remaining
+                       if frontier_keys[location] in requested else 0
+                      ) for location, location_remaining in remaining.items()
         }
     elif paid_launch_authority is None:
         service_claim_limit = _evidence_aware_service_limit(

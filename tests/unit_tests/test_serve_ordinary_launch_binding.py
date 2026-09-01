@@ -123,7 +123,7 @@ def test_non_pool_profile_envelope_is_closed_and_canonical() -> None:
 
 def test_supported_non_pool_profile_set_digest_is_stable_and_complete() -> None:
     digest = binding.supported_non_pool_profile_set_digest()
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 13
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 14
     assert len(digest) == 64
     assert digest == binding.supported_non_pool_profile_set_digest()
     assert set(binding._PROFILE_AUTHORIZATION_KIND) == set(  # pylint: disable=protected-access
@@ -961,7 +961,7 @@ def test_non_pool_identity_and_context_are_structurally_distinct() -> None:
     binding.install_bound_non_pool_context(body, identity, 7)
     context = body.extra_launch_context
     assert context[binding.PROFILE_KIND_KEY] == 'ORDINARY_PAID'
-    assert context[binding.CAPABILITY_COHORT_EPOCH_KEY] == 13
+    assert context[binding.CAPABILITY_COHORT_EPOCH_KEY] == 14
     parsed = binding.parse_bound_non_pool_launch_context(context)
     assert isinstance(parsed, binding.BoundNonPoolLaunchContext)
     assert parsed.profile == identity.profile
@@ -1041,6 +1041,28 @@ def test_partial_context_fails_closed_and_unbound_effect_helpers_noop() -> None:
         assert authorization is None
     assert binding.begin_service_job_io({}) is None
     assert binding.record_service_job({}, 1) is None
+
+
+def test_paid_provider_allocation_wrapper_installs_request_authority_validator(
+        monkeypatch) -> None:
+    body = _body()
+    identity = _non_pool_identity(body)
+    binding.install_bound_non_pool_context(body, identity, 7)
+    receipt = object()
+    expected_validator = (
+        ordinary_launch_request.request_postgres.
+        validate_paid_provider_allocation_receipt_in_transaction)
+    called = []
+
+    def _record(launch_context, actual_receipt, *, request_validator):
+        called.append((launch_context, actual_receipt, request_validator))
+        return 'recorded'
+
+    monkeypatch.setattr(binding, 'record_paid_provider_allocation', _record)
+
+    assert ordinary_launch_request._record_paid_provider_allocation(
+        body.extra_launch_context, receipt) == 'recorded'
+    assert called == [(body.extra_launch_context, receipt, expected_validator)]
 
 
 def test_startup_classification_never_infers_effect_absence() -> None:
@@ -1259,7 +1281,7 @@ def test_api014_serve051_lineage_and_sqlite_stays_at_serve037(
     assert api_scripts.get_revision('013').down_revision == '012'
     assert api_scripts.get_revision('012').down_revision == '011'
     assert api_scripts.get_revision('011').down_revision == '010'
-    assert serve_scripts.get_heads() == ['065']
+    assert serve_scripts.get_heads() == ['066']
     assert serve_scripts.get_revision('055').down_revision == '054'
     assert serve_scripts.get_revision('053').down_revision == '052'
     assert serve_scripts.get_revision('052').down_revision == '051'

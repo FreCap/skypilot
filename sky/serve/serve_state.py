@@ -623,6 +623,49 @@ def service_replica_launch_authority_guard(
         yield lock
 
 
+_AuthorityTransactionResult = typing.TypeVar('_AuthorityTransactionResult')
+
+
+def _run_postgres_authority_transaction(
+    lock: locks.DistributedLock,
+    operation: typing.Callable[[sqlalchemy.engine.Connection],
+                               _AuthorityTransactionResult],
+    *,
+    authority_name: str,
+) -> _AuthorityTransactionResult:
+    """Run one transaction on the session that owns an advisory authority."""
+    if not isinstance(lock, locks.PostgresLock):
+        raise RuntimeError(f'{authority_name} requires a PostgreSQL authority '
+                           'session.')
+    engine = _db_manager.get_engine()
+
+    def _run(lock_connection: Any) -> _AuthorityTransactionResult:
+        connection = sqlalchemy.engine.Connection(engine,
+                                                  lock_connection,
+                                                  _allow_revalidate=False)
+        transaction = connection.begin()
+        try:
+            result = operation(connection)
+            transaction.commit()
+            return result
+        except BaseException:
+            if transaction.is_active:
+                transaction.rollback()
+            raise
+
+    return lock.run_in_lock_session(_run)
+
+
+def run_service_replica_launch_authority_transaction(
+    lock: locks.DistributedLock,
+    operation: typing.Callable[[sqlalchemy.engine.Connection],
+                               _AuthorityTransactionResult],
+) -> _AuthorityTransactionResult:
+    """Commit provider feedback on the exact shared launch-guard session."""
+    return _run_postgres_authority_transaction(
+        lock, operation, authority_name='Service replica launch authority')
+
+
 @contextlib.contextmanager
 def reserved_fill_reclaim_gate_authority_guard(
         *, shared: bool) -> typing.Iterator[locks.DistributedLock]:
@@ -669,15 +712,11 @@ def reserved_fill_reclaim_gate_authority_guard_is_valid(
     return isinstance(lock, locks.PostgresLock) and lock.is_session_alive()
 
 
-_ReservedFillActivationTransactionResult = typing.TypeVar(
-    '_ReservedFillActivationTransactionResult')
-
-
 def run_reserved_fill_reclaim_activation_transaction(
     lock: locks.DistributedLock,
     operation: typing.Callable[[sqlalchemy.engine.Connection],
-                               _ReservedFillActivationTransactionResult],
-) -> _ReservedFillActivationTransactionResult:
+                               _AuthorityTransactionResult],
+) -> _AuthorityTransactionResult:
     """Run activation state changes on the exact composite-guard session.
 
     The operation owns no transaction lifecycle. This wrapper begins and ends
@@ -686,26 +725,8 @@ def run_reserved_fill_reclaim_activation_transaction(
     SQLAlchemy facade because doing so would return the guard's DBAPI session
     to the pool and release its advisory locks.
     """
-    if not isinstance(lock, locks.PostgresLock):
-        raise RuntimeError('Reserved-fill activation requires a PostgreSQL '
-                           'authority session.')
-    engine = _db_manager.get_engine()
-
-    def _run(lock_connection: Any) -> _ReservedFillActivationTransactionResult:
-        connection = sqlalchemy.engine.Connection(engine,
-                                                  lock_connection,
-                                                  _allow_revalidate=False)
-        transaction = connection.begin()
-        try:
-            result = operation(connection)
-            transaction.commit()
-            return result
-        except BaseException:
-            if transaction.is_active:
-                transaction.rollback()
-            raise
-
-    return lock.run_in_lock_session(_run)
+    return _run_postgres_authority_transaction(
+        lock, operation, authority_name='Reserved-fill activation')
 
 
 def service_replica_launch_authority_guard_is_valid(
@@ -4652,6 +4673,158 @@ def _publish_committed_zero_cost_sequences(
             persisted.zero_cost_materialization_sequence)
 
 
+def _paid_claim_provider_allocation_recorded(claim: Any) -> bool | None:
+    """Decode the complete write-once provider-allocation marker.
+
+    ``None`` is an invalid partial/corrupt shape and must fail the surrounding
+    transaction closed. ``False`` is the legacy/unrecorded shape.
+    """
+    recorded_at = claim.provider_allocation_recorded_at
+    receipt_sha256 = claim.provider_allocation_receipt_sha256
+    if recorded_at is None and receipt_sha256 is None:
+        return False
+    if (recorded_at is None or not isinstance(receipt_sha256, str) or
+            re.fullmatch(r'[0-9a-f]{64}', receipt_sha256) is None):
+        return None
+    return True
+
+
+def _apply_paid_capacity_outcome_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    pool: Any,
+    claim: Any,
+    pool_key: str,
+    outcome: paid_capacity.LaunchOutcome,
+) -> None:
+    """Apply one paid-pool outcome using already-locked pool and claim rows."""
+    now = _paid_capacity_clock_timestamp(connection, None)
+    base_limit = paid_capacity.base_limit()
+    max_limit = paid_capacity.max_limit()
+    success_ttl = paid_capacity.success_ttl_seconds()
+    failure_cooldown = paid_capacity.failure_cooldown_seconds()
+    if outcome in (paid_capacity.LaunchOutcome.CAPACITY_FAILURE,
+                   paid_capacity.LaunchOutcome.QUOTA_FAILURE):
+        connection.execute(
+            sqlalchemy.update(paid_capacity_pools_table).where(
+                paid_capacity_pools_table.c.pool_key == pool_key).values(
+                    current_limit=base_limit,
+                    successes_since_resize=0,
+                    last_success_at=None,
+                    last_failure_at=now,
+                    updated_at=now))
+        return
+    if outcome != paid_capacity.LaunchOutcome.SUCCESS:
+        return
+
+    if pool.last_failure_at is not None:
+        if not (pool.current_limit == 1 and
+                claim.claimed_at >= pool.last_failure_at + failure_cooldown):
+            return
+        ramp_update = paid_capacity.record_outcomes(
+            base_limit,
+            0,
+            None, [paid_capacity.LaunchOutcome.SUCCESS],
+            bootstrap_limit=base_limit,
+            ceiling_limit=max_limit,
+            now=now,
+            ttl_seconds=success_ttl)
+        connection.execute(
+            sqlalchemy.update(paid_capacity_pools_table).where(
+                paid_capacity_pools_table.c.pool_key == pool_key).values(
+                    current_limit=ramp_update.current_limit,
+                    successes_since_resize=ramp_update.successes_since_resize,
+                    last_success_at=now,
+                    last_failure_at=None,
+                    updated_at=now))
+        return
+
+    ramp_update = paid_capacity.record_outcomes(
+        pool.current_limit,
+        pool.successes_since_resize,
+        pool.last_success_at, [paid_capacity.LaunchOutcome.SUCCESS],
+        bootstrap_limit=base_limit,
+        ceiling_limit=max_limit,
+        now=now,
+        ttl_seconds=success_ttl)
+    connection.execute(
+        sqlalchemy.update(paid_capacity_pools_table).where(
+            paid_capacity_pools_table.c.pool_key == pool_key).values(
+                current_limit=ramp_update.current_limit,
+                successes_since_resize=ramp_update.successes_since_resize,
+                last_success_at=now,
+                updated_at=now))
+
+
+def record_paid_provider_allocation_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    service_hash: str,
+    replica_id: int,
+    pool_key: str,
+    receipt_sha256: str,
+) -> bool:
+    """Record one exact full-fresh provider allocation and pool success.
+
+    Returns ``True`` for the first atomic record and ``False`` for an exact
+    replay. A conflicting replay or malformed durable marker raises so the
+    active launch fails closed without changing pool feedback.
+    """
+    if (connection.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value
+            or not isinstance(service_name, str) or not service_name or
+            not isinstance(service_hash, str) or not service_hash or
+            type(replica_id) is not int or replica_id < 1 or  # pylint: disable=unidiomatic-typecheck
+            not isinstance(pool_key, str) or not pool_key
+            or not isinstance(receipt_sha256, str)
+            or re.fullmatch(r'[0-9a-f]{64}', receipt_sha256) is None):
+        raise ValueError('Paid provider-allocation identity is malformed.')
+    pool = connection.execute(
+        sqlalchemy.select(paid_capacity_pools_table).where(
+            paid_capacity_pools_table.c.pool_key ==
+            pool_key).with_for_update()).one_or_none()
+    claim = connection.execute(
+        sqlalchemy.select(paid_capacity_claims_table).where(
+            paid_capacity_claims_table.c.service_name == service_name,
+            paid_capacity_claims_table.c.service_hash == service_hash,
+            paid_capacity_claims_table.c.replica_id == replica_id,
+            paid_capacity_claims_table.c.pool_key ==
+            pool_key).with_for_update()).one_or_none()
+    if pool is None or claim is None:
+        raise RuntimeError('Paid provider allocation lost its exact claim.')
+    recorded = _paid_claim_provider_allocation_recorded(claim)
+    if recorded is None:
+        raise RuntimeError('Paid provider-allocation marker is malformed.')
+    if recorded:
+        if claim.provider_allocation_receipt_sha256 != receipt_sha256:
+            raise RuntimeError('Paid provider-allocation replay conflicts with '
+                               'the durable receipt.')
+        return False
+    updated = connection.execute(
+        sqlalchemy.update(paid_capacity_claims_table).where(
+            paid_capacity_claims_table.c.service_name == service_name,
+            paid_capacity_claims_table.c.service_hash == service_hash,
+            paid_capacity_claims_table.c.replica_id == replica_id,
+            paid_capacity_claims_table.c.pool_key == pool_key,
+            paid_capacity_claims_table.c.provider_allocation_recorded_at.is_(
+                None),
+            paid_capacity_claims_table.c.provider_allocation_receipt_sha256.is_(
+                None)).
+        values(
+            provider_allocation_recorded_at=sqlalchemy.func.clock_timestamp(),
+            provider_allocation_receipt_sha256=receipt_sha256))
+    if updated.rowcount != 1:
+        raise RuntimeError('Paid provider-allocation marker lost its exact '
+                           'compare-and-swap.')
+    _apply_paid_capacity_outcome_in_transaction(
+        connection,
+        pool=pool,
+        claim=claim,
+        pool_key=pool_key,
+        outcome=paid_capacity.LaunchOutcome.SUCCESS)
+    return True
+
+
 def update_replica_for_bound_ordinary_launch_in_transaction(
     connection: sqlalchemy.engine.Connection,
     service_name: str,
@@ -4742,64 +4915,16 @@ def update_replica_for_bound_ordinary_launch_in_transaction(
 
     assert paid_capacity_outcome is not None and claim is not None
     assert pool is not None
-    now = _paid_capacity_clock_timestamp(connection, None)
-    base_limit = paid_capacity.base_limit()
-    max_limit = paid_capacity.max_limit()
-    success_ttl = paid_capacity.success_ttl_seconds()
-    failure_cooldown = paid_capacity.failure_cooldown_seconds()
-    if paid_capacity_outcome in (paid_capacity.LaunchOutcome.CAPACITY_FAILURE,
-                                 paid_capacity.LaunchOutcome.QUOTA_FAILURE):
-        connection.execute(
-            sqlalchemy.update(paid_capacity_pools_table).where(
-                paid_capacity_pools_table.c.pool_key ==
-                paid_capacity_pool_key).values(current_limit=base_limit,
-                                               successes_since_resize=0,
-                                               last_success_at=None,
-                                               last_failure_at=now,
-                                               updated_at=now))
-        return True
-    if paid_capacity_outcome != paid_capacity.LaunchOutcome.SUCCESS:
-        return True
-
-    if pool.last_failure_at is not None:
-        if not (pool.current_limit == 1 and
-                claim.claimed_at >= pool.last_failure_at + failure_cooldown):
-            return True
-        ramp_update = paid_capacity.record_outcomes(
-            base_limit,
-            0,
-            None, [paid_capacity.LaunchOutcome.SUCCESS],
-            bootstrap_limit=base_limit,
-            ceiling_limit=max_limit,
-            now=now,
-            ttl_seconds=success_ttl)
-        connection.execute(
-            sqlalchemy.update(paid_capacity_pools_table).where(
-                paid_capacity_pools_table.c.pool_key ==
-                paid_capacity_pool_key).values(
-                    current_limit=ramp_update.current_limit,
-                    successes_since_resize=ramp_update.successes_since_resize,
-                    last_success_at=now,
-                    last_failure_at=None,
-                    updated_at=now))
-        return True
-
-    ramp_update = paid_capacity.record_outcomes(
-        pool.current_limit,
-        pool.successes_since_resize,
-        pool.last_success_at, [paid_capacity.LaunchOutcome.SUCCESS],
-        bootstrap_limit=base_limit,
-        ceiling_limit=max_limit,
-        now=now,
-        ttl_seconds=success_ttl)
-    connection.execute(
-        sqlalchemy.update(paid_capacity_pools_table).where(
-            paid_capacity_pools_table.c.pool_key ==
-            paid_capacity_pool_key).values(
-                current_limit=ramp_update.current_limit,
-                successes_since_resize=ramp_update.successes_since_resize,
-                last_success_at=now,
-                updated_at=now))
+    allocation_recorded = _paid_claim_provider_allocation_recorded(claim)
+    if allocation_recorded is None:
+        return False
+    economic_outcome = (paid_capacity.LaunchOutcome.OTHER_FAILURE
+                        if allocation_recorded else paid_capacity_outcome)
+    _apply_paid_capacity_outcome_in_transaction(connection,
+                                                pool=pool,
+                                                claim=claim,
+                                                pool_key=paid_capacity_pool_key,
+                                                outcome=economic_outcome)
     return True
 
 
@@ -5949,10 +6074,10 @@ class _PaidCapacityAdmissionPlanBudget:
                     type(units) is not int or units < 1
                     for group, units in self.target_units_by_group)):
             raise ValueError('Paid plan targets are noncanonical.')
-        if (not isinstance(self.member_debits, tuple) or any(
-                not isinstance(group, str) or group not in target or
-                type(units) is not int or units < 1
-                for group, units in self.member_debits)):
+        if (not isinstance(self.member_debits, tuple) or
+                any(not isinstance(group, str) or group not in target or
+                    type(units) is not int or units < 1
+                    for group, units in self.member_debits)):
             raise ValueError('Paid plan member debits are malformed.')
 
 
@@ -6108,8 +6233,8 @@ def _paid_capacity_admission_is_immediately_saturated(
         (service_limit is not None and
          len(census.service_claims) >= service_limit) or
         (max_live_paid_gpu_units is not None and census.live_paid_gpu_units +
-         min(census.paid_gpu_units_by_index[index] for index in new_indices) >
-         max_live_paid_gpu_units))
+         min(census.paid_gpu_units_by_index[index]
+             for index in new_indices) > max_live_paid_gpu_units))
 
 
 def _lock_paid_capacity_admission_context_in_session(
@@ -6217,15 +6342,11 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
     if (plan_budget is not None and
             len(plan_budget.member_debits) != len(persistence_specs)):
         raise ValueError('Paid plan budget does not match the batch.')
-    accepted_plan_units = ({}
-                           if plan_budget is None else {
-                               group: 0
-                               for group, _ in
-                               plan_budget.target_units_by_group
-                           })
-    plan_targets = ({}
-                    if plan_budget is None else
-                    dict(plan_budget.target_units_by_group))
+    accepted_plan_units = ({} if plan_budget is None else {
+        group: 0 for group, _ in plan_budget.target_units_by_group
+    })
+    plan_targets = ({} if plan_budget is None else dict(
+        plan_budget.target_units_by_group))
     if plan_budget is not None:
         for spec, (group, units) in zip(persistence_specs,
                                         plan_budget.member_debits):
@@ -6375,8 +6496,8 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
                       plan_budget.member_debits[index])
         if plan_debit is not None:
             plan_group, plan_units = plan_debit
-            if (accepted_plan_units[plan_group] + plan_units >
-                    plan_targets[plan_group]):
+            if (accepted_plan_units[plan_group] + plan_units
+                    > plan_targets[plan_group]):
                 # The plan target applies to accepted units, not to the first
                 # N alternatives inspected.  Continue scanning so a later
                 # exact pool may provide capacity rejected by this pool.
@@ -6490,12 +6611,10 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
         if filled_groups:
             filled_frontiers = {(group,) for group in filled_groups}
             waiter_pool_keys = session.execute(
-                sqlalchemy.select(
-                    paid_capacity_waiters_table.c.pool_key).where(
-                        paid_capacity_waiters_table.c.service_name ==
-                        service_name,
-                        paid_capacity_waiters_table.c.service_hash ==
-                        service_hash)).scalars().all()
+                sqlalchemy.select(paid_capacity_waiters_table.c.pool_key).where(
+                    paid_capacity_waiters_table.c.service_name == service_name,
+                    paid_capacity_waiters_table.c.service_hash ==
+                    service_hash)).scalars().all()
             filled_pool_keys = [
                 pool_key for pool_key in waiter_pool_keys
                 if paid_capacity.frontier_key_from_pool_key(pool_key) in
@@ -6505,9 +6624,8 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
                 session.execute(
                     sqlalchemy.delete(paid_capacity_waiters_table).where(
                         paid_capacity_waiters_table.c.service_name ==
-                        service_name,
-                        paid_capacity_waiters_table.c.service_hash ==
-                        service_hash,
+                        service_name, paid_capacity_waiters_table.c.service_hash
+                        == service_hash,
                         paid_capacity_waiters_table.c.pool_key.in_(
                             filled_pool_keys)))
 

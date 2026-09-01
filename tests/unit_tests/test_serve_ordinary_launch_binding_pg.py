@@ -2,10 +2,12 @@
 # pylint: disable=not-callable,protected-access,redefined-outer-name
 # pylint: disable=unused-argument,unused-import
 
+import concurrent.futures
 import copy
 import dataclasses
 import datetime
 import json
+import threading
 import time
 from unittest import mock
 import uuid
@@ -23,6 +25,7 @@ from sky.serve import constants as serve_constants
 from sky.serve import demand_state
 from sky.serve import kubernetes_identity
 from sky.serve import ordinary_launch_binding as binding
+from sky.serve import paid_capacity
 from sky.serve import replica_managers
 from sky.serve import route_projection
 from sky.serve import route_projection_schema
@@ -841,6 +844,91 @@ def _admit_generic_paid(
             dict(launch_body.extra_launch_context))
 
 
+def _paid_provider_allocation_receipt(
+    identity: binding.NonPoolBindingIdentity,
+    **updates,
+) -> paid_capacity.PaidProviderAllocationReceipt:
+    values = {
+        'association_id': str(identity.association_id),
+        'replica_record_id': str(_RECORD_ID),
+        'provider': 'gcp',
+        'workspace': 'workspace-a',
+        'provider_identity': None,
+        'provider_project_id': 'boltz-spot-project',
+        'region': 'us-central1',
+        'zone': 'us-central1-a',
+        'instance_type': 'g2-standard-4',
+        'cluster_name_on_cloud': 'sky-svc-3',
+        'requested_num_nodes': 1,
+        'head_instance_id': 'instance-a',
+        'created_instance_ids': ('instance-a',),
+        'resumed_instance_ids': (),
+        'use_spot': True,
+    }
+    values.update(updates)
+    return paid_capacity.PaidProviderAllocationReceipt(**values)
+
+
+def _accept_paid_provider_allocation_request(*_args) -> bool:
+    return True
+
+
+def _paid_provider_feedback_state(database):
+    with database.connect() as connection:
+        claim = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.paid_capacity_claims_table.c.
+                provider_allocation_recorded_at,
+                serve_state_schema.paid_capacity_claims_table.c.
+                provider_allocation_receipt_sha256,
+            ).where(
+                serve_state_schema.paid_capacity_claims_table.c.service_name ==
+                'svc',
+                serve_state_schema.paid_capacity_claims_table.c.service_hash ==
+                'svc-hash',
+                serve_state_schema.paid_capacity_claims_table.c.replica_id ==
+                3)).one()
+        pool = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.paid_capacity_pools_table.c.current_limit,
+                serve_state_schema.paid_capacity_pools_table.c.
+                successes_since_resize,
+                serve_state_schema.paid_capacity_pools_table.c.last_success_at,
+                serve_state_schema.paid_capacity_pools_table.c.last_failure_at,
+                serve_state_schema.paid_capacity_pools_table.c.updated_at,
+            ).where(serve_state_schema.paid_capacity_pools_table.c.pool_key ==
+                    _CURRENT_PAID_POOL_KEY)).one()
+    return claim, pool
+
+
+def _project_paid_terminal_result(
+    database,
+    identity: binding.NonPoolBindingIdentity,
+    outcome: paid_capacity.LaunchOutcome,
+) -> common_utils.ProcessStatus:
+    launch_status = (common_utils.ProcessStatus.SUCCEEDED
+                     if outcome is paid_capacity.LaunchOutcome.SUCCESS else
+                     common_utils.ProcessStatus.FAILED)
+    with database.begin() as connection:
+        replica_info = (
+            serve_state.read_replica_for_bound_ordinary_launch_in_transaction(
+                connection, 'svc', 3, str(_RECORD_ID), identity.association_id))
+        replica_info.status_property.sky_launch_status = launch_status
+        assert serve_state.update_replica_for_bound_ordinary_launch_in_transaction(
+            connection,
+            'svc',
+            'svc-hash',
+            3,
+            str(_RECORD_ID),
+            identity.association_id,
+            replica_info,
+            provider_launch_succeeded=(outcome
+                                       is paid_capacity.LaunchOutcome.SUCCESS),
+            paid_capacity_pool_key=_CURRENT_PAID_POOL_KEY,
+            paid_capacity_outcome=outcome)
+    return launch_status
+
+
 def _assert_current_paid_provider_effect_is_permitted(database,) -> None:
     identity, _, launch_context = _admit_generic_paid(database)
     assert identity.profile.kind is (
@@ -865,6 +953,280 @@ def _assert_current_paid_provider_effect_is_permitted(database,) -> None:
             where(binding.ordinary_launch_associations_table.c.association_id ==
                   identity.association_id)).scalar_one()
     assert phase == binding.EffectPhase.PROVIDER_IO.value
+
+
+def test_paid_provider_allocation_first_commit_replay_and_conflict(
+        binding_database, monkeypatch) -> None:
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 14
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 4)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 120)
+    monkeypatch.setattr(paid_capacity, 'success_ttl_seconds', lambda: 600)
+    identity, context, launch_context = _admit_generic_paid(binding_database)
+    receipt = _paid_provider_allocation_receipt(identity)
+    claim = _Claim(identity.request_id, 1, str(uuid.uuid4()), str(uuid.uuid4()))
+    before_claim, before_pool = _paid_provider_feedback_state(binding_database)
+    assert before_claim == (None, None)
+    assert before_pool[:4] == (1, 0, None, None)
+
+    with binding.non_pool_provider_effect_guard(
+            launch_context,
+            claim,
+            claim_validator=lambda _connection, _association_id, _claim: True):
+        assert binding.record_paid_provider_allocation(
+            launch_context,
+            receipt,
+            request_validator=_accept_paid_provider_allocation_request
+        ) is binding.ProviderAllocationDisposition.RECORDED
+        first_claim, first_pool = _paid_provider_feedback_state(
+            binding_database)
+        assert binding.record_paid_provider_allocation(
+            launch_context,
+            receipt,
+            request_validator=_accept_paid_provider_allocation_request
+        ) is binding.ProviderAllocationDisposition.EXACT_REPLAY
+        replay_claim, replay_pool = _paid_provider_feedback_state(
+            binding_database)
+        with pytest.raises(RuntimeError, match='replay conflicts'):
+            binding.record_paid_provider_allocation(
+                launch_context,
+                dataclasses.replace(receipt,
+                                    cluster_name_on_cloud='sky-svc-3-other'),
+                request_validator=_accept_paid_provider_allocation_request)
+
+    assert first_claim.provider_allocation_recorded_at is not None
+    assert first_claim.provider_allocation_receipt_sha256 == receipt.sha256(
+        pool_key=_CURRENT_PAID_POOL_KEY, profile_digest=context.profile.digest)
+    assert first_pool.current_limit == 4
+    assert first_pool.successes_since_resize == 1
+    assert first_pool.last_success_at is not None
+    assert first_pool.last_failure_at is None
+    assert (replay_claim, replay_pool) == (first_claim, first_pool)
+    assert _paid_provider_feedback_state(binding_database) == (first_claim,
+                                                               first_pool)
+
+
+def test_paid_provider_request_validation_shares_marker_transaction(
+        binding_database) -> None:
+    identity, _, launch_context = _admit_generic_paid(binding_database)
+    receipt = _paid_provider_allocation_receipt(identity)
+    claim = _Claim(identity.request_id, 1, str(uuid.uuid4()), str(uuid.uuid4()))
+    validator_connections = []
+    marker_connections = []
+    record_marker = serve_state.record_paid_provider_allocation_in_transaction
+
+    def _validate_request(connection, _context, _association, _receipt) -> bool:
+        assert connection.in_transaction()
+        validator_connections.append(connection)
+        return True
+
+    def _record_marker(connection, **kwargs) -> bool:
+        assert connection.in_transaction()
+        marker_connections.append(connection)
+        return record_marker(connection, **kwargs)
+
+    with binding.non_pool_provider_effect_guard(
+            launch_context,
+            claim,
+            claim_validator=lambda _connection, _association_id, _claim: True):
+        with mock.patch.object(serve_state,
+                               'record_paid_provider_allocation_in_transaction',
+                               side_effect=_record_marker):
+            assert binding.record_paid_provider_allocation(
+                launch_context, receipt, request_validator=_validate_request
+            ) is binding.ProviderAllocationDisposition.RECORDED
+
+    assert len(validator_connections) == len(marker_connections) == 1
+    assert validator_connections[0] is marker_connections[0]
+
+
+def test_paid_provider_allocation_requires_live_exact_guard(
+        binding_database) -> None:
+    identity, _, launch_context = _admit_generic_paid(binding_database)
+    receipt = _paid_provider_allocation_receipt(identity)
+    claim = _Claim(identity.request_id, 1, str(uuid.uuid4()), str(uuid.uuid4()))
+
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='active provider authority guard'):
+        binding.record_paid_provider_allocation(
+            launch_context,
+            receipt,
+            request_validator=_accept_paid_provider_allocation_request)
+    with binding.non_pool_provider_effect_guard(
+            launch_context,
+            claim,
+            claim_validator=lambda _connection, _association_id, _claim: True):
+        with mock.patch.object(
+                serve_state,
+                'service_replica_launch_authority_guard_is_valid',
+                return_value=False), pytest.raises(
+                    binding.OrdinaryLaunchBindingConflict,
+                    match='active provider authority guard'):
+            binding.record_paid_provider_allocation(
+                launch_context,
+                receipt,
+                request_validator=_accept_paid_provider_allocation_request)
+
+    persisted_claim, persisted_pool = _paid_provider_feedback_state(
+        binding_database)
+    assert persisted_claim == (None, None)
+    assert persisted_pool[:4] == (1, 0, None, None)
+
+
+def test_paid_provider_allocation_transaction_rolls_back_marker_and_feedback(
+        binding_database, monkeypatch) -> None:
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 4)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 120)
+    monkeypatch.setattr(paid_capacity, 'success_ttl_seconds', lambda: 600)
+    identity, context, _ = _admit_generic_paid(binding_database)
+    receipt = _paid_provider_allocation_receipt(identity)
+    receipt_sha256 = receipt.sha256(pool_key=_CURRENT_PAID_POOL_KEY,
+                                    profile_digest=context.profile.digest)
+    before = _paid_provider_feedback_state(binding_database)
+
+    with pytest.raises(RuntimeError, match='force transaction rollback'):
+        with binding_database.begin() as connection:
+            assert serve_state.record_paid_provider_allocation_in_transaction(
+                connection,
+                service_name='svc',
+                service_hash='svc-hash',
+                replica_id=3,
+                pool_key=_CURRENT_PAID_POOL_KEY,
+                receipt_sha256=receipt_sha256)
+            claim = connection.execute(
+                sqlalchemy.select(
+                    serve_state_schema.paid_capacity_claims_table.c.
+                    provider_allocation_recorded_at).where(
+                        serve_state_schema.paid_capacity_claims_table.c.
+                        service_name == 'svc')).scalar_one()
+            pool_limit = connection.execute(
+                sqlalchemy.select(
+                    serve_state_schema.paid_capacity_pools_table.c.current_limit
+                ).where(serve_state_schema.paid_capacity_pools_table.c.pool_key
+                        == _CURRENT_PAID_POOL_KEY)).scalar_one()
+            assert claim is not None
+            assert pool_limit == 4
+            raise RuntimeError('force transaction rollback')
+
+    assert _paid_provider_feedback_state(binding_database) == before
+
+
+def test_paid_provider_allocation_concurrent_first_writer_is_exactly_once(
+        binding_database, monkeypatch) -> None:
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 4)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 120)
+    monkeypatch.setattr(paid_capacity, 'success_ttl_seconds', lambda: 600)
+    identity, context, _ = _admit_generic_paid(binding_database)
+    receipt = _paid_provider_allocation_receipt(identity)
+    receipt_sha256 = receipt.sha256(pool_key=_CURRENT_PAID_POOL_KEY,
+                                    profile_digest=context.profile.digest)
+
+    first_writer_barrier = threading.Barrier(8)
+
+    def _record_after_barrier(digest: str, barrier: threading.Barrier) -> bool:
+        barrier.wait(timeout=10)
+        with binding_database.begin() as connection:
+            return serve_state.record_paid_provider_allocation_in_transaction(
+                connection,
+                service_name='svc',
+                service_hash='svc-hash',
+                replica_id=3,
+                pool_key=_CURRENT_PAID_POOL_KEY,
+                receipt_sha256=digest)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        first_results = list(
+            executor.map(
+                lambda _: _record_after_barrier(
+                    receipt_sha256, first_writer_barrier), range(8)))
+    assert first_results.count(True) == 1
+    assert first_results.count(False) == 7
+    first_state = _paid_provider_feedback_state(binding_database)
+    assert first_state[0].provider_allocation_recorded_at is not None
+    assert first_state[0].provider_allocation_receipt_sha256 == receipt_sha256
+    assert first_state[1].current_limit == 4
+    assert first_state[1].successes_since_resize == 1
+
+    replay_barrier = threading.Barrier(8)
+
+    def _replay_or_conflict(digest: str) -> str:
+        try:
+            recorded = _record_after_barrier(digest, replay_barrier)
+        except RuntimeError as error:
+            assert 'replay conflicts' in str(error)
+            return 'conflict'
+        assert not recorded
+        return 'replay'
+
+    conflict_sha256 = ('f' * 64 if receipt_sha256 != 'f' * 64 else 'e' * 64)
+    digests = [receipt_sha256] * 4 + [conflict_sha256] * 4
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        replay_results = list(executor.map(_replay_or_conflict, digests))
+    assert replay_results.count('replay') == 4
+    assert replay_results.count('conflict') == 4
+    assert _paid_provider_feedback_state(binding_database) == first_state
+
+
+@pytest.mark.parametrize('outcome', list(paid_capacity.LaunchOutcome))
+def test_recorded_provider_allocation_suppresses_terminal_pool_feedback(
+        binding_database, monkeypatch,
+        outcome: paid_capacity.LaunchOutcome) -> None:
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 4)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 120)
+    monkeypatch.setattr(paid_capacity, 'success_ttl_seconds', lambda: 600)
+    identity, _, launch_context = _admit_generic_paid(binding_database)
+    receipt = _paid_provider_allocation_receipt(identity)
+    claim = _Claim(identity.request_id, 1, str(uuid.uuid4()), str(uuid.uuid4()))
+    with binding.non_pool_provider_effect_guard(
+            launch_context,
+            claim,
+            claim_validator=lambda _connection, _association_id, _claim: True):
+        assert binding.record_paid_provider_allocation(
+            launch_context,
+            receipt,
+            request_validator=_accept_paid_provider_allocation_request
+        ) is binding.ProviderAllocationDisposition.RECORDED
+    checkpoint_state = _paid_provider_feedback_state(binding_database)
+
+    launch_status = _project_paid_terminal_result(binding_database, identity,
+                                                  outcome)
+
+    assert _paid_provider_feedback_state(binding_database) == checkpoint_state
+    persisted = serve_state.get_replica_info_from_id('svc', 3)
+    assert persisted is not None
+    assert persisted.status_property.sky_launch_status is launch_status
+
+
+@pytest.mark.parametrize('outcome', list(paid_capacity.LaunchOutcome))
+def test_unrecorded_provider_allocation_preserves_terminal_pool_feedback(
+        binding_database, monkeypatch,
+        outcome: paid_capacity.LaunchOutcome) -> None:
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 4)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 120)
+    monkeypatch.setattr(paid_capacity, 'success_ttl_seconds', lambda: 600)
+    identity, _, _ = _admit_generic_paid(binding_database)
+    before_claim, before_pool = _paid_provider_feedback_state(binding_database)
+
+    launch_status = _project_paid_terminal_result(binding_database, identity,
+                                                  outcome)
+
+    after_claim, after_pool = _paid_provider_feedback_state(binding_database)
+    assert after_claim == before_claim == (None, None)
+    if outcome is paid_capacity.LaunchOutcome.SUCCESS:
+        assert after_pool.current_limit == 4
+        assert after_pool.successes_since_resize == 1
+        assert after_pool.last_success_at is not None
+        assert after_pool.last_failure_at is None
+    elif outcome in (paid_capacity.LaunchOutcome.CAPACITY_FAILURE,
+                     paid_capacity.LaunchOutcome.QUOTA_FAILURE):
+        assert after_pool.current_limit == 4
+        assert after_pool.successes_since_resize == 0
+        assert after_pool.last_success_at is None
+        assert after_pool.last_failure_at is not None
+    else:
+        assert after_pool == before_pool
+    persisted = serve_state.get_replica_info_from_id('svc', 3)
+    assert persisted is not None
+    assert persisted.status_property.sky_launch_status is launch_status
 
 
 def test_current_paid_effect_accepts_unprojected_service_version(
@@ -1022,8 +1384,11 @@ def test_paid_plan_is_mutable_only_before_provider_effect(
 def test_historical_cohort_cannot_start_provider_effect(
         binding_database, monkeypatch, history_distance) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    assert current_cohort == 14
     assert current_cohort > history_distance
     historical_cohort = current_cohort - history_distance
+    if history_distance == 1:
+        assert historical_cohort == 13
     with monkeypatch.context() as old_code:
         old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
                          historical_cohort)
@@ -1058,13 +1423,34 @@ def test_historical_cohort_cannot_start_provider_effect(
                 True):
             entered = True
     assert not entered
+    receipt = _paid_provider_allocation_receipt(identity)
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='active provider authority guard'):
+        binding.record_paid_provider_allocation(
+            launch_context,
+            receipt,
+            request_validator=_accept_paid_provider_allocation_request)
     with binding_database.connect() as connection:
         phase = connection.execute(
             sqlalchemy.select(
                 binding.ordinary_launch_associations_table.c.effect_phase).
             where(binding.ordinary_launch_associations_table.c.association_id ==
                   identity.association_id)).scalar_one()
+        allocation_marker = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.paid_capacity_claims_table.c.
+                provider_allocation_recorded_at,
+                serve_state_schema.paid_capacity_claims_table.c.
+                provider_allocation_receipt_sha256,
+            ).where(
+                serve_state_schema.paid_capacity_claims_table.c.service_name ==
+                'svc',
+                serve_state_schema.paid_capacity_claims_table.c.service_hash ==
+                'svc-hash',
+                serve_state_schema.paid_capacity_claims_table.c.replica_id ==
+                3)).one()
     assert phase == binding.EffectPhase.NOT_STARTED.value
+    assert allocation_marker == (None, None)
 
 
 @pytest.mark.parametrize('historical_protocol', [8, 9])
@@ -1181,7 +1567,7 @@ def _reserved_fill_cleanup_rows(
 def test_reserved_fill_cleanup_accepts_exact_adjacent_cohort_tuple(
         binding_database, monkeypatch) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
-    assert current_cohort == 11
+    assert current_cohort == 14
     service, replica, association, expected_profile = (
         _reserved_fill_cleanup_rows(current_cohort - 1, current_cohort - 1))
     validated: list[binding.NonPoolLaunchProfile] = []
@@ -1210,7 +1596,7 @@ def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
     current_projection = (
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    assert (current_cohort, current_projection) == (11, 10)
+    assert (current_cohort, current_projection) == (14, 10)
     historical_cohort = current_cohort - history_distance
     historical_projection = current_projection - history_distance
     info = _reserved_fill_replica_info()
@@ -2169,7 +2555,7 @@ def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
 def test_reserved_fill_cleanup_rejects_older_or_mismatched_cohorts(
         binding_database, monkeypatch, service_cohort,
         association_cohort) -> None:
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 13
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 14
     service, replica, association, _ = _reserved_fill_cleanup_rows(
         service_cohort, association_cohort)
     profile_validation_called = False
@@ -4150,17 +4536,19 @@ class _Claim:
 
 def test_legacy_paid_effect_revalidates_planner_only_before_provider_io(
         binding_database, monkeypatch) -> None:
-    state = _stored_replica_state({'paid_capacity_pool_key': 'pool-a'})
+    state = _stored_replica_state(
+        {'paid_capacity_pool_key': _CURRENT_PAID_POOL_KEY})
     with binding_database.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.replicas_table).where(
                 serve_state_schema.replicas_table.c.service_name == 'svc',
                 serve_state_schema.replicas_table.c.replica_id == 3).values(
-                    paid_capacity_pool_key='pool-a', replica_state=state))
+                    paid_capacity_pool_key=_CURRENT_PAID_POOL_KEY,
+                    replica_state=state))
         connection.execute(
             sqlalchemy.insert(
                 serve_state_schema.paid_capacity_pools_table).values(
-                    pool_key='pool-a',
+                    pool_key=_CURRENT_PAID_POOL_KEY,
                     current_limit=1,
                     successes_since_resize=0,
                     updated_at=time.time()))
@@ -4170,7 +4558,7 @@ def test_legacy_paid_effect_revalidates_planner_only_before_provider_io(
                     service_name='svc',
                     service_hash='svc-hash',
                     replica_id=3,
-                    pool_key='pool-a',
+                    pool_key=_CURRENT_PAID_POOL_KEY,
                     priority=1,
                     claimed_at=time.time()))
     identity, admission = _admit(binding_database)

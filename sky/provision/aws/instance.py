@@ -171,13 +171,23 @@ def _get_head_instance_id(instances: list) -> str | None:
 
 
 def _capture_fresh_instance_identity(
-        request_session: Any, *, region: str,
-        created_instance_ids: list[str]) -> common.AWSInstanceIdentity | None:
-    """Read one created instance and caller account with the same session."""
+    request_session: Any,
+    *,
+    region: str,
+    created_instance_ids: list[str],
+    expected_aws_account_id: str | None = None,
+) -> common.AWSInstanceIdentity | None:
+    """Wait for and read one exact created instance with the same session."""
     if request_session is None or len(created_instance_ids) != 1:
         return None
     instance_id = created_instance_ids[0]
     ec2_client = request_session.client('ec2', region_name=region)
+    waiter = ec2_client.get_waiter('instance_running')
+    waiter.wait(InstanceIds=[instance_id],
+                WaiterConfig={
+                    'Delay': 5,
+                    'MaxAttempts': 120,
+                })
     response = ec2_client.describe_instances(InstanceIds=[instance_id])
     reservations = response.get('Reservations')
     if not isinstance(reservations, list):
@@ -191,6 +201,9 @@ def _capture_fresh_instance_identity(
     if len(instances) != 1 or instances[0].get('InstanceId') != instance_id:
         raise ValueError('DescribeInstances did not return the exact create.')
     instance = instances[0]
+    state = instance.get('State')
+    if not isinstance(state, dict) or state.get('Name') != 'running':
+        raise ValueError('DescribeInstances did not return a running instance.')
     instance_type = instance.get('InstanceType')
     if not isinstance(instance_type, str) or not instance_type:
         raise ValueError('DescribeInstances returned no instance type.')
@@ -211,6 +224,9 @@ def _capture_fresh_instance_identity(
     account_id = caller_identity.get('Account')
     if not isinstance(account_id, str) or not account_id:
         raise ValueError('STS returned no AWS account ID.')
+    if (expected_aws_account_id is not None and
+            account_id != expected_aws_account_id):
+        raise ValueError('STS account does not match the expected AWS account.')
     return common.AWSInstanceIdentity(aws_account_id=account_id,
                                       region=region,
                                       availability_zone=availability_zone,
@@ -947,10 +963,11 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
         fresh_identity = _capture_fresh_instance_identity(
             request_session,
             region=region,
-            created_instance_ids=created_instance_ids)
+            created_instance_ids=created_instance_ids,
+            expected_aws_account_id=config.provider_create_account_id)
     except Exception as error:  # pylint: disable=broad-except
-        # Provisioning itself succeeded. Optional system-recovery evidence is
-        # fail-closed and must not make the ordinary launch fail.
+        # Provisioning itself succeeded. Optional exact fresh-instance evidence
+        # is fail-closed and must not make the ordinary launch fail.
         logger.debug('Fresh AWS identity evidence is unavailable: '
                      f'{common_utils.format_exception(error)}')
     return common.ProvisionRecord(provider_name='aws',

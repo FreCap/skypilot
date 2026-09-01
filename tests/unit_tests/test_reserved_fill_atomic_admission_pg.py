@@ -882,13 +882,13 @@ def test_serve059_lineage_and_sqlite_ceiling() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['065']
+    assert scripts.get_heads() == ['066']
     assert scripts.get_revision('060').down_revision == '059'
     assert scripts.get_revision('059').down_revision == '058'
     assert scripts.get_revision('058').down_revision == '057'
     assert scripts.get_revision('056').down_revision == '055'
     assert scripts.get_revision('055').down_revision == '054'
-    assert migration_utils.SERVE_VERSION == '065'
+    assert migration_utils.SERVE_VERSION == '066'
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
         alembic_command.upgrade(config, '056')

@@ -525,10 +525,10 @@ def test_serve056_lineage_and_postgresql_only() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
     revision = scripts.get_revision('052')
-    assert scripts.get_heads() == ['065']
+    assert scripts.get_heads() == ['066']
     assert scripts.get_revision('056').down_revision == '055'
     assert revision.down_revision == '051'
-    assert migration_utils.SERVE_VERSION == '065'
+    assert migration_utils.SERVE_VERSION == '066'
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
         alembic_command.upgrade(config, '056')

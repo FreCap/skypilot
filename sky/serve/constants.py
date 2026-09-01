@@ -1155,7 +1155,10 @@ MAX_NUMBER_OF_SERVICES_REACHED_ERROR = 'Max number of services reached'
 # shared-cache reserve correction rotated it to epoch 10. Protocol-v11's exact
 # ordinary-paid AWS negative-ack settlement rotated it to epoch 11. Protocol-v12
 # retains timed-out GCE operation evidence and reconciles exact VM, disk, and
-# create-operation state. Every live API, controller, and executor participant
-# and every service capability tuple must agree before a new paid provider
-# effect can rely on these semantics; adjacent cohorts remain settlement-only.
-NON_POOL_CAPABILITY_COHORT_EPOCH = 13
+# create-operation state. Protocol-v13 binds paid AWS replacement creates to
+# the exact account identity. Protocol-v14 checkpoints a full-fresh paid Spot
+# provider allocation before runtime setup and applies its pool feedback once.
+# Every live API, controller, and executor participant and every service
+# capability tuple must agree before a new paid provider effect can rely on
+# these semantics; adjacent cohorts remain settlement-only.
+NON_POOL_CAPABILITY_COHORT_EPOCH = 14

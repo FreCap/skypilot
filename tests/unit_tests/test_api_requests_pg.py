@@ -255,6 +255,31 @@ class _PaidProviderAbsenceGraph:
     receipt: dict[str, object]
 
 
+def _gc_paid_provider_allocation_receipt(
+    graph: _PaidProviderAbsenceGraph,
+    provider: str,
+    identity: dict[str, object],
+) -> paid_capacity.PaidProviderAllocationReceipt:
+    return paid_capacity.PaidProviderAllocationReceipt(
+        association_id=str(graph.context.association_id),
+        replica_record_id=str(graph.context.replica_record_id),
+        provider=provider,
+        workspace=str(identity['workspace']),
+        provider_identity=(str(identity['aws_account_id'])
+                           if provider == 'aws' else None),
+        provider_project_id=(str(identity['project_id'])
+                             if provider == 'gcp' else None),
+        region=str(identity['region']),
+        zone=str(identity['zone']),
+        instance_type=str(identity['instance_type']),
+        cluster_name_on_cloud=str(identity['cluster_name_on_cloud']),
+        requested_num_nodes=int(identity['num_nodes']),
+        head_instance_id='provider-instance-a',
+        created_instance_ids=('provider-instance-a',),
+        resumed_instance_ids=(),
+        use_spot=True)
+
+
 @pytest.fixture(scope='module')
 def postgres_engine():
     container = None
@@ -595,6 +620,7 @@ def _prepare_paid_provider_absence_graph(
     effect_phase: ordinary_launch_binding.EffectPhase = (
         ordinary_launch_binding.EffectPhase.PROVIDER_IO),
     canonical_paid_claim_priority: int | None = None,
+    terminalize: bool = True,
 ) -> _PaidProviderAbsenceGraph:
     if not ordinary_launch_binding.is_paid_provider_reconciliation_phase(
             effect_phase):
@@ -892,38 +918,39 @@ def _prepare_paid_provider_absence_graph(
                     effect_phase_changed_at=(sqlalchemy.func.clock_timestamp()),
                     owner_revision=association.c.owner_revision + 1,
                     updated_at=sqlalchemy.func.clock_timestamp()))
-        if explicit_cancel:
-            ordinary_launch_binding.request_cancel_in_connection(
-                connection, context, 'service-teardown')
-        assert ordinary_launch_binding.mark_ambiguous_in_connection(
-            connection, context, 'provider-result-uncertain')
-        connection.execute(
-            sqlalchemy.delete(request_postgres.QUEUE).where(
-                request_postgres.QUEUE.c.request_id == context.request_id))
-        now = sqlalchemy.func.clock_timestamp()
-        quiesced_at = (
-            datetime.datetime.now(datetime.timezone.utc) -
-            datetime.timedelta(seconds=ordinary_launch_binding.
+        if terminalize:
+            if explicit_cancel:
+                ordinary_launch_binding.request_cancel_in_connection(
+                    connection, context, 'service-teardown')
+            assert ordinary_launch_binding.mark_ambiguous_in_connection(
+                connection, context, 'provider-result-uncertain')
+            connection.execute(
+                sqlalchemy.delete(request_postgres.QUEUE).where(
+                    request_postgres.QUEUE.c.request_id == context.request_id))
+            now = sqlalchemy.func.clock_timestamp()
+            quiesced_at = (datetime.datetime.now(datetime.timezone.utc) -
+                           datetime.timedelta(
+                               seconds=ordinary_launch_binding.
                                ORDINARY_PAID_GCP_ABSENCE_SETTLE_SECONDS + 1))
-        connection.execute(
-            sqlalchemy.update(request_postgres.REQUESTS).where(
-                request_postgres.REQUESTS.c.request_id ==
-                context.request_id).values(
-                    status=(requests.RequestStatus.CANCELLED.value
+            connection.execute(
+                sqlalchemy.update(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    context.request_id).values(
+                        status=(requests.RequestStatus.CANCELLED.value
+                                if explicit_cancel else
+                                requests.RequestStatus.FAILED.value),
+                        terminal_cause=(
+                            event_api_models.EventCause.EXPLICIT_CANCEL.value
                             if explicit_cancel else
-                            requests.RequestStatus.FAILED.value),
-                    terminal_cause=(
-                        event_api_models.EventCause.EXPLICIT_CANCEL.value
-                        if explicit_cancel else
-                        event_api_models.EventCause.HANDLER_FAILED.value),
-                    execution_generation=1,
-                    execution_quiescence_required=True,
-                    execution_quiesced_generation=1,
-                    execution_quiesced_at=quiesced_at,
-                    error=(None if explicit_cancel else
-                           _gc_provider_negative_ack_error(receipt)),
-                    finished_at=now,
-                    updated_at=now))
+                            event_api_models.EventCause.HANDLER_FAILED.value),
+                        execution_generation=1,
+                        execution_quiescence_required=True,
+                        execution_quiesced_generation=1,
+                        execution_quiesced_at=quiesced_at,
+                        error=(None if explicit_cancel else
+                               _gc_provider_negative_ack_error(receipt)),
+                        finished_at=now,
+                        updated_at=now))
     return _PaidProviderAbsenceGraph(engine=engine,
                                      context=context,
                                      authority=authority,
@@ -3102,6 +3129,80 @@ def test_aws_paid_exact_identity_covers_provider_backed_phases(
         'workspace': 'workspace-a',
         'zone': 'us-east-1a',
     }
+
+
+@pytest.mark.parametrize(('provider', 'pool_key'), [
+    ('aws', _gc_paid_pool_key()),
+    ('gcp', _gc_gcp_paid_pool_key()),
+])
+def test_paid_provider_allocation_receipt_matches_locked_request_authority(
+        bound_request_database, monkeypatch, provider: str,
+        pool_key: str) -> None:
+    graph = _prepare_paid_provider_absence_graph(bound_request_database,
+                                                 monkeypatch,
+                                                 pool_key=pool_key,
+                                                 terminalize=False)
+    if provider == 'aws':
+        identity = {
+            'aws_account_id': '123456789012',
+            'cluster_name_on_cloud': _gc_cloud_cluster_name(),
+            'instance_type': 'g6.xlarge',
+            'num_nodes': 1,
+            'region': 'us-east-1',
+            'use_spot': True,
+            'workspace': 'workspace-a',
+            'zone': 'us-east-1a',
+        }
+    else:
+        identity = {
+            'cluster_name_on_cloud':
+                common_utils.make_cluster_name_on_cloud_for_user(
+                    'gc-service-3',
+                    max_length=clouds.GCP.max_cluster_name_length(),
+                    cluster_name_hash_length=clouds.GCP.
+                    cluster_name_hash_length(),
+                    user_hash='tenant-a'),
+            'instance_type': 'g2-standard-4',
+            'num_nodes': 1,
+            'project_id': 'boltz-498512',
+            'region': 'us-east4',
+            'use_spot': True,
+            'workspace': 'workspace-a',
+            'zone': 'us-east4-a',
+        }
+    receipt = _gc_paid_provider_allocation_receipt(graph, provider, identity)
+
+    with graph.engine.begin() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == graph.context.association_id).
+            with_for_update()).mappings().one()
+        assert request_postgres.validate_paid_provider_allocation_receipt_in_transaction(
+            connection, graph.context, association, receipt)
+        for changes in ({
+                'workspace': 'different-workspace'
+        }, {
+                'region': 'different-region'
+        }, {
+                'zone': 'different-zone'
+        }, {
+                'instance_type': 'different-instance-type'
+        }, {
+                'cluster_name_on_cloud': 'different-cluster'
+        }):
+            assert not request_postgres.validate_paid_provider_allocation_receipt_in_transaction(
+                connection, graph.context, association,
+                dataclasses.replace(receipt, **changes))
+        if provider == 'aws':
+            wrong_provider_scope = dataclasses.replace(
+                receipt, provider_identity='210987654321')
+        else:
+            wrong_provider_scope = dataclasses.replace(
+                receipt, provider_project_id='different-project')
+        assert not request_postgres.validate_paid_provider_allocation_receipt_in_transaction(
+            connection, graph.context, association, wrong_provider_scope)
 
 
 def test_aws_negative_ack_does_not_settle_service_job_io(
