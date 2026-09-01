@@ -93,6 +93,59 @@ def test_validate_report_accepts_complete_bounded_snapshot():
     assert complete is True
 
 
+def test_validate_report_accepts_capacity_attribution_window():
+    report = _report()
+    report['demand_window']['window_seconds'] = (
+        constants.LB_DEMAND_WINDOW_SECONDS)
+
+    normalized, _, complete = demand_state._validate_report(report)
+
+    assert normalized['demand_window']['window_seconds'] == (
+        constants.LB_DEMAND_WINDOW_SECONDS)
+    assert complete is True
+
+
+@pytest.mark.parametrize(
+    ('window_seconds', 'event_age', 'expected_timestamps', 'expected_profiles'),
+    [
+        (constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS, 30, 1, 1),
+        (constants.LB_DEMAND_WINDOW_SECONDS, 30, 1, 1),
+        (constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS, 61, 0, 0),
+        (constants.LB_DEMAND_WINDOW_SECONDS, 61, 0, 1),
+        (constants.LB_DEMAND_WINDOW_SECONDS, 301, 0, 0),
+    ])
+def test_normalize_demand_window_preserves_only_exact_long_horizon(
+        window_seconds, event_age, expected_timestamps, expected_profiles):
+    now = 1_000.0
+    effective_end = now - event_age
+    bucket_seconds = constants.LB_DEMAND_WINDOW_BUCKET_SECONDS
+    window = {
+        'bucket_seconds': bucket_seconds,
+        'window_seconds': window_seconds,
+        'buckets': [{
+            'bucket_start': int(effective_end - bucket_seconds),
+            'request_count': 1,
+            'compatibility_profiles': [{
+                'priority': 50,
+                'compatible_accelerators': ['L4'],
+                'count': 1,
+            }],
+        }],
+    }
+
+    normalized = demand_state._normalize_demand_window_for_autoscaling(
+        window,
+        received_epoch=now,
+        reporter_epoch=now,
+        now_epoch=now,
+        timestamp_limit=constants.LB_REQUEST_TIMESTAMP_CAP)
+
+    assert normalized is not None
+    timestamps, profiles = normalized
+    assert len(timestamps) == expected_timestamps
+    assert len(profiles) == expected_profiles
+
+
 def test_validate_report_accepts_one_waiter_authoritative_queue_snapshot():
     """Outer retry pressure cannot corrupt the exact waiter queue contract."""
     lb = load_balancer.SkyServeLoadBalancer('http://controller:8001', 30001)

@@ -319,7 +319,11 @@ def _validate_demand_window(
     window_seconds = value.get('window_seconds')
     if bucket_seconds != constants.LB_DEMAND_WINDOW_BUCKET_SECONDS:
         raise DemandReportError('demand_window bucket_seconds is unsupported.')
-    if window_seconds != constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS:
+    # Protocol-v2 load balancers originally retained only the 60-second QPS
+    # window.  Accept both shapes so the decoder can be deployed before the
+    # producer begins retaining the full exact-attribution horizon.
+    if window_seconds not in (constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS,
+                              constants.LB_DEMAND_WINDOW_SECONDS):
         raise DemandReportError('demand_window window_seconds is unsupported.')
     buckets = value.get('buckets')
     max_buckets = window_seconds // bucket_seconds + 2
@@ -396,6 +400,43 @@ def _validate_demand_window(
         'compatibility_complete': compatibility_complete,
         'saturated': saturated,
     }, compatibility_complete, compatibility_accelerators
+
+
+def _normalize_demand_window_for_autoscaling(
+    window: Mapping[str, Any],
+    *,
+    received_epoch: float,
+    reporter_epoch: float,
+    now_epoch: float,
+    timestamp_limit: int,
+) -> tuple[list[float], list[dict[str, Any]]] | None:
+    """Translate either accepted window shape into one autoscaler projection.
+
+    Exact accelerator profiles retain the envelope's declared horizon.  Raw
+    timestamps remain the documented 60-second QPS projection; retaining them
+    for 300 seconds would inflate fallback request-rate estimates and the
+    public recent-request count.
+    """
+    bucket_seconds = int(window['bucket_seconds'])
+    window_seconds = int(window['window_seconds'])
+    timestamps: list[float] = []
+    compatibility_profiles: list[dict[str, Any]] = []
+    for bucket in window['buckets']:
+        effective_end = (received_epoch + int(bucket['bucket_start']) +
+                         bucket_seconds - reporter_epoch)
+        if effective_end <= now_epoch - window_seconds:
+            continue
+        count = int(bucket['request_count'])
+        if (effective_end >
+                now_epoch - constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS):
+            if len(timestamps) + count > timestamp_limit:
+                return None
+            timestamps.extend([effective_end] * count)
+        for raw_profile in bucket['compatibility_profiles']:
+            profile = dict(raw_profile)
+            profile['timestamp'] = effective_end
+            compatibility_profiles.append(profile)
+    return timestamps, compatibility_profiles
 
 
 def _validate_report(raw: Any) -> tuple[dict[str, Any], str, bool]:
@@ -1411,7 +1452,6 @@ def get_autoscaling_snapshot(
         })
         reporter_epoch = row['reporter_observed_at'].timestamp()
         window = payload['demand_window']
-        bucket_seconds = int(window['bucket_seconds'])
         coverage_started_at = window.get('coverage_started_at')
         aggregate_window_covered = bool(
             aggregate_window_covered and isinstance(coverage_started_at,
@@ -1425,20 +1465,18 @@ def get_autoscaling_snapshot(
         offered_arrival_tracking_saturated = bool(
             offered_arrival_tracking_saturated or window.get('saturated') or
             payload.get('offered_arrival_tracking_saturated'))
-        for bucket in window['buckets']:
-            effective_end = (row['received_at'].timestamp() +
-                             int(bucket['bucket_start']) + bucket_seconds -
-                             reporter_epoch)
-            if effective_end <= now_epoch - int(window['window_seconds']):
-                continue
-            count = int(bucket['request_count'])
-            if len(timestamps) + count > constants.LB_REQUEST_TIMESTAMP_CAP:
-                return None
-            timestamps.extend([effective_end] * count)
-            for raw_profile in bucket['compatibility_profiles']:
-                profile = dict(raw_profile)
-                profile['timestamp'] = effective_end
-                compatibility_profiles.append(profile)
+        normalized_window = _normalize_demand_window_for_autoscaling(
+            window,
+            received_epoch=row['received_at'].timestamp(),
+            reporter_epoch=reporter_epoch,
+            now_epoch=now_epoch,
+            timestamp_limit=(constants.LB_REQUEST_TIMESTAMP_CAP -
+                             len(timestamps)))
+        if normalized_window is None:
+            return None
+        row_timestamps, row_profiles = normalized_window
+        timestamps.extend(row_timestamps)
+        compatibility_profiles.extend(row_profiles)
         queue_depth += int(payload['queue_depth'])
         rejected += int(payload['rejected_in_window'])
         recent_rejected += int(payload['rejected_in_recent_window'])

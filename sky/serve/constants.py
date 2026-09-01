@@ -528,6 +528,11 @@ LB_DEMAND_REPORT_RETENTION_SECONDS = 60 * 60
 LB_DEMAND_REPORT_MAX_REPORTERS = 32
 LB_DEMAND_REPORT_MAX_BYTES = 512 * 1024
 LB_DEMAND_WINDOW_BUCKET_SECONDS = 5
+# Exact accelerator attribution must outlive every aggregate arrival signal
+# that can contribute to the logical capacity target.  Otherwise the retained
+# 300-second offered-arrival floor can stay positive after its exact-card
+# evidence expires and the paid planner must fail closed.
+LB_DEMAND_WINDOW_SECONDS = LB_OFFERED_ARRIVAL_WINDOW_SECONDS
 # Once the direct feed is fresh, controller status enrichment is optional for
 # request visibility.  Keep that enrichment bounded so a wedged controller
 # cannot make the durable request card disappear behind the client timeout.
