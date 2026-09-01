@@ -8,6 +8,8 @@ active, its target-qps map, the stored stream timeout) -- not on any logging.
 """
 # pylint: disable=invalid-name,protected-access
 import asyncio
+import datetime
+import pathlib
 import threading
 import time
 import types
@@ -15,10 +17,15 @@ from unittest import mock
 
 import pytest
 
+import sky
+from sky.serve import autoscalers
 from sky.serve import constants
+from sky.serve import controller
+from sky.serve import demand_state
 from sky.serve import lb_ha
 from sky.serve import load_balancer
 from sky.serve import load_balancing_policies as lb_policies
+from sky.serve import route_projection
 
 
 def _make_lb(policy_name=None) -> load_balancer.SkyServeLoadBalancer:
@@ -356,6 +363,67 @@ def _run_one_sync(lb: load_balancer.SkyServeLoadBalancer,
         else:
             asyncio.run(lb._sync_with_controller_once())
     return session
+
+
+def test_zero_replica_projected_route_emits_complete_active_demand(
+        monkeypatch: pytest.MonkeyPatch):
+    """The paid-capacity fixture can report complete demand from zero."""
+    monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'lb-pod-uid-a')
+    fixture_path = (pathlib.Path(__file__).parents[1] / 'skyserve' /
+                    'paid_capacity' / 'service.yaml')
+    yaml_content = fixture_path.read_text(encoding='utf-8')
+    task = sky.Task.from_yaml_str(yaml_content)
+    assert task.service is not None
+    autoscaler = autoscalers.Autoscaler.from_spec('spot-e2e', task.service)
+    service_controller = controller.SkyServeController.__new__(
+        controller.SkyServeController)
+    service_controller._autoscaler = autoscaler
+    service_controller._replica_manager = types.SimpleNamespace(
+        yaml_content=yaml_content, spot_placer=None)
+    routing_spec = service_controller._build_routing_spec(task.service)
+    assert routing_spec is not None
+
+    projected = route_projection.build_incremental_route_view(
+        [], [],
+        set(),
+        now=datetime.datetime.now(datetime.timezone.utc),
+        service_version=7,
+        routing_spec=routing_spec,
+        capacity_hint={})
+    response = dict(projected.response)
+    response.update({
+        'route_projection_generation': 11,
+        'route_projection_sha256': 'a' * 64,
+        'route_source_epoch': 3,
+    })
+    lb = load_balancer.SkyServeLoadBalancer('http://ctrl:8001',
+                                            8890,
+                                            lb_slot=lb_ha.LbSlot.A)
+    lb._lb_role = lb_ha.LbRole.ACTIVE
+    lb._lb_role_generation = 4
+
+    session = _run_one_sync(lb, response)
+    sync_payload = session.post_calls[0][1]['json']
+    demand_report, _, _, _ = lb._build_demand_report()
+    normalized, _, complete = demand_state._validate_report(demand_report)
+
+    assert projected.response['replica_info'] == {}
+    assert projected.response['num_ready_replicas'] == 0
+    assert sync_payload['in_flight'] == {}
+    assert sync_payload['unknown_in_flight_urls'] == []
+    assert normalized['applied_role'] == lb_ha.LbRole.ACTIVE.value
+    assert normalized['applied_generation'] == 4
+    assert normalized['routing_version'] == 7
+    assert normalized['route_projection_generation'] == 11
+    assert normalized['route_projection_sha256'] == 'a' * 64
+    assert normalized['route_source_epoch'] == 3
+    assert normalized['routing_urls'] == []
+    assert normalized['http_in_flight'] == {}
+    assert normalized['async_occupancy'] == {}
+    assert normalized['unknown_in_flight_urls'] == []
+    assert normalized['configured_accelerators'] == ['L4']
+    assert normalized['request_accelerator_compatibility_version'] == 1
+    assert complete is True
 
 
 def test_cold_lb_observes_retired_async_url_without_routing_it():
