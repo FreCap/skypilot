@@ -716,6 +716,90 @@ def test_cleanup_census_counts_instance_after_cluster_label_loss():
     assert state.running_count == 1
 
 
+@pytest.mark.parametrize('child_status', ('RUNNING', 'DONE'))
+def test_cleanup_census_attributes_bulk_insert_parent_by_operation_lineage(
+        child_status):
+    operation_group_id = '3fd64c92-0559-4aac-85ea-abd455118d1d'
+    state = qualifier.parse_gcp_cleanup_state(
+        service_name='paid-e2e',
+        instances=[],
+        disks=[],
+        operations=[{
+            'name': 'provider-generated-bulk-operation',
+            'operationType': 'bulkInsert',
+            'operationGroupId': operation_group_id,
+            'status': 'RUNNING',
+            'targetLink': ('https://compute.googleapis.com/compute/v1/'
+                           'projects/project'),
+        }, {
+            'name': 'provider-generated-child-operation',
+            'operationType': 'insert',
+            'operationGroupId': operation_group_id,
+            'status': child_status,
+            'targetLink': ('https://compute.googleapis.com/compute/v1/'
+                           'projects/project/zones/us-central1-a/instances/'
+                           'paid-e2e-1-head-1234abcd-compute'),
+        }])
+    # An active child remains one target, while a terminal child leaves its
+    # still-running bulk parent as one in-flight lineage.
+    assert state.inflight_operation_count == 1
+
+
+def test_cleanup_census_does_not_guess_bulk_insert_parent_from_name():
+    operation_group_id = '97d626fe-7df7-4c0d-81de-3e17fbefa589'
+    state = qualifier.parse_gcp_cleanup_state(
+        service_name='paid-e2e',
+        instances=[],
+        disks=[],
+        operations=[
+            {
+                # Neither an operation-name prefix nor a shared group with
+                # another service is ownership evidence for this service.
+                'name': 'paid-e2e-bulk-insert',
+                'operationType': 'bulkInsert',
+                'operationGroupId': operation_group_id,
+                'status': 'RUNNING',
+                'targetLink': ('https://compute.googleapis.com/compute/v1/'
+                               'projects/project'),
+            },
+            {
+                'name': 'unrelated-child-operation',
+                'operationType': 'insert',
+                'operationGroupId': operation_group_id,
+                'status': 'DONE',
+                'targetLink': ('https://compute.googleapis.com/compute/v1/'
+                               'projects/project/zones/us-central1-a/instances/'
+                               'unrelated-1-head-1234abcd-compute'),
+            }
+        ])
+    assert state.inflight_operation_count == 0
+
+
+def test_cleanup_census_ignores_terminal_bulk_insert_lineage():
+    operation_group_id = '3fd64c92-0559-4aac-85ea-abd455d7b607'
+    state = qualifier.parse_gcp_cleanup_state(
+        service_name='paid-e2e',
+        instances=[],
+        disks=[],
+        operations=[{
+            'name': 'provider-generated-bulk-operation',
+            'operationType': 'bulkInsert',
+            'operationGroupId': operation_group_id,
+            'status': 'DONE',
+            'targetLink': ('https://compute.googleapis.com/compute/v1/'
+                           'projects/project'),
+        }, {
+            'name': 'provider-generated-child-operation',
+            'operationType': 'insert',
+            'operationGroupId': operation_group_id,
+            'status': 'DONE',
+            'targetLink': ('https://compute.googleapis.com/compute/v1/'
+                           'projects/project/zones/us-central1-a/instances/'
+                           'paid-e2e-1-head-1234abcd-compute'),
+        }])
+    assert state.inflight_operation_count == 0
+
+
 def test_provider_census_uses_binding_derived_tenant_hashed_name():
     cloud_name = 'paid-e2e-1-tenanthash'
     generated_name = f'{cloud_name}-head-1234abcd-compute'
@@ -745,6 +829,60 @@ def test_provider_census_uses_binding_derived_tenant_hashed_name():
     assert state.disk_count == 1
     assert state.inflight_operation_count == 1
     assert state.cluster_names == frozenset({cloud_name})
+
+
+@pytest.mark.parametrize('child_status', ('RUNNING', 'DONE'))
+def test_provider_reducer_attributes_bound_bulk_insert_parent_once(
+        child_status):
+    operation_group_id = 'c935584d-d1a3-4db7-a825-f799c34cc454'
+    child = {
+        'operationType': 'insert',
+        'operationGroupId': operation_group_id,
+        'status': child_status,
+        'targetLink': ('https://compute.googleapis.com/compute/v1/projects/'
+                       'project/zones/us-central1-a/instances/'
+                       'paid-e2e-1-head-1234abcd-compute'),
+    }
+    parent = {
+        'name': 'provider-generated-bulk-operation',
+        'operationType': 'bulkInsert',
+        'operationGroupId': operation_group_id,
+        'status': 'RUNNING',
+        'targetLink': ('https://compute.googleapis.com/compute/v1/projects/'
+                       'project'),
+    }
+    state = qualifier.parse_gcp_state(
+        service_name='paid-e2e',
+        expected_cluster_zones={'paid-e2e-1': 'us-central1-a'},
+        profile=qualifier.PROFILES['small'],
+        instances=[],
+        disks=[],
+        operations=[parent, child])
+    assert state.inflight_operation_count == 1
+
+    wrong_zone_child = {
+        **child,
+        'targetLink': child['targetLink'].replace('us-central1-a',
+                                                  'us-east1-b'),
+    }
+    with pytest.raises(qualifier.GuardViolation,
+                       match='outside its binding zone'):
+        qualifier.parse_gcp_state(
+            service_name='paid-e2e',
+            expected_cluster_zones={'paid-e2e-1': 'us-central1-a'},
+            profile=qualifier.PROFILES['small'],
+            instances=[],
+            disks=[],
+            operations=[parent, wrong_zone_child])
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='without a durable launch binding'):
+        qualifier.parse_gcp_state(service_name='paid-e2e',
+                                  expected_cluster_zones={},
+                                  profile=qualifier.PROFILES['small'],
+                                  instances=[],
+                                  disks=[],
+                                  operations=[parent, child])
 
 
 def test_paid_debit_includes_failed_until_cleanup_is_proven():
@@ -1570,9 +1708,8 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
     assert samples[0]['provider_running'] == 20
     assert samples[0]['provider_free_unbound_replicas'] == 1
     assert samples[2]['provider_free_unbound_replicas'] == 0
-    assert [
-        sample.get('observation_error_type') for sample in samples
-    ] == [None, 'QualificationError', None]
+    assert [sample.get('observation_error_type') for sample in samples
+           ] == [None, 'QualificationError', None]
 
 
 def test_pressure_remains_continuous_until_scale_converges(monkeypatch):
