@@ -1588,7 +1588,7 @@ Controls request proxy behavior for the SkyServe load balancer.
           max_size: 1000
           max_concurrency_per_replica: 1
           max_concurrency: 32
-          timeout_seconds: 120
+          timeout_seconds: 600
           max_request_body_bytes: 1048576
           use_async_occupancy: false
 
@@ -1680,7 +1680,7 @@ allowing large queues of small payloads.
           max_size: 1000
           max_concurrency_per_replica: 1
           max_concurrency: 32
-          timeout_seconds: 120
+          timeout_seconds: 600
           max_request_body_bytes: 1048576
           use_async_occupancy: false
 
