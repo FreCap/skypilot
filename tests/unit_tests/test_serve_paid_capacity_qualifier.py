@@ -7,11 +7,14 @@ import datetime
 import hashlib
 import importlib.util
 import json
+import os
 import pathlib
 import shlex
+import socket
 import subprocess
 import sys
-import threading
+import time
+import urllib.error
 import urllib.request
 
 import pytest
@@ -33,7 +36,6 @@ def _load_module(name: str, path: pathlib.Path):
 
 _FIXTURE_DIR = pathlib.Path(__file__).parents[1] / 'skyserve' / 'paid_capacity'
 qualifier = _load_module('paid_capacity_qualifier', _FIXTURE_DIR / 'qualify.py')
-worker = _load_module('paid_capacity_worker', _FIXTURE_DIR / 'server.py')
 
 
 def _instance(*,
@@ -151,7 +153,12 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
         assert resources['infra'] == 'gcp/us-central1'
         assert resources['instance_type'] == 'g2-standard-4'
         assert resources['accelerators'] == 'L4:1'
+        assert 'workdir' not in config
+        assert 'file_mounts' not in config
+        assert 'server.py' not in config['run']
+        assert "exec python3 - <<'PY'" in config['run']
         task = sky.Task.from_yaml_str(output.read_text(encoding='utf-8'))
+        assert task.workdir is None
         serve_utils.validate_service_task(task, pool=False)
 
 
@@ -1106,14 +1113,34 @@ def test_one_request_rejects_identity_only_acknowledgement():
 
 
 def test_worker_exposes_health_occupancy_and_stable_identity():
-    server = worker._Server(('127.0.0.1', 0), worker._Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    endpoint = f'http://127.0.0.1:{server.server_port}'
+    config = yaml.safe_load(
+        (_FIXTURE_DIR / 'service.yaml').read_text(encoding='utf-8'))
+    with socket.socket() as port_socket:
+        port_socket.bind(('127.0.0.1', 0))
+        port = port_socket.getsockname()[1]
+    process = subprocess.Popen(['bash', '-c', config['run']],
+                               env={
+                                   **os.environ, 'PORT': str(port)
+                               },
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE,
+                               text=True)
+    endpoint = f'http://127.0.0.1:{port}'
     try:
-        with urllib.request.urlopen(f'{endpoint}/health',
-                                    timeout=2) as response:
-            assert json.load(response) == {'status': 'ok'}
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                with urllib.request.urlopen(f'{endpoint}/health',
+                                            timeout=1) as response:
+                    assert json.load(response) == {'status': 'ok'}
+                break
+            except urllib.error.URLError:
+                if process.poll() is not None:
+                    _, stderr = process.communicate(timeout=1)
+                    pytest.fail(f'Inline worker exited early: {stderr}')
+                if time.monotonic() >= deadline:
+                    pytest.fail('Inline worker did not become healthy.')
+                time.sleep(0.05)
         capacity_request = urllib.request.Request(
             f'{endpoint}/v1/models/model:predict',
             data=json.dumps({
@@ -1139,6 +1166,9 @@ def test_worker_exposes_health_occupancy_and_stable_identity():
                 'status': 'ok',
             }
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)

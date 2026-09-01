@@ -37,6 +37,80 @@ resources:
   use_spot: true
   ports: 8080
 
-workdir: tests/skyserve/paid_capacity
+run: |
+  exec python3 - <<'PY'
+  import http.server
+  import json
+  import os
+  import threading
+  import time
 
-run: python3 server.py --port 8080
+  _lock = threading.Lock()
+  _running = 0
+
+  class Handler(http.server.BaseHTTPRequestHandler):
+      server_version = 'SkyServePaidCapacityTest/1'
+
+      def log_message(self, _format, *_args):
+          pass
+
+      def write_json(self, status, payload):
+          body = json.dumps(payload, sort_keys=True).encode()
+          self.send_response(status)
+          self.send_header('Content-Type', 'application/json')
+          self.send_header('Content-Length', str(len(body)))
+          self.end_headers()
+          try:
+              self.wfile.write(body)
+          except (BrokenPipeError, ConnectionResetError):
+              pass
+
+      def do_GET(self):
+          if self.path == '/health':
+              self.write_json(200, {'status': 'ok'})
+          else:
+              self.write_json(404, {'error': 'not found'})
+
+      def do_POST(self):
+          global _running
+          if self.path != '/v1/models/model:predict':
+              self.write_json(404, {'error': 'not found'})
+              return
+          try:
+              length = int(self.headers.get('Content-Length', '0'))
+              payload = json.loads(self.rfile.read(length) or b'{}')
+          except (ValueError, json.JSONDecodeError):
+              self.write_json(400, {'error': 'invalid JSON'})
+              return
+          if payload.get('action') == 'async_capacity':
+              with _lock:
+                  running = _running
+              self.write_json(200, {
+                  'status': 'READY',
+                  'running_count': running,
+                  'predict_concurrency': 1,
+                  'max_workers': 1,
+              })
+              return
+          duration = payload.get('duration_seconds', 0)
+          request_id = payload.get('request_id')
+          if (not isinstance(duration, (int, float)) or
+                  isinstance(duration, bool) or not 0 <= duration <= 120 or
+                  not isinstance(request_id, str) or not request_id):
+              self.write_json(400, {'error': 'invalid request'})
+              return
+          with _lock:
+              _running += 1
+          try:
+              time.sleep(float(duration))
+              self.write_json(200, {
+                  'request_id': request_id,
+                  'status': 'ok',
+              })
+          finally:
+              with _lock:
+                  _running -= 1
+
+  port = int(os.environ.get('PORT', '8080'))
+  http.server.ThreadingHTTPServer(('0.0.0.0', port), Handler).serve_forever()
+  PY
