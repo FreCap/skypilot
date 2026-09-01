@@ -2150,13 +2150,18 @@ function ServiceDetails() {
       onServiceHashMismatch: refreshIdentity,
       refreshIntervalMs: 10 * 1000,
     });
-  const [capacityPlanExpiryTick, setCapacityPlanExpiryTick] = useState(0);
+  // The committed-plan lease is evaluated against this clock. It advances
+  // exactly when the DB-relative lease deadline passes so the memo below
+  // re-runs and the projection fails closed to STALE without a refetch.
+  const [capacityPlanClockSeconds, setCapacityPlanClockSeconds] = useState(
+    () => Date.now() / 1000
+  );
   useEffect(() => {
     const deadline = currentCapacityPlanLocalDeadline(replicaHistory);
     if (deadline == null) return undefined;
     const delayMs = Math.max(0, deadline * 1000 - Date.now()) + 1;
     const timer = setTimeout(
-      () => setCapacityPlanExpiryTick((value) => value + 1),
+      () => setCapacityPlanClockSeconds(Date.now() / 1000),
       Math.min(delayMs, 2 ** 31 - 1)
     );
     return () => clearTimeout(timer);
@@ -2306,7 +2311,11 @@ function ServiceDetails() {
         !legacy && pricingData.aggregateUnavailableReason,
       serviceYamlUnavailable: !legacy && Boolean(anchoredHash),
     };
-    enriched = applyCurrentCapacityPlanHistory(enriched, replicaHistory);
+    enriched = applyCurrentCapacityPlanHistory(
+      enriched,
+      replicaHistory,
+      capacityPlanClockSeconds
+    );
     if (persistedPricing.estimatedHourlyCost != null) {
       enriched.costPerThousandRequests =
         enriched.requestRate > 0
@@ -2325,7 +2334,7 @@ function ServiceDetails() {
     }
     return enriched;
   }, [
-    capacityPlanExpiryTick,
+    capacityPlanClockSeconds,
     demand.demandData,
     ownsRouteState,
     pricingData,

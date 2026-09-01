@@ -3241,7 +3241,10 @@ on-demand spill.
 - Commit a durable plan and require its exact minute-history projection before
   provider effects. Inject a history-write failure and prove plan/head/admission
   remain committed and usable; require a later reconciliation to fill the
-  projection gap. In a mixed-writer minute, require the committed-plan
+  projection gap. Hold the minute-history row locked from another connection
+  and prove the commit returns within the local lock timeout with the plan and
+  head advanced, the projection unchanged and unexposed, and the next commit
+  restoring it. In a mixed-writer minute, require the committed-plan
   projection to win latest state while preserving pressure peaks; require the
   controller writer's ownership check and upsert to share one transaction under
   explicit `LEGACY_CONTROLLER` ownership.
@@ -3252,7 +3255,10 @@ on-demand spill.
   Independently corrupt each fence and require planned values to be
   unavailable rather than zero. Prove the dashboard displays the PostgreSQL
   target while controller/provider enrichment is unavailable and retains a
-  last-good projection only until its DB-relative lease expires.
+  last-good projection only until its DB-relative lease expires; a rendered
+  test with a lease shorter than the poll interval must flip to `STALE`
+  without a refetch, so the expiry clock cannot be silently dropped from the
+  page's memoized projection.
 - With complete current telemetry and a zero launch-lead seed, prove 1,000
   queued requests of ten seconds each produce the same
   priority/deadline-weighted work in the aggregate and exact-card maps. At a
