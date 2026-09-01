@@ -122,6 +122,25 @@ def _observation(observed_at: float = 1000,
         **values)
 
 
+def _request_telemetry(*,
+                       queue_depth=0,
+                       in_flight=0,
+                       processing=0,
+                       state_counts=None):
+    summary = {
+        'request_telemetry_observed_at': 1000.0,
+        'request_telemetry_state': 'fresh',
+        'request_telemetry_reason': 'complete',
+        'request_telemetry_compatibility_complete': True,
+        'request_queue_depth': queue_depth,
+        'in_flight_requests': in_flight,
+        'processing_requests': processing,
+        'confirmed_in_flight_requests': in_flight,
+        'confirmed_processing_requests': processing,
+    }
+    return qualifier.request_telemetry_from_summary(summary, state_counts or {})
+
+
 def test_render_profiles_share_one_spot_only_service(tmp_path):
     source = _FIXTURE_DIR / 'service.yaml'
     for name, expected_units, expected_first_wave, expected_period in (
@@ -1448,6 +1467,165 @@ def test_one_request_rejects_identity_only_acknowledgement():
                                    deadline=qualifier.time.monotonic() + 2))
 
 
+def test_exact_async_request_uses_canonical_acceptance_and_completion():
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+
+    class Response:
+        """Minimal exact protocol response."""
+
+        def __init__(self, status, body, state, revision):
+            self.status = status
+            self._body = body
+            self.headers = {
+                'X-SkyServe-Async-Ledger-Protocol': '1',
+                'X-SkyServe-Service-Incarnation': 'incarnation-a',
+                'X-SkyServe-Async-Attempt-Id': attempt_id,
+                'X-SkyServe-Async-Attempt-No': '1',
+                'X-SkyServe-Async-Ledger-Revision': str(revision),
+                'X-SkyServe-Async-Ledger-State': state,
+            }
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def read(self):
+            return self._body
+
+    class Session:
+        """Return one durable ACCEPTED receipt and its terminal callback."""
+
+        def __init__(self):
+            self.calls = []
+            self.responses = [
+                Response(
+                    202,
+                    json.dumps({
+                        'request_id': 'execution-1',
+                        'status': 'accepted',
+                    }).encode(), 'ACCEPTED', 2),
+                Response(204, b'', 'SUCCEEDED', 3),
+            ]
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return self.responses.pop(0)
+
+    session = Session()
+    asyncio.run(
+        qualifier._one_exact_async_request(session,
+                                           endpoint='https://service.test',
+                                           token='secret',
+                                           service_hash='incarnation-a',
+                                           request_id='execution-1',
+                                           stable_job_id='job-1',
+                                           duration_seconds=0,
+                                           deadline=qualifier.time.monotonic() +
+                                           2))
+
+    assert len(session.calls) == 2
+    submit_url, submit = session.calls[0]
+    assert submit_url.endswith('/v1/models/model:predict')
+    assert submit['data'] == qualifier.rfc8785.dumps({
+        'action': 'async_predict',
+        'payload': {
+            'duration_seconds': 0,
+        },
+        'request_id': 'execution-1',
+    })
+    assert submit['headers']['X-SkyServe-Job-Id'] == 'job-1'
+    callback_url, callback = session.calls[1]
+    assert callback_url.endswith('/_lb/prediction-completed')
+    assert callback['json']['attempt_id'] == attempt_id
+    assert callback['json']['expected_revision'] == 2
+    assert callback['json']['status'] == 'SUCCEEDED'
+
+
+def test_exact_async_request_never_replays_ambiguous_submission():
+
+    class Session:
+
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, _url, **_kwargs):
+            self.calls += 1
+            raise qualifier.aiohttp.ClientConnectionError('lost response')
+
+    session = Session()
+    with pytest.raises(qualifier.QualificationError,
+                       match='lost its exact admission response'):
+        asyncio.run(
+            qualifier._submit_exact_async_request(
+                session,
+                endpoint='https://service.test',
+                token='secret',
+                service_hash='incarnation-a',
+                request_id='execution-1',
+                stable_job_id='job-1',
+                duration_seconds=0,
+                deadline=qualifier.time.monotonic() + 2))
+    assert session.calls == 1
+
+
+def test_request_telemetry_requires_exact_positive_and_terminal_delta(tmp_path):
+    baseline = _request_telemetry()
+    positive = _request_telemetry(queue_depth=7,
+                                  in_flight=5,
+                                  processing=3,
+                                  state_counts={'ACCEPTED': 3})
+    final = _request_telemetry(state_counts={'SUCCEEDED': 16})
+    assert baseline.is_exact_zero()
+    assert positive.is_fresh_complete()
+    assert not positive.is_exact_zero()
+    assert final.is_exact_zero()
+    assert final.ledger_succeeded - baseline.ledger_succeeded == 16
+
+    class Observer:
+
+        def __init__(self, values):
+            self.values = list(values)
+
+        async def request_telemetry(self):
+            return self.values.pop(0)
+
+    async def exercise():
+        profile = dataclasses.replace(qualifier.PROFILES['small'],
+                                      poll_seconds=0)
+        receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                    service_name='paid-e2e',
+                                    profile=profile)
+        held = asyncio.create_task(asyncio.Event().wait())
+        try:
+            observed_positive = await (
+                qualifier._wait_for_positive_request_telemetry(
+                    observer=Observer([positive]),
+                    profile=profile,
+                    receipt=receipt,
+                    traffic=held,
+                    baseline=baseline))
+            observed_final = await qualifier._wait_for_final_request_telemetry(
+                observer=Observer([final]),
+                profile=profile,
+                receipt=receipt,
+                baseline=baseline,
+                expected_succeeded_delta=16)
+            return observed_positive, observed_final, receipt
+        finally:
+            held.cancel()
+            await asyncio.gather(held, return_exceptions=True)
+
+    observed_positive, observed_final, receipt = asyncio.run(exercise())
+    assert observed_positive == positive
+    assert observed_final == final
+    assert [
+        sample['phase']
+        for sample in receipt._payload['request_telemetry_samples']
+    ] == ['positive', 'final']
+
+
 def test_worker_exposes_health_occupancy_and_stable_identity():
     config = yaml.safe_load(
         (_FIXTURE_DIR / 'service.yaml').read_text(encoding='utf-8'))
@@ -1501,6 +1679,33 @@ def test_worker_exposes_health_occupancy_and_stable_identity():
                 'request_id': 'stable-1',
                 'status': 'ok',
             }
+        exact_body, exact_intent = qualifier._canonical_exact_request(
+            'exact-execution-1', 0.5)
+        exact_request = urllib.request.Request(
+            f'{endpoint}/v1/models/model:predict',
+            data=exact_body,
+            headers={
+                'Content-Type': 'application/json',
+                'X-SkyServe-Async-Ledger-Protocol': '1',
+                'X-SkyServe-Service-Incarnation': 'incarnation-a',
+                'X-SkyServe-Async-Intent-Sha256': exact_intent,
+                'X-SkyServe-Execution-Request-Id': 'exact-execution-1',
+                'X-SkyServe-Async-Attempt-Id': '11111111-1111-4111-8111-111111111111',
+                'X-SkyServe-Async-Attempt-No': '1',
+                'X-SkyServe-Async-Ledger-Revision': '1',
+            },
+            method='POST')
+        with urllib.request.urlopen(exact_request, timeout=2) as response:
+            assert response.status == 202
+            assert json.load(response) == {
+                'request_id': 'exact-execution-1',
+                'status': 'accepted',
+            }
+        with urllib.request.urlopen(capacity_request, timeout=2) as response:
+            assert json.load(response)['running_count'] == 1
+        time.sleep(0.6)
+        with urllib.request.urlopen(capacity_request, timeout=2) as response:
+            assert json.load(response)['running_count'] == 0
     finally:
         process.terminate()
         try:

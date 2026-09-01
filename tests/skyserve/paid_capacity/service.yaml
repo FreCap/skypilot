@@ -43,8 +43,10 @@ run: |
   import http.server
   import json
   import os
+  import re
   import threading
   import time
+  import uuid
 
   _lock = threading.Lock()
   _running = 0
@@ -91,6 +93,53 @@ run: |
                   'running_count': running,
                   'predict_concurrency': 1,
                   'max_workers': 1,
+              })
+              return
+          if payload.get('action') == 'async_predict':
+              request_id = payload.get('request_id')
+              work = payload.get('payload')
+              duration = (work.get('duration_seconds')
+                          if isinstance(work, dict) else None)
+              attempt_id = self.headers.get('X-SkyServe-Async-Attempt-Id')
+              try:
+                  canonical_attempt_id = str(uuid.UUID(attempt_id))
+                  attempt_no = int(
+                      self.headers.get('X-SkyServe-Async-Attempt-No', '0'))
+                  revision = int(
+                      self.headers.get('X-SkyServe-Async-Ledger-Revision', '0'))
+              except (TypeError, ValueError):
+                  canonical_attempt_id = None
+                  attempt_no = 0
+                  revision = 0
+              intent = self.headers.get('X-SkyServe-Async-Intent-Sha256', '')
+              if (set(payload) != {'action', 'payload', 'request_id'} or
+                      set(work or {}) != {'duration_seconds'} or
+                      not isinstance(duration, (int, float)) or
+                      isinstance(duration, bool) or not 0 <= duration <= 120 or
+                      not isinstance(request_id, str) or not request_id or
+                      self.headers.get('X-SkyServe-Async-Ledger-Protocol') != '1' or
+                      not self.headers.get('X-SkyServe-Service-Incarnation') or
+                      self.headers.get('X-SkyServe-Execution-Request-Id') != request_id or
+                      re.fullmatch(r'[0-9a-f]{64}', intent) is None or
+                      canonical_attempt_id != attempt_id or attempt_no < 1 or
+                      revision < 1):
+                  self.write_json(400, {'error': 'invalid exact request'})
+                  return
+              with _lock:
+                  _running += 1
+
+              def finish_async():
+                  global _running
+                  try:
+                      time.sleep(float(duration))
+                  finally:
+                      with _lock:
+                          _running -= 1
+
+              threading.Thread(target=finish_async, daemon=True).start()
+              self.write_json(202, {
+                  'request_id': request_id,
+                  'status': 'accepted',
               })
               return
           duration = payload.get('duration_seconds', 0)

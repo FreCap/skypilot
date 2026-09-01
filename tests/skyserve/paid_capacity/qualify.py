@@ -40,13 +40,17 @@ from typing import Any
 import uuid
 
 import aiohttp
+import rfc8785
 import sqlalchemy
 import yaml
 
 from sky import skypilot_config
 from sky.adaptors import gcp as gcp_adaptor
 from sky.provision.gcp import instance_utils
+from sky.serve import async_request_ledger
 from sky.serve import auth_tokens
+from sky.serve import constants as serve_constants
+from sky.serve import demand_state
 from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
 from sky.serve import serve_state
@@ -122,6 +126,11 @@ _REQUEST_PRIORITY = 50
 _GCP_LIST_PAGE_SIZE = 500
 _GCP_API_RETRIES = 3
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+_ASYNC_ACTIVE_STATES = frozenset({
+    'DISPATCH_MAY_HAVE_OCCURRED',
+    'ACCEPTED',
+    'AMBIGUOUS',
+})
 _ACTIVE_DEMAND_NAMES = frozenset({
     'async_occupancy',
     'busy_replicas',
@@ -179,6 +188,99 @@ def demand_units(payload: object) -> int:
                 'arrivals_' in normalized):
             total += _numeric_total(value)
     return total
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class RequestTelemetry:
+    """Production-reduced request gauges plus exact-ledger state counts."""
+
+    observed_at: float
+    state: str
+    reason: str
+    compatibility_complete: bool
+    queue_depth: int | None
+    in_flight_requests: int | None
+    processing_requests: int | None
+    confirmed_in_flight_requests: int | None
+    confirmed_processing_requests: int | None
+    ledger_state_counts: tuple[tuple[str, int], ...]
+
+    def ledger_count(self, state: str) -> int:
+        return dict(self.ledger_state_counts).get(state, 0)
+
+    @property
+    def ledger_total(self) -> int:
+        return sum(count for _, count in self.ledger_state_counts)
+
+    @property
+    def ledger_active(self) -> int:
+        counts = dict(self.ledger_state_counts)
+        return sum(counts.get(state, 0) for state in _ASYNC_ACTIVE_STATES)
+
+    @property
+    def ledger_succeeded(self) -> int:
+        return self.ledger_count('SUCCEEDED')
+
+    def is_fresh_complete(self) -> bool:
+        return (self.state == 'fresh' and self.reason == 'complete' and
+                self.compatibility_complete and self.queue_depth is not None and
+                self.in_flight_requests is not None and
+                self.processing_requests is not None)
+
+    def is_exact_zero(self) -> bool:
+        return (self.is_fresh_complete() and self.queue_depth == 0 and
+                self.in_flight_requests == 0 and
+                self.processing_requests == 0 and self.ledger_active == 0)
+
+
+def request_telemetry_from_summary(
+    summary: collections.abc.Mapping[str, Any],
+    ledger_state_counts: collections.abc.Mapping[str, int],
+) -> RequestTelemetry:
+    """Validate one production demand summary and exact-ledger projection."""
+    states = tuple(
+        state.value for state in async_request_ledger.AsyncRequestState)
+    normalized_counts: list[tuple[str, int]] = []
+    for state in states:
+        count = ledger_state_counts.get(state, 0)
+        if type(count) is not int or count < 0:
+            raise QualificationError('Async-ledger state count is invalid.')
+        normalized_counts.append((state, count))
+
+    def _nullable_count(field: str) -> int | None:
+        value = summary.get(field)
+        if value is None:
+            return None
+        if type(value) is not int or value < 0:
+            raise QualificationError(
+                f'Request telemetry field {field} is invalid.')
+        return value
+
+    observed_at = summary.get('request_telemetry_observed_at')
+    if (not isinstance(observed_at, (int, float)) or
+            isinstance(observed_at, bool) or observed_at < 0):
+        # Unavailable/stale summaries intentionally have no source timestamp.
+        observed_at = 0.0
+    state = summary.get('request_telemetry_state')
+    reason = summary.get('request_telemetry_reason')
+    complete = summary.get('request_telemetry_compatibility_complete')
+    if (not isinstance(state, str) or not isinstance(reason, str) or
+            type(complete) is not bool):
+        raise QualificationError('Request telemetry summary is malformed.')
+    return RequestTelemetry(
+        observed_at=float(observed_at),
+        state=state,
+        reason=reason,
+        compatibility_complete=complete,
+        queue_depth=_nullable_count('request_queue_depth'),
+        in_flight_requests=_nullable_count('in_flight_requests'),
+        processing_requests=_nullable_count('processing_requests'),
+        confirmed_in_flight_requests=_nullable_count(
+            'confirmed_in_flight_requests'),
+        confirmed_processing_requests=_nullable_count(
+            'confirmed_processing_requests'),
+        ledger_state_counts=tuple(normalized_counts),
+    )
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -1132,6 +1234,23 @@ class PostgresObserver:
         return (paid_debit_census(replicas).gpu_units, int(claim_count),
                 int(waiter_count))
 
+    def request_telemetry(self) -> RequestTelemetry:
+        """Read the same durable request reduction shown by the service UI."""
+        scope = self._provider_scope
+        if scope is None:
+            raise QualificationError('Provider scope was not frozen.')
+        summary = demand_state.get_request_summary(self._service_name,
+                                                   scope.service_hash)
+        ledger = async_request_ledger.get_summary(self._service_name,
+                                                  scope.service_hash,
+                                                  engine=self._engine)
+        if (ledger.get('available') is not True or
+                ledger.get('service_hash') != scope.service_hash or
+                not isinstance(ledger.get('state_counts'), dict)):
+            raise QualificationError(
+                'Exact async-ledger request summary is unavailable.')
+        return request_telemetry_from_summary(summary, ledger['state_counts'])
+
     def snapshot(self, load_balancer: 'LoadBalancerState') -> DatabaseState:
         scope = self._provider_scope
         if scope is None:
@@ -1541,6 +1660,9 @@ class Observer:
         self._gcp = gcp
         self._http = http
 
+    async def request_telemetry(self) -> RequestTelemetry:
+        return await asyncio.to_thread(self._postgres.request_telemetry)
+
     async def snapshot(self) -> Observation:
         # Capture raw provider state first, then the durable authorization used
         # to classify it.  Since a binding commit precedes its provider effect,
@@ -1643,6 +1765,7 @@ class Receipt:
             'minimum_running': profile.minimum_running,
             'started_at': time.time(),
             'samples': [],
+            'request_telemetry_samples': [],
         }
 
     def sample(self, phase: str, observation: Observation) -> None:
@@ -1658,11 +1781,23 @@ class Receipt:
             'observation_error_type': type(error).__name__,
         })
 
+    def request_telemetry(self, phase: str,
+                          telemetry: RequestTelemetry) -> None:
+        self._payload['request_telemetry_samples'].append({
+            'phase': phase,
+            **dataclasses.asdict(telemetry),
+            'ledger_active': telemetry.ledger_active,
+            'ledger_succeeded': telemetry.ledger_succeeded,
+            'ledger_total': telemetry.ledger_total,
+        })
+
     def finish(self,
                *,
                progress: Progress,
                pressure_successes: int,
                warm_successes: int,
+               ledger_baseline: RequestTelemetry | None = None,
+               ledger_final: RequestTelemetry | None = None,
                error: BaseException | None = None) -> None:
         self._payload.update({
             'finished_at': time.time(),
@@ -1676,6 +1811,21 @@ class Receipt:
             'pressure_successes': pressure_successes,
             'warm_successes': warm_successes,
         })
+        if ledger_baseline is not None:
+            self._payload['ledger_baseline_total'] = (
+                ledger_baseline.ledger_total)
+            self._payload['ledger_baseline_succeeded'] = (
+                ledger_baseline.ledger_succeeded)
+        if ledger_final is not None:
+            self._payload['ledger_final_total'] = ledger_final.ledger_total
+            self._payload['ledger_final_succeeded'] = (
+                ledger_final.ledger_succeeded)
+        if ledger_baseline is not None and ledger_final is not None:
+            self._payload['ledger_request_delta'] = (
+                ledger_final.ledger_total - ledger_baseline.ledger_total)
+            self._payload['ledger_succeeded_delta'] = (
+                ledger_final.ledger_succeeded -
+                ledger_baseline.ledger_succeeded)
         if error is not None:
             # Never serialize exception text: transport/database errors may
             # contain an endpoint or credential-bearing connection string.
@@ -1684,6 +1834,305 @@ class Receipt:
         self._path.write_text(
             json.dumps(self._payload, indent=2, sort_keys=True) + '\n',
             encoding='utf-8')
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ExactAsyncReceipt:
+    """Receipt fields required to complete one synthetic exact request."""
+
+    attempt_id: str
+    attempt_no: int
+    state: str
+    revision: int
+
+
+def _single_response_header(response: aiohttp.ClientResponse, name: str) -> str:
+    get_all = getattr(response.headers, 'getall', None)
+    if callable(get_all):
+        values = list(get_all(name, []))
+    else:
+        value = response.headers.get(name)
+        values = [] if value is None else [value]
+    if len(values) != 1 or not isinstance(values[0], str) or not values[0]:
+        raise QualificationError(
+            f'Exact async response lacks one {name} header.')
+    return values[0]
+
+
+def _receipt_from_headers(
+    response: aiohttp.ClientResponse,
+    *,
+    service_hash: str,
+    expected_state: str,
+    prior: ExactAsyncReceipt | None = None,
+) -> ExactAsyncReceipt:
+    if (_single_response_header(
+            response, serve_constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER) != str(
+                serve_constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION) or
+            _single_response_header(
+                response, serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER)
+            != service_hash):
+        raise QualificationError(
+            'Exact async response changed protocol or service incarnation.')
+    attempt_id = _single_response_header(
+        response, serve_constants.LB_ASYNC_ATTEMPT_ID_HEADER)
+    try:
+        if str(uuid.UUID(attempt_id)) != attempt_id:
+            raise ValueError
+        attempt_no = int(
+            _single_response_header(response,
+                                    serve_constants.LB_ASYNC_ATTEMPT_NO_HEADER))
+        revision = int(
+            _single_response_header(
+                response, serve_constants.LB_ASYNC_LEDGER_REVISION_HEADER))
+    except (TypeError, ValueError) as error:
+        raise QualificationError(
+            'Exact async response has malformed receipt identity.') from error
+    state = _single_response_header(
+        response, serve_constants.LB_ASYNC_LEDGER_STATE_HEADER)
+    if (attempt_no < 1 or revision < 1 or state != expected_state or
+        (prior is not None and
+         (attempt_id != prior.attempt_id or attempt_no != prior.attempt_no or
+          revision <= prior.revision))):
+        raise QualificationError(
+            'Exact async response has a conflicting receipt transition.')
+    return ExactAsyncReceipt(attempt_id=attempt_id,
+                             attempt_no=attempt_no,
+                             state=state,
+                             revision=revision)
+
+
+def _canonical_exact_request(request_id: str,
+                             duration_seconds: float) -> tuple[bytes, str]:
+    body = rfc8785.dumps({
+        'action': 'async_predict',
+        'payload': {
+            'duration_seconds': duration_seconds,
+        },
+        'request_id': request_id,
+    })
+    return body, hashlib.sha256(body).hexdigest()
+
+
+def _exact_request_headers(*, token: str, service_hash: str, request_id: str,
+                           stable_job_id: str,
+                           intent_sha256: str) -> dict[str, str]:
+    return {
+        _AUTH_HEADER: f'Bearer {token}',
+        _JOB_ID_HEADER: stable_job_id,
+        _PRIORITY_HEADER: str(_REQUEST_PRIORITY),
+        _ACCELERATORS_HEADER: 'L4',
+        'Content-Type': 'application/json',
+        serve_constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: str(
+            serve_constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION),
+        serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: service_hash,
+        serve_constants.LB_ASYNC_INTENT_SHA256_HEADER: intent_sha256,
+        serve_constants.LB_ASYNC_EXECUTION_REQUEST_ID_HEADER: request_id,
+    }
+
+
+async def _submit_exact_async_request(
+    session: aiohttp.ClientSession,
+    *,
+    endpoint: str,
+    token: str,
+    service_hash: str,
+    request_id: str,
+    stable_job_id: str,
+    duration_seconds: float,
+    deadline: float,
+) -> tuple[ExactAsyncReceipt, str]:
+    """Submit only after an exact pre-dispatch rejection authorizes retry."""
+    url = endpoint.rstrip('/') + '/v1/models/model:predict'
+    body, intent_sha256 = _canonical_exact_request(request_id, duration_seconds)
+    headers = _exact_request_headers(token=token,
+                                     service_hash=service_hash,
+                                     request_id=request_id,
+                                     stable_job_id=stable_job_id,
+                                     intent_sha256=intent_sha256)
+    while time.monotonic() < deadline:
+        try:
+            async with session.post(url, headers=headers,
+                                    data=body) as response:
+                response_body = await response.read()
+                if response.status == 202:
+                    receipt = _receipt_from_headers(response,
+                                                    service_hash=service_hash,
+                                                    expected_state='ACCEPTED')
+                    try:
+                        result = json.loads(response_body)
+                    except (UnicodeDecodeError, ValueError) as error:
+                        raise QualificationError(
+                            f'{request_id} returned invalid JSON.') from error
+                    if result != {
+                            'request_id': request_id,
+                            'status': 'accepted',
+                    }:
+                        raise QualificationError(
+                            f'{request_id} returned an invalid acceptance.')
+                    return receipt, intent_sha256
+                if response.status not in (429, 503):
+                    raise QualificationError(
+                        f'{request_id} returned HTTP {response.status}.')
+                _receipt_from_headers(response,
+                                      service_hash=service_hash,
+                                      expected_state='REJECTED_PRE_DISPATCH')
+                retry_after = response.headers.get('Retry-After', '1')
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as error:
+            # A lost submission response is dispatch-ambiguous. This
+            # qualification driver is not a durable campaign controller, so it
+            # fails closed instead of replaying a non-idempotent request.
+            raise QualificationError(
+                f'{request_id} lost its exact admission response.') from error
+        try:
+            delay = min(10.0, max(0.1, float(retry_after)))
+        except ValueError:
+            delay = 1.0
+        await asyncio.sleep(delay)
+    raise QualificationError(
+        f'{request_id} exhausted its exact admission deadline.')
+
+
+async def _complete_exact_async_request(
+    session: aiohttp.ClientSession,
+    *,
+    endpoint: str,
+    token: str,
+    service_hash: str,
+    request_id: str,
+    intent_sha256: str,
+    accepted: ExactAsyncReceipt,
+    processing_time_us: int,
+    deadline: float,
+) -> None:
+    """Retry only the idempotent terminal callback for an accepted attempt."""
+    url = (endpoint.rstrip('/') +
+           serve_constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH)
+    headers = {
+        _AUTH_HEADER: f'Bearer {token}',
+        serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: service_hash,
+    }
+    payload = {
+        'ledger_protocol_version':
+            serve_constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION,
+        'request_id': request_id,
+        'intent_sha256': intent_sha256,
+        'attempt_id': accepted.attempt_id,
+        'attempt_no': accepted.attempt_no,
+        'expected_revision': accepted.revision,
+        'status': 'SUCCEEDED',
+        'processing_time_us': processing_time_us,
+    }
+    while time.monotonic() < deadline:
+        retry_after = '0.5'
+        try:
+            async with session.post(url, headers=headers,
+                                    json=payload) as response:
+                await response.read()
+                if response.status == 204:
+                    _receipt_from_headers(response,
+                                          service_hash=service_hash,
+                                          expected_state='SUCCEEDED',
+                                          prior=accepted)
+                    return
+                if (response.status not in _RETRYABLE_STATUSES and
+                        response.status != 409):
+                    raise QualificationError(
+                        f'{request_id} completion returned '
+                        f'HTTP {response.status}.')
+                retry_after = response.headers.get('Retry-After', '0.5')
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+            pass
+        try:
+            delay = min(5.0, max(0.1, float(retry_after)))
+        except ValueError:
+            delay = 0.5
+        await asyncio.sleep(delay)
+    raise QualificationError(f'{request_id} exhausted its completion deadline.')
+
+
+async def _one_exact_async_request(
+    session: aiohttp.ClientSession,
+    *,
+    endpoint: str,
+    token: str,
+    service_hash: str,
+    request_id: str,
+    stable_job_id: str,
+    duration_seconds: float,
+    deadline: float,
+) -> None:
+    receipt, intent_sha256 = await _submit_exact_async_request(
+        session,
+        endpoint=endpoint,
+        token=token,
+        service_hash=service_hash,
+        request_id=request_id,
+        stable_job_id=stable_job_id,
+        duration_seconds=duration_seconds,
+        deadline=deadline)
+    if receipt.state == 'SUCCEEDED':
+        return
+    await asyncio.sleep(duration_seconds)
+    await _complete_exact_async_request(session,
+                                        endpoint=endpoint,
+                                        token=token,
+                                        service_hash=service_hash,
+                                        request_id=request_id,
+                                        intent_sha256=intent_sha256,
+                                        accepted=receipt,
+                                        processing_time_us=int(
+                                            duration_seconds * 1_000_000),
+                                        deadline=deadline)
+
+
+async def send_exact_async_requests(
+    *,
+    endpoint: str,
+    token: str,
+    service_hash: str,
+    prefix: str,
+    count: int,
+    concurrency: int,
+    hold_requests: int,
+    hold_seconds: float,
+    timeout_seconds: float,
+) -> int:
+    """Submit and durably complete exact synthetic async requests."""
+    queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
+    for index in range(count):
+        queue.put_nowait((index, f'{prefix}-execution-{index:05d}'))
+    deadline = time.monotonic() + timeout_seconds
+    successes = 0
+    lock = asyncio.Lock()
+
+    async def worker() -> None:
+        nonlocal successes
+        while True:
+            try:
+                index, request_id = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            await _one_exact_async_request(
+                session,
+                endpoint=endpoint,
+                token=token,
+                service_hash=service_hash,
+                request_id=request_id,
+                stable_job_id=f'{prefix}-job-{index:05d}',
+                duration_seconds=(hold_seconds if index < hold_requests else 0),
+                deadline=deadline)
+            async with lock:
+                successes += 1
+            queue.task_done()
+
+    timeout = aiohttp.ClientTimeout(total=11 * 60)
+    connector = aiohttp.TCPConnector(limit=concurrency)
+    async with aiohttp.ClientSession(timeout=timeout,
+                                     connector=connector) as session:
+        await asyncio.gather(*(worker() for _ in range(min(count, concurrency)))
+                            )
+    return successes
 
 
 async def _one_request(session: aiohttp.ClientSession, *, url: str, token: str,
@@ -1799,6 +2248,97 @@ async def send_continuous_pressure(*, endpoint: str, token: str, prefix: str,
                                      connector=connector) as session:
         await asyncio.gather(*(worker(index) for index in range(concurrency)))
     return successes
+
+
+async def _wait_for_telemetry_baseline(*, observer: Observer, profile: Profile,
+                                       receipt: Receipt) -> RequestTelemetry:
+    deadline = time.monotonic() + 5 * 60
+    while time.monotonic() < deadline:
+        try:
+            telemetry = await observer.request_telemetry()
+        except Exception:  # pylint: disable=broad-except
+            await asyncio.sleep(profile.poll_seconds)
+            continue
+        receipt.request_telemetry('baseline', telemetry)
+        if telemetry.is_exact_zero():
+            return telemetry
+        await asyncio.sleep(profile.poll_seconds)
+    raise QualificationError(
+        'Service did not establish a fresh exact request-telemetry baseline.')
+
+
+async def _wait_for_positive_request_telemetry(
+    *,
+    observer: Observer,
+    profile: Profile,
+    receipt: Receipt,
+    traffic: asyncio.Task[int],
+    baseline: RequestTelemetry,
+) -> RequestTelemetry:
+    deadline = time.monotonic() + max(2 * 60, 4 * profile.poll_seconds)
+    while time.monotonic() < deadline:
+        if traffic.done():
+            try:
+                successes = traffic.result()
+            except BaseException as error:
+                raise QualificationError(
+                    'Exact traffic failed before positive telemetry.') \
+                    from error
+            raise QualificationError(
+                'Exact traffic finished before fresh positive processing, '
+                f'queue, and in-flight telemetry after {successes} successes.')
+        try:
+            telemetry = await observer.request_telemetry()
+        except Exception:  # pylint: disable=broad-except
+            await asyncio.sleep(profile.poll_seconds)
+            continue
+        receipt.request_telemetry('positive', telemetry)
+        if (telemetry.is_fresh_complete() and
+                telemetry.queue_depth is not None and
+                telemetry.queue_depth > 0 and
+                telemetry.in_flight_requests is not None and
+                telemetry.in_flight_requests > 0 and
+                telemetry.processing_requests is not None and
+                telemetry.processing_requests > 0 and
+                telemetry.confirmed_in_flight_requests is not None and
+                telemetry.confirmed_in_flight_requests > 0 and
+                telemetry.confirmed_processing_requests is not None and
+                telemetry.confirmed_processing_requests > 0 and
+                telemetry.ledger_total > baseline.ledger_total and
+                telemetry.ledger_count('ACCEPTED') > 0):
+            return telemetry
+        await asyncio.sleep(profile.poll_seconds)
+    raise QualificationError(
+        'No fresh positive processing, queued, and in-flight sample was '
+        'observed for exact traffic.')
+
+
+async def _wait_for_final_request_telemetry(
+    *,
+    observer: Observer,
+    profile: Profile,
+    receipt: Receipt,
+    baseline: RequestTelemetry,
+    expected_succeeded_delta: int,
+) -> RequestTelemetry:
+    deadline = time.monotonic() + 5 * 60
+    while time.monotonic() < deadline:
+        try:
+            telemetry = await observer.request_telemetry()
+        except Exception:  # pylint: disable=broad-except
+            await asyncio.sleep(profile.poll_seconds)
+            continue
+        receipt.request_telemetry('final', telemetry)
+        if (telemetry.is_exact_zero() and
+                telemetry.ledger_total - baseline.ledger_total
+                == expected_succeeded_delta and
+                telemetry.ledger_succeeded - baseline.ledger_succeeded
+                == expected_succeeded_delta):
+            return telemetry
+        await asyncio.sleep(profile.poll_seconds)
+    raise QualificationError(
+        'Exact request telemetry did not reach the required SUCCEEDED delta '
+        'and current-work zero.')
 
 
 async def _validated_sample(*, observer: Observer, profile: Profile,
@@ -2022,6 +2562,8 @@ async def qualify(args: argparse.Namespace) -> None:
                       profile=profile)
     warm_successes = 0
     pressure_successes = 0
+    ledger_baseline: RequestTelemetry | None = None
+    ledger_final: RequestTelemetry | None = None
     failure: BaseException | None = None
     run_id = f'{args.service_name}-{int(time.time())}'
     try:
@@ -2030,6 +2572,9 @@ async def qualify(args: argparse.Namespace) -> None:
                                  profile=profile,
                                  progress=progress,
                                  receipt=receipt)
+        ledger_baseline = await _wait_for_telemetry_baseline(observer=observer,
+                                                             profile=profile,
+                                                             receipt=receipt)
         progress.start_scale()
         pressure_stop = asyncio.Event()
         pressure = asyncio.create_task(
@@ -2049,18 +2594,28 @@ async def qualify(args: argparse.Namespace) -> None:
                                   receipt=receipt,
                                   pressure=pressure)
             pressure_stop.set()
-            warm = asyncio.create_task(
-                send_requests(endpoint=args.endpoint,
-                              token=token,
-                              prefix=f'{run_id}-warm',
-                              count=profile.warm_requests,
-                              concurrency=profile.warm_concurrency,
-                              duration_seconds=0,
-                              timeout_seconds=profile.drain_timeout_seconds))
-            pressure_successes, warm_successes = await asyncio.gather(
-                pressure, warm)
+            pressure_successes = await pressure
             if pressure_successes < 1:
                 raise QualificationError('No pressure request completed.')
+            warm = asyncio.create_task(
+                send_exact_async_requests(
+                    endpoint=args.endpoint,
+                    token=token,
+                    service_hash=provider_scope.service_hash,
+                    prefix=f'{run_id}-warm',
+                    count=profile.warm_requests,
+                    concurrency=profile.warm_concurrency,
+                    hold_requests=min(profile.minimum_running,
+                                      profile.warm_requests),
+                    hold_seconds=max(30, 3 * profile.poll_seconds + 10),
+                    timeout_seconds=profile.drain_timeout_seconds))
+            assert ledger_baseline is not None
+            await _wait_for_positive_request_telemetry(observer=observer,
+                                                       profile=profile,
+                                                       receipt=receipt,
+                                                       traffic=warm,
+                                                       baseline=ledger_baseline)
+            warm_successes = await warm
         except BaseException:
             pressure_stop.set()
             pressure.cancel()
@@ -2076,6 +2631,13 @@ async def qualify(args: argparse.Namespace) -> None:
                               profile=profile,
                               progress=progress,
                               receipt=receipt)
+        assert ledger_baseline is not None
+        ledger_final = await _wait_for_final_request_telemetry(
+            observer=observer,
+            profile=profile,
+            receipt=receipt,
+            baseline=ledger_baseline,
+            expected_succeeded_delta=profile.warm_requests)
     except BaseException as error:
         failure = error
         raise
@@ -2083,6 +2645,8 @@ async def qualify(args: argparse.Namespace) -> None:
         receipt.finish(progress=progress,
                        pressure_successes=pressure_successes,
                        warm_successes=warm_successes,
+                       ledger_baseline=ledger_baseline,
+                       ledger_final=ledger_final,
                        error=failure)
         postgres.close()
     print(
