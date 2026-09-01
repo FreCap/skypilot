@@ -114,7 +114,7 @@ PROFILES = {
                      drain_timeout_seconds=30 * 60,
                      zero_hold_seconds=6 * 60,
                      poll_seconds=10,
-                     scale_up_min_replicas=100,
+                     scale_up_min_replicas=120,
                      scale_up_period_seconds=60),
 }
 
