@@ -19,7 +19,9 @@ from unittest import mock
 from sky.serve import autoscalers
 from sky.serve import capacity_planning
 from sky.serve import constants
+from sky.serve import demand_state
 from sky.serve import kueue_lane_capacity
+from sky.serve import request_aggregator
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
 from sky.serve import serve_state
@@ -486,6 +488,142 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             result.envelope.candidate.next_policy_state.
             last_reduced_demand_generation, 1)
         self.assertIsNone(result.rollout_failure)
+
+    def test_attribution_horizon_preserves_finalized_paid_successor(self):
+        """Exact-card evidence survives as long as its aggregate arrival."""
+        autoscaler = _durable_autoscaler(max_replicas=100,
+                                         expected_request_duration_seconds=10)
+        statuses = ([serve_state.ReplicaStatus.READY] * 6 +
+                    [serve_state.ReplicaStatus.STARTING] * 3 +
+                    [serve_state.ReplicaStatus.PROVISIONING] +
+                    [serve_state.ReplicaStatus.SHUTTING_DOWN] * 5)
+        replicas = tuple(
+            _replica(replica_id, status=status)
+            for replica_id, status in enumerate(statuses, start=1))
+        reservation = _durable_reservation(existing_paid=len(replicas))
+        decision_inputs = _durable_inputs(replicas)
+
+        def _finalize(result, decision_epoch):
+            candidate = capacity_planning.finalize_capacity_plan(
+                result.envelope.snapshot,
+                result.envelope.candidate,
+                accepted_paid_plan_units=(
+                    capacity_planning.AcceleratorCapacity()),
+                accepted_paid_gpu_units=0,
+                decision_db_epoch=decision_epoch)
+            state = candidate.next_policy_state
+            assert state is not None
+            return state, candidate
+
+        initial = self._plan(autoscaler,
+                             report=_durable_report(
+                                 queue_depth=10,
+                                 queued_profiles=[{
+                                     'priority': 50,
+                                     'compatible_accelerators': ['L4'],
+                                     'count': 10,
+                                 }]),
+                             replicas=replicas,
+                             reservation=reservation,
+                             decision_inputs=decision_inputs)
+        assert initial is not None
+        prior_state, prior_candidate = _finalize(initial, self._DB_EPOCH)
+        self.assertEqual(prior_candidate.aggregate_demand_target, 10)
+
+        now = [self._DB_EPOCH]
+        request = types.SimpleNamespace(
+            _skyserve_compatible_accelerators=('L4',),
+            _skyserve_request_priority=50)
+        with mock.patch.object(request_aggregator.time,
+                               'time',
+                               side_effect=lambda: now[0]):
+            producer = request_aggregator.RequestTimestamp()
+            producer.add(request)
+
+        # Bucket ends trail raw request timestamps by five seconds.  Age 66
+        # reproduces the production failure at effective age 61; age 299 proves
+        # the upper edge remains attributable to the same finalized lineage.
+        for generation, request_age in ((2, 66), (3, 299)):
+            with mock.patch.object(request_aggregator.time,
+                                   'time',
+                                   side_effect=lambda: now[0]):
+                now[0] = self._DB_EPOCH + request_age
+                window = producer.demand_window_snapshot()
+            normalized = (demand_state._normalize_demand_window_for_autoscaling(
+                window,
+                received_epoch=now[0],
+                reporter_epoch=now[0],
+                now_epoch=now[0],
+                timestamp_limit=constants.LB_REQUEST_TIMESTAMP_CAP))
+            assert normalized is not None
+            timestamps, profiles = normalized
+            self.assertEqual(timestamps, [])
+            self.assertEqual(len(profiles), 1)
+            report = _durable_report(generation=generation,
+                                     compatibility_profiles=profiles)
+            report.update(unique_job_arrivals_60s=0,
+                          unique_job_arrivals_300s=256,
+                          headerless_arrivals_60s=0,
+                          headerless_arrivals_300s=0,
+                          offered_arrival_tracking_saturated=False)
+
+            successor = self._plan(autoscaler,
+                                   report=report,
+                                   replicas=replicas,
+                                   reservation=reservation,
+                                   decision_inputs=decision_inputs,
+                                   prior_policy_state=prior_state,
+                                   prior_candidate=prior_candidate,
+                                   planning_db_epoch=now[0])
+
+            assert successor is not None
+            candidate = successor.envelope.candidate
+            self.assertEqual(candidate.aggregate_demand_target, 10)
+            self.assertEqual(candidate.supply_aware_demand_target.as_dict(),
+                             {'L4': 10})
+            self.assertEqual(candidate.paid_launch_target.as_dict(), {})
+            prior_state, prior_candidate = _finalize(successor, now[0])
+
+        with mock.patch.object(request_aggregator.time,
+                               'time',
+                               side_effect=lambda: now[0]):
+            now[0] = self._DB_EPOCH + constants.LB_DEMAND_WINDOW_SECONDS + 6
+            expired_window = producer.demand_window_snapshot()
+        self.assertEqual(expired_window['buckets'], [])
+        fresh_zero_proven = demand_state.reports_prove_fresh_aggregate_zero([{
+            'payload': {
+                'protocol_version': 2,
+                'reporter_observed_at': now[0],
+                'demand_window': expired_window,
+                'offered_arrival_tracking_saturated': False,
+                'queue_depth': 0,
+                'rejected_in_window': 0,
+                'rejected_in_recent_window': 0,
+            }
+        }])
+        self.assertTrue(fresh_zero_proven)
+        zero_report = _durable_report(generation=4)
+        zero_report.update(unique_job_arrivals_60s=0,
+                           unique_job_arrivals_300s=0,
+                           headerless_arrivals_60s=0,
+                           headerless_arrivals_300s=0,
+                           offered_arrival_tracking_saturated=False)
+
+        fresh_zero = self._plan(autoscaler,
+                                report=zero_report,
+                                replicas=replicas,
+                                reservation=reservation,
+                                decision_inputs=decision_inputs,
+                                prior_policy_state=prior_state,
+                                prior_candidate=prior_candidate,
+                                planning_db_epoch=now[0],
+                                fresh_zero=fresh_zero_proven)
+
+        assert fresh_zero is not None
+        self.assertEqual(fresh_zero.envelope.candidate.aggregate_demand_target,
+                         0)
+        self.assertEqual(
+            fresh_zero.envelope.candidate.paid_launch_target.as_dict(), {})
 
     def test_durable_planner_rejects_adaptive_scale_up(self):
         autoscaler = _durable_autoscaler(

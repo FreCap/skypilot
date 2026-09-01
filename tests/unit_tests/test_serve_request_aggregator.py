@@ -144,7 +144,7 @@ def test_durable_window_survives_controller_drain_and_expires(monkeypatch):
     snapshot = aggregator.demand_window_snapshot()
     assert snapshot == {
         'bucket_seconds': constants.LB_DEMAND_WINDOW_BUCKET_SECONDS,
-        'window_seconds': constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS,
+        'window_seconds': constants.LB_DEMAND_WINDOW_SECONDS,
         'coverage_started_at': 120.0,
         'buckets': [{
             'bucket_start': 120,
@@ -159,7 +159,14 @@ def test_durable_window_survives_controller_drain_and_expires(monkeypatch):
         'saturated': False,
     }
 
+    # The aggregate 300-second offered-arrival floor remains live here, so its
+    # exact accelerator attribution must remain live too.
     now[0] += constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS + 1
+    retained = aggregator.demand_window_snapshot()
+    assert retained['buckets'] == snapshot['buckets']
+
+    now[0] += (constants.LB_DEMAND_WINDOW_SECONDS -
+               constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
     expired = aggregator.demand_window_snapshot()
     assert expired['buckets'] == []
     assert expired['coverage_started_at'] == 120.0
