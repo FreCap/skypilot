@@ -1441,6 +1441,71 @@ def _canonical_aws_resources(
     return instances, volumes
 
 
+_AWS_INSTANCE_IDENTITY_FIELDS = (
+    'availability_zone',
+    'client_token',
+    'cluster_name_on_cloud',
+    'instance_id',
+    'instance_type',
+    'market',
+    'region',
+)
+_AWS_VOLUME_IDENTITY_FIELDS = (
+    'cluster_name_on_cloud',
+    'region',
+    'volume_id',
+)
+
+
+def _merge_aws_instance_observations(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge two sequential tag-query observations of one EC2 instance."""
+    if any(
+            previous.get(field) != current.get(field)
+            for field in _AWS_INSTANCE_IDENTITY_FIELDS):
+        raise GuardViolation('AWS service instance identity is contradictory.')
+
+    previous_volume_ids = previous['volume_ids']
+    current_volume_ids = current['volume_ids']
+    if (len(previous_volume_ids) != len(set(previous_volume_ids)) or
+            len(current_volume_ids) != len(set(current_volume_ids))):
+        raise GuardViolation(
+            'AWS service instance repeats one EBS volume identity.')
+
+    merged = dict(previous)
+    previous_state = previous['state']
+    current_state = current['state']
+    if previous_state != current_state:
+        # The two service-tag queries are separate EC2 snapshots.  Preserve an
+        # observed non-running state on disagreement so this census cannot
+        # overstate physical RUNNING capacity.  The reducer distinguishes only
+        # running from non-running, so the first non-running observation
+        # suffices.
+        merged['state'] = (current_state
+                           if previous_state == 'running' else previous_state)
+    merged['volume_ids'] = tuple(
+        sorted(set(previous_volume_ids) | set(current_volume_ids)))
+    return merged
+
+
+def _merge_aws_volume_observations(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge two sequential tag-query observations of one EBS volume."""
+    if any(
+            previous.get(field) != current.get(field)
+            for field in _AWS_VOLUME_IDENTITY_FIELDS):
+        raise GuardViolation('AWS service volume identity is contradictory.')
+    merged = dict(previous)
+    # Presence, rather than the lifecycle spelling, is the cleanup evidence.
+    # Keep one deterministic state that was actually observed.
+    merged['state'] = min(previous['state'], current['state'])
+    return merged
+
+
 def parse_aws_state(*,
                     identities: collections.abc.Sequence[AwsProviderIdentity],
                     profile: Profile, service_instances: object,
@@ -1820,18 +1885,20 @@ class AwsObserver:
                                     state, collections.abc.Mapping) else None),
                                 'volume_ids': tuple(sorted(volume_ids)),
                             }
-                            if any(value is None or value == ''
-                                   for value in canonical.values()):
+                            if (any(value is None or value == ''
+                                    for value in canonical.values()) or
+                                    not isinstance(canonical['state'], str)):
                                 raise GuardViolation(
                                     'AWS service instance identity is '
                                     'incomplete.')
                             instance_id = str(canonical['instance_id'])
-                            previous = regional_instances.setdefault(
-                                instance_id, canonical)
-                            if previous != canonical:
-                                raise GuardViolation(
-                                    'AWS service instance identity is '
-                                    'contradictory.')
+                            previous = regional_instances.get(instance_id)
+                            if previous is None:
+                                regional_instances[instance_id] = canonical
+                            else:
+                                regional_instances[instance_id] = (
+                                    _merge_aws_instance_observations(
+                                        previous, canonical))
             instance_types = {
                 str(instance['instance_type'])
                 for instance in regional_instances.values()
@@ -1896,11 +1963,13 @@ class AwsObserver:
                             'state': state,
                             'volume_id': volume_id,
                         }
-                        previous = volumes_by_id.setdefault(
-                            volume_id, canonical_volume)
-                        if previous != canonical_volume:
-                            raise GuardViolation(
-                                'AWS service volume identity is contradictory.')
+                        previous = volumes_by_id.get(volume_id)
+                        if previous is None:
+                            volumes_by_id[volume_id] = canonical_volume
+                        else:
+                            volumes_by_id[volume_id] = (
+                                _merge_aws_volume_observations(
+                                    previous, canonical_volume))
                         newly_retained_by_region[region_scope.region].add(
                             volume_id)
 
