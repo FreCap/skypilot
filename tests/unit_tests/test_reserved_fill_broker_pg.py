@@ -2989,7 +2989,7 @@ class TestPaidCapacityAuthorityPG:
         assert waiters == []
         assert replica_pool == pool_a
 
-    def test_paid_claim_redrive_requires_same_replica_record_identity(
+    def test_paid_claim_redrive_preserves_claim_and_requires_same_record(
             self, broker_engine, monkeypatch):
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
         serve_state.Base.metadata.create_all(broker_engine)
@@ -3024,7 +3024,7 @@ class TestPaidCapacityAuthorityPG:
         persisted = serve_state.get_replica_info_from_id('svc', 1)
         assert persisted is not None
         assert persisted.replica_record_id == original.replica_record_id
-        assert persisted.version == 2
+        assert persisted.version == 1
         with sqlalchemy.orm.Session(broker_engine) as session:
             claim = session.execute(
                 sqlalchemy.select(
@@ -3035,7 +3035,7 @@ class TestPaidCapacityAuthorityPG:
                         'svc',
                         serve_state.paid_capacity_claims_table.c.replica_id ==
                         1)).one()
-        assert claim == (self._test_pool('pool'), 21, 100)
+        assert claim == (self._test_pool('pool'), 20, 100)
 
     def test_frontier_fill_withdraws_ineligible_priority_waiter(
             self, broker_engine, monkeypatch):
@@ -3642,12 +3642,61 @@ class TestPaidCapacityAuthorityPG:
                     serve_state.replicas_table.c.paid_capacity_pool_key).where(
                         serve_state.replicas_table.c.service_name == 'svc',
                         serve_state.replicas_table.c.replica_id == 1)).one()
-            claims = session.execute(
-                sqlalchemy.select(
-                    serve_state.paid_capacity_claims_table)).fetchall()
+            replica_before = dict(
+                session.execute(
+                    sqlalchemy.select(serve_state.replicas_table).where(
+                        serve_state.replicas_table.c.service_name == 'svc',
+                        serve_state.replicas_table.c.replica_id ==
+                        1)).mappings().one())
+            claim_before = dict(
+                session.execute(
+                    sqlalchemy.select(serve_state.paid_capacity_claims_table)).
+                mappings().one())
         assert row[0] == self._test_pool('pool')
-        assert len(claims) == 1
-        assert claims[0].claimed_at == 0
+        assert claim_before['priority'] == 20
+        assert claim_before['claimed_at'] == 0
+
+        # Controller restart uses the minimum priority.  Adoption reasserts
+        # the replica/pool edge but must not rewrite either half of the
+        # admission receipt, even if its in-memory snapshot is stale.
+        stale_info = self._info('svc', 1)
+        stale_info.replica_record_id = info.replica_record_id
+        stale_info.version = 99
+        stale_info.cluster_name = 'stale-restart-snapshot'
+        stale_info.replica_port = '9999'
+        assert serve_state.adopt_paid_capacity_claims(
+            'svc',
+            'hash', [(1, self._test_pool('pool'), 0, stale_info)],
+            base_limit=60,
+            now=200,
+            expected_controller_owner=(11, '10.0.0.1'))
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            replica_after = dict(
+                session.execute(
+                    sqlalchemy.select(serve_state.replicas_table).where(
+                        serve_state.replicas_table.c.service_name == 'svc',
+                        serve_state.replicas_table.c.replica_id ==
+                        1)).mappings().one())
+            claim_after = dict(
+                session.execute(
+                    sqlalchemy.select(serve_state.paid_capacity_claims_table)).
+                mappings().one())
+        assert replica_after == replica_before
+        assert claim_after == claim_before
+
+        with pytest.raises(ValueError, match='cannot move between exact'):
+            serve_state.adopt_paid_capacity_claims(
+                'svc',
+                'hash', [(1, self._test_pool('other'), 0, info)],
+                base_limit=60,
+                now=300,
+                expected_controller_owner=(11, '10.0.0.1'))
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            assert dict(
+                session.execute(
+                    sqlalchemy.select(serve_state.paid_capacity_claims_table)).
+                mappings().one()) == claim_before
+
         restored = serve_state.get_replica_info_from_id('svc', 1)
         assert restored is not None
         assert restored.paid_capacity_pool_key == self._test_pool('pool')
