@@ -16,7 +16,7 @@ from sky.serve import demand_state_schema
 from sky.serve import serve_state_schema
 from sky.utils.db import migration_utils
 
-pytestmark = pytest.mark.xdist_group(name='serve_demand_state_schema_050_pg')
+pytestmark = pytest.mark.xdist_group(name='serve_demand_state_schema_head_pg')
 
 
 def _report(now: float, *, sequence: int = 1) -> dict:
@@ -105,7 +105,7 @@ def _report(now: float, *, sequence: int = 1) -> dict:
 def demand_database(empty_postgres, monkeypatch):
     serve_config = migration_utils.get_alembic_config(
         empty_postgres, migration_utils.SERVE_DB_NAME)
-    alembic_command.upgrade(serve_config, '050')
+    alembic_command.upgrade(serve_config, 'head')
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
     with empty_postgres.begin() as connection:
@@ -181,6 +181,25 @@ def test_report_sequence_idempotency_freshness_and_summary(demand_database):
     assert stale['processing_requests'] is None
     assert stale['confirmed_processing_requests'] is None
     assert stale['http_in_flight_requests'] is None
+
+
+def test_request_summary_accepts_explicit_postgres_engine(
+        demand_database, monkeypatch):
+    now = time.time()
+    demand_state.ingest_report('svc', 'svc-hash', _report(now))
+
+    def fail_global_engine_lookup():
+        raise AssertionError('explicit engine must bypass the global manager')
+
+    monkeypatch.setattr(serve_state_schema, 'get_database_engine',
+                        fail_global_engine_lookup)
+    summary = demand_state.get_request_summary('svc',
+                                               'svc-hash',
+                                               engine=demand_database)
+
+    assert summary['request_telemetry_state'] == 'fresh'
+    assert summary['request_telemetry_compatibility_complete'] is True
+    assert summary['request_queue_depth'] == 0
 
 
 def test_report_rejects_wrong_service_hash_and_reporter_clock(demand_database):
