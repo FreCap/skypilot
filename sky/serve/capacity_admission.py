@@ -3804,7 +3804,13 @@ def service_name_has_terminal_absence_authority_in_connection(
                 _PAID_WAITERS.c.service_name == service_name).order_by(
                     _PAID_WAITERS.c.pool_key,
                     _PAID_WAITERS.c.service_hash).with_for_update()).mappings())
-    return not waiters
+    # A waiter is only a fairness heartbeat; it cannot authorize a provider
+    # effect without a paid claim.  The exact service row is already locked in
+    # a launch-blocking lifecycle and the provider census above proved that no
+    # claim remains.  Current-incarnation waiters can therefore be deleted by
+    # the caller's final transaction.  A waiter from another hash still blocks
+    # deletion so name reuse cannot inherit or erase foreign authority.
+    return all(row['service_hash'] == service['hash'] for row in waiters)
 
 
 def _canonical_prepared_paid_launch_specs(
