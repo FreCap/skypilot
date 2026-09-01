@@ -828,7 +828,7 @@ class DatabaseState:
     waiter_count: int
     demand_units: int
     bound_cluster_zones: tuple[tuple[str, str], ...]
-    phase_a_pending_replica_ids: tuple[int, ...] = ()
+    provider_free_unbound_replica_ids: tuple[int, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -1037,18 +1037,20 @@ def _is_selectable_settled_paid_binding(
             binding))
 
 
-def _is_exact_provider_free_paid_pending_pair(
+def _is_exact_provider_free_unbound_paid_debit(
     replica: collections.abc.Mapping[str, Any],
     claim: collections.abc.Mapping[str, Any] | None,
     bindings: collections.abc.Sequence[collections.abc.Mapping[str, Any]],
 ) -> bool:
-    """Whether one debit is exact paid state with no possible provider I/O.
+    """Whether one unbound paid debit permits no possible provider I/O.
 
-    This includes both the initial claim+replica Phase-A pair and the short
-    recovery interval after a pre-effect attempt is durably settled, its
-    pointer is cleared, and generation+1 has not yet been admitted.  The
-    retained claim funds that retry.  Provider-present or ambiguous history
-    never enters this path.
+    This includes the initial atomic claim+replica Phase-A pair and a settled
+    pre-effect attempt while its logical replica awaits retry or cleanup.  A
+    pre-effect settlement atomically releases its claim before asynchronous
+    retirement removes the provider-free row.  The two shapes are mutually
+    exclusive: no history requires a claim, while exact pre-effect history
+    requires claim absence.  Provider-present or ambiguous history never
+    enters this path.
     """
     record_id = replica.get('replica_record_id')
     try:
@@ -1073,7 +1075,11 @@ def _is_exact_provider_free_paid_pending_pair(
         str(binding.get('replica_record_id')) == canonical_record_id
     ]
     pool_key = replica.get('paid_capacity_pool_key')
-    history_is_provider_free = not exact_history
+    claim_matches = bool(
+        isinstance(claim, collections.abc.Mapping) and
+        claim.get('replica_id') == replica.get('replica_id') and
+        claim.get('pool_key') == pool_key)
+    history_is_provider_free = False
     if len(exact_history) == 1:
         predecessor = exact_history[0]
         history_is_provider_free = bool(
@@ -1088,14 +1094,14 @@ def _is_exact_provider_free_paid_pending_pair(
             .ReconciliationOutcome.PRE_EFFECT_TERMINAL.value and
             ordinary_launch_binding.
             settled_association_proves_execution_quiescence(predecessor))
+    funding_is_exact = (claim_matches if not exact_history else
+                        history_is_provider_free and claim is None)
     return bool(
         canonical_record_id == str(record_id) and
         replica.get('ordinary_launch_association_id') is None and
-        history_is_provider_free and
-        isinstance(claim, collections.abc.Mapping) and
-        claim.get('replica_id') == replica.get('replica_id') and
-        claim.get('pool_key') == pool_key and
-        replica.get('status') in ('PENDING', 'PROVISIONING') and
+        (not exact_history or history_is_provider_free) and funding_is_exact and
+        replica.get('status') in ('PENDING', 'PROVISIONING', 'SHUTTING_DOWN',
+                                  'FAILED_CLEANUP') and
         replica.get('is_spot') is True and relationally_paid and
         info.replica_id == replica.get('replica_id') and
         info.replica_record_id == canonical_record_id and
@@ -1432,16 +1438,16 @@ class PostgresObserver:
                     'A paid binding has multiple retained API requests.')
             request_by_association[association_id] = request
         bound_cluster_zones: dict[str, str] = {}
-        phase_a_pending_replica_ids: list[int] = []
+        provider_free_unbound_replica_ids: list[int] = []
         for replica in debits.replicas:
             try:
                 binding = select_replica_binding(replica, bindings)
             except GuardViolation:
                 claim = claim_by_replica_id.get(replica['replica_id'])
-                if not _is_exact_provider_free_paid_pending_pair(
+                if not _is_exact_provider_free_unbound_paid_debit(
                         replica, claim, bindings):
                     raise
-                phase_a_pending_replica_ids.append(replica['replica_id'])
+                provider_free_unbound_replica_ids.append(replica['replica_id'])
                 continue
             try:
                 context = ordinary_launch_binding.bound_context_from_association(
@@ -1497,8 +1503,8 @@ class PostgresObserver:
             waiter_count=int(waiter_count),
             demand_units=demand_units(demand_report['payload']),
             bound_cluster_zones=tuple(sorted(bound_cluster_zones.items())),
-            phase_a_pending_replica_ids=tuple(
-                sorted(phase_a_pending_replica_ids)),
+            provider_free_unbound_replica_ids=tuple(
+                sorted(provider_free_unbound_replica_ids)),
         )
 
 
@@ -2376,10 +2382,10 @@ async def _validated_sample(*, observer: Observer, profile: Profile,
         observation = await observer.snapshot(
             require_complete_demand_report=phase != 'scale')
         validate_observation(observation, profile)
-        if observation.database.phase_a_pending_replica_ids:
+        if observation.database.provider_free_unbound_replica_ids:
             raise QualificationError(
-                'PostgreSQL observation intersects provider-free paid Phase-A '
-                'admission.')
+                'PostgreSQL observation intersects provider-free unbound paid '
+                'admission or settlement.')
     except GuardViolation:
         # Market, card, cap, and durable provider-identity guards are the only
         # evidence failures authoritative enough to stop offered traffic.
