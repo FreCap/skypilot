@@ -840,6 +840,7 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
         'claimed_units': 1,
         'paid_claim_priorities': [50],
         'waiters': 0,
+        'provider_free_unbound_replicas': 0,
         'postgres_demand_units': 0,
         'provider_instances': 0,
         'provider_running': 0,
@@ -1158,7 +1159,7 @@ def test_replica_binding_selection_accepts_settled_failed_provider_absence():
         qualifier.select_replica_binding(replica, [malformed])
 
 
-def test_exact_provider_free_unbound_paid_debit_is_an_observation_miss(
+def test_exact_provider_free_unbound_paid_debit_remains_visible_during_scale(
         tmp_path):
     record_id = '22222222-2222-4222-8222-222222222222'
     pool_key = 'exact-gcp-spot-pool'
@@ -1321,6 +1322,13 @@ def test_exact_provider_free_unbound_paid_debit_is_an_observation_miss(
         demand_units=4,
         provider_free_unbound_replica_ids=(7,)),
                            load_balancer=_load_balancer_state(demand_units=4))
+    exact_zero_without_marker = _observation()
+    assert exact_zero_without_marker.is_exact_zero()
+    assert not dataclasses.replace(
+        exact_zero_without_marker,
+        database=dataclasses.replace(
+            exact_zero_without_marker.database,
+            provider_free_unbound_replica_ids=(7,))).is_exact_zero()
 
     class Observer:
 
@@ -1337,9 +1345,11 @@ def test_exact_provider_free_unbound_paid_debit_is_an_observation_miss(
                                     progress=qualifier.Progress(),
                                     receipt=receipt,
                                     phase='scale'))
-    assert observed is None
-    assert receipt._payload['samples'][-1]['observation_error_type'] == (
-        'QualificationError')
+    assert observed is phase_a
+    sample = receipt._payload['samples'][-1]
+    assert sample['phase'] == 'scale'
+    assert sample['provider_free_unbound_replicas'] == 1
+    assert 'observation_error_type' not in sample
 
 
 def test_phase_a_observation_cannot_hide_a_provider_effect(tmp_path):
@@ -1507,7 +1517,8 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
     now = qualifier.time.time()
     observations = [
         _observation(observed_at=now + 1,
-                     database=database,
+                     database=dataclasses.replace(
+                         database, provider_free_unbound_replica_ids=(7,)),
                      provider=_provider_state(instance_count=20,
                                               running_count=20,
                                               disk_count=20,
@@ -1555,9 +1566,12 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
     progress, receipt = asyncio.run(exercise())
     assert progress.peak_running == 64
     assert progress.scale_reached_monotonic == now + 2
+    samples = receipt._payload['samples']
+    assert samples[0]['provider_running'] == 20
+    assert samples[0]['provider_free_unbound_replicas'] == 1
+    assert samples[2]['provider_free_unbound_replicas'] == 0
     assert [
-        sample.get('observation_error_type')
-        for sample in receipt._payload['samples']
+        sample.get('observation_error_type') for sample in samples
     ] == [None, 'QualificationError', None]
 
 

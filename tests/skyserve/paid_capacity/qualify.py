@@ -1670,6 +1670,7 @@ class Observation:
         return (self.database.paid_debit_units == 0 and
                 self.database.claimed_units == 0 and
                 self.database.waiter_count == 0 and
+                not self.database.provider_free_unbound_replica_ids and
                 self.database.demand_units == 0 and
                 self.provider.instance_count == 0 and
                 self.provider.disk_count == 0 and
@@ -1793,6 +1794,11 @@ def observation_summary(observation: Observation) -> dict[str, Any]:
         'claimed_units': observation.database.claimed_units,
         'paid_claim_priorities': list(observation.database.claim_priorities),
         'waiters': observation.database.waiter_count,
+        # Phase-A launch intents are expected while a wave is being bound.
+        # Keep them visible in the receipt without mistaking them for an
+        # observer blackout; exact-zero still requires that they disappear.
+        'provider_free_unbound_replicas': len(
+            observation.database.provider_free_unbound_replica_ids),
         'postgres_demand_units': observation.database.demand_units,
         'provider_instances': observation.provider.instance_count,
         'provider_running': observation.provider.running_count,
@@ -2403,10 +2409,6 @@ async def _validated_sample(*, observer: Observer, profile: Profile,
         observation = await observer.snapshot(
             require_complete_demand_report=phase != 'scale')
         validate_observation(observation, profile)
-        if observation.database.provider_free_unbound_replica_ids:
-            raise QualificationError(
-                'PostgreSQL observation intersects provider-free unbound paid '
-                'admission or settlement.')
     except GuardViolation:
         # Market, card, cap, and durable provider-identity guards are the only
         # evidence failures authoritative enough to stop offered traffic.
