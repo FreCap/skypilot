@@ -332,6 +332,19 @@ class _PaidPhaseARecoveryIdentity:
     replica_record_id: str
 
 
+@dataclasses.dataclass(frozen=True)
+class _PaidLaunchMaterializationHandoff:
+    """Exact process-local ownership spanning paid commit to publication."""
+
+    prepared_specs: tuple[paid_capacity.PaidLaunchSpec, ...]
+
+    @property
+    def identities(self) -> frozenset[_PaidPhaseARecoveryIdentity]:
+        return frozenset(
+            _PaidPhaseARecoveryIdentity(spec.replica_id, spec.replica_record_id)
+            for spec in self.prepared_specs)
+
+
 @dataclasses.dataclass
 class _PaidPhaseARecovery:
     """Process-local retry state for one exact Phase-A identity."""
@@ -3844,6 +3857,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._non_pool_reconciliation_attempts: dict[int, int] = {}
         self._non_pool_reconciliation_retry_at: dict[int, float] = {}
         self._paid_phase_a_recovery_lock = threading.Lock()
+        self._paid_launch_materialization_identities: set[
+            _PaidPhaseARecoveryIdentity] = set()
         self._paid_phase_a_recoveries: dict[_PaidPhaseARecoveryIdentity,
                                             _PaidPhaseARecovery] = {}
         self._ordinary_launch_binding_authority: (ControllerBindingAuthority |
@@ -4566,7 +4581,7 @@ class SkyPilotReplicaManager(ReplicaManager):
     def materialize_paid_launch_receipt(
         self,
         receipt: paid_capacity.PaidLaunchReceipt,
-        prepared_specs: Iterable[paid_capacity.PaidLaunchSpec],
+        handoff: _PaidLaunchMaterializationHandoff,
     ) -> tuple[_ReplicaLaunchResult, ...]:
         """Build and publish only the acknowledged sparse committed subset.
 
@@ -4579,28 +4594,46 @@ class SkyPilotReplicaManager(ReplicaManager):
         """
         if not isinstance(receipt, paid_capacity.PaidLaunchReceipt):
             raise TypeError('receipt must be a PaidLaunchReceipt.')
-        specs = tuple(prepared_specs)
-        if any(not isinstance(spec, paid_capacity.PaidLaunchSpec)
-               for spec in specs):
-            raise TypeError('prepared_specs contains a non-launch spec.')
+        if not isinstance(handoff, _PaidLaunchMaterializationHandoff):
+            raise TypeError('handoff must be a paid materialization handoff.')
+        specs = handoff.prepared_specs
         spec_by_identity = {
             (spec.replica_id, spec.replica_record_id): spec for spec in specs
         }
         if len(spec_by_identity) != len(specs):
             raise ValueError('Prepared paid launch identities must be unique.')
+        receipt_identities = frozenset(
+            _PaidPhaseARecoveryIdentity(member.replica_id,
+                                        member.replica_record_id)
+            for member in receipt.members)
+        with self._paid_phase_a_recovery_lock:
+            if (not receipt_identities.issubset(handoff.identities) or
+                    not receipt_identities.issubset(
+                        self._paid_launch_materialization_identities)):
+                raise ValueError(
+                    'Paid launch receipt has no active materialization handoff.'
+                )
         authority = self._ordinary_launch_binding_authority
         if (receipt.service_name != self._service_name or
                 receipt.service_hash != self._service_hash or
                 receipt.service_version != self.latest_version or
                 authority is None or not authority.generic_launches_required or
-                receipt.service_lifecycle_epoch !=
-                authority.service_lifecycle_epoch):
+                receipt.service_lifecycle_epoch
+                != authority.service_lifecycle_epoch):
             raise ValueError('Paid launch receipt is stale for this manager.')
 
         built: list[tuple[ReplicaInfo, _ReplicaLaunchThread,
                           _ReplicaLaunchResult]] = []
         accepted_locations: set[spot_placer.Location] = set()
-        recovery_identities: list[_PaidPhaseARecoveryIdentity] = []
+        # Every receipt member committed before this process-local operation.
+        # If construction fails at any position, transfer the complete sparse
+        # receipt to exact Phase-A recovery rather than leaving an unvisited
+        # suffix dependent on the generic unowned-row scan.
+        recovery_identities = [
+            _PaidPhaseARecoveryIdentity(member.replica_id,
+                                        member.replica_record_id)
+            for member in receipt.members
+        ]
         try:
             committed_by_identity = {
                 (info.replica_id, info.replica_record_id): info
@@ -4608,14 +4641,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             }
             for member in receipt.members:
                 identity = (member.replica_id, member.replica_record_id)
-                recovery_identities.append(
-                    _PaidPhaseARecoveryIdentity(member.replica_id,
-                                                member.replica_record_id))
                 spec = spec_by_identity.get(identity)
                 if (spec is None or spec.service_name != receipt.service_name or
                         spec.service_hash != receipt.service_hash or
-                        spec.service_lifecycle_epoch !=
-                        receipt.service_lifecycle_epoch or
+                        spec.service_lifecycle_epoch
+                        != receipt.service_lifecycle_epoch or
                         spec.service_version != receipt.service_version or
                         spec.pool_key != member.pool_key or
                         spec.accelerator != member.accelerator or
@@ -5531,6 +5561,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     serve_state.ReplicaStatus.PROVISIONING) or
                     info.replica_id in runtime.launch_thread_pool or
                     info.replica_id in runtime.down_thread_pool or
+                    self._paid_launch_materialization_is_pending(info) or
                     self._paid_phase_a_recovery_is_pending(info)):
                 continue
             try:
@@ -10540,6 +10571,54 @@ class SkyPilotReplicaManager(ReplicaManager):
         # refresh pass returns. Waking it here never performs database or
         # provider I/O under the scale-up manager lock.
         self._legacy_mutation_runtime_state().launch_completion_event.set()
+
+    def begin_paid_launch_materialization(
+        self,
+        prepared_specs: Iterable[paid_capacity.PaidLaunchSpec],
+    ) -> _PaidLaunchMaterializationHandoff:
+        """Fence exact prepared identities before their PostgreSQL commit.
+
+        The fence is deliberately process-local.  It only distinguishes a
+        live controller's commit-to-worker-publication handoff from genuinely
+        abandoned Phase-A rows.  If the process exits, the fence disappears
+        and the replacement controller's existing durable recovery path owns
+        those rows.
+        """
+        specs = tuple(prepared_specs)
+        if any(not isinstance(spec, paid_capacity.PaidLaunchSpec)
+               for spec in specs):
+            raise TypeError('prepared_specs contains a non-launch spec.')
+        identities = frozenset(
+            _PaidPhaseARecoveryIdentity(spec.replica_id, spec.replica_record_id)
+            for spec in specs)
+        if (len(identities) != len(specs) or
+                len({identity.replica_id for identity in identities
+                    }) != len(identities)):
+            raise ValueError('Prepared paid launch identities must be unique.')
+        with self._paid_phase_a_recovery_lock:
+            overlap = ((self._paid_launch_materialization_identities |
+                        set(self._paid_phase_a_recoveries)) & identities)
+            if overlap:
+                raise RuntimeError(
+                    'Paid launch materialization identity is already owned.')
+            self._paid_launch_materialization_identities.update(identities)
+        return _PaidLaunchMaterializationHandoff(specs)
+
+    def end_paid_launch_materialization(
+            self, handoff: _PaidLaunchMaterializationHandoff) -> None:
+        """Release one exact handoff after publication or recovery transfer."""
+        if not isinstance(handoff, _PaidLaunchMaterializationHandoff):
+            raise TypeError('handoff must be a paid materialization handoff.')
+        with self._paid_phase_a_recovery_lock:
+            self._paid_launch_materialization_identities.difference_update(
+                handoff.identities)
+
+    def _paid_launch_materialization_is_pending(self,
+                                                info: ReplicaInfo) -> bool:
+        identity = _PaidPhaseARecoveryIdentity(info.replica_id,
+                                               info.replica_record_id)
+        with self._paid_phase_a_recovery_lock:
+            return identity in self._paid_launch_materialization_identities
 
     def _paid_phase_a_recovery_is_pending(self, info: ReplicaInfo) -> bool:
         identity = _PaidPhaseARecoveryIdentity(info.replica_id,

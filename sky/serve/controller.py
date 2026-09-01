@@ -6443,6 +6443,33 @@ class SkyServeController:
                 common_utils.format_exception(error))
             return ()
 
+    def _prepare_current_paid_launch_handoff_specs(
+        self,
+        decision_autoscaler: autoscalers.ConcurrencyAutoscaler,
+        decision_version: int,
+        replica_infos: list[replica_managers.ReplicaInfo],
+    ) -> tuple[paid_capacity.PaidLaunchSpec, ...] | None:
+        """Prepare the exact speculative set fenced around paid admission."""
+        try:
+            max_live_paid_gpu_units = (
+                self._replica_manager.max_live_paid_gpu_units)
+        except (TypeError, ValueError) as error:
+            logger.warning(
+                'Suppressing promoted capacity planning because '
+                'the active service paid cap is unavailable: %s',
+                common_utils.format_exception(error))
+            return None
+        if (max_live_paid_gpu_units is not None and
+            (type(max_live_paid_gpu_units) is not int or
+             max_live_paid_gpu_units < 0)):
+            logger.warning('Suppressing promoted capacity planning because '
+                           'the active service paid cap is malformed.')
+            return None
+        return self._prepare_current_paid_launch_specs(decision_autoscaler,
+                                                       decision_version,
+                                                       replica_infos,
+                                                       max_live_paid_gpu_units)
+
     @staticmethod
     def _install_committed_capacity_plan_projection(
         decision_autoscaler: autoscalers.ConcurrencyAutoscaler,
@@ -6466,6 +6493,29 @@ class SkyServeController:
             accepted.get(card.casefold(), 0) < target
             for card, target in candidate.paid_launch_target.entries)
 
+    @staticmethod
+    def _paid_launch_receipt_can_materialize(
+        committed: capacity_admission.CommittedCapacityPlan,
+        planned: _LinearizedScalePlan,
+    ) -> bool:
+        """Keep gate, reserved, and paid effects mutually exclusive."""
+        candidate = planned.capacity_plan_candidate
+        receipt = committed.paid_launch_receipt
+        if (candidate is None or planned.capacity_planning_snapshot is None):
+            return False
+        if candidate.kind is capacity_planning.CapacityPlanKind.GATE_ACQUISITION:
+            if receipt.members:
+                raise RuntimeError('Gate acquisition committed paid launch '
+                                   'work.')
+            return False
+        reserved_launch_target = candidate.reserved_launch_target.as_dict()
+        if any(reserved_launch_target.values()):
+            if receipt.members:
+                raise RuntimeError('Atomic capacity admission committed paid '
+                                   'work beside compatible reserved work.')
+            return False
+        return bool(receipt.members)
+
     def _plan_and_admit_current_capacity(
         self,
         decision_autoscaler: autoscalers.Autoscaler,
@@ -6477,9 +6527,14 @@ class SkyServeController:
         replica_infos: list[replica_managers.ReplicaInfo],
         *,
         sequenced_reserved_fill: bool,
+        prepared_paid_launch_specs: tuple[paid_capacity.PaidLaunchSpec, ...],
     ) -> tuple[capacity_admission.CommittedCapacityPlan, _LinearizedScalePlan,
                tuple[paid_capacity.PaidLaunchSpec, ...]] | None:
-        """Plan and atomically admit one current paid wave in PostgreSQL."""
+        """Plan and atomically admit one already-fenced paid wave in PostgreSQL.
+
+        Production callers must install the exact process-local materialization
+        handoff before supplying ``prepared_paid_launch_specs``.
+        """
         binding = self._ordinary_launch_binding_authority
         service_hash = self._service_hash
         if (binding is None or not isinstance(service_hash, str) or
@@ -6509,24 +6564,12 @@ class SkyServeController:
         accounting_cards = {
             card.casefold(): width for card, width in configured_shapes.entries
         }
-        try:
-            max_live_paid_gpu_units = (
-                self._replica_manager.max_live_paid_gpu_units)
-        except (TypeError, ValueError) as error:
-            logger.warning(
-                'Suppressing promoted capacity planning because '
-                'the active service paid cap is unavailable: %s',
-                common_utils.format_exception(error))
-            return None
-        if (max_live_paid_gpu_units is not None and
-            (type(max_live_paid_gpu_units) is not int or
-             max_live_paid_gpu_units < 0)):
+        if (not isinstance(prepared_paid_launch_specs, tuple) or
+                any(not isinstance(spec, paid_capacity.PaidLaunchSpec)
+                    for spec in prepared_paid_launch_specs)):
             logger.warning('Suppressing promoted capacity planning because '
-                           'the active service paid cap is malformed.')
+                           'its prepared paid launch set is malformed.')
             return None
-        prepared_paid_launch_specs = self._prepare_current_paid_launch_specs(
-            decision_autoscaler, decision_version, replica_infos,
-            max_live_paid_gpu_units)
 
         planned: _LinearizedScalePlan | None = None
         durable_plan: autoscalers.DurableCapacityReconcilePlan | None = None
@@ -6917,6 +6960,52 @@ class SkyServeController:
             self._durable_demand_snapshot = snapshot
         return committed, planned, prepared_paid_launch_specs
 
+    def _plan_admit_and_materialize_current_capacity(
+        self,
+        decision_autoscaler: autoscalers.Autoscaler,
+        decision_version: int,
+        actuation_generation: int,
+        notification_generation: int,
+        planning_state_fingerprint: str | None,
+        prepared_decision_inputs: autoscalers.ScalingDecisionInputs,
+        replica_infos: list[replica_managers.ReplicaInfo],
+        *,
+        sequenced_reserved_fill: bool,
+    ) -> tuple[capacity_admission.CommittedCapacityPlan, _LinearizedScalePlan,
+               tuple[paid_capacity.PaidLaunchSpec, ...]] | None:
+        """Own paid identities continuously from commit through publication."""
+        if not isinstance(decision_autoscaler,
+                          autoscalers.ConcurrencyAutoscaler):
+            logger.warning('Suppressing promoted capacity planning because the '
+                           'autoscaler has no pure durable logical planner.')
+            return None
+        prepared_specs = self._prepare_current_paid_launch_handoff_specs(
+            decision_autoscaler, decision_version, replica_infos)
+        if prepared_specs is None:
+            return None
+        handoff = self._replica_manager.begin_paid_launch_materialization(
+            prepared_specs)
+        try:
+            current_plan = self._plan_and_admit_current_capacity(
+                decision_autoscaler,
+                decision_version,
+                actuation_generation,
+                notification_generation,
+                planning_state_fingerprint,
+                prepared_decision_inputs,
+                replica_infos,
+                sequenced_reserved_fill=sequenced_reserved_fill,
+                prepared_paid_launch_specs=prepared_specs)
+            if current_plan is None:
+                return None
+            committed, planned, _ = current_plan
+            if self._paid_launch_receipt_can_materialize(committed, planned):
+                self._replica_manager.materialize_paid_launch_receipt(
+                    committed.paid_launch_receipt, handoff)
+            return current_plan
+        finally:
+            self._replica_manager.end_paid_launch_materialization(handoff)
+
     def _reconcile_scale_once(self, reconcile_generation: int) -> None:
         """Plan and actuate one optimistic, version-fenced scale epoch."""
         stop_event = self._get_actuation_stop()
@@ -7001,30 +7090,28 @@ class SkyServeController:
 
                 committed_capacity: (capacity_admission.CommittedCapacityPlan |
                                      None) = None
-                prepared_paid_launch_specs: tuple[paid_capacity.PaidLaunchSpec,
-                                                  ...] = ()
                 durable_snapshot = None
                 durable_logical_snapshot = None
                 fresh_aggregate_zero = False
                 if durable_demand_promoted:
                     assert decision_inputs is not None
-                    current_plan = self._plan_and_admit_current_capacity(
-                        decision_autoscaler,
-                        decision_version,
-                        actuation_generation,
-                        notification_generation,
-                        planning_state_fingerprint,
-                        decision_inputs,
-                        replica_infos,
-                        sequenced_reserved_fill=sequenced_reserved_fill)
+                    current_plan = (
+                        self._plan_admit_and_materialize_current_capacity(
+                            decision_autoscaler,
+                            decision_version,
+                            actuation_generation,
+                            notification_generation,
+                            planning_state_fingerprint,
+                            decision_inputs,
+                            replica_infos,
+                            sequenced_reserved_fill=sequenced_reserved_fill))
                     if current_plan is None:
                         self._refresh_replica_counts_snapshot()
                         self._durable_demand_snapshot = None
                         self._replica_manager.invalidate_logical_reconcile_state(
                         )
                         return
-                    (committed_capacity, linearized,
-                     prepared_paid_launch_specs) = current_plan
+                    committed_capacity, linearized, _ = current_plan
                     durable_snapshot = linearized.snapshot
                     durable_logical_snapshot = linearized.logical_snapshot
                     notification_generation = (
@@ -7045,9 +7132,6 @@ class SkyServeController:
                         return
                     if (committed_capacity_plan.kind is capacity_planning.
                             CapacityPlanKind.GATE_ACQUISITION):
-                        if committed_capacity.paid_launch_receipt.members:
-                            raise RuntimeError(
-                                'Gate acquisition committed paid launch work.')
                         # A gate-acquisition publication is neither a planning
                         # failure nor scale-to-zero authority. Its committed
                         # candidate has already refreshed the disposable
@@ -7058,10 +7142,6 @@ class SkyServeController:
                     reservation_budget = (committed_capacity_plan.
                                           reserved_launch_target.as_dict())
                     if any(reservation_budget.values()):
-                        if committed_capacity.paid_launch_receipt.members:
-                            raise RuntimeError(
-                                'Atomic capacity admission committed paid work '
-                                'beside compatible reserved work.')
                         self._accept_sequenced_reserved_fill(
                             linearized.reserved_fill_allocation_map,
                             decision_autoscaler, decision_version,
@@ -7075,9 +7155,6 @@ class SkyServeController:
                         return
                     paid_launch_receipt = (
                         committed_capacity.paid_launch_receipt)
-                    if paid_launch_receipt.members:
-                        self._replica_manager.materialize_paid_launch_receipt(
-                            paid_launch_receipt, prepared_paid_launch_specs)
                     if (paid_launch_receipt.members and
                             self._paid_launch_receipt_underfills_plan(
                                 committed_capacity_plan, paid_launch_receipt)):

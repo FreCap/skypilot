@@ -4590,6 +4590,7 @@ def test_controller_installs_finalized_partial_paid_wave_and_successor(
         prepared_inputs = (
             autoscalers.prepare_controller_scaling_decision_inputs(
                 autoscaler, replica_infos))
+        prepared_specs = manager.prepare_paid_launch_specs()
         result = ctrl._plan_and_admit_current_capacity(
             autoscaler,
             1,
@@ -4598,7 +4599,8 @@ def test_controller_installs_finalized_partial_paid_wave_and_successor(
             planning_fingerprint,
             prepared_inputs,
             replica_infos,
-            sequenced_reserved_fill=False)
+            sequenced_reserved_fill=False,
+            prepared_paid_launch_specs=prepared_specs)
         assert result is not None
         return result
 
@@ -4753,6 +4755,7 @@ def test_fresh_zero_multi_pool_admission_accepts_yaml_card_casing(
             serve_state.get_scale_planning_state_fingerprint(
                 'svc', require_version=True))
         assert planning_fingerprint is not None
+        prepared_specs = manager.prepare_paid_launch_specs()
         result = ctrl._plan_and_admit_current_capacity(
             autoscaler,
             1,
@@ -4760,7 +4763,8 @@ def test_fresh_zero_multi_pool_admission_accepts_yaml_card_casing(
             0,
             planning_fingerprint,
             prepared_inputs, [],
-            sequenced_reserved_fill=True)
+            sequenced_reserved_fill=True,
+            prepared_paid_launch_specs=prepared_specs)
         assert result is not None
         return result[0]
 
