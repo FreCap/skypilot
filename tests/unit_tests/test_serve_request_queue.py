@@ -86,6 +86,7 @@ def test_queue_config_round_trip_and_defaults():
     assert queue['size_per_replica'] == 3
     assert queue['max_size'] == 1000
     assert queue['max_concurrency'] == 32
+    assert queue['timeout_seconds'] == 600
     assert queue['max_request_body_bytes'] == 1024 * 1024
     assert queue['use_async_occupancy'] is False
     restored = service_spec_lib.SkyServiceSpec.from_yaml_config(
