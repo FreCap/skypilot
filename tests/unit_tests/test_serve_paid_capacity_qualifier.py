@@ -23,6 +23,7 @@ from smoke_tests import smoke_tests_utils
 import yaml
 
 import sky
+from sky.serve import replica_managers
 from sky.serve import serve_utils
 
 
@@ -971,6 +972,102 @@ def test_replica_binding_selection_accepts_settled_failed_provider_absence():
     with pytest.raises(qualifier.GuardViolation,
                        match='unique current or latest settled'):
         qualifier.select_replica_binding(replica, [malformed])
+
+
+def test_exact_associationless_phase_a_pair_is_an_observation_miss(tmp_path):
+    record_id = '22222222-2222-4222-8222-222222222222'
+    pool_key = 'exact-gcp-spot-pool'
+    info = replica_managers.ReplicaInfo(replica_id=7,
+                                        cluster_name='paid-e2e-7',
+                                        replica_port='8000',
+                                        is_spot=True,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+    info.replica_record_id = record_id
+    info.paid_capacity_pool_key = pool_key
+    replica = {
+        'replica_id': 7,
+        'replica_state_version': 1,
+        'replica_record_id': record_id,
+        'ordinary_launch_association_id': None,
+        'status': info.status.value,
+        'is_spot': True,
+        'paid_capacity_pool_key': pool_key,
+        'version': 1,
+        'cluster_name': 'paid-e2e-7',
+        'replica_state': info.to_storage_dict(),
+    }
+    claim = {
+        'replica_id': 7,
+        'pool_key': pool_key,
+    }
+    assert qualifier._is_exact_associationless_paid_phase_a_pair(
+        replica, claim, [])
+    assert not qualifier._is_exact_associationless_paid_phase_a_pair(
+        replica, {
+            **claim, 'pool_key': 'another-pool'
+        }, [])
+    assert not qualifier._is_exact_associationless_paid_phase_a_pair(
+        replica, claim, [{
+            'replica_id': 7,
+            'replica_record_id': record_id,
+        }])
+
+    phase_a = _observation(database=_database_state(
+        paid_debit_units=1,
+        claimed_units=1,
+        claim_priorities=(50,),
+        demand_units=4,
+        phase_a_pending_replica_ids=(7,)),
+                           load_balancer=_load_balancer_state(demand_units=4))
+
+    class Observer:
+
+        async def snapshot(self):
+            return phase_a
+
+    receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                service_name='paid-e2e',
+                                profile=qualifier.PROFILES['scale'])
+    observed = asyncio.run(
+        qualifier._validated_sample(observer=Observer(),
+                                    profile=qualifier.PROFILES['scale'],
+                                    progress=qualifier.Progress(),
+                                    receipt=receipt,
+                                    phase='scale'))
+    assert observed is None
+    assert receipt._payload['samples'][-1]['observation_error_type'] == (
+        'QualificationError')
+
+
+def test_phase_a_observation_cannot_hide_a_provider_effect(tmp_path):
+    phase_a_with_effect = _observation(
+        database=_database_state(paid_debit_units=1,
+                                 claimed_units=1,
+                                 claim_priorities=(50,),
+                                 demand_units=4,
+                                 phase_a_pending_replica_ids=(7,)),
+        provider=_provider_state(instance_count=1,
+                                 cluster_names=frozenset({'paid-e2e-7'})),
+        load_balancer=_load_balancer_state(demand_units=4))
+
+    class Observer:
+
+        async def snapshot(self):
+            return phase_a_with_effect
+
+    receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                service_name='paid-e2e',
+                                profile=qualifier.PROFILES['scale'])
+    with pytest.raises(qualifier.GuardViolation,
+                       match='durable launch binding'):
+        asyncio.run(
+            qualifier._validated_sample(observer=Observer(),
+                                        profile=qualifier.PROFILES['scale'],
+                                        progress=qualifier.Progress(),
+                                        receipt=receipt,
+                                        phase='scale'))
 
 
 def test_demand_projection_is_zero_sensitive():

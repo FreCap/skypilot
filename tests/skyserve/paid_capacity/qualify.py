@@ -49,6 +49,7 @@ from sky.provision.gcp import instance_utils
 from sky.serve import auth_tokens
 from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
+from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.server.requests import non_pool_launch
 from sky.server.requests import postgres as request_postgres
@@ -725,6 +726,7 @@ class DatabaseState:
     waiter_count: int
     demand_units: int
     bound_cluster_zones: tuple[tuple[str, str], ...]
+    phase_a_pending_replica_ids: tuple[int, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -921,8 +923,64 @@ def _is_selectable_settled_paid_binding(
     # current association pointer without recording a service job.  Delegate
     # this exceptional shape to the production read-side validator instead of
     # duplicating its quiescence and provider-evidence contract in the harness.
-    return ordinary_launch_binding.settled_association_proves_execution_quiescence(
-        binding)
+    return bool(
+        binding.get('resolution')
+        == ordinary_launch_binding.Resolution.PROJECTED.value and
+        binding.get('reconciliation_outcome')
+        == ordinary_launch_binding.ReconciliationOutcome.PROJECTED.value and
+        binding.get('provider_evidence')
+        == ordinary_launch_binding.ProviderEvidence.ABSENT.value and
+        binding.get('service_job_id') is None and
+        ordinary_launch_binding.settled_association_proves_execution_quiescence(
+            binding))
+
+
+def _is_exact_associationless_paid_phase_a_pair(
+    replica: collections.abc.Mapping[str, Any],
+    claim: collections.abc.Mapping[str, Any] | None,
+    bindings: collections.abc.Sequence[collections.abc.Mapping[str, Any]],
+) -> bool:
+    """Whether one debit is an exact paid pre-association Phase-A pair."""
+    record_id = replica.get('replica_record_id')
+    try:
+        canonical_record_id = str(uuid.UUID(str(record_id)))
+        replica_state_version = replica.get('replica_state_version')
+        replica_state = replica.get('replica_state')
+        if (type(replica_state_version) is not int or  # pylint: disable=unidiomatic-typecheck
+                not isinstance(replica_state, dict)):
+            return False
+        info = serve_state.decode_replica_state_for_authority(
+            replica_state_version, replica_state)
+        relationally_paid = (
+            paid_capacity.validate_paid_replica_relational_copies(
+                replica_state,
+                pool_key_value=replica.get('paid_capacity_pool_key')))
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError,
+            paid_capacity.PaidGPUAttributionError):
+        return False
+    exact_history = [
+        binding for binding in bindings
+        if binding.get('replica_id') == replica.get('replica_id') and
+        str(binding.get('replica_record_id')) == canonical_record_id
+    ]
+    pool_key = replica.get('paid_capacity_pool_key')
+    return bool(
+        canonical_record_id == str(record_id) and
+        replica.get('ordinary_launch_association_id') is None and
+        not exact_history and isinstance(claim, collections.abc.Mapping) and
+        claim.get('replica_id') == replica.get('replica_id') and
+        claim.get('pool_key') == pool_key and
+        replica.get('status') in ('PENDING', 'PROVISIONING') and
+        replica.get('is_spot') is True and relationally_paid and
+        info.replica_id == replica.get('replica_id') and
+        info.replica_record_id == canonical_record_id and
+        info.version == replica.get('version') and
+        info.cluster_name == replica.get('cluster_name') and
+        info.status.value == replica.get('status') and
+        info.is_spot is replica.get('is_spot') and
+        info.paid_capacity_pool_key == pool_key and
+        ordinary_launch_binding.classify_non_pool_launch_profile(info)
+        is ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
 
 
 def select_replica_binding(
@@ -1112,6 +1170,7 @@ class PostgresObserver:
                 sqlalchemy.text('''
                     SELECT replica.replica_id, replica.cluster_name,
                            replica.status, replica.is_spot,
+                           replica.replica_state_version, replica.version,
                            replica.paid_capacity_pool_key,
                            replica.ordinary_launch_association_id,
                            replica.replica_state ->> 'replica_record_id'
@@ -1166,7 +1225,7 @@ class PostgresObserver:
                 }).mappings().all()
             claims = connection.execute(
                 sqlalchemy.text('''
-                    SELECT c.replica_id, c.claimed_at, c.priority,
+                    SELECT c.replica_id, c.pool_key, c.claimed_at, c.priority,
                            c.capacity_plan_generation,
                            c.capacity_plan_sha256,
                            c.capacity_plan_accelerator,
@@ -1213,6 +1272,10 @@ class PostgresObserver:
         if not claim_ids.issubset(replica_ids):
             raise GuardViolation(
                 'An unresolved paid claim has no debit-bearing replica.')
+        claim_census = paid_claim_census(claims)
+        claim_by_replica_id = {claim['replica_id']: claim for claim in claims}
+        if len(claim_by_replica_id) != len(claims):
+            raise GuardViolation('Paid claims have duplicate replica IDs.')
         request_by_association: dict[str, sqlalchemy.engine.RowMapping] = {}
         for request in requests:
             association_id = str(request['ordinary_launch_association_id'])
@@ -1221,8 +1284,17 @@ class PostgresObserver:
                     'A paid binding has multiple retained API requests.')
             request_by_association[association_id] = request
         bound_cluster_zones: dict[str, str] = {}
+        phase_a_pending_replica_ids: list[int] = []
         for replica in debits.replicas:
-            binding = select_replica_binding(replica, bindings)
+            try:
+                binding = select_replica_binding(replica, bindings)
+            except GuardViolation:
+                claim = claim_by_replica_id.get(replica['replica_id'])
+                if not _is_exact_associationless_paid_phase_a_pair(
+                        replica, claim, bindings):
+                    raise
+                phase_a_pending_replica_ids.append(replica['replica_id'])
+                continue
             try:
                 context = ordinary_launch_binding.bound_context_from_association(
                     binding)
@@ -1263,7 +1335,6 @@ class PostgresObserver:
                 raise GuardViolation(
                     'Paid replicas share one durable GCP provider identity.')
             bound_cluster_zones[cloud_name] = identity['zone']
-        claim_census = paid_claim_census(claims)
         demand_report = select_route_authoritative_report(
             authority, demand_reports, load_balancer)
         return DatabaseState(
@@ -1275,6 +1346,8 @@ class PostgresObserver:
             waiter_count=int(waiter_count),
             demand_units=demand_units(demand_report['payload']),
             bound_cluster_zones=tuple(sorted(bound_cluster_zones.items())),
+            phase_a_pending_replica_ids=tuple(
+                sorted(phase_a_pending_replica_ids)),
         )
 
 
@@ -1712,6 +1785,10 @@ async def _validated_sample(*, observer: Observer, profile: Profile,
     try:
         observation = await observer.snapshot()
         validate_observation(observation, profile)
+        if observation.database.phase_a_pending_replica_ids:
+            raise QualificationError(
+                'PostgreSQL observation intersects provider-free paid Phase-A '
+                'admission.')
     except GuardViolation:
         # Market, card, cap, and durable provider-identity guards are the only
         # evidence failures authoritative enough to stop offered traffic.
