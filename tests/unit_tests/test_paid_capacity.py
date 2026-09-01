@@ -13,6 +13,7 @@ from sky.serve import capacity_admission
 from sky.serve import capacity_planning
 from sky.serve import constants
 from sky.serve import paid_capacity
+from sky.serve import placement_policy
 from sky.serve import replica_managers
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -2403,6 +2404,194 @@ def test_saturated_pool_exhaustion_spills_to_next_pool():
     assert paid_capacity.select_location(placer, budget) == expensive
 
 
+@pytest.mark.parametrize(('initial_headroom', 'expected_selections'),
+                         [((60, 60, 60), (40, 40, 40)),
+                          ((60, 60, 1), (60, 59, 1))])
+def test_managed_equal_cost_tier_balances_by_initial_pool_headroom(
+        initial_headroom, expected_selections):
+    locations = [
+        make_location(f'us-central1-{zone}', {'L4': 1}, cloud_name='GCP')
+        for zone in ('a', 'b', 'c')
+    ]
+    for location in locations:
+        location.instance_type = 'g2-standard-4'
+    placer = make_placer({location: 0.424 for location in locations})
+    pool_keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in locations
+    }
+    budget = paid_capacity.LaunchBudget(
+        remaining_by_location=dict(zip(locations, initial_headroom)),
+        pool_key_by_location=pool_keys,
+        states_by_pool_key={
+            pool_keys[location]: {
+                'remaining': remaining,
+                'admission_state': 'active',
+            } for location, remaining in zip(locations, initial_headroom)
+        },
+        globally_managed=True,
+        service_remaining=120,
+        frontier_limit=3,
+        max_frontier_limit=3,
+        frontier_key_by_location={location: ('l4',) for location in locations})
+
+    selected = []
+    for _ in range(120):
+        location = paid_capacity.select_location(placer, budget)
+        assert location is not None
+        selected.append(location)
+        paid_capacity.debit(budget, location)
+
+    assert tuple(selected.count(location)
+                 for location in locations) == expected_selections
+    assert selected[:3] == locations
+    if initial_headroom == (60, 60, 60):
+        for prefix_length in range(1, len(selected) + 1):
+            prefix_counts = [
+                selected[:prefix_length].count(location)
+                for location in locations
+            ]
+            assert max(prefix_counts) - min(prefix_counts) <= 1
+
+
+def _managed_equal_cost_budget(
+    placer: spot_placer.SpotPlacer,
+    *,
+    first_remaining: int = 1,
+    second_remaining: int = 60,
+) -> tuple[paid_capacity.LaunchBudget, spot_placer.Location,
+           spot_placer.Location]:
+    first, second = placer.ranked_active_locations()
+    pool_keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in (first, second)
+    }
+    budget = paid_capacity.LaunchBudget(
+        remaining_by_location={
+            first: first_remaining,
+            second: second_remaining,
+        },
+        pool_key_by_location=pool_keys,
+        states_by_pool_key={
+            pool_key: {
+                'remaining': 60,
+                'admission_state': 'active',
+            } for pool_key in pool_keys.values()
+        },
+        globally_managed=True,
+        service_remaining=first_remaining + second_remaining)
+    return budget, first, second
+
+
+def test_equal_normalized_cost_does_not_balance_across_purchase_market():
+    spot = make_location('us-central1-a',
+                         {'L4': 1},
+                         cloud_name='GCP',
+                         use_spot=True)
+    on_demand = make_location('us-central1-b',
+                              {'L4': 1},
+                              cloud_name='GCP',
+                              use_spot=False)
+    placer = make_placer({spot: 0.424, on_demand: 0.424})
+    budget, canonical, noncanonical = _managed_equal_cost_budget(placer)
+
+    assert budget.remaining_by_location[canonical] == 1
+    assert budget.remaining_by_location[noncanonical] == 60
+    assert paid_capacity.select_location(placer, budget) == canonical
+
+
+def test_equal_normalized_cost_does_not_balance_across_backend_shape():
+    one_gpu = make_location('us-central1-a', {'L4': 1}, cloud_name='GCP')
+    eight_gpu = make_location('us-central1-b', {'L4': 8}, cloud_name='GCP')
+    contract = placement_policy.resolve_fresh_contract(
+        placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
+    placer = make_placer({one_gpu: 0.424, eight_gpu: 3.392},
+                         placement_contract=contract)
+    budget, canonical, noncanonical = _managed_equal_cost_budget(placer)
+
+    assert budget.remaining_by_location[canonical] == 1
+    assert budget.remaining_by_location[noncanonical] == 60
+    assert paid_capacity.select_location(placer, budget) == canonical
+
+
+def test_balancing_does_not_cross_normalized_cost_tier():
+    cheap = make_location('us-central1-a', {'L4': 1}, cloud_name='GCP')
+    expensive = make_location('us-central1-b', {'L4': 1}, cloud_name='GCP')
+    placer = make_placer({cheap: 0.424, expensive: 0.425})
+    budget, canonical, noncanonical = _managed_equal_cost_budget(placer)
+
+    assert canonical == cheap
+    assert noncanonical == expensive
+    assert paid_capacity.select_location(placer, budget) == cheap
+
+
+def test_equal_cost_tier_balances_across_cloud_and_region():
+    locations = [
+        make_location('us-central1', {'L4': 1}, cloud_name='GCP'),
+        make_location('us-east-1', {'L4': 1}, cloud_name='AWS'),
+    ]
+    placer = make_placer({location: 0.424 for location in locations})
+    budget, canonical, balanced = _managed_equal_cost_budget(placer)
+
+    assert paid_capacity.select_location(placer, budget) == balanced
+    assert balanced != canonical
+
+
+def test_managed_balancing_reserves_retry_for_exact_returned_pool(
+        monkeypatch):
+    locations = [
+        make_location(f'us-central1-{zone}', {'L4': 1}, cloud_name='GCP')
+        for zone in ('a', 'b')
+    ]
+    placer = make_placer({location: 0.424 for location in locations})
+    budget, canonical, balanced = _managed_equal_cost_budget(placer)
+    observed_at = 1000.0
+    placer.set_preemptive(balanced, observed_at=observed_at)
+    placer.mark_retry_state_persisted()
+    monkeypatch.setattr(spot_placer, '_preemption_retry_seconds', lambda: 600)
+    monkeypatch.setattr(spot_placer.time, 'time', lambda: observed_at + 601)
+
+    assert placer.preview_next_location() == canonical
+    with mock.patch.object(
+            placer,
+            'preview_next_location',
+            wraps=placer.preview_next_location) as preview, mock.patch.object(
+                placer,
+                'select_next_location',
+                wraps=placer.select_next_location) as reserve:
+        assert paid_capacity.select_location(placer, budget) == balanced
+
+    preview.assert_called_once()
+    reserve.assert_called_once()
+    assert reserve.call_args.kwargs['allowed_locations'] == {balanced}
+    assert canonical not in placer.location2retry_reserved_at
+    assert placer.location2retry_reserved_at == {balanced: observed_at + 601}
+    assert placer.retry_state_dirty
+
+
+def test_local_equal_cost_tier_preserves_stable_catalog_order():
+    locations = [
+        make_location(f'us-central1-{zone}', {'L4': 1}, cloud_name='GCP')
+        for zone in ('a', 'b')
+    ]
+    placer = make_placer({location: 0.424 for location in locations})
+    budget = paid_capacity.LaunchBudget(
+        remaining_by_location={location: 2 for location in locations},
+        pool_key_by_location={},
+        states_by_pool_key={},
+        globally_managed=False)
+    first, second = placer.ranked_active_locations()
+
+    selected = []
+    for _ in range(4):
+        location = paid_capacity.select_location(placer, budget)
+        assert location is not None
+        selected.append(location)
+        paid_capacity.debit(budget, location)
+
+    assert selected == [first, first, second, second]
+
+
 def test_cold_large_wave_opens_only_two_l4_pools_before_feedback():
     locations = [
         make_location(region, {'L4': 1}, cloud_name='AWS')
@@ -2807,6 +2996,22 @@ def test_priority_deferral_stops_same_pool_without_paid_spill():
     assert budget.remaining_by_location == {cheap: 10, expensive: 10}
     assert budget.priority_deferred_pool_keys == {'cheap'}
     assert paid_capacity.select_location(placer, budget) is None
+
+
+def test_equal_cost_balancing_cannot_bypass_priority_deferral():
+    locations = [
+        make_location(f'us-central1-{zone}', {'L4': 1}, cloud_name='GCP')
+        for zone in ('a', 'b')
+    ]
+    placer = make_placer({location: 0.424 for location in locations})
+    budget, canonical, would_balance = _managed_equal_cost_budget(placer)
+    assert budget.remaining_by_location[canonical] == 1
+    assert budget.remaining_by_location[would_balance] == 60
+    paid_capacity.defer_for_priority(budget, canonical)
+
+    assert paid_capacity.select_location(placer, budget) is None
+    assert budget.remaining_by_location[would_balance] == 60
+    assert budget.stop_sequence == 2
 
 
 def test_debit_and_exhaust_share_headroom_across_location_aliases():

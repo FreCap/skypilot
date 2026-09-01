@@ -132,6 +132,26 @@ class PhysicalBackendShape:
         return self.gpu_units_per_node * self.num_nodes
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class EqualCostBalancingTier:
+    """Exact economic and physical boundary for paid-pool striping."""
+
+    normalized_cost: float
+    use_spot: bool
+    physical_backend_shape: PhysicalBackendShape
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.normalized_cost, (int, float)) or
+                isinstance(self.normalized_cost, bool) or
+                not math.isfinite(float(self.normalized_cost)) or
+                self.normalized_cost <= 0 or
+                type(self.use_spot) is not bool or  # pylint: disable=unidiomatic-typecheck
+                not isinstance(self.physical_backend_shape,
+                               PhysicalBackendShape)):
+            raise PaidGPUAttributionError(
+                'Equal-cost paid balancing tier is malformed.')
+
+
 def freeze_paid_launch_payload(value: Mapping[str, Any]) -> bytes:
     """Freeze one JSON object used by a provider-free launch specification."""
     if not isinstance(value, Mapping):
@@ -1507,6 +1527,30 @@ def _exact_whole_gpu_shape(
     return card.casefold(), int(count)
 
 
+def equal_cost_balancing_tier(
+    location: spot_placer.Location,
+    *,
+    normalized_cost: float,
+    num_nodes: int,
+) -> EqualCostBalancingTier:
+    """Derive the sole paid-pool striping key from exact catalog facts."""
+    if not isinstance(location, spot_placer.Location):
+        raise PaidGPUAttributionError(
+            'Equal-cost balancing requires an exact catalog location.')
+    if type(location.use_spot) is not bool:  # pylint: disable=unidiomatic-typecheck
+        raise PaidGPUAttributionError(
+            'Equal-cost balancing requires an exact purchase market.')
+    card, width = _exact_whole_gpu_shape(
+        location.accelerators, field='equal-cost balancing location')
+    return EqualCostBalancingTier(
+        normalized_cost=normalized_cost,
+        use_spot=location.use_spot,
+        physical_backend_shape=PhysicalBackendShape(
+            accelerator=card,
+            gpu_units_per_node=width,
+            num_nodes=num_nodes))
+
+
 def _paid_pool_gpu_shape(pool_key_value: Any) -> PhysicalBackendShape:
     """Decode the billing shape from one canonical exact paid pool."""
     if not isinstance(pool_key_value, str):
@@ -2349,6 +2393,99 @@ def _record_selection_stop(budget: LaunchBudget) -> None:
     budget.stop_sequence += 1
 
 
+def _balanced_equal_cost_location(
+    placer: spot_placer.SpotPlacer,
+    budget: LaunchBudget,
+    selected: spot_placer.Location,
+    candidates: set[spot_placer.Location],
+) -> spot_placer.Location:
+    """Balance one canonical equal-cost/card tier by admission headroom.
+
+    PostgreSQL's pool snapshot is immutable for this advisory wave while
+    ``remaining_by_location`` is debited after every selection. Choosing the
+    largest remaining fraction of that initial headroom is deterministic
+    weighted round-robin: equal 60-slot pools split a 120-member wave 40/40/40,
+    while a 1-slot probe beside two 60-slot pools receives exactly one member.
+
+    The placer's first selection remains the economic authority. We consider
+    only exact pools with the same normalized cost, purchase market, and
+    physical backend shape, so balancing can neither cross a price tier nor
+    move work between cards or backend widths. A legacy process-local budget
+    or incomplete headroom evidence keeps the existing stable catalog
+    tie-break unchanged.
+    """
+    if not budget.globally_managed:
+        return selected
+    entries_by_location = {
+        entry.location: entry for entry in placer.ranked_catalog_entries
+    }
+    selected_entry = entries_by_location.get(selected)
+    if selected_entry is None:
+        return selected
+    selected_pool = budget.pool_key_by_location.get(selected)
+    try:
+        selected_tier = equal_cost_balancing_tier(
+            selected,
+            normalized_cost=selected_entry.normalized_hourly_cost,
+            num_nodes=placer.num_nodes)
+        if (paid_pool_gpu_shape(selected_pool) !=
+                selected_tier.physical_backend_shape):
+            return selected
+    except PaidGPUAttributionError:
+        return selected
+    tier: list[tuple[spot_placer.Location, str]] = []
+    for entry in placer.ranked_catalog_entries:
+        location = entry.location
+        if location not in candidates:
+            continue
+        pool = budget.pool_key_by_location.get(location)
+        try:
+            candidate_tier = equal_cost_balancing_tier(
+                location,
+                normalized_cost=entry.normalized_hourly_cost,
+                num_nodes=placer.num_nodes)
+            if (candidate_tier != selected_tier or
+                    paid_pool_gpu_shape(pool) !=
+                    candidate_tier.physical_backend_shape):
+                continue
+        except PaidGPUAttributionError:
+            continue
+        assert pool is not None
+        tier.append((location, pool))
+    if len(tier) < 2:
+        return selected
+
+    weighted: list[tuple[spot_placer.Location, int, int]] = []
+    seen_pool_keys = set()
+    for location, pool in tier:
+        current = budget.remaining_by_location.get(location)
+        state = budget.states_by_pool_key.get(pool)
+        initial = state.get('remaining') if isinstance(state, Mapping) else None
+        if (pool in seen_pool_keys or
+                type(current) is not int or current <= 0 or  # pylint: disable=unidiomatic-typecheck
+                type(initial) is not int or initial < current or  # pylint: disable=unidiomatic-typecheck
+                initial <= 0):
+            # Partial or contradictory evidence must not invent a new
+            # tie-break. Preserve the selector's canonical answer instead.
+            if pool not in seen_pool_keys:
+                return selected
+            continue
+        seen_pool_keys.add(pool)
+        weighted.append((location, current, initial))
+    if len(weighted) < 2:
+        return selected
+
+    best_location, best_remaining, best_initial = weighted[0]
+    for location, remaining, initial in weighted[1:]:
+        # Compare exact rational values without floating-point rounding. A tie
+        # retains immutable catalog order from ``ranked_catalog_entries``.
+        if remaining * best_initial > best_remaining * initial:
+            best_location = location
+            best_remaining = remaining
+            best_initial = initial
+    return best_location
+
+
 def _select_location(
     placer: spot_placer.SpotPlacer,
     budget: LaunchBudget,
@@ -2358,8 +2495,12 @@ def _select_location(
     reserve_retry: bool,
 ) -> spot_placer.Location | None:
     """Select from one budget, optionally reserving an expired-bench retry."""
+    # A globally managed equal-cost tier may change the stable catalog
+    # tie-break after observing the cheapest candidate. Preview first so a
+    # retry probe is reserved only for the exact pool ultimately returned.
     select_next = (placer.select_next_location
-                   if reserve_retry else placer.preview_next_location)
+                   if reserve_retry and not budget.globally_managed else
+                   placer.preview_next_location)
     active = [
         location for location in placer.active_locations()
         if allowed_locations is None or location in allowed_locations
@@ -2456,12 +2597,29 @@ def _select_location(
     if selected is None:
         _record_selection_stop(budget)
         return None
+    if selected not in zero_cost:
+        # Priority deferral is a wave-wide stop at the canonical economic
+        # choice. It must be checked before striping; otherwise a same-tier
+        # peer with a larger headroom fraction would become accidental spill.
+        selected_key = budget.pool_key_by_location.get(selected)
+        if selected_key in budget.priority_deferred_pool_keys:
+            _record_selection_stop(budget)
+            return None
+        selected = _balanced_equal_cost_location(placer, budget, selected,
+                                                 candidates)
+        selected_key = budget.pool_key_by_location.get(selected)
+        if selected_key in budget.priority_deferred_pool_keys:
+            _record_selection_stop(budget)
+            return None
+    if reserve_retry and budget.globally_managed:
+        reserved = placer.select_next_location(
+            skip_zero_cost_preference=skip_zero_cost_preference,
+            allowed_locations={selected})
+        if reserved != selected:
+            _record_selection_stop(budget)
+            return None
     if selected in zero_cost:
         return selected
-    selected_key = budget.pool_key_by_location.get(selected)
-    if selected_key in budget.priority_deferred_pool_keys:
-        _record_selection_stop(budget)
-        return None
     if selected in expansion_candidates:
         key = budget.frontier_key_by_location.get(selected,
                                                   frontier_key(selected))

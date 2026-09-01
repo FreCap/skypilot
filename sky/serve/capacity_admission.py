@@ -3911,6 +3911,16 @@ def _canonical_prepared_paid_launch_specs(
         catalog_by_location = {
             entry.location: entry for entry in ranked_catalog
         }
+        catalog_tier_by_location = {}
+        for entry in ranked_catalog:
+            try:
+                tier = serve_paid_capacity.equal_cost_balancing_tier(
+                    entry.location,
+                    normalized_cost=entry.normalized_hourly_cost,
+                    num_nodes=backend_num_nodes)
+            except serve_paid_capacity.PaidGPUAttributionError:
+                continue
+            catalog_tier_by_location[entry.location] = tier
     except (TypeError, ValueError) as error:
         raise CapacityAdmissionConflict(
             'Elected version paid launch authority is malformed.') from error
@@ -3925,7 +3935,11 @@ def _canonical_prepared_paid_launch_specs(
     identities = set()
     record_ids = set()
     occurrences_by_rank: dict[int, int] = {}
-    previous_order: tuple[int, int] | None = None
+    previous_normalized_cost: float | None = None
+    current_balancing_tier: serve_paid_capacity.EqualCostBalancingTier | None = (
+        None)
+    closed_balancing_tiers: set[
+        serve_paid_capacity.EqualCostBalancingTier] = set()
     pool_window = serve_paid_capacity.base_limit()
     expected_worker_fields = {
         'schema_version', 'launch_yaml_content', 'cluster_name',
@@ -4002,16 +4016,38 @@ def _canonical_prepared_paid_launch_specs(
                 not isinstance(replica_port, str) or not replica_port):
             raise CapacityAdmissionConflict(
                 'Prepared paid launch disagrees with the elected catalog.')
+        balancing_tier = catalog_tier_by_location.get(catalog_entry.location)
+        try:
+            expected_shape = serve_paid_capacity.PhysicalBackendShape(
+                accelerator=spec.accelerator,
+                gpu_units_per_node=spec.gpu_units_per_node,
+                num_nodes=spec.num_nodes)
+        except serve_paid_capacity.PaidGPUAttributionError as error:
+            raise CapacityAdmissionConflict(
+                'Prepared paid launch has no exact balancing tier.') from error
+        if (balancing_tier is None or
+                balancing_tier.physical_backend_shape != expected_shape):
+            raise CapacityAdmissionConflict(
+                'Prepared paid launch has no exact balancing tier.')
         occurrence = occurrences_by_rank.get(evidence.catalog_rank, 0)
         expected_round, expected_slot = divmod(occurrence, pool_window)
-        order = (evidence.catalog_rank, occurrence)
+        tier_transition = balancing_tier != current_balancing_tier
+        invalid_tier_transition = (
+            tier_transition and current_balancing_tier is not None and
+            balancing_tier in closed_balancing_tiers)
         if ((evidence.exploration_round, evidence.slot_within_pool_window)
                 != (expected_round, expected_slot) or
-            (previous_order is not None and order <= previous_order)):
+            (previous_normalized_cost is not None and
+             catalog_entry.normalized_hourly_cost < previous_normalized_cost) or
+                invalid_tier_transition):
             raise CapacityAdmissionConflict(
                 'Prepared paid launch catalog traversal is noncanonical.')
         occurrences_by_rank[evidence.catalog_rank] = occurrence + 1
-        previous_order = order
+        previous_normalized_cost = catalog_entry.normalized_hourly_cost
+        if tier_transition:
+            if current_balancing_tier is not None:
+                closed_balancing_tiers.add(current_balancing_tier)
+            current_balancing_tier = balancing_tier
         identity = (spec.replica_id, spec.replica_record_id)
         if spec.replica_id in identities or spec.replica_record_id in record_ids:
             raise ValueError('Prepared paid launch identities are duplicated.')

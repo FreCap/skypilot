@@ -96,6 +96,21 @@ proved by campaign ``spot-e2e-0901k``; the five-minute cold-scale threshold,
 exact 10,000-completion async ledger, fleet recreation, and nonzero dashboard
 ledger capture remain open.
 
+Within one identical typed balancing tier -- normalized cost, purchase market
+(``use_spot``), and exact physical backend shape (accelerator, width, and node
+count) -- a globally managed launch wave balances by the largest remaining
+fraction of each pool's immutable wave-start PostgreSQL headroom. This is the
+sole exception to stable catalog-rank tie-breaking: it cannot select a more
+expensive location, cross purchase markets or backend shapes, alter a
+local/legacy budget, or infer missing headroom. Thus three 60-slot equal-cost
+pools divide a 120-member wave as 40/40/40, while headroom 60/60/1 divides the
+same capped wave as 60/59/1. The locked validator permits rank interleaving
+only inside one identical typed tier. Distinct tiers form contiguous blocks;
+same-cost tier blocks may appear in either order, but a closed tier cannot
+resume. Normalized cost remains nondecreasing and every rank-local occurrence
+remains exact. Expensive-to-cheaper traversal fails before any replica, claim,
+or plan write.
+
 Release `1.1.1578`, source merge
 `c52a4dde95bc80036801d2d8bfb96d5bd8d43473`, deployed PR #1809 homogeneously
 at Helm revision 697. All two API, two controller, three executor, and GCP login
