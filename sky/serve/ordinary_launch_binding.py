@@ -7810,6 +7810,10 @@ def replica_has_projected_provider_absence_cleanup_marker(
         # post-quiescence ABSENT evidence before retirement. The removal path
         # independently revalidates its owner, record, and Kueue fences.
         return True
+    # A later generic purge can persist SUCCEEDED after this provider-ABSENT
+    # shape committed. Consumers still revalidate the exact settled evidence.
+    paid_absence_down_status = status.sky_down_status in (
+        None, common_utils.ProcessStatus.SUCCEEDED)
     return bool(
         getattr(replica_info, 'reserved_fill', None) is False and
         getattr(replica_info, 'is_zero_cost', None) is False and
@@ -7817,7 +7821,7 @@ def replica_has_projected_provider_absence_cleanup_marker(
         getattr(replica_info, 'service_job_id', None) is None and
         isinstance(pool_key, str) and bool(pool_key) and
         status.sky_launch_status == common_utils.ProcessStatus.FAILED and
-        status.sky_down_status is None and status.service_ready_now is False and
+        paid_absence_down_status and status.service_ready_now is False and
         status.is_scale_down is False and status.preempted is False and
         status.purged is False and status.failed_spot_availability is True and
         status.wait_for_idle_before_termination is False and

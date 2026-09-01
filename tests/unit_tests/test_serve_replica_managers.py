@@ -1901,16 +1901,16 @@ def _provider_free_paid_budget(manager,
         frontiers[location] = paid_capacity.frontier_key(location)
     if service_remaining is None:
         service_remaining = sum(remaining.values())
-    return paid_capacity.LaunchBudget(
-        remaining_by_location=remaining,
-        pool_key_by_location=pool_keys,
-        states_by_pool_key=states,
-        globally_managed=True,
-        service_remaining=service_remaining,
-        service_claim_limit=max(1, service_remaining),
-        frontier_limit=frontier_limit,
-        max_frontier_limit=frontier_limit,
-        frontier_key_by_location=frontiers)
+    return paid_capacity.LaunchBudget(remaining_by_location=remaining,
+                                      pool_key_by_location=pool_keys,
+                                      states_by_pool_key=states,
+                                      globally_managed=True,
+                                      service_remaining=service_remaining,
+                                      service_claim_limit=max(
+                                          1, service_remaining),
+                                      frontier_limit=frontier_limit,
+                                      max_frontier_limit=frontier_limit,
+                                      frontier_key_by_location=frontiers)
 
 
 def test_prepare_paid_launch_specs_is_bounded_cost_ordered_and_io_free():
@@ -1971,8 +1971,8 @@ def test_prepare_paid_launch_specs_does_not_reserve_retry_probe(monkeypatch):
                         lambda: now[0])
     manager._spot_placer.set_preemptive(cheap)
     manager._spot_placer.mark_retry_state_persisted()
-    now[0] += (replica_managers.spot_placer.
-               _PREEMPTION_RETRY_SECONDS_DEFAULT + 1)
+    now[0] += (replica_managers.spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT +
+               1)
     state_before = manager._spot_placer.dump_retry_state()
 
     with mock.patch.object(manager,
@@ -2021,7 +2021,8 @@ def test_prepare_paid_launch_specs_fails_closed_if_alternatives_exceed_bound():
                 manager, {
                     location: 6
                     for location in manager._spot_placer.active_locations()
-                }, service_remaining=6))
+                },
+                service_remaining=6))
 
     assert specs == ()
     assert manager._next_replica_id == initial_replica_id
@@ -2029,10 +2030,7 @@ def test_prepare_paid_launch_specs_fails_closed_if_alternatives_exceed_bound():
 
 def test_prepare_paid_launch_specs_uses_state_aware_third_pool_fallback():
     manager, cheap, middle = _provider_free_paid_manager()
-    fallback = make_location('us-central1-c', {
-        'L4': 1
-    },
-                             cloud_name='GCP')
+    fallback = make_location('us-central1-c', {'L4': 1}, cloud_name='GCP')
     fallback.instance_type = 'g2-standard-12'
     _set_paid_placer(manager, {
         cheap: 0.1,
@@ -2061,7 +2059,8 @@ def test_prepare_paid_launch_specs_uses_state_aware_third_pool_fallback():
                     cheap: 60,
                     middle: 1,
                     fallback: 59,
-                }, service_remaining=120))
+                },
+                service_remaining=120))
 
     pool_keys = [
         paid_capacity.pool_key(location, workspace='default', num_nodes=1)
@@ -2112,6 +2111,91 @@ def test_prepare_paid_launch_specs_balances_cheapest_equal_cost_tier(
     assert tuple([spec.pool_key
                   for spec in specs].count(pool_key)
                  for pool_key in pool_keys) == expected_selections
+
+
+def test_prepare_paid_launch_specs_spreads_240_unit_wave_across_price_tiers():
+    """GCP capacity feedback moves a 240-unit wave to another region."""
+    manager, first, second = _provider_free_paid_manager()
+    first.region = 'us-central1'
+    first.zone = 'us-central1-a'
+    second.region = 'us-central1'
+    second.zone = 'us-central1-b'
+    third = make_location('us-east4', {'L4': 1}, cloud_name='GCP')
+    third.zone = 'us-east4-a'
+    fourth = make_location('us-east4', {'L4': 1}, cloud_name='GCP')
+    fourth.zone = 'us-east4-c'
+    locations = (first, second, third, fourth)
+    for location in locations:
+        location.instance_type = 'g2-standard-4'
+    _set_paid_placer(manager, {
+        first: 0.3106,
+        second: 0.3106,
+        third: 0.34166,
+        fourth: 0.34166,
+    })
+
+    with mock.patch.object(manager,
+                           '_task_template_for_version',
+                           return_value=mock.Mock()), \
+         mock.patch.object(replica_managers,
+                           '_get_resources_ports',
+                           return_value='8080'), \
+         mock.patch.object(replica_managers.skypilot_config,
+                           'to_dict',
+                           return_value={'api_server': {'endpoint': 'local'}}), \
+         mock.patch.object(paid_capacity, 'base_limit', return_value=60):
+        specs = manager.prepare_paid_launch_specs(
+            accelerator_shapes={'L4': 1},
+            max_gpu_units_by_accelerator={'l4': 240},
+            max_candidates=240,
+            occupied_replica_ids=(),
+            version_authority=_paid_version_authority(manager),
+            paid_location_launch_budget=_provider_free_paid_budget(
+                manager, {location: 60 for location in locations},
+                service_remaining=240,
+                frontier_limit=36))
+        # This is the production feedback boundary used after the launch
+        # reducer classifies provider-native capacity exhaustion.  Keep the
+        # admission budget unchanged: the placer bench, rather than a test-only
+        # allocator or synthetic zero headroom, must force regional failover.
+        manager._spot_placer.set_preemptive(first, reason='capacity')
+        manager._spot_placer.set_preemptive(second, reason='capacity')
+        refill_specs = manager.prepare_paid_launch_specs(
+            accelerator_shapes={'L4': 1},
+            max_gpu_units_by_accelerator={'l4': 240},
+            max_candidates=240,
+            occupied_replica_ids=(),
+            version_authority=_paid_version_authority(manager),
+            paid_location_launch_budget=_provider_free_paid_budget(
+                manager, {location: 60 for location in locations},
+                service_remaining=240,
+                frontier_limit=36))
+
+    pool_keys = tuple(
+        paid_capacity.pool_key(location, workspace='default', num_nodes=1)
+        for location in locations)
+    prepared_pool_keys = [spec.pool_key for spec in specs]
+    assert len(specs) == 240
+    assert tuple(
+        prepared_pool_keys.count(pool_key) for pool_key in pool_keys) == (60,
+                                                                          60,
+                                                                          60,
+                                                                          60)
+    assert set(prepared_pool_keys[:120]) == set(pool_keys[:2])
+    assert set(prepared_pool_keys[120:]) == set(pool_keys[2:])
+    assert all(spec.accelerator == 'l4' and spec.physical_gpu_units == 1
+               for spec in specs)
+    refill_pool_keys = [spec.pool_key for spec in refill_specs]
+    assert len(refill_specs) == 120
+    assert tuple(
+        refill_pool_keys.count(pool_key) for pool_key in pool_keys) == (0, 0,
+                                                                        60, 60)
+    assert all(spec.accelerator == 'l4' and spec.physical_gpu_units == 1
+               for spec in refill_specs)
+    assert {(spec.region, spec.zone) for spec in refill_specs} == {
+        ('us-east4', 'us-east4-a'),
+        ('us-east4', 'us-east4-c'),
+    }
 
 
 def test_prepare_paid_launch_specs_preserves_each_accelerator_frontier():
@@ -2314,7 +2398,8 @@ def test_materialize_paid_launch_receipt_builds_only_sparse_members():
                 manager, {
                     location: 1
                     for location in manager._spot_placer.active_locations()
-                }, service_remaining=2))
+                },
+                service_remaining=2))
     selected = specs[1]
     member = paid_capacity.PaidLaunchReceiptMember(
         replica_id=selected.replica_id,
@@ -2341,7 +2426,8 @@ def test_materialize_paid_launch_receipt_builds_only_sparse_members():
         funding=replica_managers._ReplicaLaunchFunding.PAID)
     expected_location = replica_managers.spot_placer.Location.from_resources_override(
         replica_managers._decode_replica_resource_state(
-            paid_capacity.thaw_paid_launch_payload(selected.resources_override)))
+            paid_capacity.thaw_paid_launch_payload(
+                selected.resources_override)))
     assert expected_location is not None
 
     def _read_committed(service_name):
@@ -3710,6 +3796,10 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         info.is_spot = True
         info.paid_capacity_pool_key = _canonical_paid_pool_key()
         info.status_property.sky_launch_status = common_utils.ProcessStatus.FAILED
+        # A later generic purge may persist this monotonic terminal marker
+        # after the exact provider ABSENT projection has already committed.
+        info.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
         info.status_property.failed_spot_availability = True
         assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
             info)
@@ -3731,6 +3821,25 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         retire.assert_called_once_with('svc', 3, info.replica_record_id)
         manager._handle_sky_down_finish.assert_not_called()
         provider_down.assert_not_called()
+
+    @pytest.mark.parametrize('down_status', [
+        common_utils.ProcessStatus.SCHEDULED,
+        common_utils.ProcessStatus.RUNNING,
+        common_utils.ProcessStatus.FAILED,
+        common_utils.ProcessStatus.INTERRUPTED,
+    ])
+    def test_projected_paid_absence_rejects_inexact_down_marker(
+            self, down_status):
+        info = _fake_replica_info(
+            3, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.is_spot = True
+        info.paid_capacity_pool_key = _canonical_paid_pool_key()
+        info.status_property.sky_launch_status = common_utils.ProcessStatus.FAILED
+        info.status_property.sky_down_status = down_status
+        info.status_property.failed_spot_availability = True
+
+        assert not ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+            info)
 
     def test_projected_provider_absence_restart_skips_provider_cleanup(self):
         manager = _make_manager()
@@ -6964,6 +7073,22 @@ def _quota_error() -> exceptions.ResourcesUnavailableError:
                                                 failover_history=[attempt])
 
 
+def _gcp_capacity_error() -> exceptions.ResourcesUnavailableError:
+    provider_error = provision_common.ProvisionerError(
+        'GCP bulk insert did not meet the requested count')
+    provider_error.errors = [{
+        'code': 'VM_MIN_COUNT_NOT_REACHED',
+        'message': 'minimum count not reached',
+    }, {
+        'code': 'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
+        'message': 'zone resource pool exhausted',
+    }]
+    attempt = exceptions.ResourcesUnavailableError('GCP zone exhausted')
+    attempt.__cause__ = provider_error
+    return exceptions.ResourcesUnavailableError(
+        'GCP optimizer locations exhausted', failover_history=[attempt])
+
+
 def test_launch_worker_uses_its_frozen_controller_config(monkeypatch):
     observed = {}
     monkeypatch.setattr(os, 'environ',
@@ -7163,6 +7288,7 @@ class TestLaunchClusterRetry:
         Returns (mock_sdk, mock_terminate, raised RuntimeError or None).
         """
         observed_workspaces = kwargs.pop('observed_workspaces', None)
+        launch_cloud = kwargs.pop('launch_cloud', clouds.AWS())
         launch_side_effect = kwargs.pop('launch_side_effect', None)
         terminate_side_effect = kwargs.pop('terminate_side_effect', None)
         cancel_side_effect = kwargs.pop('cancel_side_effect', None)
@@ -7170,7 +7296,7 @@ class TestLaunchClusterRetry:
         raised = None
         task = mock.MagicMock()
         resource = mock.MagicMock()
-        resource.cloud = clouds.AWS()
+        resource.cloud = launch_cloud
         task.resources = {resource}
         with mock.patch(
                 'sky.serve.replica_managers.task_lib.Task.from_yaml_str',
@@ -7410,6 +7536,19 @@ class TestLaunchClusterRetry:
         mock_sdk, mock_terminate, raised = self._run_launch_cluster(
             tmp_path, [_capacity_error()] * 3, availability_max_retry=1)
         assert isinstance(raised, replica_managers._ReplicaLaunchCapacityError)
+        assert mock_sdk.launch.call_count == 1
+        mock_terminate.assert_not_called()
+
+    def test_gcp_capacity_failure_crosses_launch_boundary_without_retry(
+            self, tmp_path):
+        """Provider-native GCP exhaustion reaches the placer in one attempt."""
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [_gcp_capacity_error()],
+            availability_max_retry=1,
+            launch_cloud=clouds.GCP())
+
+        assert isinstance(raised, replica_managers._ReplicaLaunchCapacityError)
+        assert raised.reason == 'capacity'
         assert mock_sdk.launch.call_count == 1
         mock_terminate.assert_not_called()
 
@@ -9611,6 +9750,100 @@ class TestLaunchOwnershipFence:
         assert mgr._launch_thread_pool[1] is successor
         assert 1 not in mgr._replica_to_request_id
         terminate.assert_not_called()
+
+    def test_failed_paid_worker_before_binding_retires_phase_a_without_down(
+            self):
+        """A committed paid intent with no request has no provider to down."""
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._spot_placer = None
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=2,
+            generic=True)
+        mgr._ordinary_launch_binding_authority = authority
+        info = _fake_replica_info(
+            1, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.paid_capacity_pool_key = _canonical_paid_pool_key()
+        receipt = paid_capacity.PaidLaunchReceiptMember(
+            replica_id=info.replica_id,
+            replica_record_id=info.replica_record_id,
+            pool_key=info.paid_capacity_pool_key,
+            priority=50,
+            accelerator='l4',
+            plan_units=1,
+            physical_gpu_units=1)
+
+        def _fail_before_admission():
+            raise ValueError('prepared request is invalid')
+
+        worker = replica_managers._ReplicaLaunchThread(
+            target=_fail_before_admission,
+            replica_id=info.replica_id,
+            replica_record_id=info.replica_record_id,
+            service_hash=mgr._service_hash,
+            controller_owner=mgr._controller_owner,
+            teardown_requested=threading.Event(),
+            completion_queue=queue.SimpleQueue(),
+            completion_event=threading.Event(),
+            bound_ordinary_launch=True,
+            paid_claim_commit_receipt=receipt)
+        runtime = mgr._legacy_mutation_runtime_state()
+        runtime.launch_thread_pool[info.replica_id] = worker
+        worker.start()
+        worker.join()
+        assert not worker.is_alive()
+        assert runtime.launch_thread_pool.get(info.replica_id) is worker
+        assert isinstance(worker.exception, ValueError)
+        assert info.replica_id not in mgr._replica_to_request_id
+        assert not mgr._update_recovery_required
+        assert replica_managers._bound_ordinary_paid_claim_owns_provider_effect(
+            info, launch_thread=worker)
+        retirement = ordinary_launch_binding.PreAdmissionRetirement(
+            ordinary_launch_binding.PreAdmissionRetirementDisposition.RETIRED,
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value={info.replica_id: info}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=None) as inspect, \
+             mock.patch.object(
+                 ordinary_launch_binding,
+                 'retire_pre_admission_non_pool_launch_intent',
+                 return_value=retirement) as retire, \
+             mock.patch.object(mgr,
+                               '_notify_scale_reconciliation') as notify, \
+             mock.patch.object(mgr, '_persist_replicas') as persist, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_legacy_mutation_runtime()
+
+            identity = replica_managers._PaidPhaseARecoveryIdentity(
+                info.replica_id, info.replica_record_id)
+            assert set(mgr._paid_phase_a_recoveries) == {identity}
+            assert info.replica_id not in mgr._launch_thread_pool
+            assert info.replica_id not in mgr._replica_to_request_id
+            persist.assert_not_called()
+            terminate.assert_not_called()
+
+            mgr._reconcile_paid_phase_a_recoveries()
+
+        inspect.assert_called_once_with('svc', info.replica_id,
+                                        info.replica_record_id)
+        retire.assert_called_once_with(authority, info.replica_id,
+                                       info.replica_record_id)
+        notify.assert_called_once_with()
+        assert not mgr._paid_phase_a_recoveries
 
     def test_current_owner_redrives_finished_unresolved_bound_worker(self):
         """A local lost acknowledgement is not an ownership-loss detach."""

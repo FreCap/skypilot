@@ -30,6 +30,7 @@ import asyncio
 import collections.abc
 import dataclasses
 import datetime
+import enum
 import hashlib
 import json
 import os
@@ -65,6 +66,9 @@ class QualificationError(RuntimeError):
 
 class GuardViolation(QualificationError):
     """An authoritative market, card, cap, or identity guard failed."""
+
+
+_PROVIDER_SCOPE_SCHEMA_VERSION = 2
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -103,7 +107,7 @@ PROFILES = {
                      scale_up_min_replicas=2,
                      scale_up_period_seconds=10),
     'scale': Profile(name='scale',
-                     max_units=120,
+                     max_units=240,
                      minimum_running=100,
                      pressure_concurrency=256,
                      pressure_duration_seconds=30,
@@ -114,7 +118,7 @@ PROFILES = {
                      drain_timeout_seconds=30 * 60,
                      zero_hold_seconds=6 * 60,
                      poll_seconds=10,
-                     scale_up_min_replicas=120,
+                     scale_up_min_replicas=240,
                      scale_up_period_seconds=60),
 }
 
@@ -303,23 +307,28 @@ class ProviderCensus:
     operations: object
 
 
+class GcpLocationScope(str, enum.Enum):
+    """Provider census boundary persisted by the qualification harness."""
+
+    PROJECT_WIDE = 'project-wide'
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class ProviderScope:
-    """Exact GCP scope frozen by the service's committed version."""
+    """Exact project-wide GCP scope frozen by the committed version."""
 
     service_hash: str
     lifecycle_epoch: int
     service_version: int
     project_id: str
     workspace: str
-    region: str
+    location_scope: GcpLocationScope
     controller_config_digest: str
     controller_config_snapshot_id: str
 
 
 def provider_scope_from_controller_config(
-        authority: collections.abc.Mapping[str, Any], *,
-        expected_region: str) -> ProviderScope:
+        authority: collections.abc.Mapping[str, Any]) -> ProviderScope:
     """Resolve GCP scope from immutable version state, never ambient config."""
     config_bytes = authority.get('controller_config')
     if isinstance(config_bytes, memoryview):
@@ -347,16 +356,14 @@ def provider_scope_from_controller_config(
     if (not isinstance(config_snapshot, collections.abc.Mapping) or
             not isinstance(service_hash, str) or not service_hash or
             type(lifecycle_epoch) is not int or lifecycle_epoch < 1 or
-            type(service_version) is not int or service_version < 1 or
-            not isinstance(expected_region, str) or
-            re.fullmatch(r'[a-z]+-[a-z0-9]+[0-9]', expected_region) is None):
+            type(service_version) is not int or service_version < 1):
         raise GuardViolation(
-            'Current service version has no exact workspace/region authority.')
+            'Current service version has no exact workspace authority.')
     project_id = (
         skypilot_config.get_effective_workspace_region_config_from_snapshot(
             config_snapshot,
             'gcp', ('project_id',),
-            region=expected_region,
+            region=None,
             workspace=workspace))
     if (not isinstance(project_id, str) or
             re.fullmatch(r'[a-z][a-z0-9-]{4,28}[a-z0-9]', project_id) is None):
@@ -367,7 +374,7 @@ def provider_scope_from_controller_config(
                          service_version=service_version,
                          project_id=project_id,
                          workspace=workspace,
-                         region=expected_region,
+                         location_scope=GcpLocationScope.PROJECT_WIDE,
                          controller_config_digest=digest,
                          controller_config_snapshot_id=snapshot_id)
 
@@ -376,7 +383,7 @@ def write_provider_scope(path: pathlib.Path, service_name: str,
                          scope: ProviderScope) -> None:
     """Persist credential-free teardown authority before traffic is offered."""
     payload = {
-        'schema_version': 1,
+        'schema_version': _PROVIDER_SCOPE_SCHEMA_VERSION,
         'service_name': service_name,
         'provider': 'gcp',
         **dataclasses.asdict(scope),
@@ -395,14 +402,17 @@ def read_provider_scope(path: pathlib.Path, service_name: str) -> ProviderScope:
         raise QualificationError('Provider-scope receipt is unavailable.') \
             from error
     field_names = {field.name for field in dataclasses.fields(ProviderScope)}
-    if (not isinstance(payload, dict) or payload.get('schema_version') != 1 or
+    if (not isinstance(payload, dict) or
+            payload.get('schema_version') != _PROVIDER_SCOPE_SCHEMA_VERSION or
             payload.get('service_name') != service_name or
             payload.get('provider') != 'gcp' or set(payload)
             != field_names | {'schema_version', 'service_name', 'provider'}):
         raise QualificationError('Provider-scope receipt is malformed.')
     try:
-        scope = ProviderScope(**{field: payload[field] for field in field_names})
-    except TypeError as error:
+        values = {field: payload[field] for field in field_names}
+        values['location_scope'] = GcpLocationScope(values['location_scope'])
+        scope = ProviderScope(**values)
+    except (TypeError, ValueError) as error:
         raise QualificationError('Provider-scope receipt is malformed.') \
             from error
     if (not isinstance(scope.service_hash, str) or not scope.service_hash or
@@ -413,8 +423,7 @@ def read_provider_scope(path: pathlib.Path, service_name: str) -> ProviderScope:
             not isinstance(scope.project_id, str) or re.fullmatch(
                 r'[a-z][a-z0-9-]{4,28}[a-z0-9]', scope.project_id) is None or
             not isinstance(scope.workspace, str) or not scope.workspace or
-            not isinstance(scope.region, str) or
-            re.fullmatch(r'[a-z]+-[a-z0-9]+[0-9]', scope.region) is None or
+            scope.location_scope is not GcpLocationScope.PROJECT_WIDE or
             not isinstance(scope.controller_config_digest, str) or re.fullmatch(
                 r'[0-9a-f]{64}', scope.controller_config_digest) is None or
             not isinstance(scope.controller_config_snapshot_id, str) or
@@ -428,6 +437,18 @@ def _managed_compute_resource_pattern(cluster_name: str) -> re.Pattern[str]:
     return re.compile(
         rf'{re.escape(cluster_name)}-(?:head|worker)-'
         rf'[a-z0-9]{{{instance_utils.INSTANCE_NAME_UUID_LEN}}}-compute')
+
+
+def _gcp_region_from_zone(zone: object) -> str | None:
+    """Return the exact parent region for one well-formed GCP zone."""
+    if not isinstance(zone, str):
+        return None
+    match = re.fullmatch(r'([a-z]+-[a-z0-9]+[0-9])-[a-z]', zone)
+    return None if match is None else match.group(1)
+
+
+def _gcp_region_matches_zone(region: object, zone: object) -> bool:
+    return isinstance(region, str) and _gcp_region_from_zone(zone) == region
 
 
 def _scoped_compute_resource_pattern(service_name: str) -> re.Pattern[str]:
@@ -488,21 +509,24 @@ def _unique_scoped_resources(
     return result
 
 
-def parse_gcp_state(
-    *,
-    service_name: str,
-    expected_cluster_zones: collections.abc.Mapping[str, str],
-    profile: Profile,
-    instances: object,
-    disks: object,
-    expected_region: str,
-    operations: object = ()) -> ProviderState:
+def parse_gcp_state(*,
+                    service_name: str,
+                    expected_cluster_zones: collections.abc.Mapping[str, str],
+                    profile: Profile,
+                    instances: object,
+                    disks: object,
+                    operations: object = ()) -> ProviderState:
     """Validate and reduce one provider-native GCP census."""
     if (not isinstance(instances, list) or not isinstance(disks, list) or
             not isinstance(operations, (list, tuple))):
         raise QualificationError('GCP provider census is not a resource list.')
     if not service_name:
         raise QualificationError('Provider census requires a service scope.')
+    if (not isinstance(expected_cluster_zones, collections.abc.Mapping) or
+            any(not isinstance(cluster_name, str) or not cluster_name or
+                _gcp_region_from_zone(zone) is None
+                for cluster_name, zone in expected_cluster_zones.items())):
+        raise GuardViolation('Durable launch binding has an invalid GCP zone.')
     expected_cluster_names = frozenset(expected_cluster_zones)
     patterns = {
         name: _managed_compute_resource_pattern(name)
@@ -538,9 +562,9 @@ def parse_gcp_state(
         target_link = str(operation.get('targetLink', ''))
         zone_match = re.search(r'/zones/([^/]+)/', target_link)
         if (zone_match is None or
-                not zone_match.group(1).startswith(f'{expected_region}-')):
+                _gcp_region_from_zone(zone_match.group(1)) is None):
             raise GuardViolation(
-                'GCP create operation is outside the bound region.')
+                'GCP create operation has no exact provider zone.')
         target_name = _basename(target_link)
         previous_zone = owned_inflight_operation_targets.setdefault(
             target_name, zone_match.group(1))
@@ -574,8 +598,7 @@ def parse_gcp_state(
             raise GuardViolation(
                 f'GCP instance {instance.get("name")!r} has the wrong shape.')
         instance_zone = _basename(instance.get('zone'))
-        if (not instance_zone.startswith(f'{expected_region}-') or
-                instance_zone != expected_cluster_zones[cluster_name]):
+        if instance_zone != expected_cluster_zones[cluster_name]:
             raise GuardViolation(
                 f'GCP instance {instance.get("name")!r} is in the wrong '
                 'binding zone.')
@@ -781,7 +804,6 @@ class GcpObserver:
                                profile=self._profile,
                                instances=census.instances,
                                disks=census.disks,
-                               expected_region=self._scope.region,
                                operations=census.operations)
 
 
@@ -947,12 +969,14 @@ def gcp_identity_from_retained_request(
             str(binding['paid_capacity_pool_key']))
         workspace = binding['service_workspace']
         if (not isinstance(config_snapshot, collections.abc.Mapping) or
-                not isinstance(pool_identity, collections.abc.Mapping) or
-                pool_identity.get('cloud') != 'gcp' or
+                not isinstance(pool_identity, collections.abc.Mapping)):
+            raise ValueError('request provider scope mismatch')
+        pool_region = pool_identity.get('region')
+        pool_zone = pool_identity.get('zone')
+        if (pool_identity.get('cloud') != 'gcp' or
                 pool_identity.get('workspace') != workspace or
-                pool_identity.get('region') != scope.region or
-                not isinstance(pool_identity.get('zone'), str) or
-                not pool_identity['zone'].startswith(f'{scope.region}-') or
+                pool_identity.get('accelerators') != [['l4', 1]] or
+                not _gcp_region_matches_zone(pool_region, pool_zone) or
                 config_snapshot.get('active_workspace') != workspace or
                 workspace != scope.workspace):
             raise ValueError('request provider scope mismatch')
@@ -960,7 +984,7 @@ def gcp_identity_from_retained_request(
             skypilot_config.get_effective_workspace_region_config_from_snapshot(
                 config_snapshot,
                 'gcp', ('managed_instance_group',),
-                region=pool_identity['region'],
+                region=pool_region,
                 workspace=workspace))
         if managed_instance_group is not None:
             raise ValueError('managed instance groups are outside this test')
@@ -968,14 +992,14 @@ def gcp_identity_from_retained_request(
             skypilot_config.get_effective_workspace_region_config_from_snapshot(
                 config_snapshot,
                 'gcp', ('project_id',),
-                region=pool_identity['region'],
+                region=pool_region,
                 workspace=workspace))
         identity = ordinary_launch_binding.ordinary_paid_gcp_provider_identity(
             binding, project_id=request_project)
         if (identity['project_id'] != scope.project_id or
                 identity['workspace'] != scope.workspace or
-                identity['region'] != scope.region or
-                identity['zone'] != pool_identity['zone'] or
+                identity['region'] != pool_region or
+                identity['zone'] != pool_zone or
                 identity['instance_type'] != 'g2-standard-4' or
                 identity['num_nodes'] != 1 or identity['use_spot'] is not True):
             raise ValueError('request-derived provider identity mismatch')
@@ -1159,15 +1183,13 @@ class PostgresObserver:
     remain fresh while traffic is being qualified.
     """
 
-    def __init__(self, database_url: str, service_name: str,
-                 region: str) -> None:
+    def __init__(self, database_url: str, service_name: str) -> None:
         url = sqlalchemy.engine.make_url(database_url)
         if not url.drivername.startswith('postgresql'):
             raise QualificationError('Paid qualification requires PostgreSQL.')
         self._engine = sqlalchemy.create_engine(database_url,
                                                 pool_pre_ping=True)
         self._service_name = service_name
-        self._region = region
         self._provider_scope: ProviderScope | None = None
 
     def close(self) -> None:
@@ -1199,8 +1221,7 @@ class PostgresObserver:
         if row is None:
             raise GuardViolation(
                 'Service has no current committed provider-scope authority.')
-        scope = provider_scope_from_controller_config(
-            row, expected_region=self._region)
+        scope = provider_scope_from_controller_config(row)
         self._provider_scope = scope
         return scope
 
@@ -2482,7 +2503,7 @@ def freeze_provider_scope(args: argparse.Namespace) -> None:
     if not database_url:
         raise QualificationError(
             f'{args.postgres_url_env} must contain the PostgreSQL URL.')
-    postgres = PostgresObserver(database_url, args.service_name, args.region)
+    postgres = PostgresObserver(database_url, args.service_name)
     deadline = time.monotonic() + args.timeout_seconds
     scope: ProviderScope | None = None
     try:
@@ -2507,7 +2528,7 @@ def freeze_provider_scope(args: argparse.Namespace) -> None:
             {
                 'outcome': 'scope-frozen',
                 'provider': 'gcp',
-                'region': scope.region,
+                'location_scope': scope.location_scope.value,
                 'receipt': str(pathlib.Path(args.output)),
             },
             sort_keys=True))
@@ -2520,7 +2541,7 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
         raise QualificationError(
             f'{args.postgres_url_env} must contain the PostgreSQL URL.')
     scope = read_provider_scope(pathlib.Path(args.scope), args.service_name)
-    postgres = PostgresObserver(database_url, args.service_name, scope.region)
+    postgres = PostgresObserver(database_url, args.service_name)
     gcp = GcpObserver(service_name=args.service_name,
                       scope=scope,
                       profile=PROFILES['scale'])
@@ -2578,7 +2599,7 @@ async def qualify(args: argparse.Namespace) -> None:
 
     frozen_scope = read_provider_scope(pathlib.Path(args.scope),
                                        args.service_name)
-    postgres = PostgresObserver(database_url, args.service_name, args.region)
+    postgres = PostgresObserver(database_url, args.service_name)
     provider_scope = postgres.provider_scope()
     if provider_scope != frozen_scope:
         postgres.close()
@@ -2718,7 +2739,7 @@ def render_service(args: argparse.Namespace) -> None:
     })
     resources = config['resources']
     if (resources.get('use_spot') is not True or
-            resources.get('infra') != 'gcp/us-central1' or
+            resources.get('infra') != 'gcp' or
             resources.get('instance_type') != 'g2-standard-4' or
             resources.get('accelerators') != 'L4:1'):
         raise QualificationError('Service fixture is not exact one-L4 Spot.')
@@ -2739,7 +2760,6 @@ def _parser() -> argparse.ArgumentParser:
 
     freeze = subparsers.add_parser('freeze-scope')
     freeze.add_argument('--service-name', required=True)
-    freeze.add_argument('--region', default='us-central1')
     freeze.add_argument('--output', required=True)
     freeze.add_argument('--timeout-seconds', type=float, default=5 * 60)
     freeze.add_argument('--poll-seconds', type=float, default=5)
@@ -2752,7 +2772,6 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument('--endpoint', required=True)
     run.add_argument('--receipt', required=True)
     run.add_argument('--scope', required=True)
-    run.add_argument('--region', default='us-central1')
     run.add_argument('--auth-token-env',
                      default='SKYPILOT_SERVE_E2E_AUTH_TOKEN')
     run.add_argument('--postgres-url-env', default='SKYPILOT_DB_CONNECTION_URI')

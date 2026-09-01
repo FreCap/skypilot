@@ -2,53 +2,76 @@
 
 Last updated: 2026-09-01
 
-Status: **the reserved-capacity path, exact-card compatibility, bounded paid
-admission, historical at-least-100 Spot scale, 10,000-request transport, and
-exact provider teardown are production-qualified. Early provider-materialized
-pool feedback and exact async-ledger telemetry are being implemented and are
-not yet deployed or production-proven.** One
-PostgreSQL-authoritative planner is the canonical source path for both
-reservation-aware actuation and paid Spot residual. Historical production runs
-proved complete East occupancy, Kueue-bounded PHX occupancy, reclaim, mixed
-reserved-plus-Spot execution, at-least-100 Spot scale-out, 10,000 authenticated
-warm requests, and exact provider teardown. Full idle research occupancy is no
-longer a steady-state goal: the current service uses `utilization_gate: true`,
-so it consumes only capacity justified by demand and returns that capacity to
-the unchanged scheduler when idle.
+Status: **the reservation-aware planner, exact-card compatibility, bounded
+Spot-only paid admission, historical at-least-100 Spot scale, 10,000-request
+transport, and exact provider teardown are production-qualified. The final
+current-writer project-wide GCP scale/traffic/drain receipt and clean
+`boltz-l4-fleet` recreation remain open.** One PostgreSQL-authoritative planner
+is the canonical source path for reservation-aware actuation and paid Spot
+residual. Historical production runs proved complete East occupancy,
+Kueue-bounded PHX occupancy under the unchanged research policy, reclaim,
+mixed reserved-plus-Spot execution, at-least-100 Spot scale-out, 10,000
+authenticated warm requests, and exact provider teardown. Full idle research
+occupancy is no longer a steady-state goal: `utilization_gate: true` permits
+only demand-backed fill and returns it to the unchanged scheduler when idle.
 
-The current production control plane is release ``1.1.1598``, source
-``402a7a61ef1e381b210d42164040ca4429160f95``, deployed homogeneously at Helm
-revision 716 on 2026-09-01 with image
-``sha256:328dea2bf429c2b42206a382d87cecf8ec2326779ef9e61a87c80ab5d0de9d3c``.
+The current production control plane is release ``1.1.1603``, source
+``9f444ba5a64520e1b2c69527260418b67426b7bf``, deployed homogeneously at Helm
+revision 720 on 2026-09-01 with image
+``sha256:19e1a010a460a9bbba93ea5ecefdb405e588c22184233d0496a1e99af45a5220``.
 All two API, two controller, and three executor replicas are Ready on that
-digest, with a service-wide paid launch window of 120. The bounded-candidate
-correction is therefore deployed. The cold ``spot-e2e-0901k`` campaign reached
-113 concurrently provider-``RUNNING`` GCP Spot L4 VMs and then returned its
-service, claims, debits, VMs, disks, and operations to exact zero. It first
-crossed 100 at 343.5 seconds, missing the five-minute qualification gate even
-though the first 60 VMs were already provider-ready much earlier.
+digest with zero restarts; PostgreSQL is the central store and Helm storage is
+disabled. This release includes provider-``RUNNING`` paid-pool feedback and
+equal-cost pool balancing. The cold ``spot-e2e-0901k`` campaign reached 113
+concurrent provider-``RUNNING`` GCP Spot L4 VMs and returned its complete
+provider/PostgreSQL graph to exact zero; it first crossed 100 at 343.5 seconds.
+Earlier clean-frontier evidence crossed 100 in 221.9 seconds and peaked at 117.
 
-The remaining scale latency is a feedback-boundary error, not provider
-scarcity. The first wave intentionally admitted 60 requests in the cheapest
-pool and one probe in each alternative pool. The cheapest pool's VMs were
-provider-``RUNNING`` while their requests continued through deploy-variable,
-SSH, wheel, credential, runtime, Ray, and service-job setup. Pool success was
-recorded only when each complete ``sky.launch`` request became terminal, so no
-second-wave request was admitted for 209 seconds. Provider availability and
-runtime/service readiness are different facts and must not share one terminal
-receipt.
+The first project-wide follow-up, ``spot-e2e-0901v``, loaded 44 eligible GCP
+Spot L4 pools and froze exact project/workspace/version authority without a
+single-region restriction. Its cheapest two zones returned genuine provider
+capacity failures. Thirteen exact Spot VMs materialized transiently, and normal
+failure cleanup then proved three consecutive samples with zero claims,
+debits, VMs, disks, operations, and waiters. The qualifier stopped on a real
+controller invariant violation before a scale result: six paid Phase-A rows
+had no retained launch association, yet their claims survived terminal row
+projection until a future paid-admission sweep.
 
-The canonical correction adds one write-once provider-allocation marker to the
-existing exact paid claim. Immediately after the in-tree provisioner returns a
-single-node, full-fresh allocation observed by the provider as ``RUNNING``, and
-before runtime setup, the bound request commits the marker and one normal
-pool-success ramp atomically. The write is allowed only for the exact active
-protocol-v2 ``ORDINARY_PAID`` association, request execution claim, replica
-record, Spot pool, built-in provisioner, zero resumed nodes, and matching
-provider account/project, region, zone, instance type, instance ID, and cluster
-identity. Custom provisioners, multi-node replicas, partial creates, resumes,
-replacements, Kubernetes, and reserved fill retain terminal feedback and do
-not use this checkpoint.
+The canonical correction does not weaken claim/debit guards or add a retry
+path. A finished ordinary-paid worker carrying one exact committed Phase-A
+receipt and no durable bound association is transferred to the existing exact
+pre-admission retirement lane. That PostgreSQL transaction locks and
+revalidates the service, replica record, association absence, request graph,
+and claim before deleting the planner row and claim together. If association
+admission won the race, retirement returns ``ASSOCIATED`` and normal bound
+adoption remains the only path. No provider ``down`` is authorized from
+pre-admission absence. A separate cleanup correction accepts a later
+``sky_down=SUCCEEDED`` marker only for the already exact provider-``ABSENT``,
+quiesced, claim-free and pin-free paid projection; every ambiguous or failed
+down marker remains rejected.
+
+The next billable qualification is deliberately bounded at 240 one-L4 Spot
+VMs with a 60-member per-pool window and a minimum proof of 100
+provider-``RUNNING`` workers. Four pools are opened in cost order immediately.
+This is the smallest bound that leaves 120 attempts in the next price tier when
+the two known-cheapest pools are exhausted. It changes neither the tracked
+Helm default nor `boltz-l4-fleet`'s 120-GPU paid cap. The deterministic suite
+uses the production selector to prove a 60/60/60/60 first wave, a 0/0/60/60
+later-tier refill, exact no-on-demand filtering, and pre-binding claim
+retirement. The real-cloud gate remains at least 100 provider-running workers
+within five minutes, 10,000 authenticated completions with fresh positive
+request telemetry, and natural exact-zero drain.
+
+Provider availability and runtime/service readiness are separate facts. The
+write-once provider-allocation marker commits normal pool-success feedback
+after the in-tree provisioner returns a single-node full-fresh allocation
+observed as provider-``RUNNING`` and before runtime setup. It is allowed only
+for the exact active protocol-v2 ``ORDINARY_PAID`` association, request
+execution claim, replica record, Spot pool, built-in provisioner, zero resumed
+nodes, and matching provider account/project, region, zone, instance type,
+instance ID, and cluster identity. Custom provisioners, multi-node replicas,
+partial creates, resumes, replacements, Kubernetes, and reserved fill retain
+terminal feedback and do not use this checkpoint.
 
 The paid claim stores a PostgreSQL timestamp and receipt SHA-256 as an
 all-or-none pair; the closed receipt contract name is covered by that digest.
