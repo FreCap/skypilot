@@ -1,5 +1,11 @@
 # SkyServe Controller History Persistence
 
+Last updated: 2026-09-01
+
+Status: **the extraction is complete. A source-only follow-up projects durable
+logical-plan history immediately after the PostgreSQL capacity-plan commit;
+deployment and live dashboard verification remain open.**
+
 ## Context
 
 `sky/serve/controller.py` is 4,313 lines and changes for several independent
@@ -45,7 +51,7 @@ offloaded to the executor), and change cadence from controller reconciliation.
 - Change cadence: capacity semantics, accelerator compatibility, HA, and
   load-balancer protocol changes.
 
-### Best-effort history persistence and projection
+### Legacy best-effort history persistence and projection
 
 - Callers: normal LB sync, draining-LB history-only sync, and focused controller
   tests through the historical `SkyServeController` methods.
@@ -59,8 +65,9 @@ offloaded to the executor), and change cadence from controller reconciliation.
   history, database failure leaking into routing, invented exact-card overlays,
   or blocking the event loop.
 - Performance sensitivity: one executor submission for each present history
-  family and autoscaler snapshot; no extra database reads, copies, or provider
-  calls may be introduced.
+  family and autoscaler snapshot. The durable-plan amendment adds one bounded
+  ownership read before this legacy autoscaler callback can write; it adds no
+  provider call or allocator invocation.
 - Change cadence: history schema, validation, aggregation, and observability
   failure policy.
 
@@ -105,16 +112,42 @@ class, or circular import. The helper module must not import the controller.
   and preserve their authority checks and ordering.
 - Missing history remains an accepted no-op. Invalid bounded input is
   acknowledged and dropped. Infrastructure failures return `False` for LB
-  history and remain non-fatal for autoscaler history.
+  history and remain non-fatal for legacy-controller autoscaler history.
 - Reporter session validation, service-incarnation fencing, history payloads,
   timestamps, exact-card completeness checks, and durable writer calls are
   unchanged.
 - Each present history family still performs exactly one executor submission
-  and one durable writer call. Autoscaler history still samples `time.time()`
-  once before its executor submission.
+  and one durable writer call. The `LEGACY_CONTROLLER` autoscaler-history path
+  still samples `time.time()` once before its executor submission.
 - Imports stay at module scope. No public import path, wire shape, serialized
   identity, database format, CLI output, remote command, or lifecycle ordering
   changes.
+
+### Durable-plan ownership amendment
+
+For a `DURABLE_FEED` service, the finalized `CommittedCapacityPlan` is now the
+only autoscaler-history source. Plan/head/policy and accepted capacity admission
+commit first. Before any provider effect can consume that authority, a bounded,
+best-effort transaction upserts its pure display projection into the existing
+`serve_autoscaler_history` minute bucket. This invokes no allocator and
+introduces no table or migration. History is observability, not launch
+authority: a history failure is logged but cannot roll back or suppress the
+committed plan, and the next reconciliation retries the projection.
+
+The extracted controller writer remains only at the explicit
+`LEGACY_CONTROLLER` compatibility boundary. Its ownership check and history
+upsert share one transaction and lock the exact service/incarnation row, so a
+promotion cannot race a late legacy write. Unknown source ownership and
+`DURABLE_FEED` both skip it. During a mixed-binary minute, a digest-bearing
+committed-plan sample wins the latest-state fields while the existing pressure
+fields retain their minute peaks. History reads expose plan provenance only
+when its generation, digest, and validity horizon match the current service
+version/hash and current plan head. The response carries the PostgreSQL clock;
+the dashboard evaluates expiry against that clock. This amendment supersedes
+the original
+no-behavior-change contract only for durable logical services; load-balancer
+request history and legacy physical/QPS autoscaler history retain the extracted
+behavior above.
 
 ## Alternatives
 
@@ -125,8 +158,11 @@ class, or circular import. The helper module must not import the controller.
   split across modules.
 - Add a `HistoryWriter` class or protocol: no second implementation exists and
   construction or dependency injection would add state and indirection.
-- Pass an immutable snapshot DTO: unnecessary copying and a new compatibility
-  surface for data already owned by the controller.
+- Pass an immutable snapshot DTO through the extracted controller methods:
+  unnecessary copying and a new compatibility surface for data already owned
+  by that controller. The durable-plan amendment does use a small typed DTO at
+  the separate transaction-local history seam, where the committed plan—not
+  mutable controller state—is the source.
 - Keep forwarding wrappers in `controller.py`: preserves implementation module
   names but adds permanent call depth and leaves duplicate ownership.
 - Move LB report preparation too: rejected because it shares controller locks,
@@ -166,9 +202,14 @@ and require the complete relevant check rollup on the exact pushed SHA.
 
 ## Performance and rollout
 
-The extraction adds no wrapper, object, query, provider call, snapshot copy, or
-lock. Compare cold imports and representative calls before and after. Treat a
-repeatable material regression as a blocker.
+The original extraction adds no wrapper, object, query, provider call,
+snapshot copy, or lock. The durable-plan amendment retains the plan connection
+across commit and adds one short second transaction with local lock and
+statement timeouts, plus one locked
+source-ownership read before the legacy callback may write. It adds no allocator
+invocation, provider read, table, migration, or alternate endpoint. Compare
+cold imports and representative calls before and after, and treat a repeatable
+material regression or minute-row contention as a blocker.
 
 This is an internal structural change with no migration or feature flag. Roll
 back by reverting the extraction commit. Merge only after exact-head CI and

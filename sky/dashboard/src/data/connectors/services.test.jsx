@@ -66,6 +66,45 @@ describe('normalizeAcceleratorBreakdown capacity semantics', () => {
       })
     ).toBeNull();
   });
+
+  it('accepts only a complete native-typed committed-plan projection', () => {
+    const projection = {
+      ...legacyBreakdown,
+      capacity_semantics_version: 2,
+      warm_retention_target: { L4: 1 },
+      cold_launch_authority: { L4: 1 },
+      capacity_plan_generation: 7,
+      capacity_plan_sha256: 'a'.repeat(64),
+      capacity_plan_valid_until: 200,
+    };
+
+    expect(normalizeAcceleratorBreakdown(projection)).toHaveProperty(
+      'capacityPlan',
+      {
+        generation: 7,
+        sha256: 'a'.repeat(64),
+        validUntil: 200,
+      }
+    );
+    expect(
+      normalizeAcceleratorBreakdown({
+        ...projection,
+        capacity_plan_generation: '7',
+      })
+    ).toBeNull();
+    expect(
+      normalizeAcceleratorBreakdown({
+        ...projection,
+        capacity_plan_valid_until: '200',
+      })
+    ).toBeNull();
+    expect(
+      normalizeAcceleratorBreakdown({
+        ...projection,
+        demand_target: { L4: '' },
+      })
+    ).toBeNull();
+  });
 });
 
 function mockDispatchResponse() {
@@ -1672,6 +1711,19 @@ describe('service version administration', () => {
 });
 
 describe('normalizeReplicaHistory', () => {
+  it('distinguishes an old missing projection mode from malformed null', () => {
+    expect(
+      normalizeReplicaHistory({ available: true })
+        .autoscalerProjectionModeMalformed
+    ).toBe(false);
+    expect(
+      normalizeReplicaHistory({
+        available: true,
+        autoscaler_projection_mode: null,
+      }).autoscalerProjectionModeMalformed
+    ).toBe(true);
+  });
+
   it('drops malformed samples and defaults invalid counts to zero', () => {
     const history = normalizeReplicaHistory({
       available: true,
@@ -1686,8 +1738,8 @@ describe('normalizeReplicaHistory', () => {
       ],
       autoscaler_samples: [
         {
-          timestamp: '120',
-          observed_at: '125',
+          timestamp: 120,
+          observed_at: 125,
           controller_session_id: 'a'.repeat(32),
           version: 2,
           replica_unit: 'logical_slot',
@@ -1765,6 +1817,7 @@ describe('normalizeReplicaHistory', () => {
         },
       },
     ]);
+    expect(history.autoscalerLatestSampleMalformed).toBe(true);
     expect(history.requestWindowSeconds).toBe(3600);
     expect(history.requestsLastHour).toBe(7);
   });

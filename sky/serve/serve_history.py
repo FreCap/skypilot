@@ -1,7 +1,9 @@
 """PostgreSQL-backed aggregate history for SkyServe status and requests."""
 
 from collections.abc import Collection
+import dataclasses
 import datetime
+import math
 from typing import Any
 
 import sqlalchemy
@@ -10,6 +12,7 @@ from sqlalchemy.dialects import postgresql
 
 from sky import sky_logging
 from sky.serve import async_request_ledger
+from sky.serve import capacity_admission_schema
 from sky.serve import constants
 from sky.serve import serve_state
 from sky.utils import common_utils
@@ -1637,6 +1640,12 @@ _OPTIONAL_ACCELERATOR_BREAKDOWN_MAP_FIELDS = (
     'cold_launch_authority',
 )
 
+_CAPACITY_PLAN_PROVENANCE_FIELDS = frozenset({
+    'capacity_plan_generation',
+    'capacity_plan_sha256',
+    'capacity_plan_valid_until',
+})
+
 
 def _normalize_accelerator_breakdown(
         value: dict[str, Any] | None) -> dict[str, Any]:
@@ -1693,7 +1702,36 @@ def _normalize_accelerator_breakdown(
             assert count is not None
             normalized[card] = count
         result[field] = normalized
+    provenance_fields = _CAPACITY_PLAN_PROVENANCE_FIELDS & set(value)
+    if provenance_fields:
+        if provenance_fields != _CAPACITY_PLAN_PROVENANCE_FIELDS:
+            raise ValueError('Capacity-plan provenance must be complete.')
+        generation = value['capacity_plan_generation']
+        if (not isinstance(generation, int) or isinstance(generation, bool) or
+                generation < 1):
+            raise ValueError('capacity_plan_generation must be positive.')
+        result['capacity_plan_generation'] = generation
+        plan_sha256 = value['capacity_plan_sha256']
+        if (not isinstance(plan_sha256, str) or len(plan_sha256) != 64 or
+                any(character not in '0123456789abcdef'
+                    for character in plan_sha256)):
+            raise ValueError(
+                'capacity_plan_sha256 must be a lowercase SHA-256 digest.')
+        result['capacity_plan_sha256'] = plan_sha256
+        valid_until = value['capacity_plan_valid_until']
+        if (not isinstance(valid_until,
+                           (int, float)) or isinstance(valid_until, bool) or
+                not math.isfinite(valid_until) or valid_until <= 0):
+            raise ValueError(
+                'capacity_plan_valid_until must be a positive timestamp.')
+        result['capacity_plan_valid_until'] = valid_until
     return result
+
+
+def normalize_accelerator_breakdown(
+        value: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate the shared exact-card autoscaler projection."""
+    return _normalize_accelerator_breakdown(value)
 
 
 def _accelerator_breakdown_aggregate_observation(
@@ -1720,6 +1758,149 @@ def _accelerator_breakdown_aggregate_observation(
     }
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AutoscalerHistorySnapshot:
+    """One validated minute-history observation from one scaling authority."""
+
+    service_name: str
+    service_hash: str
+    controller_session_id: str
+    version: int
+    replica_unit: str
+    demand_target: int
+    capacity_target: int
+    ready_capacity: int
+    provisioning_capacity: int
+    total_capacity: int
+    observed_at: datetime.datetime
+    peak_in_flight: int | None = None
+    peak_queue_depth: int | None = None
+    accelerator_breakdown: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.service_name, str) or not self.service_name or
+                not isinstance(self.service_hash, str) or
+                not self.service_hash):
+            raise ValueError('service_name and service_hash must be non-empty.')
+        if (not isinstance(self.controller_session_id, str) or
+                len(self.controller_session_id) != 32 or
+                any(character not in '0123456789abcdef'
+                    for character in self.controller_session_id)):
+            raise ValueError(
+                'controller_session_id must be a lowercase hex UUID.')
+        if (not isinstance(self.version, int) or
+                isinstance(self.version, bool) or self.version < 1):
+            raise ValueError('version must be a positive integer.')
+        if self.replica_unit not in {'physical_backend', 'logical_slot'}:
+            raise ValueError('replica_unit must identify physical or logical '
+                             'capacity.')
+        for field in ('demand_target', 'capacity_target', 'ready_capacity',
+                      'provisioning_capacity', 'total_capacity'):
+            _nonnegative_int(getattr(self, field), field)
+        for field in ('peak_in_flight', 'peak_queue_depth'):
+            _nonnegative_int(getattr(self, field), field, nullable=True)
+        if self.capacity_target < self.demand_target:
+            raise ValueError('capacity_target must be at least demand_target.')
+        if (not isinstance(self.observed_at, datetime.datetime) or
+                self.observed_at.tzinfo is None):
+            raise ValueError('observed_at must be timezone-aware.')
+        breakdown = normalize_accelerator_breakdown(self.accelerator_breakdown)
+        if breakdown:
+            breakdown['_aggregate_observation'] = (
+                _accelerator_breakdown_aggregate_observation(
+                    controller_session_id=self.controller_session_id,
+                    version=self.version,
+                    replica_unit=self.replica_unit,
+                    demand_target=self.demand_target,
+                    capacity_target=self.capacity_target,
+                    ready_capacity=self.ready_capacity,
+                    provisioning_capacity=self.provisioning_capacity,
+                    total_capacity=self.total_capacity,
+                ))
+        object.__setattr__(self, 'accelerator_breakdown', breakdown)
+
+
+def record_autoscaler_snapshot_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    snapshot: AutoscalerHistorySnapshot,
+) -> int:
+    """Upsert one autoscaler sample through the caller's PostgreSQL commit."""
+    if not isinstance(snapshot, AutoscalerHistorySnapshot):
+        raise ValueError('snapshot must be an AutoscalerHistorySnapshot.')
+    if connection.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ValueError('Autoscaler history transactions require PostgreSQL.')
+    observed_at = snapshot.observed_at.astimezone(datetime.timezone.utc)
+    bucket_start = observed_at.replace(second=0, microsecond=0)
+    row = {
+        'service_name': snapshot.service_name,
+        'service_hash': snapshot.service_hash,
+        'bucket_start': bucket_start,
+        'observed_at': observed_at,
+        'controller_session_id': snapshot.controller_session_id,
+        'version': snapshot.version,
+        'replica_unit': snapshot.replica_unit,
+        'demand_target': snapshot.demand_target,
+        'capacity_target': snapshot.capacity_target,
+        'ready_capacity': snapshot.ready_capacity,
+        'provisioning_capacity': snapshot.provisioning_capacity,
+        'total_capacity': snapshot.total_capacity,
+        'peak_in_flight': snapshot.peak_in_flight,
+        'peak_queue_depth': snapshot.peak_queue_depth,
+        'accelerator_breakdown': snapshot.accelerator_breakdown,
+        'accelerator_breakdown_observed_at': observed_at,
+    }
+    table = serve_autoscaler_history_table
+    insert = postgresql.insert(table).values(row)
+    excluded = insert.excluded
+    existing_is_plan = table.c.accelerator_breakdown[
+        'capacity_plan_generation'].astext.is_not(None)
+    incoming_is_plan = excluded.accelerator_breakdown[
+        'capacity_plan_generation'].astext.is_not(None)
+    same_authority = sqlalchemy.or_(
+        sqlalchemy.and_(existing_is_plan, incoming_is_plan),
+        sqlalchemy.and_(~existing_is_plan, ~incoming_is_plan))
+    newest = sqlalchemy.or_(
+        sqlalchemy.and_(incoming_is_plan, ~existing_is_plan),
+        sqlalchemy.and_(same_authority, excluded.observed_at
+                        >= table.c.observed_at))
+
+    def latest(column: str) -> Any:
+        return sqlalchemy.case((newest, getattr(excluded, column)),
+                               else_=getattr(table.c, column))
+
+    def peak(column: str) -> Any:
+        existing = getattr(table.c, column)
+        incoming = getattr(excluded, column)
+        return sqlalchemy.case(
+            (existing.is_(None), incoming), (incoming.is_(None), existing),
+            else_=sqlalchemy.func.greatest(existing, incoming))
+
+    connection.execute(
+        insert.on_conflict_do_update(
+            index_elements=[
+                table.c.service_name,
+                table.c.service_hash,
+                table.c.bucket_start,
+            ],
+            set_={
+                'observed_at': latest('observed_at'),
+                'controller_session_id': latest('controller_session_id'),
+                'version': latest('version'),
+                'replica_unit': latest('replica_unit'),
+                'demand_target': latest('demand_target'),
+                'capacity_target': latest('capacity_target'),
+                'ready_capacity': latest('ready_capacity'),
+                'provisioning_capacity': latest('provisioning_capacity'),
+                'total_capacity': latest('total_capacity'),
+                'peak_in_flight': peak('peak_in_flight'),
+                'peak_queue_depth': peak('peak_queue_depth'),
+                'accelerator_breakdown': latest('accelerator_breakdown'),
+                'accelerator_breakdown_observed_at':
+                    latest('accelerator_breakdown_observed_at'),
+            }))
+    return 1
+
+
 def record_autoscaler_snapshot(
     service_name: str,
     service_hash: str,
@@ -1736,125 +1917,44 @@ def record_autoscaler_snapshot(
     peak_queue_depth: int | None = None,
     accelerator_breakdown: dict[str, Any] | None = None,
     timestamp: float | None = None,
+    required_source_mode: str | None = None,
 ) -> int:
     """Persist one controller-authored autoscaler observation.
 
     Latest target/capacity fields win within a minute while pressure gauges
     retain their peak. Non-PostgreSQL deployments accept and drop the sample.
     """
-    if (not isinstance(service_name, str) or not service_name or
-            not isinstance(service_hash, str) or not service_hash):
-        raise ValueError('service_name and service_hash must be non-empty.')
-    if (not isinstance(controller_session_id, str) or
-            len(controller_session_id) != 32 or
-            any(character not in '0123456789abcdef'
-                for character in controller_session_id)):
-        raise ValueError('controller_session_id must be a lowercase hex UUID.')
-    if (not isinstance(version, int) or isinstance(version, bool) or
-            version < 1):
-        raise ValueError('version must be a positive integer.')
-    if replica_unit not in {'physical_backend', 'logical_slot'}:
-        raise ValueError('replica_unit must identify physical or logical '
-                         'capacity.')
-    demand_target = _nonnegative_int(demand_target, 'demand_target')
-    capacity_target = _nonnegative_int(capacity_target, 'capacity_target')
-    ready_capacity = _nonnegative_int(ready_capacity, 'ready_capacity')
-    provisioning_capacity = _nonnegative_int(provisioning_capacity,
-                                             'provisioning_capacity')
-    total_capacity = _nonnegative_int(total_capacity, 'total_capacity')
-    peak_in_flight = _nonnegative_int(peak_in_flight,
-                                      'peak_in_flight',
-                                      nullable=True)
-    peak_queue_depth = _nonnegative_int(peak_queue_depth,
-                                        'peak_queue_depth',
-                                        nullable=True)
-    accelerator_breakdown = _normalize_accelerator_breakdown(
-        accelerator_breakdown)
-    assert demand_target is not None
-    assert capacity_target is not None
-    assert ready_capacity is not None
-    assert provisioning_capacity is not None
-    assert total_capacity is not None
-    if capacity_target < demand_target:
-        raise ValueError('capacity_target must be at least demand_target.')
-    if accelerator_breakdown:
-        accelerator_breakdown['_aggregate_observation'] = (
-            _accelerator_breakdown_aggregate_observation(
-                controller_session_id=controller_session_id,
-                version=version,
-                replica_unit=replica_unit,
-                demand_target=demand_target,
-                capacity_target=capacity_target,
-                ready_capacity=ready_capacity,
-                provisioning_capacity=provisioning_capacity,
-                total_capacity=total_capacity,
-            ))
-
+    snapshot = AutoscalerHistorySnapshot(
+        service_name=service_name,
+        service_hash=service_hash,
+        controller_session_id=controller_session_id,
+        version=version,
+        replica_unit=replica_unit,
+        demand_target=demand_target,
+        capacity_target=capacity_target,
+        ready_capacity=ready_capacity,
+        provisioning_capacity=provisioning_capacity,
+        total_capacity=total_capacity,
+        peak_in_flight=peak_in_flight,
+        peak_queue_depth=peak_queue_depth,
+        accelerator_breakdown=accelerator_breakdown,
+        observed_at=_utc_datetime(timestamp))
+    if required_source_mode not in {None, 'LEGACY_CONTROLLER'}:
+        raise ValueError('required_source_mode is unsupported.')
     engine = _postgres_engine()
     if engine is None:
         return 0
-    observed_at = _utc_datetime(timestamp)
-    bucket_start = observed_at.replace(second=0, microsecond=0)
-    row = {
-        'service_name': service_name,
-        'service_hash': service_hash,
-        'bucket_start': bucket_start,
-        'observed_at': observed_at,
-        'controller_session_id': controller_session_id,
-        'version': version,
-        'replica_unit': replica_unit,
-        'demand_target': demand_target,
-        'capacity_target': capacity_target,
-        'ready_capacity': ready_capacity,
-        'provisioning_capacity': provisioning_capacity,
-        'total_capacity': total_capacity,
-        'peak_in_flight': peak_in_flight,
-        'peak_queue_depth': peak_queue_depth,
-        'accelerator_breakdown': accelerator_breakdown,
-        'accelerator_breakdown_observed_at': observed_at,
-    }
-    table = serve_autoscaler_history_table
     with engine.begin() as connection:
-        insert = postgresql.insert(table).values(row)
-        excluded = insert.excluded
-        newest = excluded.observed_at >= table.c.observed_at
-
-        def latest(column: str) -> Any:
-            return sqlalchemy.case((newest, getattr(excluded, column)),
-                                   else_=getattr(table.c, column))
-
-        def peak(column: str) -> Any:
-            existing = getattr(table.c, column)
-            incoming = getattr(excluded, column)
-            return sqlalchemy.case(
-                (existing.is_(None), incoming), (incoming.is_(None), existing),
-                else_=sqlalchemy.func.greatest(existing, incoming))
-
-        connection.execute(
-            insert.on_conflict_do_update(
-                index_elements=[
-                    table.c.service_name,
-                    table.c.service_hash,
-                    table.c.bucket_start,
-                ],
-                set_={
-                    'observed_at': sqlalchemy.func.greatest(
-                        table.c.observed_at, excluded.observed_at),
-                    'controller_session_id': latest('controller_session_id'),
-                    'version': latest('version'),
-                    'replica_unit': latest('replica_unit'),
-                    'demand_target': latest('demand_target'),
-                    'capacity_target': latest('capacity_target'),
-                    'ready_capacity': latest('ready_capacity'),
-                    'provisioning_capacity': latest('provisioning_capacity'),
-                    'total_capacity': latest('total_capacity'),
-                    'peak_in_flight': peak('peak_in_flight'),
-                    'peak_queue_depth': peak('peak_queue_depth'),
-                    'accelerator_breakdown': latest('accelerator_breakdown'),
-                    'accelerator_breakdown_observed_at':
-                        latest('accelerator_breakdown_observed_at'),
-                }))
-    return 1
+        if required_source_mode is not None:
+            source_mode = connection.execute(
+                sqlalchemy.select(
+                    serve_state.services_table.c.demand_source_mode).where(
+                        serve_state.services_table.c.name == service_name,
+                        serve_state.services_table.c.hash == service_hash,
+                    ).with_for_update()).scalar_one_or_none()
+            if source_mode != required_source_mode:
+                return 0
+        return record_autoscaler_snapshot_in_connection(connection, snapshot)
 
 
 def _normalize_status_history_sections(
@@ -1910,6 +2010,7 @@ def unavailable_status_history(reason: str,
         })
     if 'autoscaler' in requested_sections:
         response['autoscaler_samples'] = []
+        response['autoscaler_projection_mode'] = None
     if requested_sections & {'requests', 'prediction'}:
         response['async_request_summary'] = (
             async_request_ledger.unavailable_summary(reason))
@@ -1943,18 +2044,39 @@ def get_status_history(
         return unavailable_status_history('postgres_required',
                                           requested_sections)
 
-    observed_at = _utc_datetime(timestamp)
-    window_start = observed_at - datetime.timedelta(hours=hours)
     services = serve_state.services_table
     history = serve_replica_status_history_table
+    heads = capacity_admission_schema.serve_capacity_plan_heads_table
+    plans = capacity_admission_schema.serve_capacity_plans_table
     with orm.Session(engine) as session:
-        service_hash = session.execute(
-            sqlalchemy.select(services.c.hash).where(
+        service_join = services.outerjoin(
+            heads, heads.c.service_name == services.c.name).outerjoin(
+                plans,
+                sqlalchemy.and_(
+                    plans.c.service_name == heads.c.service_name,
+                    plans.c.generation == heads.c.generation,
+                ))
+        service_row = session.execute(
+            sqlalchemy.select(
+                services.c.hash,
+                services.c.demand_source_mode,
+                services.c.current_version,
+                heads.c.generation.label('capacity_plan_generation'),
+                heads.c.valid_until.label('capacity_plan_valid_until'),
+                plans.c.content_sha256.label('capacity_plan_sha256'),
+                plans.c.service_hash.label('capacity_plan_service_hash'),
+                plans.c.service_version.label('capacity_plan_service_version'),
+                sqlalchemy.func.clock_timestamp().label('database_now'),
+            ).select_from(service_join).where(
                 services.c.name == service_name,
-                services.c.pool == 0)).scalar_one_or_none()
-        if service_hash is None:
+                services.c.pool == 0)).mappings().one_or_none()
+        if service_row is None:
             return unavailable_status_history('service_not_found',
                                               requested_sections)
+        service_hash = service_row['hash']
+        observed_at = (_utc_datetime(timestamp) if timestamp is not None else
+                       service_row['database_now'])
+        window_start = observed_at - datetime.timedelta(hours=hours)
         if (expected_service_hash is not None and
                 service_hash != expected_service_hash):
             return unavailable_status_history('service_hash_mismatch',
@@ -2086,6 +2208,25 @@ def get_status_history(
             return None
         serialized = dict(breakdown)
         serialized.pop('_aggregate_observation', None)
+        if service_row['demand_source_mode'] == 'DURABLE_FEED':
+            valid_until = service_row['capacity_plan_valid_until']
+            plan_matches_service = (service_row['capacity_plan_service_hash']
+                                    == service_hash and
+                                    service_row['capacity_plan_service_version']
+                                    == service_row['current_version'])
+            expected_plan = ((
+                service_row['capacity_plan_generation'],
+                service_row['capacity_plan_sha256'],
+                (None if valid_until is None else valid_until.timestamp()),
+            ) if plan_matches_service else (None, None, None))
+            projected_plan = (
+                serialized.get('capacity_plan_generation'),
+                serialized.get('capacity_plan_sha256'),
+                serialized.get('capacity_plan_valid_until'),
+            )
+            if projected_plan != expected_plan:
+                for field in _CAPACITY_PLAN_PROVENANCE_FIELDS:
+                    serialized.pop(field, None)
         return serialized
 
     autoscaler_samples = [{
@@ -2147,6 +2288,10 @@ def get_status_history(
         })
     if 'autoscaler' in requested_sections:
         response['autoscaler_samples'] = autoscaler_samples
+        source_mode = service_row['demand_source_mode']
+        response['autoscaler_projection_mode'] = (
+            source_mode if source_mode in {'LEGACY_CONTROLLER', 'DURABLE_FEED'
+                                          } else 'MALFORMED')
     if requested_sections & {'requests', 'prediction'}:
         # Kept in the history envelope for compatibility with clients that
         # predate the canonical current-activity projection on /demand.

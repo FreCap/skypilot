@@ -428,4 +428,5 @@ def test_autoscaler_history_samples_once_and_forwards_snapshot():
         peak_queue_depth=1,
         accelerator_breakdown=None,
         timestamp=123.0,
+        required_source_mode='LEGACY_CONTROLLER',
     )

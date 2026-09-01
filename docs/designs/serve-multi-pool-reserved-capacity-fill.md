@@ -1660,7 +1660,7 @@ it has merged or been deployed.
 | Lifecycle-137 evidence | Release `1.1.1554` reached exactly 100 provider-`RUNNING` GCP Spot one-L4 workers with zero ordinary on-demand and zero wrong-shape capacity. All 10,000 authenticated warm requests returned first-attempt HTTP 200. Normal down converged service, replica, claim, waiter, VM, and disk state to exact zero before the schema-3 cutover. |
 | Lifecycle-136 evidence | Run `9462207b-e026-4c5e-b610-acaba61e9b0a` on `1.1.1550` reached exactly 100 provider-`RUNNING` GCP Spot L4 VMs, with zero on-demand and zero non-L4 VMs. It accepted the 10,000-ID continuation and subsequent 5,000-ID extension. Normal teardown reached provider zero in about 3 minutes 16 seconds and full PostgreSQL/provider/disk zero in about 3 minutes 45 seconds. The immutable bundle records SHA-256 `audit.jsonl` `51807331f170d1352e9001324bd2e66f169a8a04867b7ca9bf94d8c4b953a8d7`, `arm.json` `92542d925ad50f0916cd8dcdc3977d27aa7f6a5e27b269445e03b70eadc36e70`, and `guard.json` `54a503e1f83eaa4899bce38bcc254591f885587ba87e81241fe3332a4188a649`. |
 | Cold-scale timing | **Count is proven; the five-minute current-writer objective remains open by 43.5 seconds.** Campaign `spot-e2e-0901k` first reached 100 at 343.5 seconds and peaked at 113. Provider census showed the first 60 VMs ready well before the terminal launch receipts opened the second wave. Serve066 moves that one economic feedback edge to exact provider-`RUNNING`; it does not erase cooldown evidence or weaken capacity failures. |
-| Telemetry | PR #1783 is deployed in the current source lineage. The current demand endpoint is controller-independent and, after lifecycle-141 drain, reported two fresh complete HA reporters with exact queued, async-processing, HTTP-in-flight, and total-in-flight values all zero. Request history retained the classified successful request. The qualification client did not create protocol-covered async-ledger rows, so a current-schema nonzero exact terminal-ledger/UI capture remains a full-design acceptance gate. It is not provider billing authority. |
+| Telemetry | PR #1783 is deployed in the current source lineage. The current demand endpoint is controller-independent and, after lifecycle-141 drain, reported two fresh complete HA reporters with exact queued, async-processing, HTTP-in-flight, and total-in-flight values all zero. A source-only successor now projects each finalized `CommittedCapacityPlan` into the existing minute autoscaler history immediately after its authoritative commit. The existing history read requires the projection generation, digest, and validity horizon to match the current plan head and service version/hash, returns the PostgreSQL clock, and lets the dashboard reject expiry against that clock; no new endpoint or table is added. It is not deployed or production-proven yet. Request history retained the classified successful request. The qualification client did not create protocol-covered async-ledger rows, so a current-schema nonzero exact terminal-ledger/UI capture remains a full-design acceptance gate. Telemetry is not provider billing or launch authority. |
 | Writer protocol | Public API 93, worker projection 10, deployed non-pool capability cohort 13, source cohort 14, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. The schema-3 cutover added no database migration. |
 | Service activation | **The qualification service and `boltz-l4-fleet` are absent while the paid correction is qualified and deployed.** The next clean fleet creation uses `min_replicas: 0`, zero fill floor, `utilization_gate: true`, paid cap 120, East A100/A100-80GB and PHX H200 through the existing server-owned contexts, and AWS/GCP L4 Spot only for genuine residual demand. No migration or retained service-version compatibility step is required for this test-only lifecycle. |
@@ -1851,6 +1851,18 @@ the existing raw-concurrency target, ``max_replicas``, paid-admission, and
 provider-policy ceilings.  This preserves recovery for a cold burst whose SLA
 is shorter than its measured provisioning lead while making the inevitable
 miss visible instead of representing that launch as SLA-compliant.
+
+For `DURABLE_FEED`, observability consumes that same finalized result rather
+than recomputing mutable autoscaler state. Plan/head/policy/admission commit
+first. Before provider effects, a bounded best-effort transaction projects the
+`CommittedCapacityPlan` into the existing `serve_autoscaler_history` minute
+bucket using the plan decision time. The plan connection is retained across
+commit and reused for this bounded second transaction, so no pool checkout can
+consume the authority lease. A telemetry failure cannot roll back or suppress
+authority; a later reconciliation retries it. The old controller-sync
+writer checks and locks explicit `LEGACY_CONTROLLER` ownership in the same
+transaction as its upsert; unknown ownership fails closed. No new history
+table, migration, allocator, endpoint, or provider read is introduced.
 
 This replaces the uniform cold-lead queue calculation whenever the elected
 load balancers provide a complete current deadline gauge; it is not an
@@ -2947,6 +2959,19 @@ With a source timestamp and freshness, the service UI exposes accepted/recent,
 queued, processing, in-flight asynchronous, rejected, terminal completed and
 failed, and unknown/protocol-uncovered requests.
 
+The existing autoscaler section of the controller-independent history read is
+also the current capacity-plan projection. One PostgreSQL statement joins the
+service, current head, and exact plan generation. A minute sample retains plan
+provenance only when generation, digest, validity horizon, service hash, and
+service version match that current authority. The PostgreSQL clock defines the
+read window; the dashboard rejects a returned horizon that has expired against
+that clock. The existing history refresh runs every ten seconds and uses its
+demand target and exact-card breakdown even when controller/provider route or
+status enrichment is unavailable. `UNAVAILABLE`, `STALE`, and `MALFORMED`
+carry null planned values and an exact reason; none is rendered as zero. An
+old server or explicit `LEGACY_CONTROLLER` owner retains the prior controller
+projection boundary. No API-version bump or second allocation path exists.
+
 Replica presentation has independent economic (reserved fill, other zero-cost,
 paid Spot, paid non-Spot, unknown) and lifecycle (ready, provisioning, shutting
 down, cleanup-uncertain, historical) axes.
@@ -3060,6 +3085,10 @@ missing telemetry.
     zero-authority. Version replacement is never inferred from compatible
     cards or funded by Spot. Exact-zero down followed by a new lifecycle is the
     sole supported update path for this service.
+27. **One plan, including observability:** durable history and the current UI
+    target are projections of the exact finalized committed plan. They never
+    rerun allocation, observe a different mutable generation, or translate
+    missing/stale/malformed authority into a zero target.
 
 ## Single-version service contract
 
@@ -3177,6 +3206,21 @@ on-demand spill.
 ### Source qualification
 
 - Run formatter/type/lint checks on every changed source file.
+- Commit a durable plan and require its exact minute-history projection before
+  provider effects. Inject a history-write failure and prove plan/head/admission
+  remain committed and usable; require a later reconciliation to fill the
+  projection gap. In a mixed-writer minute, require the committed-plan
+  projection to win latest state while preserving pressure peaks; require the
+  controller writer's ownership check and upsert to share one transaction under
+  explicit `LEGACY_CONTROLLER` ownership.
+- Read the current projection through the existing autoscaler-history section.
+  Expose provenance only for an exact current service hash/version, head
+  generation, content digest, and matching validity horizon. Return the
+  PostgreSQL clock and require the dashboard to reject expiry against it.
+  Independently corrupt each fence and require planned values to be
+  unavailable rather than zero. Prove the dashboard displays the PostgreSQL
+  target while controller/provider enrichment is unavailable and retains a
+  last-good projection only until its DB-relative lease expires.
 - With complete current telemetry and a zero launch-lead seed, prove 1,000
   queued requests of ten seconds each produce the same
   priority/deadline-weighted work in the aggregate and exact-card maps. At a
