@@ -5329,27 +5329,63 @@ def retire_bound_non_pool_projected_paid_provider_absence(
                 paid_retirement.serve_paid_replica_retirements_table)
             kueue_admissions = (
                 kueue_lane_lineage_schema.serve_kueue_admissions_table)
+            retirement = connection.execute(
+                sqlalchemy.select(paid_retirements).where(
+                    paid_retirements.c.service_name == service_name,
+                    paid_retirements.c.replica_id ==
+                    replica_id).with_for_update()).mappings().one_or_none()
+            if retirement is not None and (
+                    retirement['state']
+                    != paid_retirement.PaidRetirementState.COMMITTED.value or
+                    retirement['service_hash'] != association['service_hash'] or
+                    retirement['replica_record_id'] != record_uuid or
+                    retirement['service_lifecycle_epoch']
+                    != association['service_lifecycle_epoch'] or
+                    retirement['service_version']
+                    != association['service_version'] or
+                    retirement['committed_at'] is None or
+                    retirement['cancelled_at'] is not None):
+                return False
             dependent_counts = connection.execute(
                 sqlalchemy.select(
-                    sqlalchemy.select(sqlalchemy.func.count()).select_from(
-                        route_leases).where(
-                            route_leases.c.service_name == service_name,
-                            route_leases.c.replica_id == replica_id,
-                            route_leases.c.replica_record_id ==
-                            record_uuid).scalar_subquery(),
-                    sqlalchemy.select(sqlalchemy.func.count()).select_from(
-                        paid_retirements).where(
-                            paid_retirements.c.service_name == service_name,
-                            paid_retirements.c.replica_id ==
-                            replica_id).scalar_subquery(),
-                    sqlalchemy.select(sqlalchemy.func.count()).select_from(
-                        kueue_admissions).where(
-                            kueue_admissions.c.service_name == service_name,
-                            kueue_admissions.c.replica_id ==
-                            replica_id).scalar_subquery())).one()
+                    sqlalchemy.select(
+                        sqlalchemy.func.count()  # pylint: disable=not-callable
+                    ).select_from(route_leases).where(
+                        route_leases.c.service_name == service_name,
+                        route_leases.c.replica_id == replica_id,
+                        route_leases.c.replica_record_id ==
+                        record_uuid).scalar_subquery(),
+                    sqlalchemy.select(
+                        sqlalchemy.func.count()  # pylint: disable=not-callable
+                    ).select_from(kueue_admissions).where(
+                        kueue_admissions.c.service_name == service_name,
+                        kueue_admissions.c.replica_id ==
+                        replica_id).scalar_subquery())).one()
             if any(int(count) != 0 for count in dependent_counts):
                 return False
             replicas = serve_state_schema.replicas_table
+            if retirement is not None:
+                # COMMITTED retirement is irreversible teardown authority for
+                # this exact replica, not a live dependency.  Consume it with
+                # the provider-free replica row in this same transaction.
+                deleted_retirement = connection.execute(
+                    sqlalchemy.delete(paid_retirements).where(
+                        paid_retirements.c.service_name == service_name,
+                        paid_retirements.c.replica_id == replica_id,
+                        paid_retirements.c.service_hash ==
+                        association['service_hash'],
+                        paid_retirements.c.replica_record_id == record_uuid,
+                        paid_retirements.c.service_lifecycle_epoch ==
+                        association['service_lifecycle_epoch'],
+                        paid_retirements.c.service_version ==
+                        association['service_version'], paid_retirements.c.state
+                        == paid_retirement.PaidRetirementState.COMMITTED.value,
+                        paid_retirements.c.committed_at.is_not(None),
+                        paid_retirements.c.cancelled_at.is_(None)))
+                if deleted_retirement.rowcount != 1:
+                    raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                        'Paid provider-absence retirement lost its exact '
+                        'committed retirement.')
             deleted = connection.execute(
                 sqlalchemy.delete(replicas).where(
                     replicas.c.service_name == service_name,
