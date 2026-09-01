@@ -250,14 +250,14 @@ def test_create_instances_projects_request_without_mutating_node_config():
                 'Key': 'Name',
                 'Value': 'custom-name',
             }, {
+                'Key': 'owner',
+                'Value': 'sky',
+            }, {
                 'Key': provision_constants.TAG_RAY_CLUSTER_NAME,
                 'Value': 'cluster',
             }, {
                 'Key': provision_constants.TAG_SKYPILOT_CLUSTER_NAME,
                 'Value': 'cluster',
-            }, {
-                'Key': 'owner',
-                'Value': 'sky',
             }, {
                 'Key': provision_constants.TAG_SKYPILOT_MANAGED,
                 'Value': provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
@@ -268,6 +268,12 @@ def test_create_instances_projects_request_without_mutating_node_config():
         }, {
             'ResourceType': 'volume',
             'Tags': [{
+                'Key': provision_constants.TAG_RAY_CLUSTER_NAME,
+                'Value': 'cluster',
+            }, {
+                'Key': provision_constants.TAG_SKYPILOT_CLUSTER_NAME,
+                'Value': 'cluster',
+            }, {
                 'Key': provision_constants.TAG_SKYPILOT_MANAGED,
                 'Value': provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
             }, {
@@ -315,6 +321,12 @@ def test_create_instances_tags_all_resources_and_reserves_managed_marker():
                 'Key': provision_constants.TAG_SKYPILOT_MANAGED,
                 'Value': 'false',
             }, {
+                'Key': provision_constants.TAG_RAY_CLUSTER_NAME,
+                'Value': 'wrong-cluster',
+            }, {
+                'Key': provision_constants.TAG_SKYPILOT_CLUSTER_NAME,
+                'Value': 'wrong-cluster',
+            }, {
                 'Key': 'owner',
                 'Value': resource_type,
             }],
@@ -340,6 +352,10 @@ def test_create_instances_tags_all_resources_and_reserves_managed_marker():
         tags = {tag['Key']: tag['Value'] for tag in tag_spec['Tags']}
         assert tags[provision_constants.TAG_SKYPILOT_MANAGED] == (
             provision_constants.SKYPILOT_MANAGED_TAG_VALUE)
+        if tag_spec['ResourceType'] in ('instance', 'volume'):
+            assert tags[provision_constants.TAG_RAY_CLUSTER_NAME] == 'cluster'
+            assert tags[
+                provision_constants.TAG_SKYPILOT_CLUSTER_NAME] == 'cluster'
         assert tags['owner'] == tag_spec['ResourceType']
 
 

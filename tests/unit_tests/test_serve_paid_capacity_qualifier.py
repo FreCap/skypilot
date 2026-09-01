@@ -41,6 +41,58 @@ _FIXTURE_DIR = pathlib.Path(__file__).parents[1] / 'skyserve' / 'paid_capacity'
 qualifier = _load_module('paid_capacity_qualifier', _FIXTURE_DIR / 'qualify.py')
 
 
+def _provider_scope(**overrides):
+    values = {
+        'service_hash': 'incarnation',
+        'lifecycle_epoch': 7,
+        'service_version': 11,
+        'max_live_paid_gpu_units': 2,
+        'providers': ('aws', 'gcp'),
+        'project_id': 'durable-project',
+        'workspace': 'workspace-a',
+        'location_scope': qualifier.GcpLocationScope.PROJECT_WIDE,
+        'aws_location_scope':
+            (qualifier.AwsLocationScope.FROZEN_CATALOG_REGIONS),
+        'aws_regions':
+            (qualifier.AwsRegionScope(aws_account_id='123456789012',
+                                      credential_profile='durable-profile',
+                                      region='us-east-2'),),
+        'catalog_shapes': (
+            qualifier.CatalogShape(cloud='aws',
+                                   region='us-east-2',
+                                   zone='us-east-2a',
+                                   instance_type='g6.xlarge',
+                                   gpu_units_per_instance=1),
+            qualifier.CatalogShape(cloud='aws',
+                                   region='us-east-2',
+                                   zone='us-east-2b',
+                                   instance_type='g6.12xlarge',
+                                   gpu_units_per_instance=4),
+            qualifier.CatalogShape(cloud='aws',
+                                   region='us-east-2',
+                                   zone='us-east-2c',
+                                   instance_type='g6.48xlarge',
+                                   gpu_units_per_instance=8),
+            qualifier.CatalogShape(cloud='gcp',
+                                   region='us-central1',
+                                   zone='us-central1-a',
+                                   instance_type='g2-standard-4',
+                                   gpu_units_per_instance=1),
+            qualifier.CatalogShape(cloud='gcp',
+                                   region='us-east1',
+                                   zone='us-east1-b',
+                                   instance_type='g2-standard-4',
+                                   gpu_units_per_instance=1),
+        ),
+        'placement_catalog_sha256': 'c' * 64,
+        'service_yaml_sha256': 'd' * 64,
+        'controller_config_digest': 'a' * 64,
+        'controller_config_snapshot_id': 'b' * 64,
+    }
+    values.update(overrides)
+    return qualifier.ProviderScope(**values)
+
+
 def _instance(*,
               provisioning_model: str = 'SPOT',
               cluster_name: str = 'paid-e2e-1',
@@ -63,7 +115,61 @@ def _instance(*,
     }
 
 
+def _aws_identity(*,
+                  client_token='token-new',
+                  cluster_name='paid-e2e-1-1234567890-tenant',
+                  instance_type='g6.xlarge',
+                  width=1,
+                  zone='us-east-2a'):
+    return qualifier.AwsProviderIdentity(aws_account_id='123456789012',
+                                         client_token=client_token,
+                                         cluster_name_on_cloud=cluster_name,
+                                         credential_profile='durable-profile',
+                                         gpu_units_per_instance=width,
+                                         instance_type=instance_type,
+                                         num_nodes=1,
+                                         region='us-east-2',
+                                         use_spot=True,
+                                         workspace='workspace-a',
+                                         zone=zone)
+
+
+def _aws_instance(*,
+                  client_token='token-new',
+                  cluster_name='paid-e2e-1-1234567890-tenant',
+                  instance_id='i-new',
+                  instance_type='g6.xlarge',
+                  width=1,
+                  zone='us-east-2a',
+                  state='running',
+                  volume_id='vol-new'):
+    return {
+        'availability_zone': zone,
+        'client_token': client_token,
+        'cluster_name_on_cloud': cluster_name,
+        'instance_id': instance_id,
+        'instance_type': instance_type,
+        'market': 'spot',
+        'provider_gpu_units': width,
+        'region': 'us-east-2',
+        'state': state,
+        'volume_ids': (volume_id,),
+    }
+
+
+def _aws_volume(*,
+                cluster_name='paid-e2e-1-1234567890-tenant',
+                volume_id='vol-new'):
+    return {
+        'cluster_name_on_cloud': cluster_name,
+        'region': 'us-east-2',
+        'state': 'in-use',
+        'volume_id': volume_id,
+    }
+
+
 def _database_state(**overrides):
+    bound_cluster_zones = overrides.pop('bound_cluster_zones', ())
     values = {
         'service_hash': 'incarnation',
         'controller': qualifier.ControllerIdentity(
@@ -76,19 +182,53 @@ def _database_state(**overrides):
         'claim_priorities': (),
         'waiter_count': 0,
         'demand_units': 0,
-        'bound_cluster_zones': (),
+        'gcp_provider_identities': tuple(
+            qualifier.GcpProviderIdentity(
+                cluster_name_on_cloud=cluster_name,
+                gpu_units_per_instance=1,
+                instance_type='g2-standard-4',
+                project_id='durable-project',
+                region=qualifier._gcp_region_from_zone(zone),
+                workspace='workspace-a',
+                zone=zone) for cluster_name, zone in bound_cluster_zones),
+        'aws_provider_identities': (),
+        'provider_free_unbound_replica_ids': (),
     }
     values.update(overrides)
     return qualifier.DatabaseState(**values)
 
 
 def _provider_state(**overrides):
+    instance_count = overrides.get('instance_count', 0)
+    running_count = overrides.get('running_count', 0)
+    gpu_units = overrides.get('gpu_units', instance_count)
+    running_gpu_units = overrides.get('running_gpu_units', running_count)
     values = {
         'instance_count': 0,
         'running_count': 0,
+        'gpu_units': gpu_units,
+        'running_gpu_units': running_gpu_units,
         'disk_count': 0,
         'inflight_operation_count': 0,
         'cluster_names': frozenset(),
+        'clouds': (
+            qualifier.ProviderCloudState(cloud='gcp',
+                                         instance_count=instance_count,
+                                         running_count=running_count,
+                                         gpu_units=gpu_units,
+                                         running_gpu_units=running_gpu_units,
+                                         disk_count=overrides.get(
+                                             'disk_count', 0),
+                                         inflight_operation_count=overrides.get(
+                                             'inflight_operation_count', 0)),
+            qualifier.ProviderCloudState(cloud='aws',
+                                         instance_count=0,
+                                         running_count=0,
+                                         gpu_units=0,
+                                         running_gpu_units=0,
+                                         disk_count=0,
+                                         inflight_operation_count=0),
+        ),
     }
     values.update(overrides)
     return qualifier.ProviderState(**values)
@@ -146,7 +286,7 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
     source = _FIXTURE_DIR / 'service.yaml'
     for name, expected_units, expected_first_wave, expected_period in (
         ('small', 2, 2, 10),
-        ('scale', 240, 240, 60),
+        ('scale', 420, 420, 10),
     ):
         output = tmp_path / f'{name}.yaml'
         args = type('Args', (), {
@@ -171,12 +311,20 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
         profile = qualifier.PROFILES[name]
         assert queue['min_size'] == profile.pressure_concurrency
         assert queue['max_size'] == max(32, profile.pressure_concurrency * 2)
-        assert queue['max_concurrency'] == min(128,
-                                               profile.pressure_concurrency)
+        assert queue['max_concurrency'] == max(
+            8, min(128, profile.pressure_concurrency))
         assert resources['use_spot'] is True
-        assert resources['infra'] == 'gcp'
-        assert resources['instance_type'] == 'g2-standard-4'
         assert resources['accelerators'] == 'L4:1'
+        assert resources['any_of'] == [
+            {
+                'infra': 'aws',
+            },
+            {
+                'infra': 'gcp',
+            },
+        ]
+        assert 'infra' not in resources
+        assert 'instance_type' not in resources
         assert 'workdir' not in config
         assert 'file_mounts' not in config
         assert 'server.py' not in config['run']
@@ -214,6 +362,9 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
                 'gcp': {
                     'project_id': 'durable-project',
                 },
+                'aws': {
+                    'profile': 'durable-profile',
+                },
             },
         },
     }).encode()
@@ -221,6 +372,40 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
         qualifier.serve_utils, 'parse_and_validate_version_controller_config',
         lambda contents, workspace, _source: yaml.safe_load(contents))
     monkeypatch.setenv('GOOGLE_CLOUD_PROJECT', 'wrong-ambient-project')
+
+    class Sts:
+
+        @staticmethod
+        def get_caller_identity():
+            return {'Account': '123456789012'}
+
+    class Session:
+
+        @staticmethod
+        def client(name, *, region_name):
+            assert name == 'sts'
+            assert region_name == 'us-east-2'
+            return Sts()
+
+    monkeypatch.setattr(qualifier.aws_adaptor, 'session',
+                        lambda profile: Session())
+    catalog = qualifier.spot_placer.PlacementCatalog(
+        entries=((qualifier.spot_placer.Location(sky.AWS(),
+                                                 'us-east-2',
+                                                 'us-east-2a',
+                                                 accelerators={'L4': 1},
+                                                 use_spot=True,
+                                                 instance_type='g6.xlarge'),
+                  0.1),
+                 (qualifier.spot_placer.Location(sky.GCP(),
+                                                 'us-central1',
+                                                 'us-central1-a',
+                                                 accelerators={'L4': 1},
+                                                 use_spot=True,
+                                                 instance_type='g2-standard-4'),
+                  0.2)),
+        num_nodes=1).to_dict()
+    service_yaml = (_FIXTURE_DIR / 'service.yaml').read_text(encoding='utf-8')
     authority = {
         'service_hash': 'incarnation',
         'service_lifecycle_epoch': 7,
@@ -229,6 +414,8 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
         'controller_config': config_bytes,
         'controller_config_digest': hashlib.sha256(config_bytes).hexdigest(),
         'controller_config_snapshot_id': 'a' * 64,
+        'placement_catalog': catalog,
+        'yaml_content': service_yaml,
     }
     scope = qualifier.provider_scope_from_controller_config(authority)
     assert scope.project_id == 'durable-project'
@@ -254,15 +441,7 @@ def test_provider_scope_commands_are_regionless_by_default():
 
 def test_retained_request_accepts_cross_region_and_rejects_scope_drift(
         monkeypatch):
-    scope = qualifier.ProviderScope(
-        service_hash='incarnation',
-        lifecycle_epoch=7,
-        service_version=11,
-        project_id='durable-project',
-        workspace='workspace-a',
-        location_scope=qualifier.GcpLocationScope.PROJECT_WIDE,
-        controller_config_digest='a' * 64,
-        controller_config_snapshot_id='b' * 64)
+    scope = _provider_scope()
     association_id = uuid.UUID('11111111-1111-4111-8111-111111111111')
     binding = {
         'association_id': association_id,
@@ -283,7 +462,7 @@ def test_retained_request_accepts_cross_region_and_rejects_scope_drift(
         'user_id': 'tenant-a',
         'cluster_name': 'paid-e2e-1',
     }
-    retained_request = [None]
+    retained_request: list[object | None] = [None]
     monkeypatch.setattr(qualifier.request_postgres, 'request_from_mapping',
                         lambda _row: retained_request[0])
     context = object()
@@ -330,8 +509,8 @@ def test_retained_request_accepts_cross_region_and_rejects_scope_drift(
     configure()
     identity = qualifier.gcp_identity_from_retained_request(
         binding, request_row, scope)
-    assert identity['region'] == 'us-east1'
-    assert identity['zone'] == 'us-east1-b'
+    assert identity.region == 'us-east1'
+    assert identity.zone == 'us-east1-b'
 
     for overrides in ({
             'project_id': 'different-project'
@@ -435,15 +614,7 @@ def test_gcp_observer_uses_compute_api_adc_and_paginates(monkeypatch):
         return Compute()
 
     monkeypatch.setattr(qualifier.gcp_adaptor, 'build', build)
-    scope = qualifier.ProviderScope(
-        service_hash='incarnation',
-        lifecycle_epoch=7,
-        service_version=11,
-        project_id='durable-project',
-        workspace='workspace-a',
-        location_scope=(qualifier.GcpLocationScope.PROJECT_WIDE),
-        controller_config_digest='a' * 64,
-        controller_config_snapshot_id='b' * 64)
+    scope = _provider_scope()
     observer = qualifier.GcpObserver(service_name='paid-e2e',
                                      scope=scope,
                                      profile=qualifier.PROFILES['small'])
@@ -485,15 +656,7 @@ def test_gcp_observer_sanitizes_api_failures():
         def instances(self):
             return Collection()
 
-    scope = qualifier.ProviderScope(
-        service_hash='incarnation',
-        lifecycle_epoch=7,
-        service_version=11,
-        project_id='durable-project',
-        workspace='workspace-a',
-        location_scope=(qualifier.GcpLocationScope.PROJECT_WIDE),
-        controller_config_digest='a' * 64,
-        controller_config_snapshot_id='b' * 64)
+    scope = _provider_scope()
     observer = qualifier.GcpObserver(service_name='paid-e2e',
                                      scope=scope,
                                      profile=qualifier.PROFILES['small'],
@@ -502,6 +665,435 @@ def test_gcp_observer_sanitizes_api_failures():
         observer.census()
     assert str(error.value) == 'GCP Compute API instances census failed.'
     assert 'credential-bearing' not in str(error.value)
+
+
+def test_aws_retained_identity_is_bound_to_frozen_catalog(monkeypatch):
+    scope = _provider_scope(max_live_paid_gpu_units=8)
+    pool = {
+        'accelerators': [['L4', 8]],
+        'cloud': 'aws',
+        'instance_type': 'g6.48xlarge',
+        'num_nodes': 1,
+        'region': 'us-east-2',
+        'use_spot': True,
+        'version': 1,
+        'workspace': 'workspace-a',
+        'zone': 'us-east-2c',
+    }
+    config = {
+        'active_workspace': 'workspace-a',
+        'workspaces': {
+            'workspace-a': {
+                'aws': {
+                    'profile': 'durable-profile',
+                },
+            },
+        },
+    }
+    monkeypatch.setattr(qualifier, '_retained_launch_request', lambda *_args:
+                        (config, pool, 'workspace-a'))
+
+    def provider_identity(_binding, *, credential_profile):
+        assert credential_profile == 'durable-profile'
+        return {
+            'aws_account_id': '123456789012',
+            'client_token': 'token-wide',
+            'cluster_name_on_cloud': 'paid-e2e-1-1234567890-tenant',
+            'credential_profile': credential_profile,
+            'instance_type': pool['instance_type'],
+            'num_nodes': 1,
+            'region': pool['region'],
+            'use_spot': True,
+            'workspace': 'workspace-a',
+            'zone': pool['zone'],
+        }
+
+    monkeypatch.setattr(qualifier.ordinary_launch_binding,
+                        'ordinary_paid_aws_provider_identity',
+                        provider_identity)
+    identity = qualifier.aws_identity_from_retained_request({}, {}, scope)
+    assert identity.instance_type == 'g6.48xlarge'
+    assert identity.gpu_units_per_instance == 8
+
+    pool['accelerators'] = [['L4', 4]]
+    with pytest.raises(qualifier.GuardViolation,
+                       match='retained-request AWS identity'):
+        qualifier.aws_identity_from_retained_request({}, {}, scope)
+    pool['accelerators'] = [['L4', 8]]
+    pool['instance_type'] = 'g6.xlarge'
+    with pytest.raises(qualifier.GuardViolation,
+                       match='retained-request AWS identity'):
+        qualifier.aws_identity_from_retained_request({}, {}, scope)
+
+
+def test_aws_provider_reduction_counts_logical_width_and_allows_retry_history():
+    profile = dataclasses.replace(qualifier.PROFILES['small'], max_units=16)
+    cluster = 'paid-e2e-1-1234567890-tenant'
+    old = _aws_identity(client_token='token-old',
+                        cluster_name=cluster,
+                        instance_type='g6.48xlarge',
+                        width=8,
+                        zone='us-east-2c')
+    new = _aws_identity(client_token='token-new',
+                        cluster_name=cluster,
+                        instance_type='g6.48xlarge',
+                        width=8,
+                        zone='us-east-2c')
+    instance = _aws_instance(client_token='token-new',
+                             cluster_name=cluster,
+                             instance_type='g6.48xlarge',
+                             width=8,
+                             zone='us-east-2c')
+    state = qualifier.parse_aws_state(
+        identities=(old, new),
+        profile=profile,
+        service_instances=(instance,),
+        service_volumes=(_aws_volume(cluster_name=cluster),))
+    assert state.instance_count == 1
+    assert state.running_count == 1
+    assert state.gpu_units == 8
+    assert state.running_gpu_units == 8
+    assert state.cloud('aws').shapes == (qualifier.ProviderShapeState(
+        gpu_units_per_instance=8,
+        instance_count=1,
+        instance_type='g6.48xlarge',
+        running_count=1,
+        running_gpu_units=8),)
+
+    simultaneous_old = _aws_instance(client_token='token-old',
+                                     cluster_name=cluster,
+                                     instance_id='i-old',
+                                     instance_type='g6.48xlarge',
+                                     width=8,
+                                     zone='us-east-2c',
+                                     volume_id='vol-old')
+    with pytest.raises(qualifier.GuardViolation,
+                       match='multiple live provider effects'):
+        qualifier.parse_aws_state(
+            identities=(old, new),
+            profile=profile,
+            service_instances=(simultaneous_old, instance),
+            service_volumes=(_aws_volume(cluster_name=cluster),
+                             _aws_volume(cluster_name=cluster,
+                                         volume_id='vol-old')))
+
+
+def test_aws_observer_scans_both_tags_and_attests_provider_width(monkeypatch):
+    cluster = 'paid-e2e-1-1234567890-tenant'
+    tags = [{
+        'Key': qualifier.provision_constants.TAG_RAY_CLUSTER_NAME,
+        'Value': cluster,
+    }, {
+        'Key': qualifier.provision_constants.TAG_SKYPILOT_CLUSTER_NAME,
+        'Value': cluster,
+    }, {
+        'Key': qualifier.provision_constants.TAG_SKYPILOT_MANAGED,
+        'Value': qualifier.provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+    }]
+    raw_instance = {
+        'BlockDeviceMappings': [{
+            'Ebs': {
+                'DeleteOnTermination': True,
+                'VolumeId': 'vol-new',
+            },
+        }],
+        'ClientToken': 'token-new',
+        'InstanceId': 'i-new',
+        'InstanceLifecycle': 'spot',
+        'InstanceType': 'g6.xlarge',
+        'Placement': {
+            'AvailabilityZone': 'us-east-2a',
+        },
+        'State': {
+            'Name': 'running',
+        },
+        'Tags': tags,
+    }
+    raw_volume = {
+        'VolumeId': 'vol-new',
+        'State': 'in-use',
+        'Tags': tags,
+    }
+    paginator_calls = []
+
+    class Paginator:
+
+        def __init__(self, name):
+            self.name = name
+
+        def paginate(self, *, Filters):  # pylint: disable=invalid-name
+            paginator_calls.append((self.name, Filters))
+            if self.name == 'describe_instances':
+                return ({'Reservations': [{'Instances': [raw_instance]}]},)
+            return ({'Volumes': [raw_volume]},)
+
+    class Ec2:
+
+        type_calls = 0
+
+        @staticmethod
+        def get_paginator(name):
+            return Paginator(name)
+
+        @classmethod
+        def describe_instance_types(cls, *, InstanceTypes):
+            cls.type_calls += 1
+            assert InstanceTypes == ['g6.xlarge']
+            return {
+                'InstanceTypes': [{
+                    'InstanceType': 'g6.xlarge',
+                    'GpuInfo': {
+                        'Gpus': [{
+                            'Name': 'L4',
+                            'Manufacturer': 'NVIDIA',
+                            'Count': 1,
+                        }],
+                    },
+                }],
+            }
+
+    class Sts:
+
+        @staticmethod
+        def get_caller_identity():
+            return {'Account': '123456789012'}
+
+    class Session:
+
+        @staticmethod
+        def client(name, *, region_name):
+            assert region_name == 'us-east-2'
+            return Sts() if name == 'sts' else Ec2()
+
+    monkeypatch.setattr(qualifier.aws_adaptor, 'session',
+                        lambda profile: Session())
+    observer = qualifier.AwsObserver(profile=qualifier.PROFILES['small'],
+                                     service_name='paid-e2e',
+                                     scope=_provider_scope())
+    census = observer.census()
+    state = observer.reduce(census, (_aws_identity(),))
+    assert state.running_gpu_units == 1
+    assert census.service_instances[0]['provider_gpu_units'] == 1
+    assert Ec2.type_calls == 1
+    observer.census()
+    assert Ec2.type_calls == 1
+    instance_tag_queries = [
+        filters[1]['Name']
+        for name, filters in paginator_calls
+        if name == 'describe_instances'
+    ]
+    assert set(instance_tag_queries) == {
+        'tag:ray-cluster-name', 'tag:skypilot-cluster-name'
+    }
+    volume_tag_queries = [
+        filters[0]['Name']
+        for name, filters in paginator_calls
+        if name == 'describe_volumes' and filters[0]['Name'].startswith('tag:')
+    ]
+    assert set(volume_tag_queries) == {
+        'tag:ray-cluster-name', 'tag:skypilot-cluster-name'
+    }
+
+    raw_volume['Tags'] = [tags[0]]
+    with pytest.raises(qualifier.GuardViolation,
+                       match='volume escaped exact scope'):
+        qualifier.AwsObserver(profile=qualifier.PROFILES['small'],
+                              service_name='paid-e2e',
+                              scope=_provider_scope()).census()
+    raw_volume['Tags'] = tags
+
+    original = Ec2.describe_instance_types
+
+    def wrong_width(*, InstanceTypes):
+        response = original(InstanceTypes=InstanceTypes)
+        response['InstanceTypes'][0]['GpuInfo']['Gpus'][0]['Count'] = 4
+        return response
+
+    monkeypatch.setattr(Ec2, 'describe_instance_types',
+                        staticmethod(wrong_width))
+    with pytest.raises(qualifier.GuardViolation,
+                       match='disagrees with frozen catalog'):
+        qualifier.AwsObserver(profile=qualifier.PROFILES['small'],
+                              service_name='paid-e2e',
+                              scope=_provider_scope()).census()
+
+    class WrongSts:
+
+        @staticmethod
+        def get_caller_identity():
+            return {'Account': '999999999999'}
+
+    class WrongSession:
+
+        @staticmethod
+        def client(name, *, region_name):
+            assert region_name == 'us-east-2'
+            return WrongSts() if name == 'sts' else Ec2()
+
+    monkeypatch.setattr(qualifier.aws_adaptor, 'session',
+                        lambda profile: WrongSession())
+    with pytest.raises(qualifier.GuardViolation,
+                       match='resolved to another account'):
+        qualifier.AwsObserver(profile=qualifier.PROFILES['small'],
+                              service_name='paid-e2e',
+                              scope=_provider_scope()).census()
+
+
+def test_aws_cleanup_counts_orphan_instance_and_ebs_without_database():
+    instance = _aws_instance(instance_type='g6.48xlarge',
+                             width=8,
+                             zone='us-east-2c')
+    state = qualifier.parse_aws_cleanup_state(service_instances=(instance,),
+                                              service_volumes=({
+                                                  'cluster_name_on_cloud': None,
+                                                  'region': 'us-east-2',
+                                                  'state': 'available',
+                                                  'volume_id': 'vol-orphan',
+                                              },))
+    assert state.instance_count == 1
+    assert state.gpu_units == 8
+    assert state.disk_count == 1
+    assert state.cloud('aws').shapes[0].gpu_units_per_instance == 8
+
+
+def test_aws_observer_scans_every_frozen_catalog_region(monkeypatch):
+    calls = []
+
+    class Paginator:
+
+        def __init__(self, region, name):
+            self.region = region
+            self.name = name
+
+        def paginate(self, *, Filters):  # pylint: disable=invalid-name
+            calls.append((self.region, self.name, Filters))
+            if self.name == 'describe_instances':
+                return ({'Reservations': []},)
+            return ({'Volumes': []},)
+
+    class Ec2:
+
+        def __init__(self, region):
+            self.region = region
+
+        def get_paginator(self, name):
+            return Paginator(self.region, name)
+
+    class Sts:
+
+        @staticmethod
+        def get_caller_identity():
+            return {'Account': '123456789012'}
+
+    profiles = {
+        'east-profile': 'us-east-2',
+        'west-profile': 'us-west-2',
+    }
+
+    class Session:
+
+        def __init__(self, region):
+            self.region = region
+
+        def client(self, name, *, region_name):
+            assert region_name == self.region
+            return Sts() if name == 'sts' else Ec2(self.region)
+
+    monkeypatch.setattr(qualifier.aws_adaptor, 'session',
+                        lambda profile: Session(profiles[profile]))
+    shapes = (*_provider_scope().catalog_shapes,
+              qualifier.CatalogShape(cloud='aws',
+                                     region='us-west-2',
+                                     zone='us-west-2a',
+                                     instance_type='g6.xlarge',
+                                     gpu_units_per_instance=1))
+    scope = _provider_scope(
+        aws_regions=(qualifier.AwsRegionScope(aws_account_id='123456789012',
+                                              credential_profile='east-profile',
+                                              region='us-east-2'),
+                     qualifier.AwsRegionScope(aws_account_id='123456789012',
+                                              credential_profile='west-profile',
+                                              region='us-west-2')),
+        catalog_shapes=tuple(sorted(shapes, key=qualifier._catalog_shape_key)))
+    observer = qualifier.AwsObserver(profile=qualifier.PROFILES['small'],
+                                     service_name='paid-e2e',
+                                     scope=scope)
+    census = observer.census()
+    assert census.service_instances == ()
+    assert census.service_volumes == ()
+    for region in profiles.values():
+        regional = [call for call in calls if call[0] == region]
+        assert sum(call[1] == 'describe_instances' for call in regional) == 2
+        assert sum(call[1] == 'describe_volumes' for call in regional) == 2
+
+
+def test_aws_cleanup_census_retains_exact_legacy_ebs_identity(monkeypatch):
+
+    class Paginator:
+
+        def __init__(self, name):
+            self.name = name
+
+        def paginate(self, *, Filters):  # pylint: disable=invalid-name
+            if self.name == 'describe_instances':
+                return ({'Reservations': []},)
+            if Filters[0]['Name'] == 'volume-id':
+                assert Filters[0]['Values'] == ['vol-legacy']
+                return ({
+                    'Volumes': [{
+                        'VolumeId': 'vol-legacy',
+                        'State': 'available',
+                        'Tags': [],
+                    }],
+                },)
+            return ({'Volumes': []},)
+
+    class Ec2:
+
+        @staticmethod
+        def get_paginator(name):
+            return Paginator(name)
+
+    class Sts:
+
+        @staticmethod
+        def get_caller_identity():
+            return {'Account': '123456789012'}
+
+    class Session:
+
+        @staticmethod
+        def client(name, *, region_name):
+            assert region_name == 'us-east-2'
+            return Sts() if name == 'sts' else Ec2()
+
+    monkeypatch.setattr(qualifier.aws_adaptor, 'session',
+                        lambda profile: Session())
+    observer = qualifier.AwsObserver(
+        profile=qualifier.PROFILES['small'],
+        service_name='paid-e2e',
+        scope=_provider_scope(),
+        retained_volume_ids_by_region={'us-east-2': ['vol-legacy']})
+    census = observer.census()
+    assert census.service_instances == ()
+    assert census.service_volumes == ({
+        'cluster_name_on_cloud': None,
+        'region': 'us-east-2',
+        'state': 'available',
+        'volume_id': 'vol-legacy',
+    },)
+    assert qualifier.parse_aws_cleanup_state(
+        service_instances=census.service_instances,
+        service_volumes=census.service_volumes).disk_count == 1
+
+
+def test_optional_aws_receipt_never_blocks_tag_scoped_cleanup(tmp_path):
+    missing = tmp_path / 'missing.json'
+    assert qualifier.read_optional_aws_volume_ids_receipt(missing,
+                                                          'paid-e2e') == {}
+    missing.write_text('{partial', encoding='utf-8')
+    assert qualifier.read_optional_aws_volume_ids_receipt(missing,
+                                                          'paid-e2e') == {}
 
 
 def test_provider_guard_rejects_on_demand_wrong_shape_and_overshoot():
@@ -559,11 +1151,10 @@ def test_provider_guard_ignores_preexisting_unrelated_resources():
         disks=[{
             'name': 'unrelated-1-head'
         }])
-    assert state == qualifier.ProviderState(instance_count=0,
-                                            running_count=0,
-                                            disk_count=0,
-                                            inflight_operation_count=0,
-                                            cluster_names=frozenset())
+    assert state.instance_count == 0
+    assert state.gpu_units == 0
+    assert state.cluster_names == frozenset()
+    assert state.cloud('gcp').instance_count == 0
 
 
 def test_provider_guard_rejects_unbound_service_effects():
@@ -965,29 +1556,20 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
                                 profile=qualifier.PROFILES['small'])
     receipt.sample('scale', observation)
 
-    assert receipt._payload['schema_version'] == 2
+    assert receipt._payload['schema_version'] == 3
     assert receipt._payload['request_priority'] == 50
-    assert receipt._payload['samples'] == [{
-        'phase': 'scale',
-        'observed_at': 1000,
-        'controller_pid': 321,
-        'controller_ip': '10.0.0.9',
-        'controller_owner_epoch': 12,
-        'controller_incarnation': 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
-        'paid_debit_units': 0,
-        'claimed_units': 1,
-        'paid_claim_priorities': [50],
-        'waiters': 0,
-        'provider_free_unbound_replicas': 0,
-        'postgres_demand_units': 0,
-        'provider_instances': 0,
-        'provider_running': 0,
-        'provider_disks': 0,
-        'provider_inflight_operations': 0,
-        'lb_demand_units': 0,
-        'lb_ready_replicas': 0,
-    }]
-
+    sample = receipt._payload['samples'][0]
+    assert sample['phase'] == 'scale'
+    assert sample['controller_pid'] == 321
+    assert sample['controller_owner_epoch'] == 12
+    assert sample['claimed_units'] == 1
+    assert sample['paid_claim_priorities'] == [50]
+    assert sample['provider_instances'] == 0
+    assert sample['provider_gpu_units'] == 0
+    assert sample['provider_running_gpu_units'] == 0
+    assert set(sample['provider_by_cloud']) == {'aws', 'gcp'}
+    assert all(
+        cloud['shapes'] == [] for cloud in sample['provider_by_cloud'].values())
     with pytest.raises(qualifier.GuardViolation,
                        match='controller owner fence'):
         qualifier.controller_identity_from_authority({
@@ -1060,15 +1642,10 @@ def test_request_telemetry_uses_observer_postgres_engine(monkeypatch):
     observer = object.__new__(qualifier.PostgresObserver)
     observer._engine = object()
     observer._service_name = 'paid-e2e'
-    observer._provider_scope = qualifier.ProviderScope(
-        service_hash='service-hash',
-        lifecycle_epoch=1,
-        service_version=1,
-        workspace='workspace-a',
-        project_id='project-a',
-        location_scope=qualifier.GcpLocationScope.PROJECT_WIDE,
-        controller_config_digest='a' * 64,
-        controller_config_snapshot_id='b' * 64)
+    observer._provider_scope = _provider_scope(service_hash='service-hash',
+                                               lifecycle_epoch=1,
+                                               service_version=1,
+                                               project_id='project-a')
     seen = {}
 
     def get_request_summary(service_name, service_hash, *, engine):
@@ -1573,8 +2150,8 @@ def test_retained_binding_allows_provider_effect_after_claim_release():
 
     bound = dataclasses.replace(
         unbound,
-        database=dataclasses.replace(
-            unbound.database,
+        database=_database_state(
+            paid_debit_units=1,
             # A successful provider request releases its admission claim.  A
             # retained immutable binding, not a current claim or plan head,
             # remains the proof for the live provider effect.
@@ -1986,20 +2563,50 @@ def test_request_telemetry_requires_exact_positive_and_terminal_delta(tmp_path):
     ] == ['positive', 'final']
 
 
-def test_worker_exposes_health_occupancy_and_stable_identity():
+@pytest.mark.parametrize('gpu_units', (1, 4))
+def test_worker_exposes_exact_multi_gpu_capacity(gpu_units):
     config = yaml.safe_load(
         (_FIXTURE_DIR / 'service.yaml').read_text(encoding='utf-8'))
     with socket.socket() as port_socket:
         port_socket.bind(('127.0.0.1', 0))
         port = port_socket.getsockname()[1]
-    process = subprocess.Popen(['bash', '-c', config['run']],
-                               env={
-                                   **os.environ, 'PORT': str(port)
-                               },
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE,
-                               text=True)
+    process = subprocess.Popen(
+        ['bash', '-c', config['run']],
+        env={
+            **os.environ,
+            'PORT': str(port),
+            'SKYPILOT_NUM_GPUS_PER_NODE': str(gpu_units),
+        },
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True)
     endpoint = f'http://127.0.0.1:{port}'
+
+    def exact_request(index: int, duration: float) -> urllib.request.Request:
+        request_id = f'exact-execution-{index}'
+        body, intent = qualifier._canonical_exact_request(request_id, duration)
+        return urllib.request.Request(
+            f'{endpoint}/v1/models/model:predict',
+            data=body,
+            headers={
+                'Content-Type': 'application/json',
+                'X-SkyServe-Async-Ledger-Protocol': '1',
+                'X-SkyServe-Service-Incarnation': 'incarnation-a',
+                'X-SkyServe-Async-Intent-Sha256': intent,
+                'X-SkyServe-Execution-Request-Id': request_id,
+                'X-SkyServe-Async-Attempt-Id': str(uuid.UUID(int=index + 1)),
+                'X-SkyServe-Async-Attempt-No': '1',
+                'X-SkyServe-Async-Ledger-Revision': '1',
+            },
+            method='POST')
+
+    capacity_request = urllib.request.Request(
+        f'{endpoint}/v1/models/model:predict',
+        data=json.dumps({
+            'action': 'async_capacity'
+        }).encode(),
+        headers={'Content-Type': 'application/json'},
+        method='POST')
     try:
         deadline = time.monotonic() + 5
         while True:
@@ -2015,55 +2622,30 @@ def test_worker_exposes_health_occupancy_and_stable_identity():
                 if time.monotonic() >= deadline:
                     pytest.fail('Inline worker did not become healthy.')
                 time.sleep(0.05)
-        capacity_request = urllib.request.Request(
-            f'{endpoint}/v1/models/model:predict',
-            data=json.dumps({
-                'action': 'async_capacity'
-            }).encode(),
-            headers={'Content-Type': 'application/json'},
-            method='POST')
+
         with urllib.request.urlopen(capacity_request, timeout=2) as response:
             capacity = json.load(response)
         assert capacity['running_count'] == 0
-        assert capacity['predict_concurrency'] == 1
-        work_request = urllib.request.Request(
-            f'{endpoint}/v1/models/model:predict',
-            data=json.dumps({
-                'request_id': 'stable-1',
-                'duration_seconds': 0,
-            }).encode(),
-            headers={'Content-Type': 'application/json'},
-            method='POST')
-        with urllib.request.urlopen(work_request, timeout=2) as response:
-            assert json.load(response) == {
-                'request_id': 'stable-1',
-                'status': 'ok',
-            }
-        exact_body, exact_intent = qualifier._canonical_exact_request(
-            'exact-execution-1', 0.5)
-        exact_request = urllib.request.Request(
-            f'{endpoint}/v1/models/model:predict',
-            data=exact_body,
-            headers={
-                'Content-Type': 'application/json',
-                'X-SkyServe-Async-Ledger-Protocol': '1',
-                'X-SkyServe-Service-Incarnation': 'incarnation-a',
-                'X-SkyServe-Async-Intent-Sha256': exact_intent,
-                'X-SkyServe-Execution-Request-Id': 'exact-execution-1',
-                'X-SkyServe-Async-Attempt-Id': '11111111-1111-4111-8111-111111111111',
-                'X-SkyServe-Async-Attempt-No': '1',
-                'X-SkyServe-Async-Ledger-Revision': '1',
-            },
-            method='POST')
-        with urllib.request.urlopen(exact_request, timeout=2) as response:
-            assert response.status == 202
-            assert json.load(response) == {
-                'request_id': 'exact-execution-1',
-                'status': 'accepted',
-            }
+        assert capacity['predict_concurrency'] == gpu_units
+        assert capacity['max_workers'] == gpu_units
+
+        for index in range(gpu_units):
+            with urllib.request.urlopen(exact_request(index, 0.75),
+                                        timeout=2) as response:
+                assert response.status == 202
+                assert json.load(response) == {
+                    'request_id': f'exact-execution-{index}',
+                    'status': 'accepted',
+                }
         with urllib.request.urlopen(capacity_request, timeout=2) as response:
-            assert json.load(response)['running_count'] == 1
-        time.sleep(0.6)
+            assert json.load(response)['running_count'] == gpu_units
+
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(exact_request(gpu_units, 0.75), timeout=2)
+        assert rejected.value.code == 429
+        assert json.load(rejected.value) == {'error': 'worker capacity full'}
+
+        time.sleep(0.85)
         with urllib.request.urlopen(capacity_request, timeout=2) as response:
             assert json.load(response)['running_count'] == 0
     finally:

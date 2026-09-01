@@ -319,8 +319,9 @@ def _merge_tag_specs(
         user_tag_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Merges user-provided tag specifications without mutating either input.
 
-    User tags override SkyPilot defaults except for the reserved managed
-    marker. Resource types not already emitted by SkyPilot are retained.
+    User tags override SkyPilot defaults except for provider-identity and
+    managed markers. Resource types not already emitted by SkyPilot are
+    retained.
 
     Args:
         tag_specs (List[Dict[str, Any]]): base node provider tag specs
@@ -330,6 +331,11 @@ def _merge_tag_specs(
         A new merged list of tag specifications.
     """
     merged_tag_specs = copy.deepcopy(tag_specs)
+    reserved_tag_keys = {
+        constants.TAG_RAY_CLUSTER_NAME,
+        constants.TAG_SKYPILOT_CLUSTER_NAME,
+        constants.TAG_SKYPILOT_MANAGED,
+    }
     specs_by_resource_type = {
         tag_spec['ResourceType']: tag_spec for tag_spec in merged_tag_specs
     }
@@ -346,7 +352,7 @@ def _merge_tag_specs(
         }
         for user_tag in user_tag_spec['Tags']:
             key = user_tag['Key']
-            if key == constants.TAG_SKYPILOT_MANAGED:
+            if key in reserved_tag_keys:
                 continue
             if key in tags_by_key:
                 tags_by_key[key]['Value'] = user_tag['Value']
@@ -394,9 +400,9 @@ def create_instances(
         create_max_retries = BOTO_CREATE_MAX_RETRIES
     tags = {
         'Name': cluster_name,
+        **tags,
         constants.TAG_RAY_CLUSTER_NAME: cluster_name,
         constants.TAG_SKYPILOT_CLUSTER_NAME: cluster_name,
-        **tags,
         constants.TAG_SKYPILOT_MANAGED: constants.SKYPILOT_MANAGED_TAG_VALUE,
     }
     conf = copy.deepcopy(node_config)
@@ -420,6 +426,12 @@ def create_instances(
     }, {
         'ResourceType': 'volume',
         'Tags': [{
+            'Key': constants.TAG_RAY_CLUSTER_NAME,
+            'Value': cluster_name,
+        }, {
+            'Key': constants.TAG_SKYPILOT_CLUSTER_NAME,
+            'Value': cluster_name,
+        }, {
             'Key': constants.TAG_SKYPILOT_MANAGED,
             'Value': constants.SKYPILOT_MANAGED_TAG_VALUE,
         }],

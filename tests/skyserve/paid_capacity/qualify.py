@@ -20,9 +20,9 @@ The data-plane bearer is read from ``SKYPILOT_SERVE_E2E_AUTH_TOKEN`` when an
 external runner explicitly supplies it.  In an API-server pod, the normal
 projected data-plane token ring is used instead.  ``SKYPILOT_DB_CONNECTION_URI``
 must name the same PostgreSQL database as the API server.  No credential is
-emitted into the receipt.  Provider census uses the Google Compute v1 API with
-application-default credentials; neither this program nor the API-server image
-requires the ``gcloud`` executable.
+emitted into the receipt.  Provider census uses the Google Compute v1 and AWS
+EC2 APIs with the committed service version's credentials; no cloud CLI is
+required in the API-server image.
 """
 
 import argparse
@@ -46,7 +46,9 @@ import sqlalchemy
 import yaml
 
 from sky import skypilot_config
+from sky.adaptors import common as adaptors_common
 from sky.adaptors import gcp as gcp_adaptor
+from sky.provision import constants as provision_constants
 from sky.provision.gcp import instance_utils
 from sky.serve import async_request_ledger
 from sky.serve import auth_tokens
@@ -56,8 +58,11 @@ from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import spot_placer
 from sky.server.requests import non_pool_launch
 from sky.server.requests import postgres as request_postgres
+
+aws_adaptor = adaptors_common.LazyImport('sky.adaptors.aws')
 
 
 class QualificationError(RuntimeError):
@@ -68,7 +73,7 @@ class GuardViolation(QualificationError):
     """An authoritative market, card, cap, or identity guard failed."""
 
 
-_PROVIDER_SCOPE_SCHEMA_VERSION = 2
+_PROVIDER_SCOPE_SCHEMA_VERSION = 3
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -107,9 +112,9 @@ PROFILES = {
                      scale_up_min_replicas=2,
                      scale_up_period_seconds=10),
     'scale': Profile(name='scale',
-                     max_units=240,
+                     max_units=420,
                      minimum_running=100,
-                     pressure_concurrency=256,
+                     pressure_concurrency=512,
                      pressure_duration_seconds=30,
                      warm_requests=10_000,
                      warm_concurrency=256,
@@ -118,8 +123,8 @@ PROFILES = {
                      drain_timeout_seconds=30 * 60,
                      zero_hold_seconds=6 * 60,
                      poll_seconds=10,
-                     scale_up_min_replicas=240,
-                     scale_up_period_seconds=60),
+                     scale_up_min_replicas=420,
+                     scale_up_period_seconds=10),
 }
 
 _AUTH_HEADER = 'X-SkyPilot-Serve-Authorization'
@@ -361,14 +366,69 @@ def request_telemetry_from_summary(
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class ProviderShapeState:
+    """Physical machine and logical GPU counts for one exact shape."""
+
+    gpu_units_per_instance: int
+    instance_count: int
+    instance_type: str
+    running_count: int
+    running_gpu_units: int
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ProviderCloudState:
+    """Exact provider-native counts for one cloud."""
+
+    cloud: str
+    instance_count: int
+    running_count: int
+    gpu_units: int
+    running_gpu_units: int
+    disk_count: int
+    inflight_operation_count: int
+    shapes: tuple[ProviderShapeState, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class ProviderState:
-    """One exact provider-native reduction."""
+    """One exact provider-native reduction, optionally across clouds."""
 
     instance_count: int
     running_count: int
+    gpu_units: int
+    running_gpu_units: int
     disk_count: int
     inflight_operation_count: int
     cluster_names: frozenset[str]
+    clouds: tuple[ProviderCloudState, ...] = ()
+
+    def cloud(self, name: str) -> ProviderCloudState:
+        matches = [state for state in self.clouds if state.cloud == name]
+        if len(matches) != 1:
+            raise QualificationError(
+                f'Provider census has no unique {name} reduction.')
+        return matches[0]
+
+
+def combine_provider_states(*states: ProviderState) -> ProviderState:
+    """Combine disjoint provider reductions without losing provenance."""
+    clouds = tuple(cloud for state in states for cloud in state.clouds)
+    names = [cloud.cloud for cloud in clouds]
+    if len(names) != len(set(names)):
+        raise QualificationError(
+            'Provider reductions contain duplicate clouds.')
+    return ProviderState(
+        instance_count=sum(state.instance_count for state in states),
+        running_count=sum(state.running_count for state in states),
+        gpu_units=sum(state.gpu_units for state in states),
+        running_gpu_units=sum(state.running_gpu_units for state in states),
+        disk_count=sum(state.disk_count for state in states),
+        inflight_operation_count=sum(
+            state.inflight_operation_count for state in states),
+        cluster_names=frozenset().union(
+            *(state.cluster_names for state in states)),
+        clouds=clouds)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -380,29 +440,175 @@ class ProviderCensus:
     operations: object
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AwsProviderCensus:
+    """One frozen-region census of every service-tagged AWS effect."""
+
+    service_instances: object
+    service_volumes: object
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class GcpProviderIdentity:
+    """One GCP allocation recovered from its retained request and pool."""
+
+    cluster_name_on_cloud: str
+    gpu_units_per_instance: int
+    instance_type: str
+    project_id: str
+    region: str
+    workspace: str
+    zone: str
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AwsProviderIdentity:
+    """One AWS allocation recovered from its retained request and pool."""
+
+    aws_account_id: str
+    client_token: str
+    cluster_name_on_cloud: str
+    credential_profile: str | None
+    gpu_units_per_instance: int
+    instance_type: str
+    num_nodes: int
+    region: str
+    use_spot: bool
+    workspace: str
+    zone: str
+
+
 class GcpLocationScope(str, enum.Enum):
     """Provider census boundary persisted by the qualification harness."""
 
     PROJECT_WIDE = 'project-wide'
 
 
+class AwsLocationScope(str, enum.Enum):
+    """AWS census boundary retained by every paid launch request."""
+
+    FROZEN_CATALOG_REGIONS = 'frozen-catalog-regions'
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AwsRegionScope:
+    """One committed-catalog AWS account/credential/region boundary."""
+
+    aws_account_id: str
+    credential_profile: str | None
+    region: str
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class CatalogShape:
+    """One exact whole-L4 launch shape frozen with the service version."""
+
+    cloud: str
+    region: str
+    zone: str
+    instance_type: str
+    gpu_units_per_instance: int
+
+
+def _catalog_shape_key(shape: CatalogShape) -> tuple[str, str, str, str, int]:
+    return (shape.cloud, shape.region, shape.zone or
+            '', shape.instance_type, shape.gpu_units_per_instance)
+
+
+def _scope_has_catalog_shape(scope: 'ProviderScope', *, cloud: str, region: str,
+                             zone: str, instance_type: str, width: int) -> bool:
+    return CatalogShape(cloud=cloud,
+                        region=region,
+                        zone=zone,
+                        instance_type=instance_type,
+                        gpu_units_per_instance=width) in scope.catalog_shapes
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class ProviderScope:
-    """Exact project-wide GCP scope frozen by the committed version."""
+    """Exact cross-cloud provider scope frozen by the committed version."""
 
     service_hash: str
     lifecycle_epoch: int
     service_version: int
-    project_id: str
+    max_live_paid_gpu_units: int
+    providers: tuple[str, ...]
+    project_id: str | None
     workspace: str
-    location_scope: GcpLocationScope
+    location_scope: GcpLocationScope | None
+    aws_location_scope: AwsLocationScope | None
+    aws_regions: tuple[AwsRegionScope, ...]
+    catalog_shapes: tuple[CatalogShape, ...]
+    placement_catalog_sha256: str
+    service_yaml_sha256: str
     controller_config_digest: str
     controller_config_snapshot_id: str
 
 
+def _whole_l4_width(accelerators: object) -> int:
+    """Return one exact positive whole-L4 width."""
+    if not isinstance(accelerators,
+                      collections.abc.Mapping) or len(accelerators) != 1:
+        raise ValueError('accelerator shape is not exact L4')
+    accelerator, width = next(iter(accelerators.items()))
+    if (not isinstance(accelerator, str) or accelerator.casefold() != 'l4' or
+            type(width) is not int or width < 1):
+        raise ValueError('accelerator shape is not exact whole L4')
+    return width
+
+
+def _pool_l4_width(pool_identity: collections.abc.Mapping[str, Any]) -> int:
+    """Return the exact width in a canonical paid-capacity pool key."""
+    accelerators = pool_identity.get('accelerators')
+    if (not isinstance(accelerators, list) or len(accelerators) != 1 or
+            not isinstance(accelerators[0], list) or len(accelerators[0]) != 2):
+        raise ValueError('paid pool has no exact accelerator shape')
+    accelerator, width = accelerators[0]
+    if (not isinstance(accelerator, str) or accelerator.casefold() != 'l4' or
+            type(width) is not int or width < 1):
+        raise ValueError('paid pool has no exact whole-L4 shape')
+    return width
+
+
+def _validate_cross_cloud_service_config(config: object) -> tuple[int, int]:
+    """Require the one generic logical-L4 qualification contract."""
+    if not isinstance(config, dict):
+        raise ValueError('service YAML is not a mapping')
+    service = config.get('service')
+    resources = config.get('resources')
+    if (not isinstance(service, dict) or not isinstance(resources, dict)):
+        raise ValueError('service YAML is incomplete')
+    policy = service.get('replica_policy')
+    load_balancer = service.get('load_balancer')
+    queue = (load_balancer.get('request_queue') if isinstance(
+        load_balancer, dict) else None)
+    max_paid_units = (policy.get('max_live_paid_gpu_units') if isinstance(
+        policy, dict) else None)
+    per_replica_concurrency = (queue.get('max_concurrency_per_replica')
+                               if isinstance(queue, dict) else None)
+    if (service.get('load_balancing_policy') != 'instance_aware_least_load' or
+            not isinstance(policy, dict) or
+            policy.get('spot_placer') != 'dynamic_fallback_per_gpu' or
+            type(max_paid_units) is not int or max_paid_units < 1 or
+            not isinstance(queue, dict) or
+            type(per_replica_concurrency) is not int or
+            per_replica_concurrency < 1 or
+            type(queue.get('max_concurrency')) is not int or
+            queue['max_concurrency'] < 1 or
+            resources.get('accelerators') != 'L4:1' or
+            resources.get('use_spot') is not True or
+            resources.get('any_of') != [{
+                'infra': 'aws'
+            }, {
+                'infra': 'gcp'
+            }] or 'infra' in resources or 'instance_type' in resources):
+        raise ValueError('service YAML is not generic cross-cloud L4')
+    return max_paid_units, per_replica_concurrency
+
+
 def provider_scope_from_controller_config(
         authority: collections.abc.Mapping[str, Any]) -> ProviderScope:
-    """Resolve GCP scope from immutable version state, never ambient config."""
+    """Resolve provider scope from immutable version state, never ambient config."""
     config_bytes = authority.get('controller_config')
     if isinstance(config_bytes, memoryview):
         config_bytes = config_bytes.tobytes()
@@ -426,28 +632,132 @@ def provider_scope_from_controller_config(
     service_hash = authority.get('service_hash')
     lifecycle_epoch = authority.get('service_lifecycle_epoch')
     service_version = authority.get('current_version')
+    placement_catalog = authority.get('placement_catalog')
+    yaml_content = authority.get('yaml_content')
     if (not isinstance(config_snapshot, collections.abc.Mapping) or
             not isinstance(service_hash, str) or not service_hash or
             type(lifecycle_epoch) is not int or lifecycle_epoch < 1 or
-            type(service_version) is not int or service_version < 1):
+            type(service_version) is not int or service_version < 1 or
+            not isinstance(placement_catalog, dict) or
+            not isinstance(yaml_content, str)):
         raise GuardViolation(
             'Current service version has no exact workspace authority.')
-    project_id = (
-        skypilot_config.get_effective_workspace_region_config_from_snapshot(
-            config_snapshot,
-            'gcp', ('project_id',),
-            region=None,
-            workspace=workspace))
-    if (not isinstance(project_id, str) or
-            re.fullmatch(r'[a-z][a-z0-9-]{4,28}[a-z0-9]', project_id) is None):
+    try:
+        (max_live_paid_gpu_units,
+         max_concurrency_per_replica) = _validate_cross_cloud_service_config(
+             yaml.safe_load(yaml_content))
+    except (TypeError, ValueError, yaml.YAMLError) as error:
         raise GuardViolation(
-            'Current service version has no exact GCP project authority.')
+            'Current service version is not generic cross-cloud L4.') \
+            from error
+    try:
+        catalog = spot_placer.PlacementCatalog.from_dict(placement_catalog)
+    except (KeyError, TypeError, ValueError) as error:
+        raise GuardViolation(
+            'Current service version has no exact placement catalog.'
+        ) from error
+    providers = tuple(
+        sorted({
+            str(location.cloud).casefold() for location, _ in catalog.entries
+        }))
+    try:
+        catalog_is_exact = bool(
+            providers == ('aws', 'gcp') and catalog.num_nodes == 1 and
+            all(location.use_spot is True and isinstance(location.region, str)
+                and bool(location.region) and isinstance(location.zone, str) and
+                bool(location.zone) and isinstance(location.instance_type, str)
+                and bool(location.instance_type) and
+                _whole_l4_width(location.accelerators) >= 1
+                for location, _ in catalog.entries))
+    except ValueError:
+        catalog_is_exact = False
+    if not catalog_is_exact:
+        raise GuardViolation(
+            'Current service version has no exact whole-L4 Spot catalog.')
+    if max_concurrency_per_replica < max(
+            _whole_l4_width(location.accelerators)
+            for location, _ in catalog.entries):
+        raise GuardViolation(
+            'Current service queue clips a catalog L4 machine width.')
+    catalog_shapes = tuple(
+        sorted(
+            {
+                CatalogShape(cloud=str(location.cloud).casefold(),
+                             region=location.region,
+                             zone=location.zone,
+                             instance_type=str(location.instance_type),
+                             gpu_units_per_instance=_whole_l4_width(
+                                 location.accelerators))
+                for location, _ in catalog.entries
+            },
+            key=_catalog_shape_key))
+    project_id: str | None = None
+    gcp_location_scope: GcpLocationScope | None = None
+    if 'gcp' in providers:
+        project_id = (
+            skypilot_config.get_effective_workspace_region_config_from_snapshot(
+                config_snapshot,
+                'gcp', ('project_id',),
+                region=None,
+                workspace=workspace))
+        if (not isinstance(project_id, str) or re.fullmatch(
+                r'[a-z][a-z0-9-]{4,28}[a-z0-9]', project_id) is None):
+            raise GuardViolation(
+                'Current service version has no exact GCP project authority.')
+        gcp_location_scope = GcpLocationScope.PROJECT_WIDE
+    aws_location_scope = (AwsLocationScope.FROZEN_CATALOG_REGIONS
+                          if 'aws' in providers else None)
+    aws_regions: list[AwsRegionScope] = []
+    try:
+        for region in sorted({
+                location.region
+                for location, _ in catalog.entries
+                if str(location.cloud).casefold() == 'aws'
+        }):
+            credential_profile = (
+                skypilot_config.
+                get_effective_workspace_region_config_from_snapshot(
+                    config_snapshot,
+                    'aws', ('profile',),
+                    region=region,
+                    workspace=workspace))
+            if (credential_profile is not None and
+                (not isinstance(credential_profile, str) or
+                 not credential_profile)):
+                raise ValueError('invalid AWS credential profile')
+            session = aws_adaptor.session(profile=credential_profile)
+            caller = session.client('sts',
+                                    region_name=region).get_caller_identity()
+            account_id = caller.get('Account')
+            if (not isinstance(account_id, str) or
+                    re.fullmatch(r'[0-9]{12}', account_id) is None):
+                raise ValueError('invalid AWS account identity')
+            aws_regions.append(
+                AwsRegionScope(aws_account_id=account_id,
+                               credential_profile=credential_profile,
+                               region=region))
+    except Exception as error:  # pylint: disable=broad-except
+        raise GuardViolation(
+            'Current service version has no exact AWS catalog authority.') \
+            from error
+    if not aws_regions:
+        raise GuardViolation(
+            'Current service version has no AWS catalog regions.')
     return ProviderScope(service_hash=service_hash,
                          lifecycle_epoch=lifecycle_epoch,
                          service_version=service_version,
+                         max_live_paid_gpu_units=max_live_paid_gpu_units,
+                         providers=providers,
                          project_id=project_id,
                          workspace=workspace,
-                         location_scope=GcpLocationScope.PROJECT_WIDE,
+                         location_scope=gcp_location_scope,
+                         aws_location_scope=aws_location_scope,
+                         aws_regions=tuple(aws_regions),
+                         catalog_shapes=catalog_shapes,
+                         placement_catalog_sha256=hashlib.sha256(
+                             rfc8785.dumps(placement_catalog)).hexdigest(),
+                         service_yaml_sha256=hashlib.sha256(
+                             yaml_content.encode('utf-8')).hexdigest(),
                          controller_config_digest=digest,
                          controller_config_snapshot_id=snapshot_id)
 
@@ -458,7 +768,7 @@ def write_provider_scope(path: pathlib.Path, service_name: str,
     payload = {
         'schema_version': _PROVIDER_SCOPE_SCHEMA_VERSION,
         'service_name': service_name,
-        'provider': 'gcp',
+        'provider': 'serve-paid-spot',
         **dataclasses.asdict(scope),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -478,12 +788,22 @@ def read_provider_scope(path: pathlib.Path, service_name: str) -> ProviderScope:
     if (not isinstance(payload, dict) or
             payload.get('schema_version') != _PROVIDER_SCOPE_SCHEMA_VERSION or
             payload.get('service_name') != service_name or
-            payload.get('provider') != 'gcp' or set(payload)
+            payload.get('provider') != 'serve-paid-spot' or set(payload)
             != field_names | {'schema_version', 'service_name', 'provider'}):
         raise QualificationError('Provider-scope receipt is malformed.')
     try:
         values = {field: payload[field] for field in field_names}
-        values['location_scope'] = GcpLocationScope(values['location_scope'])
+        values['providers'] = tuple(values['providers'])
+        values['aws_regions'] = tuple(
+            AwsRegionScope(**region) for region in values['aws_regions'])
+        values['catalog_shapes'] = tuple(
+            CatalogShape(**shape) for shape in values['catalog_shapes'])
+        if values['location_scope'] is not None:
+            values['location_scope'] = GcpLocationScope(
+                values['location_scope'])
+        if values['aws_location_scope'] is not None:
+            values['aws_location_scope'] = AwsLocationScope(
+                values['aws_location_scope'])
         scope = ProviderScope(**values)
     except (TypeError, ValueError) as error:
         raise QualificationError('Provider-scope receipt is malformed.') \
@@ -493,10 +813,45 @@ def read_provider_scope(path: pathlib.Path, service_name: str) -> ProviderScope:
             scope.lifecycle_epoch < 1 or
             type(scope.service_version) is not int or
             scope.service_version < 1 or
-            not isinstance(scope.project_id, str) or re.fullmatch(
-                r'[a-z][a-z0-9-]{4,28}[a-z0-9]', scope.project_id) is None or
+            type(scope.max_live_paid_gpu_units) is not int or
+            scope.max_live_paid_gpu_units < 1 or
+            scope.providers != ('aws', 'gcp') or
+        (('gcp' in scope.providers)
+         != (isinstance(scope.project_id, str) and re.fullmatch(
+             r'[a-z][a-z0-9-]{4,28}[a-z0-9]', scope.project_id) is not None)) or
             not isinstance(scope.workspace, str) or not scope.workspace or
-            scope.location_scope is not GcpLocationScope.PROJECT_WIDE or
+        (('gcp' in scope.providers) != (scope.location_scope
+                                        is GcpLocationScope.PROJECT_WIDE)) or
+        (('aws' in scope.providers)
+         != (scope.aws_location_scope
+             is AwsLocationScope.FROZEN_CATALOG_REGIONS)) or
+            not scope.aws_regions or
+            tuple(sorted(scope.aws_regions, key=lambda region: region.region))
+            != scope.aws_regions or
+            len({region.region for region in scope.aws_regions}) != len(
+                scope.aws_regions) or
+            any(not isinstance(region.region, str) or not region.region or
+                (region.credential_profile is not None and
+                 (not isinstance(region.credential_profile, str) or
+                  not region.credential_profile)) or
+                re.fullmatch(r'[0-9]{12}', region.aws_account_id) is None
+                for region in scope.aws_regions) or not scope.catalog_shapes or
+            tuple(sorted(scope.catalog_shapes,
+                         key=_catalog_shape_key)) != scope.catalog_shapes or
+            len(set(scope.catalog_shapes)) != len(scope.catalog_shapes) or
+            any(shape.cloud not in scope.providers or
+                not isinstance(shape.region, str) or not shape.region or
+                not isinstance(shape.zone, str) or not shape.zone or
+                not isinstance(shape.instance_type, str) or
+                not shape.instance_type or type(shape.gpu_units_per_instance)
+                is not int or shape.gpu_units_per_instance < 1
+                for shape in scope.catalog_shapes) or
+        {shape.cloud for shape in scope.catalog_shapes} != set(
+            scope.providers) or
+            not isinstance(scope.placement_catalog_sha256, str) or re.fullmatch(
+                r'[0-9a-f]{64}', scope.placement_catalog_sha256) is None or
+            not isinstance(scope.service_yaml_sha256, str) or
+            re.fullmatch(r'[0-9a-f]{64}', scope.service_yaml_sha256) is None or
             not isinstance(scope.controller_config_digest, str) or re.fullmatch(
                 r'[0-9a-f]{64}', scope.controller_config_digest) is None or
             not isinstance(scope.controller_config_snapshot_id, str) or
@@ -582,25 +937,65 @@ def _unique_scoped_resources(
     return result
 
 
-def parse_gcp_state(*,
-                    service_name: str,
-                    expected_cluster_zones: collections.abc.Mapping[str, str],
-                    profile: Profile,
-                    instances: object,
-                    disks: object,
-                    operations: object = ()) -> ProviderState:
+def _gcp_instance_l4_width(instance: collections.abc.Mapping[str, Any]) -> int:
+    """Read and validate one exact whole-L4 provider shape."""
+    accelerators = instance.get('guestAccelerators')
+    if (not isinstance(accelerators, list) or len(accelerators) != 1 or
+            not isinstance(accelerators[0], dict) or
+            _basename(accelerators[0].get('acceleratorType')).casefold()
+            != 'nvidia-l4'):
+        raise GuardViolation(
+            f'GCP instance {instance.get("name")!r} is not exact L4.')
+    width = accelerators[0].get('acceleratorCount')
+    if type(width) is not int or width < 1:
+        raise GuardViolation(
+            f'GCP instance {instance.get("name")!r} has invalid L4 width.')
+    return width
+
+
+def parse_gcp_state(
+    *,
+    service_name: str,
+    profile: Profile,
+    instances: object,
+    disks: object,
+    operations: object = (),
+    expected_identities: collections.abc.Mapping[str, GcpProviderIdentity] |
+    None = None,
+    expected_cluster_zones: collections.abc.Mapping[str, str] | None = None
+) -> ProviderState:
     """Validate and reduce one provider-native GCP census."""
     if (not isinstance(instances, list) or not isinstance(disks, list) or
             not isinstance(operations, (list, tuple))):
         raise QualificationError('GCP provider census is not a resource list.')
     if not service_name:
         raise QualificationError('Provider census requires a service scope.')
-    if (not isinstance(expected_cluster_zones, collections.abc.Mapping) or
-            any(not isinstance(cluster_name, str) or not cluster_name or
-                _gcp_region_from_zone(zone) is None
-                for cluster_name, zone in expected_cluster_zones.items())):
-        raise GuardViolation('Durable launch binding has an invalid GCP zone.')
-    expected_cluster_names = frozenset(expected_cluster_zones)
+    if expected_identities is None:
+        if expected_cluster_zones is None:
+            raise GuardViolation('Durable launch binding has no GCP identity.')
+        expected_identities = {
+            cluster_name: GcpProviderIdentity(
+                cluster_name_on_cloud=cluster_name,
+                gpu_units_per_instance=1,
+                instance_type='g2-standard-4',
+                project_id='unit-test-project',
+                region=_gcp_region_from_zone(zone) or '',
+                workspace='unit-test',
+                zone=zone)
+            for cluster_name, zone in expected_cluster_zones.items()
+        }
+    elif expected_cluster_zones is not None:
+        raise GuardViolation('GCP provider identity scope is ambiguous.')
+    if (not isinstance(expected_identities, collections.abc.Mapping) or any(
+            not isinstance(cluster_name, str) or not cluster_name or
+            not isinstance(identity, GcpProviderIdentity) or
+            identity.cluster_name_on_cloud != cluster_name or
+            _gcp_region_from_zone(identity.zone) != identity.region or
+            not identity.instance_type or identity.gpu_units_per_instance < 1
+            for cluster_name, identity in expected_identities.items())):
+        raise GuardViolation(
+            'Durable launch binding has an invalid GCP identity.')
+    expected_cluster_names = frozenset(expected_identities)
     patterns = {
         name: _managed_compute_resource_pattern(name)
         for name in expected_cluster_names
@@ -660,22 +1055,21 @@ def parse_gcp_state(*,
                 str(scheduling.get('provisioningModel', '')).upper() != 'SPOT'):
             raise GuardViolation(
                 f'GCP instance {instance.get("name")!r} is not Spot.')
-        if _basename(instance.get('machineType')) != 'g2-standard-4':
+        expected_identity = expected_identities[cluster_name]
+        if (_basename(instance.get('machineType'))
+                != expected_identity.instance_type):
             raise GuardViolation(
                 f'GCP instance {instance.get("name")!r} has the wrong shape.')
         instance_zone = _basename(instance.get('zone'))
-        if instance_zone != expected_cluster_zones[cluster_name]:
+        if instance_zone != expected_identity.zone:
             raise GuardViolation(
                 f'GCP instance {instance.get("name")!r} is in the wrong '
                 'binding zone.')
-        accelerators = instance.get('guestAccelerators')
-        if (not isinstance(accelerators, list) or len(accelerators) != 1 or
-                not isinstance(accelerators[0], dict) or
-                accelerators[0].get('acceleratorCount') != 1 or
-                _basename(accelerators[0].get('acceleratorType')).casefold()
-                != 'nvidia-l4'):
+        if (_gcp_instance_l4_width(instance)
+                != expected_identity.gpu_units_per_instance):
             raise GuardViolation(
-                f'GCP instance {instance.get("name")!r} is not one L4.')
+                f'GCP instance {instance.get("name")!r} has the wrong L4 '
+                'width.')
     disk_identity_by_cluster: dict[str, tuple[str, str]] = {}
     for disk in owned_disks:
         cluster_name = bound_cluster_for_generated_name(disk.get('name'))
@@ -694,7 +1088,8 @@ def parse_gcp_state(*,
             raise GuardViolation(
                 'A one-node paid binding has multiple GCP disk effects.')
         disk_identity_by_cluster[cluster_name] = identity
-        if _basename(disk.get('zone')) != expected_cluster_zones[cluster_name]:
+        if (_basename(disk.get('zone'))
+                != expected_identities[cluster_name].zone):
             raise GuardViolation(
                 f'GCP disk {disk.get("name")!r} is in the wrong binding zone.')
     for cluster_name in instance_identity_by_cluster.keys(
@@ -715,7 +1110,7 @@ def parse_gcp_state(*,
         if previous_target != target:
             raise GuardViolation(
                 'A one-node paid binding has multiple GCP create operations.')
-        if operation_zone != expected_cluster_zones[cluster_name]:
+        if operation_zone != expected_identities[cluster_name].zone:
             raise GuardViolation(
                 'GCP create operation is outside its binding zone.')
         operation_identity = (operation_zone, target)
@@ -726,17 +1121,52 @@ def parse_gcp_state(*,
                     existing_identity != operation_identity):
                 raise GuardViolation(
                     'A paid binding has contradictory GCP create identities.')
-    if len(owned_instances) > profile.max_units:
-        raise GuardViolation('Provider instance count exceeded the armed cap.')
-    return ProviderState(
+    gpu_units = sum(
+        _gcp_instance_l4_width(instance) for instance in owned_instances)
+    running_gpu_units = sum(
+        _gcp_instance_l4_width(instance)
+        for instance in owned_instances
+        if str(instance.get('status', '')).upper() == 'RUNNING')
+    if gpu_units > profile.max_units:
+        raise GuardViolation('Provider GPU units exceeded the armed cap.')
+    shape_counts: dict[tuple[str, int], list[int]] = {}
+    for instance in owned_instances:
+        cluster_name = bound_cluster_for_generated_name(instance.get('name'))
+        assert cluster_name is not None
+        shape_identity = expected_identities[cluster_name]
+        counts = shape_counts.setdefault(
+            (shape_identity.instance_type,
+             shape_identity.gpu_units_per_instance), [0, 0])
+        counts[0] += 1
+        if str(instance.get('status', '')).upper() == 'RUNNING':
+            counts[1] += 1
+    shapes = tuple(
+        ProviderShapeState(instance_type=instance_type,
+                           gpu_units_per_instance=width,
+                           instance_count=counts[0],
+                           running_count=counts[1],
+                           running_gpu_units=counts[1] * width)
+        for (instance_type, width), counts in sorted(shape_counts.items()))
+    cloud_state = ProviderCloudState(
+        cloud='gcp',
         instance_count=len(owned_instances),
         running_count=sum(
             str(item.get('status', '')).upper() == 'RUNNING'
             for item in owned_instances),
+        gpu_units=gpu_units,
+        running_gpu_units=running_gpu_units,
         disk_count=len(owned_disks),
         inflight_operation_count=len(owned_inflight_operation_targets),
+        shapes=shapes)
+    return ProviderState(
+        instance_count=cloud_state.instance_count,
+        running_count=cloud_state.running_count,
+        gpu_units=cloud_state.gpu_units,
+        running_gpu_units=cloud_state.running_gpu_units,
+        disk_count=cloud_state.disk_count,
+        inflight_operation_count=(cloud_state.inflight_operation_count),
         cluster_names=frozenset(cluster_names),
-    )
+        clouds=(cloud_state,))
 
 
 def parse_gcp_cleanup_state(*, service_name: str, instances: object,
@@ -763,15 +1193,49 @@ def parse_gcp_cleanup_state(*, service_name: str, instances: object,
     cluster_names = frozenset(
         cluster_name for item in owned_instances
         if (cluster_name := _cluster_label(item)) is not None)
-    return ProviderState(
+    gpu_units = sum(
+        _gcp_instance_l4_width(instance) for instance in owned_instances)
+    running_gpu_units = sum(
+        _gcp_instance_l4_width(instance)
+        for instance in owned_instances
+        if str(instance.get('status', '')).upper() == 'RUNNING')
+    shape_counts: dict[tuple[str, int], list[int]] = {}
+    for instance in owned_instances:
+        shape = (_basename(instance.get('machineType')),
+                 _gcp_instance_l4_width(instance))
+        if not shape[0]:
+            raise GuardViolation('GCP cleanup instance has no exact shape.')
+        counts = shape_counts.setdefault(shape, [0, 0])
+        counts[0] += 1
+        if str(instance.get('status', '')).upper() == 'RUNNING':
+            counts[1] += 1
+    shapes = tuple(
+        ProviderShapeState(instance_type=instance_type,
+                           gpu_units_per_instance=width,
+                           instance_count=counts[0],
+                           running_count=counts[1],
+                           running_gpu_units=counts[1] * width)
+        for (instance_type, width), counts in sorted(shape_counts.items()))
+    cloud_state = ProviderCloudState(
+        cloud='gcp',
         instance_count=len(owned_instances),
         running_count=sum(
             str(item.get('status', '')).upper() == 'RUNNING'
             for item in owned_instances),
+        gpu_units=gpu_units,
+        running_gpu_units=running_gpu_units,
         disk_count=len(owned_disks),
         inflight_operation_count=len(operation_targets),
+        shapes=shapes)
+    return ProviderState(
+        instance_count=cloud_state.instance_count,
+        running_count=cloud_state.running_count,
+        gpu_units=cloud_state.gpu_units,
+        running_gpu_units=cloud_state.running_gpu_units,
+        disk_count=cloud_state.disk_count,
+        inflight_operation_count=(cloud_state.inflight_operation_count),
         cluster_names=cluster_names,
-    )
+        clouds=(cloud_state,))
 
 
 class GcpObserver:
@@ -786,6 +1250,9 @@ class GcpObserver:
         self._service_name = service_name
         self._scope = scope
         self._profile = profile
+        if ('gcp' not in scope.providers or
+                not isinstance(scope.project_id, str)):
+            raise QualificationError('Provider scope does not include GCP.')
         try:
             self._compute = (gcp_adaptor.build(
                 'compute', 'v1', credentials=None, cache_discovery=False)
@@ -862,14 +1329,567 @@ class GcpObserver:
 
     def reduce(
         self, census: ProviderCensus,
-        expected_cluster_zones: collections.abc.Mapping[str,
-                                                        str]) -> ProviderState:
+        expected_identities: collections.abc.Mapping[str, GcpProviderIdentity]
+    ) -> ProviderState:
         return parse_gcp_state(service_name=self._service_name,
-                               expected_cluster_zones=expected_cluster_zones,
+                               expected_identities=expected_identities,
                                profile=self._profile,
                                instances=census.instances,
                                disks=census.disks,
                                operations=census.operations)
+
+
+def empty_provider_state(cloud: str) -> ProviderState:
+    cloud_state = ProviderCloudState(cloud=cloud,
+                                     instance_count=0,
+                                     running_count=0,
+                                     gpu_units=0,
+                                     running_gpu_units=0,
+                                     disk_count=0,
+                                     inflight_operation_count=0)
+    return ProviderState(instance_count=0,
+                         running_count=0,
+                         gpu_units=0,
+                         running_gpu_units=0,
+                         disk_count=0,
+                         inflight_operation_count=0,
+                         cluster_names=frozenset(),
+                         clouds=(cloud_state,))
+
+
+def _aws_shape_states(
+    instances: collections.abc.Sequence[collections.abc.Mapping[str, Any]],
+) -> tuple[ProviderShapeState, ...]:
+    shape_counts: dict[tuple[str, int], list[int]] = {}
+    for instance in instances:
+        instance_type = instance.get('instance_type')
+        width = instance.get('provider_gpu_units')
+        state = instance.get('state')
+        if (not isinstance(instance_type, str) or not instance_type or
+                type(width) is not int or width < 1 or
+                not isinstance(state, str) or not state):
+            raise GuardViolation('AWS service instance has no exact L4 shape.')
+        counts = shape_counts.setdefault((instance_type, width), [0, 0])
+        counts[0] += 1
+        if state == 'running':
+            counts[1] += 1
+    return tuple(
+        ProviderShapeState(instance_type=instance_type,
+                           gpu_units_per_instance=width,
+                           instance_count=counts[0],
+                           running_count=counts[1],
+                           running_gpu_units=counts[1] * width)
+        for (instance_type, width), counts in sorted(shape_counts.items()))
+
+
+def _canonical_aws_resources(
+    *, instances: object, volumes: object
+) -> tuple[tuple[collections.abc.Mapping[str, Any], ...], tuple[
+        collections.abc.Mapping[str, Any], ...]]:
+    if not isinstance(instances, tuple) or not isinstance(volumes, tuple):
+        raise QualificationError('AWS service census is not canonical.')
+    if not all(
+            isinstance(item, collections.abc.Mapping)
+            for item in (*instances, *volumes)):
+        raise QualificationError('AWS service census is not canonical.')
+    return instances, volumes
+
+
+def parse_aws_state(*,
+                    identities: collections.abc.Sequence[AwsProviderIdentity],
+                    profile: Profile, service_instances: object,
+                    service_volumes: object) -> ProviderState:
+    """Correlate every service-scoped AWS effect with durable launch state."""
+    instances, volumes = _canonical_aws_resources(instances=service_instances,
+                                                  volumes=service_volumes)
+    identity_by_token = {
+        identity.client_token: identity for identity in identities
+    }
+    if len(identity_by_token) != len(identities):
+        raise GuardViolation('AWS paid bindings reuse one ClientToken.')
+    allowed_regions_by_cluster: dict[str,
+                                     set[str]] = collections.defaultdict(set)
+    for binding_identity in identities:
+        allowed_regions_by_cluster[binding_identity.cluster_name_on_cloud].add(
+            binding_identity.region)
+
+    allocation_counts: dict[str, int] = collections.defaultdict(int)
+    seen_instance_ids: set[str] = set()
+    attached_volume_ids: set[str] = set()
+    live_clusters: list[str] = []
+    for instance in instances:
+        token = instance.get('client_token')
+        observed_identity = (identity_by_token.get(token) if isinstance(
+            token, str) else None)
+        instance_id = instance.get('instance_id')
+        state = instance.get('state')
+        raw_volume_ids = instance.get('volume_ids')
+        if (observed_identity is None or not isinstance(instance_id, str) or
+                not instance_id or instance_id in seen_instance_ids or
+                instance.get('cluster_name_on_cloud')
+                != observed_identity.cluster_name_on_cloud or
+                instance.get('availability_zone') != observed_identity.zone or
+                instance.get('region') != observed_identity.region or
+                instance.get('instance_type') != observed_identity.instance_type
+                or instance.get('provider_gpu_units')
+                != observed_identity.gpu_units_per_instance or
+                instance.get('market') != 'spot' or state not in {
+                    'pending', 'running', 'shutting-down', 'stopping', 'stopped'
+                } or not isinstance(raw_volume_ids, tuple) or
+                not raw_volume_ids or
+                any(not isinstance(volume_id, str) or not volume_id
+                    for volume_id in raw_volume_ids)):
+            raise GuardViolation(
+                'AWS service effect escaped its retained launch binding.')
+        if len(raw_volume_ids) != len(set(raw_volume_ids)):
+            raise GuardViolation(
+                'AWS service instance repeats one EBS volume identity.')
+        overlap = attached_volume_ids.intersection(raw_volume_ids)
+        if overlap:
+            raise GuardViolation('AWS service instances share an EBS volume.')
+        attached_volume_ids.update(raw_volume_ids)
+        seen_instance_ids.add(instance_id)
+        allocation_counts[observed_identity.client_token] += 1
+        if (allocation_counts[observed_identity.client_token]
+                > observed_identity.num_nodes):
+            raise GuardViolation(
+                'AWS provider allocation exceeded its retained node count.')
+        live_clusters.append(observed_identity.cluster_name_on_cloud)
+
+    existing_volume_ids: set[str] = set()
+    volume_clusters: set[str] = set()
+    for volume in volumes:
+        volume_id = volume.get('volume_id')
+        state = volume.get('state')
+        region = volume.get('region')
+        cluster_name = volume.get('cluster_name_on_cloud')
+        if (not isinstance(volume_id, str) or not volume_id or
+                volume_id in existing_volume_ids or
+                not isinstance(state, str) or not state or
+                not isinstance(region, str) or not region or
+                not isinstance(cluster_name, str) or not cluster_name):
+            raise GuardViolation('AWS service EBS census is not canonical.')
+        if region not in allowed_regions_by_cluster.get(cluster_name, set()):
+            raise GuardViolation(
+                'AWS service EBS effect has no retained launch binding.')
+        existing_volume_ids.add(volume_id)
+        volume_clusters.add(cluster_name)
+    if not attached_volume_ids.issubset(existing_volume_ids):
+        raise QualificationError(
+            'AWS attached EBS volume is not yet visible in the service census.')
+
+    if len(live_clusters) != len(set(live_clusters)):
+        raise GuardViolation(
+            'AWS retry history contains multiple live provider effects.')
+    gpu_units = sum(
+        int(instance['provider_gpu_units']) for instance in instances)
+    running_gpu_units = sum(
+        int(instance['provider_gpu_units'])
+        for instance in instances
+        if instance['state'] == 'running')
+    if gpu_units > profile.max_units:
+        raise GuardViolation('Provider GPU units exceeded the armed cap.')
+    shapes = _aws_shape_states(instances)
+    cloud_state = ProviderCloudState(
+        cloud='aws',
+        instance_count=len(instances),
+        running_count=sum(
+            instance['state'] == 'running' for instance in instances),
+        gpu_units=gpu_units,
+        running_gpu_units=running_gpu_units,
+        disk_count=len(existing_volume_ids),
+        inflight_operation_count=0,
+        shapes=shapes)
+    return ProviderState(instance_count=cloud_state.instance_count,
+                         running_count=cloud_state.running_count,
+                         gpu_units=cloud_state.gpu_units,
+                         running_gpu_units=cloud_state.running_gpu_units,
+                         disk_count=cloud_state.disk_count,
+                         inflight_operation_count=0,
+                         cluster_names=frozenset(live_clusters) |
+                         frozenset(volume_clusters),
+                         clouds=(cloud_state,))
+
+
+def parse_aws_cleanup_state(*, service_instances: object,
+                            service_volumes: object) -> ProviderState:
+    """Count AWS effects from frozen regions after database state is gone."""
+    instances, volumes = _canonical_aws_resources(instances=service_instances,
+                                                  volumes=service_volumes)
+    instance_ids: set[str] = set()
+    cluster_names: set[str] = set()
+    for instance in instances:
+        instance_id = instance.get('instance_id')
+        cluster_name = instance.get('cluster_name_on_cloud')
+        if (not isinstance(instance_id, str) or not instance_id or
+                instance_id in instance_ids or
+                not isinstance(cluster_name, str) or not cluster_name):
+            raise GuardViolation(
+                'AWS cleanup instance census is not canonical.')
+        instance_ids.add(instance_id)
+        cluster_names.add(cluster_name)
+    volume_ids: set[str] = set()
+    for volume in volumes:
+        volume_id = volume.get('volume_id')
+        cluster_name = volume.get('cluster_name_on_cloud')
+        if (not isinstance(volume_id, str) or not volume_id or
+                volume_id in volume_ids or
+            (cluster_name is not None and
+             (not isinstance(cluster_name, str) or not cluster_name))):
+            raise GuardViolation('AWS cleanup EBS census is not canonical.')
+        volume_ids.add(volume_id)
+        if isinstance(cluster_name, str):
+            cluster_names.add(cluster_name)
+    shapes = _aws_shape_states(instances)
+    gpu_units = sum(
+        int(instance['provider_gpu_units']) for instance in instances)
+    running_gpu_units = sum(
+        int(instance['provider_gpu_units'])
+        for instance in instances
+        if instance['state'] == 'running')
+    cloud_state = ProviderCloudState(
+        cloud='aws',
+        instance_count=len(instances),
+        running_count=sum(
+            instance['state'] == 'running' for instance in instances),
+        gpu_units=gpu_units,
+        running_gpu_units=running_gpu_units,
+        disk_count=len(volumes),
+        inflight_operation_count=0,
+        shapes=shapes)
+    return ProviderState(instance_count=cloud_state.instance_count,
+                         running_count=cloud_state.running_count,
+                         gpu_units=cloud_state.gpu_units,
+                         running_gpu_units=cloud_state.running_gpu_units,
+                         disk_count=cloud_state.disk_count,
+                         inflight_operation_count=0,
+                         cluster_names=frozenset(cluster_names),
+                         clouds=(cloud_state,))
+
+
+class AwsObserver:
+    """Census every service-tagged effect in every frozen AWS region."""
+
+    def __init__(
+        self,
+        *,
+        profile: Profile,
+        service_name: str,
+        scope: ProviderScope,
+        retained_volume_ids_by_region: collections.abc.Mapping[
+            str, collections.abc.Sequence[str]] | None = None,
+    ) -> None:
+        self._profile = profile
+        self._service_name = service_name
+        self._scope = scope
+        configured_regions = {region.region for region in scope.aws_regions}
+        retained = retained_volume_ids_by_region or {}
+        if not set(retained).issubset(configured_regions):
+            raise QualificationError(
+                'Retained AWS volumes are outside frozen catalog regions.')
+        self._cleanup_mode = retained_volume_ids_by_region is not None
+        self._retained_volume_ids_by_region = {
+            region: set(retained.get(region, ()))
+            for region in configured_regions
+        }
+        self._instance_type_widths: dict[tuple[str, str], int] = {}
+
+    @staticmethod
+    def _tags(resource: collections.abc.Mapping[str, Any]) -> dict[str, str]:
+        raw_tags = resource.get('Tags', [])
+        if not isinstance(raw_tags, list):
+            raise GuardViolation('AWS service effect has invalid tags.')
+        tags: dict[str, str] = {}
+        for tag in raw_tags:
+            if (not isinstance(tag, collections.abc.Mapping) or
+                    not isinstance(tag.get('Key'), str) or
+                    not isinstance(tag.get('Value'), str) or
+                    tag['Key'] in tags):
+                raise GuardViolation(
+                    'AWS service effect has non-canonical tags.')
+            tags[tag['Key']] = tag['Value']
+        return tags
+
+    def _exact_service_cluster(
+            self, tags: collections.abc.Mapping[str, str]) -> str | None:
+        ray_name = tags.get(provision_constants.TAG_RAY_CLUSTER_NAME)
+        sky_name = tags.get(provision_constants.TAG_SKYPILOT_CLUSTER_NAME)
+        if (not isinstance(ray_name, str) or
+                not ray_name.startswith(f'{self._service_name}-') or
+                sky_name != ray_name or
+                tags.get(provision_constants.TAG_SKYPILOT_MANAGED)
+                != provision_constants.SKYPILOT_MANAGED_TAG_VALUE):
+            return None
+        return ray_name
+
+    @staticmethod
+    def _provider_l4_width(instance_type: object) -> tuple[str, int]:
+        if not isinstance(instance_type, collections.abc.Mapping):
+            raise GuardViolation('AWS instance-type census is malformed.')
+        name = instance_type.get('InstanceType')
+        gpu_info = instance_type.get('GpuInfo')
+        gpus = (gpu_info.get('Gpus')
+                if isinstance(gpu_info, collections.abc.Mapping) else None)
+        if (not isinstance(name, str) or not name or
+                not isinstance(gpus, list) or not gpus):
+            raise GuardViolation(
+                'AWS instance type has no exact NVIDIA L4 inventory.')
+        width = 0
+        for gpu in gpus:
+            if (not isinstance(gpu, collections.abc.Mapping) or
+                    str(gpu.get('Manufacturer', '')).casefold() != 'nvidia' or
+                    str(gpu.get('Name', '')).casefold() != 'l4' or
+                    type(gpu.get('Count')) is not int or gpu['Count'] < 1):
+                raise GuardViolation(
+                    'AWS instance type has non-L4 GPU inventory.')
+            width += gpu['Count']
+        return name, width
+
+    def _catalog_width(self, region: str, instance_type: str) -> int:
+        widths = {
+            shape.gpu_units_per_instance
+            for shape in self._scope.catalog_shapes
+            if shape.cloud == 'aws' and shape.region == region and
+            shape.instance_type == instance_type
+        }
+        if len(widths) != 1:
+            raise GuardViolation(
+                'AWS service effect is absent from the frozen catalog.')
+        return next(iter(widths))
+
+    def _attest_instance_types(self, client: Any, region: str,
+                               instance_types: set[str]) -> None:
+        missing = sorted(instance_type for instance_type in instance_types
+                         if (region,
+                             instance_type) not in self._instance_type_widths)
+        for start in range(0, len(missing), 100):
+            batch = missing[start:start + 100]
+            response = client.describe_instance_types(InstanceTypes=batch)
+            values = (response.get('InstanceTypes') if isinstance(
+                response, collections.abc.Mapping) else None)
+            if not isinstance(values, list):
+                raise QualificationError(
+                    'AWS instance-type census is malformed.')
+            observed: dict[str, int] = {}
+            for value in values:
+                name, width = self._provider_l4_width(value)
+                if name in observed:
+                    raise GuardViolation(
+                        'AWS instance-type census repeats one shape.')
+                observed[name] = width
+            if set(observed) != set(batch):
+                raise GuardViolation('AWS instance-type census is incomplete.')
+            for name, width in observed.items():
+                if width != self._catalog_width(region, name):
+                    raise GuardViolation(
+                        'AWS provider GPU width disagrees with frozen catalog.')
+                self._instance_type_widths[(region, name)] = width
+
+    def _service_census(
+            self
+    ) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+        instances_by_id: dict[str, dict[str, Any]] = {}
+        volumes_by_id: dict[str, dict[str, Any]] = {}
+        newly_retained_by_region: dict[str,
+                                       set[str]] = collections.defaultdict(set)
+        tag_keys = (provision_constants.TAG_RAY_CLUSTER_NAME,
+                    provision_constants.TAG_SKYPILOT_CLUSTER_NAME)
+        for region_scope in self._scope.aws_regions:
+            session = aws_adaptor.session(
+                profile=region_scope.credential_profile)
+            caller = session.client(
+                'sts', region_name=region_scope.region).get_caller_identity()
+            if caller.get('Account') != region_scope.aws_account_id:
+                raise GuardViolation(
+                    'AWS credential profile resolved to another account.')
+            client = session.client('ec2', region_name=region_scope.region)
+            regional_instances: dict[str, dict[str, Any]] = {}
+            for tag_key in tag_keys:
+                pages = client.get_paginator('describe_instances').paginate(
+                    Filters=[{
+                        'Name': 'instance-state-name',
+                        'Values': [
+                            'pending', 'running', 'stopping', 'stopped',
+                            'shutting-down'
+                        ],
+                    }, {
+                        'Name': f'tag:{tag_key}',
+                        'Values': [f'{self._service_name}-*'],
+                    }])
+                for page in pages:
+                    reservations = page.get('Reservations')
+                    if not isinstance(reservations, list):
+                        raise QualificationError(
+                            'AWS service instance census is malformed.')
+                    for reservation in reservations:
+                        raw_instances = (
+                            reservation.get('Instances') if isinstance(
+                                reservation, collections.abc.Mapping) else None)
+                        if not isinstance(raw_instances, list):
+                            raise QualificationError(
+                                'AWS service instance census is malformed.')
+                        for instance in raw_instances:
+                            if not isinstance(instance,
+                                              collections.abc.Mapping):
+                                raise QualificationError(
+                                    'AWS service instance census is malformed.')
+                            tags = self._tags(instance)
+                            cluster_name = self._exact_service_cluster(tags)
+                            block_devices = instance.get('BlockDeviceMappings')
+                            if (cluster_name is None or
+                                    not isinstance(block_devices, list)):
+                                raise GuardViolation(
+                                    'AWS service instance escaped exact tags.')
+                            volume_ids: list[str] = []
+                            for block_device in block_devices:
+                                ebs = (block_device.get('Ebs') if isinstance(
+                                    block_device, collections.abc.Mapping) else
+                                       None)
+                                if (not isinstance(ebs, collections.abc.Mapping)
+                                        or ebs.get('DeleteOnTermination')
+                                        is not True or
+                                        not isinstance(ebs.get('VolumeId'), str)
+                                        or not ebs['VolumeId']):
+                                    raise GuardViolation(
+                                        'AWS service instance has unsafe EBS.')
+                                volume_ids.append(ebs['VolumeId'])
+                            placement = instance.get('Placement')
+                            state = instance.get('State')
+                            lifecycle = instance.get('InstanceLifecycle')
+                            canonical = {
+                                'availability_zone':
+                                    (placement.get('AvailabilityZone')
+                                     if isinstance(placement,
+                                                   collections.abc.Mapping) else
+                                     None),
+                                'client_token': instance.get('ClientToken'),
+                                'cluster_name_on_cloud': cluster_name,
+                                'instance_id': instance.get('InstanceId'),
+                                'instance_type': instance.get('InstanceType'),
+                                'market': ('spot' if lifecycle == 'spot' else
+                                           'on_demand'
+                                           if lifecycle is None else lifecycle),
+                                'region': region_scope.region,
+                                'state': (state.get('Name') if isinstance(
+                                    state, collections.abc.Mapping) else None),
+                                'volume_ids': tuple(sorted(volume_ids)),
+                            }
+                            if any(value is None or value == ''
+                                   for value in canonical.values()):
+                                raise GuardViolation(
+                                    'AWS service instance identity is '
+                                    'incomplete.')
+                            instance_id = str(canonical['instance_id'])
+                            previous = regional_instances.setdefault(
+                                instance_id, canonical)
+                            if previous != canonical:
+                                raise GuardViolation(
+                                    'AWS service instance identity is '
+                                    'contradictory.')
+            instance_types = {
+                str(instance['instance_type'])
+                for instance in regional_instances.values()
+            }
+            self._attest_instance_types(client, region_scope.region,
+                                        instance_types)
+            for instance_id, canonical in regional_instances.items():
+                canonical['provider_gpu_units'] = self._instance_type_widths[(
+                    region_scope.region, str(canonical['instance_type']))]
+                previous = instances_by_id.setdefault(instance_id, canonical)
+                if previous != canonical:
+                    raise GuardViolation(
+                        'AWS service instance identity is duplicated.')
+                newly_retained_by_region[region_scope.region].update(
+                    canonical['volume_ids'])
+
+            prior_retained = set(
+                self._retained_volume_ids_by_region[region_scope.region])
+            exact_volume_ids = (prior_retained |
+                                newly_retained_by_region[region_scope.region])
+            volume_queries: list[tuple[bool, list[dict[str, Any]]]] = []
+            for tag_key in tag_keys:
+                volume_queries.append((False, [{
+                    'Name': f'tag:{tag_key}',
+                    'Values': [f'{self._service_name}-*'],
+                }]))
+            volume_queries.extend((True, [{
+                'Name': 'volume-id',
+                'Values': sorted(exact_volume_ids)[start:start + 500],
+            }]) for start in range(0, len(exact_volume_ids), 500))
+            for exact_lookup, filters in volume_queries:
+                pages = client.get_paginator('describe_volumes').paginate(
+                    Filters=filters)
+                for page in pages:
+                    raw_volumes = page.get('Volumes')
+                    if not isinstance(raw_volumes, list):
+                        raise QualificationError(
+                            'AWS service volume census is malformed.')
+                    for volume in raw_volumes:
+                        if not isinstance(volume, collections.abc.Mapping):
+                            raise QualificationError(
+                                'AWS service volume census is malformed.')
+                        volume_id = volume.get('VolumeId')
+                        state = volume.get('State')
+                        tags = self._tags(volume)
+                        cluster_name = self._exact_service_cluster(tags)
+                        has_service_identity_tag = any(
+                            tags.get(key) is not None for key in tag_keys)
+                        may_be_legacy_receipt = (exact_lookup and
+                                                 self._cleanup_mode and
+                                                 volume_id in prior_retained and
+                                                 not has_service_identity_tag)
+                        if (not isinstance(volume_id, str) or not volume_id or
+                                not isinstance(state, str) or not state or
+                            (cluster_name is None and
+                             not may_be_legacy_receipt)):
+                            raise GuardViolation(
+                                'AWS service volume escaped exact scope.')
+                        canonical_volume = {
+                            'cluster_name_on_cloud': cluster_name,
+                            'region': region_scope.region,
+                            'state': state,
+                            'volume_id': volume_id,
+                        }
+                        previous = volumes_by_id.setdefault(
+                            volume_id, canonical_volume)
+                        if previous != canonical_volume:
+                            raise GuardViolation(
+                                'AWS service volume identity is contradictory.')
+                        newly_retained_by_region[region_scope.region].add(
+                            volume_id)
+
+        for region, retained_ids in newly_retained_by_region.items():
+            self._retained_volume_ids_by_region[region].update(retained_ids)
+        return (tuple(instances_by_id[key] for key in sorted(instances_by_id)),
+                tuple(volumes_by_id[key] for key in sorted(volumes_by_id)))
+
+    def census(self) -> AwsProviderCensus:
+        try:
+            service_instances, service_volumes = self._service_census()
+        except GuardViolation:
+            raise
+        except QualificationError:
+            raise
+        except Exception as error:  # pylint: disable=broad-except
+            raise QualificationError('AWS EC2 census failed.') from error
+        return AwsProviderCensus(service_instances=service_instances,
+                                 service_volumes=service_volumes)
+
+    def retained_volume_ids(self) -> dict[str, list[str]]:
+        """Return credential-free disk identities for durable receipts."""
+        return {
+            region: sorted(volume_ids) for region, volume_ids in sorted(
+                self._retained_volume_ids_by_region.items())
+        }
+
+    def reduce(
+        self, census: AwsProviderCensus,
+        identities: collections.abc.Sequence[AwsProviderIdentity]
+    ) -> ProviderState:
+        return parse_aws_state(identities=identities,
+                               profile=self._profile,
+                               service_instances=census.service_instances,
+                               service_volumes=census.service_volumes)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -914,7 +1934,8 @@ class DatabaseState:
     claim_priorities: tuple[int, ...]
     waiter_count: int
     demand_units: int
-    bound_cluster_zones: tuple[tuple[str, str], ...]
+    gcp_provider_identities: tuple[GcpProviderIdentity, ...]
+    aws_provider_identities: tuple[AwsProviderIdentity, ...]
     provider_free_unbound_replica_ids: tuple[int, ...] = ()
 
 
@@ -978,10 +1999,11 @@ def paid_claim_census(
                     claim['capacity_plan_sha256']
                     != claim['persisted_plan_sha256'] or
                     str(claim['capacity_plan_accelerator']).casefold() != 'l4'
-                    or claim['capacity_plan_units'] != 1):
+                    or type(claim['capacity_plan_units']) is not int or
+                    claim['capacity_plan_units'] < 1):
                 raise GuardViolation(
                     f'Paid claim is not priority {_REQUEST_PRIORITY} and '
-                    'linked to one immutable L4 plan.')
+                    'linked to one immutable whole-L4 plan.')
             claimed_units += claim['capacity_plan_units']
             priorities.append(priority)
     except (KeyError, TypeError) as error:
@@ -1003,47 +2025,69 @@ _BOUND_REQUEST_PROFILE_FIELDS = (
 )
 
 
+def _retained_launch_request(
+    binding: collections.abc.Mapping[str, Any],
+    request_row: sqlalchemy.engine.RowMapping,
+) -> tuple[collections.abc.Mapping[str, Any], collections.abc.Mapping[str, Any],
+           str]:
+    """Correlate a retained API request with its immutable association."""
+    if (str(request_row['ordinary_launch_association_id']) != str(
+            binding['association_id']) or
+            request_row['request_id'] != binding['request_id'] or
+            request_row['handler_name']
+            != non_pool_launch.NON_POOL_LAUNCH_HANDLER_NAME or
+            request_row['user_id'] != binding['tenant_scope'] or
+            request_row['cluster_name'] != binding['cluster_name'] or
+            any(request_row[field] != binding[field]
+                for field in _BOUND_REQUEST_PROFILE_FIELDS)):
+        raise ValueError('request correlation mismatch')
+    request = request_postgres.request_from_mapping(request_row)
+    body = request.request_body
+    context = ordinary_launch_binding.bound_context_from_association(binding)
+    parsed_context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+        body.extra_launch_context)
+    if parsed_context != context:
+        raise ValueError('request binding context mismatch')
+    config_snapshot = body.override_skypilot_config
+    pool_identity = paid_capacity.pool_key_payload(
+        str(binding['paid_capacity_pool_key']))
+    workspace = binding['service_workspace']
+    if (not isinstance(config_snapshot, collections.abc.Mapping) or
+            not isinstance(pool_identity, collections.abc.Mapping) or
+            not isinstance(workspace, str) or not workspace):
+        raise ValueError('request provider scope mismatch')
+    return config_snapshot, pool_identity, workspace
+
+
 def gcp_identity_from_retained_request(
     binding: collections.abc.Mapping[str, Any],
     request_row: sqlalchemy.engine.RowMapping,
     scope: ProviderScope,
-) -> dict[str, Any]:
+) -> GcpProviderIdentity:
     """Recover one exact GCP allocation from its immutable API request."""
     try:
-        if (str(request_row['ordinary_launch_association_id']) != str(
-                binding['association_id']) or
-                request_row['request_id'] != binding['request_id'] or
-                request_row['handler_name']
-                != non_pool_launch.NON_POOL_LAUNCH_HANDLER_NAME or
-                request_row['user_id'] != binding['tenant_scope'] or
-                request_row['cluster_name'] != binding['cluster_name'] or
-                any(request_row[field] != binding[field]
-                    for field in _BOUND_REQUEST_PROFILE_FIELDS)):
-            raise ValueError('request correlation mismatch')
-        request = request_postgres.request_from_mapping(request_row)
-        body = request.request_body
-        context = ordinary_launch_binding.bound_context_from_association(
-            binding)
-        parsed_context = (
-            ordinary_launch_binding.parse_bound_non_pool_launch_context(
-                body.extra_launch_context))
-        if parsed_context != context:
-            raise ValueError('request binding context mismatch')
-        config_snapshot = body.override_skypilot_config
-        pool_identity = paid_capacity.pool_key_payload(
-            str(binding['paid_capacity_pool_key']))
-        workspace = binding['service_workspace']
-        if (not isinstance(config_snapshot, collections.abc.Mapping) or
-                not isinstance(pool_identity, collections.abc.Mapping)):
-            raise ValueError('request provider scope mismatch')
+        config_snapshot, pool_identity, workspace = _retained_launch_request(
+            binding, request_row)
         pool_region = pool_identity.get('region')
         pool_zone = pool_identity.get('zone')
+        gpu_units = _pool_l4_width(pool_identity)
         if (pool_identity.get('cloud') != 'gcp' or
                 pool_identity.get('workspace') != workspace or
-                pool_identity.get('accelerators') != [['l4', 1]] or
+                not isinstance(pool_region, str) or not pool_region or
+                not isinstance(pool_zone, str) or not pool_zone or
                 not _gcp_region_matches_zone(pool_region, pool_zone) or
+                pool_identity.get('num_nodes') != 1 or
+                pool_identity.get('use_spot') is not True or
+                not isinstance(pool_identity.get('instance_type'), str) or
+                not pool_identity['instance_type'] or
                 config_snapshot.get('active_workspace') != workspace or
-                workspace != scope.workspace):
+                workspace != scope.workspace or not _scope_has_catalog_shape(
+                    scope,
+                    cloud='gcp',
+                    region=pool_region,
+                    zone=pool_zone,
+                    instance_type=pool_identity['instance_type'],
+                    width=gpu_units)):
             raise ValueError('request provider scope mismatch')
         managed_instance_group = (
             skypilot_config.get_effective_workspace_region_config_from_snapshot(
@@ -1065,14 +2109,93 @@ def gcp_identity_from_retained_request(
                 identity['workspace'] != scope.workspace or
                 identity['region'] != pool_region or
                 identity['zone'] != pool_zone or
-                identity['instance_type'] != 'g2-standard-4' or
+                identity['instance_type'] != pool_identity['instance_type'] or
                 identity['num_nodes'] != 1 or identity['use_spot'] is not True):
             raise ValueError('request-derived provider identity mismatch')
-        return identity
+        return GcpProviderIdentity(
+            cluster_name_on_cloud=identity['cluster_name_on_cloud'],
+            gpu_units_per_instance=gpu_units,
+            instance_type=identity['instance_type'],
+            project_id=identity['project_id'],
+            region=identity['region'],
+            workspace=identity['workspace'],
+            zone=identity['zone'])
     except (AttributeError, KeyError, TypeError, ValueError,
             ordinary_launch_binding.OrdinaryLaunchBindingConflict) as error:
         raise GuardViolation(
             'Paid replica has no exact retained-request GCP identity.') \
+            from error
+
+
+def aws_identity_from_retained_request(
+    binding: collections.abc.Mapping[str, Any],
+    request_row: sqlalchemy.engine.RowMapping,
+    scope: ProviderScope,
+) -> AwsProviderIdentity:
+    """Recover one exact AWS allocation from its immutable API request."""
+    try:
+        config_snapshot, pool_identity, workspace = _retained_launch_request(
+            binding, request_row)
+        region = pool_identity.get('region')
+        zone = pool_identity.get('zone')
+        gpu_units = _pool_l4_width(pool_identity)
+        if (pool_identity.get('cloud') != 'aws' or
+                pool_identity.get('workspace') != workspace or
+                not isinstance(region, str) or not region or
+                not isinstance(zone, str) or not zone or
+                not zone.startswith(region) or
+                pool_identity.get('num_nodes') != 1 or
+                pool_identity.get('use_spot') is not True or
+                not isinstance(pool_identity.get('instance_type'), str) or
+                not pool_identity['instance_type'] or
+                config_snapshot.get('active_workspace') != workspace or
+                workspace != scope.workspace or not _scope_has_catalog_shape(
+                    scope,
+                    cloud='aws',
+                    region=region,
+                    zone=zone,
+                    instance_type=pool_identity['instance_type'],
+                    width=gpu_units)):
+            raise ValueError('request provider scope mismatch')
+        credential_profile = (
+            skypilot_config.get_effective_workspace_region_config_from_snapshot(
+                config_snapshot,
+                'aws', ('profile',),
+                region=region,
+                workspace=workspace))
+        identity = ordinary_launch_binding.ordinary_paid_aws_provider_identity(
+            binding, credential_profile=credential_profile)
+        matching_region_scopes = [
+            region_scope for region_scope in scope.aws_regions
+            if region_scope.region == region
+        ]
+        if (identity['workspace'] != scope.workspace or
+                identity['region'] != region or identity['zone'] != zone or
+                identity['instance_type'] != pool_identity['instance_type'] or
+                identity['num_nodes'] != 1 or
+                identity['use_spot'] is not True or
+                len(matching_region_scopes) != 1 or
+                matching_region_scopes[0].credential_profile
+                != identity['credential_profile'] or
+                matching_region_scopes[0].aws_account_id
+                != identity['aws_account_id']):
+            raise ValueError('request-derived provider identity mismatch')
+        return AwsProviderIdentity(
+            aws_account_id=identity['aws_account_id'],
+            client_token=identity['client_token'],
+            cluster_name_on_cloud=identity['cluster_name_on_cloud'],
+            credential_profile=identity['credential_profile'],
+            gpu_units_per_instance=gpu_units,
+            instance_type=identity['instance_type'],
+            num_nodes=identity['num_nodes'],
+            region=identity['region'],
+            use_spot=identity['use_spot'],
+            workspace=identity['workspace'],
+            zone=identity['zone'])
+    except (AttributeError, KeyError, TypeError, ValueError,
+            ordinary_launch_binding.OrdinaryLaunchBindingConflict) as error:
+        raise GuardViolation(
+            'Paid replica has no exact retained-request AWS identity.') \
             from error
 
 
@@ -1260,6 +2383,12 @@ class PostgresObserver:
     def close(self) -> None:
         self._engine.dispose()
 
+    def bind_provider_scope(self, scope: ProviderScope) -> None:
+        """Retain a frozen scope for post-service cleanup observation."""
+        if (self._provider_scope is not None and self._provider_scope != scope):
+            raise GuardViolation('Provider scope changed after it was frozen.')
+        self._provider_scope = scope
+
     def provider_scope(self) -> ProviderScope:
         """Freeze provider scope from the current committed service version."""
         with self._engine.connect() as connection:
@@ -1271,7 +2400,9 @@ class PostgresObserver:
                            s.workspace,
                            v.controller_config,
                            v.controller_config_digest,
-                           v.controller_config_snapshot_id
+                           v.controller_config_snapshot_id,
+                           v.placement_catalog,
+                           v.yaml_content
                     FROM services AS s
                     JOIN version_specs AS v
                       ON v.service_name = s.name
@@ -1289,6 +2420,91 @@ class PostgresObserver:
         scope = provider_scope_from_controller_config(row)
         self._provider_scope = scope
         return scope
+
+    def _retained_launch_rows(
+        self,
+        connection: sqlalchemy.engine.Connection,
+        scope: ProviderScope,
+    ) -> tuple[list[sqlalchemy.engine.RowMapping],
+               list[sqlalchemy.engine.RowMapping]]:
+        requests = connection.execute(
+            sqlalchemy.text('''
+                SELECT request.*
+                FROM api_requests AS request
+                JOIN serve_ordinary_launch_associations AS binding
+                  ON binding.association_id =
+                     request.ordinary_launch_association_id
+                 AND binding.request_id = request.request_id
+                WHERE binding.service_name = :name
+                  AND binding.service_hash = :service_hash
+                  AND binding.profile_kind = :profile_kind
+                  AND binding.binding_protocol_version = :protocol
+            '''), {
+                'name': self._service_name,
+                'service_hash': scope.service_hash,
+                'profile_kind': (ordinary_launch_binding.
+                                 NonPoolLaunchProfileKind.ORDINARY_PAID.value),
+                'protocol':
+                    (ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+            }).mappings().all()
+        bindings = connection.execute(
+            sqlalchemy.text('''
+                SELECT binding.*
+                FROM serve_ordinary_launch_associations AS binding
+                WHERE binding.service_name = :name
+                  AND binding.service_hash = :service_hash
+                  AND binding.profile_kind = :profile_kind
+                  AND binding.binding_protocol_version = :protocol
+                ORDER BY binding.replica_id, binding.launch_generation
+            '''), {
+                'name': self._service_name,
+                'service_hash': scope.service_hash,
+                'profile_kind': (ordinary_launch_binding.
+                                 NonPoolLaunchProfileKind.ORDINARY_PAID.value),
+                'protocol':
+                    (ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+            }).mappings().all()
+        return list(requests), list(bindings)
+
+    @staticmethod
+    def _request_by_association(
+        requests: collections.abc.Sequence[sqlalchemy.engine.RowMapping],
+    ) -> dict[str, sqlalchemy.engine.RowMapping]:
+        result: dict[str, sqlalchemy.engine.RowMapping] = {}
+        for request in requests:
+            association_id = str(request['ordinary_launch_association_id'])
+            if association_id in result:
+                raise GuardViolation(
+                    'A paid binding has multiple retained API requests.')
+            result[association_id] = request
+        return result
+
+    def _aws_identities_from_rows(
+        self,
+        bindings: collections.abc.Sequence[sqlalchemy.engine.RowMapping],
+        request_by_association: collections.abc.Mapping[
+            str, sqlalchemy.engine.RowMapping],
+        scope: ProviderScope,
+    ) -> tuple[AwsProviderIdentity, ...]:
+        identities: list[AwsProviderIdentity] = []
+        for binding in bindings:
+            pool = paid_capacity.pool_key_payload(
+                str(binding['paid_capacity_pool_key']))
+            if not isinstance(pool, collections.abc.Mapping):
+                raise GuardViolation('Paid binding has no exact provider pool.')
+            if pool.get('cloud') != 'aws':
+                continue
+            request = request_by_association.get(str(binding['association_id']))
+            if request is None:
+                raise GuardViolation(
+                    'AWS paid binding lost its retained API request.')
+            identities.append(
+                aws_identity_from_retained_request(binding, request, scope))
+        tokens = [identity.client_token for identity in identities]
+        if len(tokens) != len(set(tokens)):
+            raise GuardViolation('AWS paid bindings reuse one ClientToken.')
+        return tuple(
+            sorted(identities, key=lambda identity: identity.client_token))
 
     def cleanup_debits(self) -> tuple[int, int, int]:
         """Return production-equivalent debits, claims, and live waiters."""
@@ -1374,6 +2590,8 @@ class PostgresObserver:
                            s.lb_cutover_phase,
                            v.controller_config_digest,
                            v.controller_config_snapshot_id,
+                           v.placement_catalog,
+                           v.yaml_content,
                            h.generation AS route_generation,
                            h.valid_until > clock_timestamp() AS route_fresh,
                            r.service_hash AS route_service_hash,
@@ -1403,7 +2621,15 @@ class PostgresObserver:
                     authority['controller_config_digest']
                     != scope.controller_config_digest or
                     authority['controller_config_snapshot_id']
-                    != scope.controller_config_snapshot_id):
+                    != scope.controller_config_snapshot_id or
+                    not isinstance(authority['placement_catalog'], dict) or
+                    hashlib.sha256(rfc8785.dumps(
+                        authority['placement_catalog'])).hexdigest()
+                    != scope.placement_catalog_sha256 or
+                    not isinstance(authority['yaml_content'], str) or
+                    hashlib.sha256(
+                        authority['yaml_content'].encode('utf-8')).hexdigest()
+                    != scope.service_yaml_sha256):
                 raise GuardViolation(
                     'Service provider scope changed during qualification.')
             replicas = connection.execute(
@@ -1424,45 +2650,7 @@ class PostgresObserver:
                 '''), {
                     'name': self._service_name
                 }).mappings().all()
-            requests = connection.execute(
-                sqlalchemy.text('''
-                    SELECT request.*
-                    FROM api_requests AS request
-                    JOIN serve_ordinary_launch_associations AS binding
-                      ON binding.association_id =
-                         request.ordinary_launch_association_id
-                     AND binding.request_id = request.request_id
-                    WHERE binding.service_name = :name
-                      AND binding.service_hash = :service_hash
-                      AND binding.profile_kind = :profile_kind
-                      AND binding.binding_protocol_version = :protocol
-                '''), {
-                    'name': self._service_name,
-                    'service_hash': service_hash,
-                    'profile_kind':
-                        (ordinary_launch_binding.NonPoolLaunchProfileKind.
-                         ORDINARY_PAID.value),
-                    'protocol': (ordinary_launch_binding.
-                                 NON_POOL_BINDING_PROTOCOL_VERSION),
-                }).mappings().all()
-            bindings = connection.execute(
-                sqlalchemy.text('''
-                    SELECT binding.*
-                    FROM serve_ordinary_launch_associations AS binding
-                    WHERE binding.service_name = :name
-                      AND binding.service_hash = :service_hash
-                      AND binding.profile_kind = :profile_kind
-                      AND binding.binding_protocol_version = :protocol
-                    ORDER BY binding.replica_id, binding.launch_generation
-                '''), {
-                    'name': self._service_name,
-                    'service_hash': service_hash,
-                    'profile_kind':
-                        (ordinary_launch_binding.NonPoolLaunchProfileKind.
-                         ORDINARY_PAID.value),
-                    'protocol': (ordinary_launch_binding.
-                                 NON_POOL_BINDING_PROTOCOL_VERSION),
-                }).mappings().all()
+            requests, bindings = self._retained_launch_rows(connection, scope)
             claims = connection.execute(
                 sqlalchemy.text('''
                     SELECT c.replica_id, c.pool_key, c.claimed_at, c.priority,
@@ -1516,14 +2704,14 @@ class PostgresObserver:
         claim_by_replica_id = {claim['replica_id']: claim for claim in claims}
         if len(claim_by_replica_id) != len(claims):
             raise GuardViolation('Paid claims have duplicate replica IDs.')
-        request_by_association: dict[str, sqlalchemy.engine.RowMapping] = {}
-        for request in requests:
-            association_id = str(request['ordinary_launch_association_id'])
-            if association_id in request_by_association:
-                raise GuardViolation(
-                    'A paid binding has multiple retained API requests.')
-            request_by_association[association_id] = request
-        bound_cluster_zones: dict[str, str] = {}
+        request_by_association = self._request_by_association(requests)
+        aws_identities = self._aws_identities_from_rows(bindings,
+                                                        request_by_association,
+                                                        scope)
+        aws_identities_by_token = {
+            identity.client_token: identity for identity in aws_identities
+        }
+        gcp_identities: dict[str, GcpProviderIdentity] = {}
         provider_free_unbound_replica_ids: list[int] = []
         for replica in debits.replicas:
             try:
@@ -1556,13 +2744,28 @@ class PostgresObserver:
                     str(binding['association_id']))
                 if request is None:
                     raise ValueError('retained request is unavailable')
-                identity = gcp_identity_from_retained_request(
-                    binding, request, scope)
+                pool = paid_capacity.pool_key_payload(
+                    str(binding['paid_capacity_pool_key']))
+                if not isinstance(pool, collections.abc.Mapping):
+                    raise ValueError('paid pool identity is unavailable')
+                cloud = pool.get('cloud')
+                if cloud == 'gcp':
+                    identity: GcpProviderIdentity | AwsProviderIdentity = (
+                        gcp_identity_from_retained_request(
+                            binding, request, scope))
+                elif cloud == 'aws':
+                    identity = aws_identity_from_retained_request(
+                        binding, request, scope)
+                    if aws_identities_by_token.get(
+                            identity.client_token) != identity:
+                        raise ValueError('AWS retained identity is unstable')
+                else:
+                    raise ValueError('paid pool uses an unqualified provider')
             except (KeyError, TypeError, ValueError,
                     ordinary_launch_binding.OrdinaryLaunchBindingConflict
                    ) as error:
                 raise GuardViolation(
-                    'Paid replica has no exact durable GCP launch binding.') \
+                    'Paid replica has no exact durable provider launch binding.') \
                     from error
             if (replica['is_spot'] is not True or
                     not replica['replica_record_id'] or
@@ -1570,11 +2773,18 @@ class PostgresObserver:
                     != replica['paid_capacity_pool_key']):
                 raise GuardViolation(
                     'Paid replica has no exact retained Spot launch binding.')
-            cloud_name = identity['cluster_name_on_cloud']
-            if cloud_name in bound_cluster_zones:
+            claim = claim_by_replica_id.get(replica['replica_id'])
+            if (claim is not None and claim['capacity_plan_units']
+                    != identity.gpu_units_per_instance):
                 raise GuardViolation(
-                    'Paid replicas share one durable GCP provider identity.')
-            bound_cluster_zones[cloud_name] = identity['zone']
+                    'Paid claim units disagree with its provider shape.')
+            if isinstance(identity, GcpProviderIdentity):
+                cloud_name = identity.cluster_name_on_cloud
+                if cloud_name in gcp_identities:
+                    raise GuardViolation(
+                        'Paid replicas share one durable GCP provider identity.'
+                    )
+                gcp_identities[cloud_name] = identity
         demand_report = select_route_authoritative_report(
             authority,
             demand_reports,
@@ -1588,7 +2798,10 @@ class PostgresObserver:
             claim_priorities=claim_census.priorities,
             waiter_count=int(waiter_count),
             demand_units=demand_units(demand_report['payload']),
-            bound_cluster_zones=tuple(sorted(bound_cluster_zones.items())),
+            gcp_provider_identities=tuple(
+                sorted(gcp_identities.values(),
+                       key=lambda identity: identity.cluster_name_on_cloud)),
+            aws_provider_identities=aws_identities,
             provider_free_unbound_replica_ids=tuple(
                 sorted(provider_free_unbound_replica_ids)),
         )
@@ -1747,17 +2960,31 @@ class Observation:
 def validate_observation(observation: Observation, profile: Profile) -> None:
     database = observation.database
     provider = observation.provider
-    bound_cluster_names = frozenset(
-        cluster_name for cluster_name, _ in database.bound_cluster_zones)
+    gcp_identities = {
+        identity.cluster_name_on_cloud: identity
+        for identity in database.gcp_provider_identities
+    }
+    aws_identities = database.aws_provider_identities
+    bound_cluster_names = frozenset(gcp_identities) | frozenset(
+        identity.cluster_name_on_cloud for identity in aws_identities)
     if database.service_hash != observation.load_balancer.service_hash:
         raise QualificationError(
             'PostgreSQL and load balancer incarnations differ.')
     if (database.claimed_units > profile.max_units or
             database.paid_debit_units > profile.max_units):
         raise GuardViolation('PostgreSQL capacity exceeded the armed cap.')
-    if (provider.instance_count > len(bound_cluster_names) or
-            provider.disk_count > len(bound_cluster_names) or
-            provider.inflight_operation_count > len(bound_cluster_names)):
+    if provider.gpu_units > profile.max_units:
+        raise GuardViolation('Provider capacity exceeded the armed GPU cap.')
+    gcp = provider.cloud('gcp')
+    aws = provider.cloud('aws')
+    if (gcp.instance_count > len(gcp_identities) or
+            gcp.disk_count > len(gcp_identities) or
+            gcp.inflight_operation_count > len(gcp_identities) or
+            gcp.gpu_units > sum(identity.gpu_units_per_instance
+                                for identity in gcp_identities.values()) or
+            aws.instance_count > len(aws_identities) or
+            aws.gpu_units > sum(identity.gpu_units_per_instance
+                                for identity in aws_identities)):
         raise GuardViolation('Provider effects exceed durable launch bindings.')
     unbound_clusters = provider.cluster_names - bound_cluster_names
     if unbound_clusters:
@@ -1769,9 +2996,10 @@ class Observer:
     """Compose raw provider state with newer durable/data-plane evidence."""
 
     def __init__(self, *, postgres: PostgresObserver, gcp: GcpObserver,
-                 http: HttpObserver) -> None:
+                 aws: AwsObserver, http: HttpObserver) -> None:
         self._postgres = postgres
         self._gcp = gcp
+        self._aws = aws
         self._http = http
 
     async def request_telemetry(self) -> RequestTelemetry:
@@ -1786,13 +3014,21 @@ class Observer:
         # to classify it.  Since a binding commit precedes its provider effect,
         # this avoids both logical-name prefix guesses and an old-DB/new-VM
         # ordering manufactured by the observer itself.
-        census = await asyncio.to_thread(self._gcp.census)
+        gcp_census, aws_census = await asyncio.gather(
+            asyncio.to_thread(self._gcp.census),
+            asyncio.to_thread(self._aws.census))
         load_balancer = await self._http.snapshot()
         database = await asyncio.to_thread(
             self._postgres.snapshot,
             load_balancer,
             require_complete_demand_report=require_complete_demand_report)
-        provider = self._gcp.reduce(census, dict(database.bound_cluster_zones))
+        gcp_identities = {
+            identity.cluster_name_on_cloud: identity
+            for identity in database.gcp_provider_identities
+        }
+        provider = combine_provider_states(
+            self._gcp.reduce(gcp_census, gcp_identities),
+            self._aws.reduce(aws_census, database.aws_provider_identities))
         return Observation(observed_at=time.time(),
                            observed_monotonic=time.monotonic(),
                            database=database,
@@ -1805,6 +3041,11 @@ class Progress:
     """Strict scale and drain gates accumulated from valid samples."""
 
     peak_running: int = 0
+    peak_running_gpu_units: int = 0
+    peak_running_by_cloud: dict[str,
+                                int] = dataclasses.field(default_factory=dict)
+    peak_running_gpu_units_by_cloud: dict[str, int] = dataclasses.field(
+        default_factory=dict)
     scale_started_monotonic: float | None = None
     scale_reached_monotonic: float | None = None
     zero_since_monotonic: float | None = None
@@ -1818,8 +3059,18 @@ class Progress:
     def observe(self, observation: Observation, profile: Profile) -> None:
         self.peak_running = max(self.peak_running,
                                 observation.provider.running_count)
+        self.peak_running_gpu_units = max(
+            self.peak_running_gpu_units, observation.provider.running_gpu_units)
+        for cloud in observation.provider.clouds:
+            self.peak_running_by_cloud[cloud.cloud] = max(
+                self.peak_running_by_cloud.get(cloud.cloud, 0),
+                cloud.running_count)
+            self.peak_running_gpu_units_by_cloud[cloud.cloud] = max(
+                self.peak_running_gpu_units_by_cloud.get(cloud.cloud, 0),
+                cloud.running_gpu_units)
         if (self.scale_reached_monotonic is None and
-                observation.provider.running_count >= profile.minimum_running):
+                observation.provider.running_gpu_units
+                >= profile.minimum_running):
             if self.scale_started_monotonic is None:
                 raise QualificationError(
                     'Provider reached RUNNING before the scale timer.')
@@ -1867,6 +3118,19 @@ def observation_summary(observation: Observation) -> dict[str, Any]:
         'postgres_demand_units': observation.database.demand_units,
         'provider_instances': observation.provider.instance_count,
         'provider_running': observation.provider.running_count,
+        'provider_gpu_units': observation.provider.gpu_units,
+        'provider_running_gpu_units': observation.provider.running_gpu_units,
+        'provider_by_cloud': {
+            cloud.cloud: {
+                'instances': cloud.instance_count,
+                'running': cloud.running_count,
+                'gpu_units': cloud.gpu_units,
+                'running_gpu_units': cloud.running_gpu_units,
+                'disks': cloud.disk_count,
+                'inflight_operations': cloud.inflight_operation_count,
+                'shapes': [dataclasses.asdict(shape) for shape in cloud.shapes],
+            } for cloud in observation.provider.clouds
+        },
         'provider_disks': observation.provider.disk_count,
         'provider_inflight_operations':
             (observation.provider.inflight_operation_count),
@@ -1882,7 +3146,7 @@ class Receipt:
                  profile: Profile) -> None:
         self._path = path
         self._payload: dict[str, Any] = {
-            'schema_version': 2,
+            'schema_version': 3,
             'service_name': service_name,
             'profile': profile.name,
             'request_priority': _REQUEST_PRIORITY,
@@ -1921,6 +3185,8 @@ class Receipt:
                progress: Progress,
                pressure_successes: int,
                warm_successes: int,
+               aws_volume_ids: collections.abc.Mapping[str, list[str]] |
+               None = None,
                ledger_baseline: RequestTelemetry | None = None,
                ledger_final: RequestTelemetry | None = None,
                error: BaseException | None = None) -> None:
@@ -1928,6 +3194,10 @@ class Receipt:
             'finished_at': time.time(),
             'outcome': 'passed' if error is None else 'failed',
             'peak_running': progress.peak_running,
+            'peak_running_gpu_units': progress.peak_running_gpu_units,
+            'peak_running_by_cloud': progress.peak_running_by_cloud,
+            'peak_running_gpu_units_by_cloud':
+                progress.peak_running_gpu_units_by_cloud,
             'scale_elapsed_seconds':
                 (None if progress.scale_started_monotonic is None or
                  progress.scale_reached_monotonic is None else
@@ -1935,6 +3205,7 @@ class Receipt:
                  progress.scale_started_monotonic),
             'pressure_successes': pressure_successes,
             'warm_successes': warm_successes,
+            'aws_retained_volume_ids': dict(aws_volume_ids or {}),
         })
         if ledger_baseline is not None:
             self._payload['ledger_baseline_total'] = (
@@ -1959,6 +3230,48 @@ class Receipt:
         self._path.write_text(
             json.dumps(self._payload, indent=2, sort_keys=True) + '\n',
             encoding='utf-8')
+
+
+def read_aws_volume_ids_receipt(
+    path: pathlib.Path,
+    service_name: str,
+) -> dict[str, list[str]]:
+    """Read exact EBS identities retained by the qualification run."""
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise QualificationError('Qualification receipt is unavailable.') \
+            from error
+    raw = (payload.get('aws_retained_volume_ids')
+           if isinstance(payload, dict) else None)
+    if (not isinstance(payload, dict) or payload.get('schema_version') != 3 or
+            payload.get('service_name') != service_name or
+            not isinstance(raw, dict)):
+        raise QualificationError('Qualification receipt is malformed.')
+    result: dict[str, list[str]] = {}
+    for region, volume_ids in raw.items():
+        if (not isinstance(region, str) or not region or
+                not isinstance(volume_ids, list) or
+                volume_ids != sorted(set(volume_ids)) or
+                any(not isinstance(volume_id, str) or not volume_id
+                    for volume_id in volume_ids)):
+            raise QualificationError('Qualification receipt is malformed.')
+        result[region] = volume_ids
+    return result
+
+
+def read_optional_aws_volume_ids_receipt(
+    path: pathlib.Path,
+    service_name: str,
+) -> dict[str, list[str]]:
+    """Best-effort teardown aid; frozen service-tag scans remain authoritative."""
+    try:
+        return read_aws_volume_ids_receipt(path, service_name)
+    except QualificationError:
+        # The process can be killed before its non-authoritative receipt is
+        # written.  New EBS resources carry both service identity tags, so a
+        # missing or partial receipt must not prevent scoped cleanup polling.
+        return {}
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -2533,7 +3846,8 @@ async def _wait_for_scale(*, observer: Observer, profile: Profile,
             return
         await asyncio.sleep(profile.poll_seconds)
     raise QualificationError(
-        f'Provider did not reach {profile.minimum_running} RUNNING instances.')
+        f'Provider did not reach {profile.minimum_running} RUNNING L4 GPU '
+        'units.')
 
 
 async def _wait_for_drain(*, observer: Observer, profile: Profile,
@@ -2590,12 +3904,15 @@ def freeze_provider_scope(args: argparse.Namespace) -> None:
         postgres.close()
     if scope is None:
         raise QualificationError('Provider scope was not frozen.')
+    if (scope.location_scope is None or scope.aws_location_scope is None):
+        raise QualificationError('Provider scope lacks one cloud boundary.')
     print(
         json.dumps(
             {
                 'outcome': 'scope-frozen',
-                'provider': 'gcp',
-                'location_scope': scope.location_scope.value,
+                'providers': list(scope.providers),
+                'gcp_location_scope': scope.location_scope.value,
+                'aws_location_scope': scope.aws_location_scope.value,
                 'receipt': str(pathlib.Path(args.output)),
             },
             sort_keys=True))
@@ -2608,19 +3925,33 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
         raise QualificationError(
             f'{args.postgres_url_env} must contain the PostgreSQL URL.')
     scope = read_provider_scope(pathlib.Path(args.scope), args.service_name)
+    retained_volume_ids = read_optional_aws_volume_ids_receipt(
+        pathlib.Path(args.receipt), args.service_name)
     postgres = PostgresObserver(database_url, args.service_name)
+    postgres.bind_provider_scope(scope)
+    cleanup_profile = dataclasses.replace(
+        PROFILES['scale'], max_units=scope.max_live_paid_gpu_units)
     gcp = GcpObserver(service_name=args.service_name,
                       scope=scope,
-                      profile=PROFILES['scale'])
+                      profile=cleanup_profile)
+    aws = AwsObserver(profile=cleanup_profile,
+                      service_name=args.service_name,
+                      scope=scope,
+                      retained_volume_ids_by_region=retained_volume_ids)
     deadline = time.monotonic() + args.timeout_seconds
     consecutive_zero = 0
     try:
         while time.monotonic() < deadline:
-            census = await asyncio.to_thread(gcp.census)
-            provider = parse_gcp_cleanup_state(service_name=args.service_name,
-                                               instances=census.instances,
-                                               disks=census.disks,
-                                               operations=census.operations)
+            gcp_census, aws_census = await asyncio.gather(
+                asyncio.to_thread(gcp.census), asyncio.to_thread(aws.census))
+            provider = combine_provider_states(
+                parse_gcp_cleanup_state(service_name=args.service_name,
+                                        instances=gcp_census.instances,
+                                        disks=gcp_census.disks,
+                                        operations=gcp_census.operations),
+                parse_aws_cleanup_state(
+                    service_instances=aws_census.service_instances,
+                    service_volumes=aws_census.service_volumes))
             debits, claims, waiters = await asyncio.to_thread(
                 postgres.cleanup_debits)
             exact_zero = (provider.instance_count == 0 and
@@ -2636,6 +3967,10 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
                     'cleanup_provider_instances': provider.instance_count,
                     'cleanup_provider_operations':
                         provider.inflight_operation_count,
+                    'cleanup_provider_by_cloud': {
+                        cloud.cloud: dataclasses.asdict(cloud)
+                        for cloud in provider.clouds
+                    },
                     'cleanup_waiters': waiters,
                     'zero_samples': consecutive_zero,
                 },
@@ -2647,7 +3982,7 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
     finally:
         postgres.close()
     raise QualificationError(
-        'Teardown left paid database debits or scoped GCP resources.')
+        'Teardown left paid database debits or scoped provider resources.')
 
 
 async def qualify(args: argparse.Namespace) -> None:
@@ -2672,11 +4007,19 @@ async def qualify(args: argparse.Namespace) -> None:
         postgres.close()
         raise GuardViolation(
             'Current service provider scope differs from the frozen receipt.')
+    if profile.max_units != provider_scope.max_live_paid_gpu_units:
+        postgres.close()
+        raise GuardViolation(
+            'Run profile differs from the committed paid GPU cap.')
     http = HttpObserver(args.endpoint, token)
+    aws = AwsObserver(profile=profile,
+                      service_name=args.service_name,
+                      scope=provider_scope)
     observer = Observer(postgres=postgres,
                         gcp=GcpObserver(service_name=args.service_name,
                                         scope=provider_scope,
                                         profile=profile),
+                        aws=aws,
                         http=http)
     progress = Progress()
     receipt = Receipt(path=pathlib.Path(args.receipt),
@@ -2767,6 +4110,7 @@ async def qualify(args: argparse.Namespace) -> None:
         receipt.finish(progress=progress,
                        pressure_successes=pressure_successes,
                        warm_successes=warm_successes,
+                       aws_volume_ids=aws.retained_volume_ids(),
                        ledger_baseline=ledger_baseline,
                        ledger_final=ledger_final,
                        error=failure)
@@ -2777,6 +4121,10 @@ async def qualify(args: argparse.Namespace) -> None:
                 'outcome': 'passed',
                 'profile': profile.name,
                 'peak_running': progress.peak_running,
+                'peak_running_gpu_units': progress.peak_running_gpu_units,
+                'peak_running_by_cloud': progress.peak_running_by_cloud,
+                'peak_running_gpu_units_by_cloud':
+                    progress.peak_running_gpu_units_by_cloud,
                 'warm_successes': warm_successes,
                 'receipt': str(pathlib.Path(args.receipt)),
             },
@@ -2802,14 +4150,28 @@ def render_service(args: argparse.Namespace) -> None:
     queue.update({
         'min_size': profile.pressure_concurrency,
         'max_size': max(32, profile.pressure_concurrency * 2),
-        'max_concurrency': min(128, profile.pressure_concurrency),
+        'max_concurrency': max(8, min(128, profile.pressure_concurrency)),
     })
     resources = config['resources']
+    expected_locations = [
+        {
+            'infra': 'aws',
+        },
+        {
+            'infra': 'gcp',
+        },
+    ]
     if (resources.get('use_spot') is not True or
-            resources.get('infra') != 'gcp' or
-            resources.get('instance_type') != 'g2-standard-4' or
-            resources.get('accelerators') != 'L4:1'):
-        raise QualificationError('Service fixture is not exact one-L4 Spot.')
+            resources.get('accelerators') != 'L4:1' or
+            resources.get('any_of') != expected_locations or
+            'infra' in resources or 'instance_type' in resources):
+        raise QualificationError(
+            'Service fixture is not cross-cloud whole-L4 Spot.')
+    try:
+        _validate_cross_cloud_service_config(config)
+    except ValueError as error:
+        raise QualificationError(
+            'Rendered service lost the cross-cloud L4 contract.') from error
     output = pathlib.Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(yaml.safe_dump(config, sort_keys=False), encoding='utf-8')
@@ -2846,6 +4208,7 @@ def _parser() -> argparse.ArgumentParser:
     cleanup = subparsers.add_parser('wait-cleanup')
     cleanup.add_argument('--service-name', required=True)
     cleanup.add_argument('--scope', required=True)
+    cleanup.add_argument('--receipt', required=True)
     cleanup.add_argument('--timeout-seconds', type=float, default=10 * 60)
     cleanup.add_argument('--poll-seconds', type=float, default=10)
     cleanup.add_argument('--postgres-url-env',
