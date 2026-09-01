@@ -329,7 +329,7 @@ class RequestTimestamp(RequestsAggregator):
 
     def demand_window_snapshot(self) -> dict[str, Any]:
         """Return one non-destructive, bounded rolling demand snapshot."""
-        window_seconds = constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS
+        window_seconds = constants.LB_DEMAND_WINDOW_SECONDS
         bucket_seconds = constants.LB_DEMAND_WINDOW_BUCKET_SECONDS
         cutoff = time.time() - window_seconds
         while (self._demand_window_timestamps and
