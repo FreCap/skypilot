@@ -134,6 +134,8 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
         })()
         qualifier.render_service(args)
         config = yaml.safe_load(output.read_text(encoding='utf-8'))
+        assert (config['service']['load_balancing_policy'] ==
+                'instance_aware_least_load')
         policy = config['service']['replica_policy']
         resources = config['resources']
         assert policy['min_replicas'] == 0
@@ -160,6 +162,25 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
         task = sky.Task.from_yaml_str(output.read_text(encoding='utf-8'))
         assert task.workdir is None
         serve_utils.validate_service_task(task, pool=False)
+
+
+def test_render_rejects_paid_fixture_without_exact_accelerator_routing(
+        tmp_path):
+    config = yaml.safe_load(
+        (_FIXTURE_DIR / 'service.yaml').read_text(encoding='utf-8'))
+    del config['service']['load_balancing_policy']
+    source = tmp_path / 'source.yaml'
+    source.write_text(yaml.safe_dump(config, sort_keys=False), encoding='utf-8')
+    args = type(
+        'Args', (), {
+            'profile': 'scale',
+            'source': str(source),
+            'output': str(tmp_path / 'rendered.yaml'),
+        })()
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='requires exact accelerator routing'):
+        qualifier.render_service(args)
 
 
 def test_provider_scope_comes_from_durable_version_not_ambient(

@@ -1988,6 +1988,10 @@ def render_service(args: argparse.Namespace) -> None:
     profile = PROFILES[args.profile]
     source = pathlib.Path(args.source)
     config = yaml.safe_load(source.read_text(encoding='utf-8'))
+    if config['service'].get(
+            'load_balancing_policy') != 'instance_aware_least_load':
+        raise QualificationError(
+            'Paid qualification requires exact accelerator routing.')
     policy = config['service']['replica_policy']
     policy.update({
         'max_replicas': profile.max_units,

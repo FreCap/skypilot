@@ -1,4 +1,5 @@
 service:
+  load_balancing_policy: instance_aware_least_load
   readiness_probe:
     path: /health
     initial_delay_seconds: 10
