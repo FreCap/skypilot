@@ -234,6 +234,40 @@ def _provider_state(**overrides):
     return qualifier.ProviderState(**values)
 
 
+def _provider_cluster_names(cloud, count):
+    return tuple(f'paid-e2e-{cloud}-{index:03d}' for index in range(count))
+
+
+def _cross_cloud_provider_state(*,
+                                gcp_running_count,
+                                aws_running_count,
+                                gpu_units_per_instance=1):
+    gcp_names = _provider_cluster_names('gcp', gcp_running_count)
+    aws_names = _provider_cluster_names('aws', aws_running_count)
+
+    def _cloud_state(cloud, running_count):
+        gpu_units = running_count * gpu_units_per_instance
+        return qualifier.ProviderCloudState(cloud=cloud,
+                                            instance_count=running_count,
+                                            running_count=running_count,
+                                            gpu_units=gpu_units,
+                                            running_gpu_units=gpu_units,
+                                            disk_count=running_count,
+                                            inflight_operation_count=0)
+
+    gcp = _cloud_state('gcp', gcp_running_count)
+    aws = _cloud_state('aws', aws_running_count)
+    return qualifier.ProviderState(
+        instance_count=gcp.instance_count + aws.instance_count,
+        running_count=gcp.running_count + aws.running_count,
+        gpu_units=gcp.gpu_units + aws.gpu_units,
+        running_gpu_units=gcp.running_gpu_units + aws.running_gpu_units,
+        disk_count=gcp.disk_count + aws.disk_count,
+        inflight_operation_count=0,
+        cluster_names=frozenset(gcp_names + aws_names),
+        clouds=(gcp, aws))
+
+
 def _load_balancer_state(**overrides):
     values = {
         'service_hash': 'incarnation',
@@ -2279,18 +2313,17 @@ def test_route_authority_must_be_fresh_and_match_lifecycle():
 
 def test_progress_requires_scale_slo_and_sustained_exact_zero():
     profile = qualifier.PROFILES['small']
+    gcp_name = _provider_cluster_names('gcp', 1)[0]
+    aws_name = _provider_cluster_names('aws', 1)[0]
     scaled = _observation(
         observed_at=1000,
-        database=_database_state(paid_debit_units=2,
-                                 bound_cluster_zones=(('paid-e2e-1',
-                                                       'us-central1-a'),
-                                                      ('paid-e2e-2',
-                                                       'us-central1-a'))),
-        provider=_provider_state(instance_count=2,
-                                 running_count=2,
-                                 disk_count=2,
-                                 cluster_names=frozenset(
-                                     {'paid-e2e-1', 'paid-e2e-2'})),
+        database=_database_state(
+            paid_debit_units=2,
+            bound_cluster_zones=((gcp_name, 'us-central1-a'),),
+            aws_provider_identities=(_aws_identity(client_token='token-aws-0',
+                                                   cluster_name=aws_name),)),
+        provider=_cross_cloud_provider_state(gcp_running_count=1,
+                                             aws_running_count=1),
         load_balancer=_load_balancer_state(demand_units=4, ready_replicas=2))
     qualifier.validate_observation(scaled, profile)
     progress = qualifier.Progress(scale_started_monotonic=900)
@@ -2308,14 +2341,42 @@ def test_progress_requires_scale_slo_and_sustained_exact_zero():
     too_slow = dataclasses.replace(scaled,
                                    observed_at=800,
                                    observed_monotonic=2000)
-    with pytest.raises(qualifier.QualificationError, match='Scale-out took'):
+    with pytest.raises(qualifier.QualificationError,
+                       match='physical RUNNING.*across AWS and GCP took'):
         qualifier.Progress(scale_started_monotonic=1000).observe(
             too_slow, profile)
 
 
+def test_progress_scale_counts_physical_vms_not_logical_gpu_units():
+    profile = qualifier.PROFILES['scale']
+    observation = _observation(provider=_cross_cloud_provider_state(
+        gcp_running_count=25, aws_running_count=25, gpu_units_per_instance=2))
+    progress = qualifier.Progress(scale_started_monotonic=900)
+
+    progress.observe(observation, profile)
+
+    assert progress.peak_running == 50
+    assert progress.peak_running_gpu_units == 100
+    assert progress.scale_reached_monotonic is None
+
+
+def test_progress_scale_requires_running_cohorts_in_aws_and_gcp():
+    profile = qualifier.PROFILES['scale']
+    observation = _observation(provider=_cross_cloud_provider_state(
+        gcp_running_count=100, aws_running_count=0))
+    progress = qualifier.Progress(scale_started_monotonic=900)
+
+    progress.observe(observation, profile)
+
+    assert progress.peak_running == 100
+    assert progress.peak_running_by_cloud == {'gcp': 100, 'aws': 0}
+    assert progress.scale_reached_monotonic is None
+
+
 def test_scale_survives_transient_observer_blackout(tmp_path):
     """Model pressure surviving observer loss from 20 to 64 VMs."""
-    cloud_names = frozenset(f'paid-e2e-{index:03d}' for index in range(64))
+    gcp_names = _provider_cluster_names('gcp', 32)
+    aws_names = _provider_cluster_names('aws', 32)
     profile = dataclasses.replace(qualifier.PROFILES['scale'],
                                   minimum_running=64,
                                   poll_seconds=0,
@@ -2325,25 +2386,23 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
         claimed_units=0,
         demand_units=64,
         bound_cluster_zones=tuple(
-            (name, 'us-central1-a') for name in cloud_names))
+            (name, 'us-central1-a') for name in gcp_names),
+        aws_provider_identities=tuple(
+            _aws_identity(client_token=f'token-aws-{index}', cluster_name=name)
+            for index, name in enumerate(aws_names)))
     now = qualifier.time.time()
     observations = [
         _observation(observed_at=now + 1,
                      database=dataclasses.replace(
                          database, provider_free_unbound_replica_ids=(7,)),
-                     provider=_provider_state(instance_count=20,
-                                              running_count=20,
-                                              disk_count=20,
-                                              cluster_names=frozenset(
-                                                  sorted(cloud_names)[:20])),
+                     provider=_cross_cloud_provider_state(gcp_running_count=10,
+                                                          aws_running_count=10),
                      load_balancer=_load_balancer_state(demand_units=64)),
         qualifier.QualificationError('transient observer blackout'),
         _observation(observed_at=now + 2,
                      database=database,
-                     provider=_provider_state(instance_count=64,
-                                              running_count=64,
-                                              disk_count=64,
-                                              cluster_names=cloud_names),
+                     provider=_cross_cloud_provider_state(gcp_running_count=32,
+                                                          aws_running_count=32),
                      load_balancer=_load_balancer_state(demand_units=64,
                                                         ready_replicas=20)),
     ]
