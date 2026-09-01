@@ -7,6 +7,7 @@ import concurrent.futures
 import dataclasses
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -14,6 +15,7 @@ import shutil
 import signal
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from unittest import mock
@@ -253,6 +255,21 @@ class _PaidProviderAbsenceGraph:
     authority: ordinary_launch_binding.ControllerBindingAuthority
     pool_key: str
     receipt: dict[str, object]
+
+
+def _load_paid_capacity_qualifier():
+    module_name = 'paid_capacity_qualifier_pg_regression'
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    qualifier_path = (pathlib.Path(__file__).parents[1] / 'skyserve' /
+                      'paid_capacity' / 'qualify.py')
+    spec = importlib.util.spec_from_file_location(module_name, qualifier_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _gc_paid_provider_allocation_receipt(
@@ -622,9 +639,14 @@ def _prepare_paid_provider_absence_graph(
     canonical_paid_claim_priority: int | None = None,
     terminalize: bool = True,
 ) -> _PaidProviderAbsenceGraph:
-    if not ordinary_launch_binding.is_paid_provider_reconciliation_phase(
-            effect_phase):
+    if (effect_phase is not ordinary_launch_binding.EffectPhase.NOT_STARTED and
+            not ordinary_launch_binding.is_paid_provider_reconciliation_phase(
+                effect_phase)):
         raise ValueError('Test graph requires a paid reconciliation phase.')
+    if (effect_phase is ordinary_launch_binding.EffectPhase.NOT_STARTED and
+            terminalize):
+        raise ValueError('A pre-effect graph must be terminalized by the '
+                         'production reducer.')
     engine, _ = bound_request_database
     if pool_key is None:
         pool_key = _gc_paid_pool_key()
@@ -901,9 +923,11 @@ def _prepare_paid_provider_absence_graph(
             ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
     with engine.begin() as connection:
         association = ordinary_launch_binding.ordinary_launch_associations_table
-        connection.execute(
-            sqlalchemy.update(association).where(
-                association.c.association_id == context.association_id).values(
+        if effect_phase is not ordinary_launch_binding.EffectPhase.NOT_STARTED:
+            connection.execute(
+                sqlalchemy.update(association).where(
+                    association.c.association_id == context.association_id).
+                values(
                     effect_phase=(
                         ordinary_launch_binding.EffectPhase.PROVIDER_IO.value),
                     effect_phase_changed_at=(sqlalchemy.func.clock_timestamp()),
@@ -5237,6 +5261,105 @@ def test_terminal_bound_pidless_claim_settles_immediately_before_provider_io(
     claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
                                    item.claim_token, item.worker_instance_id)
     assert backend.acknowledge_execution_quiescence(claim)
+
+
+def test_paid_pre_effect_reducer_commits_exact_provider_free_observer_shape(
+        bound_request_database, monkeypatch):
+    """One transaction settles a no-effect attempt and releases its claim."""
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch,
+        effect_phase=ordinary_launch_binding.EffectPhase.NOT_STARTED,
+        canonical_paid_claim_priority=50,
+        terminalize=False)
+    queue = request_postgres.PostgresQueueBackend(
+        requests.ScheduleType.LONG.value,
+        supported_handler_names=frozenset(
+            {non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME}))
+    candidate = queue.peek_provider_mutation()
+    assert candidate is not None
+    assert candidate.request_id == graph.context.request_id
+    item = queue.claim_provider_mutation(candidate)
+    assert item is not None
+    assert item.request_id == graph.context.request_id
+    with graph.engine.connect() as connection:
+        initial_pool_key = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.paid_capacity_claims_table.c.pool_key).where(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == 'gc-service',
+                    serve_state_schema.paid_capacity_claims_table.c.replica_id
+                    == 3)).scalar_one()
+    assert initial_pool_key == graph.pool_key
+
+    _expire_claim(graph.engine, graph.context.request_id)
+    reduction = request_postgres.reduce_bound_ordinary_launch(
+        graph.context,
+        graph.authority,
+        project_replica_result=_keep_replica_projection)
+    assert reduction.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.PRE_EFFECT_TERMINAL)
+    assert reduction.projected
+
+    with graph.engine.begin() as connection:
+        replica = dict(
+            connection.execute(
+                sqlalchemy.text('''
+                    SELECT replica.replica_id, replica.cluster_name,
+                           replica.status, replica.is_spot,
+                           replica.replica_state_version, replica.version,
+                           replica.paid_capacity_pool_key,
+                           replica.ordinary_launch_association_id,
+                           replica.replica_state ->> 'replica_record_id'
+                               AS replica_record_id,
+                           replica.replica_state,
+                           replica.sky_down_status,
+                           replica.created_at
+                    FROM replicas AS replica
+                    WHERE replica.service_name = 'gc-service'
+                      AND replica.replica_id = 3
+                ''')).mappings().one())
+        association = dict(
+            connection.execute(
+                sqlalchemy.select(
+                    ordinary_launch_binding.ordinary_launch_associations_table).
+                where(ordinary_launch_binding.
+                      ordinary_launch_associations_table.c.association_id ==
+                      graph.context.association_id)).mappings().one())
+        claim_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table).where(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == 'gc-service')).scalar_one()
+        pin_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUEST_RETENTION_PINS).where(
+                    request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                    graph.context.request_id)).scalar_one()
+
+    assert replica['ordinary_launch_association_id'] is None
+    assert association['resolution'] == (
+        ordinary_launch_binding.Resolution.PRE_EFFECT_TERMINAL.value)
+    assert association['reconciliation_outcome'] == (
+        ordinary_launch_binding.ReconciliationOutcome.PRE_EFFECT_TERMINAL.value)
+    assert association['effect_phase'] == (
+        ordinary_launch_binding.EffectPhase.NOT_STARTED.value)
+    assert association['launch_generation'] == 1
+    assert association['cancel_reason'] is None
+    assert association['cancel_requested_at'] is None
+    assert claim_count == 0
+    assert pin_count == 0
+    assert ordinary_launch_binding.settled_association_proves_execution_quiescence(
+        association)
+
+    qualifier = _load_paid_capacity_qualifier()
+    assert qualifier._is_exact_provider_free_unbound_paid_debit(
+        replica, None, [association])
+    assert not qualifier._is_exact_provider_free_unbound_paid_debit(
+        replica, {
+            'replica_id': 3,
+            'pool_key': initial_pool_key,
+        }, [association])
 
 
 def test_active_expired_bound_claim_preserves_prior_exact_quiescence(

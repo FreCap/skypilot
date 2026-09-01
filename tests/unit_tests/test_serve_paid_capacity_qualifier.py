@@ -1058,7 +1058,8 @@ def test_replica_binding_selection_accepts_settled_failed_provider_absence():
         qualifier.select_replica_binding(replica, [malformed])
 
 
-def test_exact_provider_free_paid_pending_pair_is_an_observation_miss(tmp_path):
+def test_exact_provider_free_unbound_paid_debit_is_an_observation_miss(
+        tmp_path):
     record_id = '22222222-2222-4222-8222-222222222222'
     pool_key = 'exact-gcp-spot-pool'
     info = replica_managers.ReplicaInfo(replica_id=7,
@@ -1086,9 +1087,9 @@ def test_exact_provider_free_paid_pending_pair_is_an_observation_miss(tmp_path):
         'replica_id': 7,
         'pool_key': pool_key,
     }
-    assert qualifier._is_exact_provider_free_paid_pending_pair(
+    assert qualifier._is_exact_provider_free_unbound_paid_debit(
         replica, claim, [])
-    assert not qualifier._is_exact_provider_free_paid_pending_pair(
+    assert not qualifier._is_exact_provider_free_unbound_paid_debit(
         replica, {
             **claim, 'pool_key': 'another-pool'
         }, [])
@@ -1160,37 +1161,54 @@ def test_exact_provider_free_paid_pending_pair_is_an_observation_miss(tmp_path):
     }
     assert (qualifier.ordinary_launch_binding.
             settled_association_proves_execution_quiescence(predecessor))
-    assert qualifier._is_exact_provider_free_paid_pending_pair(
+    assert qualifier._is_exact_provider_free_unbound_paid_debit(
+        replica, None, [predecessor])
+    assert not qualifier._is_exact_provider_free_unbound_paid_debit(
         replica, claim, [predecessor])
-    assert not qualifier._is_exact_provider_free_paid_pending_pair(
-        replica, claim, [{
+    assert qualifier._is_exact_provider_free_unbound_paid_debit(
+        {
+            **replica,
+            'status': 'FAILED_CLEANUP',
+            'replica_state': {
+                **replica['replica_state'],
+                'status_property': {
+                    **replica['replica_state']['status_property'],
+                    'sky_launch_status': 'RUNNING',
+                    'sky_down_status': 'FAILED',
+                },
+            },
+        }, None, [predecessor])
+    assert not qualifier._is_exact_provider_free_unbound_paid_debit(
+        replica, None, [])
+    assert not qualifier._is_exact_provider_free_unbound_paid_debit(
+        replica, None, [{
             **predecessor,
             'paid_capacity_pool_key': 'another-pool',
         }])
-    assert not qualifier._is_exact_provider_free_paid_pending_pair(
-        replica, claim, [{
+    assert not qualifier._is_exact_provider_free_unbound_paid_debit(
+        replica, None, [{
             **predecessor,
             'resolution': 'AMBIGUOUS',
             'reconciliation_outcome': 'POST_EFFECT_AMBIGUOUS',
         }])
-    assert not qualifier._is_exact_provider_free_paid_pending_pair(
-        replica, claim, [{
+    assert not qualifier._is_exact_provider_free_unbound_paid_debit(
+        replica, None, [{
             **predecessor,
             'execution_quiesced_at': None,
         }])
-    assert not qualifier._is_exact_provider_free_paid_pending_pair(
-        replica, claim, [{
+    assert not qualifier._is_exact_provider_free_unbound_paid_debit(
+        replica, None, [{
             **predecessor,
             'launch_generation': 2,
         }])
-    assert not qualifier._is_exact_provider_free_paid_pending_pair(
-        replica, claim, [{
+    assert not qualifier._is_exact_provider_free_unbound_paid_debit(
+        replica, None, [{
             **predecessor,
             'cancel_reason': 'explicit_cancel',
             'cancel_requested_at': quiesced_at,
         }])
-    assert not qualifier._is_exact_provider_free_paid_pending_pair(
-        replica, claim,
+    assert not qualifier._is_exact_provider_free_unbound_paid_debit(
+        replica, None,
         [predecessor, {
             **predecessor,
             'association_id': 'association-2',
@@ -1201,7 +1219,7 @@ def test_exact_provider_free_paid_pending_pair_is_an_observation_miss(tmp_path):
         claimed_units=1,
         claim_priorities=(50,),
         demand_units=4,
-        phase_a_pending_replica_ids=(7,)),
+        provider_free_unbound_replica_ids=(7,)),
                            load_balancer=_load_balancer_state(demand_units=4))
 
     class Observer:
@@ -1230,7 +1248,7 @@ def test_phase_a_observation_cannot_hide_a_provider_effect(tmp_path):
                                  claimed_units=1,
                                  claim_priorities=(50,),
                                  demand_units=4,
-                                 phase_a_pending_replica_ids=(7,)),
+                                 provider_free_unbound_replica_ids=(7,)),
         provider=_provider_state(instance_count=1,
                                  cluster_names=frozenset({'paid-e2e-7'})),
         load_balancer=_load_balancer_state(demand_units=4))
