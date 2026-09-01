@@ -10,7 +10,7 @@ service:
       min_size: 4
       size_per_replica: 1
       max_size: 32
-      max_concurrency_per_replica: 1
+      max_concurrency_per_replica: 8
       max_concurrency: 4
       timeout_seconds: 600
       max_request_body_bytes: 65536
@@ -32,11 +32,12 @@ service:
     cost_rebalance: false
 
 resources:
-  infra: gcp
-  instance_type: g2-standard-4
   accelerators: L4:1
   use_spot: true
   ports: 8080
+  any_of:
+    - infra: aws
+    - infra: gcp
 
 run: |
   exec python3 - <<'PY'
@@ -48,6 +49,12 @@ run: |
   import time
   import uuid
 
+  try:
+      _capacity = int(os.environ['SKYPILOT_NUM_GPUS_PER_NODE'])
+  except (KeyError, TypeError, ValueError) as error:
+      raise RuntimeError('SKYPILOT_NUM_GPUS_PER_NODE must be an integer') from error
+  if _capacity < 1:
+      raise RuntimeError('SKYPILOT_NUM_GPUS_PER_NODE must be positive')
   _lock = threading.Lock()
   _running = 0
 
@@ -91,8 +98,8 @@ run: |
               self.write_json(200, {
                   'status': 'READY',
                   'running_count': running,
-                  'predict_concurrency': 1,
-                  'max_workers': 1,
+                  'predict_concurrency': _capacity,
+                  'max_workers': _capacity,
               })
               return
           if payload.get('action') == 'async_predict':
@@ -126,6 +133,9 @@ run: |
                   self.write_json(400, {'error': 'invalid exact request'})
                   return
               with _lock:
+                  if _running >= _capacity:
+                      self.write_json(429, {'error': 'worker capacity full'})
+                      return
                   _running += 1
 
               def finish_async():
@@ -150,6 +160,9 @@ run: |
               self.write_json(400, {'error': 'invalid request'})
               return
           with _lock:
+              if _running >= _capacity:
+                  self.write_json(429, {'error': 'worker capacity full'})
+                  return
               _running += 1
           try:
               time.sleep(float(duration))
