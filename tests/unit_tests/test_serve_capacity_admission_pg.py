@@ -1821,6 +1821,51 @@ def _enable_durable_intent(engine,
     assert result.rowcount == 1
 
 
+def _current_capacity_controller(
+    incarnation: uuid.UUID,
+    autoscaler: autoscalers.ConcurrencyAutoscaler,
+    manager: object,
+) -> controller.SkyServeController:
+    """Build the controller adapter around the real PostgreSQL repository."""
+    ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
+    ctrl._service_name = 'svc'
+    ctrl._service_hash = 'svc-hash'
+    ctrl._replica_manager = manager
+    ctrl._autoscaler = autoscaler
+    ctrl._routing_state_lock = threading.RLock()
+    ctrl._actuation_epoch_lock = threading.RLock()
+    ctrl._actuation_generation = 0
+    ctrl._actuation_stop = threading.Event()
+    ctrl._reconcile_generation = 0
+    ctrl._durable_demand_snapshot = None
+    ctrl._scale_reconcile_coordinator = types.SimpleNamespace(generation=0,
+                                                              notify=lambda: 0)
+    ctrl._ordinary_launch_binding_authority = (
+        ordinary_launch_binding.ControllerBindingAuthority(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_workspace='workspace-a',
+            service_lifecycle_epoch=3,
+            controller_pid=123,
+            controller_ip='10.0.0.5',
+            controller_incarnation=incarnation,
+            controller_owner_epoch=4,
+            capable=True,
+            binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=3,
+            non_pool_capable=True,
+            non_pool_binding_protocol_version=(
+                ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+            non_pool_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            non_pool_capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+            non_pool_receipt_protocol_version=(
+                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)))
+    return ctrl
+
+
 def _mock_current_allocation(monkeypatch,
                              identity,
                              *,
@@ -3614,6 +3659,140 @@ def test_current_planner_callback_failure_rolls_back(capacity_database):
         ).scalar_one() == 0
 
 
+def test_controller_installs_finalized_partial_paid_wave_and_successor(
+        capacity_database):
+    """The controller consumes the repository-finalized paid policy state."""
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           max_replicas=120,
+                           replica_unit='logical',
+                           max_live_paid_gpu_units=120,
+                           max_scale_up_rate_percentage=100,
+                           scale_up_rate_min_replicas=8,
+                           scale_up_rate_period_seconds=60)
+
+    route_response = _route_response()
+    route_response.update(replica_info={}, num_ready_replicas=0)
+    route_response['capacity_hint']['replica_unit'] = 'logical'
+    route = _publish_route_snapshot(engine, incarnation, route_response, {},
+                                    set())
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_snapshots_table).where(
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    service_name == 'svc').values(producer_protocol_version=2))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_projection_protocol_version=2,
+                    route_projection_controller_incarnation=incarnation))
+
+    def _queued_report(sequence: int) -> dict:
+        report = _demand_report(time.time(),
+                                route,
+                                sequence=sequence,
+                                request_count=0)
+        report.update(http_in_flight={},
+                      async_occupancy={},
+                      occupancy_sample_generation={},
+                      occupancy_sample_age_seconds={},
+                      occupancy_sampled_urls=[],
+                      total_slots_by_url={},
+                      routing_urls=[],
+                      queue_depth=100,
+                      queue_depth_by_priority={'50': 100},
+                      queued_requests_by_compatibility=[{
+                          'priority': 50,
+                          'compatible_accelerators': ['L4'],
+                          'count': 100,
+                      }],
+                      queued_request_deadline_buckets=[{
+                          'priority': 50,
+                          'compatible_accelerators': ['L4'],
+                          'remaining_seconds': 600,
+                          'count': 100,
+                      }],
+                      configured_accelerators=['L4'])
+        return report
+
+    demand_state.ingest_report('svc', 'svc-hash', _queued_report(2))
+    spec = serve_state.get_spec('svc', 1)
+    assert spec is not None
+    autoscaler = autoscalers.Autoscaler.from_spec('svc', spec, version=1)
+    assert isinstance(autoscaler, autoscalers.ConcurrencyAutoscaler)
+    autoscaler.set_configured_accelerator_shapes({'L4': 1})
+    first_spec = _paid_launch_spec(engine, 0, 101)
+    second_spec = _paid_launch_spec(engine, 0, 102)
+    manager = types.SimpleNamespace(
+        max_live_paid_gpu_units=120,
+        workspace='workspace-a',
+        spot_placer=None,
+        prepare_paid_launch_specs=mock.Mock(side_effect=((first_spec,),
+                                                         (second_spec,))))
+    ctrl = _current_capacity_controller(incarnation, autoscaler, manager)
+    installed = []
+    install_projection = autoscaler.install_committed_capacity_projection
+
+    def _install(*, committed_candidate):
+        installed.append(committed_candidate)
+        install_projection(committed_candidate=committed_candidate)
+
+    autoscaler.install_committed_capacity_projection = _install
+
+    def _admit(replica_infos):
+        planning_fingerprint = (
+            serve_state.get_scale_planning_state_fingerprint(
+                'svc', require_version=True))
+        assert planning_fingerprint is not None
+        prepared_inputs = (
+            autoscalers.prepare_controller_scaling_decision_inputs(
+                autoscaler, replica_infos))
+        result = ctrl._plan_and_admit_current_capacity(
+            autoscaler,
+            1,
+            0,
+            0,
+            planning_fingerprint,
+            prepared_inputs,
+            replica_infos,
+            sequenced_reserved_fill=False)
+        assert result is not None
+        return result
+
+    first, first_local, first_prepared = _admit([])
+    pre_finalized = capacity_planning.plan_capacity(first.planner_snapshot)
+
+    assert first_prepared == (first_spec,)
+    assert [member.replica_id for member in first.paid_launch_receipt.members
+           ] == [101]
+    assert first.candidate.paid_launch_target.total() > 1
+    assert first.candidate.next_policy_state is not None
+    assert pre_finalized.next_policy_state is not None
+    assert pre_finalized.next_policy_state.paid_window_started_db_epoch is None
+    assert (first.candidate.next_policy_state.paid_window_started_db_epoch
+            is not None)
+    assert (first.candidate.next_policy_state.paid_window_ceiling_by_accelerator
+            == first.candidate.paid_launch_target)
+    assert dataclasses.replace(
+        first.candidate,
+        next_policy_state=pre_finalized.next_policy_state) == pre_finalized
+    assert first_local.capacity_plan_candidate == first.candidate
+    assert installed == [first.candidate]
+
+    demand_state.ingest_report('svc', 'svc-hash', _queued_report(3))
+    replica_infos = serve_state.get_replica_infos('svc')
+    assert [info.replica_id for info in replica_infos] == [101]
+    successor, successor_local, successor_prepared = _admit(replica_infos)
+
+    assert successor_prepared == (second_spec,)
+    assert successor.authority.generation == first.authority.generation + 1
+    assert successor_local.capacity_plan_candidate == successor.candidate
+    assert installed == [first.candidate, successor.candidate]
+
+
 def test_fresh_zero_multi_pool_admission_accepts_yaml_card_casing(
         capacity_database, monkeypatch):
     """Repository genesis and the production autoscaler share one card domain."""
@@ -3727,42 +3906,7 @@ def test_fresh_zero_multi_pool_admission_accepts_yaml_card_casing(
         spot_placer=None,
         prepare_paid_launch_specs=mock.Mock(
             return_value=(_paid_launch_spec(engine, 0, 101),)))
-    ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
-    ctrl._service_name = 'svc'
-    ctrl._service_hash = 'svc-hash'
-    ctrl._replica_manager = manager
-    ctrl._autoscaler = autoscaler
-    ctrl._routing_state_lock = threading.RLock()
-    ctrl._actuation_epoch_lock = threading.RLock()
-    ctrl._actuation_generation = 0
-    ctrl._actuation_stop = threading.Event()
-    ctrl._reconcile_generation = 0
-    ctrl._durable_demand_snapshot = None
-    ctrl._scale_reconcile_coordinator = types.SimpleNamespace(generation=0,
-                                                              notify=lambda: 0)
-    ctrl._ordinary_launch_binding_authority = (
-        ordinary_launch_binding.ControllerBindingAuthority(
-            service_name='svc',
-            service_hash='svc-hash',
-            service_workspace='workspace-a',
-            service_lifecycle_epoch=3,
-            controller_pid=123,
-            controller_ip='10.0.0.5',
-            controller_incarnation=incarnation,
-            controller_owner_epoch=4,
-            capable=True,
-            binding_mode=ordinary_launch_binding.BindingMode.BOUND,
-            binding_epoch=3,
-            non_pool_capable=True,
-            non_pool_binding_protocol_version=(
-                ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
-            non_pool_profile_set_digest=(
-                ordinary_launch_binding.supported_non_pool_profile_set_digest()
-            ),
-            non_pool_capability_cohort_epoch=(
-                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
-            non_pool_receipt_protocol_version=(
-                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)))
+    ctrl = _current_capacity_controller(incarnation, autoscaler, manager)
 
     def _admit():
         planning_fingerprint = (

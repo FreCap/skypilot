@@ -6852,10 +6852,21 @@ class SkyServeController:
                     f'{common_utils.format_exception(error)}')
                 return None
             snapshot = committed.demand_snapshot
+            planned_candidate = (None if planned is None else
+                                 planned.capacity_plan_candidate)
+            # Paid arbitration finalizes only the DB-clock policy memory of
+            # the pure candidate.  That repository-owned change is part of
+            # the atomic commit, so compare the immutable planning projection
+            # after rebinding it to the committed policy state.  Every other
+            # candidate field must remain exactly equivalent.
+            committed_projection = (
+                None if planned_candidate is None else dataclasses.replace(
+                    planned_candidate,
+                    next_policy_state=committed.candidate.next_policy_state))
             if (planned is None or planned.snapshot != snapshot or
                     durable_plan is None or planned.capacity_planning_snapshot
                     != committed.planner_snapshot or
-                    planned.capacity_plan_candidate != committed.candidate):
+                    committed_projection != committed.candidate):
                 logger.warning('Suppressing local capacity actuation because '
                                'the committed planner candidate changed.')
                 return None
