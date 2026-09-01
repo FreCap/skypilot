@@ -150,6 +150,36 @@ pytest tests/unit_tests/
 pytest tests/unit_tests/test_resources.py
 ```
 
+### Test Layers and Provider Substitution
+
+Use these three test layers consistently:
+
+1. **Unit tests** exercise one unit of policy or orchestration in process. They
+   may use focused mocks or stubs for immediate collaborators, but they do not
+   prove that a provisioning workflow is integrated correctly.
+2. **Unpaid provider-interface end-to-end tests** run the real public workflow,
+   controller, persistence, planning, and reconciliation paths while replacing
+   only external provider network calls with a typed fake provisioning adapter.
+   The fake must model asynchronous provider behavior such as delayed status,
+   partial success, capacity exhaustion, preemption, lost acknowledgements, and
+   deletion; it must not replace the production orchestration being tested.
+3. **Paid end-to-end tests** run the same workflows through real provider
+   adapters and billable resources. Keep them explicitly approved, bounded in
+   size and time, and require teardown plus provider-side absence evidence.
+
+Provisioning must have one narrow, typed substitution boundary consumed by
+production orchestration through normal dependency injection. Use named,
+immutable request and result types and a `Protocol` or ABC; the production
+adapter and typed fake must implement the same interface. Maintain one shared
+behavioral contract suite and run it against the fake in ordinary CI and each
+real adapter in its paid suite.
+
+A graph of monkeypatches over controller, worker, database, and provider
+internals is not end-to-end evidence. Such a test is a unit or integration test
+and must be described as one. If an unpaid end-to-end test cannot be written by
+swapping only the provider interface, simplify or introduce that production
+interface before adding more patches.
+
 ### CI Tests via PR Comments
 
 Trigger CI tests on pull requests using comments:

@@ -3114,17 +3114,22 @@ class Progress:
             self.peak_running_gpu_units_by_cloud[cloud.cloud] = max(
                 self.peak_running_gpu_units_by_cloud.get(cloud.cloud, 0),
                 cloud.running_gpu_units)
+        aws_running = observation.provider.cloud('aws').running_count
+        gcp_running = observation.provider.cloud('gcp').running_count
         if (self.scale_reached_monotonic is None and
-                observation.provider.running_gpu_units
-                >= profile.minimum_running):
+                observation.provider.running_count >= profile.minimum_running
+                and aws_running > 0 and gcp_running > 0):
             if self.scale_started_monotonic is None:
                 raise QualificationError(
-                    'Provider reached RUNNING before the scale timer.')
+                    'Provider reached the physical cross-cloud RUNNING target '
+                    'before the scale timer.')
             elapsed = (observation.observed_monotonic -
                        self.scale_started_monotonic)
             if elapsed > profile.scale_slo_seconds:
                 raise QualificationError(
-                    f'Scale-out took {elapsed:.1f}s; limit is '
+                    f'Scale-out to {profile.minimum_running} physical RUNNING '
+                    f'L4 Spot VMs across AWS and GCP took {elapsed:.1f}s; '
+                    'limit is '
                     f'{profile.scale_slo_seconds:.1f}s.')
             self.scale_reached_monotonic = observation.observed_monotonic
 
@@ -3892,8 +3897,8 @@ async def _wait_for_scale(*, observer: Observer, profile: Profile,
             return
         await asyncio.sleep(profile.poll_seconds)
     raise QualificationError(
-        f'Provider did not reach {profile.minimum_running} RUNNING L4 GPU '
-        'units.')
+        f'Provider did not reach {profile.minimum_running} physical RUNNING '
+        'L4 Spot VMs with nonzero AWS and GCP cohorts.')
 
 
 async def _wait_for_drain(*, observer: Observer, profile: Profile,
