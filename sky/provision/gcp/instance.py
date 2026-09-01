@@ -2,6 +2,7 @@
 import collections
 from collections.abc import Callable
 from collections.abc import Iterable
+from collections.abc import Mapping
 import copy
 from multiprocessing import pool
 import re
@@ -274,6 +275,64 @@ def _get_head_instance_id(instances: list) -> str | None:
     return head_instance_id
 
 
+def _resource_self_link_matches(value: object, *, project_id: str,
+                                resource_path: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    return value.endswith(f'/projects/{project_id}/{resource_path}')
+
+
+def _capture_fresh_compute_instance_identity(
+    *,
+    project_id: str,
+    zone: str,
+    expected_instance_type: str | None,
+    created_instance_ids: list[str],
+    resumed_instance_ids: list[str],
+    running_instances: Mapping[str, Any],
+) -> common.GCPInstanceIdentity | None:
+    """Close one fresh GCE Spot identity from the post-create RUNNING read."""
+    if (not isinstance(expected_instance_type, str) or
+            not expected_instance_type or resumed_instance_ids or
+            len(created_instance_ids) != 1 or
+            len(set(created_instance_ids)) != 1 or
+            set(running_instances) != set(created_instance_ids)):
+        return None
+    instance_name = created_instance_ids[0]
+    instance = running_instances[instance_name]
+    if not isinstance(instance, Mapping):
+        raise ValueError('GCP RUNNING observation is not an instance object.')
+    observed_instance_type = instance_utils.selflink_to_name(
+        expected_instance_type)
+    exact_observation = (
+        instance.get('name') == instance_name and
+        instance.get(instance_utils.GCPComputeInstance.STATUS_FIELD)
+        == instance_utils.GCPComputeInstance.RUNNING_STATE and
+        _resource_self_link_matches(
+            instance.get('selfLink'),
+            project_id=project_id,
+            resource_path=f'zones/{zone}/instances/{instance_name}') and
+        _resource_self_link_matches(instance.get('zone'),
+                                    project_id=project_id,
+                                    resource_path=f'zones/{zone}') and
+        _resource_self_link_matches(
+            instance.get('machineType'),
+            project_id=project_id,
+            resource_path=(f'zones/{zone}/machineTypes/'
+                           f'{observed_instance_type}')))
+    scheduling = instance.get('scheduling')
+    if (not exact_observation or not isinstance(scheduling, Mapping) or
+            scheduling.get('provisioningModel') != 'SPOT'):
+        raise ValueError(
+            'GCP fresh instance does not match the exact RUNNING Spot '
+            'identity.')
+    return common.GCPInstanceIdentity(project_id=project_id,
+                                      zone=zone,
+                                      instance_name=instance_name,
+                                      instance_type=observed_instance_type,
+                                      market_type='spot')
+
+
 def _run_instances(region: str, cluster_name_on_cloud: str,
                    config: common.ProvisionConfig) -> common.ProvisionRecord:
     """See sky/provision/__init__.py"""
@@ -488,13 +547,29 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
             tpu_node,
             vpc_name,
         )
+    fresh_identity = None
+    if resource is instance_utils.GCPComputeInstance:
+        try:
+            fresh_identity = _capture_fresh_compute_instance_identity(
+                project_id=project_id,
+                zone=availability_zone,
+                expected_instance_type=config.node_config.get('machineType'),
+                created_instance_ids=created_instance_ids,
+                resumed_instance_ids=resumed_instance_ids,
+                running_instances=instances)
+        except Exception as error:  # pylint: disable=broad-except
+            # Provisioning itself succeeded. Optional early-feedback evidence
+            # is fail-closed and must not make the ordinary launch fail.
+            logger.debug('Fresh GCP identity evidence is unavailable: '
+                         f'{common_utils.format_exception(error)}')
     return common.ProvisionRecord(provider_name='gcp',
                                   region=region,
                                   zone=availability_zone,
                                   cluster_name=cluster_name_on_cloud,
                                   head_instance_id=head_instance_id,
                                   resumed_instance_ids=resumed_instance_ids,
-                                  created_instance_ids=created_instance_ids)
+                                  created_instance_ids=created_instance_ids,
+                                  fresh_gcp_instance_identity=fresh_identity)
 
 
 def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,

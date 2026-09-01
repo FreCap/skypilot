@@ -1251,7 +1251,12 @@ class PostgresObserver:
                 'Exact async-ledger request summary is unavailable.')
         return request_telemetry_from_summary(summary, ledger['state_counts'])
 
-    def snapshot(self, load_balancer: 'LoadBalancerState') -> DatabaseState:
+    def snapshot(
+        self,
+        load_balancer: 'LoadBalancerState',
+        *,
+        require_complete_demand_report: bool = True,
+    ) -> DatabaseState:
         scope = self._provider_scope
         if scope is None:
             raise QualificationError('Provider scope was not frozen.')
@@ -1478,7 +1483,10 @@ class PostgresObserver:
                     'Paid replicas share one durable GCP provider identity.')
             bound_cluster_zones[cloud_name] = identity['zone']
         demand_report = select_route_authoritative_report(
-            authority, demand_reports, load_balancer)
+            authority,
+            demand_reports,
+            load_balancer,
+            require_complete=require_complete_demand_report)
         return DatabaseState(
             service_hash=service_hash,
             controller=controller_identity,
@@ -1509,8 +1517,17 @@ def select_route_authoritative_report(
     authority: collections.abc.Mapping[str, Any],
     reports: collections.abc.Sequence[collections.abc.Mapping[str, Any]],
     load_balancer: LoadBalancerState,
+    *,
+    require_complete: bool = True,
 ) -> collections.abc.Mapping[str, Any]:
-    """Select only the report belonging to the LB that served this probe."""
+    """Select only the report belonging to the LB that served this probe.
+
+    Scale-out measures provider startup while traffic is intentionally
+    saturating replicas.  A routed report may therefore be incomplete until
+    every new replica has produced its first in-flight sample.  That must not
+    hide already-running provider capacity.  Baseline and drain observations
+    retain the complete-report requirement because they prove exact zero.
+    """
     if (authority.get('lb_ha_enabled') != 1 or
             authority.get('lb_cutover_phase') != 'STABLE' or
             authority.get('lb_active_slot') != load_balancer.slot or
@@ -1544,7 +1561,10 @@ def select_route_authoritative_report(
         report for report in candidates
         if report.get('received_at') == newest_at
     ]
-    if len(newest) != 1 or newest[0].get('complete') is not True:
+    if len(newest) != 1:
+        raise QualificationError(
+            'Routed load-balancer report is ambiguous or incomplete.')
+    if require_complete and newest[0].get('complete') is not True:
         raise QualificationError(
             'Routed load-balancer report is ambiguous or incomplete.')
     return newest[0]
@@ -1663,15 +1683,21 @@ class Observer:
     async def request_telemetry(self) -> RequestTelemetry:
         return await asyncio.to_thread(self._postgres.request_telemetry)
 
-    async def snapshot(self) -> Observation:
+    async def snapshot(
+        self,
+        *,
+        require_complete_demand_report: bool = True,
+    ) -> Observation:
         # Capture raw provider state first, then the durable authorization used
         # to classify it.  Since a binding commit precedes its provider effect,
         # this avoids both logical-name prefix guesses and an old-DB/new-VM
         # ordering manufactured by the observer itself.
         census = await asyncio.to_thread(self._gcp.census)
         load_balancer = await self._http.snapshot()
-        database = await asyncio.to_thread(self._postgres.snapshot,
-                                           load_balancer)
+        database = await asyncio.to_thread(
+            self._postgres.snapshot,
+            load_balancer,
+            require_complete_demand_report=require_complete_demand_report)
         provider = self._gcp.reduce(census, dict(database.bound_cluster_zones))
         return Observation(observed_at=time.time(),
                            observed_monotonic=time.monotonic(),
@@ -2346,7 +2372,8 @@ async def _validated_sample(*, observer: Observer, profile: Profile,
                             phase: str) -> Observation | None:
     """Collect one sample without turning observer loss into launch control."""
     try:
-        observation = await observer.snapshot()
+        observation = await observer.snapshot(
+            require_complete_demand_report=phase != 'scale')
         validate_observation(observation, profile)
         if observation.database.phase_a_pending_replica_ids:
             raise QualificationError(

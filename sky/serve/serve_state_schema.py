@@ -1019,10 +1019,13 @@ paid_capacity_claims_table = sqlalchemy.Table(
     sqlalchemy.Column('demand_source_epoch', sqlalchemy.BigInteger),
     sqlalchemy.Column('capacity_plan_accelerator', sqlalchemy.Text),
     sqlalchemy.Column('capacity_plan_units', sqlalchemy.Integer),
-    # These constraints intentionally match the PostgreSQL-only Serve050
-    # migration. Keep them out of local controller SQLite DDL: num_nonnulls
-    # and the regex operator are PostgreSQL expressions, while local Serve
-    # state still officially supports SQLite.
+    sqlalchemy.Column('provider_allocation_recorded_at',
+                      sqlalchemy.DateTime(timezone=True)),
+    sqlalchemy.Column('provider_allocation_receipt_sha256', sqlalchemy.Text),
+    # These constraints intentionally match the PostgreSQL-only Serve050 and
+    # Serve066 migrations. Keep them out of local controller SQLite DDL:
+    # num_nonnulls and the regex operator are PostgreSQL expressions, while
+    # local Serve state still officially supports SQLite.
     sqlalchemy.CheckConstraint(
         'num_nonnulls(capacity_plan_generation, capacity_plan_sha256, '
         'demand_feed_generation, demand_source_epoch, '
@@ -1037,6 +1040,16 @@ paid_capacity_claims_table = sqlalchemy.Table(
         'length(capacity_plan_accelerator) > 0 AND '
         'capacity_plan_units > 0))',
         name='serve050_paid_claim_plan_values_ck').ddl_if(dialect='postgresql'),
+    sqlalchemy.CheckConstraint(
+        'num_nonnulls(provider_allocation_recorded_at, '
+        'provider_allocation_receipt_sha256) IN (0, 2)',
+        name='serve066_paid_claim_provider_allocation_complete_ck').ddl_if(
+            dialect='postgresql'),
+    sqlalchemy.CheckConstraint(
+        '(provider_allocation_receipt_sha256 IS NULL OR '
+        "provider_allocation_receipt_sha256 ~ '^[0-9a-f]{64}$')",
+        name='serve066_paid_claim_provider_allocation_digest_ck').ddl_if(
+            dialect='postgresql'),
 )
 sqlalchemy.Index('paid_capacity_claims_pool_idx',
                  paid_capacity_claims_table.c.pool_key)

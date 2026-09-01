@@ -792,6 +792,15 @@ def test_route_report_uses_only_the_routed_active_lb():
     assert selected is active
     assert qualifier.demand_units(selected['payload']) == 7
 
+    incomplete = {**active, 'complete': False}
+    with pytest.raises(qualifier.QualificationError,
+                       match='ambiguous or incomplete'):
+        qualifier.select_route_authoritative_report(authority, [incomplete],
+                                                    _load_balancer_state())
+    assert qualifier.select_route_authoritative_report(
+        authority, [incomplete], _load_balancer_state(),
+        require_complete=False) is incomplete
+
     with pytest.raises(qualifier.QualificationError,
                        match='does not match stable'):
         qualifier.select_route_authoritative_report(
@@ -1141,7 +1150,8 @@ def test_exact_provider_free_paid_pending_pair_is_an_observation_miss(tmp_path):
 
     class Observer:
 
-        async def snapshot(self):
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
             return phase_a
 
     receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
@@ -1171,7 +1181,8 @@ def test_phase_a_observation_cannot_hide_a_provider_effect(tmp_path):
 
     class Observer:
 
-        async def snapshot(self):
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
             return phase_a_with_effect
 
     receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
@@ -1185,6 +1196,29 @@ def test_phase_a_observation_cannot_hide_a_provider_effect(tmp_path):
                                         progress=qualifier.Progress(),
                                         receipt=receipt,
                                         phase='scale'))
+
+
+@pytest.mark.parametrize('phase', ['baseline', 'drain'])
+def test_zero_gates_require_complete_demand_reports(tmp_path, phase):
+    observation = _observation()
+
+    class Observer:
+
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert require_complete_demand_report
+            return observation
+
+    receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                service_name='paid-e2e',
+                                profile=qualifier.PROFILES['scale'])
+    observed = asyncio.run(
+        qualifier._validated_sample(observer=Observer(),
+                                    profile=qualifier.PROFILES['scale'],
+                                    progress=qualifier.Progress(),
+                                    receipt=receipt,
+                                    phase=phase))
+    assert observed is observation
+    assert receipt._payload['samples'][-1]['phase'] == phase
 
 
 def test_demand_projection_is_zero_sensitive():
@@ -1319,7 +1353,8 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
 
     class Observer:
 
-        async def snapshot(self):
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
             result = observations.pop(0)
             if isinstance(result, Exception):
                 raise result

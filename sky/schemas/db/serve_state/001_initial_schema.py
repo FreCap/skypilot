@@ -70,6 +70,8 @@ _POST_REVISION_001_COLUMNS = {
         'demand_source_epoch',
         'capacity_plan_accelerator',
         'capacity_plan_units',
+        'provider_allocation_recorded_at',
+        'provider_allocation_receipt_sha256',
     }),
 }
 _POST_REVISION_001_CONSTRAINTS = {
@@ -91,6 +93,8 @@ _POST_REVISION_001_CONSTRAINTS = {
     'paid_capacity_claims': frozenset({
         'serve050_paid_claim_plan_complete_ck',
         'serve050_paid_claim_plan_values_ck',
+        'serve066_paid_claim_provider_allocation_complete_ck',
+        'serve066_paid_claim_provider_allocation_digest_ck',
     }),
 }
 

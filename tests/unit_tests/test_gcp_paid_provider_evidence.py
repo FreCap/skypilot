@@ -9,6 +9,146 @@ from sky.provision.gcp import instance
 from sky.provision.gcp import instance_utils
 from sky.server.requests import postgres as request_postgres
 
+_PROJECT_ID = 'boltz-spot-project'
+_ZONE = 'us-central1-a'
+_INSTANCE_NAME = 'sky-svc-head-12345678-compute'
+_INSTANCE_TYPE = 'g2-standard-4'
+
+
+def _running_spot_instance(**updates):
+    prefix = ('https://www.googleapis.com/compute/v1/projects/'
+              f'{_PROJECT_ID}')
+    value = {
+        'name': _INSTANCE_NAME,
+        'selfLink': f'{prefix}/zones/{_ZONE}/instances/{_INSTANCE_NAME}',
+        'zone': f'{prefix}/zones/{_ZONE}',
+        'machineType': f'{prefix}/zones/{_ZONE}/machineTypes/{_INSTANCE_TYPE}',
+        'status': 'RUNNING',
+        'scheduling': {
+            'provisioningModel': 'SPOT',
+        },
+    }
+    value.update(updates)
+    return value
+
+
+def test_capture_fresh_gcp_identity_requires_exact_running_spot() -> None:
+    identity = instance._capture_fresh_compute_instance_identity(  # pylint: disable=protected-access
+        project_id=_PROJECT_ID,
+        zone=_ZONE,
+        expected_instance_type=_INSTANCE_TYPE,
+        created_instance_ids=[_INSTANCE_NAME],
+        resumed_instance_ids=[],
+        running_instances={_INSTANCE_NAME: _running_spot_instance()})
+
+    assert identity == common.GCPInstanceIdentity(project_id=_PROJECT_ID,
+                                                  zone=_ZONE,
+                                                  instance_name=_INSTANCE_NAME,
+                                                  instance_type=_INSTANCE_TYPE,
+                                                  market_type='spot')
+
+
+@pytest.mark.parametrize('updates', [{
+    'name': 'other-instance'
+}, {
+    'status': 'PROVISIONING'
+}, {
+    'selfLink': ('https://www.googleapis.com/compute/v1/projects/'
+                 f'other-project/zones/{_ZONE}/instances/{_INSTANCE_NAME}')
+}, {
+    'zone': ('https://www.googleapis.com/compute/v1/projects/'
+             f'{_PROJECT_ID}/zones/us-central1-b')
+}, {
+    'machineType': ('https://www.googleapis.com/compute/v1/projects/'
+                    f'{_PROJECT_ID}/zones/{_ZONE}/machineTypes/'
+                    'g2-standard-8')
+}, {
+    'scheduling': {
+        'provisioningModel': 'STANDARD'
+    }
+}, {
+    'scheduling': {}
+}],
+                         ids=('wrong-name', 'not-running', 'wrong-project',
+                              'wrong-zone', 'wrong-machine', 'not-spot',
+                              'missing-market'))
+def test_capture_fresh_gcp_identity_rejects_observation_mismatch(
+        updates) -> None:
+    with pytest.raises(ValueError, match='exact RUNNING Spot identity'):
+        instance._capture_fresh_compute_instance_identity(  # pylint: disable=protected-access
+            project_id=_PROJECT_ID,
+            zone=_ZONE,
+            expected_instance_type=_INSTANCE_TYPE,
+            created_instance_ids=[_INSTANCE_NAME],
+            resumed_instance_ids=[],
+            running_instances={
+                _INSTANCE_NAME: _running_spot_instance(**updates)
+            })
+
+
+@pytest.mark.parametrize(
+    ('expected_instance_type', 'created', 'resumed', 'running'),
+    [(None, [_INSTANCE_NAME], [], {
+        _INSTANCE_NAME: _running_spot_instance()
+    }), (_INSTANCE_TYPE, [], [], {}),
+     (_INSTANCE_TYPE, [_INSTANCE_NAME, 'worker'], [], {
+         _INSTANCE_NAME: _running_spot_instance(),
+         'worker': _running_spot_instance(name='worker'),
+     }),
+     (_INSTANCE_TYPE, [_INSTANCE_NAME], ['resumed'], {
+         _INSTANCE_NAME: _running_spot_instance(),
+     }), (_INSTANCE_TYPE, [_INSTANCE_NAME], [], {}),
+     (_INSTANCE_TYPE, [_INSTANCE_NAME], [], {
+         _INSTANCE_NAME: _running_spot_instance(),
+         'other': _running_spot_instance(name='other'),
+     })],
+    ids=('missing-machine', 'no-create', 'multi-create', 'resumed',
+         'not-observed', 'extra-running'))
+def test_capture_fresh_gcp_identity_omits_inexact_fresh_set(
+        expected_instance_type, created, resumed, running) -> None:
+    assert instance._capture_fresh_compute_instance_identity(  # pylint: disable=protected-access
+        project_id=_PROJECT_ID,
+        zone=_ZONE,
+        expected_instance_type=expected_instance_type,
+        created_instance_ids=created,
+        resumed_instance_ids=resumed,
+        running_instances=running) is None
+
+
+@pytest.mark.parametrize('provisioning_model', ['SPOT', 'STANDARD'])
+def test_run_instances_populates_only_matching_gcp_spot_identity(
+        monkeypatch, provisioning_model) -> None:
+    config = common.ProvisionConfig(provider_config={
+        'project_id': _PROJECT_ID,
+        'availability_zone': _ZONE,
+    },
+                                    authentication_config={},
+                                    docker_config={},
+                                    node_config={'machineType': _INSTANCE_TYPE},
+                                    count=1,
+                                    tags={},
+                                    resume_stopped_nodes=False,
+                                    ports_to_open_on_launch=None)
+    observed = _running_spot_instance(scheduling={
+        'provisioningModel': provisioning_model,
+    })
+    monkeypatch.setattr(
+        instance_utils.GCPComputeInstance, 'filter',
+        mock.Mock(side_effect=[{}, {}, {}, {
+            _INSTANCE_NAME: observed
+        }]))
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'create_instances',
+                        mock.Mock(return_value=(None, [_INSTANCE_NAME])))
+
+    record = instance._run_instances(  # pylint: disable=protected-access
+        'us-central1', 'sky-svc', config)
+
+    if provisioning_model == 'SPOT':
+        assert record.fresh_gcp_instance_identity is not None
+        assert record.fresh_gcp_instance_identity.project_id == _PROJECT_ID
+    else:
+        assert record.fresh_gcp_instance_identity is None
+
 
 def test_query_managed_boot_disks_requires_marker_and_exact_name(
         monkeypatch) -> None:

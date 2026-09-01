@@ -1,5 +1,6 @@
 """Backend: runs on cloud virtual machines, managed by Ray."""
 from collections.abc import Iterable
+from collections.abc import Mapping
 import contextlib
 import copy
 import dataclasses
@@ -114,6 +115,7 @@ ordinary_launch_binding = adaptors_common.LazyImport(
     'sky.serve.ordinary_launch_binding')
 ordinary_launch_request = adaptors_common.LazyImport(
     'sky.server.requests.ordinary_launch')
+paid_capacity = adaptors_common.LazyImport('sky.serve.paid_capacity')
 provider_phase = adaptors_common.LazyImport('sky.serve.provider_phase')
 serve_placement_history = adaptors_common.LazyImport(
     'sky.serve.placement_history')
@@ -544,6 +546,105 @@ def _reserved_fill_kubernetes_provider_effect_guard_factory(
             not isinstance(cloud, clouds.SSH)):
         return guard_factory
     return None
+
+
+def _record_full_fresh_paid_provider_allocation(
+    *,
+    launch_context: Mapping[str, Any],
+    cloud: clouds.Cloud,
+    workspace: str,
+    region: clouds.Region,
+    instance_type: str | None,
+    use_spot: bool,
+    requested_num_nodes: int,
+    cluster_existed: bool,
+    cluster_name_on_cloud: str,
+    provision_record: provision_common.ProvisionRecord,
+    bulk_provision_fn: typing.Callable[..., Any],
+    builtin_bulk_provision_fn: typing.Callable[..., Any] | None,
+) -> bool:
+    """Checkpoint exact provider-ready paid capacity before runtime setup."""
+    if (not ordinary_launch_binding.has_bound_launch_context(launch_context) or
+            ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY
+            not in launch_context):
+        return False
+    try:
+        context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+            launch_context)
+    except ValueError as error:
+        raise exceptions.ServeReplicaLaunchFenceError(
+            'Paid provider-allocation context is malformed.') from error
+    if (context.profile.kind is not ordinary_launch_binding.
+            NonPoolLaunchProfileKind.ORDINARY_PAID):
+        return False
+    provider = provision_record.provider_name.casefold()
+    created_ids = tuple(
+        sorted(
+            str(instance_id)
+            for instance_id in provision_record.created_instance_ids))
+    resumed_ids = tuple(
+        sorted(
+            str(instance_id)
+            for instance_id in provision_record.resumed_instance_ids))
+    head_instance_id = str(provision_record.head_instance_id)
+    eligible = bool(builtin_bulk_provision_fn is not None and
+                    bulk_provision_fn is builtin_bulk_provision_fn and
+                    not cluster_existed and
+                    isinstance(cloud, (clouds.AWS, clouds.GCP)) and
+                    provider == str(cloud).casefold() and
+                    provision_record.region == region.name and
+                    provision_record.cluster_name == cluster_name_on_cloud and
+                    isinstance(instance_type, str) and instance_type and
+                    use_spot is True and type(requested_num_nodes) is int and
+                    requested_num_nodes == 1 and  # pylint: disable=unidiomatic-typecheck
+                    not resumed_ids and len(created_ids) == requested_num_nodes
+                    and len(set(created_ids)) == requested_num_nodes
+                    and head_instance_id in created_ids)
+    if not eligible:
+        return False
+    provider_identity = None
+    provider_project_id = None
+    if isinstance(cloud, clouds.AWS):
+        aws_identity = provision_record.fresh_aws_instance_identity
+        if (aws_identity is None or
+                aws_identity.ec2_instance_id not in created_ids or
+                aws_identity.region != region.name or
+                aws_identity.availability_zone != provision_record.zone or
+                aws_identity.instance_type != instance_type or
+                aws_identity.market_type != 'spot'):
+            return False
+        provider_identity = aws_identity.aws_account_id
+    else:
+        gcp_identity = provision_record.fresh_gcp_instance_identity
+        if (gcp_identity is None or
+                gcp_identity.instance_name not in created_ids or
+                gcp_identity.zone != provision_record.zone or
+                gcp_identity.instance_type != instance_type or
+                gcp_identity.market_type != 'spot'):
+            return False
+        provider_project_id = gcp_identity.project_id
+    receipt = paid_capacity.PaidProviderAllocationReceipt(
+        contract=paid_capacity.PAID_PROVIDER_ALLOCATION_CONTRACT,
+        association_id=str(context.association_id),
+        replica_record_id=str(context.replica_record_id),
+        provider=provider,
+        workspace=workspace,
+        provider_identity=provider_identity,
+        provider_project_id=provider_project_id,
+        region=provision_record.region,
+        zone=provision_record.zone,
+        instance_type=instance_type,
+        cluster_name_on_cloud=cluster_name_on_cloud,
+        requested_num_nodes=requested_num_nodes,
+        head_instance_id=head_instance_id,
+        created_instance_ids=created_ids,
+        resumed_instance_ids=resumed_ids,
+        use_spot=True)
+    disposition = ordinary_launch_request._record_paid_provider_allocation(  # pylint: disable=protected-access
+        launch_context, receipt)
+    logger.info('Recorded paid provider allocation %s for %s.',
+                disposition.value, cluster_name_on_cloud)
+    return True
 
 
 _RESERVED_FILL_POD_MATERIALIZED_KEY = '_reserved_fill_pod_materialized'
@@ -1990,6 +2091,20 @@ class RetryingVmProvisioner:
                                         cluster_name,
                                         handle.cluster_name_on_cloud),
                                     **bulk_provision_kwargs)
+                        _record_full_fresh_paid_provider_allocation(
+                            launch_context=self._extra_launch_context,
+                            cloud=to_provision.cloud,
+                            workspace=skypilot_config.get_active_workspace(),
+                            region=region,
+                            instance_type=to_provision.instance_type,
+                            use_spot=to_provision.use_spot,
+                            requested_num_nodes=num_nodes,
+                            cluster_existed=cluster_exists,
+                            cluster_name_on_cloud=handle.cluster_name_on_cloud,
+                            provision_record=provision_record,
+                            bulk_provision_fn=bulk_provision_fn,
+                            builtin_bulk_provision_fn=(
+                                builtin_bulk_provision_fn))
                         if reserved_fill_fence is not None:
                             # A successful protocol-v2 Kubernetes bulk call
                             # means its exact Pod now exists or was adopted.

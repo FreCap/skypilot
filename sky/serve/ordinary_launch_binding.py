@@ -24,7 +24,7 @@ import hashlib
 import json
 import math
 import re
-from typing import Any, Protocol
+from typing import Any, Protocol, TYPE_CHECKING
 import uuid
 
 import sqlalchemy
@@ -44,6 +44,9 @@ from sky.utils import common_utils
 from sky.utils import locks
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
+
+if TYPE_CHECKING:
+    from sky.serve import paid_capacity as paid_capacity_lib
 
 reserved_fill_planner = adaptors_common.LazyImport(
     'sky.serve.reserved_fill_planner')
@@ -213,6 +216,13 @@ class ProviderEvidence(str, enum.Enum):
     ABSENT = 'ABSENT'
     UNKNOWN = 'UNKNOWN'
     REPLACED = 'REPLACED'
+
+
+class ProviderAllocationDisposition(str, enum.Enum):
+    """Result of one exact paid provider-allocation checkpoint."""
+
+    RECORDED = 'RECORDED'
+    EXACT_REPLAY = 'EXACT_REPLAY'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1274,6 +1284,10 @@ class ExecutionClaim(Protocol):
 
 ClaimValidator = Callable[
     [sqlalchemy.engine.Connection, uuid.UUID, ExecutionClaim], bool]
+PaidProviderAllocationRequestValidator = Callable[[
+    sqlalchemy.engine.Connection, BoundNonPoolLaunchContext, Mapping[
+        str, Any], 'paid_capacity_lib.PaidProviderAllocationReceipt'
+], bool]
 TransitionBarrier = Callable[[sqlalchemy.engine.Connection], bool]
 
 
@@ -5119,6 +5133,79 @@ def require_active_provider_effect_authorization(
         raise OrdinaryLaunchBindingConflict(
             'Bound provider I/O has no active association authorization.')
     return authorization
+
+
+def record_paid_provider_allocation(
+    launch_context: Mapping[str, Any],
+    receipt: 'paid_capacity_lib.PaidProviderAllocationReceipt',
+    *,
+    request_validator: PaidProviderAllocationRequestValidator,
+) -> ProviderAllocationDisposition:
+    """Atomically checkpoint one full-fresh running paid allocation.
+
+    This is economic pool feedback, not provider cleanup evidence. It runs on
+    the exact shared launch-authority PostgreSQL session while the bound API
+    request still owns its execution claim and provider effect.
+    """
+    authorization = _active_authorization(launch_context)
+    if authorization is None:
+        raise OrdinaryLaunchBindingConflict(
+            'Paid provider allocation has no active effect authorization.')
+    context = authorization.context
+    if (not isinstance(context, BoundNonPoolLaunchContext) or
+            context.profile.kind is not NonPoolLaunchProfileKind.ORDINARY_PAID
+            or authorization.guard is None or
+            not isinstance(receipt, paid_capacity.PaidProviderAllocationReceipt)
+            or receipt.association_id != str(context.association_id) or
+            receipt.replica_record_id != str(context.replica_record_id)):
+        raise OrdinaryLaunchBindingConflict(
+            'Paid provider-allocation receipt has no exact ordinary-paid '
+            'authority.')
+
+    def _record(connection: sqlalchemy.engine.Connection) -> bool:
+        snapshot = validate_effect_authority_in_connection(
+            connection,
+            context,
+            authorization.claim,
+            authorization.claim_validator,
+            launch_context=launch_context)
+        association = snapshot.association
+        if (association['resolution'] != Resolution.BOUND.value or
+                association['reconciliation_outcome']
+                != ReconciliationOutcome.ACTIVE_ADOPT.value or
+                association['effect_phase'] != EffectPhase.PROVIDER_IO.value or
+                int(association['owner_revision'])
+                != authorization.owner_revision):
+            raise OrdinaryLaunchBindingConflict(
+                'Paid provider allocation lost its active provider phase.')
+        if not request_validator(connection, context, association, receipt):
+            raise OrdinaryLaunchBindingConflict(
+                'Paid provider allocation contradicts its immutable '
+                'request authority.')
+        pool_key = association['paid_capacity_pool_key']
+        if not isinstance(pool_key, str) or not pool_key:
+            raise OrdinaryLaunchBindingConflict(
+                'Paid provider allocation has no exact pool identity.')
+        try:
+            receipt.validate_pool_key(pool_key)
+            receipt_sha256 = receipt.sha256(
+                pool_key=pool_key, profile_digest=context.profile.digest)
+        except ValueError as error:
+            raise OrdinaryLaunchBindingConflict(
+                'Paid provider-allocation receipt contradicts its bound '
+                'pool.') from error
+        return serve_state.record_paid_provider_allocation_in_transaction(
+            connection,
+            service_name=context.service_name,
+            service_hash=str(association['service_hash']),
+            replica_id=context.replica_id,
+            pool_key=pool_key,
+            receipt_sha256=receipt_sha256)
+
+    recorded = serve_state.run_service_replica_launch_authority_transaction(
+        authorization.guard, _record)
+    return (ProviderAllocationDisposition.RECORDED
+            if recorded else ProviderAllocationDisposition.EXACT_REPLAY)
 
 
 def begin_service_job_io(launch_context: Mapping[str, Any]) -> int | None:

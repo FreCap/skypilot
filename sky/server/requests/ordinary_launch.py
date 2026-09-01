@@ -97,6 +97,21 @@ def _begin_service_job_io(
     return ordinary_launch_binding.begin_service_job_io(extra_launch_context)
 
 
+def _record_paid_provider_allocation(extra_launch_context: Mapping[str, Any],
+                                     receipt: Any) -> Any:
+    """Persist provider-ready paid feedback under the active request claim."""
+    if not _has_bound_context_fields(extra_launch_context):
+        raise exceptions.ServeReplicaLaunchFenceError(
+            'Paid provider allocation has no bound request context.')
+    _validate_bound_entrypoint_context(extra_launch_context)
+    return ordinary_launch_binding.record_paid_provider_allocation(
+        extra_launch_context,
+        receipt,
+        request_validator=(
+            request_postgres.
+            validate_paid_provider_allocation_receipt_in_transaction))
+
+
 def _record_service_job(extra_launch_context: Mapping[str, Any],
                         job_id: int) -> int | None:
     """Record a bound service job under the active provider authority."""

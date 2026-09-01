@@ -59,6 +59,7 @@ from sky.utils.db import migration_utils
 if typing.TYPE_CHECKING:
     from sky.serve import capacity_authority as capacity_authority_lib
     from sky.serve import ordinary_launch_binding as ordinary_launch_binding_lib
+    from sky.serve import paid_capacity as paid_capacity_lib
     from sky.serve import replica_managers
 
 logger = sky_logging.init_logger(__name__)
@@ -5025,6 +5026,129 @@ def _ordinary_paid_request_identity_matches(
                 == context.input_digest)
     except (AttributeError, TypeError, ValueError):
         return False
+
+
+def _paid_provider_allocation_identity_from_locked_request(
+    connection: sqlalchemy.engine.Connection,
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    association: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    """Derive provider identity only from one locked immutable request.
+
+    The caller already owns and has validated the active request claim in this
+    transaction.  This helper adds the retained request bytes, service owner,
+    and frozen workspace configuration to the provider-allocation authority;
+    it never consults ambient workspace configuration.
+    """
+    if (context.profile.kind is not ordinary_launch_binding.
+            NonPoolLaunchProfileKind.ORDINARY_PAID or
+            context.capability_cohort_epoch
+            != ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH or
+            association.get('association_id') != context.association_id or
+            association.get('request_id') != context.request_id or
+            association.get('replica_record_id') != context.replica_record_id or
+            association.get('resolution')
+            != ordinary_launch_binding.Resolution.BOUND.value or
+            association.get('reconciliation_outcome')
+            != ordinary_launch_binding.ReconciliationOutcome.ACTIVE_ADOPT.value
+            or association.get('effect_phase')
+            != ordinary_launch_binding.EffectPhase.PROVIDER_IO.value or
+            association.get('service_job_id') is not None):
+        return None
+    _, request_row, _, pin_row = _lock_bound_request_evidence(
+        connection, context)
+    if request_row is None or pin_row is None:
+        return None
+    try:
+        request = _request_from_mapping(
+            typing.cast(sqlalchemy.engine.RowMapping, request_row))
+        parsed_context = (
+            ordinary_launch_binding.parse_bound_non_pool_launch_context(
+                request.request_body.extra_launch_context))
+        if (parsed_context != context or
+                not _ordinary_paid_request_identity_matches(
+                    connection, association, request_row, request, context) or
+                _request_service_job_id(
+                    request_row, str(association['cluster_name'])) is not None):
+            return None
+        pool_key = association.get('paid_capacity_pool_key')
+        pool_identity = paid_capacity.pool_key_payload(str(pool_key))
+        config_snapshot = request.request_body.override_skypilot_config
+        workspace = association.get('service_workspace')
+        if (not isinstance(pool_identity, Mapping) or
+                not isinstance(config_snapshot, Mapping) or
+                not isinstance(workspace, str) or not workspace or
+                pool_identity.get('workspace') != workspace or
+                config_snapshot.get('active_workspace') != workspace):
+            return None
+        cloud = pool_identity.get('cloud')
+        region = pool_identity.get('region')
+        if cloud == 'aws':
+            credential_profile = (
+                skypilot_config.
+                get_effective_workspace_region_config_from_snapshot(
+                    config_snapshot,
+                    'aws', ('profile',),
+                    region=region,
+                    workspace=workspace))
+            return ('aws',
+                    ordinary_launch_binding.ordinary_paid_aws_provider_identity(
+                        association, credential_profile=credential_profile))
+        if cloud != 'gcp':
+            return None
+        project_id = (
+            skypilot_config.get_effective_workspace_region_config_from_snapshot(
+                config_snapshot,
+                'gcp', ('project_id',),
+                region=region,
+                workspace=workspace))
+        return ('gcp',
+                ordinary_launch_binding.ordinary_paid_gcp_provider_identity(
+                    association, project_id=project_id))
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
+def validate_paid_provider_allocation_receipt_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    association: Mapping[str, Any],
+    receipt: paid_capacity_lib.PaidProviderAllocationReceipt,
+) -> bool:
+    """Bind provider-ready feedback to the exact retained launch request."""
+    if (connection.dialect.name
+            != db_utils.SQLAlchemyDialect.POSTGRESQL.value or not isinstance(
+                context, ordinary_launch_binding.BoundNonPoolLaunchContext) or
+            not isinstance(receipt, paid_capacity.PaidProviderAllocationReceipt)
+            or receipt.association_id != str(context.association_id) or
+            receipt.replica_record_id != str(context.replica_record_id)):
+        return False
+    resolved = _paid_provider_allocation_identity_from_locked_request(
+        connection, context, association)
+    if resolved is None:
+        return False
+    provider, identity = resolved
+    try:
+        receipt.validate_pool_key(str(association['paid_capacity_pool_key']))
+    except (KeyError, TypeError, ValueError):
+        return False
+    common_matches = bool(
+        receipt.provider == provider and
+        receipt.workspace == identity.get('workspace') and
+        receipt.region == identity.get('region') and
+        receipt.zone == identity.get('zone') and
+        receipt.instance_type == identity.get('instance_type') and
+        receipt.cluster_name_on_cloud == identity.get('cluster_name_on_cloud')
+        and receipt.requested_num_nodes == identity.get('num_nodes') and
+        receipt.use_spot is identity.get('use_spot'))
+    if not common_matches:
+        return False
+    if provider == 'aws':
+        return bool(
+            receipt.provider_identity == identity.get('aws_account_id') and
+            receipt.provider_project_id is None)
+    return bool(receipt.provider_identity is None and
+                receipt.provider_project_id == identity.get('project_id'))
 
 
 def authorize_bound_non_pool_provider_present_cleanup(
