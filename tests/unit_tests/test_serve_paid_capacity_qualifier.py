@@ -974,7 +974,7 @@ def test_replica_binding_selection_accepts_settled_failed_provider_absence():
         qualifier.select_replica_binding(replica, [malformed])
 
 
-def test_exact_associationless_phase_a_pair_is_an_observation_miss(tmp_path):
+def test_exact_provider_free_paid_pending_pair_is_an_observation_miss(tmp_path):
     record_id = '22222222-2222-4222-8222-222222222222'
     pool_key = 'exact-gcp-spot-pool'
     info = replica_managers.ReplicaInfo(replica_id=7,
@@ -1002,16 +1002,114 @@ def test_exact_associationless_phase_a_pair_is_an_observation_miss(tmp_path):
         'replica_id': 7,
         'pool_key': pool_key,
     }
-    assert qualifier._is_exact_associationless_paid_phase_a_pair(
+    assert qualifier._is_exact_provider_free_paid_pending_pair(
         replica, claim, [])
-    assert not qualifier._is_exact_associationless_paid_phase_a_pair(
+    assert not qualifier._is_exact_provider_free_paid_pending_pair(
         replica, {
             **claim, 'pool_key': 'another-pool'
         }, [])
-    assert not qualifier._is_exact_associationless_paid_phase_a_pair(
+    profile = qualifier.ordinary_launch_binding.NonPoolLaunchProfile.create(
+        qualifier.ordinary_launch_binding.NonPoolLaunchProfileKind.
+        ORDINARY_PAID,
+        authorization_reference=(
+            f'paid-capacity:incarnation:{record_id}:{pool_key}'),
+        authorization_generation=1,
+        authorization_payload={'capacity_plan_generation': 1})
+    quiesced_at = datetime.datetime(2026,
+                                    9,
+                                    1,
+                                    1,
+                                    0,
+                                    tzinfo=datetime.timezone.utc)
+    predecessor = {
+        'association_id': uuid.UUID('11111111-1111-4111-8111-111111111111'),
+        'request_id': 'request-1',
+        'service_name': 'paid-e2e',
+        'service_hash': 'incarnation',
+        'service_workspace': 'mt-hybrid',
+        'service_lifecycle_epoch': 1,
+        'service_binding_epoch': 1,
+        'service_version': 1,
+        'replica_id': 7,
+        'replica_record_id': record_id,
+        'launch_generation': 1,
+        'input_digest': 'a' * 64,
+        'cluster_name': 'paid-e2e-7',
+        'tenant_scope': 'tenant-a',
+        'paid_capacity_pool_key': pool_key,
+        'effect_phase': 'NOT_STARTED',
+        'resolution': 'PRE_EFFECT_TERMINAL',
+        'terminal_status': 'FAILED',
+        'terminal_cause': 'request_never_executed',
+        'terminal_execution_generation': 1,
+        'execution_quiescence_required': True,
+        'execution_quiesced_generation': 1,
+        'execution_quiesced_at': quiesced_at,
+        'service_job_id': None,
+        'result_recorded_at': None,
+        'ambiguity_code': None,
+        'projected_at': quiesced_at,
+        'pin_released_at': quiesced_at,
+        'tombstone_not_before': quiesced_at + datetime.timedelta(days=60),
+        'cancel_reason': None,
+        'cancel_requested_at': None,
+        'binding_protocol_version': 2,
+        'profile_kind': profile.kind.value,
+        'profile_version': profile.version,
+        'profile_digest': profile.digest,
+        'capability_cohort_epoch':
+            (qualifier.ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+            ),
+        'capability_profile_set_digest':
+            (qualifier.ordinary_launch_binding.
+             supported_non_pool_profile_set_digest()),
+        'receipt_protocol_version': 1,
+        'authorization_kind': profile.authorization_kind.value,
+        'authorization_reference': profile.authorization_reference,
+        'authorization_generation': profile.authorization_generation,
+        'authorization_digest': profile.authorization_digest,
+        'reconciliation_outcome': 'PRE_EFFECT_TERMINAL',
+        'provider_evidence': 'NOT_QUERIED',
+        'provider_evidence_observed_at': None,
+        'provider_evidence_payload': None,
+        'provider_evidence_digest': None,
+    }
+    assert (qualifier.ordinary_launch_binding.
+            settled_association_proves_execution_quiescence(predecessor))
+    assert qualifier._is_exact_provider_free_paid_pending_pair(
+        replica, claim, [predecessor])
+    assert not qualifier._is_exact_provider_free_paid_pending_pair(
         replica, claim, [{
-            'replica_id': 7,
-            'replica_record_id': record_id,
+            **predecessor,
+            'paid_capacity_pool_key': 'another-pool',
+        }])
+    assert not qualifier._is_exact_provider_free_paid_pending_pair(
+        replica, claim, [{
+            **predecessor,
+            'resolution': 'AMBIGUOUS',
+            'reconciliation_outcome': 'POST_EFFECT_AMBIGUOUS',
+        }])
+    assert not qualifier._is_exact_provider_free_paid_pending_pair(
+        replica, claim, [{
+            **predecessor,
+            'execution_quiesced_at': None,
+        }])
+    assert not qualifier._is_exact_provider_free_paid_pending_pair(
+        replica, claim, [{
+            **predecessor,
+            'launch_generation': 2,
+        }])
+    assert not qualifier._is_exact_provider_free_paid_pending_pair(
+        replica, claim, [{
+            **predecessor,
+            'cancel_reason': 'explicit_cancel',
+            'cancel_requested_at': quiesced_at,
+        }])
+    assert not qualifier._is_exact_provider_free_paid_pending_pair(
+        replica, claim,
+        [predecessor, {
+            **predecessor,
+            'association_id': 'association-2',
         }])
 
     phase_a = _observation(database=_database_state(

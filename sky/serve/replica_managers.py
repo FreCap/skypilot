@@ -4120,21 +4120,20 @@ class SkyPilotReplicaManager(ReplicaManager):
         max_candidates: int,
         occupied_replica_ids: Iterable[int],
         version_authority: paid_capacity.PaidLaunchVersionAuthority,
-        aws_account_id: str | None = None,
+        paid_location_launch_budget: paid_capacity.LaunchBudget,
     ) -> tuple[paid_capacity.PaidLaunchSpec, ...]:
-        """Freeze a bounded cost-ordered Spot superset without authority I/O.
+        """Freeze a bounded state-aware Spot cohort without authority I/O.
 
-        This runs before PostgreSQL knows the final target.  It therefore owns
-        no plan generation, claim, demand epoch, or launch authority.  The
-        caller may pass a per-card superset ceiling; the atomic repository is
-        free to accept a sparse subset from its final locked observation.
+        The launch budget is an optimistic PostgreSQL observation built before
+        this manager lock.  It selects at most one concrete spec per requested
+        backend.  The fused repository remains the sole authority: it locks
+        and revalidates every selected exact pool before persisting any row.
 
         The only mutable inputs consulted under ``self.lock`` are the elected
-        manager configuration, its already-materialized placement catalog,
-        and numeric-ID allocator.  No database/provider operation or worker
-        construction occurs here.  Numeric IDs may be burned by a rejected
-        template; this avoids an in-process reservation object crossing the
-        transaction boundary.
+        manager configuration and its already-materialized placement catalog.
+        No database/provider operation or worker construction occurs here.
+        Prepared identities do not advance the process allocator; only the
+        committed receipt does.
         """
         if (type(max_candidates) is not int or max_candidates < 0 or  # pylint: disable=unidiomatic-typecheck
                 max_candidates > paid_capacity.MAX_PREPARED_LAUNCH_SPECS):
@@ -4144,13 +4143,18 @@ class SkyPilotReplicaManager(ReplicaManager):
         shapes: dict[str, int] = {}
         caps: dict[str, int] = {}
         for raw_card, raw_width in accelerator_shapes.items():
-            card = str(raw_card).casefold()
+            if not isinstance(raw_card, str):
+                raise ValueError('accelerator_shapes requires string keys.')
+            card = raw_card.casefold()
             if (not card or card in shapes or type(raw_width) is not int or  # pylint: disable=unidiomatic-typecheck
                     raw_width < 1):
                 raise ValueError('accelerator_shapes is malformed.')
             shapes[card] = raw_width
         for raw_card, raw_cap in max_gpu_units_by_accelerator.items():
-            card = str(raw_card).casefold()
+            if not isinstance(raw_card, str):
+                raise ValueError(
+                    'max_gpu_units_by_accelerator requires string keys.')
+            card = raw_card.casefold()
             if (card not in shapes or card in caps or
                     type(raw_cap) is not int or raw_cap < 0):  # pylint: disable=unidiomatic-typecheck
                 raise ValueError('max_gpu_units_by_accelerator is malformed.')
@@ -4166,6 +4170,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         if not isinstance(version_authority,
                           paid_capacity.PaidLaunchVersionAuthority):
             raise ValueError('Paid launch version authority is malformed.')
+        if (not isinstance(paid_location_launch_budget,
+                           paid_capacity.LaunchBudget) or
+                not paid_location_launch_budget.globally_managed):
+            raise ValueError('Paid launch budget is malformed.')
 
         with self.lock:
             if self._update_recovery_required or self._is_pool:
@@ -4210,7 +4218,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             catalog_entries = {
                 entry.location: entry for entry in placer.ranked_catalog_entries
             }
-            ranked_locations = []
+            ranked_pools = []
+            seen_pool_keys = set()
             for location in placer.ranked_active_locations():
                 cloud = str(location.cloud).casefold()
                 accelerators = location.accelerators
@@ -4234,121 +4243,134 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # An unpriced or stale catalog member cannot become paid
                     # provider authority.  Keep trying exact priced pools.
                     continue
-                ranked_locations.append(
-                    (location, cloud, card, raw_width, catalog_entry.rank))
-            if not ranked_locations:
+                if caps[card] < raw_width * num_nodes:
+                    continue
+                try:
+                    exact_pool_key = (paid_location_launch_budget.
+                                      pool_key_by_location[location])
+                except KeyError:
+                    # The optimistic budget intentionally omits providers
+                    # whose exact account identity could not be resolved.
+                    continue
+                if exact_pool_key in seen_pool_keys:
+                    continue
+                seen_pool_keys.add(exact_pool_key)
+                ranked_pools.append((location, cloud, card, raw_width,
+                                     catalog_entry.rank, exact_pool_key))
+            if not ranked_pools:
+                return ()
+            requested_backends = sum(caps[card] // (width * num_nodes)
+                                     for card, width in shapes.items())
+            if requested_backends > max_candidates:
+                logger.warning(
+                    'Suppressing paid launch preparation because %s requested '
+                    'backends exceed the bounded preparation limit %s.',
+                    requested_backends, max_candidates)
                 return ()
 
             prepared: list[paid_capacity.PaidLaunchSpec] = []
             remaining = dict(caps)
-            per_pool_window = paid_capacity.base_limit()
-            exploration_round = 0
+            next_replica_id = self._next_replica_id
+            metadata_by_location = {
+                location: (cloud, card, width, catalog_rank, exact_pool_key)
+                for location, cloud, card, width, catalog_rank, exact_pool_key
+                in ranked_pools
+            }
+            occurrence_by_rank: dict[int, int] = {}
             while len(prepared) < max_candidates:
-                made_progress = False
-                for location, cloud, card, width, catalog_rank in ranked_locations:
-                    physical_gpu_units = width * num_nodes
-                    for pool_slot in range(per_pool_window):
-                        if (len(prepared) >= max_candidates or
-                                remaining[card] < physical_gpu_units):
-                            break
-                        try:
-                            exact_pool_key = paid_capacity.pool_key(
-                                location,
-                                workspace=self._workspace,
-                                num_nodes=num_nodes,
-                                aws_account_id=aws_account_id)
-                        except ValueError:
-                            # AWS account identity is intentionally not
-                            # resolved here: that would be provider I/O under
-                            # the manager lock. A catalog without a frozen
-                            # account contributes no provider-free template.
-                            break
-                        while self._next_replica_id in occupied:
-                            self._next_replica_id += 1
-                        replica_id = self._next_replica_id
-                        self._next_replica_id += 1
-                        occupied.add(replica_id)
-                        replica_record_id = str(uuid.uuid4())
-                        cluster_name = (
-                            serve_utils.generate_replica_cluster_name(
-                                self._service_name, replica_id,
-                                self._resource_scope))
-                        log_file_name = (
-                            serve_utils.generate_replica_launch_log_file_name(
-                                self._service_name, replica_id,
-                                self._resource_scope))
-                        raw_override = location.to_dict()
-                        raw_override['cloud'] = cloud
-                        storage_override = _encode_replica_resource_state(
-                            raw_override)
-                        assert storage_override is not None
-                        planned_capacity = (width if self._uses_logical_replicas
-                                            else 1)
-                        frozen_override = (
-                            paid_capacity.freeze_paid_launch_payload(
-                                storage_override))
-                        worker_construction = (
-                            paid_capacity.freeze_paid_launch_payload({
-                                'schema_version': 1,
-                                'launch_yaml_content': launch_yaml_content,
-                                'cluster_name': cluster_name,
-                                'log_file_name': log_file_name,
-                                'resources_override': storage_override,
-                                'retry_until_up': False,
-                                'frozen_controller_config_path': controller_config_path,
-                            }))
-                        pool_payload = paid_capacity.pool_key_payload(
-                            exact_pool_key)
-                        assert pool_payload is not None
-                        provider_identity = pool_payload.get(
-                            'provider_identity')
-                        provider_account = (
-                            provider_identity.get('aws_account_id')
-                            if isinstance(provider_identity, dict) else None)
-                        paid_spec = paid_capacity.PaidLaunchSpec(
-                            ordinal=len(prepared),
-                            service_name=self._service_name,
-                            service_hash=service_hash,
-                            service_lifecycle_epoch=(
-                                authority.service_lifecycle_epoch),
-                            service_version=version,
-                            replica_id=replica_id,
-                            replica_record_id=replica_record_id,
-                            cluster_name_seed=cluster_name,
-                            worker_construction=worker_construction,
-                            provider_account=provider_account,
-                            cloud=cloud,
-                            workspace=self._workspace,
-                            region=location.region,
-                            zone=location.zone,
-                            instance_type=location.instance_type,
-                            pool_key=exact_pool_key,
-                            frontier_key=paid_capacity.frontier_key(location),
-                            accelerator=card,
-                            gpu_units_per_node=width,
-                            num_nodes=num_nodes,
-                            resources_override=frozen_override,
-                            catalog_evidence=(
-                                paid_capacity.PaidLaunchCatalogEvidence(
-                                    placement_catalog_sha256=(
-                                        placement_catalog_sha256),
-                                    catalog_rank=catalog_rank,
-                                    exploration_round=exploration_round,
-                                    slot_within_pool_window=pool_slot,
-                                    version_authority=version_authority)))
-                        # Exercise the same complete row constructor used by
-                        # PostgreSQL without giving this seed clock authority.
-                        paid_capacity.build_pristine_paid_replica_state(
-                            paid_spec,
-                            replica_port=replica_port,
-                            planned_capacity=planned_capacity,
-                            created_at=None)
-                        prepared.append(paid_spec)
-                        remaining[card] -= physical_gpu_units
-                        made_progress = True
-                if not made_progress:
+                allowed_locations = {
+                    location for location, (_, card, width, _,
+                                            _) in metadata_by_location.items()
+                    if remaining[card] >= width * num_nodes
+                }
+                if not allowed_locations:
                     break
-                exploration_round += 1
+                selected_location = paid_capacity.preview_location(
+                    placer,
+                    paid_location_launch_budget,
+                    skip_zero_cost_preference=True,
+                    allowed_locations=allowed_locations)
+                if selected_location is None:
+                    break
+                (cloud, card, width, catalog_rank,
+                 exact_pool_key) = metadata_by_location[selected_location]
+                physical_gpu_units = width * num_nodes
+                occurrence = occurrence_by_rank.get(catalog_rank, 0)
+                occurrence_by_rank[catalog_rank] = occurrence + 1
+                while next_replica_id in occupied:
+                    next_replica_id += 1
+                replica_id = next_replica_id
+                next_replica_id += 1
+                occupied.add(replica_id)
+                replica_record_id = str(uuid.uuid4())
+                cluster_name = serve_utils.generate_replica_cluster_name(
+                    self._service_name, replica_id, self._resource_scope)
+                log_file_name = (
+                    serve_utils.generate_replica_launch_log_file_name(
+                        self._service_name, replica_id, self._resource_scope))
+                raw_override = selected_location.to_dict()
+                raw_override['cloud'] = cloud
+                storage_override = _encode_replica_resource_state(raw_override)
+                assert storage_override is not None
+                planned_capacity = width if self._uses_logical_replicas else 1
+                frozen_override = paid_capacity.freeze_paid_launch_payload(
+                    storage_override)
+                worker_construction = paid_capacity.freeze_paid_launch_payload({
+                    'schema_version': 1,
+                    'launch_yaml_content': launch_yaml_content,
+                    'cluster_name': cluster_name,
+                    'log_file_name': log_file_name,
+                    'resources_override': storage_override,
+                    'retry_until_up': False,
+                    'frozen_controller_config_path': controller_config_path,
+                })
+                pool_payload = paid_capacity.pool_key_payload(exact_pool_key)
+                assert pool_payload is not None
+                provider_identity = pool_payload.get('provider_identity')
+                provider_account = (provider_identity.get('aws_account_id')
+                                    if isinstance(provider_identity, dict) else
+                                    None)
+                paid_spec = paid_capacity.PaidLaunchSpec(
+                    ordinal=len(prepared),
+                    service_name=self._service_name,
+                    service_hash=service_hash,
+                    service_lifecycle_epoch=authority.service_lifecycle_epoch,
+                    service_version=version,
+                    replica_id=replica_id,
+                    replica_record_id=replica_record_id,
+                    cluster_name_seed=cluster_name,
+                    worker_construction=worker_construction,
+                    provider_account=provider_account,
+                    cloud=cloud,
+                    workspace=self._workspace,
+                    region=selected_location.region,
+                    zone=selected_location.zone,
+                    instance_type=selected_location.instance_type,
+                    pool_key=exact_pool_key,
+                    frontier_key=paid_capacity.frontier_key(selected_location),
+                    accelerator=card,
+                    gpu_units_per_node=width,
+                    num_nodes=num_nodes,
+                    resources_override=frozen_override,
+                    catalog_evidence=paid_capacity.PaidLaunchCatalogEvidence(
+                        placement_catalog_sha256=placement_catalog_sha256,
+                        catalog_rank=catalog_rank,
+                        exploration_round=(occurrence //
+                                           paid_capacity.base_limit()),
+                        slot_within_pool_window=(occurrence %
+                                                 paid_capacity.base_limit()),
+                        version_authority=version_authority))
+                # Exercise the same complete row constructor used by
+                # PostgreSQL without giving this seed clock authority.
+                paid_capacity.build_pristine_paid_replica_state(
+                    paid_spec,
+                    replica_port=replica_port,
+                    planned_capacity=planned_capacity,
+                    created_at=None)
+                prepared.append(paid_spec)
+                remaining[card] -= physical_gpu_units
+                paid_capacity.debit(paid_location_launch_budget,
+                                    selected_location)
             return tuple(prepared)
 
     def _build_paid_launch_worker_postcommit(
@@ -4564,12 +4586,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                 receipt.service_hash != self._service_hash or
                 receipt.service_version != self.latest_version or
                 authority is None or not authority.generic_launches_required or
-                receipt.service_lifecycle_epoch
-                != authority.service_lifecycle_epoch):
+                receipt.service_lifecycle_epoch !=
+                authority.service_lifecycle_epoch):
             raise ValueError('Paid launch receipt is stale for this manager.')
 
         built: list[tuple[ReplicaInfo, _ReplicaLaunchThread,
                           _ReplicaLaunchResult]] = []
+        accepted_locations: set[spot_placer.Location] = set()
         recovery_identities: list[_PaidPhaseARecoveryIdentity] = []
         try:
             committed_by_identity = {
@@ -4584,8 +4607,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 spec = spec_by_identity.get(identity)
                 if (spec is None or spec.service_name != receipt.service_name or
                         spec.service_hash != receipt.service_hash or
-                        spec.service_lifecycle_epoch
-                        != receipt.service_lifecycle_epoch or
+                        spec.service_lifecycle_epoch !=
+                        receipt.service_lifecycle_epoch or
                         spec.service_version != receipt.service_version or
                         spec.pool_key != member.pool_key or
                         spec.accelerator != member.accelerator or
@@ -4601,6 +4624,25 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._build_paid_launch_worker_postcommit(
                         spec, member, info))
                 built.append((info, launch_thread, launch_result))
+                stored_override = paid_capacity.thaw_paid_launch_payload(
+                    spec.resources_override)
+                location = spot_placer.Location.from_resources_override(
+                    _decode_replica_resource_state(stored_override))
+                if location is None:
+                    raise ValueError(
+                        'Committed paid launch lost its exact retry location.')
+                accepted_locations.add(location)
+            placer = self._spot_placer
+            if accepted_locations and placer is None:
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    'Committed paid launch lost its placement policy.')
+            if placer is not None:
+                for location in accepted_locations:
+                    placer.reserve_retry(location)
+                # A rejected prepared alternative never reaches this point.
+                # Persist accepted probe reservations before a worker can
+                # publish or perform a provider effect.
+                self._persist_spot_placement_state_if_dirty()
         except BaseException:
             self._enqueue_paid_phase_a_recovery_identities(recovery_identities)
             raise
@@ -4609,6 +4651,15 @@ class SkyPilotReplicaManager(ReplicaManager):
         try:
             with self.lock:
                 runtime = self._legacy_mutation_runtime_state()
+                if receipt.members:
+                    # Prepared candidates have no authority and must not
+                    # consume the process allocator.  Advance only past IDs
+                    # whose replica rows committed atomically with this
+                    # acknowledged receipt.
+                    self._next_replica_id = max(
+                        self._next_replica_id,
+                        max(member.replica_id for member in receipt.members) +
+                        1)
                 for info, launch_thread, _ in built:
                     existing = runtime.launch_thread_pool.get(info.replica_id)
                     if (existing is not None and

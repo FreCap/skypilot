@@ -1236,20 +1236,10 @@ class SpotPlacer:
         """Return the immutable selector order computed at construction."""
         return self._ranked_catalog_entries
 
-    def select_next_location(
-            self,
-            *,
-            skip_zero_cost_preference: bool = False,
-            allowed_locations: set[Location] | None = None) -> Location | None:
-        """Select the cheapest usable location, preferring the free tier.
-
-        ``skip_zero_cost_preference`` is the broker's demand-placement gate:
-        when a service already holds its zero-cost grant, free locations are
-        excluded while a paid candidate exists. A zero-cost-only catalog must
-        still serve, so the gate throttles preference rather than availability.
-        ``allowed_locations`` keeps a card-targeted launch inside its exact
-        accelerator subset.
-        """
+    def _next_location_candidate(
+            self, *, skip_zero_cost_preference: bool,
+            allowed_locations: set[Location] | None) -> Location | None:
+        """Return the cheapest usable location without reserving a retry."""
         active_locations = [
             location for location in self.active_locations()
             if allowed_locations is None or location in allowed_locations
@@ -1269,16 +1259,43 @@ class SpotPlacer:
             ]
             if paid:
                 active_locations = paid
-        # A failed launch benches the exact selected location, so the next
-        # selection falls through to the next-cheapest ACTIVE candidate.
-        selected = self._min_cost_location(active_locations)
+        return self._min_cost_location(active_locations)
+
+    def preview_next_location(
+            self,
+            *,
+            skip_zero_cost_preference: bool = False,
+            allowed_locations: set[Location] | None = None) -> Location | None:
+        """Observe the next location without consuming its retry allowance."""
+        return self._next_location_candidate(
+            skip_zero_cost_preference=skip_zero_cost_preference,
+            allowed_locations=allowed_locations)
+
+    def select_next_location(
+            self,
+            *,
+            skip_zero_cost_preference: bool = False,
+            allowed_locations: set[Location] | None = None) -> Location | None:
+        """Select and reserve the cheapest usable location.
+
+        ``skip_zero_cost_preference`` is the broker's demand-placement gate:
+        when a service already holds its zero-cost grant, free locations are
+        excluded while a paid candidate exists. A zero-cost-only catalog must
+        still serve, so the gate throttles preference rather than availability.
+        ``allowed_locations`` keeps a card-targeted launch inside its exact
+        accelerator subset.
+        """
+        selected = self._next_location_candidate(
+            skip_zero_cost_preference=skip_zero_cost_preference,
+            allowed_locations=allowed_locations)
+        if selected is None:
+            return None
         self._consume_retry_if_benched(selected)
         # Large heterogeneous catalogs routinely contain hundreds of entries.
         # Emitting every candidate for every replica turns the hot placement
         # path into multi-megabyte log churn; the durable placement snapshot is
         # the complete diagnostic surface.
-        logger.info('Selected location %s from %d active candidate(s).',
-                    selected, len(active_locations))
+        logger.info('Selected location %s.', selected)
         return selected
 
     def ranked_active_locations(

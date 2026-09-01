@@ -519,22 +519,29 @@ class TestConnectionLocalPaidAdmission:
                                        resource_scope='paid-core-scope')
 
     @staticmethod
-    def _spec() -> paid_capacity.PaidClaimPersistenceSpec:
+    def _spec(replica_id: int = 1,
+              accelerator_count: int = 1,
+              region: str = 'us-central1',
+              frontier_limit: int = 1
+             ) -> paid_capacity.PaidClaimPersistenceSpec:
         location = spot_placer.Location(cloud=clouds.GCP(),
-                                        region='us-central1',
+                                        region=region,
                                         zone=None,
-                                        accelerators={'L4': 1},
+                                        accelerators={
+                                            'L4': accelerator_count
+                                        },
                                         use_spot=True,
-                                        instance_type='g2-standard-4')
+                                        instance_type=(
+                                            f'test-l4-{accelerator_count}'))
         info = replica_managers.ReplicaInfo(
-            replica_id=1,
-            cluster_name='paid-core-svc-1',
+            replica_id=replica_id,
+            cluster_name=f'paid-core-svc-{replica_id}',
             replica_port='8080',
             is_spot=True,
             location=location,
             version=1,
             resources_override=location.to_dict())
-        candidate = paid_capacity.PaidClaimCandidate(replica_id=1,
+        candidate = paid_capacity.PaidClaimCandidate(replica_id=replica_id,
                                                      replica_info=info,
                                                      location=location,
                                                      priority=20,
@@ -545,7 +552,7 @@ class TestConnectionLocalPaidAdmission:
                                             workspace='default',
                                             num_nodes=1),
             frontier_key=paid_capacity.frontier_key(location),
-            frontier_limit=1)
+            frontier_limit=frontier_limit)
 
     @staticmethod
     def _legacy_admit(
@@ -666,6 +673,156 @@ class TestConnectionLocalPaidAdmission:
                 assert session.execute(
                     sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
                                      ).select_from(table)).scalar_one() == 0
+
+    def test_gpu_cap_skips_wide_alternative_and_admits_narrow_one(
+            self, broker_engine):
+        self._add_service()
+        specs = [
+            self._spec(replica_id=1,
+                       accelerator_count=8,
+                       region='us-central1-wide'),
+            self._spec(replica_id=2,
+                       accelerator_count=1,
+                       region='us-central1-narrow'),
+        ]
+
+        with orm.Session(broker_engine) as session:
+            serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+                session.connection())
+            owner = serve_state._lock_service_owner_row_in_session(
+                session,
+                'paid-core-svc',
+                'paid-core-hash', (11, '10.0.0.1'),
+                require_launch_allowed=True)
+            assert owner is not None
+            upstream = serve_state._PaidCapacityAdmissionUpstreamContext(
+                service_hash='paid-core-hash',
+                service_version=owner.current_version,
+                max_live_paid_gpu_units=4)
+            census = serve_state._paid_capacity_admission_census_in_session(
+                session,
+                'paid-core-svc',
+                'paid-core-hash',
+                specs,
+                max_live_paid_gpu_units=4)
+            assert census is not None
+            locked_context = (
+                serve_state._lock_paid_capacity_admission_context_in_session(
+                    session,
+                    broker_engine,
+                    'paid-core-svc',
+                    specs,
+                    upstream=upstream,
+                    census=census,
+                    base_limit=1,
+                    now=100))
+            decision = (
+                serve_state._admit_replicas_with_paid_capacity_claims_in_session(
+                    session,
+                    broker_engine,
+                    'paid-core-svc',
+                    specs,
+                    locked_context=locked_context,
+                    base_limit=1,
+                    max_limit=1,
+                    service_limit=None,
+                    success_ttl_seconds=60,
+                    failure_cooldown_seconds=60,
+                    waiter_ttl_seconds=30,
+                    plan_budget=serve_state._PaidCapacityAdmissionPlanBudget(
+                        target_units_by_group=(('l4', 1),),
+                        member_debits=(('l4', 1), ('l4', 1)))))
+
+            assert decision.result_values == ('service_saturated', 'acquired')
+            assert decision.accepted_indices == (1,)
+            session.rollback()
+
+    def test_plan_budget_scans_saturated_pool_and_clears_waiters(
+            self, broker_engine):
+        self._add_service()
+        specs = [
+            self._spec(replica_id=index + 1,
+                       region=region,
+                       frontier_limit=3)
+            for index, region in enumerate((
+                'us-central1-a',
+                'us-central1-a',
+                'us-central1-b',
+                'us-central1-b',
+                'us-central1-c',
+                'us-central1-c',
+            ))
+        ]
+
+        with orm.Session(broker_engine) as session:
+            session.execute(
+                sqlalchemy.insert(
+                    serve_state.paid_capacity_pools_table).values(
+                        pool_key=specs[2].pool_key,
+                        current_limit=1,
+                        successes_since_resize=0,
+                        last_failure_at=39,
+                        updated_at=39))
+            serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+                session.connection())
+            owner = serve_state._lock_service_owner_row_in_session(
+                session,
+                'paid-core-svc',
+                'paid-core-hash', (11, '10.0.0.1'),
+                require_launch_allowed=True)
+            assert owner is not None
+            upstream = serve_state._PaidCapacityAdmissionUpstreamContext(
+                service_hash='paid-core-hash',
+                service_version=owner.current_version,
+                max_live_paid_gpu_units=None)
+            census = serve_state._paid_capacity_admission_census_in_session(
+                session,
+                'paid-core-svc',
+                'paid-core-hash',
+                specs,
+                max_live_paid_gpu_units=None)
+            assert census is not None
+            locked_context = (
+                serve_state._lock_paid_capacity_admission_context_in_session(
+                    session,
+                    broker_engine,
+                    'paid-core-svc',
+                    specs,
+                    upstream=upstream,
+                    census=census,
+                    base_limit=2,
+                    now=100))
+            decision = (
+                serve_state._admit_replicas_with_paid_capacity_claims_in_session(
+                    session,
+                    broker_engine,
+                    'paid-core-svc',
+                    specs,
+                    locked_context=locked_context,
+                    base_limit=2,
+                    max_limit=2,
+                    service_limit=None,
+                    success_ttl_seconds=60,
+                    failure_cooldown_seconds=60,
+                    waiter_ttl_seconds=30,
+                    plan_budget=serve_state._PaidCapacityAdmissionPlanBudget(
+                        target_units_by_group=(('l4', 4),),
+                        member_debits=(('l4', 1),) * 6)))
+
+            assert decision.result_values == (
+                'acquired',
+                'acquired',
+                'acquired',
+                'saturated',
+                'acquired',
+                'service_saturated',
+            )
+            assert decision.accepted_indices == (0, 1, 2, 4)
+            waiter_count = session.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    serve_state.paid_capacity_waiters_table)).scalar_one()
+            assert waiter_count == 0
+            session.rollback()
 
     def test_legacy_wrapper_validates_before_persisting(self, broker_engine,
                                                         monkeypatch):

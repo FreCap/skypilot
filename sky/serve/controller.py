@@ -6372,7 +6372,6 @@ class SkyServeController:
             card: backend_limits.get(card, 0) * width * backend_num_nodes
             for card, width in shapes.items()
         }
-        max_candidates = sum(backend_limits.values())
         try:
             version_authority = serve_state.get_paid_launch_version_authority(
                 self._service_name, decision_version)
@@ -6400,31 +6399,38 @@ class SkyServeController:
                 common_utils.format_exception(error))
             return ()
         placer = self._replica_manager.spot_placer
-        aws_account_id = None
-        if placer is not None:
-            locations = tuple(placer.ranked_active_locations())
-            try:
-                # This is the only provider-I/O step.  It deliberately happens
-                # before ReplicaManager, routing, and PostgreSQL locks.
-                aws_account_id = (
-                    paid_capacity.resolve_aws_account_id_for_locations(
-                        locations, workspace=self._replica_manager.workspace))
-            except Exception as error:  # pylint: disable=broad-except
-                # Missing AWS identity suppresses AWS templates only.  GCP
-                # templates remain preparable in the same heterogeneous tick.
-                logger.warning(
-                    'Disabling AWS paid candidates because the exact workspace '
-                    'account is unavailable: %s',
-                    common_utils.format_exception(error))
+        if placer is None:
+            return ()
+        try:
+            # This optimistic read is deliberately before ReplicaManager and
+            # PostgreSQL correctness locks.  The fused admission transaction
+            # revalidates every selected pool and any stale underfill schedules
+            # a fresh reconcile.
+            paid_launch_budget = paid_capacity.build_launch_budget(
+                placer,
+                workspace=self._replica_manager.workspace,
+                existing_replica_infos=replica_infos,
+                globally_managed=True,
+                service_name=self._service_name,
+                service_hash=self._service_hash,
+                requested_frontier_keys={(card,) for card in backend_limits},
+                max_live_paid_gpu_units=max_live_paid_gpu_units,
+                prospective_backend_claims_by_accelerator=backend_limits)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Suppressing paid candidates because the advisory launch '
+                'budget is unavailable: %s',
+                common_utils.format_exception(error))
+            return ()
         try:
             prepared = self._replica_manager.prepare_paid_launch_specs(
                 accelerator_shapes=shapes,
                 max_gpu_units_by_accelerator=card_ceilings,
-                max_candidates=max_candidates,
+                max_candidates=sum(backend_limits.values()),
                 occupied_replica_ids=(
                     info.replica_id for info in replica_infos),
                 version_authority=version_authority,
-                aws_account_id=aws_account_id)
+                paid_location_launch_budget=paid_launch_budget)
             if (not isinstance(prepared, tuple) or
                     any(not isinstance(spec, paid_capacity.PaidLaunchSpec)
                         for spec in prepared)):
@@ -6445,6 +6451,20 @@ class SkyServeController:
         """Isolate the disposable post-commit autoscaler projection adapter."""
         decision_autoscaler.install_committed_capacity_projection(
             committed_candidate=committed_candidate)
+
+    @staticmethod
+    def _paid_launch_receipt_underfills_plan(
+        candidate: capacity_planning.CapacityPlanCandidate,
+        receipt: paid_capacity.PaidLaunchReceipt,
+    ) -> bool:
+        """Whether optimistic pool selection left locked paid work unfilled."""
+        accepted: dict[str, int] = {}
+        for member in receipt.members:
+            card = member.accelerator.casefold()
+            accepted[card] = accepted.get(card, 0) + member.plan_units
+        return any(
+            accepted.get(card.casefold(), 0) < target
+            for card, target in candidate.paid_launch_target.entries)
 
     def _plan_and_admit_current_capacity(
         self,
@@ -6846,6 +6866,13 @@ class SkyServeController:
                         planning_state_fingerprint)))
             except (capacity_admission.CapacityAdmissionError,
                     ValueError) as error:
+                if isinstance(
+                        error,
+                        capacity_admission.CapacityAdmissionRetryableConflict):
+                    # Drop the stale preload and let the coordinator rebuild
+                    # replica inputs and candidate specs from durable rows.
+                    # Retrying this closure would reuse the stale snapshot.
+                    self._notify_scale_reconcile()
                 logger.warning(
                     'Suppressing paid launch because current demand/supply '
                     'planning could not commit: '
@@ -7051,6 +7078,15 @@ class SkyServeController:
                     if paid_launch_receipt.members:
                         self._replica_manager.materialize_paid_launch_receipt(
                             paid_launch_receipt, prepared_paid_launch_specs)
+                    if (paid_launch_receipt.members and
+                            self._paid_launch_receipt_underfills_plan(
+                                committed_capacity_plan, paid_launch_receipt)):
+                        # The optimistic pool-state read raced a locked claim,
+                        # cooldown, or frontier update.  Committed members are
+                        # already safe to launch; immediately rebuild the
+                        # residual from fresh durable state instead of waiting
+                        # for provider feedback that may never arrive.
+                        self._notify_scale_reconcile()
                     retirement_changed = False
                     if (fresh_aggregate_zero and
                             durable_snapshot.reconcile_authority.
