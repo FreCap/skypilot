@@ -46,6 +46,8 @@ from sky.serve import route_projection_schema
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import service
+from sky.serve import service_spec
+from sky.serve import spot_placer
 from sky.serve import zero_cost_actuation
 from sky.serve import zero_cost_actuation_schema
 from sky.serve.server import core as serve_core
@@ -592,6 +594,7 @@ def _prepare_paid_provider_absence_graph(
         ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID),
     effect_phase: ordinary_launch_binding.EffectPhase = (
         ordinary_launch_binding.EffectPhase.PROVIDER_IO),
+    canonical_paid_claim_priority: int | None = None,
 ) -> _PaidProviderAbsenceGraph:
     if not ordinary_launch_binding.is_paid_provider_reconciliation_phase(
             effect_phase):
@@ -602,6 +605,24 @@ def _prepare_paid_provider_absence_graph(
     info = replica_managers.ReplicaInfo.from_storage_dict(_gc_replica_state())
     info.is_spot = True
     info.paid_capacity_pool_key = pool_key
+    paid_location = None
+    if canonical_paid_claim_priority is not None:
+        paid_location = spot_placer.Location(cloud=clouds.AWS(),
+                                             region='us-east-1',
+                                             zone='us-east-1a',
+                                             accelerators={'L4': 1},
+                                             use_spot=True,
+                                             instance_type='g6.xlarge')
+        info = replica_managers.ReplicaInfo(
+            replica_id=3,
+            cluster_name='gc-service-3',
+            replica_port='8080',
+            is_spot=True,
+            location=paid_location,
+            version=2,
+            resources_override=paid_location.to_dict(),
+            planned_capacity=1)
+        info.replica_record_id = str(_GC_REPLICA_RECORD_ID)
     replacement_authorization = None
     if profile_kind is (ordinary_launch_binding.NonPoolLaunchProfileKind.
                         UNKNOWN_CAPACITY_REPLACEMENT):
@@ -681,31 +702,80 @@ def _prepare_paid_provider_absence_graph(
                 serve_state_schema.services_table.c.name ==
                 'gc-service').values(owner_user_id='tenant-a',
                                      owner_user_name='Tenant A'))
-        connection.execute(
-            sqlalchemy.insert(
-                serve_state_schema.paid_capacity_pools_table).values(
-                    pool_key=pool_key,
-                    current_limit=1,
-                    successes_since_resize=0,
-                    updated_at=time.time()))
-        connection.execute(
-            sqlalchemy.update(serve_state_schema.replicas_table).where(
-                serve_state_schema.replicas_table.c.service_name ==
-                'gc-service',
-                serve_state_schema.replicas_table.c.replica_id == 3).values(
-                    status='PROVISIONING',
-                    is_spot=True,
-                    paid_capacity_pool_key=pool_key,
-                    replica_state=info.to_storage_dict()))
-        connection.execute(
-            sqlalchemy.insert(
-                serve_state_schema.paid_capacity_claims_table).values(
-                    service_name='gc-service',
-                    service_hash='gc-service-hash',
-                    replica_id=3,
-                    pool_key=pool_key,
-                    priority=1,
-                    claimed_at=time.time()))
+        if canonical_paid_claim_priority is None:
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_pools_table).values(
+                        pool_key=pool_key,
+                        current_limit=1,
+                        successes_since_resize=0,
+                        updated_at=time.time()))
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    'gc-service',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='PROVISIONING',
+                        is_spot=True,
+                        paid_capacity_pool_key=pool_key,
+                        replica_state=info.to_storage_dict()))
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_claims_table).values(
+                        service_name='gc-service',
+                        service_hash='gc-service-hash',
+                        replica_id=3,
+                        pool_key=pool_key,
+                        priority=1,
+                        claimed_at=time.time()))
+        else:
+            # The canonical writer owns the initial replica+claim insert, so
+            # remove the schema fixture's placeholder row and provide the
+            # current typed service spec it validates under the service lock.
+            connection.execute(
+                sqlalchemy.delete(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    'gc-service',
+                    serve_state_schema.replicas_table.c.replica_id == 3))
+            current_spec = service_spec.SkyServiceSpec(
+                readiness_path='/health',
+                ports='8080',
+                initial_delay_seconds=0,
+                readiness_timeout_seconds=5,
+                endpoint_probe_interval_seconds=1,
+                lb_stream_timeout_seconds=10,
+                min_replicas=0,
+                max_replicas=10,
+                target_concurrency_per_replica=1,
+                spot_placer='dynamic_fallback')
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                    serve_state_schema.version_specs_table.c.service_name ==
+                    'gc-service',
+                    serve_state_schema.version_specs_table.c.version ==
+                    2).values(spec=serve_state._serialize_current_service_spec(  # pylint: disable=protected-access
+                        current_spec)))
+
+    if canonical_paid_claim_priority is not None:
+        assert paid_location is not None
+        budget = paid_capacity.LaunchBudget(
+            remaining_by_location={paid_location: 1},
+            pool_key_by_location={paid_location: pool_key},
+            states_by_pool_key={},
+            globally_managed=True,
+            service_claim_limit=1,
+            frontier_limit=1,
+            frontier_key_by_location={paid_location: ('l4',)})
+        assert paid_capacity.try_persist_claim(
+            service_name='gc-service',
+            service_hash='gc-service-hash',
+            controller_owner=(123, '10.0.0.2'),
+            replica_id=3,
+            replica_info=info,
+            location=paid_location,
+            budget=budget,
+            priority=canonical_paid_claim_priority
+        ) is paid_capacity.ClaimResult.ACQUIRED
 
     profile = ordinary_launch_binding.resolve_non_pool_launch_profile(
         'gc-service', 3, _GC_REPLICA_RECORD_ID)
@@ -4070,6 +4140,124 @@ def test_projected_paid_provider_absence_consumes_exact_committed_retirement(
                     service_name == 'gc-service',
                     paid_retirement.serve_paid_replica_retirements_table.c.
                     replica_id == 3)).scalar_one() == 0
+
+
+def test_paid_restart_to_provider_absence_reaches_exact_zero(
+        bound_request_database, monkeypatch) -> None:
+    """Compose paid admission, restart adoption, and terminal cleanup.
+
+    This is the production journey the isolated contract tests did not cover:
+    a non-minimum request priority is frozen into the paid claim and bound
+    launch profile, restart adoption receives the controller's minimum launch
+    priority, and provider-absence cleanup must still consume the complete
+    graph.  The pre-fix adoption UPSERT rewrote the claim priority here, so the
+    later frozen-profile validation failed closed and left the replica and
+    COMMITTED retirement behind indefinitely.
+    """
+    engine, backend = bound_request_database
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database, monkeypatch, canonical_paid_claim_priority=50)
+    claims = serve_state_schema.paid_capacity_claims_table
+    replicas = serve_state_schema.replicas_table
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    retirements = paid_retirement.serve_paid_replica_retirements_table
+
+    with engine.connect() as connection:
+        # Selecting whole rows makes this assertion cover every relational and
+        # JSON authority field, including timestamps, planner attribution,
+        # immutable record identity, binding pointer and frozen profile.
+        claim_before = dict(
+            connection.execute(
+                sqlalchemy.select(claims).where(
+                    claims.c.service_name == 'gc-service',
+                    claims.c.service_hash == 'gc-service-hash',
+                    claims.c.replica_id == 3)).mappings().one())
+        replica_before = dict(
+            connection.execute(
+                sqlalchemy.select(replicas).where(
+                    replicas.c.service_name == 'gc-service',
+                    replicas.c.replica_id == 3)).mappings().one())
+    assert set(claim_before) == set(claims.c.keys())
+    assert set(replica_before) == set(replicas.c.keys())
+    assert claim_before['priority'] == 50
+    assert replica_before['is_spot'] is True
+
+    restart_info = serve_state.get_replica_info_from_id('gc-service', 3)
+    assert restart_info is not None
+    assert paid_capacity.adopt_existing_claims(
+        service_name='gc-service',
+        service_hash='gc-service-hash',
+        controller_owner=(123, '10.0.0.2'),
+        workspace='workspace-a',
+        placer=None,
+        replica_infos=[restart_info],
+        priority=serve_constants.LB_REQUEST_PRIORITY_MIN)
+    with engine.connect() as connection:
+        claim_after = dict(
+            connection.execute(
+                sqlalchemy.select(claims).where(
+                    claims.c.service_name == 'gc-service',
+                    claims.c.service_hash == 'gc-service-hash',
+                    claims.c.replica_id == 3)).mappings().one())
+        replica_after = dict(
+            connection.execute(
+                sqlalchemy.select(replicas).where(
+                    replicas.c.service_name == 'gc-service',
+                    replicas.c.replica_id == 3)).mappings().one())
+    assert claim_after == claim_before
+    assert replica_after == replica_before
+
+    _insert_paid_retirement(graph)
+    _project_prepared_paid_provider_absence_graph(graph)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    assert manager._finalize_projected_provider_absence_cleanup(3)
+
+    # Production request retention removes the terminal request after the
+    # projection transaction releases its exact pin.  Age only the immutable
+    # association deadline to avoid a 60-day sleep, then use production
+    # tombstone GC for the final association removal.
+    asyncio.run(backend.delete_requests([graph.context.request_id]))
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "SET LOCAL session_replication_role = 'replica'")
+        connection.execute(
+            sqlalchemy.update(associations).where(
+                associations.c.association_id == graph.context.association_id).
+            values(tombstone_not_before=(sqlalchemy.func.clock_timestamp() -
+                                         datetime.timedelta(seconds=1))))
+    with engine.begin() as connection:
+        assert request_postgres.gc_bound_ordinary_launch_tombstones_in_transaction(
+            connection) == 1
+
+    scoped_tables = (
+        (replicas,
+         sqlalchemy.and_(replicas.c.service_name == 'gc-service',
+                         replicas.c.replica_id == 3)),
+        (claims,
+         sqlalchemy.and_(claims.c.service_name == 'gc-service',
+                         claims.c.replica_id == 3)),
+        (associations,
+         associations.c.association_id == graph.context.association_id),
+        (retirements,
+         sqlalchemy.and_(retirements.c.service_name == 'gc-service',
+                         retirements.c.replica_id == 3)),
+        (request_postgres.REQUESTS,
+         request_postgres.REQUESTS.c.request_id == graph.context.request_id),
+        (request_postgres.QUEUE,
+         request_postgres.QUEUE.c.request_id == graph.context.request_id),
+        (request_postgres.REQUEST_RETENTION_PINS,
+         request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+         graph.context.request_id),
+    )
+    with engine.connect() as connection:
+        for table, predicate in scoped_tables:
+            count = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(table).where(predicate)).scalar_one()
+            assert count == 0, table.name
 
 
 @pytest.mark.parametrize('mutation', [
