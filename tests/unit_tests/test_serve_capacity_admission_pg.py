@@ -1126,7 +1126,6 @@ def _paid_launch_spec(
     pool_occurrence: int | None = None,
 ) -> paid_capacity.PaidLaunchSpec:
     """Build one deeply immutable, provider-free paid launch candidate."""
-    assert accelerator.casefold() == 'l4'
     with engine.connect() as connection:
         version_row = connection.execute(
             sqlalchemy.select(
@@ -1233,6 +1232,61 @@ def _paid_launch_spec(
                 controller_config=controller_config,
                 controller_config_digest=version_row[4],
                 controller_config_snapshot_id=version_row[5])))
+
+
+def _validate_prepared_paid_specs(
+    engine: sqlalchemy.engine.Engine,
+    specs: tuple[paid_capacity.PaidLaunchSpec, ...],
+    *,
+    accounting_cards: dict[str, int],
+) -> tuple[tuple[paid_capacity.PaidLaunchSpec, ...], str | None]:
+    """Run the production immutable-spec validator without admitting rows."""
+    with engine.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).mappings().one()
+        version = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.version_specs_table.c.spec,
+                serve_state_schema.version_specs_table.c.yaml_content,
+                serve_state_schema.version_specs_table.c.placement_catalog,
+                serve_state_schema.version_specs_table.c.controller_config,
+                serve_state_schema.version_specs_table.c.
+                controller_config_digest,
+                serve_state_schema.version_specs_table.c.
+                controller_config_snapshot_id).where(
+                    serve_state_schema.version_specs_table.c.service_name ==
+                    'svc', serve_state_schema.version_specs_table.c.version ==
+                    1)).mappings().one()
+    serialized_spec = version['spec']
+    controller_config = version['controller_config']
+    if isinstance(serialized_spec, memoryview):
+        serialized_spec = serialized_spec.tobytes()
+    if isinstance(controller_config, memoryview):
+        controller_config = controller_config.tobytes()
+    assert isinstance(serialized_spec, bytes)
+    assert isinstance(controller_config, bytes)
+    persisted_spec = pickle.loads(serialized_spec)
+    locked_version = capacity_admission._LockedPaidLaunchVersionAuthority(
+        service_spec=serialized_spec,
+        launch_yaml_content=version['yaml_content'],
+        placement_catalog=version['placement_catalog'],
+        placement_contract=persisted_spec.placement_contract,
+        controller_config=controller_config,
+        controller_config_digest=version['controller_config_digest'],
+        controller_config_snapshot_id=(
+            version['controller_config_snapshot_id']))
+    return capacity_admission._canonical_prepared_paid_launch_specs(
+        specs,
+        service=service,
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards=accounting_cards,
+        backend_num_nodes=1,
+        locked_version=locked_version)
 
 
 def _replica_values(replica_id: int,
@@ -3046,6 +3100,238 @@ def test_current_planner_scans_third_pool_until_accepted_target(
     assert accepted_pool_keys.count(middle_pool_key) == 1
     assert accepted_pool_keys.count(specs[120].pool_key) == 39
     assert committed.candidate.paid_launch_target.as_dict() == {'l4': 100}
+
+
+def test_current_planner_accepts_equal_cost_pool_interleaving(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 60)
+    locations = []
+    for index in range(2):
+        location = _paid_location(1)
+        location.region = f'us-central1-{chr(ord("a") + index)}'
+        location.instance_type = f'test-l4-equal-pool-{index}'
+        locations.append((location, 0.424))
+    catalog = spot_placer.PlacementCatalog(tuple(locations),
+                                           num_nodes=1).to_dict()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    placement_catalog=catalog))
+
+    occurrences = {0: 0, 1: 0}
+    specs = []
+    for ordinal, pool_rank in enumerate((0, 1, 0)):
+        specs.append(
+            _paid_launch_spec(engine,
+                              ordinal,
+                              1100 + ordinal,
+                              pool_rank=pool_rank,
+                              pool_occurrence=occurrences[pool_rank]))
+        occurrences[pool_rank] += 1
+
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
+                                       service_hash='svc-hash',
+                                       service_lifecycle_epoch=3,
+                                       service_version=1,
+                                       accounting_cards={'l4': 1},
+                                       backend_num_nodes=1,
+                                       sequenced_reserved_fill=False,
+                                       planner=lambda snapshot, supply:
+                                       _current_decision(snapshot, supply, 3),
+                                       prepared_paid_launch_specs=tuple(specs))
+
+    assert [
+        member.pool_key for member in committed.paid_launch_receipt.members
+    ] == [spec.pool_key for spec in specs]
+
+
+def test_paid_launch_validator_rejects_inexact_interleaved_rank_occurrence(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 60)
+    locations = []
+    for index in range(2):
+        location = _paid_location(1)
+        location.region = f'us-central1-{chr(ord("a") + index)}'
+        location.instance_type = f'test-l4-occurrence-pool-{index}'
+        locations.append((location, 0.424))
+    catalog = spot_placer.PlacementCatalog(tuple(locations), num_nodes=1)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    placement_catalog=catalog.to_dict()))
+    ranks = tuple(
+        entry.rank for entry in catalog.ranked_entries(
+            _capacity_service_spec(False).placement_contract))
+    specs = (_paid_launch_spec(engine,
+                               0,
+                               1115,
+                               pool_rank=ranks[0],
+                               pool_occurrence=0),
+             _paid_launch_spec(engine,
+                               1,
+                               1116,
+                               pool_rank=ranks[1],
+                               pool_occurrence=0),
+             _paid_launch_spec(engine,
+                               2,
+                               1117,
+                               pool_rank=ranks[0],
+                               pool_occurrence=0))
+    before = _paid_write_counts(engine)
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='catalog traversal is noncanonical'):
+        _validate_prepared_paid_specs(engine,
+                                      specs,
+                                      accounting_cards={'l4': 1})
+
+    assert _paid_write_counts(engine) == before
+
+
+def _install_equal_cost_shape_catalog(
+    engine: sqlalchemy.engine.Engine,) -> dict[str, int]:
+    """Install two same-cost Spot tiers and return their global ranks."""
+    l4 = _paid_location(1)
+    l4.region = 'us-central1-a'
+    l4.instance_type = 'test-l4-exact-tier'
+    a100 = make_location('us-central1-b',
+                         {'A100': 1},
+                         cloud_name='GCP',
+                         instance_type='test-a100-exact-tier')
+    a100.image_id = {None: 'skypilot:test-regionless-image'}
+    entries = [(l4, 0.424), (a100, 0.424)]
+    entries.sort(key=lambda item: item[0].sort_key())
+    catalog = spot_placer.PlacementCatalog(tuple(entries), num_nodes=1)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    placement_catalog=catalog.to_dict()))
+    contract = _capacity_service_spec(False).placement_contract
+    return {
+        next(iter(entry.location.accelerators)).casefold(): entry.rank
+        for entry in catalog.ranked_entries(contract)
+    }
+
+
+def _equal_cost_shape_specs(
+    engine: sqlalchemy.engine.Engine,
+    ranks: dict[str, int],
+    card_order: tuple[str, ...],
+    *,
+    first_replica_id: int,
+) -> tuple[paid_capacity.PaidLaunchSpec, ...]:
+    occurrences = {rank: 0 for rank in ranks.values()}
+    specs = []
+    catalog_cards = {'l4': 'L4', 'a100': 'A100'}
+    for ordinal, card in enumerate(card_order):
+        rank = ranks[card]
+        specs.append(
+            _paid_launch_spec(engine,
+                              ordinal,
+                              first_replica_id + ordinal,
+                              accelerator=catalog_cards[card],
+                              pool_rank=rank,
+                              pool_occurrence=occurrences[rank]))
+        occurrences[rank] += 1
+    return tuple(specs)
+
+
+@pytest.mark.parametrize(
+    'card_order',
+    [('l4', 'l4', 'a100', 'a100'), ('a100', 'a100', 'l4', 'l4')])
+def test_paid_launch_validator_accepts_contiguous_same_cost_tier_blocks(
+        capacity_database, card_order):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    ranks = _install_equal_cost_shape_catalog(engine)
+    specs = _equal_cost_shape_specs(engine,
+                                    ranks,
+                                    card_order,
+                                    first_replica_id=1120)
+    before = _paid_write_counts(engine)
+
+    validated, replica_port = _validate_prepared_paid_specs(
+        engine, specs, accounting_cards={'l4': 1, 'a100': 1})
+
+    assert validated == specs
+    assert replica_port == '8000'
+    assert _paid_write_counts(engine) == before
+
+
+def test_paid_launch_validator_rejects_cross_shape_tier_resume(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    ranks = _install_equal_cost_shape_catalog(engine)
+    specs = _equal_cost_shape_specs(engine,
+                                    ranks, ('l4', 'a100', 'l4'),
+                                    first_replica_id=1130)
+    before = _paid_write_counts(engine)
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='catalog traversal is noncanonical'):
+        _validate_prepared_paid_specs(engine,
+                                      specs,
+                                      accounting_cards={
+                                          'l4': 1,
+                                          'a100': 1,
+                                      })
+
+    assert _paid_write_counts(engine) == before
+
+
+def test_current_planner_rejects_descending_normalized_cost_traversal(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 60)
+    locations = []
+    for index, cost in enumerate((0.10, 0.20)):
+        location = _paid_location(1)
+        location.region = f'us-central1-{chr(ord("a") + index)}'
+        location.instance_type = f'test-l4-ordered-pool-{index}'
+        locations.append((location, cost))
+    catalog = spot_placer.PlacementCatalog(tuple(locations),
+                                           num_nodes=1).to_dict()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    placement_catalog=catalog))
+    specs = (_paid_launch_spec(engine, 0, 1110, pool_rank=1, pool_occurrence=0),
+             _paid_launch_spec(engine, 1, 1111, pool_rank=0, pool_occurrence=0))
+    before = _paid_write_counts(engine)
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='catalog traversal is noncanonical'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(
+                **_current_owner_kwargs(engine),
+                service_name='svc',
+                service_hash='svc-hash',
+                service_lifecycle_epoch=3,
+                service_version=1,
+                accounting_cards={'l4': 1},
+                backend_num_nodes=1,
+                sequenced_reserved_fill=False,
+                planner=lambda snapshot, supply: _current_decision(
+                    snapshot, supply, 2),
+                prepared_paid_launch_specs=specs)
+
+    assert _paid_write_counts(engine) == before
 
 
 def test_current_planner_recomputes_prior_claims_after_stale_cleanup(

@@ -2073,6 +2073,47 @@ def test_prepare_paid_launch_specs_uses_state_aware_third_pool_fallback():
     assert [spec.pool_key for spec in specs].count(pool_keys[2]) == 59
 
 
+@pytest.mark.parametrize(('initial_headroom', 'expected_selections'),
+                         [((60, 60, 60), (40, 40, 40)),
+                          ((60, 60, 1), (60, 59, 1))])
+def test_prepare_paid_launch_specs_balances_cheapest_equal_cost_tier(
+        initial_headroom, expected_selections):
+    manager, first, second = _provider_free_paid_manager()
+    third = make_location('us-central1-c', {'L4': 1}, cloud_name='GCP')
+    third.instance_type = 'g2-standard-12'
+    locations = (first, second, third)
+    _set_paid_placer(manager, {location: 0.424 for location in locations})
+
+    with mock.patch.object(manager,
+                           '_task_template_for_version',
+                           return_value=mock.Mock()), \
+         mock.patch.object(replica_managers,
+                           '_get_resources_ports',
+                           return_value='8080'), \
+         mock.patch.object(replica_managers.skypilot_config,
+                           'to_dict',
+                           return_value={'api_server': {'endpoint': 'local'}}), \
+         mock.patch.object(paid_capacity, 'base_limit', return_value=60):
+        specs = manager.prepare_paid_launch_specs(
+            accelerator_shapes={'L4': 1},
+            max_gpu_units_by_accelerator={'l4': 120},
+            max_candidates=120,
+            occupied_replica_ids=(),
+            version_authority=_paid_version_authority(manager),
+            paid_location_launch_budget=_provider_free_paid_budget(
+                manager,
+                dict(zip(locations, initial_headroom)),
+                service_remaining=120))
+
+    pool_keys = tuple(
+        paid_capacity.pool_key(location, workspace='default', num_nodes=1)
+        for location in locations)
+    assert len(specs) == 120
+    assert tuple([spec.pool_key
+                  for spec in specs].count(pool_key)
+                 for pool_key in pool_keys) == expected_selections
+
+
 def test_prepare_paid_launch_specs_preserves_each_accelerator_frontier():
     manager, l4, _ = _provider_free_paid_manager()
     a100 = make_location('us-central1-b', {'A100': 1}, cloud_name='GCP')
