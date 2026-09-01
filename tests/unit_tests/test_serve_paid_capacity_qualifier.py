@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 import types
+from typing import Any
 import urllib.error
 import urllib.request
 import uuid
@@ -909,6 +910,51 @@ def test_aws_provider_reduction_counts_logical_width_and_allows_retry_history():
                                          volume_id='vol-old')))
 
 
+@pytest.mark.parametrize(('field', 'replacement'), [
+    ('availability_zone', 'us-east-2b'),
+    ('client_token', 'different-token'),
+    ('cluster_name_on_cloud', 'paid-e2e-2-1234567890-tenant'),
+    ('instance_id', 'i-different'),
+    ('instance_type', 'g6.12xlarge'),
+    ('market', 'on_demand'),
+    ('region', 'us-west-2'),
+])
+def test_aws_duplicate_tag_snapshots_reject_immutable_identity_drift(
+        field, replacement):
+    previous = _aws_instance()
+    current = {
+        **previous,
+        field: replacement,
+    }
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='instance identity is contradictory'):
+        qualifier._merge_aws_instance_observations(previous, current)
+
+
+def test_aws_duplicate_tag_snapshots_do_not_hide_repeated_ebs_identity():
+    previous = {
+        **_aws_instance(),
+        'volume_ids': ('vol-new', 'vol-new'),
+    }
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='repeats one EBS volume identity'):
+        qualifier._merge_aws_instance_observations(previous, _aws_instance())
+
+
+def test_aws_duplicate_tag_snapshots_reject_ebs_identity_drift():
+    previous = _aws_volume()
+    current = {
+        **previous,
+        'region': 'us-west-2',
+    }
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='volume identity is contradictory'):
+        qualifier._merge_aws_volume_observations(previous, current)
+
+
 def test_aws_observer_scans_both_tags_and_attests_provider_width(monkeypatch):
     cluster = 'paid-e2e-1-1234567890-tenant'
     tags = [{
@@ -940,14 +986,28 @@ def test_aws_observer_scans_both_tags_and_attests_provider_width(monkeypatch):
         },
         'Tags': tags,
     }
+    pending_instance = {
+        **raw_instance,
+        'BlockDeviceMappings': [],
+        'State': {
+            'Name': 'pending',
+        },
+    }
     raw_volume = {
         'VolumeId': 'vol-new',
         'State': 'in-use',
         'Tags': tags,
     }
+    creating_volume = {
+        **raw_volume,
+        'State': 'creating',
+    }
     paginator_calls = []
+    instance_observations: Any = iter((pending_instance, raw_instance))
+    volume_observations: Any = iter((creating_volume, raw_volume))
 
     class Paginator:
+        """Return one frozen provider observation per tag query."""
 
         def __init__(self, name):
             self.name = name
@@ -955,10 +1015,13 @@ def test_aws_observer_scans_both_tags_and_attests_provider_width(monkeypatch):
         def paginate(self, *, Filters):  # pylint: disable=invalid-name
             paginator_calls.append((self.name, Filters))
             if self.name == 'describe_instances':
-                return ({'Reservations': [{'Instances': [raw_instance]}]},)
-            return ({'Volumes': [raw_volume]},)
+                observation = next(instance_observations, raw_instance)
+                return ({'Reservations': [{'Instances': [observation]}]},)
+            observation = next(volume_observations, raw_volume)
+            return ({'Volumes': [observation]},)
 
     class Ec2:
+        """Minimal sequential-snapshot EC2 client."""
 
         type_calls = 0
 
@@ -1003,10 +1066,18 @@ def test_aws_observer_scans_both_tags_and_attests_provider_width(monkeypatch):
                                      scope=_provider_scope())
     census = observer.census()
     state = observer.reduce(census, (_aws_identity(),))
-    assert state.running_gpu_units == 1
+    # The two required cluster-tag queries are separate provider snapshots.
+    # A pending -> running / creating -> in-use transition is not contradictory,
+    # but the mixed census must not claim RUNNING capacity.
+    assert state.running_gpu_units == 0
+    assert census.service_instances[0]['state'] == 'pending'
+    assert census.service_instances[0]['volume_ids'] == ('vol-new',)
+    assert census.service_volumes[0]['state'] == 'creating'
     assert census.service_instances[0]['provider_gpu_units'] == 1
     assert Ec2.type_calls == 1
-    observer.census()
+    settled_census = observer.census()
+    assert observer.reduce(settled_census,
+                           (_aws_identity(),)).running_gpu_units == 1
     assert Ec2.type_calls == 1
     instance_tag_queries = [
         filters[1]['Name']
