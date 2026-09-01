@@ -61,8 +61,14 @@ def _instance(*,
 def _database_state(**overrides):
     values = {
         'service_hash': 'incarnation',
+        'controller': qualifier.ControllerIdentity(
+            pid=123,
+            ip='10.0.0.1',
+            owner_epoch=7,
+            incarnation='12345678-1234-5678-9234-567812345678'),
         'paid_debit_units': 0,
         'claimed_units': 0,
+        'claim_priorities': (),
         'waiter_count': 0,
         'demand_units': 0,
         'bound_cluster_zones': (),
@@ -180,6 +186,158 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
     receipt = tmp_path / 'scope.json'
     qualifier.write_provider_scope(receipt, 'paid-e2e', scope)
     assert qualifier.read_provider_scope(receipt, 'paid-e2e') == scope
+
+
+def test_gcp_observer_uses_compute_api_adc_and_paginates(monkeypatch):
+
+    class Request:
+        """One deterministic discovery API request."""
+
+        def __init__(self, response):
+            self._response = response
+
+        def execute(self, *, num_retries):
+            assert num_retries == qualifier._GCP_API_RETRIES
+            return self._response
+
+    class Collection:
+        """Record explicit page tokens for one aggregated-list endpoint."""
+
+        def __init__(self, pages):
+            self._pages = pages
+            self.calls = []
+
+        def aggregatedList(self, **kwargs):  # pylint: disable=invalid-name
+            self.calls.append(kwargs)
+            return Request(self._pages[kwargs.get('pageToken')])
+
+    instances = Collection({
+        None: {
+            'items': {
+                'zones/us-central1-a': {
+                    'instances': [{
+                        'name': 'first'
+                    }],
+                },
+            },
+            'nextPageToken': 'next-instances',
+        },
+        'next-instances': {
+            'items': {
+                'zones/us-central1-b': {
+                    'instances': [{
+                        'name': 'second'
+                    }],
+                },
+            },
+        },
+    })
+    disks = Collection({
+        None: {
+            'items': {
+                'zones/us-central1-a': {
+                    'disks': [{
+                        'name': 'disk'
+                    }],
+                },
+            },
+        },
+    })
+    operations = Collection({
+        None: {
+            'items': {
+                'zones/us-central1-a': {
+                    'operations': [{
+                        'name': 'operation'
+                    }],
+                },
+            },
+        },
+    })
+
+    class Compute:
+
+        def instances(self):
+            return instances
+
+        def disks(self):
+            return disks
+
+        def globalOperations(self):  # pylint: disable=invalid-name
+            return operations
+
+    builds = []
+
+    def build(*args, **kwargs):
+        builds.append((args, kwargs))
+        return Compute()
+
+    monkeypatch.setattr(qualifier.gcp_adaptor, 'build', build)
+    scope = qualifier.ProviderScope(service_hash='incarnation',
+                                    lifecycle_epoch=7,
+                                    service_version=11,
+                                    project_id='durable-project',
+                                    workspace='workspace-a',
+                                    region='us-central1',
+                                    controller_config_digest='a' * 64,
+                                    controller_config_snapshot_id='b' * 64)
+    observer = qualifier.GcpObserver(service_name='paid-e2e',
+                                     scope=scope,
+                                     profile=qualifier.PROFILES['small'])
+    census = observer.census()
+
+    assert builds == [(('compute', 'v1'), {
+        'credentials': None,
+        'cache_discovery': False,
+    })]
+    assert census.instances == [{'name': 'first'}, {'name': 'second'}]
+    assert census.disks == [{'name': 'disk'}]
+    assert census.operations == [{'name': 'operation'}]
+    assert instances.calls == [{
+        'project': 'durable-project',
+        'maxResults': qualifier._GCP_LIST_PAGE_SIZE,
+        'returnPartialSuccess': True,
+    }, {
+        'project': 'durable-project',
+        'maxResults': qualifier._GCP_LIST_PAGE_SIZE,
+        'returnPartialSuccess': True,
+        'pageToken': 'next-instances',
+    }]
+
+
+def test_gcp_observer_sanitizes_api_failures():
+
+    class Request:
+
+        def execute(self, **_kwargs):
+            raise RuntimeError('credential-bearing-provider-error')
+
+    class Collection:
+
+        def aggregatedList(self, **_kwargs):  # pylint: disable=invalid-name
+            return Request()
+
+    class Compute:
+
+        def instances(self):
+            return Collection()
+
+    scope = qualifier.ProviderScope(service_hash='incarnation',
+                                    lifecycle_epoch=7,
+                                    service_version=11,
+                                    project_id='durable-project',
+                                    workspace='workspace-a',
+                                    region='us-central1',
+                                    controller_config_digest='a' * 64,
+                                    controller_config_snapshot_id='b' * 64)
+    observer = qualifier.GcpObserver(service_name='paid-e2e',
+                                     scope=scope,
+                                     profile=qualifier.PROFILES['small'],
+                                     compute=Compute())
+    with pytest.raises(qualifier.QualificationError) as error:
+        observer.census()
+    assert str(error.value) == 'GCP Compute API instances census failed.'
+    assert 'credential-bearing' not in str(error.value)
 
 
 def test_provider_guard_rejects_on_demand_wrong_shape_and_overshoot():
@@ -482,6 +640,71 @@ def test_paid_debit_includes_failed_until_cleanup_is_proven():
         },
     }
     assert qualifier.paid_debit_census([cleaned]).gpu_units == 0
+
+
+def test_paid_claim_requires_exact_offered_priority_and_plan():
+    claim = {
+        'priority': 50,
+        'capacity_plan_generation': 9,
+        'capacity_plan_sha256': 'a' * 64,
+        'persisted_plan_sha256': 'a' * 64,
+        'capacity_plan_accelerator': 'L4',
+        'capacity_plan_units': 1,
+    }
+    census = qualifier.paid_claim_census([claim, dict(claim)])
+    assert census.gpu_units == 2
+    assert census.priorities == (50, 50)
+
+    for invalid_priority in (49, 51, True, None):
+        with pytest.raises(qualifier.GuardViolation, match='not priority 50'):
+            qualifier.paid_claim_census([{
+                **claim, 'priority': invalid_priority
+            }])
+
+
+def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
+        tmp_path):
+    authority = {
+        'controller_pid': 321,
+        'controller_ip': '10.0.0.9',
+        'controller_owner_epoch': 12,
+        'controller_incarnation': 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+    }
+    controller = qualifier.controller_identity_from_authority(authority)
+    observation = _observation(database=_database_state(
+        controller=controller, claimed_units=1, claim_priorities=(50,)))
+    receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                service_name='paid-e2e',
+                                profile=qualifier.PROFILES['small'])
+    receipt.sample('scale', observation)
+
+    assert receipt._payload['schema_version'] == 2
+    assert receipt._payload['request_priority'] == 50
+    assert receipt._payload['samples'] == [{
+        'phase': 'scale',
+        'observed_at': 1000,
+        'controller_pid': 321,
+        'controller_ip': '10.0.0.9',
+        'controller_owner_epoch': 12,
+        'controller_incarnation': 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        'paid_debit_units': 0,
+        'claimed_units': 1,
+        'paid_claim_priorities': [50],
+        'waiters': 0,
+        'postgres_demand_units': 0,
+        'provider_instances': 0,
+        'provider_running': 0,
+        'provider_disks': 0,
+        'provider_inflight_operations': 0,
+        'lb_demand_units': 0,
+        'lb_ready_replicas': 0,
+    }]
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='controller owner fence'):
+        qualifier.controller_identity_from_authority({
+            **authority, 'controller_owner_epoch': 0
+        })
 
 
 def test_route_report_uses_only_the_routed_active_lb():

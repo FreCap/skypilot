@@ -3370,6 +3370,16 @@ PostgreSQL/VM/disk/operation zero for the configured interval. A collected
 smoke test, mocked provider response, unit receipt, or historical pre-#1813 run
 does not satisfy this gate.
 
+The production qualifier reads instances, disks, and operations through
+the Google Compute v1 API with application-default credentials; it has no
+``gcloud`` executable dependency. Every PostgreSQL sample records the exact
+controller PID, IP, owner epoch, and incarnation. Every live paid claim must
+retain request priority 50 and its immutable one-L4 capacity-plan link. Those
+fields make a controller restart or takeover auditable from one receipt rather
+than from mutable logs. The test source is not installed in the API image; the
+operator copies the single qualifier file into a temporary API-pod path for the
+run. The installed SkyPilot package supplies its runtime imports.
+
 Historical baseline, complete on 2026-08-26 with release `1.1.1513`. The disposable GCP-only service
 used a fixed floor and ceiling of 120, `max_live_paid_gpu_units: 120`, a hard
 guard cap of 120, and only Spot `g2-standard-4` with exactly one L4. The fixed
@@ -3482,10 +3492,11 @@ condition of the already-complete paid Spot provider-lifecycle gate.
   Only explicit service recreation may change the service incarnation.
 - Freeze at least one ordinary-paid claim/profile before restart. Require the
   complete claim and profile-covered replica projection to remain unchanged
-  through child restart and Pod takeover. If qualifying the historical cohort,
-  require the current priority to be exactly 0 and cleanup to match exactly one
-  frozen historical priority with no other drift. Capture the affected-row
-  census before and after cleanup.
+  through child restart and Pod takeover. The current executable qualification
+  sends and requires exact priority 50. If separately qualifying a historical
+  cohort, require its frozen historical priority and cleanup to match exactly
+  that one value with no other drift. Capture the affected-row census before
+  and after cleanup.
 - A stale predecessor worker completion must be ignored.
 
 ## Evidence to retain
@@ -3546,7 +3557,8 @@ these remaining current-writer acceptance gates:
    deployed image. Drive the configured roughly-100-Spot limit within a few
    minutes, subject to real provider availability/cooldowns, and complete its
    10,000 authenticated stable identities. Retain the qualifier's immutable
-   PostgreSQL/GCP receipt; capture current queued, processing, in-flight and
+   PostgreSQL/GCP receipt, including controller-owner transitions and exact
+   priority-50 claim samples; capture current queued, processing, in-flight and
    terminal ledger/UI evidence; and require zero ordinary on-demand and zero
    wrong-shape capacity. The merged runner and its unit tests do not close this
    gate without the live billable receipt.

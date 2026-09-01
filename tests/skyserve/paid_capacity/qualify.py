@@ -20,7 +20,9 @@ The data-plane bearer is read from ``SKYPILOT_SERVE_E2E_AUTH_TOKEN`` when an
 external runner explicitly supplies it.  In an API-server pod, the normal
 projected data-plane token ring is used instead.  ``SKYPILOT_DB_CONNECTION_URI``
 must name the same PostgreSQL database as the API server.  No credential is
-emitted into the receipt.
+emitted into the receipt.  Provider census uses the Google Compute v1 API with
+application-default credentials; neither this program nor the API-server image
+requires the ``gcloud`` executable.
 """
 
 import argparse
@@ -33,15 +35,16 @@ import json
 import os
 import pathlib
 import re
-import subprocess
 import time
 from typing import Any
+import uuid
 
 import aiohttp
 import sqlalchemy
 import yaml
 
 from sky import skypilot_config
+from sky.adaptors import gcp as gcp_adaptor
 from sky.provision.gcp import instance_utils
 from sky.serve import auth_tokens
 from sky.serve import ordinary_launch_binding
@@ -114,6 +117,9 @@ _AUTH_HEADER = 'X-SkyPilot-Serve-Authorization'
 _JOB_ID_HEADER = 'X-SkyServe-Job-Id'
 _PRIORITY_HEADER = 'X-SkyServe-Priority'
 _ACCELERATORS_HEADER = 'X-SkyServe-Compatible-Accelerators'
+_REQUEST_PRIORITY = 50
+_GCP_LIST_PAGE_SIZE = 500
+_GCP_API_RETRIES = 3
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 _ACTIVE_DEMAND_NAMES = frozenset({
     'async_occupancy',
@@ -391,7 +397,7 @@ def parse_gcp_state(
     """Validate and reduce one provider-native GCP census."""
     if (not isinstance(instances, list) or not isinstance(disks, list) or
             not isinstance(operations, (list, tuple))):
-        raise QualificationError('gcloud census is not a JSON list.')
+        raise QualificationError('GCP provider census is not a resource list.')
     if not service_name:
         raise QualificationError('Provider census requires a service scope.')
     expected_cluster_names = frozenset(expected_cluster_zones)
@@ -546,7 +552,7 @@ def parse_gcp_cleanup_state(*, service_name: str, instances: object,
     """Count every remaining provider effect in the dedicated test scope."""
     if (not isinstance(instances, list) or not isinstance(disks, list) or
             not isinstance(operations, (list, tuple))):
-        raise QualificationError('gcloud cleanup census is not a JSON list.')
+        raise QualificationError('GCP cleanup census is not a resource list.')
     owned_instances = _unique_scoped_resources(instances,
                                                service_name=service_name,
                                                kind='instance')
@@ -580,34 +586,88 @@ def parse_gcp_cleanup_state(*, service_name: str, instances: object,
 class GcpObserver:
     """Read-only provider census reduced by durable cloud identities."""
 
-    def __init__(self, *, service_name: str, scope: ProviderScope,
-                 profile: Profile) -> None:
+    def __init__(self,
+                 *,
+                 service_name: str,
+                 scope: ProviderScope,
+                 profile: Profile,
+                 compute: object | None = None) -> None:
         self._service_name = service_name
         self._scope = scope
         self._profile = profile
-
-    def _list(self, kind: str) -> object:
-        result = subprocess.run([
-            'gcloud', 'compute', kind, 'list', '--project',
-            self._scope.project_id, '--format=json'
-        ],
-                                check=False,
-                                capture_output=True,
-                                text=True,
-                                timeout=45)
-        if result.returncode != 0:
-            raise QualificationError(
-                f'gcloud {kind} census failed: {result.stderr[:300]}')
         try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError as error:
+            self._compute = (gcp_adaptor.build(
+                'compute', 'v1', credentials=None, cache_discovery=False)
+                             if compute is None else compute)
+        except Exception as error:  # pylint: disable=broad-except
             raise QualificationError(
-                f'gcloud {kind} returned invalid JSON.') from error
+                'GCP Compute API client initialization failed.') from error
+
+    def _aggregated_list(self, collection_name: str,
+                         item_name: str) -> list[dict[str, Any]]:
+        """Read every project resource with ADC and explicit pagination."""
+        try:
+            collection_factory = getattr(self._compute, collection_name)
+            collection = collection_factory()
+        except (AttributeError, TypeError) as error:
+            raise QualificationError(
+                f'GCP Compute API {item_name} census is unavailable.') \
+                from error
+
+        resources: list[dict[str, Any]] = []
+        page_token: str | None = None
+        seen_tokens: set[str] = set()
+        while True:
+            request_kwargs: dict[str, Any] = {
+                'project': self._scope.project_id,
+                'maxResults': _GCP_LIST_PAGE_SIZE,
+                'returnPartialSuccess': True,
+            }
+            if page_token is not None:
+                request_kwargs['pageToken'] = page_token
+            try:
+                response = collection.aggregatedList(**request_kwargs).execute(
+                    num_retries=_GCP_API_RETRIES)
+            except Exception as error:  # pylint: disable=broad-except
+                # Never include provider exception text in a qualification
+                # error: it may contain credential or request metadata.
+                raise QualificationError(
+                    f'GCP Compute API {item_name} census failed.') from error
+            if not isinstance(response, collections.abc.Mapping):
+                raise QualificationError(
+                    f'GCP Compute API {item_name} census is malformed.')
+            scoped_items = response.get('items', {})
+            if not isinstance(scoped_items, collections.abc.Mapping):
+                raise QualificationError(
+                    f'GCP Compute API {item_name} census is malformed.')
+            for scope_name in sorted(scoped_items):
+                scope_payload = scoped_items[scope_name]
+                if not isinstance(scope_payload, collections.abc.Mapping):
+                    raise QualificationError(
+                        f'GCP Compute API {item_name} census is malformed.')
+                page_resources = scope_payload.get(item_name, ())
+                if not isinstance(page_resources, (list, tuple)):
+                    raise QualificationError(
+                        f'GCP Compute API {item_name} census is malformed.')
+                if not all(isinstance(item, dict) for item in page_resources):
+                    raise QualificationError(
+                        f'GCP Compute API {item_name} census is malformed.')
+                resources.extend(page_resources)
+            next_token = response.get('nextPageToken')
+            if next_token is None:
+                return resources
+            if (not isinstance(next_token, str) or not next_token or
+                    next_token in seen_tokens):
+                raise QualificationError(
+                    f'GCP Compute API {item_name} pagination is malformed.')
+            seen_tokens.add(next_token)
+            page_token = next_token
 
     def census(self) -> ProviderCensus:
-        return ProviderCensus(instances=self._list('instances'),
-                              disks=self._list('disks'),
-                              operations=self._list('operations'))
+        return ProviderCensus(
+            instances=self._aggregated_list('instances', 'instances'),
+            disks=self._aggregated_list('disks', 'disks'),
+            operations=self._aggregated_list('globalOperations', 'operations'))
 
     def reduce(
         self, census: ProviderCensus,
@@ -623,12 +683,45 @@ class GcpObserver:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class ControllerIdentity:
+    """Exact durable owner of the observed service-controller generation."""
+
+    pid: int
+    ip: str
+    owner_epoch: int
+    incarnation: str
+
+
+def controller_identity_from_authority(
+        authority: collections.abc.Mapping[str, Any]) -> ControllerIdentity:
+    """Validate and normalize one PostgreSQL controller-owner fence."""
+    pid = authority.get('controller_pid')
+    ip = authority.get('controller_ip')
+    owner_epoch = authority.get('controller_owner_epoch')
+    incarnation = authority.get('controller_incarnation')
+    try:
+        normalized_incarnation = str(uuid.UUID(str(incarnation)))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise GuardViolation(
+            'Service has no exact controller incarnation.') from error
+    if (type(pid) is not int or pid < 1 or not isinstance(ip, str) or not ip or
+            type(owner_epoch) is not int or owner_epoch < 1):
+        raise GuardViolation('Service has no exact controller owner fence.')
+    return ControllerIdentity(pid=pid,
+                              ip=ip,
+                              owner_epoch=owner_epoch,
+                              incarnation=normalized_incarnation)
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class DatabaseState:
     """One consistent PostgreSQL authority and telemetry snapshot."""
 
     service_hash: str
+    controller: ControllerIdentity
     paid_debit_units: int
     claimed_units: int
+    claim_priorities: tuple[int, ...]
     waiter_count: int
     demand_units: int
     bound_cluster_zones: tuple[tuple[str, str], ...]
@@ -640,6 +733,14 @@ class PaidDebitCensus:
 
     replicas: tuple[collections.abc.Mapping[str, Any], ...]
     gpu_units: int
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PaidClaimCensus:
+    """Exact priority and immutable-plan attribution of live paid claims."""
+
+    gpu_units: int
+    priorities: tuple[int, ...]
 
 
 def paid_debit_census(
@@ -668,6 +769,36 @@ def paid_debit_census(
             'Replica rows have no exact paid cleanup/debit attribution.') \
             from error
     return PaidDebitCensus(replicas=tuple(debit_replicas), gpu_units=gpu_units)
+
+
+def paid_claim_census(
+    claims: collections.abc.Sequence[collections.abc.Mapping[str, Any]],
+) -> PaidClaimCensus:
+    """Require every live claim to retain the offered priority and plan."""
+    claimed_units = 0
+    priorities: list[int] = []
+    try:
+        for claim in claims:
+            priority = claim['priority']
+            if (type(priority) is not int or priority != _REQUEST_PRIORITY or
+                    type(claim['capacity_plan_generation']) is not int or
+                    claim['capacity_plan_generation'] <= 0 or
+                    not isinstance(claim['capacity_plan_sha256'], str) or
+                    claim['capacity_plan_sha256']
+                    != claim['persisted_plan_sha256'] or
+                    str(claim['capacity_plan_accelerator']).casefold() != 'l4'
+                    or claim['capacity_plan_units'] != 1):
+                raise GuardViolation(
+                    f'Paid claim is not priority {_REQUEST_PRIORITY} and '
+                    'linked to one immutable L4 plan.')
+            claimed_units += claim['capacity_plan_units']
+            priorities.append(priority)
+    except (KeyError, TypeError) as error:
+        raise GuardViolation(
+            'Paid claim has incomplete priority or plan attribution.') \
+            from error
+    return PaidClaimCensus(gpu_units=claimed_units,
+                           priorities=tuple(priorities))
 
 
 _BOUND_REQUEST_PROFILE_FIELDS = (
@@ -922,6 +1053,10 @@ class PostgresObserver:
                            s.lifecycle_epoch AS service_lifecycle_epoch,
                            s.current_version,
                            s.workspace,
+                           s.controller_pid,
+                           s.controller_ip,
+                           s.controller_incarnation,
+                           s.controller_owner_epoch,
                            s.lb_ha_enabled,
                            s.lb_active_slot,
                            s.lb_cutover_generation,
@@ -949,6 +1084,7 @@ class PostgresObserver:
                     'name': self._service_name
                 }).mappings().one_or_none()
             service_hash, lifecycle_epoch = validate_route_authority(authority)
+            controller_identity = controller_identity_from_authority(authority)
             if (service_hash != scope.service_hash or
                     lifecycle_epoch != scope.lifecycle_epoch or
                     authority['current_version'] != scope.service_version or
@@ -1017,7 +1153,7 @@ class PostgresObserver:
                 }).mappings().all()
             claims = connection.execute(
                 sqlalchemy.text('''
-                    SELECT c.replica_id, c.claimed_at,
+                    SELECT c.replica_id, c.claimed_at, c.priority,
                            c.capacity_plan_generation,
                            c.capacity_plan_sha256,
                            c.capacity_plan_accelerator,
@@ -1114,24 +1250,15 @@ class PostgresObserver:
                 raise GuardViolation(
                     'Paid replicas share one durable GCP provider identity.')
             bound_cluster_zones[cloud_name] = identity['zone']
-        claimed_units = 0
-        for claim in claims:
-            if (type(claim['capacity_plan_generation']) is not int or
-                    claim['capacity_plan_generation'] <= 0 or
-                    not isinstance(claim['capacity_plan_sha256'], str) or
-                    claim['capacity_plan_sha256']
-                    != claim['persisted_plan_sha256'] or
-                    str(claim['capacity_plan_accelerator']).casefold() != 'l4'
-                    or claim['capacity_plan_units'] != 1):
-                raise GuardViolation(
-                    'Paid claim is not linked to one immutable L4 plan.')
-            claimed_units += claim['capacity_plan_units']
+        claim_census = paid_claim_census(claims)
         demand_report = select_route_authoritative_report(
             authority, demand_reports, load_balancer)
         return DatabaseState(
             service_hash=service_hash,
+            controller=controller_identity,
             paid_debit_units=debits.gpu_units,
-            claimed_units=claimed_units,
+            claimed_units=claim_census.gpu_units,
+            claim_priorities=claim_census.priorities,
             waiter_count=int(waiter_count),
             demand_units=demand_units(demand_report['payload']),
             bound_cluster_zones=tuple(sorted(bound_cluster_zones.items())),
@@ -1373,8 +1500,13 @@ class Progress:
 def observation_summary(observation: Observation) -> dict[str, Any]:
     return {
         'observed_at': observation.observed_at,
+        'controller_pid': observation.database.controller.pid,
+        'controller_ip': observation.database.controller.ip,
+        'controller_owner_epoch': observation.database.controller.owner_epoch,
+        'controller_incarnation': observation.database.controller.incarnation,
         'paid_debit_units': observation.database.paid_debit_units,
         'claimed_units': observation.database.claimed_units,
+        'paid_claim_priorities': list(observation.database.claim_priorities),
         'waiters': observation.database.waiter_count,
         'postgres_demand_units': observation.database.demand_units,
         'provider_instances': observation.provider.instance_count,
@@ -1394,9 +1526,10 @@ class Receipt:
                  profile: Profile) -> None:
         self._path = path
         self._payload: dict[str, Any] = {
-            'schema_version': 1,
+            'schema_version': 2,
             'service_name': service_name,
             'profile': profile.name,
+            'request_priority': _REQUEST_PRIORITY,
             'max_units': profile.max_units,
             'minimum_running': profile.minimum_running,
             'started_at': time.time(),
@@ -1450,7 +1583,7 @@ async def _one_request(session: aiohttp.ClientSession, *, url: str, token: str,
     headers = {
         _AUTH_HEADER: f'Bearer {token}',
         _JOB_ID_HEADER: request_id,
-        _PRIORITY_HEADER: '50',
+        _PRIORITY_HEADER: str(_REQUEST_PRIORITY),
         _ACCELERATORS_HEADER: 'L4',
     }
     body = {
