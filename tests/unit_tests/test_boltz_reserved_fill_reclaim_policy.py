@@ -513,9 +513,9 @@ def _fake_attest(policy: policy_lib.BoltzReservedFillReclaimPolicy):
     def attest(names, _deadline):
         context_names = tuple(names)
         context_proofs = {
-            name: _context_proof(policy._bundle.fleet_context(name),
-                                 policy._bundle.provider_context(name))
-            for name in context_names
+            name: _context_proof(
+                policy._bundle.fleet_context(name),
+                policy._bundle.provider_context(name)) for name in context_names
         }
         completed = time.monotonic()
         return context_proofs, {name: completed for name in context_names}
@@ -1095,8 +1095,9 @@ def test_activation_accepts_zero_capacity_context_and_positive_peer(
         phx_name: _context_proof(phx,
                                  policy._bundle.provider_context(phx_name)),
     }
-    attest = mock.Mock(return_value=(
-        proofs, {context_name: time.monotonic() for context_name in proofs}))
+    attest = mock.Mock(return_value=(proofs, {
+        context_name: time.monotonic() for context_name in proofs
+    }))
     emit_proof = mock.Mock()
     monkeypatch.setattr(policy, '_attest_contexts', attest)
     monkeypatch.setattr(policy, '_emit_proof', emit_proof)

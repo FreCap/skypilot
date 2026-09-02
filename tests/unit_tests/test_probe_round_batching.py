@@ -790,8 +790,8 @@ class TestProbeRoundBatching(unittest.TestCase):
                         kubernetes_context='ctx',
                         physical_cluster_uid='physical-uid')),
                 cluster_name=info.cluster_name,
-                replica_record_id=str(uuid.UUID(int=info.replica_id)))
-            for info in infos
+                replica_record_id=str(
+                    uuid.UUID(int=info.replica_id))) for info in infos
         }
         for info in infos:
             info.replica_record_id = proofs[info.replica_id].replica_record_id

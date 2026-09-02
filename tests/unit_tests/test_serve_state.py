@@ -37,6 +37,7 @@ from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import service as service_lib
 from sky.serve import service_spec as service_spec_lib
+from sky.serve import spot_placer
 from sky.serve import system_oom_recovery
 from sky.serve import system_recovery_state as recovery_state
 from sky.skylet import constants as skylet_constants
@@ -56,6 +57,20 @@ def _replica(replica_id: int,
         version=version,
         resources_override=None,
     )
+
+
+def _paid_pool_key(accelerator: str = 'A100-80GB') -> str:
+    """Exact provider pool identity accepted by paid GPU attribution."""
+    location = spot_placer.Location(cloud=clouds.AWS(),
+                                    region='us-east-1',
+                                    zone='us-east-1a',
+                                    accelerators={accelerator: 1},
+                                    use_spot=True,
+                                    instance_type='p4d.24xlarge')
+    return paid_capacity.pool_key(location,
+                                  workspace='default',
+                                  num_nodes=1,
+                                  aws_account_id='123456789012')
 
 
 class _TestServiceSpec(service_spec_lib.SkyServiceSpec):
@@ -507,12 +522,12 @@ def _insert_protocol4_terminal_receipt_state(
             frozenset({service_name}), receipt_facts))
     image_evidence = {
         (service_name, version):
-        placement_contract_normalization._ExternalEvidence(0, digest * 64)
+            placement_contract_normalization._ExternalEvidence(0, digest * 64)
         for version, digest in zip((1, 2, 3), 'abc')
     }
     action_evidence = {
         (service_name, version):
-        placement_contract_normalization._ExternalEvidence(0, digest * 64)
+            placement_contract_normalization._ExternalEvidence(0, digest * 64)
         for version, digest in zip((1, 2, 3), 'def')
     }
     empty_evidence = placement_contract_normalization._ExternalEvidence(
@@ -1226,9 +1241,14 @@ def test_replica_updates_and_insert_conflicts_preserve_action_owned_columns(
     _add_minimal_service('svc', service_hash=service_hash)
     expected_by_replica = {}
 
+    # Fresh paid admission fails closed on any cleanup-unproven row whose
+    # relational pool key and zero-cost copy disagree, so the pre-existing
+    # rows carry the same exact paid pool the admission below targets.
+    pool_key = _paid_pool_key()
     for replica_id in range(1, 5):
-        assert serve_state.add_or_update_replica('svc', replica_id,
-                                                 _replica(replica_id))
+        existing = _replica(replica_id)
+        existing.paid_capacity_pool_key = pool_key
+        assert serve_state.add_or_update_replica('svc', replica_id, existing)
         launch_shadow_coverage_id = (None if replica_id %
                                      2 else uuid.UUID(int=replica_id * 100 + 5))
         down_shadow_coverage_id = (None if replica_id %
@@ -1282,7 +1302,7 @@ def test_replica_updates_and_insert_conflicts_preserve_action_owned_columns(
             service_hash,
             3,
             _replica(3, version=2),
-            pool_key='test-paid-pool',
+            pool_key=pool_key,
             priority=1,
             base_limit=1,
             max_limit=2,
@@ -2243,15 +2263,16 @@ def test_identical_projection_retry_is_idempotent_at_db_boundary(
     projections = _placement_projection_args()
     assert _add_minimal_service(service_name, spec=_v2_service_spec('initial'))
     assert serve_state.add_version(service_name) == 2
-    assert (serve_state.add_or_update_version(
-        service_name, 2, _v2_service_spec('projected'), yaml_content, **
-        projections) is serve_state.VersionCommitResult.COMMITTED)
+    assert (serve_state.add_or_update_version(service_name, 2,
+                                              _v2_service_spec('projected'),
+                                              yaml_content, **projections)
+            is serve_state.VersionCommitResult.COMMITTED)
     row_before = _read_version_row(_mock_serve_db, service_name, 2)
 
     assert (serve_state.add_or_update_version(
         service_name, 2, _v2_service_spec('rebuilt-on-retry'), yaml_content,
-        **copy.deepcopy(projections)) is
-            serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
+        **copy.deepcopy(projections))
+            is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
     assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
 
 
@@ -2304,9 +2325,11 @@ def test_identical_historical_projection_retry_remains_idempotent(
     assert _add_minimal_service(service_name, spec=_v2_service_spec('initial'))
     assert serve_state.add_version(service_name) == 2
     current_projections = _placement_projection_args()
-    assert (serve_state.add_or_update_version(
-        service_name, 2, _v2_service_spec('projected'), yaml_content, **
-        current_projections) is serve_state.VersionCommitResult.COMMITTED)
+    assert (serve_state.add_or_update_version(service_name, 2,
+                                              _v2_service_spec('projected'),
+                                              yaml_content,
+                                              **current_projections)
+            is serve_state.VersionCommitResult.COMMITTED)
 
     # Simulate a version committed by one of the two previous protocols.  The
     # current controller may settle an exact lost-response retry, but must not
@@ -2324,9 +2347,9 @@ def test_identical_historical_projection_retry_remains_idempotent(
     row_before = _read_version_row(_mock_serve_db, service_name, 2)
 
     assert (serve_state.add_or_update_version(
-        service_name, 2, _v2_service_spec('rebuilt-on-retry'), yaml_content, **
-        historical_projections) is
-            serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
+        service_name, 2, _v2_service_spec('rebuilt-on-retry'), yaml_content,
+        **historical_projections)
+            is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
     assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
 
 
@@ -2342,9 +2365,10 @@ def test_projection_drift_conflicts_and_preserves_committed_row(
     projections = _placement_projection_args()
     assert _add_minimal_service(service_name, spec=_v2_service_spec('initial'))
     assert serve_state.add_version(service_name) == 2
-    assert (serve_state.add_or_update_version(
-        service_name, 2, _v2_service_spec('projected'), yaml_content, **
-        projections) is serve_state.VersionCommitResult.COMMITTED)
+    assert (serve_state.add_or_update_version(service_name, 2,
+                                              _v2_service_spec('projected'),
+                                              yaml_content, **projections)
+            is serve_state.VersionCommitResult.COMMITTED)
     row_before = _read_version_row(_mock_serve_db, service_name, 2)
     changed = copy.deepcopy(projections)
     if projection_name == 'controller_job_projection':
@@ -2355,8 +2379,8 @@ def test_projection_drift_conflicts_and_preserves_committed_row(
         changed[projection_name][0]['accelerator_name'] = 'H100'
 
     assert (serve_state.add_or_update_version(
-        service_name, 2, _v2_service_spec('rebuilt-on-retry'), yaml_content, **
-        changed) is serve_state.VersionCommitResult.CONTENT_CONFLICT)
+        service_name, 2, _v2_service_spec('rebuilt-on-retry'), yaml_content,
+        **changed) is serve_state.VersionCommitResult.CONTENT_CONFLICT)
     assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
 
 
@@ -2366,9 +2390,10 @@ def test_identical_yaml_retry_cannot_backfill_legacy_null_projections(
     yaml_content = 'value: legacy'
     assert _add_minimal_service(service_name, spec=_v2_service_spec('initial'))
     assert serve_state.add_version(service_name) == 2
-    assert (serve_state.add_or_update_version(
-        service_name, 2, _v2_service_spec('legacy'), yaml_content) is
-            serve_state.VersionCommitResult.COMMITTED)
+    assert (serve_state.add_or_update_version(service_name, 2,
+                                              _v2_service_spec('legacy'),
+                                              yaml_content)
+            is serve_state.VersionCommitResult.COMMITTED)
     row_before = _read_version_row(_mock_serve_db, service_name, 2)
     assert all(row_before[column] is None for column in (
         'controller_job_projection',
@@ -2376,10 +2401,11 @@ def test_identical_yaml_retry_cannot_backfill_legacy_null_projections(
         'worker_placement_projections',
     ))
 
-    assert (serve_state.add_or_update_version(
-        service_name, 2, _v2_service_spec('legacy-retry'), yaml_content,
-        **_placement_projection_args()) is
-            serve_state.VersionCommitResult.CONTENT_CONFLICT)
+    assert (serve_state.add_or_update_version(service_name, 2,
+                                              _v2_service_spec('legacy-retry'),
+                                              yaml_content,
+                                              **_placement_projection_args())
+            is serve_state.VersionCommitResult.CONTENT_CONFLICT)
     assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
 
 
@@ -2550,8 +2576,8 @@ def test_version_controller_config_retry_requires_exact_snapshot(
         'value: v2',
         controller_config=snapshot[0],
         controller_config_digest=snapshot[1],
-        controller_config_snapshot_id=snapshot[2]) is
-            serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
+        controller_config_snapshot_id=snapshot[2])
+            is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
     assert (serve_state.add_or_update_version('svc-config-retry', 2,
                                               _service_spec('v2'), 'value: v2')
             is serve_state.VersionCommitResult.CONTENT_CONFLICT)
@@ -2563,8 +2589,8 @@ def test_version_controller_config_retry_requires_exact_snapshot(
         'value: v2',
         controller_config=different_snapshot[0],
         controller_config_digest=different_snapshot[1],
-        controller_config_snapshot_id=different_snapshot[2]) is
-            serve_state.VersionCommitResult.CONTENT_CONFLICT)
+        controller_config_snapshot_id=different_snapshot[2])
+            is serve_state.VersionCommitResult.CONTENT_CONFLICT)
     assert _read_version_row(_mock_serve_db, 'svc-config-retry',
                              2) == (original_row)
 
@@ -2578,9 +2604,10 @@ def test_config_aware_commit_backfills_only_null_prior_versions(_mock_serve_db):
         controller_config_digest=initial_snapshot[1],
         controller_config_snapshot_id=initial_snapshot[2])
     assert serve_state.add_version('svc-config-backfill') == 2
-    assert (serve_state.add_or_update_version(
-        'svc-config-backfill', 2, _service_spec('legacy'), 'value: legacy') is
-            serve_state.VersionCommitResult.COMMITTED)
+    assert (serve_state.add_or_update_version('svc-config-backfill', 2,
+                                              _service_spec('legacy'),
+                                              'value: legacy')
+            is serve_state.VersionCommitResult.COMMITTED)
     assert serve_state.add_version('svc-config-backfill') == 3
 
     current_snapshot = _config_snapshot(b'active_workspace: current\n', '3')
@@ -2597,8 +2624,8 @@ def test_config_aware_commit_backfills_only_null_prior_versions(_mock_serve_db):
         legacy_controller_config_snapshot=legacy_snapshot,
         legacy_controller_applied_version=1,
         expected_service_hash='incarnation-a',
-        expected_controller_owner=(12345, None)) is
-            serve_state.VersionCommitResult.COMMITTED)
+        expected_controller_owner=(12345, None))
+            is serve_state.VersionCommitResult.COMMITTED)
     assert serve_state.get_version_controller_config('svc-config-backfill',
                                                      1) == initial_snapshot
     assert serve_state.get_version_controller_config('svc-config-backfill',
@@ -2758,9 +2785,10 @@ def test_version_placement_catalog_persists_and_backfills_once(_mock_serve_db):
     assert serve_state.get_placement_catalog('svc-catalog', 2) == update_catalog
 
     assert serve_state.add_version('svc-catalog') == 3
-    assert (serve_state.add_or_update_version(
-        'svc-catalog', 3, _service_spec('legacy'), 'value: legacy') is
-            serve_state.VersionCommitResult.COMMITTED)
+    assert (serve_state.add_or_update_version('svc-catalog', 3,
+                                              _service_spec('legacy'),
+                                              'value: legacy')
+            is serve_state.VersionCommitResult.COMMITTED)
     winner = {'schema_version': 1, 'entries': [{'winner': True}]}
     loser = {'schema_version': 1, 'entries': [{'winner': False}]}
     assert serve_state.set_placement_catalog_if_missing('svc-catalog', 3,
@@ -2777,8 +2805,8 @@ def test_identical_version_retry_only_backfills_missing_catalog(_mock_serve_db):
                                               1,
                                               _service_spec('ignored'),
                                               'yaml: v1',
-                                              placement_catalog=catalog) is
-            serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
+                                              placement_catalog=catalog)
+            is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
     row = _read_version_row(_mock_serve_db, 'svc-catalog-retry', 1)
     assert row['placement_catalog'] == catalog
     original_spec = row['spec']
@@ -2791,8 +2819,8 @@ def test_identical_version_retry_only_backfills_missing_catalog(_mock_serve_db):
                                                   'entries': [{
                                                       'other': True
                                                   }]
-                                              }) is
-            serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
+                                              })
+            is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
     final_row = _read_version_row(_mock_serve_db, 'svc-catalog-retry', 1)
     assert final_row['placement_catalog'] == catalog
     assert final_row['spec'] == original_spec
@@ -2806,21 +2834,21 @@ def test_logical_replica_activation_is_durable_and_one_way(_mock_serve_db):
 
     assert serve_state.add_version('svc-logical') == 2
     assert (serve_state.add_or_update_version('svc-logical', 2, logical,
-                                              'yaml: logical') is
-            serve_state.VersionCommitResult.COMMITTED)
+                                              'yaml: logical')
+            is serve_state.VersionCommitResult.COMMITTED)
     assert serve_state.service_uses_logical_replica_semantics('svc-logical')
 
     assert serve_state.add_version('svc-logical') == 3
     assert (serve_state.add_or_update_version('svc-logical', 3, physical,
-                                              'yaml: physical') is
-            serve_state.VersionCommitResult.SEMANTIC_CONFLICT)
+                                              'yaml: physical')
+            is serve_state.VersionCommitResult.SEMANTIC_CONFLICT)
     assert serve_state.get_spec('svc-logical', 3) is None
 
     # A lost-response retry of a physical version committed before activation
     # remains idempotent. The fence only rejects new physical commits.
     assert (serve_state.add_or_update_version('svc-logical', 1, physical,
-                                              'yaml: v1') is
-            serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
+                                              'yaml: v1')
+            is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
 
 
 def test_lower_logical_commit_cannot_flip_newer_physical_semantics(
@@ -2832,11 +2860,11 @@ def test_lower_logical_commit_cannot_flip_newer_physical_semantics(
     assert serve_state.add_version('svc-out-of-order') == 3
 
     assert (serve_state.add_or_update_version('svc-out-of-order', 3, physical,
-                                              'yaml: physical-v3') is
-            serve_state.VersionCommitResult.COMMITTED)
+                                              'yaml: physical-v3')
+            is serve_state.VersionCommitResult.COMMITTED)
     assert (serve_state.add_or_update_version('svc-out-of-order', 2, logical,
-                                              'yaml: logical-v2') is
-            serve_state.VersionCommitResult.STALE_VERSION)
+                                              'yaml: logical-v2')
+            is serve_state.VersionCommitResult.STALE_VERSION)
     assert not serve_state.service_uses_logical_replica_semantics(
         'svc-out-of-order')
     assert serve_state.get_spec('svc-out-of-order', 2) is None
