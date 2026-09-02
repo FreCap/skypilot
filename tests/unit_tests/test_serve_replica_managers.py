@@ -4706,8 +4706,10 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         one_or_none = (
             connection.execute.return_value.mappings.return_value.one_or_none)
         one_or_none.side_effect = [None, predecessor, predecessor]
+        connection.dialect.name = 'postgresql'
+        connection.in_transaction.return_value = True
         engine = mock.MagicMock()
-        engine.connect.return_value.__enter__.return_value = connection
+        engine.begin.return_value.__enter__.return_value = connection
         with mock.patch.object(request_postgres,
                                'initialize_and_get_db',
                                return_value=engine):
@@ -4735,8 +4737,10 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         connection = mock.MagicMock()
         (connection.execute.return_value.mappings.return_value.one_or_none.
          return_value) = predecessor
+        connection.dialect.name = 'postgresql'
+        connection.in_transaction.return_value = True
         engine = mock.MagicMock()
-        engine.connect.return_value.__enter__.return_value = connection
+        engine.begin.return_value.__enter__.return_value = connection
         with mock.patch.object(request_postgres,
                                'initialize_and_get_db',
                                return_value=engine), \
@@ -8124,7 +8128,7 @@ run: echo hi
         persisted_spec = mock.sentinel.persisted_spec
 
         with mock.patch(
-                'sky.serve.replica_managers.load_task_with_service_spec',
+                'sky.serve.serve_utils.load_task_with_service_spec',
                 return_value=task) as load_task, \
              mock.patch('sky.serve.replica_managers.usage_lib'), \
              mock.patch('sky.serve.replica_managers.sdk') as mock_sdk:

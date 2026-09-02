@@ -27,6 +27,7 @@ from test_kueue_lane_lineage_pg import _receipt as _kueue_receipt
 from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
+from sky import clouds
 from sky import global_user_state_schema
 from sky.client import sdk
 from sky.serve import autoscaler_compatibility
@@ -3158,9 +3159,13 @@ def test_current_planner_enforces_exact_multi_gpu_paid_cap(
 
 
 def test_manager_prepared_heterogeneous_wave_cannot_starve_a100_at_global_cap(
-        capacity_database):
+        capacity_database, monkeypatch):
     """Cheaper L4 alternatives cannot consume A100's locked paid authority."""
     engine, incarnation, _ = capacity_database
+    # The repository rebuilds every candidate through the real GCP cloud of
+    # the locked catalog; synthetic instance types have no catalog memory.
+    monkeypatch.setattr(clouds.GCP, 'get_vcpus_mem_from_instance_type',
+                        lambda *_args, **_kwargs: (4, 16.0))
     _enable_durable_intent(engine,
                            incarnation,
                            reserved_fill_enabled=False,
@@ -3176,6 +3181,9 @@ def test_manager_prepared_heterogeneous_wave_cannot_starve_a100_at_global_cap(
                          instance_type='test-a100-required')
     for location in (l4, a100):
         location.image_id = {None: 'skypilot:test-regionless-image'}
+        # Canonical request reconstruction serializes the task, which reads
+        # the synthetic instance type's memory from the mock cloud.
+        location.cloud.get_vcpus_mem_from_instance_type.return_value = (4, 16.0)
     service = serve_state.get_spec('svc', 1)
     assert service is not None
     placer = make_placer({
@@ -3383,6 +3391,8 @@ def test_current_planner_accepts_equal_cost_pool_interleaving(
         capacity_database, monkeypatch):
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    monkeypatch.setattr(clouds.GCP, 'get_vcpus_mem_from_instance_type',
+                        lambda *_args, **_kwargs: (4, 16.0))
     monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 60)
     locations = []
     for index in range(2):
@@ -4522,6 +4532,8 @@ def test_current_planner_rejects_descending_normalized_cost_traversal(
         capacity_database, monkeypatch):
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    monkeypatch.setattr(clouds.GCP, 'get_vcpus_mem_from_instance_type',
+                        lambda *_args, **_kwargs: (4, 16.0))
     monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 60)
     locations = []
     for index, cost in enumerate((0.10, 0.20)):

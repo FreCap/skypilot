@@ -3645,8 +3645,9 @@ def test_gcp_paid_identity_accepts_http_post_normalization_body(
             user_hash='skyserve'))
 
 
-def test_gcp_paid_provider_identity_uses_frozen_region_for_project(
+def test_gcp_paid_provider_identity_uses_frozen_pool_project(
         bound_request_database, monkeypatch) -> None:
+    """A v2 pool froze its project at admission; config is never consulted."""
     graph = _prepare_paid_provider_absence_graph(
         bound_request_database, monkeypatch, pool_key=_gc_gcp_paid_pool_key())
     original_resolver = (request_postgres.skypilot_config.
@@ -3656,8 +3657,7 @@ def test_gcp_paid_provider_identity_uses_frozen_region_for_project(
     def _regional_project_resolver(config_snapshot, cloud, keys, **kwargs):
         if cloud == 'gcp' and keys == ('project_id',):
             project_reads.append(kwargs)
-            if kwargs.get('region') == 'us-east4':
-                return 'regional-project'
+            return 'regional-project'
         return original_resolver(config_snapshot, cloud, keys, **kwargs)
 
     monkeypatch.setattr(request_postgres.skypilot_config,
@@ -3668,11 +3668,8 @@ def test_gcp_paid_provider_identity_uses_frozen_region_for_project(
         graph.context, graph.authority)
 
     assert identity is not None
-    assert identity['project_id'] == 'regional-project'
-    assert project_reads == [{
-        'region': 'us-east4',
-        'workspace': 'workspace-a',
-    }]
+    assert identity['project_id'] == 'boltz-498512'
+    assert project_reads == []
 
 
 @pytest.mark.parametrize('production_http_normalization', [False, True])
