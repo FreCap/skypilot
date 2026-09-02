@@ -398,27 +398,43 @@ def _fresh_image_catalog() -> common.LazyDataFrame:
     return common.read_catalog('aws/images.csv', pull_frequency_hours=0)
 
 
-def _is_ami_id(image_id: str | None) -> bool:
-    return (image_id is not None and
+def _is_ami_id(image_id: object) -> bool:
+    return (isinstance(image_id, str) and
             _AMI_ID_PATTERN.fullmatch(image_id) is not None)
 
 
 def get_image_id_from_tag(tag: str, region: str | None) -> str | None:
     """Returns the image id from the tag."""
-    global _image_df
-
     image_id = common.get_image_id_from_tag_impl(_image_df, tag, region)
     if not _is_ami_id(image_id):
         # Refresh once per request when the tag is absent or contains a
         # generator placeholder.  Regionless placement checks several regions
         # together; reusing one refreshed LazyDataFrame prevents one download
-        # for every missing region.
+        # for every missing region.  The module-level catalog keeps its
+        # regular pull cadence: binding the forced-refresh frame to it would
+        # re-download the catalog at the start of every later request, even
+        # requests whose lookups all hit.
         logger.debug('Refreshing the image catalog and trying again.')
-        _image_df = _fresh_image_catalog()
-        image_id = common.get_image_id_from_tag_impl(_image_df, tag, region)
+        image_id = common.get_image_id_from_tag_impl(_fresh_image_catalog(),
+                                                     tag, region)
     return image_id if _is_ami_id(image_id) else None
 
 
+def _tag_has_ami(df: common.LazyDataFrame, tag: str) -> bool:
+    image_ids = df[df['Tag'] == tag]['ImageId']
+    return any(_is_ami_id(image_id) for image_id in image_ids)
+
+
 def is_image_tag_valid(tag: str, region: str | None) -> bool:
-    """Returns whether the image tag is valid."""
-    return get_image_id_from_tag(tag, region) is not None
+    """Returns whether the tag maps to an AMI in ``region``.
+
+    A region-agnostic tag (``region is None``) is valid when any region has an
+    AMI for it; AWS default tags map to one AMI per region, so the
+    single-image lookup cannot answer that question.
+    """
+    if region is not None:
+        return get_image_id_from_tag(tag, region) is not None
+    if _tag_has_ami(_image_df, tag):
+        return True
+    logger.debug('Refreshing the image catalog and trying again.')
+    return _tag_has_ami(_fresh_image_catalog(), tag)
