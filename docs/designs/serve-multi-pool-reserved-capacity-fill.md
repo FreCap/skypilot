@@ -1769,6 +1769,14 @@ projection inside the committed v4 witness and made budget authority explicit:
 - `HOLDINGS_ONLY` retains bounded existing fill but cannot acquire a new pool.
   Missing, stale, flexible, mixed, configured-minimum, floor/fixed-inflated,
   or otherwise incomplete durable evidence always selects this mode.
+  A current witness whose plan has no reservation-compatible demand (zero
+  demand, or paid-only demand on a non-reserved card) publishes no
+  acquisition classes and a zero target; that is a proven zero for the
+  release governor (`demonstrated_need = 0`, not blind), so idle release
+  starts after the ordinary dwell instead of the blind grace period. Only an
+  absent or stale witness is blind, and a blind heartbeat publishes
+  `boot_hold = false` because the governor ignores the hold while blind and
+  the allocation publisher rejects a blind witness that carries one.
 - `EXACT_SINGLETON` is permitted only when the adopted positive target is no
   greater than raw demand and is explained by singleton request classes
   already bound by the v4 digest. A normal rate-limited upscale wave may use a
