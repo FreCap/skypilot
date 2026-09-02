@@ -1,6 +1,6 @@
 # Managed-job terminal cluster reconciliation
 
-Status: Ready for review and deployment
+Status: Deployed
 
 Last updated: 2026-09-02
 
@@ -108,6 +108,18 @@ same visible `WAITING` row for a later current controller.
 No compatibility path or feature flag is introduced, so no stacked removal
 change is required.
 
+Production deployed release `1.1.1638` from merge commit
+`1cad3f6d0442926f30ee26b2b8a294cceeceb245` at Helm revision 753. The API,
+controller, and executor deployments are pinned to image digest
+`sha256:5de0e97ab88b66bf0496a84059cfb96b3d97cde7174948a7cdfeddddd15b41a2`;
+the immutable chart digest is
+`sha256:8f6b5ee2ffe5951c37631e4af1a16b5cf84f72fd432d376acc3a13f504ff3c97`.
+Because the fixed three-node control-plane fleet could not fit the HA API
+surge replica, the rollout temporarily reduced executors to their supported HA
+minimum of two through Helm, completed the API rollout, and then restored all
+seven executors through Helm. Both stages used atomic rollback and preserved
+at least two API replicas and two executors.
+
 ## Verification plan
 
 - Unit-test candidate filtering: attributed current rows, legacy exact-name
@@ -131,4 +143,7 @@ change is required.
   pre-existing `capacityPlanExpiryTick` hook warning.
 - [x] Production incident interval is corrected and rollup read-back matches.
 - [x] No live AWS resources remain for job 6036.
-- [ ] Reconciliation code is reviewed and deployed to the API server.
+- [x] Reconciliation code is reviewed and deployed to the API server. Leader
+  recovery completed with zero legacy orphan candidates; the API reported
+  commit `1cad3f6d0442926f30ee26b2b8a294cceeceb245`, all role deployments were
+  Ready, and no live clusters or in-progress managed jobs remained.
