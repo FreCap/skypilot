@@ -875,8 +875,11 @@ def _system_recovery_body_and_identity(
         intent,
         service_name='svc',
         service_version=2,
+        service_lifecycle_epoch=4,
         controller_pid=123,
-        controller_ip='10.0.0.2')
+        controller_ip='10.0.0.2',
+        controller_incarnation=_CONTROLLER_ID,
+        controller_owner_epoch=6)
     recovery_context.update({
         binding.REPLICA_ID_KEY: 3,
         binding.REPLICA_RECORD_ID_KEY: str(_RECORD_ID),
@@ -1358,7 +1361,9 @@ def test_api014_serve051_lineage_and_sqlite_stays_at_serve037(
     assert (
         server_constants.MIN_SERVE_INCREMENTAL_ROUTE_LEASES_API_VERSION == 88)
     assert server_constants.MIN_SERVE_EXACT_REQUEST_SUMMARY_API_VERSION == 92
-    assert server_constants.API_VERSION == 93
+    assert (
+        server_constants.MIN_SERVE_OFFERED_ARRIVAL_TELEMETRY_API_VERSION == 94)
+    assert server_constants.API_VERSION == 94
 
     alembic_command.upgrade(serve_config, '037')
     inspector = sqlalchemy.inspect(sqlite)

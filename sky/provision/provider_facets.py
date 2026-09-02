@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import inspect
 import types
 import typing
@@ -22,6 +23,88 @@ INSTANCE_LIFECYCLE_V1_METHODS: typing.Final[tuple[str, ...]] = (
     'wait_instances',
     'get_cluster_info',
 )
+
+# This is the maximum wire payload accepted by one facet invocation, not a
+# global fleet or reconciliation limit.  Callers with larger inventories must
+# partition them into aggregate calls of at most this size; they must never
+# fall back to singleton instance queries.
+INSTANCE_STATUS_INVENTORY_V1_MAX_QUERIES: typing.Final[int] = 800
+INSTANCE_STATUS_INVENTORY_V1_TIMEOUT_SECONDS: typing.Final[int] = 30
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class InstanceStatusInventoryQueryV1:
+    """One exact cluster identity in a provider inventory snapshot."""
+
+    query_id: str
+    cluster_name: str
+    cluster_name_on_cloud: str
+    provider_config: dict[str, Any]
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class InstanceStatusInventoryEntryV1:
+    """One immutable instance status returned by an inventory read."""
+
+    instance_id: str
+    status: status_lib.ClusterStatus | None
+    reason: str | None = None
+
+
+class InstanceStatusInventoryDispositionV1(enum.Enum):
+    """Whether one query has complete provider evidence."""
+
+    OBSERVED = 'observed'
+    UNKNOWN = 'unknown'
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class InstanceStatusInventoryObservationV1:
+    """One cluster's projection from a shared provider inventory read.
+
+    ``OBSERVED`` with an empty ``entries`` tuple is authoritative absence.
+    ``UNKNOWN`` is deliberately distinct: it carries no interruption evidence.
+    """
+
+    query_id: str
+    disposition: InstanceStatusInventoryDispositionV1
+    entries: tuple[InstanceStatusInventoryEntryV1, ...] = ()
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.query_id:
+            raise ValueError('Inventory observation query_id must be nonempty.')
+        if self.disposition is InstanceStatusInventoryDispositionV1.OBSERVED:
+            if self.error is not None:
+                raise ValueError('Observed inventory cannot carry an error.')
+        elif self.disposition is InstanceStatusInventoryDispositionV1.UNKNOWN:
+            if self.entries:
+                raise ValueError('Unknown inventory cannot carry entries.')
+            if not self.error:
+                raise ValueError('Unknown inventory must explain its error.')
+        else:
+            raise ValueError('Unknown inventory disposition.')
+
+
+@typing.runtime_checkable
+class InstanceStatusInventoryV1(typing.Protocol):
+    """Optional bounded provider capability for aggregate status reads.
+
+    This capability deliberately remains optional on ``InstanceLifecycleV1``:
+    older provisioner plugins continue to register and operate.  Callers must
+    treat an absent capability as UNKNOWN instead of falling back to N
+    singleton ``query_instances`` calls.
+    """
+
+    # pylint: disable=unnecessary-ellipsis
+
+    def query_instances_batch(
+        self,
+        queries: tuple[InstanceStatusInventoryQueryV1, ...],
+        *,
+        deadline_monotonic: float,
+    ) -> tuple[InstanceStatusInventoryObservationV1, ...]:
+        ...
 
 
 @typing.runtime_checkable
@@ -246,6 +329,13 @@ def instance_lifecycle_v1_validation_errors(lifecycle: Any) -> tuple[str, ...]:
     return tuple(errors)
 
 
+def instance_status_inventory_v1_validation_error(owner: Any) -> str | None:
+    """Return a callable-shape error for the optional batch capability."""
+    return _callable_v1_validation_error(
+        getattr(owner, 'query_instances_batch', None),
+        InstanceStatusInventoryV1.query_instances_batch)
+
+
 def builtin_query_instances_diagnostic_v1_validation_errors(
     diagnostic: BuiltinQueryInstancesDiagnosticV1,) -> tuple[str, ...]:
     """Return callable-shape errors for a built-in query diagnostic."""
@@ -274,10 +364,18 @@ def builtin_query_instances_diagnostic_v1_validation_errors(
 __all__ = [
     'BuiltinQueryInstancesDiagnosticV1',
     'INSTANCE_LIFECYCLE_V1_METHODS',
+    'INSTANCE_STATUS_INVENTORY_V1_MAX_QUERIES',
+    'INSTANCE_STATUS_INVENTORY_V1_TIMEOUT_SECONDS',
     'InstanceLifecycleV1',
+    'InstanceStatusInventoryDispositionV1',
+    'InstanceStatusInventoryEntryV1',
+    'InstanceStatusInventoryObservationV1',
+    'InstanceStatusInventoryQueryV1',
+    'InstanceStatusInventoryV1',
     'LegacyInstanceLifecycleAdapter',
     'ProvisionerBundleV1',
     'QueryInstancesFnV1',
     'builtin_query_instances_diagnostic_v1_validation_errors',
     'instance_lifecycle_v1_validation_errors',
+    'instance_status_inventory_v1_validation_error',
 ]

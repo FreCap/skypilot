@@ -126,10 +126,11 @@ def test_replica_reads_have_a_distinct_api_capability_version():
         server_constants.MIN_SERVE_EXACT_REQUEST_SUMMARY_API_VERSION)
     assert exact_request_summary_version == 92
     assert lazy_version_yaml_version < exact_request_summary_version
-    # API 93 (8731de20a) only advanced the SkyServe shared-cache projection
-    # protocol to v10; it introduced no client-gated capability constant.
-    assert server_constants.API_VERSION == 93
-    assert exact_request_summary_version < server_constants.API_VERSION
+    offered_arrival_version = (
+        server_constants.MIN_SERVE_OFFERED_ARRIVAL_TELEMETRY_API_VERSION)
+    assert offered_arrival_version == 94
+    assert exact_request_summary_version < offered_arrival_version
+    assert server_constants.API_VERSION == offered_arrival_version
 
 
 def test_current_demand_reads_database_without_controller():

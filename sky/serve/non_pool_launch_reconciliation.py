@@ -15,6 +15,7 @@ from collections.abc import Callable
 from collections.abc import Mapping
 import dataclasses
 import time
+import typing
 from typing import Any, cast
 
 from sky import exceptions
@@ -25,6 +26,9 @@ from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
 from sky.serve import reserved_capacity
 from sky.utils import common_utils
+
+if typing.TYPE_CHECKING:
+    from sky.server.requests import postgres as request_postgres_types
 
 request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
 api_requests = adaptors_common.LazyImport('sky.server.requests.requests')
@@ -312,10 +316,11 @@ def _gcp_observation_payload(
 
 
 def _query_aws_paid_provider_census(
-    provider_identity: Mapping[str, Any],) -> list[dict[str, str]]:
+    scope: request_postgres_types.BoundAwsProviderCensusScope,
+) -> list[dict[str, str]]:
     """Perform one uncached, account-checked EC2 client-token census."""
-    session = aws_adaptor.session(
-        profile=provider_identity['credential_profile'])
+    provider_identity = scope.provider_identity
+    session = aws_adaptor.session(profile=scope.credential_profile)
     region = provider_identity['region']
     caller = session.client('sts', region_name=region).get_caller_identity()
     if caller.get('Account') != provider_identity['aws_account_id']:
@@ -439,7 +444,7 @@ def _observe_aws_paid_provider(
     authority: ordinary_launch_binding.ControllerBindingAuthority,
 ) -> ProviderObservation:
     """Query frozen AWS account, placement, and EC2 client-token identity."""
-    identity = request_postgres.bound_non_pool_aws_provider_identity(
+    scope = request_postgres.bound_non_pool_aws_provider_census_scope(
         context, authority)
     base = {
         'association_id': str(context.association_id),
@@ -448,14 +453,15 @@ def _observe_aws_paid_provider(
         'profile_kind': context.profile.kind.value,
         'replica_record_id': str(context.replica_record_id),
     }
-    if identity is None:
+    if scope is None:
         return ProviderObservation(
             ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
                 **base,
-                'reason': 'missing-immutable-aws-provider-identity',
+                'reason': 'missing-immutable-aws-provider-access',
             })
+    identity = scope.provider_identity
     try:
-        instances = _query_aws_paid_provider_census(identity)
+        instances = _query_aws_paid_provider_census(scope)
     except Exception as error:  # pylint: disable=broad-except
         return ProviderObservation(
             ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
@@ -484,7 +490,7 @@ def _observe_aws_paid_provider(
             })
     time.sleep(_AWS_EMPTY_CENSUS_INTERVAL_SECONDS)
     try:
-        instances = _query_aws_paid_provider_census(identity)
+        instances = _query_aws_paid_provider_census(scope)
     except Exception as error:  # pylint: disable=broad-except
         return ProviderObservation(
             ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
@@ -859,11 +865,12 @@ def terminate_aws_paid_provider_allocation(
                 context, authority)):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'AWS provider cleanup lacks exact durable PRESENT authority.')
-    identity = request_postgres.bound_non_pool_aws_provider_identity(
+    scope = request_postgres.bound_non_pool_aws_provider_census_scope(
         context, authority)
-    if identity is None:
+    if scope is None:
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-            'AWS provider cleanup lost its immutable request identity.')
+            'AWS provider cleanup lost immutable identity or access.')
+    identity = scope.provider_identity
     deadline = time.monotonic() + _AWS_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS
     last_cleanup_error: BaseException | None = None
     observation: ProviderObservation | None = None
@@ -880,15 +887,14 @@ def terminate_aws_paid_provider_allocation(
                 'AWS provider cleanup lost authority while deleting the exact '
                 'allocation.')
         try:
-            instances = _query_aws_paid_provider_census(identity)
+            instances = _query_aws_paid_provider_census(scope)
             live_ids = [
                 instance['instance_id']
                 for instance in instances
                 if instance['state'] != 'terminated'
             ]
             if live_ids:
-                session = aws_adaptor.session(
-                    profile=identity['credential_profile'])
+                session = aws_adaptor.session(profile=scope.credential_profile)
                 account = session.client(
                     'sts',
                     region_name=identity['region']).get_caller_identity()

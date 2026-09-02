@@ -1,14 +1,19 @@
-"""Resource-heavy unpaid 10k cold-queue test through the real LB HTTP surface.
+"""Resource-heavy production-interface component test for a 10k cold queue.
 
 This starts the production SkyServe load balancer against a fake controller
 that speaks the normal sync contract.  It replaces no load-balancer internals:
 10,000 HTTP requests enter the public inference route, remain queued with zero
 ready replicas, and are then cancelled through their client connections.
 
+This is not an unpaid provider-interface E2E: it deliberately replaces the
+controller and does not run PostgreSQL, planning, reconciliation, or a provider
+facet.  Its contract is load-balancer event-loop responsiveness and exact
+public demand accounting at maximum tested queue cardinality.
+
 Run as the dedicated resource-heavy regression (it opens 10,000 local
 sockets, so do not run it under xdist):
 
-    pytest -n0 tests/integration_tests/test_lb_cold_queue_e2e.py
+    pytest -n0 tests/integration_tests/test_lb_cold_queue_component.py
 """
 import asyncio
 import json
@@ -232,6 +237,7 @@ async def _run_test(controller_port: int, lb_port: int) -> None:
 
 
 @pytest.mark.serve_lb_10k_interface
+@pytest.mark.component
 def test_ten_thousand_cold_requests_keep_public_surfaces_responsive() -> None:
     context = multiprocessing.get_context('spawn')
     controller_port = _unused_local_port()

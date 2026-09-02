@@ -426,12 +426,12 @@ def test_skyserve_spot_recovery():
     smoke_tests_utils.run_one_test(test)
 
 
-@pytest.mark.gcp
 @pytest.mark.serve
 @pytest.mark.slow
 @pytest.mark.resource_heavy
 @pytest.mark.exclusive
 @pytest.mark.no_auto_retry
+@pytest.mark.paid_e2e
 def test_skyserve_paid_spot_postgres_e2e(request: pytest.FixtureRequest):
     """Prove authenticated PostgreSQL admission through natural Spot drain.
 
@@ -446,6 +446,7 @@ def test_skyserve_paid_spot_postgres_e2e(request: pytest.FixtureRequest):
     provider = request.config.getoption('--serve-paid-provider-e2e-provider')
     economic_receipt = request.config.getoption(
         '--serve-paid-provider-e2e-economic-receipt')
+    workspace = request.config.getoption('--serve-paid-provider-e2e-workspace')
     if (profile == 'provider-canary') != (provider is not None):
         pytest.fail('provider-canary requires exactly one explicit provider; '
                     'economic profiles forbid provider pinning')
@@ -463,39 +464,23 @@ def test_skyserve_paid_spot_postgres_e2e(request: pytest.FixtureRequest):
                     'API server projected token ring')
     name = common_utils.make_cluster_name_on_cloud(
         f'paid-e2e-{smoke_tests_utils.test_id}', 24)
-    qualifier = 'tests/skyserve/paid_capacity/qualify.py'
-    rendered = f'/tmp/{name}-{profile}.yaml'
-    receipt = f'/tmp/{name}-{profile}-receipt.json'
-    scope_receipt = f'/tmp/{name}-{profile}-scope.json'
-    cleanup_receipt = f'/tmp/{name}-{profile}-cleanup.json'
+    lifecycle = 'tests/skyserve/paid_capacity/lifecycle.py'
+    artifacts_dir = f'/tmp/{name}-{profile}-artifacts'
     python = shlex.quote(sys.executable)
     provider_arg = ('' if provider is None else
                     f' --provider {shlex.quote(provider)}')
     economic_receipt_arg = (
         '' if economic_receipt is None else
         f' --economic-receipt {shlex.quote(economic_receipt)}')
-    render_command = (f'{python} {shlex.quote(qualifier)} render '
-                      f'--profile {shlex.quote(profile)} '
-                      f'{provider_arg} '
-                      f'{economic_receipt_arg} '
-                      f'--output {shlex.quote(rendered)}')
-    qualify_command = (f'{_SERVE_ENDPOINT_WAIT.format(name=name)}; '
-                       f'{python} {shlex.quote(qualifier)} run '
-                       f'--profile {shlex.quote(profile)} '
-                       f'{provider_arg} '
-                       f'{economic_receipt_arg} '
-                       f'--service-name {shlex.quote(name)} '
-                       '--endpoint "$endpoint" '
-                       f'--receipt {shlex.quote(receipt)} '
-                       f'--scope {shlex.quote(scope_receipt)}')
-    freeze_scope_command = (f'{python} {shlex.quote(qualifier)} freeze-scope '
-                            f'--service-name {shlex.quote(name)} '
-                            f'--output {shlex.quote(scope_receipt)}')
-    wait_cleanup_command = (f'{python} {shlex.quote(qualifier)} wait-cleanup '
-                            f'--service-name {shlex.quote(name)} '
-                            f'--scope {shlex.quote(scope_receipt)} '
-                            f'--receipt {shlex.quote(receipt)} '
-                            f'--output {shlex.quote(cleanup_receipt)}')
+    workspace_arg = ('' if workspace is None else
+                     f' --workspace {shlex.quote(workspace)}')
+    lifecycle_command = (f'exec {python} {shlex.quote(lifecycle)} '
+                         f'--profile {shlex.quote(profile)} '
+                         f'{provider_arg} '
+                         f'{economic_receipt_arg} '
+                         f'{workspace_arg} '
+                         f'--service-name {shlex.quote(name)} '
+                         f'--artifacts-dir {shlex.quote(artifacts_dir)}')
     env = dict(smoke_tests_utils.LOW_CONTROLLER_RESOURCE_ENV)
     if auth_token:
         # A local API server started by this test must pass the same token to
@@ -505,16 +490,16 @@ def test_skyserve_paid_spot_postgres_e2e(request: pytest.FixtureRequest):
         env['SKYPILOT_SERVE_LB_AUTH_TOKEN'] = auth_token
     test = smoke_tests_utils.Test(
         f'test-skyserve-paid-spot-postgres-{profile}',
-        [
-            render_command,
-            f'sky serve up -n {name} -y {shlex.quote(rendered)}',
-            freeze_scope_command,
-            qualify_command,
-        ],
-        smoke_tests_utils.command_with_cleanup(
-            _TEARDOWN_SERVICE.format(name=name), wait_cleanup_command),
+        [lifecycle_command],
         env=env,
         timeout=90 * 60,
+        # On timeout the lifecycle first spends up to five minutes recovering
+        # exact provider scope.  A normal-down CLI attempt is itself bounded at
+        # fifteen minutes, followed by thirty minutes proving exact provider/
+        # PostgreSQL zero.  Keep a bounded five-minute margin for CLI
+        # termination and receipt persistence.
+        timeout_termination_grace_seconds=55 * 60,
+        timeout_completion_receipt=(f'{artifacts_dir}/{name}-lifecycle.json'),
     )
     smoke_tests_utils.run_one_test(test)
 

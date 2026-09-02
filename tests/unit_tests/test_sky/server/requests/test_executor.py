@@ -322,7 +322,7 @@ def test_drain_racing_running_transition_cancels_before_effect_gate(
 
 
 def test_nested_controller_claim_gets_one_shot_capability(monkeypatch):
-    """Only a complete authenticated managed-job origin receives authority."""
+    """A verified origin receives authority across a split-role claim."""
     capability = controller_capability.generate()
     controller_capability.install_process_local(capability)
     origin = (1, '12345678-1234-4abc-9234-56789abcdef0', 7, 0,
@@ -333,7 +333,9 @@ def test_nested_controller_claim_gets_one_shot_capability(monkeypatch):
         retryable=False,
         execution_generation=3,
         claim_token='claim-token',
-        worker_instance_id=origin[1],
+        # The disposable request claimant is intentionally distinct from the
+        # logical outer-controller identity carried by the job origin.
+        worker_instance_id='abcdef01-2345-4abc-9234-56789abcdef0',
         managed_job_origin=origin)
     queue = mock.Mock()
     queue.peek_provider_mutation.return_value = None

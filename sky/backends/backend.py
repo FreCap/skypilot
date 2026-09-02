@@ -24,6 +24,10 @@ class ServeReplicaJobStatusSource(enum.Enum):
     """Authoritative steady-state liveness source for a Serve replica.
 
     ``REMOTE_JOB`` requires querying the job table inside every replica.
+    ``STARTUP_SENTINEL_AND_PROVIDER_ENDPOINT`` keeps one exact pre-ready
+    sentinel per immutable version for the bad-rollout circuit breaker, then
+    makes provider lifecycle plus endpoint probes authoritative after any
+    version replica has served.
     ``PROVIDER_AND_ENDPOINT`` means the provider lifecycle plus SkyServe's
     application endpoint probe own ordinary replica liveness, so a remote job
     query would be duplicate evidence.  Callers must still request exact job
@@ -32,6 +36,8 @@ class ServeReplicaJobStatusSource(enum.Enum):
     """
 
     REMOTE_JOB = 'remote_job'
+    STARTUP_SENTINEL_AND_PROVIDER_ENDPOINT = (
+        'startup_sentinel_and_provider_endpoint')
     PROVIDER_AND_ENDPOINT = 'provider_and_endpoint'
 
 

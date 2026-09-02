@@ -8,6 +8,7 @@ import dis
 import enum
 import functools
 import inspect
+import math
 import types
 from types import MappingProxyType
 import typing
@@ -400,6 +401,22 @@ class _ProvisionerResolution:
             diagnostic_implementation=diagnostic_implementation,
         )
 
+    def resolve_instance_status_inventory(self) -> Any | None:
+        """Resolve the optional batch observer without mixed-owner fallback."""
+        if self.strict_bundle is not None:
+            owner: Any = self.strict_bundle.instance_lifecycle
+            return (owner if callable(
+                getattr(owner, 'query_instances_batch', None)) else None)
+        if self.legacy_registration is not None:
+            owner = self.legacy_registration.module
+            return (owner if callable(
+                getattr(owner, 'query_instances_batch', None)) else None)
+        if self.builtin_bundle is None:
+            return None
+        owner = self.builtin_bundle.legacy_module
+        return (owner if owner is not None and callable(
+            getattr(owner, 'query_instances_batch', None)) else None)
+
 
 def _resolve_provisioner(provider_name: str) -> _ProvisionerResolution:
     canonical_name = _canonical_provider_name(provider_name)
@@ -558,6 +575,98 @@ def query_instances(
           NOTE: This is currently only used on kubernetes.
     """
     raise NotImplementedError
+
+
+def _unknown_instance_status_inventory(
+    queries: tuple[provider_facets.InstanceStatusInventoryQueryV1, ...],
+    error: str,
+) -> tuple[provider_facets.InstanceStatusInventoryObservationV1, ...]:
+    """Return fail-closed UNKNOWN results for one exact input batch."""
+    return tuple(
+        provider_facets.InstanceStatusInventoryObservationV1(
+            query_id=query.query_id,
+            disposition=(
+                provider_facets.InstanceStatusInventoryDispositionV1.UNKNOWN),
+            error=error) for query in queries)
+
+
+def query_instances_batch(
+    provider_name: str,
+    queries: tuple[provider_facets.InstanceStatusInventoryQueryV1, ...],
+    *,
+    deadline_monotonic: float,
+) -> tuple[provider_facets.InstanceStatusInventoryObservationV1, ...]:
+    """Read one bounded provider inventory without singleton fallback.
+
+    Providers may partition the immutable batch by credential authority and
+    location.  An old provider without this optional capability yields UNKNOWN
+    for every query; this function must never hide that gap behind N calls to
+    ``query_instances``.
+    """
+    if type(queries) is not tuple:  # pylint: disable=unidiomatic-typecheck
+        raise TypeError('Instance inventory queries must be an exact tuple.')
+    if (isinstance(deadline_monotonic, bool) or
+            not isinstance(deadline_monotonic, (int, float)) or
+            not math.isfinite(deadline_monotonic)):
+        raise ValueError('Instance inventory deadline must be finite.')
+    if len(queries) > (
+            provider_facets.INSTANCE_STATUS_INVENTORY_V1_MAX_QUERIES):
+        raise ValueError(
+            'Instance inventory batch exceeds its hard bound of '
+            f'{provider_facets.INSTANCE_STATUS_INVENTORY_V1_MAX_QUERIES}.')
+    query_ids = []
+    for query in queries:
+        if type(query) is not provider_facets.InstanceStatusInventoryQueryV1:
+            raise TypeError('Instance inventory query has an invalid type.')
+        if (not query.query_id or not query.cluster_name or
+                not query.cluster_name_on_cloud or
+                type(query.provider_config) is not dict):
+            raise ValueError('Instance inventory query is malformed.')
+        query_ids.append(query.query_id)
+    if len(set(query_ids)) != len(query_ids):
+        raise ValueError('Instance inventory query IDs must be unique.')
+    if not queries:
+        return ()
+
+    resolution = _resolve_provisioner(provider_name)
+    if not resolution.exists:
+        return _unknown_instance_status_inventory(
+            queries, f'unknown provider {resolution.canonical_name!r}')
+    owner = resolution.resolve_instance_status_inventory()
+    if owner is None:
+        return _unknown_instance_status_inventory(
+            queries, 'provider has no batch instance-status capability')
+    validation_error = (
+        provider_facets.instance_status_inventory_v1_validation_error(owner))
+    if validation_error is not None:
+        return _unknown_instance_status_inventory(
+            queries, f'invalid batch instance-status capability: '
+            f'{validation_error}')
+    try:
+        observations = owner.query_instances_batch(
+            queries, deadline_monotonic=float(deadline_monotonic))
+    except Exception as error:  # pylint: disable=broad-except
+        logger.warning('Batch instance-status observation failed for %r: %s',
+                       resolution.canonical_name, error)
+        return _unknown_instance_status_inventory(
+            queries, f'{type(error).__name__}: {error}')
+
+    if type(observations) is not tuple:  # pylint: disable=unidiomatic-typecheck
+        return _unknown_instance_status_inventory(
+            queries, 'provider returned a non-tuple inventory observation')
+    by_query_id = {}
+    malformed = len(observations) != len(queries)
+    for observation in observations:
+        if (type(observation)
+                is not provider_facets.InstanceStatusInventoryObservationV1 or
+                observation.query_id in by_query_id):
+            malformed = True
+            continue
+        by_query_id[observation.query_id] = observation
+    if malformed or set(by_query_id) != set(query_ids):
+        return _unknown_instance_status_inventory(
+            queries, 'provider returned a malformed inventory observation')
+    return tuple(by_query_id[query_id] for query_id in query_ids)
 
 
 @_route_to_cloud_impl

@@ -1,5 +1,6 @@
 """Characterization tests for SkyServe's versioned replica record."""
 # pylint: disable=protected-access
+import contextlib
 import copy
 import dataclasses
 import logging
@@ -819,24 +820,57 @@ def test_pool_probe_propagates_explicit_provider_phase_admission():
     admission = mock.sentinel.provider_phase_admission
 
     with mock.patch.object(replica_info.global_user_state,
-                           'get_handle_from_cluster_name',
-                           return_value=handle), \
+                           'get_handle_from_cluster_name') as get_handle, \
          mock.patch.object(replica_info.backend_utils,
-                           'check_cluster_available',
-                           return_value=handle), \
+                           'check_cluster_available') as check_available, \
          mock.patch.object(replica_info.backend_utils,
                            'get_backend_from_handle',
                            return_value=backend), \
          mock.patch.object(reserved_capacity,
                            'protocol_v2_provider_fence',
                            provider_fence):
-        _, ready, _ = replica.probe_pool(provider_phase_admission=admission)
+        _, ready, _ = replica.probe_pool(handle=handle,
+                                         provider_phase_admission=admission)
 
     assert ready
+    get_handle.assert_not_called()
+    check_available.assert_not_called()
     assert provider_fence.call_args_list == [
         mock.call(replica, handle, phase_admission=admission),
-        mock.call(replica, handle, phase_admission=admission),
     ]
+    backend.get_job_status.assert_called_once_with(handle, [1],
+                                                   stream_logs=False,
+                                                   serve_transport=None)
+
+
+def test_pool_probe_propagates_explicit_job_status_transport_bounds():
+    replica = _protocol_v2_replica()
+    handle = _protocol_v2_handle()
+    transport = mock.sentinel.transport
+    backend = mock.Mock()
+    backend.get_job_status.return_value = {
+        1: replica_info.job_lib.JobStatus.SUCCEEDED
+    }
+
+    with mock.patch.object(replica_info.global_user_state,
+                           'get_handle_from_cluster_name') as get_handle, \
+         mock.patch.object(replica_info.backend_utils,
+                           'check_cluster_available') as check_available, \
+         mock.patch.object(replica_info.backend_utils,
+                           'get_backend_from_handle',
+                           return_value=backend), \
+         mock.patch.object(reserved_capacity,
+                           'protocol_v2_provider_fence',
+                           return_value=contextlib.nullcontext()):
+        _, ready, _ = replica.probe_pool(handle=handle,
+                                         job_status_transport=transport)
+
+    assert ready
+    get_handle.assert_not_called()
+    check_available.assert_not_called()
+    backend.get_job_status.assert_called_once_with(handle, [1],
+                                                   stream_logs=False,
+                                                   serve_transport=transport)
 
 
 def test_golden_v7_reader_pins_v1_1_1276_materialization():
@@ -1277,7 +1311,8 @@ def test_probe_contains_input_and_transport_failures():
     assert isinstance(probe_time, float)
     client.get.assert_called_once_with('https://replica.example/health',
                                        headers={'X-User': 'value'},
-                                       timeout=7)
+                                       timeout=7,
+                                       stream=True)
 
 
 def test_probe_reports_exact_start_immediately_before_transport_call():
@@ -1307,3 +1342,42 @@ def test_probe_reports_exact_start_immediately_before_transport_call():
     assert ready
     assert [event for event, _ in events] == ['start', 'request']
     assert isinstance(events[0][1], float)
+    response.close.assert_called_once_with()
+
+
+def test_probe_never_materializes_readiness_response_body():
+    replica = _replica()
+
+    class _HeadersOnlyResponse:
+        status_code = 503
+
+        def __init__(self):
+            self.closed = False
+
+        @property
+        def text(self):
+            raise AssertionError('readiness probe materialized response body')
+
+        def close(self):
+            self.closed = True
+
+    response = _HeadersOnlyResponse()
+    client = mock.Mock()
+    client.get.return_value = response
+
+    with mock.patch.object(replica_managers.replica_tls,
+                           'probe_client',
+                           return_value=client):
+        actual, ready, _ = replica.probe(readiness_path='/health',
+                                         post_data=None,
+                                         timeout=7,
+                                         headers=None,
+                                         resolved_url='http://replica.example')
+
+    assert actual is replica
+    assert ready is False
+    assert response.closed
+    client.get.assert_called_once_with('http://replica.example/health',
+                                       headers=None,
+                                       timeout=7,
+                                       stream=True)

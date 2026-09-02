@@ -2279,6 +2279,14 @@ function ServiceDetails() {
           requestQueueDepth: directDemand.requestQueueDepth ?? null,
           rejectedRequests: directDemand.rejectedRequests ?? null,
           recentRejectedRequests: directDemand.recentRejectedRequests ?? null,
+          offeredArrivalTelemetryAvailable:
+            directDemand.offeredArrivalTelemetryAvailable === true,
+          uniqueJobArrivals60s: directDemand.uniqueJobArrivals60s ?? null,
+          uniqueJobArrivals300s: directDemand.uniqueJobArrivals300s ?? null,
+          headerlessArrivals60s: directDemand.headerlessArrivals60s ?? null,
+          headerlessArrivals300s: directDemand.headerlessArrivals300s ?? null,
+          offeredArrivalTrackingSaturated:
+            directDemand.offeredArrivalTrackingSaturated ?? null,
         }
       : {};
     let enriched = {
@@ -3121,7 +3129,7 @@ export function ServiceDetailCard({
     serviceData.requestWindowSeconds != null
   ) {
     addRequestActivityDetail(
-      `${lastReportedPrefix}${serviceData.recentRequestCount.toLocaleString()} requests in ${serviceData.requestWindowSeconds}s`
+      `${lastReportedPrefix}${serviceData.recentRequestCount.toLocaleString()} recorded requests in ${serviceData.requestWindowSeconds}s`
     );
   }
   if (
@@ -3129,7 +3137,7 @@ export function ServiceDetailCard({
     requestHistory?.requestsLastHour != null
   ) {
     addRequestActivityDetail(
-      `${requestHistory.requestsLastHour.toLocaleString()} requests in last hour`
+      `${requestHistory.requestsLastHour.toLocaleString()} recorded requests in last hour`
     );
   }
   if (serviceData.requestQueueDepth != null) {
@@ -3215,6 +3223,55 @@ export function ServiceDetailCard({
           serviceData.httpInFlightRequests === 1 ? '' : 's'
         } + ${serviceData.confirmedProcessingRequests.toLocaleString()} confirmed async processing`
       : null;
+  const offeredArrivals60s =
+    serviceData.uniqueJobArrivals60s != null &&
+    serviceData.headerlessArrivals60s != null
+      ? serviceData.uniqueJobArrivals60s + serviceData.headerlessArrivals60s
+      : null;
+  const offeredArrivals300s =
+    serviceData.uniqueJobArrivals300s != null &&
+    serviceData.headerlessArrivals300s != null
+      ? serviceData.uniqueJobArrivals300s + serviceData.headerlessArrivals300s
+      : null;
+  const offeredArrivalDetails = (uniqueJobs, headerless, windowLabel) => {
+    if (uniqueJobs == null || headerless == null) {
+      return ['offered-arrival telemetry unavailable'];
+    }
+    return [
+      `${uniqueJobs.toLocaleString()} stable-ID + ${headerless.toLocaleString()} headerless in ${windowLabel}`,
+      ...(serviceData.offeredArrivalTrackingSaturated === true
+        ? ['tracking saturated; reported counts are lower bounds']
+        : []),
+      'includes pre-admission attempts; stable IDs are deduplicated within each load-balancer window',
+      ...requestFreshnessDetails,
+    ];
+  };
+  const offeredArrivalMetrics = [
+    {
+      label: 'Offered arrivals (60s)',
+      value:
+        offeredArrivals60s != null
+          ? `${lastReportedPrefix}${offeredArrivals60s.toLocaleString()} offered in 60s`
+          : unavailableRequestMetric,
+      details: offeredArrivalDetails(
+        serviceData.uniqueJobArrivals60s,
+        serviceData.headerlessArrivals60s,
+        '60s'
+      ),
+    },
+    {
+      label: 'Offered arrivals (5m)',
+      value:
+        offeredArrivals300s != null
+          ? `${lastReportedPrefix}${offeredArrivals300s.toLocaleString()} offered in 5m`
+          : unavailableRequestMetric,
+      details: offeredArrivalDetails(
+        serviceData.uniqueJobArrivals300s,
+        serviceData.headerlessArrivals300s,
+        '5m'
+      ),
+    },
+  ];
   const requestBreakdownMetrics = [
     {
       label: 'Async processing now',
@@ -3257,8 +3314,9 @@ export function ServiceDetailCard({
     },
   ];
   const requestMetrics = requestTelemetryBreakdownAvailable
-    ? requestBreakdownMetrics
+    ? [...offeredArrivalMetrics, ...requestBreakdownMetrics]
     : [
+        ...offeredArrivalMetrics,
         {
           label: 'Requests now',
           value:

@@ -1,5 +1,5 @@
 """Hermetic contracts for the paid-provider qualification harness."""
-# pylint: disable=protected-access
+# pylint: disable=missing-class-docstring,protected-access
 
 import asyncio
 import dataclasses
@@ -13,6 +13,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 import types
 from typing import Any
@@ -41,6 +42,50 @@ def _load_module(name: str, path: pathlib.Path):
 
 _FIXTURE_DIR = pathlib.Path(__file__).parents[1] / 'skyserve' / 'paid_capacity'
 qualifier = _load_module('paid_capacity_qualifier', _FIXTURE_DIR / 'qualify.py')
+
+
+class _HttpResponseContext:
+    """Minimal aiohttp request context for endpoint-readiness tests."""
+
+    def __init__(self, outcome):
+        self._outcome = outcome
+
+    async def __aenter__(self):
+        if isinstance(self._outcome, BaseException):
+            raise self._outcome
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    @property
+    def status(self):
+        return self._outcome
+
+    async def read(self):
+        return b''
+
+
+class _HttpSession:
+    """Scripted aiohttp session for endpoint-readiness tests."""
+
+    def __init__(self, outcomes, calls, timeout):
+        self._outcomes = outcomes
+        self._calls = calls
+        self.timeout = timeout
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    def get(self, url, **kwargs):
+        self._calls.append((url, kwargs))
+        outcome = self._outcomes.pop(0)
+        if callable(outcome):
+            outcome = outcome()
+        return _HttpResponseContext(outcome)
 
 
 def _provider_scope(**overrides):
@@ -133,7 +178,6 @@ def _aws_identity(*,
     return qualifier.AwsProviderIdentity(aws_account_id='123456789012',
                                          client_token=client_token,
                                          cluster_name_on_cloud=cluster_name,
-                                         credential_profile='durable-profile',
                                          gpu_units_per_instance=width,
                                          instance_type=instance_type,
                                          num_nodes=1,
@@ -299,11 +343,14 @@ def _observation(observed_at: float = 1000,
         'load_balancer': _load_balancer_state(),
     }
     values.update(overrides)
-    return qualifier.Observation(
-        observed_at=observed_at,
-        observed_monotonic=(observed_at if observed_monotonic is None else
-                            observed_monotonic),
-        **values)
+    finished_monotonic = (observed_at
+                          if observed_monotonic is None else observed_monotonic)
+    return qualifier.Observation(observed_started_at=observed_at - 0.5,
+                                 observed_started_monotonic=finished_monotonic -
+                                 0.5,
+                                 observed_at=observed_at,
+                                 observed_monotonic=finished_monotonic,
+                                 **values)
 
 
 def _request_telemetry(*,
@@ -781,6 +828,111 @@ def test_provider_scope_commands_are_regionless_by_default():
     assert not hasattr(run, 'region')
 
 
+def test_http_authentication_waits_for_dns_and_endpoint_readiness(monkeypatch):
+    now = [100.0]
+    sleeps = []
+    calls = []
+    outcomes = [
+        qualifier.aiohttp.ClientConnectorDNSError(None,
+                                                  OSError('not resolved')),
+        503,
+        401,
+        200,
+    ]
+
+    def client_session(*, timeout):
+        assert timeout.total == 15
+        return _HttpSession(outcomes, calls, timeout)
+
+    async def sleep(delay):
+        sleeps.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(qualifier.aiohttp, 'ClientSession', client_session)
+    monkeypatch.setattr(qualifier.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', sleep)
+
+    asyncio.run(
+        qualifier.HttpObserver('https://new-nlb.example.test',
+                               'token').prove_authentication())
+
+    assert sleeps == [2, 2]
+    assert len(calls) == 4
+    assert calls[-2][1] == {}
+    assert calls[-1][1] == {
+        'headers': {
+            qualifier._AUTH_HEADER: 'Bearer token',
+        }
+    }
+
+
+def test_http_authentication_fails_immediately_when_not_enforced(monkeypatch):
+    calls = []
+    outcomes = [200]
+
+    monkeypatch.setattr(
+        qualifier.aiohttp, 'ClientSession',
+        lambda *, timeout: _HttpSession(outcomes, calls, timeout))
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='authentication is not enforced'):
+        asyncio.run(
+            qualifier.HttpObserver('https://service.example.test',
+                                   'token').prove_authentication())
+
+    assert len(calls) == 1
+
+
+def test_http_authentication_fails_immediately_for_rejected_token(monkeypatch):
+    calls = []
+    outcomes = [401, 403]
+
+    monkeypatch.setattr(
+        qualifier.aiohttp, 'ClientSession',
+        lambda *, timeout: _HttpSession(outcomes, calls, timeout))
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='Authenticated capacity probe returned 403'):
+        asyncio.run(
+            qualifier.HttpObserver('https://service.example.test',
+                                   'bad-token').prove_authentication())
+
+    assert len(calls) == 2
+
+
+def test_http_authentication_dns_retry_has_monotonic_deadline(monkeypatch):
+    now = [100.0]
+    sleeps = []
+    calls = []
+    outcomes = [
+        lambda: qualifier.aiohttp.ClientConnectorDNSError(
+            None, OSError('not resolved')),
+        lambda: qualifier.aiohttp.ClientConnectorDNSError(
+            None, OSError('not resolved')),
+    ]
+
+    async def sleep(delay):
+        sleeps.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(
+        qualifier.aiohttp, 'ClientSession',
+        lambda *, timeout: _HttpSession(outcomes, calls, timeout))
+    monkeypatch.setattr(qualifier.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', sleep)
+    monkeypatch.setattr(qualifier, '_ENDPOINT_AUTHENTICATION_TIMEOUT_SECONDS',
+                        4)
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='authentication deadline'):
+        asyncio.run(
+            qualifier.HttpObserver('https://new-nlb.example.test',
+                                   'token').prove_authentication())
+
+    assert sleeps == [2, 2]
+    assert len(calls) == 2
+
+
 def test_retained_request_accepts_cross_region_and_rejects_scope_drift(
         monkeypatch):
     scope = _provider_scope()
@@ -1016,32 +1168,27 @@ def test_aws_retained_identity_is_bound_to_frozen_catalog(monkeypatch):
         'cloud': 'aws',
         'instance_type': 'g6.48xlarge',
         'num_nodes': 1,
+        'provider_identity': {
+            'aws_account_id': '123456789012',
+        },
         'region': 'us-east-2',
         'use_spot': True,
-        'version': 1,
+        'version': 2,
         'workspace': 'workspace-a',
         'zone': 'us-east-2c',
     }
-    config = {
-        'active_workspace': 'workspace-a',
-        'workspaces': {
-            'workspace-a': {
-                'aws': {
-                    'profile': 'durable-profile',
-                },
-            },
-        },
-    }
+    # Server-controller launch requests deliberately omit credentials and
+    # retain only the workspace selector.
+    config = {'active_workspace': 'workspace-a'}
     monkeypatch.setattr(qualifier, '_retained_launch_request', lambda *_args:
                         (config, pool, 'workspace-a'))
 
     def provider_identity(_binding, *, credential_profile):
-        assert credential_profile == 'durable-profile'
+        assert credential_profile is None
         return {
-            'aws_account_id': '123456789012',
+            'aws_account_id': pool['provider_identity']['aws_account_id'],
             'client_token': 'token-wide',
             'cluster_name_on_cloud': 'paid-e2e-1-1234567890-tenant',
-            'credential_profile': credential_profile,
             'instance_type': pool['instance_type'],
             'num_nodes': 1,
             'region': pool['region'],
@@ -1056,6 +1203,7 @@ def test_aws_retained_identity_is_bound_to_frozen_catalog(monkeypatch):
     identity = qualifier.aws_identity_from_retained_request({}, {}, scope)
     assert identity.instance_type == 'g6.48xlarge'
     assert identity.gpu_units_per_instance == 8
+    assert not hasattr(identity, 'credential_profile')
 
     pool['accelerators'] = [['L4', 4]]
     with pytest.raises(qualifier.GuardViolation,
@@ -1063,6 +1211,11 @@ def test_aws_retained_identity_is_bound_to_frozen_catalog(monkeypatch):
         qualifier.aws_identity_from_retained_request({}, {}, scope)
     pool['accelerators'] = [['L4', 8]]
     pool['instance_type'] = 'g6.xlarge'
+    with pytest.raises(qualifier.GuardViolation,
+                       match='retained-request AWS identity'):
+        qualifier.aws_identity_from_retained_request({}, {}, scope)
+    pool['instance_type'] = 'g6.48xlarge'
+    pool['provider_identity']['aws_account_id'] = '210987654321'
     with pytest.raises(qualifier.GuardViolation,
                        match='retained-request AWS identity'):
         qualifier.aws_identity_from_retained_request({}, {}, scope)
@@ -1437,6 +1590,66 @@ def test_aws_observer_scans_every_frozen_catalog_region(monkeypatch):
         regional = [call for call in calls if call[0] == region]
         assert sum(call[1] == 'describe_instances' for call in regional) == 2
         assert sum(call[1] == 'describe_volumes' for call in regional) == 2
+
+
+def test_aws_observer_bounds_parallel_regions_and_aggregates_in_order(
+        monkeypatch):
+    regions = ('ap-south-1', 'eu-west-1', 'us-east-2', 'us-west-2')
+    scopes = tuple(
+        qualifier.AwsRegionScope(aws_account_id='123456789012',
+                                 credential_profile=f'{region}-profile',
+                                 region=region) for region in regions)
+    shapes = tuple(
+        qualifier.CatalogShape(cloud='aws',
+                               region=region,
+                               zone=f'{region}a',
+                               instance_type='g6.xlarge',
+                               gpu_units_per_instance=1) for region in regions)
+    scope = _provider_scope(aws_regions=scopes,
+                            catalog_shapes=tuple(
+                                sorted(shapes,
+                                       key=qualifier._catalog_shape_key)))
+    observer = qualifier.AwsObserver(profile=qualifier.PROFILES['small'],
+                                     service_name='paid-e2e',
+                                     scope=scope)
+    monkeypatch.setattr(qualifier, '_AWS_CENSUS_MAX_WORKERS', 2)
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def read_region(region_scope):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        # Reverse completion order to prove aggregation is not completion-ordered.
+        time.sleep(0.01 * (len(regions) - regions.index(region_scope.region)))
+        with lock:
+            active -= 1
+        suffix = len(regions) - regions.index(region_scope.region)
+        return qualifier._AwsRegionCensus(
+            region=region_scope.region,
+            service_instances=({
+                'instance_id': f'i-{suffix}'
+            },),
+            service_volumes=({
+                'volume_id': f'vol-{suffix}'
+            },),
+            retained_volume_ids=(f'vol-{suffix}',),
+            instance_type_widths=(('g6.xlarge', 1),))
+
+    monkeypatch.setattr(observer, '_read_region', read_region)
+    instances, volumes = observer._service_census()
+
+    assert peak == 2
+    assert [item['instance_id'] for item in instances
+           ] == ['i-1', 'i-2', 'i-3', 'i-4']
+    assert [item['volume_id'] for item in volumes
+           ] == ['vol-1', 'vol-2', 'vol-3', 'vol-4']
+    assert observer.retained_volume_ids() == {
+        region: [f'vol-{len(regions) - regions.index(region)}']
+        for region in regions
+    }
 
 
 def test_aws_cleanup_census_retains_exact_legacy_ebs_identity(monkeypatch):
@@ -2049,6 +2262,9 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
     assert receipt._payload['request_priority'] == 50
     sample = receipt._payload['samples'][0]
     assert sample['phase'] == 'scale'
+    assert sample['observation_started_at'] == 999.5
+    assert sample['observation_finished_at'] == 1000
+    assert sample['observation_duration_seconds'] == 0.5
     assert sample['controller_pid'] == 321
     assert sample['controller_owner_epoch'] == 12
     assert sample['claimed_units'] == 1
@@ -2712,6 +2928,34 @@ def test_retained_binding_allows_provider_effect_after_claim_release():
             claimed_units=0,
             bound_cluster_zones=(('paid-e2e-1', 'us-central1-a'),)))
     qualifier.validate_observation(bound, profile)
+
+
+def test_provider_observation_allows_wall_clock_rollback():
+    observation = dataclasses.replace(_observation(), observed_started_at=1001)
+    qualifier.validate_observation(observation, qualifier.PROFILES['small'])
+
+
+def test_provider_observation_rejects_reordered_monotonic_interval():
+    observation = dataclasses.replace(_observation(),
+                                      observed_started_monotonic=1001)
+    with pytest.raises(qualifier.QualificationError,
+                       match='invalid sample interval'):
+        qualifier.validate_observation(observation, qualifier.PROFILES['small'])
+
+
+def test_observation_census_latency_is_subtracted_from_poll_interval(
+        monkeypatch):
+    delays = []
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', sleep)
+    observation = _observation(observed_monotonic=2000)
+
+    asyncio.run(qualifier._sleep_after_observation(observation, 10))
+
+    assert delays == [9.5]
 
 
 def test_provider_canary_rejects_wrong_cloud_durable_binding():

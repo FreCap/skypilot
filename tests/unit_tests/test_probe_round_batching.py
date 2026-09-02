@@ -6,19 +6,19 @@ without the fleet lock; an exact lifecycle re-read, reduction, and batched
 write then happen under the lock before durable teardown is scheduled.
 """
 # pylint: disable=protected-access
-import ast
 import contextlib
-import inspect
-import os
-import textwrap
+import copy
 import threading
 import unittest
 from unittest import mock
 import uuid
 
+from sky.provision import provider_facets
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import system_recovery_state
+from sky.skylet import job_lib
+from sky.utils import status_lib
 
 
 def _replica_info(replica_id, probe_result):
@@ -56,47 +56,34 @@ def _replica_info(replica_id, probe_result):
 class TestProbeRoundBatching(unittest.TestCase):
     """Probe rounds snapshot shared state and persist bookkeeping in bulk."""
 
-    def test_readiness_executor_is_bounded_reused_and_replaced_after_shutdown(
+    def test_remote_io_executor_is_bounded_reused_and_terminal_after_shutdown(
             self):
         manager = self._make_manager()
         first = mock.Mock()
-        second = mock.Mock()
-        with mock.patch.object(replica_managers.subprocess_utils,
-                               'ContextThreadPoolExecutor',
-                               side_effect=[first, second]) as executor_factory:
-            self.assertIs(manager._get_readiness_executor(), first)
-            self.assertIs(manager._get_readiness_executor(), first)
+        with mock.patch.object(replica_managers,
+                               '_ReplicaRemoteIOExecutor',
+                               return_value=first) as executor_factory:
+            self.assertIs(manager._get_remote_io_executor(), first)
+            self.assertIs(manager._get_remote_io_executor(), first)
             executor_factory.assert_called_once_with(
-                max_workers=manager._PROBE_ROUND_MAX_PARALLELISM,
-                thread_name_prefix='serve-readiness')
+                probe_workers=manager._REMOTE_PROBE_PARALLELISM,
+                status_workers=manager._REMOTE_STATUS_PARALLELISM,
+                probe_queue_capacity=manager._REMOTE_PROBE_QUEUE_CAPACITY,
+                status_queue_capacity=manager._REMOTE_STATUS_QUEUE_CAPACITY)
 
-            manager._shutdown_readiness_executor()
+            manager._shutdown_remote_io_executor()
             first.shutdown.assert_called_once_with(wait=True,
                                                    cancel_futures=True)
-            self.assertIs(manager._get_readiness_executor(), second)
-            self.assertEqual(executor_factory.call_count, 2)
-            manager._shutdown_readiness_executor()
-            second.shutdown.assert_called_once_with(wait=True,
-                                                    cancel_futures=True)
-
-    def test_changed_only_rollout_flag_is_default_off_and_strict(self):
-        env_var = (replica_managers._CHANGED_ONLY_READINESS_PERSISTENCE_ENV_VAR)
-        for value, expected in ((None, False), ('false', False),
-                                ('FALSE', False), ('true', True), ('TRUE',
-                                                                   True)):
-            with self.subTest(value=value), mock.patch.dict(os.environ, {},
-                                                            clear=True):
-                if value is not None:
-                    os.environ[env_var] = value
-                self.assertEqual(
-                    replica_managers.
-                    _changed_only_readiness_persistence_enabled(), expected)
-
-        with mock.patch.dict(os.environ, {env_var: 'yes'}, clear=True), \
-             mock.patch.object(replica_managers.logger, 'warning') as warning:
-            self.assertFalse(
-                replica_managers._changed_only_readiness_persistence_enabled())
-        warning.assert_called_once()
+            with self.assertRaisesRegex(RuntimeError, 'closed'):
+                manager._get_remote_io_executor()
+            with self.assertRaisesRegex(RuntimeError, 'closed'):
+                manager._submit_remote_io(
+                    lambda: None,
+                    lane=replica_managers._ReplicaRemoteIOLane.PROBE)
+            self.assertEqual(executor_factory.call_count, 1)
+            manager._shutdown_remote_io_executor()
+            first.shutdown.assert_called_once_with(wait=True,
+                                                   cancel_futures=True)
 
     def _make_manager(self):
         manager = replica_managers.SkyPilotReplicaManager.__new__(
@@ -104,7 +91,6 @@ class TestProbeRoundBatching(unittest.TestCase):
         manager._ownership_lost = threading.Event()
         manager.lock = threading.Lock()
         manager._service_name = 'svc'
-        manager._changed_only_readiness_persistence = False
         manager._is_pool = False
         manager._uptime = 1.0
         manager._tick_version_spec_cache = {}
@@ -127,9 +113,16 @@ class TestProbeRoundBatching(unittest.TestCase):
         manager._route_projection_publisher = None
         return manager
 
-    def _run_probe_round(self, manager, infos, *, refreshed=None):
-        if refreshed is None:
-            refreshed = {info.replica_id: info for info in infos}
+    def _run_probe_round(self, manager, infos, *, cluster_records=None):
+        if cluster_records is None:
+            cluster_records = {}
+
+        def _accept(plans):
+            return ({
+                plan.opening_info.replica_id: copy.deepcopy(plan.desired_info)
+                for plan in plans
+            }, set())
+
         with mock.patch.object(serve_state,
                                'get_replica_infos',
                                return_value=infos), \
@@ -141,17 +134,17 @@ class TestProbeRoundBatching(unittest.TestCase):
                                side_effect=lambda _service_name, replica_id:
                                next((info for info in infos
                                      if info.replica_id == replica_id), None)), \
-             mock.patch.object(serve_state,
-                               'get_replica_infos_from_ids',
-                               return_value=refreshed), \
              mock.patch.object(
                  replica_managers.global_user_state,
                  'get_clusters_from_names',
-                 return_value={}), \
+                 return_value=cluster_records), \
              mock.patch.object(serve_state, 'set_service_uptime'), \
-             mock.patch.object(manager, '_persist_replicas') as persist:
+             mock.patch.object(
+                 manager,
+                 '_commit_probe_row_plans',
+                 side_effect=_accept) as commit:
             snapshot = manager._probe_all_replicas()
-        return persist, snapshot
+        return commit, snapshot
 
     @staticmethod
     def _start_capturing_thread(target, errors):
@@ -226,7 +219,6 @@ class TestProbeRoundBatching(unittest.TestCase):
         for case in cases:
             with self.subTest(case=case):
                 manager = self._make_manager()
-                manager._changed_only_readiness_persistence = True
                 opening = _replica_info(1, True)
                 opening.status_property.service_ready_now = False
                 fresh = _replica_info(1, True)
@@ -260,9 +252,6 @@ class TestProbeRoundBatching(unittest.TestCase):
                 def _full_read(_service_name):
                     return [current['row']]
 
-                def _keyed_read(_service_name, replica_ids):
-                    return ({1: current['row']} if 1 in replica_ids else {})
-
                 opening.probe = mock.Mock(side_effect=_probe)
                 manager._resolve_probe_urls = mock.Mock(side_effect=_resolve)
                 with mock.patch.object(serve_state,
@@ -271,24 +260,20 @@ class TestProbeRoundBatching(unittest.TestCase):
                      mock.patch.object(serve_state,
                                        'get_specs',
                                        return_value={1: mock.Mock()}), \
-                     mock.patch.object(serve_state,
-                                       'get_replica_infos_from_ids',
-                                       side_effect=_keyed_read), \
                      mock.patch.object(
                          replica_managers.global_user_state,
                          'get_clusters_from_names',
                          return_value={}), \
-                     mock.patch.object(manager,
-                                       '_persist_replicas') as persist, \
+                     mock.patch.object(
+                         manager,
+                         '_commit_probe_row_plans',
+                         return_value=({}, {1})) as commit, \
                      mock.patch.object(
                          manager,
                          '_write_resolved_route_materials') as write_routes, \
                      mock.patch.object(
                          manager,
                          '_issue_system_recovery_route') as issue_route, \
-                     mock.patch.object(
-                         manager,
-                         '_prepare_probe_teardown_intent') as prepare_down, \
                      mock.patch.object(
                          manager,
                          '_launch_completion_state') as wake_cleanup, \
@@ -311,10 +296,9 @@ class TestProbeRoundBatching(unittest.TestCase):
 
                 self.assertFalse(probe_thread.is_alive())
                 self.assertEqual(errors, [])
-                persist.assert_not_called()
+                commit.assert_called_once()
                 write_routes.assert_not_called()
                 issue_route.assert_not_called()
-                prepare_down.assert_not_called()
                 wake_cleanup.assert_not_called()
                 manager._terminate_replica.assert_not_called()
                 self.assertEqual(
@@ -324,9 +308,6 @@ class TestProbeRoundBatching(unittest.TestCase):
     def test_recovery_revision_change_after_bulk_reread_is_side_effect_free(
             self):
         manager = self._make_manager()
-        manager._changed_only_readiness_persistence = True
-        manager._service_hash = 'incarnation-a'
-        manager._controller_owner = (100, '10.0.0.1')
 
         candidate = _replica_info(1, True)
         candidate.system_recovery_disposition = (
@@ -337,15 +318,6 @@ class TestProbeRoundBatching(unittest.TestCase):
             system_recovery_state.SystemRecoveryDisposition.CAPABLE)
         capable.system_recovery = mock.Mock(
             state=system_recovery_state.ControllerRecoveryState.ARMED)
-
-        exact_candidate = _replica_info(1, True)
-        exact_candidate.system_recovery_disposition = (
-            system_recovery_state.SystemRecoveryDisposition.CANDIDATE)
-        exact_candidate.service_job_id = None
-        exact_capable = _replica_info(2, True)
-        exact_capable.system_recovery_disposition = (
-            system_recovery_state.SystemRecoveryDisposition.CAPABLE)
-        exact_capable.system_recovery = capable.system_recovery
 
         newer_candidate = _replica_info(1, True)
         newer_candidate.system_recovery_disposition = (
@@ -362,8 +334,29 @@ class TestProbeRoundBatching(unittest.TestCase):
         manager._system_recovery_status_initialized = {2}
         manager._system_recovery_route_generation = mock.Mock(return_value=None)
         opening = [candidate, capable]
-        exact = {1: exact_candidate, 2: exact_capable}
         newer = {1: newer_candidate, 2: newer_capable}
+
+        manager._plan_candidate_probe = mock.Mock(
+            side_effect=lambda info, **_kwargs: replica_managers.
+            _CandidateProbeReductionPlan(info=info,
+                                         force_off_route=False,
+                                         teardown=False,
+                                         events=('candidate_event',),
+                                         candidate_deadline=456.0,
+                                         clear_candidate_deadline=False))
+        manager._plan_capable_probe = mock.Mock(
+            side_effect=lambda info, **_kwargs: replica_managers.
+            _CapableProbeReductionPlan(
+                info=info,
+                reduction=system_recovery_state.RecoveryReduction(
+                    state=info.system_recovery,
+                    changed=False,
+                    force_off_route=False,
+                    clear_probe_failure_window=False,
+                    mark_ready=True,
+                    schedule_legacy_teardown=False),
+                events=('capable_event',),
+                initialized=replica_managers._LocalSetMutation.DISCARD))
 
         with mock.patch.object(serve_state,
                                'get_replica_infos',
@@ -371,31 +364,14 @@ class TestProbeRoundBatching(unittest.TestCase):
              mock.patch.object(serve_state,
                                'get_specs',
                                return_value={1: mock.Mock()}), \
-             mock.patch.object(serve_state,
-                               'get_replica_infos_from_ids',
-                               return_value=exact), \
-             mock.patch.object(serve_state,
-                               'get_replica_info_from_id',
-                               side_effect=lambda _service_name, replica_id:
-                               newer[replica_id]), \
-             mock.patch.object(
-                 serve_state,
-                 'get_service_controller_owner',
-                 return_value={
-                     'hash': 'incarnation-a',
-                     'controller_pid': 100,
-                     'controller_ip': '10.0.0.1',
-                     'lifecycle_epoch': 7,
-                 }), \
-             mock.patch.object(
-                 serve_state,
-                 'patch_replica_system_recovery') as recovery_patch, \
              mock.patch.object(
                  replica_managers.global_user_state,
                  'get_clusters_from_names',
                  return_value={}), \
-             mock.patch.object(manager,
-                               '_persist_replicas') as persist, \
+             mock.patch.object(
+                 manager,
+                 '_commit_probe_row_plans',
+                 return_value=({}, {1, 2})) as commit, \
              mock.patch.object(
                  manager,
                  '_write_resolved_route_materials') as write_routes, \
@@ -404,19 +380,14 @@ class TestProbeRoundBatching(unittest.TestCase):
                  '_issue_system_recovery_route') as issue_route, \
              mock.patch.object(
                  manager,
-                 '_prepare_probe_teardown_intent') as prepare_down, \
-             mock.patch.object(
-                 manager,
                  '_launch_completion_state') as wake_cleanup, \
              mock.patch.object(serve_state, 'set_service_uptime'):
             snapshot = manager._probe_all_replicas()
 
         self.assertEqual(snapshot, list(newer.values()))
-        recovery_patch.assert_not_called()
-        persist.assert_not_called()
+        commit.assert_called_once()
         write_routes.assert_not_called()
         issue_route.assert_not_called()
-        prepare_down.assert_not_called()
         wake_cleanup.assert_not_called()
         self.assertEqual(manager._candidate_release_monotonic_deadlines,
                          {1: 123.0})
@@ -582,15 +553,25 @@ class TestProbeRoundBatching(unittest.TestCase):
     def test_probe_round_passes_pre_resolved_url(self):
         manager = self._make_manager()
         info = _replica_info(1, True)
+        lanes = []
+        submit = manager._submit_remote_io
+
+        def _record_submit(fn, *args, lane, **kwargs):
+            lanes.append(lane)
+            return submit(fn, *args, lane=lane, **kwargs)
 
         with mock.patch.object(serve_state, 'get_replica_infos',
                                return_value=[info]), \
              mock.patch.object(serve_state, 'get_specs',
                                return_value={1: mock.Mock()}), \
              mock.patch.object(serve_state, 'add_or_update_replicas'), \
-             mock.patch.object(serve_state, 'set_service_uptime'):
+             mock.patch.object(serve_state, 'set_service_uptime'), \
+             mock.patch.object(manager,
+                               '_submit_remote_io',
+                               side_effect=_record_submit):
             manager._probe_all_replicas()
 
+        self.assertEqual(lanes, [replica_managers._ReplicaRemoteIOLane.PROBE])
         info.probe.assert_called_once_with('/',
                                            None,
                                            15,
@@ -696,7 +677,8 @@ class TestProbeRoundBatching(unittest.TestCase):
         self.assertTrue(ready)
         request.assert_called_once_with('http://10.0.0.7:8080/health',
                                         headers=None,
-                                        timeout=15)
+                                        timeout=15,
+                                        stream=True)
 
     def test_single_batch_write_flushed_before_teardown(self):
         manager = self._make_manager()
@@ -705,77 +687,271 @@ class TestProbeRoundBatching(unittest.TestCase):
         infos = [_replica_info(1, True), _replica_info(2, False)]
         calls = []
 
-        def _persist_batch(*_args, **_kwargs):
+        planned = []
+
+        def _commit_batch(plans):
             calls.append('batch')
-            return True
+            planned.extend(plans)
+            return ({
+                plan.opening_info.replica_id: plan.desired_info
+                for plan in plans
+            }, set())
+
+        wake = mock.Mock()
+        wake.set.side_effect = lambda: calls.append('wake')
+        manager._launch_completion_state = mock.Mock(return_value=(mock.Mock(),
+                                                                   wake))
 
         with mock.patch.object(serve_state, 'get_replica_infos',
                                return_value=infos), \
              mock.patch.object(serve_state, 'get_specs',
                                return_value={1: mock.Mock()}), \
              mock.patch.object(
-                 serve_state, 'add_or_update_replicas',
-                side_effect=_persist_batch) as mock_batch, \
-             mock.patch.object(
                  serve_state, 'add_or_update_replica',
                 side_effect=AssertionError(
                     'probe round must not issue per-replica upserts')), \
-             mock.patch.object(serve_state, 'get_replica_infos_from_ids',
-                               return_value={
-                                   info.replica_id: info for info in infos
-                               }), \
+             mock.patch.object(manager,
+                               '_commit_probe_row_plans',
+                               side_effect=_commit_batch) as commit, \
              mock.patch.object(serve_state, 'set_service_uptime'):
             manager._probe_all_replicas()
 
-        self.assertEqual(mock_batch.call_count, 1)
-        self.assertEqual(mock_batch.call_args.kwargs, {
-            'expected_replica_exists': True,
-            'guard_launch_exclusion': False,
-        })
-        written = mock_batch.call_args.args[1]
-        self.assertEqual(sorted(rid for rid, _ in written), [1, 2])
-        self.assertEqual(calls, ['batch'])
+        commit.assert_called_once()
+        self.assertEqual([plan.opening_info.replica_id for plan in planned],
+                         [1, 2])
+        self.assertEqual(calls, ['batch', 'wake'])
         manager._terminate_replica.assert_not_called()
-        self.assertEqual(infos[1].status_property.sky_down_status,
-                         replica_managers.common_utils.ProcessStatus.SCHEDULED)
+        self.assertEqual(
+            planned[1].desired_info.status_property.sky_down_status,
+            replica_managers.common_utils.ProcessStatus.SCHEDULED)
 
-    def test_enabled_mode_omits_stable_ordinary_rows(self):
+    def test_committed_window_publishes_teardown_before_later_window_fails(
+            self):
         manager = self._make_manager()
-        manager._changed_only_readiness_persistence = True
+        infos = [
+            _replica_info(replica_id, False) for replica_id in range(
+                1, replica_managers.system_recovery_persistence.
+                REPLICA_OBSERVATION_COMMIT_MAX_ROWS + 2)
+        ]
+        probe_results = [
+            replica_managers._ReadinessProbeResult(
+                info=info,
+                succeeded=False,
+                observed_at=2.0,
+                request_started_monotonic=1.0) for info in infos
+        ]
+        wake = mock.Mock()
+        manager._launch_completion_state = mock.Mock(return_value=(mock.Mock(),
+                                                                   wake))
+
+        def _commit(plans):
+            if plans[0].opening_info.replica_id > 1:
+                raise RuntimeError('second window failed')
+            return ({
+                plan.opening_info.replica_id: copy.deepcopy(plan.desired_info)
+                for plan in plans
+            }, set())
+
+        manager._commit_probe_row_plans = mock.Mock(side_effect=_commit)
+        with self.assertRaisesRegex(RuntimeError, 'second window failed'):
+            manager._reduce_probe_results_batch(
+                infos,
+                probe_results,
+                possibly_preempted_ids=set(),
+                blocked_identity_ids=set(),
+                provider_identity_errors={},
+                provider_phase_deferred_replica_ids=set(),
+                candidate_status_evidence={},
+                candidate_cycle_evidence={},
+                ordered_route_evidence={},
+                route_requires_next_probe_ids=set(),
+                probe_urls={},
+                resolved_route_material={},
+                deferred_route_ids=set(),
+                accepted_probe_fingerprints={})
+
+        self.assertEqual(manager._commit_probe_row_plans.call_count, 2)
+        wake.set.assert_called_once_with()
+
+    def test_stable_ordinary_rows_share_the_canonical_batch(self):
+        manager = self._make_manager()
         manager._consecutive_failure_threshold_timeout.return_value = 1000
         ready = _replica_info(1, True)
         not_ready = _replica_info(2, False)
         not_ready.first_not_ready_time = 1.0
         not_ready.first_consecutive_failure_time = 1.0
 
-        persist, snapshot = self._run_probe_round(manager, [ready, not_ready])
+        commit, snapshot = self._run_probe_round(manager, [ready, not_ready])
 
-        persist.assert_not_called()
+        commit.assert_called_once()
+        plans = commit.call_args.args[0]
+        self.assertEqual([plan.opening_info.replica_id for plan in plans],
+                         [1, 2])
+        for plan in plans:
+            self.assertEqual(
+                manager._readiness_persistence_fingerprint(plan.opening_info),
+                manager._readiness_persistence_fingerprint(plan.desired_info))
         self.assertEqual(snapshot, [ready, not_ready])
 
-    def test_disabled_and_enabled_preemption_keep_separate_write_contracts(
-            self):
-        for enabled in (False, True):
-            with self.subTest(enabled=enabled):
-                manager = self._make_manager()
-                manager._changed_only_readiness_persistence = enabled
-                manager._is_interruptible_replica = mock.Mock(return_value=True)
-                manager._cloud_instance_looks_alive.return_value = (
-                    replica_managers._PreemptionPrefilterResult(
-                        replica_managers._PreemptionPrefilterDisposition.
-                        INTERRUPTED))
-                info = _replica_info(1, False)
+    def test_preemption_effect_runs_only_after_canonical_batch_acceptance(self):
+        manager = self._make_manager()
+        manager._is_interruptible_replica = mock.Mock(return_value=True)
+        manager._cloud_instance_looks_alive.return_value = (
+            replica_managers._PreemptionPrefilterResult(
+                replica_managers._PreemptionPrefilterDisposition.INTERRUPTED))
+        info = _replica_info(1, False)
 
-                persist, _ = self._run_probe_round(manager, [info])
+        commit, _ = self._run_probe_round(manager, [info])
 
-                manager._apply_confirmed_preemption.assert_called_once_with(
-                    info, None, persist_placement=False)
-                self.assertEqual(persist.call_count, 1)
-                persisted = persist.call_args.args[0]
-                self.assertEqual(persisted, [(1, info)])
-                self.assertEqual(
-                    info.status_property.sky_down_status,
-                    replica_managers.common_utils.ProcessStatus.SCHEDULED)
+        commit.assert_called_once()
+        desired = commit.call_args.args[0][0].desired_info
+        manager._apply_confirmed_preemption.assert_called_once_with(
+            mock.ANY, None, persist_placement=False)
+        applied = manager._apply_confirmed_preemption.call_args.args[0]
+        self.assertEqual(applied.replica_id, 1)
+        self.assertEqual(desired.status_property.sky_down_status,
+                         replica_managers.common_utils.ProcessStatus.SCHEDULED)
+
+    def test_800_failed_spot_probes_use_one_aggregate_inventory(self):
+        manager = self._make_manager()
+        manager._consecutive_failure_threshold_timeout.return_value = 1000
+        manager._is_interruptible_replica = mock.Mock(return_value=True)
+        infos = [
+            _replica_info(replica_id, False) for replica_id in range(1, 801)
+        ]
+        for info in infos:
+            info.is_spot = True
+        handles = {
+            info.replica_id: mock.Mock(
+                spec=replica_managers.backends.CloudVmRayResourceHandle,
+                launched_nodes=1) for info in infos
+        }
+        for info in infos:
+            handle = handles[info.replica_id]
+            handle.cluster_name = info.cluster_name
+            handle.cluster_name_on_cloud = info.cluster_name
+            handle.launched_resources = mock.Mock()
+            handle.launched_resources.cloud = mock.Mock()
+
+        def _resolve(resolved_infos,
+                     *,
+                     resolved_handles=None,
+                     resolved_provider_configs=None,
+                     **_kwargs):
+            assert resolved_handles is not None
+            assert resolved_provider_configs is not None
+            resolved_handles.update(handles)
+            resolved_provider_configs.update(
+                {info.replica_id: {
+                    'region': 'test'
+                } for info in resolved_infos})
+            return {info.replica_id: info.url for info in resolved_infos}
+
+        manager._resolve_probe_urls.side_effect = _resolve
+        observed = {
+            info.replica_id:
+                provider_facets.InstanceStatusInventoryObservationV1(
+                    query_id=str(info.replica_id),
+                    disposition=(provider_facets.
+                                 InstanceStatusInventoryDispositionV1.OBSERVED),
+                    entries=(provider_facets.InstanceStatusInventoryEntryV1(
+                        instance_id=f'instance-{info.replica_id}',
+                        status=status_lib.ClusterStatus.UP),)) for info in infos
+        }
+        with mock.patch.object(replica_managers.backend_utils,
+                               'query_cluster_instance_statuses_batch',
+                               return_value=observed) as inventory:
+            self._run_probe_round(manager, infos)
+
+        inventory.assert_called_once_with(handles,
+                                          mock.ANY,
+                                          deadline_monotonic=mock.ANY)
+        self.assertEqual(len(inventory.call_args.args[1]), 800)
+        manager._cloud_instance_looks_alive.assert_not_called()
+        manager._apply_confirmed_preemption.assert_not_called()
+
+    def test_candidate_status_submission_is_status_lane_bounded(self):
+        manager = self._make_manager()
+        infos = [
+            _replica_info(replica_id, False) for replica_id in range(1, 50)
+        ]
+        for info in infos:
+            info.system_recovery_disposition = (
+                system_recovery_state.SystemRecoveryDisposition.CANDIDATE)
+            info.service_job_id = info.replica_id
+        manager._system_recovery_status_initialized = set()
+        manager._system_recovery_route_registry = mock.Mock()
+        manager._reconcile_system_recovery_status = mock.Mock(
+            return_value=False)
+        manager._reduce_candidate_probe = mock.Mock(
+            side_effect=lambda info, **_kwargs: (info, False, False, False))
+        outstanding = {
+            replica_managers._ReplicaRemoteIOLane.PROBE: 0,
+            replica_managers._ReplicaRemoteIOLane.STATUS: 0,
+        }
+        maximum = dict(outstanding)
+
+        class _ImmediateFuture:
+            """Synchronous future that exposes outstanding-wave size."""
+
+            def __init__(self, fn, args, kwargs, lane):
+                self._fn = fn
+                self._args = args
+                self._kwargs = kwargs
+                self._lane = lane
+
+            def result(self, timeout=None):
+                del timeout
+                try:
+                    return self._fn(*self._args, **self._kwargs)
+                finally:
+                    outstanding[self._lane] -= 1
+
+        def _submit(fn, *args, lane, **kwargs):
+            outstanding[lane] += 1
+            maximum[lane] = max(maximum[lane], outstanding[lane])
+            return _ImmediateFuture(fn, args, kwargs, lane)
+
+        manager._submit_remote_io = mock.Mock(side_effect=_submit)
+        handles = {info.cluster_name: mock.Mock() for info in infos}
+        for info in infos:
+            info.handle.return_value = handles[info.cluster_name]
+        cluster_records = {
+            cluster_name: {
+                'handle': handle
+            } for cluster_name, handle in handles.items()
+        }
+        transports = [
+            mock.Mock(source_handle=handle, transport=mock.Mock(), error=None)
+            for handle in handles.values()
+        ]
+
+        def _status(_backend, _handle, job_ids, *, stream_logs,
+                    serve_transport):
+            del _backend, _handle, stream_logs, serve_transport
+            job_id = job_ids[0]
+            return ({
+                job_id: job_lib.JobStatus.RUNNING
+            }, {}, {
+                job_id: job_lib.JobSystemRecoveryDetailStatus.ABSENT
+            })
+
+        with mock.patch.object(replica_managers.backends.CloudVmRayBackend,
+                               'build_serve_job_status_transports',
+                               return_value=transports), mock.patch.object(
+                                   replica_managers.backends.CloudVmRayBackend,
+                                   'get_job_status_with_system_recovery',
+                                   autospec=True,
+                                   side_effect=_status):
+            self._run_probe_round(manager,
+                                  infos,
+                                  cluster_records=cluster_records)
+
+        self.assertEqual(maximum[replica_managers._ReplicaRemoteIOLane.STATUS],
+                         manager._REMOTE_STATUS_PARALLELISM)
+        self.assertLessEqual(
+            maximum[replica_managers._ReplicaRemoteIOLane.PROBE],
+            manager._REMOTE_PROBE_PARALLELISM)
 
     def test_exact_kubernetes_absence_wave_schedules_in_one_probe_round(self):
         manager = self._make_manager()
@@ -805,7 +981,7 @@ class TestProbeRoundBatching(unittest.TestCase):
 
         self.assertEqual(manager._apply_confirmed_preemption.call_count, 64)
 
-    def test_enabled_mode_persists_each_readiness_fingerprint_transition(self):
+    def test_canonical_batch_plans_each_readiness_transition(self):
         cases = ({
             'name': 'false-to-true',
             'probe_result': True,
@@ -840,7 +1016,6 @@ class TestProbeRoundBatching(unittest.TestCase):
         for replica_id, case in enumerate(cases, start=1):
             with self.subTest(case=case['name']):
                 manager = self._make_manager()
-                manager._changed_only_readiness_persistence = True
                 manager._consecutive_failure_threshold_timeout.return_value = (
                     1000)
                 info = _replica_info(replica_id, case['probe_result'])
@@ -849,16 +1024,17 @@ class TestProbeRoundBatching(unittest.TestCase):
                  info.first_not_ready_time,
                  info.first_consecutive_failure_time) = case['before']
 
-                persist, _ = self._run_probe_round(manager, [info])
+                commit, _ = self._run_probe_round(manager, [info])
 
-                persist.assert_called_once_with([(replica_id, info)])
+                commit.assert_called_once()
+                plan = commit.call_args.args[0][0]
+                self.assertEqual(plan.opening_info.replica_id, replica_id)
                 self.assertEqual(
-                    manager._readiness_persistence_fingerprint(info),
-                    case['after'])
+                    manager._readiness_persistence_fingerprint(
+                        plan.desired_info), case['after'])
 
-    def test_enabled_mode_persists_only_changed_ids_in_mixed_round(self):
+    def test_canonical_batch_marks_only_changed_ids_in_mixed_round(self):
         manager = self._make_manager()
-        manager._changed_only_readiness_persistence = True
         manager._consecutive_failure_threshold_timeout.return_value = 1000
         stable_ready = _replica_info(1, True)
         stable_not_ready = _replica_info(2, False)
@@ -871,93 +1047,37 @@ class TestProbeRoundBatching(unittest.TestCase):
         first_failure = _replica_info(4, False)
         first_failure.status_property.first_ready_time = None
 
-        persist, _ = self._run_probe_round(
+        commit, _ = self._run_probe_round(
             manager,
             [stable_ready, stable_not_ready, became_not_ready, first_failure])
 
-        persist.assert_called_once()
-        self.assertEqual(
-            [replica_id for replica_id, _ in persist.call_args.args[0]], [3, 4])
+        commit.assert_called_once()
+        plans = commit.call_args.args[0]
+        self.assertEqual([
+            plan.opening_info.replica_id
+            for plan in plans
+            if (manager._readiness_persistence_fingerprint(plan.opening_info) !=
+                manager._readiness_persistence_fingerprint(plan.desired_info))
+        ], [3, 4])
 
-    def test_nonordinary_before_or_after_state_forces_stable_write(self):
-        for eligibility in ((False, True), (True, False)):
-            with self.subTest(eligibility=eligibility):
-                manager = self._make_manager()
-                manager._changed_only_readiness_persistence = True
-                manager._is_changed_only_readiness_persistence_eligible = (
-                    mock.Mock(side_effect=eligibility))
-                info = _replica_info(1, True)
-
-                persist, _ = self._run_probe_round(manager, [info])
-
-                persist.assert_called_once_with([(1, info)])
-
-    def test_recovery_and_quarantine_rows_are_unconditional_writes(self):
-        for state in ('candidate', 'capable', 'quarantined', 'active-recovery'):
-            with self.subTest(state=state):
-                manager = self._make_manager()
-                manager._changed_only_readiness_persistence = True
-                manager._consecutive_failure_threshold_timeout.return_value = (
-                    1000)
-                manager._system_recovery_route_registry = mock.Mock()
-                manager._system_recovery_status_initialized = set()
-                manager._suspend_system_recovery_route_if_unroutable = (
-                    mock.Mock(return_value=None))
-                manager._reconcile_system_recovery_status = mock.Mock(
-                    return_value=False)
-                info = _replica_info(1, state == 'active-recovery')
-                if state == 'candidate':
-                    info.system_recovery_disposition = (
-                        system_recovery_state.SystemRecoveryDisposition.
-                        CANDIDATE)
-                    info.service_job_id = None
-                    info.first_not_ready_time = 1.0
-                    info.first_consecutive_failure_time = 1.0
-                    manager._reduce_candidate_probe = mock.Mock(
-                        return_value=(info, False, False, False))
-                elif state == 'capable':
-                    info.system_recovery_disposition = (
-                        system_recovery_state.SystemRecoveryDisposition.CAPABLE)
-                    info.system_recovery = mock.Mock(
-                        state=system_recovery_state.ControllerRecoveryState.
-                        ARMED)
-                    info.first_not_ready_time = 1.0
-                    info.first_consecutive_failure_time = 1.0
-                    manager._reduce_capable_probe = mock.Mock(
-                        return_value=(info,
-                                      system_recovery_state.RecoveryReduction(
-                                          state=info.system_recovery,
-                                          changed=False,
-                                          force_off_route=False,
-                                          clear_probe_failure_window=False,
-                                          mark_ready=False,
-                                          schedule_legacy_teardown=False),
-                                      False))
-                elif state == 'quarantined':
-                    info.system_recovery_quarantine = object()
-                    info.first_not_ready_time = 1.0
-                    info.first_consecutive_failure_time = 1.0
-                else:
-                    info.system_recovery = object()
-
-                persist, _ = self._run_probe_round(manager, [info])
-
-                persist.assert_called_once_with([(1, info)])
-
-    def test_route_suspension_only_round_still_uses_persistence_path(self):
+    def test_route_suspension_runs_after_canonical_batch_acceptance(self):
         manager = self._make_manager()
-        manager._changed_only_readiness_persistence = True
         manager._consecutive_failure_threshold_timeout.return_value = 1000
         info = _replica_info(1, False)
         info.first_not_ready_time = 1.0
         info.first_consecutive_failure_time = 1.0
         suspension = object()
+        route_registry = mock.Mock()
+        manager._route_lease_registry = mock.Mock(return_value=route_registry)
         manager._suspend_system_recovery_route_if_unroutable = mock.Mock(
             return_value=suspension)
 
-        persist, _ = self._run_probe_round(manager, [info])
+        commit, _ = self._run_probe_round(manager, [info])
 
-        persist.assert_called_once_with([], route_suspensions=[suspension])
+        commit.assert_called_once()
+        manager._suspend_system_recovery_route_if_unroutable.assert_called_once(
+        )
+        route_registry.commit_suspension.assert_called_once_with(suspension)
 
     def test_route_suspension_only_persistence_requests_owner_fence(self):
         manager = self._make_manager()
@@ -985,88 +1105,34 @@ class TestProbeRoundBatching(unittest.TestCase):
 
     def test_initial_delay_sentinel_persists_before_teardown(self):
         manager = self._make_manager()
-        manager._changed_only_readiness_persistence = True
         manager._get_initial_delay_seconds.return_value = 1
         info = _replica_info(1, False)
         info.status_property.first_ready_time = None
         info.first_not_ready_time = 0.0
 
-        persist, _ = self._run_probe_round(manager, [info])
+        commit, _ = self._run_probe_round(manager, [info])
 
-        persist.assert_called_once_with([(1, info)])
-        self.assertEqual(info.status_property.first_ready_time, -1.0)
-        self.assertEqual(info.status_property.sky_down_status,
+        commit.assert_called_once()
+        desired = commit.call_args.args[0][0].desired_info
+        self.assertEqual(desired.status_property.first_ready_time, -1.0)
+        self.assertEqual(desired.status_property.sky_down_status,
                          replica_managers.common_utils.ProcessStatus.SCHEDULED)
         manager._terminate_replica.assert_not_called()
 
     def test_durable_failure_threshold_tears_down_without_rewriting_row(self):
         manager = self._make_manager()
-        manager._changed_only_readiness_persistence = True
         manager._consecutive_failure_threshold_timeout.return_value = 1
         info = _replica_info(1, False)
         info.first_not_ready_time = 0.0
         info.first_consecutive_failure_time = 0.0
 
-        persist, _ = self._run_probe_round(manager, [info])
+        commit, _ = self._run_probe_round(manager, [info])
 
-        persist.assert_called_once_with([(1, info)])
-        self.assertEqual(info.status_property.sky_down_status,
+        commit.assert_called_once()
+        desired = commit.call_args.args[0][0].desired_info
+        self.assertEqual(desired.status_property.sky_down_status,
                          replica_managers.common_utils.ProcessStatus.SCHEDULED)
         manager._terminate_replica.assert_not_called()
-
-    def test_fingerprint_and_ordinary_assignment_surface_stay_exact(self):
-        info = _replica_info(1, True)
-        info.status_property.service_ready_now = False
-        info.status_property.first_ready_time = 3.0
-        info.first_not_ready_time = 4.0
-        info.first_consecutive_failure_time = 5.0
-        self.assertEqual(
-            replica_managers.SkyPilotReplicaManager.
-            _readiness_persistence_fingerprint(info), (False, 3.0, 4.0, 5.0))
-
-        assignments = set()
-        for method in (
-                replica_managers.SkyPilotReplicaManager._probe_all_replicas,
-                replica_managers.SkyPilotReplicaManager.
-                _probe_all_replicas_with_snapshot):
-            source = textwrap.dedent(inspect.getsource(inspect.unwrap(method)))
-            for node in ast.walk(ast.parse(source)):
-                if not isinstance(node, ast.Assign):
-                    continue
-                for target in node.targets:
-                    target_source = ast.unparse(target)
-                    if target_source.startswith('info.'):
-                        assignments.add(target_source)
-        self.assertEqual(
-            assignments, {
-                'info.status_property.service_ready_now',
-                'info.status_property.first_ready_time',
-                'info.first_not_ready_time',
-                'info.first_consecutive_failure_time',
-            })
-
-    def test_changed_only_eligibility_is_fail_closed_for_recovery_state(self):
-        eligible = (replica_managers.SkyPilotReplicaManager.
-                    _is_changed_only_readiness_persistence_eligible)
-        info = _replica_info(1, True)
-        info.system_recovery_launch_intent = object()
-        self.assertTrue(eligible(info))
-
-        for mutation in ('candidate', 'capable', 'quarantine', 'recovery'):
-            with self.subTest(mutation=mutation):
-                info = _replica_info(1, True)
-                if mutation == 'candidate':
-                    info.system_recovery_disposition = (
-                        system_recovery_state.SystemRecoveryDisposition.
-                        CANDIDATE)
-                elif mutation == 'capable':
-                    info.system_recovery_disposition = (
-                        system_recovery_state.SystemRecoveryDisposition.CAPABLE)
-                elif mutation == 'quarantine':
-                    info.system_recovery_quarantine = object()
-                else:
-                    info.system_recovery = object()
-                self.assertFalse(eligible(info))
 
     def test_preloads_distinct_version_specs_in_one_query(self):
         manager = self._make_manager()
@@ -1161,9 +1227,25 @@ class TestProbeRoundBatching(unittest.TestCase):
         manager = self._make_manager()
         manager._is_pool = True
         info = _replica_info(1, True)
+        handle = mock.sentinel.handle
+        transport = mock.sentinel.transport
+        preparation = mock.Mock(source_handle=handle,
+                                transport=transport,
+                                error=None)
 
         with mock.patch.object(serve_state, 'get_replica_infos',
                                return_value=[info]), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_clusters_from_names',
+                 return_value={info.cluster_name: {'handle': handle}}), \
+             mock.patch.object(info,
+                               'handle',
+                               return_value=handle), \
+             mock.patch.object(
+                 replica_managers.backends.CloudVmRayBackend,
+                 'build_serve_job_status_transports',
+                 return_value=[preparation]), \
              mock.patch.object(serve_state, 'get_specs') as mock_get_specs, \
              mock.patch.object(serve_state, 'add_or_update_replicas'), \
              mock.patch.object(serve_state, 'set_service_uptime'):
@@ -1171,7 +1253,9 @@ class TestProbeRoundBatching(unittest.TestCase):
 
         mock_get_specs.assert_not_called()
         info.probe_pool.assert_called_once_with(
-            provider_phase_admission=mock.ANY)
+            handle=handle,
+            provider_phase_admission=mock.ANY,
+            job_status_transport=transport)
 
     def test_probe_round_returns_final_full_fleet_snapshot(self):
         manager = self._make_manager()
@@ -1213,15 +1297,10 @@ class TestProbeRoundBatching(unittest.TestCase):
                                             [infos[0], refreshed_2]]) as full_read, \
              mock.patch.object(serve_state, 'get_specs',
                                return_value={1: mock.Mock()}), \
-             mock.patch.object(
-                 serve_state, 'get_replica_infos_from_ids',
-                 return_value={info.replica_id: info
-                               for info in infos}) as keyed_read, \
              mock.patch.object(serve_state, 'add_or_update_replicas'), \
              mock.patch.object(serve_state, 'set_service_uptime'):
             snapshot = manager._probe_all_replicas()
 
-        keyed_read.assert_called_once_with('svc', [1, 2, 3])
         self.assertEqual(full_read.call_count, 2)
         self.assertEqual(snapshot, [infos[0], refreshed_2])
 
@@ -1269,7 +1348,7 @@ class TestProbeRoundBatching(unittest.TestCase):
              mock.patch.object(serve_state,
                                'add_or_update_replicas') as persist, \
              mock.patch.object(manager,
-                               '_get_readiness_executor') as get_executor:
+                               '_get_remote_io_executor') as get_executor:
             manager._probe_all_replicas()
 
         mock_get_specs.assert_not_called()

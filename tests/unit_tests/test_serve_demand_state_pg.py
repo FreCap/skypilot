@@ -159,6 +159,11 @@ def test_report_sequence_idempotency_freshness_and_summary(demand_database):
     assert summary['http_in_flight_requests'] == 1
     assert abs(summary['request_telemetry_observed_at'] - now) < 5
     assert summary['unknown_in_flight_replica_count'] == 0
+    assert summary['unique_job_arrivals_60s'] == 1
+    assert summary['unique_job_arrivals_300s'] == 1
+    assert summary['headerless_arrivals_60s'] == 0
+    assert summary['headerless_arrivals_300s'] == 0
+    assert summary['offered_arrival_tracking_saturated'] is False
 
     conflict = copy.deepcopy(report)
     conflict['queue_depth'] = 1
@@ -181,6 +186,11 @@ def test_report_sequence_idempotency_freshness_and_summary(demand_database):
     assert stale['processing_requests'] is None
     assert stale['confirmed_processing_requests'] is None
     assert stale['http_in_flight_requests'] is None
+    assert stale['unique_job_arrivals_60s'] is None
+    assert stale['unique_job_arrivals_300s'] is None
+    assert stale['headerless_arrivals_60s'] is None
+    assert stale['headerless_arrivals_300s'] is None
+    assert stale['offered_arrival_tracking_saturated'] is None
 
 
 def test_request_summary_accepts_explicit_postgres_engine(
@@ -277,6 +287,11 @@ def test_ha_handoff_adds_disjoint_work_without_double_counting_occupancy(
             'count': 1,
         }],
         queue_depth_by_priority={'50': 1},
+        unique_job_arrivals_60s=2,
+        unique_job_arrivals_300s=4,
+        headerless_arrivals_60s=3,
+        headerless_arrivals_300s=5,
+        offered_arrival_tracking_saturated=True,
     )
 
     demand_state.ingest_report('svc', 'svc-hash', draining)
@@ -295,6 +310,11 @@ def test_ha_handoff_adds_disjoint_work_without_double_counting_occupancy(
     assert summary['http_in_flight_requests'] == 5
     assert summary['unknown_in_flight_replica_count'] == 0
     assert summary['request_queue_depth'] == 1
+    assert summary['unique_job_arrivals_60s'] == 3
+    assert summary['unique_job_arrivals_300s'] == 5
+    assert summary['headerless_arrivals_60s'] == 3
+    assert summary['headerless_arrivals_300s'] == 5
+    assert summary['offered_arrival_tracking_saturated'] is True
 
 
 def test_ha_summary_freshness_uses_oldest_contributing_receipt(demand_database):

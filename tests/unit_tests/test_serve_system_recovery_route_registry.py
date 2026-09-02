@@ -18,6 +18,14 @@ class _Clock:
         return self.now
 
 
+class _NoAggregateValuesScanDict(dict):
+    """Mapping guard proving identity advancement does no global value walk."""
+
+    def values(self):
+        raise AssertionError(
+            'ordered identity advancement scanned every tombstone set')
+
+
 def _generation(*,
                 recovered: bool = False,
                 controller: int = 1,
@@ -222,7 +230,7 @@ def test_same_generation_url_change_retires_instead_of_rotating() -> None:
     assert registry.marker(7, generation, 'http://replica:8000') is None
 
 
-def test_url_change_detection_revokes_before_ordered_status_read() -> None:
+def test_url_change_detection_is_observational_until_postcommit_issue() -> None:
     clock = _Clock()
     registry = route_lease.ManagerRouteLeaseRegistry(clock)
     original = _generation()
@@ -233,9 +241,17 @@ def test_url_change_detection_revokes_before_ordered_status_read() -> None:
                                  succeeded=True)
     assert registry.heartbeat_payload()['entries']
 
+    marker = registry.marker(7, original, 'http://replica:8000')
+    payload = registry.heartbeat_payload()
+    targets = registry.probe_targets()
+
     assert registry.needs_issuance(7, original, 'http://other:8000')
-    assert registry.heartbeat_payload()['entries'] == []
-    assert registry.is_retired(7, original)
+    assert registry.marker(7, original, 'http://replica:8000') == marker
+    assert registry.heartbeat_payload() == payload
+    assert registry.probe_targets() == targets
+    assert not registry.is_retired(7, original)
+
+    # The postcommit mutation owns irreversible retirement.
     assert not registry.issue(7,
                               original,
                               'http://other:8000',
@@ -503,6 +519,49 @@ def test_registry_targets_and_tombstones_are_bounded(monkeypatch) -> None:
         len(record_ids)
         for record_ids in registry._retired_record_ids.values()) <= cap
     assert len(registry._blocked_record_ids) <= cap
+
+
+def test_max_cardinality_record_advances_do_not_scan_all_tombstones() -> None:
+    cap = constants.SYSTEM_RECOVERY_ROUTE_MAX_REPLICAS
+    registry = route_lease.ManagerRouteLeaseRegistry(_Clock())
+    registry._retired_record_ids = _NoAggregateValuesScanDict()
+    current_record_ids = {}
+
+    # Recreate every numeric replica once at the production protocol bound.
+    # The mapping guard makes this a structural complexity assertion: the old
+    # implementation called values() for each advance and therefore performed
+    # 1 + ... + N set visits.
+    for replica_id in range(1, cap + 1):
+        old_record_id = _generation(record=replica_id).replica_record_id
+        current_record_id = _generation(record=cap +
+                                        replica_id).replica_record_id
+        registry.observe_record_identity(replica_id, old_record_id)
+        registry.observe_record_identity(replica_id, current_record_id)
+        current_record_ids[replica_id] = current_record_id
+
+    assert registry._retired_record_id_count == cap
+    assert sum(
+        len(record_ids)
+        for record_ids in dict.values(registry._retired_record_ids)) == cap
+
+    # The incrementally maintained count preserves the same fail-closed bound.
+    overflow_record_id = _generation(record=2 * cap + 1).replica_record_id
+    registry.observe_record_identity(1, overflow_record_id)
+    assert registry._blocked_record_ids == {1}
+    assert registry._retired_record_id_count == cap
+
+    # Pruning one numeric identity releases exactly its tombstones and permits a
+    # later ordered history to consume the freed global slot.
+    current_record_ids.pop(1)
+    registry.prune(current_record_ids)
+    assert registry._retired_record_id_count == cap - 1
+    registry.observe_record_identity(1, overflow_record_id)
+    final_record_id = _generation(record=3 * cap + 1).replica_record_id
+    registry.observe_record_identity(1, final_record_id)
+    assert registry._retired_record_id_count == cap
+    assert sum(
+        len(record_ids)
+        for record_ids in dict.values(registry._retired_record_ids)) == cap
 
 
 def test_repeated_recreation_tombstone_overflow_blocks_only_that_id(

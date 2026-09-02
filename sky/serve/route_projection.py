@@ -46,6 +46,13 @@ ALIAS_RETENTION_SECONDS = 430
 MAX_ALIASES_PER_RECORD = 8
 MAX_ROUTE_IDENTITIES = 100_000
 MAX_ROUTE_TTL_SECONDS = 24 * 60 * 60
+_ROUTE_REVOCATION_CHUNK_SIZE = 300
+# These three provider-free worker operations run in bounded single-flight
+# threads. Pool checkout / connection establishment already use the central DB
+# policy's 15-second bounds; once a transaction starts, these local deadlines
+# prevent a lock waiter or query from pinning its non-daemon owner indefinitely.
+_INCREMENTAL_WORKER_LOCK_TIMEOUT_MS = 2_000
+_INCREMENTAL_WORKER_STATEMENT_TIMEOUT_MS = 10_000
 # A promotion read runs after the bounded Kubernetes role snapshot and inside
 # the external eight-second role-heartbeat budget.  Waiting briefly joins the
 # PostgreSQL row-lock queue instead of repeatedly losing to a stream of short
@@ -1567,33 +1574,60 @@ def revoke_replica_lease_in_session(
     commit.  Callers already mutating the replica row own the transaction.
     Missing pre-Serve051 material is the idempotent zero-row result.
     """
+    return revoke_replica_leases_in_session(session, service_name,
+                                            ((replica_id, replica_record_id),),
+                                            reason)
+
+
+def revoke_replica_leases_in_session(
+    session: orm.Session | sqlalchemy.engine.Connection,
+    service_name: str,
+    replica_identities: Sequence[tuple[int, str]],
+    reason: str,
+) -> int:
+    """Revoke an exact replica wave with bounded PostgreSQL statements."""
     _nonempty(service_name, 'service_name')
-    # Historical rows may use replica ID 0 as a non-routable sentinel.  No
-    # Serve051 lease can represent it because the lease schema requires a
-    # positive ID, so revocation is already complete.
-    if type(replica_id) is int and replica_id <= 0:  # pylint: disable=unidiomatic-typecheck
-        return 0
-    _positive_int(replica_id, 'replica_id')
-    record_id = uuid.UUID(_canonical_record_id(replica_record_id))
     _nonempty(reason, 'reason')
-    if not _route_lease_table_available(session):
-        return 0
-    now = sqlalchemy.func.clock_timestamp()
-    result = session.execute(
-        sqlalchemy.update(_LEASES).where(
-            _LEASES.c.service_name == service_name,
-            _LEASES.c.replica_id == replica_id,
-            _LEASES.c.replica_record_id == record_id,
-            _LEASES.c.revoked_at.is_(None),
-        ).values(
-            ready=False,
-            observed_at=None,
-            valid_until=None,
-            revocation_generation=_LEASES.c.revocation_generation + 1,
-            revoked_at=now,
-            revocation_reason=reason,
+    normalized: list[tuple[int, uuid.UUID]] = []
+    seen_replica_ids: set[int] = set()
+    for replica_id, replica_record_id in replica_identities:
+        # Historical rows may use replica ID 0 as a non-routable sentinel. No
+        # Serve051 lease can represent it because its schema requires positive
+        # IDs, so revocation is already complete for that identity.
+        if type(replica_id) is int and replica_id <= 0:  # pylint: disable=unidiomatic-typecheck
+            continue
+        _positive_int(replica_id, 'replica_id')
+        if replica_id in seen_replica_ids:
+            raise RouteProjectionValidationError(
+                'Route revocation identities must use unique replica IDs.')
+        seen_replica_ids.add(replica_id)
+        normalized.append((
+            replica_id,
+            uuid.UUID(_canonical_record_id(replica_record_id)),
         ))
-    return int(result.rowcount or 0)
+    if not normalized or not _route_lease_table_available(session):
+        return 0
+    normalized.sort(key=lambda identity: identity[0])
+    now = sqlalchemy.func.clock_timestamp()
+    revoked = 0
+    for start in range(0, len(normalized), _ROUTE_REVOCATION_CHUNK_SIZE):
+        chunk = normalized[start:start + _ROUTE_REVOCATION_CHUNK_SIZE]
+        result = session.execute(
+            sqlalchemy.update(_LEASES).where(
+                _LEASES.c.service_name == service_name,
+                sqlalchemy.tuple_(_LEASES.c.replica_id,
+                                  _LEASES.c.replica_record_id).in_(chunk),
+                _LEASES.c.revoked_at.is_(None),
+            ).values(
+                ready=False,
+                observed_at=None,
+                valid_until=None,
+                revocation_generation=_LEASES.c.revocation_generation + 1,
+                revoked_at=now,
+                revocation_reason=reason,
+            ))
+        revoked += int(result.rowcount or 0)
+    return revoked
 
 
 def revoke_service_leases_in_session(
@@ -1760,6 +1794,16 @@ def _merge_aliases(current: dict[str, dict[str, Any]],
                 continue
             result.setdefault(url, alias)
     return _validate_identities(result)
+
+
+def _set_incremental_worker_transaction_deadlines(session: orm.Session) -> None:
+    """Bound one PostgreSQL transaction owned by IncrementalRouteWorker."""
+    session.execute(
+        sqlalchemy.text('SET LOCAL lock_timeout = '
+                        f"'{_INCREMENTAL_WORKER_LOCK_TIMEOUT_MS}ms'"))
+    session.execute(
+        sqlalchemy.text('SET LOCAL statement_timeout = '
+                        f"'{_INCREMENTAL_WORKER_STATEMENT_TIMEOUT_MS}ms'"))
 
 
 class RouteProjectionRepository:
@@ -2103,6 +2147,7 @@ class RouteProjectionRepository:
                 'Route publisher identity is invalid.')
         try:
             with orm.Session(self.engine) as session, session.begin():
+                _set_incremental_worker_transaction_deadlines(session)
                 owner = session.execute(self._owner_query(
                     identity.service_name)).mappings().one_or_none()
                 if owner is None or not _owner_matches(identity, owner):
@@ -2198,6 +2243,7 @@ class RouteProjectionRepository:
                 'Route probe result batch contains a duplicate target.')
         try:
             with orm.Session(self.engine) as session, session.begin():
+                _set_incremental_worker_transaction_deadlines(session)
                 now = session.execute(
                     sqlalchemy.select(
                         sqlalchemy.func.clock_timestamp())).scalar_one()
@@ -2541,6 +2587,7 @@ class RouteProjectionRepository:
             # The prepare transaction deliberately takes no row locks and ends
             # before any user-supplied decoder or capacity callback runs.
             with orm.Session(self.engine) as session, session.begin():
+                _set_incremental_worker_transaction_deadlines(session)
                 prepared_owner = session.execute(
                     self._owner_query(
                         identity.service_name)).mappings().one_or_none()
@@ -2629,6 +2676,7 @@ class RouteProjectionRepository:
             # construction. A changed input rejects this tick; the worker
             # retries from a new snapshot.
             with orm.Session(self.engine) as session, session.begin():
+                _set_incremental_worker_transaction_deadlines(session)
                 owner = session.execute(
                     self._owner_query(
                         identity.service_name,

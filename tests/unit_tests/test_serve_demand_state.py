@@ -498,3 +498,45 @@ def test_aggregate_fresh_reports_rejects_corrupt_payload():
                 'applied_generation': 'corrupt',
             },
         }], 1, now)
+
+
+def test_aggregate_fresh_reports_exposes_offered_arrival_windows():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    now_epoch = now.timestamp()
+    draining = _report()
+    draining.update(
+        reporter_observed_at=now_epoch,
+        applied_role='DRAINING',
+        unique_job_arrivals_60s=2,
+        unique_job_arrivals_300s=4,
+        headerless_arrivals_60s=1,
+        headerless_arrivals_300s=3,
+    )
+    active = copy.deepcopy(draining)
+    active.update(
+        reporter_session_id='process-b',
+        lb_session_id='pod-b',
+        lb_slot='b',
+        applied_role='ACTIVE',
+        unique_job_arrivals_60s=5,
+        unique_job_arrivals_300s=7,
+        headerless_arrivals_60s=2,
+        headerless_arrivals_300s=4,
+        offered_arrival_tracking_saturated=True,
+    )
+    rows = [{
+        'reporter_session_id': report['reporter_session_id'],
+        'lb_slot': report['lb_slot'],
+        'received_at': now,
+        'reporter_observed_at': now,
+        'complete': True,
+        'payload': report,
+    } for report in (draining, active)]
+
+    summary = demand_state._aggregate_fresh_reports(rows, 3, now)
+
+    assert summary['unique_job_arrivals_60s'] == 7
+    assert summary['unique_job_arrivals_300s'] == 11
+    assert summary['headerless_arrivals_60s'] == 3
+    assert summary['headerless_arrivals_300s'] == 7
+    assert summary['offered_arrival_tracking_saturated'] is True

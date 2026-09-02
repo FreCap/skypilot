@@ -32,6 +32,7 @@ from sky.container_images import task_utils as container_image_task_utils
 from sky.dag import DEFAULT_EXECUTION
 from sky.data import data_utils
 from sky.data import storage as storage_lib
+from sky.jobs import api_access as managed_job_api_access
 from sky.jobs import constants as managed_job_constants
 from sky.jobs import runner as managed_job_runner
 from sky.jobs import state as managed_job_state
@@ -585,28 +586,10 @@ def _create_job_api_token(creator_user_id: str, job_name: str | None,
     Returns:
         A tuple of (token_string, token_id).
     """
-    # Lazy imports to avoid circular dependencies and keep import time low.
-    # pylint: disable=import-outside-toplevel
-    from sky.users.token_service import token_service
-
-    token_name = (f'{managed_job_constants.MANAGED_JOB_TOKEN_NAME_PREFIX}'
-                  f'{job_name or "unnamed"}-{dag_uuid[:8]}')
-
-    token_data = token_service.create_token(
-        creator_user_id=creator_user_id,
-        service_account_user_id=creator_user_id,
-        token_name=token_name,
-        expires_in_days=managed_job_constants.MANAGED_JOB_TOKEN_TTL_DAYS)
-
-    global_user_state.add_service_account_token(
-        token_id=token_data['token_id'],
-        token_name=token_name,
-        token_hash=token_data['token_hash'],
-        creator_user_hash=creator_user_id,
-        service_account_user_id=creator_user_id,
-        expires_at=token_data['expires_at'])
-
-    return token_data['token'], token_data['token_id']
+    return managed_job_api_access.create_job_api_token(
+        creator_user_id,
+        f'{job_name or "unnamed"}-{dag_uuid[:8]}',
+    )
 
 
 def _associate_job_api_access_token(job_ids: list[int], token_id: str) -> None:

@@ -858,6 +858,11 @@ def _empty_summary(state: str,
         'request_queue_depth': None,
         'rejected_requests': None,
         'recent_rejected_requests': None,
+        'unique_job_arrivals_60s': None,
+        'unique_job_arrivals_300s': None,
+        'headerless_arrivals_60s': None,
+        'headerless_arrivals_300s': None,
+        'offered_arrival_tracking_saturated': None,
         'request_stats_age_seconds': None,
     }
 
@@ -957,6 +962,12 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
     queue_depth = 0
     rejected = 0
     recent_rejected = 0
+    offered_arrival_counts = {
+        key: 0
+        for key in ('unique_job_arrivals_60s', 'unique_job_arrivals_300s',
+                    'headerless_arrivals_60s', 'headerless_arrivals_300s')
+    }
+    offered_arrival_tracking_saturated = False
     oldest_received_at = min(row['received_at'] for row in rows)
     complete = True
     active_report_present = False
@@ -1002,6 +1013,11 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
         queue_depth += int(payload.get('queue_depth', 0))
         rejected += int(payload.get('rejected_in_window', 0))
         recent_rejected += int(payload.get('rejected_in_recent_window', 0))
+        for field in offered_arrival_counts:
+            offered_arrival_counts[field] += int(payload.get(field, 0))
+        offered_arrival_tracking_saturated = bool(
+            offered_arrival_tracking_saturated or
+            payload.get('offered_arrival_tracking_saturated'))
         complete = complete and bool(row['complete'])
     if not active_report_present:
         return _empty_summary('stale',
@@ -1064,6 +1080,8 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
         'request_queue_depth': queue_depth,
         'rejected_requests': rejected,
         'recent_rejected_requests': recent_rejected,
+        **offered_arrival_counts,
+        'offered_arrival_tracking_saturated': offered_arrival_tracking_saturated,
         'request_stats_age_seconds': max(
             0.0, (now - oldest_received_at).total_seconds()),
     }

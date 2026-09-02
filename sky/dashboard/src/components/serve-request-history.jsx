@@ -199,7 +199,7 @@ export function RequestHistoryCard({
   const chartData = {
     datasets: [
       {
-        label: 'Requests',
+        label: 'Recorded request attempts',
         data: view.timestamps.map((timestamp, index) => ({
           x: timestamp,
           y: view.counts[index],
@@ -278,7 +278,7 @@ export function RequestHistoryCard({
   const scales = historyLinearScale(range, {
     beginAtZero: true,
     ticks: { precision: 0 },
-    title: { display: true, text: 'Recorded requests / minute' },
+    title: { display: true, text: 'Recorded request attempts / minute' },
   });
   scales.yCapacity = {
     position: 'right',
@@ -316,15 +316,17 @@ export function RequestHistoryCard({
       <div className="flex items-center justify-between mb-2">
         <div>
           <h3 className="text-lg font-semibold">
-            Request and capacity history
+            Recorded request and capacity history
           </h3>
           <div className="text-sm text-gray-500">
-            Traffic target includes autoscaler hysteresis. Traffic or
-            reservation target is the larger of traffic and reserved-capacity
-            fill. Committed / unready capacity combines queued,
-            provider-launching, application-starting, and not-ready work.
-            Non-failed tracked capacity also includes stopping and preempted
-            rows until cleanup finishes
+            Recorded attempts include admitted requests and explicit queue-full
+            or queue-timeout rejections; attempts canceled or disconnected while
+            awaiting admission are excluded. Traffic target includes autoscaler
+            hysteresis. Traffic or reservation target is the larger of traffic
+            and reserved-capacity fill. Committed / unready capacity combines
+            queued, provider-launching, application-starting, and not-ready
+            work. Non-failed tracked capacity also includes stopping and
+            preempted rows until cleanup finishes
             {loading ? ' · Refreshing…' : ''}
           </div>
         </div>
@@ -332,13 +334,13 @@ export function RequestHistoryCard({
       <Card>
         {!view.timestamps.length ? (
           <div className="text-center py-12 text-gray-500">
-            No request history is available for this range.
+            No recorded request history is available for this range.
           </div>
         ) : (
           <div className="p-4">
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4 text-sm">
               <div>
-                <div className="text-gray-500">Requests in range</div>
+                <div className="text-gray-500">Recorded attempts in range</div>
                 <div className="font-semibold">
                   {view.stats.total.toLocaleString()}
                 </div>

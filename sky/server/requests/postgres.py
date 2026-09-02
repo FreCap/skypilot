@@ -50,6 +50,7 @@ from sky.server.requests import requests as requests_lib
 from sky.server.requests import storage as request_storage
 from sky.server.requests.queues import base as queue_base
 from sky.skylet import constants as skylet_constants
+from sky.utils import config_utils
 from sky.utils import controller_capability
 from sky.utils import locks
 from sky.utils import yaml_utils
@@ -71,6 +72,7 @@ capacity_policy = adaptors_common.LazyImport('sky.provision.capacity_policy')
 paid_capacity = adaptors_common.LazyImport('sky.serve.paid_capacity')
 serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
 serve_state_schema = adaptors_common.LazyImport('sky.serve.serve_state_schema')
+serve_utils = adaptors_common.LazyImport('sky.serve.serve_utils')
 serve_statuses = adaptors_common.LazyImport('sky.serve.serve_statuses')
 route_projection_schema = adaptors_common.LazyImport(
     'sky.serve.route_projection_schema')
@@ -181,6 +183,23 @@ class BoundOrdinaryLaunchRequestFacts:
     return_value: Any
     error: Any
     error_decode_failed: bool
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class BoundAwsProviderCensusScope:
+    """Stable AWS evidence identity plus its version-owned access selector."""
+
+    provider_identity: Mapping[str, Any]
+    credential_profile: str | None
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.provider_identity, Mapping) or
+            (self.credential_profile is not None and
+             (not isinstance(self.credential_profile, str) or
+              not self.credential_profile))):
+            raise ValueError('AWS provider census scope is malformed.')
+        object.__setattr__(self, 'provider_identity',
+                           dict(self.provider_identity))
 
 
 def _canonical_evidence_sha256(value: Mapping[str, Any]) -> str:
@@ -404,6 +423,26 @@ class OrdinaryLaunchReduction:
     service_job_id: int | None
     cancel_reason: str | None
     projected: bool
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class BoundOrdinaryLaunchStatusIdentity:
+    """Exact replica lifecycle whose service job may be observed."""
+
+    replica_id: int
+    replica_record_id: str
+
+    def __post_init__(self) -> None:
+        if (isinstance(self.replica_id, bool) or
+                not isinstance(self.replica_id, int) or self.replica_id < 1):
+            raise ValueError('replica_id must be a positive integer.')
+        try:
+            record_id = uuid.UUID(self.replica_record_id)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError(
+                'replica_record_id must be a canonical UUID.') from error
+        if str(record_id) != self.replica_record_id:
+            raise ValueError('replica_record_id must be a canonical UUID.')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3316,6 +3355,67 @@ def stable_bound_ordinary_launch_submission_id(
             connection, service_name, replica_id, replica_record_id)
 
 
+def read_bound_ordinary_launch_status_job_ids(
+    service_name: str,
+    identities: typing.Sequence[BoundOrdinaryLaunchStatusIdentity],
+) -> dict[BoundOrdinaryLaunchStatusIdentity, int]:
+    """Read latest positive service-job IDs for exact replicas in one query.
+
+    The result is observation material only.  It grants no request, provider,
+    projection, cancellation, or ownership authority and can become stale as
+    soon as the transaction ends.  Consumers must revalidate the replica
+    lifecycle before reducing remote job evidence.
+    """
+    if not isinstance(service_name, str) or not service_name:
+        raise ValueError('service_name must be nonempty.')
+    unique_identities = tuple(dict.fromkeys(identities))
+    if not unique_identities:
+        return {}
+    if not all(
+            isinstance(identity, BoundOrdinaryLaunchStatusIdentity)
+            for identity in unique_identities):
+        raise TypeError('identities must contain status identity records.')
+
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    requested_pairs = [(identity.replica_id,
+                        uuid.UUID(identity.replica_record_id))
+                       for identity in unique_identities]
+    rank = sqlalchemy.func.row_number().over(
+        partition_by=(associations.c.replica_id,
+                      associations.c.replica_record_id),
+        order_by=associations.c.launch_generation.desc()).label('row_rank')
+    ranked = sqlalchemy.select(associations.c.replica_id,
+                               associations.c.replica_record_id,
+                               associations.c.service_job_id, rank).where(
+                                   associations.c.service_name == service_name,
+                                   sqlalchemy.tuple_(
+                                       associations.c.replica_id,
+                                       associations.c.replica_record_id).in_(
+                                           requested_pairs)).subquery()
+    statement = sqlalchemy.select(
+        ranked.c.replica_id, ranked.c.replica_record_id,
+        ranked.c.service_job_id).where(ranked.c.row_rank == 1)
+    engine = initialize_and_get_db()
+    with engine.begin() as connection:
+        rows = connection.execute(statement).mappings().all()
+
+    identity_by_pair = {
+        (identity.replica_id, identity.replica_record_id): identity
+        for identity in unique_identities
+    }
+    results = {}
+    for row in rows:
+        service_job_id = row['service_job_id']
+        if (isinstance(service_job_id, bool) or
+                not isinstance(service_job_id, int) or service_job_id < 1):
+            continue
+        pair = (int(row['replica_id']), str(row['replica_record_id']))
+        identity = identity_by_pair.get(pair)
+        if identity is not None:
+            results[identity] = service_job_id
+    return results
+
+
 def inspect_bound_ordinary_launch(
     service_name: str,
     replica_id: int,
@@ -4350,6 +4450,28 @@ def _gcp_launch_task_supports_plain_compute_disk_reconciliation(
     return saw_task
 
 
+def _ordinary_paid_version_controller_config_from_association_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    association: Mapping[str, Any],
+) -> config_utils.Config | None:
+    """Recover one association's immutable version configuration."""
+    service_name = association.get('service_name')
+    service_version = association.get('service_version')
+    workspace = association.get('service_workspace')
+    # pylint: disable-next=unidiomatic-typecheck
+    if (not isinstance(service_name, str) or not service_name or
+            type(service_version) is not int or service_version < 1 or
+            not isinstance(workspace, str) or not workspace):
+        return None
+    snapshot = serve_state.get_version_controller_config_in_connection(
+        connection, service_name, service_version)
+    if snapshot is None:
+        return None
+    return serve_utils.parse_and_validate_version_controller_config(
+        snapshot[0], workspace,
+        'ordinary paid provider authority controller config')
+
+
 def _ordinary_paid_aws_provider_identity_from_locked_request(
     connection: sqlalchemy.engine.Connection,
     context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
@@ -4362,7 +4484,7 @@ def _ordinary_paid_aws_provider_identity_from_locked_request(
     require_paid_claim: bool = True,
     require_retention_pin: bool = True,
 ) -> dict[str, Any] | None:
-    """Recover exact AWS census scope from the retained launch request."""
+    """Recover the stable AWS evidence identity from retained authority."""
     pool_identity = paid_capacity.pool_key_payload(
         str(association.get('paid_capacity_pool_key')))
     if (not ordinary_launch_binding.is_paid_provider_reconciliation_profile(
@@ -4415,6 +4537,9 @@ def _ordinary_paid_aws_provider_identity_from_locked_request(
         if (workspace != pool_identity.get('workspace') or
                 config_snapshot.get('active_workspace') != workspace):
             return None
+        # Keep the v1 evidence representation reconstructable across rolling
+        # upgrades. Server-controller requests deliberately retain no profile,
+        # while historical client requests may retain one here.
         credential_profile = (
             skypilot_config.get_effective_workspace_region_config_from_snapshot(
                 config_snapshot,
@@ -4423,6 +4548,46 @@ def _ordinary_paid_aws_provider_identity_from_locked_request(
                 workspace=workspace))
         return ordinary_launch_binding.ordinary_paid_aws_provider_identity(
             association, credential_profile=credential_profile)
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
+def _ordinary_paid_aws_provider_census_scope_from_locked_request(
+    connection: sqlalchemy.engine.Connection,
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    association: Mapping[str, Any],
+    facts: BoundOrdinaryLaunchRequestFacts,
+    request_row: sqlalchemy.engine.RowMapping | None,
+    queue_row: sqlalchemy.engine.RowMapping | None,
+    *,
+    expected_reconciliation_outcome: str,
+) -> BoundAwsProviderCensusScope | None:
+    """Join stable AWS evidence identity to immutable version access."""
+    provider_identity = _ordinary_paid_aws_provider_identity_from_locked_request(
+        connection,
+        context,
+        association,
+        facts,
+        request_row,
+        queue_row,
+        expected_reconciliation_outcome=expected_reconciliation_outcome)
+    if provider_identity is None:
+        return None
+    try:
+        frozen_controller_config = (
+            _ordinary_paid_version_controller_config_from_association_in_connection(
+                connection, association))
+        if frozen_controller_config is None:
+            return None
+        credential_profile = (
+            skypilot_config.get_effective_workspace_region_config_from_snapshot(
+                frozen_controller_config,
+                'aws', ('profile',),
+                region=provider_identity['region'],
+                workspace=provider_identity['workspace']))
+        return BoundAwsProviderCensusScope(
+            provider_identity=provider_identity,
+            credential_profile=credential_profile)
     except Exception:  # pylint: disable=broad-except
         return None
 
@@ -4527,9 +4692,14 @@ def _ordinary_paid_gcp_provider_identity_from_locked_request(
         if (workspace != pool_identity.get('workspace') or
                 config_snapshot.get('active_workspace') != workspace):
             return None
+        frozen_controller_config = (
+            _ordinary_paid_version_controller_config_from_association_in_connection(
+                connection, association))
+        if frozen_controller_config is None:
+            return None
         managed_instance_group = (
             skypilot_config.get_effective_workspace_region_config_from_snapshot(
-                config_snapshot,
+                frozen_controller_config,
                 'gcp', ('managed_instance_group',),
                 region=pool_identity['region'],
                 workspace=workspace))
@@ -4539,7 +4709,7 @@ def _ordinary_paid_gcp_provider_identity_from_locked_request(
         if pool_identity.get('version') == 1:
             project_id = (skypilot_config.
                           get_effective_workspace_region_config_from_snapshot(
-                              config_snapshot,
+                              frozen_controller_config,
                               'gcp', ('project_id',),
                               region=pool_identity['region'],
                               workspace=workspace))
@@ -4713,6 +4883,35 @@ def bound_non_pool_aws_provider_identity(
         facts, request_row, queue_row, _ = _lock_bound_request_evidence(
             connection, context)
         return _ordinary_paid_aws_provider_identity_from_locked_request(
+            connection,
+            context,
+            association,
+            facts,
+            request_row,
+            queue_row,
+            expected_reconciliation_outcome=(
+                ordinary_launch_binding.ReconciliationOutcome.
+                POST_EFFECT_AMBIGUOUS.value))
+
+
+def bound_non_pool_aws_provider_census_scope(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> BoundAwsProviderCensusScope | None:
+    """Read exact AWS evidence identity and version-owned access together."""
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return None
+    with engine.begin() as connection:
+        association = ordinary_launch_binding.lock_reduction_authority_in_connection(
+            connection, context)
+        if (not _controller_authority_matches_reduction(association, authority)
+                or association['resolution']
+                != ordinary_launch_binding.Resolution.AMBIGUOUS.value):
+            return None
+        facts, request_row, queue_row, _ = _lock_bound_request_evidence(
+            connection, context)
+        return _ordinary_paid_aws_provider_census_scope_from_locked_request(
             connection,
             context,
             association,
@@ -5160,9 +5359,14 @@ def _paid_provider_allocation_identity_from_locked_request(
             return None
         project_id = None
         if pool_identity.get('version') == 1:
+            frozen_controller_config = (
+                _ordinary_paid_version_controller_config_from_association_in_connection(
+                    connection, association))
+            if frozen_controller_config is None:
+                return None
             project_id = (skypilot_config.
                           get_effective_workspace_region_config_from_snapshot(
-                              config_snapshot,
+                              frozen_controller_config,
                               'gcp', ('project_id',),
                               region=region,
                               workspace=workspace))

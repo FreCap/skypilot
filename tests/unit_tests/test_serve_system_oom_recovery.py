@@ -16,6 +16,7 @@ _IMAGE_DIGEST = 'sha256:' + 'a' * 64
 _PINNED_IMAGE = f'example.invalid/model@{_IMAGE_DIGEST}'
 _SERVICE_NAME = 'boltz-l4-fleet'
 _SERVICE_HASH = 'incarnation-123'
+_CONTROLLER_INCARNATION = '33333333-3333-4333-8333-333333333333'
 
 
 def _task(run: str | None = None) -> sky.Task:
@@ -129,8 +130,11 @@ def _bound_v3_context(monkeypatch, task: sky.Task) -> dict[str, object]:
         _v3_intent(requested),
         service_name=_SERVICE_NAME,
         service_version=5,
+        service_lifecycle_epoch=4,
         controller_pid=123,
-        controller_ip='10.0.0.2')
+        controller_ip='10.0.0.2',
+        controller_incarnation=_CONTROLLER_INCARNATION,
+        controller_owner_epoch=6)
     return system_oom_recovery.bind_launch_context(unbound, 'request-123')
 
 
@@ -351,8 +355,11 @@ def test_authorization_v3_maps_explicitly_to_runtime_profile_two(monkeypatch):
         _v3_intent(requested),
         service_name=_SERVICE_NAME,
         service_version=5,
+        service_lifecycle_epoch=4,
         controller_pid=123,
-        controller_ip='10.0.0.2')
+        controller_ip='10.0.0.2',
+        controller_incarnation=_CONTROLLER_INCARNATION,
+        controller_owner_epoch=6)
     bound = system_oom_recovery.bind_launch_context(unbound, 'request-123')
     matched = system_oom_recovery.match_trusted_profile(task, bound)
 
@@ -374,8 +381,11 @@ def test_v3_context_is_closed_and_nonce_becomes_server_request_id(monkeypatch):
         _v3_intent(requested),
         service_name=_SERVICE_NAME,
         service_version=5,
+        service_lifecycle_epoch=4,
         controller_pid=None,
-        controller_ip=None)
+        controller_ip=None,
+        controller_incarnation=_CONTROLLER_INCARNATION,
+        controller_owner_epoch=6)
 
     assert system_oom_recovery.has_v3_system_oom_recovery_context(unbound)
     assert system_oom_recovery.is_unbound_launch_context(unbound)
@@ -411,8 +421,11 @@ def test_v3_context_preserves_empty_workspace_text(monkeypatch):
             _v3_intent(requested),
             service_name=_SERVICE_NAME,
             service_version=5,
+            service_lifecycle_epoch=4,
             controller_pid=None,
-            controller_ip=None)
+            controller_ip=None,
+            controller_incarnation=_CONTROLLER_INCARNATION,
+            controller_owner_epoch=6)
         bound = system_oom_recovery.bind_launch_context(unbound, 'request-123')
 
         assert unbound[constants.SYSTEM_OOM_RECOVERY_WORKSPACE_KEY] == ''

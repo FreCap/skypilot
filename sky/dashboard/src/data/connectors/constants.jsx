@@ -61,6 +61,7 @@ export const SERVE_DASHBOARD_REPLICA_READS_API_VERSION = 67;
 export const SERVE_DASHBOARD_PRICING_READS_API_VERSION = 71;
 export const SERVE_DURABLE_DEMAND_API_VERSION = 82;
 export const SERVE_EXACT_REQUEST_SUMMARY_API_VERSION = 92;
+export const SERVE_OFFERED_ARRIVAL_TELEMETRY_API_VERSION = 94;
 // Header names expected by the server's APIVersionMiddleware. Mirrors
 // sky/server/constants.py:API_VERSION_HEADER / VERSION_HEADER.
 // The middleware (versions._check_version_compatibility) requires BOTH

@@ -1,5 +1,5 @@
 """Real-PostgreSQL tests for durable API request delivery."""
-# pylint: disable=protected-access,redefined-outer-name,unexpected-keyword-arg
+# pylint: disable=not-callable,protected-access,redefined-outer-name,unexpected-keyword-arg
 
 import ast
 import asyncio
@@ -33,6 +33,7 @@ from sky import execution
 from sky import global_user_state
 from sky import global_user_state_schema
 from sky import models
+from sky import skypilot_config
 from sky.events import api_models as event_api_models
 from sky.jobs import state_schema as managed_job_state_schema
 from sky.jobs.server import core as managed_jobs_core
@@ -47,6 +48,7 @@ from sky.serve import replica_managers
 from sky.serve import route_projection_schema
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
+from sky.serve import serve_utils
 from sky.serve import service
 from sky.serve import service_spec
 from sky.serve import spot_placer
@@ -383,6 +385,15 @@ def bound_request_database(request_database, monkeypatch):
     # gate remains in legacy mode.
     alembic_command.upgrade(config, migration_utils.SERVE_VERSION)
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine', engine)
+    controller_config = b'''\
+active_workspace: workspace-a
+workspaces:
+  workspace-a:
+    aws:
+      profile: prod
+    gcp:
+      project_id: boltz-498512
+'''
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.insert(
@@ -410,6 +421,10 @@ def bound_request_database(request_database, monkeypatch):
                 service_name='gc-service',
                 version=2,
                 yaml_content='service:\n  min_replicas: 0\n',
+                controller_config=controller_config,
+                controller_config_digest=hashlib.sha256(
+                    controller_config).hexdigest(),
+                controller_config_snapshot_id='c' * 64,
                 controller_applied_at=1.0))
         connection.execute(
             sqlalchemy.insert(serve_state_schema.replicas_table).values(
@@ -832,15 +847,11 @@ def _prepare_paid_provider_absence_graph(
         'gc-service', 3, _GC_REPLICA_RECORD_ID)
     assert profile.kind is profile_kind
     launch_body = _gc_unbound_non_pool_launch_body()
+    # Production server-controller requests deliberately retain only this
+    # sparse override. Provider access and project policy come from the exact
+    # PostgreSQL version snapshot, never from ambient or request-local config.
     launch_body.override_skypilot_config = {
         'active_workspace': 'workspace-a',
-        'workspaces': {
-            'workspace-a': {
-                'gcp': {
-                    'project_id': 'boltz-498512',
-                },
-            },
-        },
     }
     if production_http_normalization:
         # The controller submits a prepared body carrying the service owner;
@@ -3177,14 +3188,41 @@ def test_paid_provider_negative_ack_projects_and_releases_debits_atomically(
     ordinary_launch_binding.EffectPhase.PROVIDER_IO,
     ordinary_launch_binding.EffectPhase.SERVICE_JOB_IO
 ])
-def test_aws_paid_exact_identity_covers_provider_backed_phases(
+def test_aws_paid_census_scope_uses_immutable_version_profile(
         bound_request_database, monkeypatch,
         effect_phase: ordinary_launch_binding.EffectPhase) -> None:
     graph = _prepare_paid_provider_absence_graph(bound_request_database,
                                                  monkeypatch,
                                                  effect_phase=effect_phase)
+    current_config = b'''\
+active_workspace: workspace-a
+workspaces:
+  workspace-a:
+    aws:
+      profile: wrong-current-profile
+'''
+    with graph.engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.version_specs_table).values(
+                service_name='gc-service',
+                version=3,
+                yaml_content='service:\n  min_replicas: 0\n',
+                controller_config=current_config,
+                controller_config_digest=hashlib.sha256(
+                    current_config).hexdigest(),
+                controller_config_snapshot_id='d' * 64,
+                controller_applied_at=2.0))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'gc-service').values(current_version=3, active_versions='[3]'))
+    monkeypatch.setattr(
+        skypilot_config, 'get_effective_workspace_region_config', lambda *_, **
+        __: pytest.fail('ambient configuration must not be consulted'))
 
     identity = request_postgres.bound_non_pool_aws_provider_identity(
+        graph.context, graph.authority)
+    scope = request_postgres.bound_non_pool_aws_provider_census_scope(
         graph.context, graph.authority)
 
     assert identity == {
@@ -3200,6 +3238,46 @@ def test_aws_paid_exact_identity_covers_provider_backed_phases(
         'workspace': 'workspace-a',
         'zone': 'us-east-1a',
     }
+    assert scope == request_postgres.BoundAwsProviderCensusScope(
+        provider_identity=identity, credential_profile='prod')
+
+
+@pytest.mark.parametrize('config_failure',
+                         ('missing', 'corrupt', 'wrong_workspace'))
+def test_aws_paid_census_scope_fails_closed_without_version_config(
+        bound_request_database, monkeypatch, config_failure: str) -> None:
+    graph = _prepare_paid_provider_absence_graph(bound_request_database,
+                                                 monkeypatch)
+    if config_failure == 'missing':
+        values = {
+            'controller_config': None,
+            'controller_config_digest': None,
+            'controller_config_snapshot_id': None,
+        }
+    elif config_failure == 'corrupt':
+        values = {'controller_config_digest': '0' * 64}
+    else:
+        wrong_config = b'active_workspace: other-workspace\n'
+        values = {
+            'controller_config': wrong_config,
+            'controller_config_digest':
+                hashlib.sha256(wrong_config).hexdigest(),
+            'controller_config_snapshot_id': 'e' * 64,
+        }
+    with graph.engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name ==
+                'gc-service',
+                serve_state_schema.version_specs_table.c.version == 2).values(
+                    **values))
+
+    identity = request_postgres.bound_non_pool_aws_provider_identity(
+        graph.context, graph.authority)
+    assert identity is not None
+    assert identity['credential_profile'] is None
+    assert request_postgres.bound_non_pool_aws_provider_census_scope(
+        graph.context, graph.authority) is None
 
 
 @pytest.mark.parametrize(('provider', 'pool_key'), [
@@ -3287,6 +3365,81 @@ def test_aws_negative_ack_does_not_settle_service_job_io(
         graph.context, graph.authority) is None
     assert request_postgres.bound_non_pool_aws_provider_identity(
         graph.context, graph.authority) is not None
+
+
+def test_aws_v1_evidence_survives_service_version_rollover(
+        bound_request_database, monkeypatch) -> None:
+    """Access selection must never change the stable evidence payload."""
+    graph = _prepare_paid_provider_absence_graph(bound_request_database,
+                                                 monkeypatch)
+    identity = request_postgres.bound_non_pool_aws_provider_identity(
+        graph.context, graph.authority)
+    scope = request_postgres.bound_non_pool_aws_provider_census_scope(
+        graph.context, graph.authority)
+    assert identity is not None
+    assert identity['credential_profile'] is None
+    assert scope == request_postgres.BoundAwsProviderCensusScope(
+        provider_identity=identity, credential_profile='prod')
+    payload = {
+        'association_id': str(graph.context.association_id),
+        'cluster_name': 'gc-service-3',
+        'instances': [{
+            'availability_zone': identity['zone'],
+            'client_token': identity['client_token'],
+            'cluster_name_on_cloud': identity['cluster_name_on_cloud'],
+            'instance_id': 'i-0123456789abcdef0',
+            'instance_type': identity['instance_type'],
+            'market': 'spot',
+            'state': 'running',
+        }],
+        'probe_contract': 'aws-client-token-instance-presence-v1',
+        'profile_kind': 'ORDINARY_PAID',
+        'provider_identity': identity,
+        'replica_record_id': str(_GC_REPLICA_RECORD_ID),
+        'result': 'PRESENT',
+    }
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, graph.authority,
+        ordinary_launch_binding.ProviderEvidence.PRESENT, payload)
+
+    next_config = b'''\
+active_workspace: workspace-a
+workspaces:
+  workspace-a:
+    aws:
+      profile: next-profile
+'''
+    with graph.engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.version_specs_table).values(
+                service_name='gc-service',
+                version=3,
+                yaml_content='service:\n  min_replicas: 0\n',
+                controller_config=next_config,
+                controller_config_digest=hashlib.sha256(
+                    next_config).hexdigest(),
+                controller_config_snapshot_id='d' * 64,
+                controller_applied_at=2.0))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'gc-service').values(current_version=3, active_versions='[3]'))
+
+    # Revalidation and cleanup remain tied to v2 request bytes, while provider
+    # access still resolves the exact v2 profile rather than the current one.
+    assert request_postgres.bound_non_pool_aws_provider_census_scope(
+        graph.context, graph.authority) == scope
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    manager._ordinary_launch_binding_authority = graph.authority
+    assert request_postgres.authorize_bound_non_pool_provider_present_cleanup(
+        graph.context,
+        graph.authority,
+        project_replica_result=lambda connection, projection: manager.
+        _project_bound_ordinary_launch(None, connection, projection))
+    assert request_postgres.bound_non_pool_provider_present_cleanup_is_authorized(
+        graph.context, graph.authority)
 
 
 @pytest.mark.parametrize('profile_kind', [
@@ -3609,10 +3762,10 @@ def test_gcp_paid_identity_accepts_http_post_normalization_body(
         tampered_task = request.request_body.model_copy(deep=True)
         tampered_task.task += '\nrun: echo tampered\n'
         tampered_bodies.append(tampered_task)
-        tampered_project = request.request_body.model_copy(deep=True)
-        tampered_project.override_skypilot_config['workspaces']['workspace-a'][
-            'gcp']['project_id'] = 'different-project'
-        tampered_bodies.append(tampered_project)
+        tampered_workspace = request.request_body.model_copy(deep=True)
+        tampered_workspace.override_skypilot_config[
+            'active_workspace'] = 'different-workspace'
+        tampered_bodies.append(tampered_workspace)
         tampered_env = request.request_body.model_copy(deep=True)
         tampered_env.env_vars['UNRELATED_ENV'] = 'tampered'
         tampered_bodies.append(tampered_env)
@@ -3664,7 +3817,45 @@ def test_gcp_paid_provider_identity_uses_frozen_pool_project(
 
     assert identity is not None
     assert identity['project_id'] == 'boltz-498512'
-    assert project_reads == []
+    assert not project_reads
+
+
+def test_gcp_paid_identity_rejects_version_managed_instance_group(
+        bound_request_database, monkeypatch) -> None:
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database, monkeypatch, pool_key=_gc_gcp_paid_pool_key())
+    mig_config = b'''\
+active_workspace: workspace-a
+gcp:
+  managed_instance_group:
+    run_duration: 600
+workspaces:
+  workspace-a:
+    gcp:
+      project_id: boltz-498512
+'''
+    parsed_config = serve_utils.parse_and_validate_version_controller_config(
+        mig_config, 'workspace-a', 'managed instance group test')
+    assert skypilot_config.get_effective_workspace_region_config_from_snapshot(
+        parsed_config,
+        'gcp', ('managed_instance_group',),
+        region='us-east4',
+        workspace='workspace-a') == {
+            'run_duration': 600
+        }
+    with graph.engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name ==
+                'gc-service',
+                serve_state_schema.version_specs_table.c.version == 2).values(
+                    controller_config=mig_config,
+                    controller_config_digest=hashlib.sha256(
+                        mig_config).hexdigest(),
+                    controller_config_snapshot_id='f' * 64))
+
+    assert request_postgres.bound_non_pool_gcp_provider_identity(
+        graph.context, graph.authority) is None
 
 
 @pytest.mark.parametrize('production_http_normalization', [False, True])
@@ -5165,6 +5356,51 @@ def _claim_gc_bound_request(engine, _backend):
     assert item.claim_token is not None
     assert item.worker_instance_id is not None
     return identity, context, queue, item
+
+
+def test_bound_status_job_ids_are_one_exact_batched_observation(
+        bound_request_database):
+    engine, backend = bound_request_database
+    identity, context, _, item = _claim_gc_bound_request(engine, backend)
+    assert backend.try_mark_running(item.request_id, 1234,
+                                    item.execution_generation, item.claim_token,
+                                    424242)
+    body = _legacy_serve_launch_request(identity.request_id).request_body
+    ordinary_launch_binding.install_bound_context(body, identity,
+                                                  context.launch_generation)
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    with ordinary_launch_binding.provider_effect_guard(
+            body.extra_launch_context,
+            claim,
+            claim_validator=(
+                request_postgres.
+                validate_bound_ordinary_launch_claim_in_transaction)):
+        ordinary_launch_binding.begin_service_job_io(body.extra_launch_context)
+        ordinary_launch_binding.record_service_job(body.extra_launch_context,
+                                                   42)
+
+    exact = request_postgres.BoundOrdinaryLaunchStatusIdentity(
+        replica_id=identity.replica_id,
+        replica_record_id=str(identity.replica_record_id))
+    missing = request_postgres.BoundOrdinaryLaunchStatusIdentity(
+        replica_id=4, replica_record_id='44444444-4444-4444-8444-444444444444')
+    statements = []
+
+    def _capture(_connection, _cursor, statement, _parameters, _context,
+                 _executemany):
+        if 'serve_ordinary_launch_associations' in statement:
+            statements.append(statement)
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _capture)
+    try:
+        result = request_postgres.read_bound_ordinary_launch_status_job_ids(
+            'gc-service', [missing, exact, exact])
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', _capture)
+
+    assert result == {exact: 42}
+    assert len(statements) == 1
 
 
 def _expire_claim(engine, request_id):

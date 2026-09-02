@@ -4801,9 +4801,11 @@ def to_label_selector(tags):
 
 
 def get_namespace_from_config(provider_config: dict[str, Any]) -> str:
+    namespace = provider_config.get('namespace')
+    if namespace is not None:
+        return namespace
     context = get_context_from_config(provider_config)
-    return provider_config.get('namespace',
-                               get_kube_config_context_namespace(context))
+    return get_kube_config_context_namespace(context)
 
 
 @timeline.event

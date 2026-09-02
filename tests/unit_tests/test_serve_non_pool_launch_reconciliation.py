@@ -1,7 +1,9 @@
 """Tests for failure-isolated non-pool provider reconciliation."""
+# pylint: disable=protected-access
 
 import json
 import types
+from unittest import mock
 import uuid
 
 import pytest
@@ -119,6 +121,16 @@ def _association_for_context(
         'authorization_generation': profile.authorization_generation,
         'authorization_digest': profile.authorization_digest,
     }
+
+
+def _aws_census_scope(
+    provider_identity: dict,
+    *,
+    credential_profile: str = 'prod',
+) -> reconciliation.request_postgres.BoundAwsProviderCensusScope:
+    return reconciliation.request_postgres.BoundAwsProviderCensusScope(
+        provider_identity=provider_identity,
+        credential_profile=credential_profile)
 
 
 @pytest.mark.parametrize(('presence', 'expected'),
@@ -367,7 +379,7 @@ def test_aws_paid_observation_uses_exact_client_token_scope(
         'aws_account_id': '096766144388',
         'client_token': 'a' * 64,
         'cluster_name_on_cloud': 'svc-3-abc',
-        'credential_profile': 'prod',
+        'credential_profile': None,
         'instance_type': 'g6.2xlarge',
         'num_nodes': 1,
         'region': 'us-east-2',
@@ -375,9 +387,10 @@ def test_aws_paid_observation_uses_exact_client_token_scope(
         'workspace': 'workspace-a',
         'zone': 'us-east-2c',
     }
+    scope = _aws_census_scope(identity)
     monkeypatch.setattr(reconciliation.request_postgres,
-                        'bound_non_pool_aws_provider_identity',
-                        lambda *_args: identity)
+                        'bound_non_pool_aws_provider_census_scope',
+                        lambda *_args: scope)
     calls = []
     monkeypatch.setattr(
         reconciliation, '_query_aws_paid_provider_census', lambda *_args: calls.
@@ -400,9 +413,10 @@ def test_aws_empty_census_before_settle_horizon_is_unknown(
         monkeypatch: pytest.MonkeyPatch) -> None:
     context = _context(
         ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    scope = _aws_census_scope({'region': 'us-east-2'})
     monkeypatch.setattr(reconciliation.request_postgres,
-                        'bound_non_pool_aws_provider_identity',
-                        lambda *_args: {'region': 'us-east-2'})
+                        'bound_non_pool_aws_provider_census_scope',
+                        lambda *_args: scope)
     monkeypatch.setattr(reconciliation, '_query_aws_paid_provider_census',
                         lambda *_args: [])
     monkeypatch.setattr(reconciliation.request_postgres,
@@ -422,7 +436,7 @@ def test_aws_paid_census_uses_retained_profile_account_and_client_token(
         'aws_account_id': '096766144388',
         'client_token': 'a' * 64,
         'cluster_name_on_cloud': 'svc-3-abc',
-        'credential_profile': 'prod',
+        'credential_profile': None,
         'instance_type': 'g6.2xlarge',
         'num_nodes': 1,
         'region': 'us-east-2',
@@ -433,6 +447,7 @@ def test_aws_paid_census_uses_retained_profile_account_and_client_token(
     calls = []
 
     class _Paginator:
+        """Scripted EC2 paginator."""
 
         def paginate(self, **kwargs):
             calls.append(('paginate', kwargs))
@@ -464,6 +479,7 @@ def test_aws_paid_census_uses_retained_profile_account_and_client_token(
             }]
 
     class _Client:
+        """Scripted STS and EC2 client."""
 
         def __init__(self, service):
             self.service = service
@@ -488,7 +504,8 @@ def test_aws_paid_census_uses_retained_profile_account_and_client_token(
 
     monkeypatch.setattr(reconciliation.aws_adaptor, 'session', _session)
 
-    observed = reconciliation._query_aws_paid_provider_census(identity)
+    observed = reconciliation._query_aws_paid_provider_census(
+        _aws_census_scope(identity))
 
     assert observed == [{
         'availability_zone': identity['zone'],
@@ -501,7 +518,7 @@ def test_aws_paid_census_uses_retained_profile_account_and_client_token(
     }]
     assert calls == [
         ('session', {
-            'profile': identity['credential_profile']
+            'profile': 'prod'
         }),
         ('client', 'sts', {
             'region_name': identity['region']
@@ -518,6 +535,58 @@ def test_aws_paid_census_uses_retained_profile_account_and_client_token(
             }],
         }),
     ]
+
+
+def test_aws_paid_census_rejects_profile_in_wrong_account(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    identity = {
+        'aws_account_id': '096766144388',
+        'region': 'us-east-2',
+    }
+    scope = _aws_census_scope(identity, credential_profile='durable-profile')
+
+    class _Session:
+
+        def client(self, service, **_kwargs):
+            if service != 'sts':
+                pytest.fail('Wrong-account credentials reached EC2.')
+            return mock.Mock(
+                get_caller_identity=lambda: {'Account': '999999999999'})
+
+    def _session(*, profile):
+        assert profile == 'durable-profile'
+        return _Session()
+
+    monkeypatch.setattr(reconciliation.aws_adaptor, 'session', _session)
+
+    with pytest.raises(ValueError, match='another account'):
+        reconciliation._query_aws_paid_provider_census(scope)
+
+
+def test_aws_paid_observation_fails_closed_when_profile_is_unusable(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    identity = {
+        'aws_account_id': '096766144388',
+        'credential_profile': None,
+        'region': 'us-east-2',
+    }
+    scope = _aws_census_scope(identity, credential_profile='durable-profile')
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_aws_provider_census_scope',
+                        lambda *_args: scope)
+    monkeypatch.setattr(
+        reconciliation, '_query_aws_paid_provider_census',
+        mock.Mock(side_effect=RuntimeError('profile unavailable')))
+
+    observed = reconciliation.observe_provider(context, _paid_replica('aws'),
+                                               'authority')
+
+    assert observed.evidence is ordinary_launch_binding.ProviderEvidence.UNKNOWN
+    assert observed.payload['reason'] == 'aws-provider-read-failed'
+    assert observed.payload['error_type'] == 'RuntimeError'
+    assert observed.payload['provider_identity'] == identity
 
 
 def test_aws_client_token_absence_evidence_is_canonical() -> None:
@@ -561,9 +630,10 @@ def test_aws_paid_present_cleanup_terminates_only_exact_instance_ids(
     context = _context(profile_kind)
     identity = {
         'aws_account_id': '096766144388',
-        'credential_profile': 'prod',
+        'credential_profile': None,
         'region': 'us-east-2',
     }
+    scope = _aws_census_scope(identity)
     live = {
         'instance_id': 'i-0123456789abcdef0',
         'state': 'running',
@@ -575,8 +645,8 @@ def test_aws_paid_present_cleanup_terminates_only_exact_instance_ids(
         'bound_non_pool_provider_present_cleanup_is_authorized',
         lambda *_args: True)
     monkeypatch.setattr(reconciliation.request_postgres,
-                        'bound_non_pool_aws_provider_identity',
-                        lambda *_args: identity)
+                        'bound_non_pool_aws_provider_census_scope',
+                        lambda *_args: scope)
     monkeypatch.setattr(
         reconciliation, '_query_aws_paid_provider_census',
         lambda *_args: events.append('census') or next(censuses))
@@ -1177,7 +1247,7 @@ def test_ordinary_paid_reconcile_without_exact_receipt_remains_unknown(
                         'bound_non_pool_terminal_provider_absence_payload',
                         lambda *_args: None)
     monkeypatch.setattr(reconciliation.request_postgres,
-                        'bound_non_pool_aws_provider_identity',
+                        'bound_non_pool_aws_provider_census_scope',
                         lambda *_args: None)
     monkeypatch.setattr(
         reconciliation.request_postgres,
@@ -1193,8 +1263,7 @@ def test_ordinary_paid_reconcile_without_exact_receipt_remains_unknown(
                                         authority, lambda *_args: True)
 
     assert observed.evidence == ordinary_launch_binding.ProviderEvidence.UNKNOWN
-    assert observed.payload[
-        'reason'] == 'missing-immutable-aws-provider-identity'
+    assert observed.payload['reason'] == 'missing-immutable-aws-provider-access'
     assert calls == [
         ('record', ordinary_launch_binding.ProviderEvidence.UNKNOWN,
          observed.payload)

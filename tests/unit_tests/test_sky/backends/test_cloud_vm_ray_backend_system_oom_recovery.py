@@ -6,6 +6,7 @@ import types
 from unittest import mock
 
 import pytest
+import yaml
 
 import sky
 from sky import clouds
@@ -18,6 +19,7 @@ from sky.serve import system_oom_recovery as serve_recovery
 from sky.skylet import job_lib
 from sky.skylet import system_oom_recovery as runtime_recovery
 from sky.utils import message_utils
+from sky.utils import yaml_utils
 
 _IMAGE_DIGEST = 'sha256:' + 'a' * 64
 _PINNED_IMAGE = f'example.invalid/model@{_IMAGE_DIGEST}'
@@ -100,8 +102,11 @@ def _context(*,
         intent,
         service_name=_SERVICE_NAME,
         service_version=4,
+        service_lifecycle_epoch=3,
         controller_pid=123,
-        controller_ip='10.0.0.2')
+        controller_ip='10.0.0.2',
+        controller_incarnation='33333333-3333-4333-8333-333333333333',
+        controller_owner_epoch=5)
     context = serve_recovery.bind_launch_context(context, 'request-1')
     if not include_contract:
         context.pop(
@@ -650,6 +655,46 @@ def test_structured_job_status_round_trips_over_grpc():
     assert detail_statuses == {7: job_lib.JobSystemRecoveryDetailStatus.PRESENT}
 
 
+def test_serve_transport_bypasses_skylet_and_generic_runner_resolution():
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+    handle = mock.MagicMock(is_grpc_enabled_with_flag=True)
+    runner = mock.MagicMock()
+    runner.enable_interactive_auth = False
+    runner.run_driver.return_value = (
+        0,
+        message_utils.encode_payload({
+            'version': 1,
+            'job_statuses': {
+                7: 'RUNNING'
+            },
+            'system_recovery_infos': {},
+            'system_recovery_detail_statuses': {
+                7: job_lib.JobSystemRecoveryDetailStatus.ABSENT.value
+            },
+        }), '')
+    transport = cloud_vm_ray_backend.ServeJobStatusTransport(
+        source_handle=handle, head_runner=runner, command_timeout_seconds=10)
+
+    with mock.patch.object(cloud_vm_ray_backend,
+                           'SkyletClient') as skylet_client, mock.patch.object(
+                               cloud_vm_ray_backend.backend_utils,
+                               'invoke_skylet_with_retries') as invoke, \
+         mock.patch.object(backend, 'run_on_head') as run_on_head:
+        statuses, _, _ = backend.get_job_status_with_system_recovery(
+            handle, [7], stream_logs=False, serve_transport=transport)
+
+    assert statuses == {7: job_lib.JobStatus.RUNNING}
+    handle.get_grpc_channel.assert_not_called()
+    skylet_client.assert_not_called()
+    invoke.assert_not_called()
+    run_on_head.assert_not_called()
+    kwargs = runner.run_driver.call_args.kwargs
+    assert kwargs['process_stream'] is False
+    assert kwargs['connect_timeout'] == 10
+    assert isinstance(kwargs['bounded_capture'],
+                      cloud_vm_ray_backend.log_lib.BoundedSubprocessCapture)
+
+
 def test_old_grpc_response_preserves_status_and_is_malformed():
     backend = cloud_vm_ray_backend.CloudVmRayBackend()
     handle = mock.MagicMock(is_grpc_enabled_with_flag=True)
@@ -803,6 +848,81 @@ def test_structured_job_status_round_trips_over_ssh(legacy_payload):
     assert statuses == {7: job_lib.JobStatus.RUNNING}
     assert infos == expected_infos
     assert detail_statuses == expected_detail_statuses
+
+
+def test_ordinary_job_status_uses_exact_prepared_transport():
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+    handle = mock.MagicMock(is_grpc_enabled_with_flag=True)
+    payload = message_utils.encode_payload({7: 'RUNNING'})
+    runner = mock.MagicMock(enable_interactive_auth=False)
+    runner.run_driver.return_value = (0, payload, '')
+    transport = cloud_vm_ray_backend.ServeJobStatusTransport(
+        source_handle=handle, head_runner=runner, command_timeout_seconds=10)
+
+    statuses = backend.get_job_status(handle, [7],
+                                      stream_logs=False,
+                                      serve_transport=transport)
+
+    assert statuses == {7: job_lib.JobStatus.RUNNING}
+    runner.run_driver.assert_called_once()
+
+
+def test_prepared_status_transport_rejects_a_different_handle():
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+    source_handle = mock.MagicMock(is_grpc_enabled_with_flag=True)
+    other_handle = mock.MagicMock(is_grpc_enabled_with_flag=True)
+    runner = mock.MagicMock(enable_interactive_auth=False)
+    transport = cloud_vm_ray_backend.ServeJobStatusTransport(
+        source_handle=source_handle,
+        head_runner=runner,
+        command_timeout_seconds=10)
+
+    with pytest.raises(ValueError, match='another handle'):
+        backend.get_job_status(other_handle, [7],
+                               stream_logs=False,
+                               serve_transport=transport)
+    runner.run_driver.assert_not_called()
+
+
+def test_status_transport_preparation_isolates_one_malformed_handle(
+        monkeypatch):
+    good = mock.MagicMock()
+    good.cluster_yaml = '/good.yaml'
+    good.docker_user = None
+    good.ssh_user = 'ubuntu'
+    good_runner = mock.MagicMock(enable_interactive_auth=False)
+    good._get_cached_command_runners_with_credentials.return_value = [  # pylint: disable=protected-access
+        good_runner
+    ]
+    bad = mock.MagicMock()
+    bad.cluster_yaml = '/bad.yaml'
+    bad.docker_user = None
+    bad.ssh_user = 'ubuntu'
+
+    valid_yaml = yaml_utils.dump_yaml_str({
+        'auth': {
+            'ssh_user': 'ubuntu',
+            'ssh_private_key': '/key'
+        },
+        'provider': {
+            'module': 'sky.aws'
+        },
+    })
+    read_many = mock.Mock(return_value=[valid_yaml, 'auth: [unterminated'])
+    monkeypatch.setattr(cloud_vm_ray_backend.global_user_state,
+                        'get_cluster_yaml_str_multiple', read_many)
+    preparations = (cloud_vm_ray_backend.CloudVmRayBackend.
+                    build_serve_job_status_transports(
+                        [good, bad], command_timeout_seconds=10))
+
+    assert preparations[0].transport is not None
+    assert preparations[0].error is None
+    assert preparations[1].transport is None
+    assert isinstance(preparations[1].error, yaml.YAMLError)
+    read_many.assert_called_once_with(['/good.yaml', '/bad.yaml'])
+    good._get_cached_command_runners_with_credentials.assert_called_once()  # pylint: disable=protected-access
+    assert good._get_cached_command_runners_with_credentials.call_args.kwargs[  # pylint: disable=protected-access
+        'avoid_ssh_control'] is True
 
 
 def test_structured_grpc_failure_falls_back_to_status_only_ssh():
