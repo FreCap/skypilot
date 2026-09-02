@@ -4104,6 +4104,202 @@ def _cancelled_aws_absence_payload(
     }
 
 
+def test_shutdown_race_late_aws_paid_effect_reaches_exact_zero(
+        bound_request_database, monkeypatch) -> None:
+    """A provider success after down remains owned until exact absence."""
+    engine, backend = bound_request_database
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch,
+        production_http_normalization=True,
+        effect_phase=ordinary_launch_binding.EffectPhase.NOT_STARTED,
+        canonical_paid_claim_priority=50,
+        terminalize=False)
+    queue = request_postgres.PostgresQueueBackend(
+        requests.ScheduleType.LONG.value,
+        supported_handler_names=frozenset(
+            {non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME}))
+    candidate = queue.peek_provider_mutation()
+    assert candidate is not None
+    item = queue.claim_provider_mutation(candidate)
+    assert item is not None
+    assert backend.try_mark_running(item.request_id, 1234,
+                                    item.execution_generation, item.claim_token,
+                                    424242)
+    claimed_request = backend.get_request(graph.context.request_id)
+    assert claimed_request is not None
+    launch_context = claimed_request.request_body.extra_launch_context
+    assert ordinary_launch_binding.parse_bound_non_pool_launch_context(
+        launch_context) == graph.context
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+
+    # The shared provider guard has crossed PROVIDER_IO, but down can still
+    # publish SHUTTING_DOWN so cancellation reaches the blocked handler. Model
+    # the provider returning a newly-created VM after that durable revocation.
+    with ordinary_launch_binding.non_pool_provider_effect_guard(
+            launch_context,
+            claim,
+            claim_validator=(
+                request_postgres.
+                validate_bound_non_pool_launch_claim_in_transaction)):
+        allocation_identity = {
+            'aws_account_id': '123456789012',
+            'cluster_name_on_cloud': _gc_cloud_cluster_name(),
+            'instance_type': 'g6.xlarge',
+            'num_nodes': 1,
+            'region': 'us-east-1',
+            'use_spot': True,
+            'workspace': 'workspace-a',
+            'zone': 'us-east-1a',
+        }
+        allocation = _gc_paid_provider_allocation_receipt(
+            graph, 'aws', allocation_identity)
+        teardown = ordinary_launch_binding.begin_service_teardown_if_owner(
+            'gc-service', 'gc-service-hash', (123, '10.0.0.2'))
+        assert teardown.authority is not None
+        with pytest.raises(
+                ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                match='no longer authorizes provider effects'):
+            ordinary_launch_binding.record_paid_provider_allocation(
+                launch_context,
+                allocation,
+                request_validator=lambda *_args: True)
+        cancelled = request_postgres.request_bound_ordinary_launch_cancel(
+            graph.context, teardown.authority, 'service-teardown')
+        assert cancelled.status is requests.RequestStatus.CANCELLED
+        assert not cancelled.quiescent
+        waiting = request_postgres.reduce_bound_ordinary_launch(
+            graph.context,
+            teardown.authority,
+            project_replica_result=_keep_replica_projection)
+        assert waiting.disposition is (
+            request_postgres.OrdinaryLaunchReductionDisposition.WAIT_QUIESCENCE)
+
+        with engine.connect() as connection:
+            replica_pointer = connection.execute(
+                sqlalchemy.select(
+                    serve_state_schema.replicas_table.c.
+                    ordinary_launch_association_id).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        'gc-service',
+                        serve_state_schema.replicas_table.c.replica_id ==
+                        3)).scalar_one()
+            claim_count = connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    serve_state_schema.paid_capacity_claims_table).where(
+                        serve_state_schema.paid_capacity_claims_table.c.
+                        service_name == 'gc-service')).scalar_one()
+            pin_count = connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    request_postgres.REQUEST_RETENTION_PINS).where(
+                        request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                        graph.context.request_id)).scalar_one()
+        assert replica_pointer == graph.context.association_id
+        assert claim_count == pin_count == 1
+
+    assert backend.converge_execution_completion(claim)
+    # Advance the durable AWS empty-census horizon without a wall-clock sleep.
+    # This is the same retained receipt; only test time has elapsed.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                graph.context.request_id).values(execution_quiesced_at=(
+                    sqlalchemy.func.clock_timestamp() - datetime.timedelta(
+                        seconds=ordinary_launch_binding.
+                        ORDINARY_PAID_AWS_ABSENCE_SETTLE_SECONDS + 1))))
+    ambiguous = request_postgres.reduce_bound_ordinary_launch(
+        graph.context,
+        teardown.authority,
+        project_replica_result=_keep_replica_projection)
+    assert ambiguous.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.AMBIGUOUS)
+    assert ambiguous.request.quiescent
+
+    provider_identity = request_postgres.bound_non_pool_aws_provider_identity(
+        graph.context, teardown.authority)
+    assert provider_identity is not None
+    base_payload = _cancelled_aws_absence_payload(graph)
+    present_payload = {
+        **base_payload,
+        'instances': [{
+            'availability_zone': provider_identity['zone'],
+            'client_token': provider_identity['client_token'],
+            'cluster_name_on_cloud': provider_identity['cluster_name_on_cloud'],
+            'instance_id': 'i-0123456789abcdef0',
+            'instance_type': provider_identity['instance_type'],
+            'market': 'spot',
+            'state': 'running',
+        }],
+        'result': 'PRESENT',
+    }
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, teardown.authority,
+        ordinary_launch_binding.ProviderEvidence.PRESENT, present_payload)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    manager._ordinary_launch_binding_authority = teardown.authority
+    assert request_postgres.authorize_bound_non_pool_provider_present_cleanup(
+        graph.context,
+        teardown.authority,
+        project_replica_result=lambda connection, projection: manager.
+        _project_bound_ordinary_launch(None, connection, projection))
+
+    claims = serve_state_schema.paid_capacity_claims_table
+    replicas = serve_state_schema.replicas_table
+    with engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id ==
+                  graph.context.association_id)).mappings().one()
+        claim_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(claims).where(
+                    claims.c.service_name == 'gc-service')).scalar_one()
+    assert association['resolution'] == 'AMBIGUOUS'
+    assert association['provider_evidence'] == 'PRESENT'
+    assert claim_count == 1
+    retained = serve_state.get_replica_info_from_id('gc-service', 3)
+    assert retained is not None
+    assert ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+        retained, require_scheduled=True)
+
+    # The same immutable observation seam later reports exact provider
+    # absence. Projection atomically releases the request pin and paid debit;
+    # restart-safe finalization consumes the replica and then the service.
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, teardown.authority,
+        ordinary_launch_binding.ProviderEvidence.ABSENT, base_payload)
+    assert request_postgres.project_bound_non_pool_provider_absence(
+        graph.context,
+        teardown.authority,
+        project_replica_result=lambda connection, projection: manager.
+        _project_bound_ordinary_launch(None, connection, projection))
+    assert manager._finalize_projected_provider_absence_cleanup(3)
+    assert serve_state.remove_service_completely('gc-service',
+                                                 'gc-service-hash',
+                                                 expected_lifecycle_epoch=4)
+
+    scoped_tables = (serve_state_schema.services_table, replicas, claims,
+                     serve_state_schema.paid_capacity_waiters_table,
+                     request_postgres.QUEUE,
+                     request_postgres.REQUEST_RETENTION_PINS)
+    with engine.connect() as connection:
+        for table in scoped_tables:
+            predicate = (
+                table.c.name == 'gc-service'
+                if table is serve_state_schema.services_table else
+                table.c.service_name == 'gc-service' if 'service_name'
+                in table.c else table.c.request_id == graph.context.request_id)
+            assert connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    table).where(predicate)).scalar_one() == 0, table.name
+
+
 def test_cancelled_aws_paid_absence_retires_atomically(bound_request_database,
                                                        monkeypatch) -> None:
     """Exact post-quiescence AWS absence releases every retained debit."""
