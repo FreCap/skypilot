@@ -103,6 +103,9 @@ def test_recovery_requeues_only_exact_terminal_done_cluster_owners(monkeypatch):
         'pool-task-10': '10',
         'never-launched-11': '11',
         'malformed': 'not-a-job-id',
+        # A legacy row whose numeric suffix collides with another job id
+        # (production shape: a pre-attribution serve replica 'cf-repro-1').
+        'cf-repro-12': None,
     }
     monkeypatch.setattr(utils.global_user_state,
                         'get_managed_job_cluster_cleanup_candidates',
@@ -162,6 +165,14 @@ def test_recovery_requeues_only_exact_terminal_done_cluster_owners(monkeypatch):
                 _task('never-launched',
                       managed_job_state.ManagedJobStatus.CANCELLED,
                       launched=False)
+            ],
+        },
+        12: {
+            'schedule_state': managed_job_state.ManagedJobScheduleState.DONE,
+            'pool': None,
+            'tasks': [
+                _task('mmp-chembl-100',
+                      managed_job_state.ManagedJobStatus.CANCELLED)
             ],
         },
     }
