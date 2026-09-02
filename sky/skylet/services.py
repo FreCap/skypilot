@@ -734,58 +734,12 @@ class ManagedJobsServiceImpl(managed_jobsv1_pb2_grpc.ManagedJobsServiceServicer
             context: grpc.ServicerContext
     ) -> managed_jobsv1_pb2.CancelJobsResponse:
         try:
-            message = None
-            cancellation_criteria = request.WhichOneof('cancellation_criteria')
-            if cancellation_criteria is None:
-                context.abort(
-                    grpc.StatusCode.INVALID_ARGUMENT,
-                    'exactly one cancellation criteria must be specified.')
-
-            graceful = (request.graceful
-                        if request.HasField('graceful') else False)
-            graceful_timeout = (request.graceful_timeout if
-                                request.HasField('graceful_timeout') else None)
-
-            if cancellation_criteria == 'all_users':
-                user_hash = request.user_hash if request.HasField(
-                    'user_hash') else None
-                all_users = request.all_users
-                if not all_users and user_hash is None:
-                    context.abort(
-                        grpc.StatusCode.INVALID_ARGUMENT,
-                        'user_hash is required when all_users is False')
-                message = managed_job_utils.cancel_jobs_by_id(
-                    job_ids=None,
-                    all_users=all_users,
-                    current_workspace=request.current_workspace,
-                    user_hash=user_hash,
-                    graceful=graceful,
-                    graceful_timeout=graceful_timeout)
-            elif cancellation_criteria == 'job_ids':
-                job_ids = list(request.job_ids.ids)
-                message = managed_job_utils.cancel_jobs_by_id(
-                    job_ids=job_ids,
-                    current_workspace=request.current_workspace,
-                    graceful=graceful,
-                    graceful_timeout=graceful_timeout)
-            elif cancellation_criteria == 'job_name':
-                message = managed_job_utils.cancel_job_by_name(
-                    job_name=request.job_name,
-                    current_workspace=request.current_workspace,
-                    graceful=graceful,
-                    graceful_timeout=graceful_timeout)
-            elif cancellation_criteria == 'pool_name':
-                message = managed_job_utils.cancel_jobs_by_pool(
-                    pool_name=request.pool_name,
-                    current_workspace=request.current_workspace)
-            else:
-                context.abort(
-                    grpc.StatusCode.INVALID_ARGUMENT,
-                    f'invalid cancellation criteria: {cancellation_criteria}')
-            if message is None:
-                context.abort(grpc.StatusCode.INTERNAL,
-                              'Job cancellation produced no result.')
+            # Single cancel dispatch, shared with the in-process consolidation
+            # path on the API server (sky.jobs.server.cancellation).
+            message = managed_job_utils.cancel_jobs_from_request(request)
             return managed_jobsv1_pb2.CancelJobsResponse(message=message)
+        except managed_job_utils.ManagedJobCancelCriteriaError as e:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:  # pylint: disable=broad-except
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 

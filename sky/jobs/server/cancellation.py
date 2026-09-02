@@ -7,6 +7,7 @@ from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
+from sky.jobs import utils as managed_job_utils
 from sky.usage import usage_lib
 from sky.utils import common_utils
 from sky.utils import controller_utils
@@ -101,8 +102,6 @@ def cancel(name: str | None = None,
 
         job_ids = None if (all_users or all) else job_ids
 
-        if not handle.is_grpc_enabled_with_flag:
-            raise exceptions.NotSupportedError(_CANCEL_TRANSPORT_UPGRADE_HINT)
         request = _build_cancel_request(
             current_workspace=skypilot_config.get_active_workspace(),
             all_users=all_users,
@@ -112,14 +111,25 @@ def cancel(name: str | None = None,
             pool=pool,
             graceful=graceful,
             graceful_timeout=graceful_timeout)
-        try:
-            response = backend_utils.invoke_skylet_with_retries(
-                lambda: cloud_vm_ray_backend.SkyletClient(
-                    handle.get_grpc_channel()).cancel_managed_jobs(request))
-        except exceptions.SkyletMethodNotImplementedError as e:
-            raise exceptions.NotSupportedError(
-                _CANCEL_TRANSPORT_UPGRADE_HINT) from e
-        stdout = response.message
+        if isinstance(handle, cloud_vm_ray_backend.LocalResourcesHandle):
+            # Consolidation mode: the jobs controller runs inside this API
+            # server deployment and no skylet gRPC server exists (the local
+            # handle never enables gRPC), so run the servicer's single
+            # dispatch in-process instead of refusing the request.
+            stdout: str | None = managed_job_utils.cancel_jobs_from_request(
+                request)
+        else:
+            if not handle.is_grpc_enabled_with_flag:
+                raise exceptions.NotSupportedError(
+                    _CANCEL_TRANSPORT_UPGRADE_HINT)
+            try:
+                response = backend_utils.invoke_skylet_with_retries(
+                    lambda: cloud_vm_ray_backend.SkyletClient(
+                        handle.get_grpc_channel()).cancel_managed_jobs(request))
+            except exceptions.SkyletMethodNotImplementedError as e:
+                raise exceptions.NotSupportedError(
+                    _CANCEL_TRANSPORT_UPGRADE_HINT) from e
+            stdout = response.message
 
         if stdout is None:
             raise RuntimeError('Managed job cancellation produced no output.')
