@@ -6,8 +6,13 @@ last entries (== the current probe time), so the list was pure growth:
 a replica flapping for hours accumulated hundreds of timestamps, all
 pickled into the replica row on every probe round. The window is now a
 single first-failure timestamp with identical teardown semantics.
+
+The reducer plans a desired row per probe result, commits the window
+through ``SkyPilotReplicaManager._commit_probe_row_plans`` and publishes
+the accepted rows; these tests accept every plan at that seam.
 """
 # pylint: disable=protected-access
+import copy
 import pickle
 import threading
 import unittest
@@ -59,65 +64,135 @@ def _make_manager(failure_threshold):
             for info in infos
         })
     manager._system_recovery_route_registry = mock.Mock()
+    manager._teardown_wakeup = threading.Event()
+    manager._launch_completion_state = mock.Mock(
+        return_value=(mock.Mock(), manager._teardown_wakeup))
+    # The committed rows are what the next probe round reads back from the
+    # database, so the commit seam writes into the same in-memory table the
+    # patched readers serve from.
+    manager._rows = {}
+
+    def _accept(plans):
+        accepted = {
+            plan.opening_info.replica_id: copy.deepcopy(plan.desired_info)
+            for plan in plans
+        }
+        manager._rows.update(accepted)
+        return accepted, set()
+
+    manager._commit_probe_row_plans = mock.Mock(side_effect=_accept)
     return manager
 
 
+def _probe_round(manager, info):
+    """Run one probe round with ``info`` as the only durable row."""
+    manager._rows[info.replica_id] = info
+    with mock.patch.object(serve_state, 'get_replica_infos',
+                           side_effect=lambda _name: list(
+                               manager._rows.values())), \
+         mock.patch.object(serve_state, 'get_specs',
+                           return_value={1: mock.Mock()}), \
+         mock.patch.object(serve_state, 'get_replica_infos_from_ids',
+                           side_effect=lambda _name, ids: {
+                               replica_id: manager._rows[replica_id]
+                               for replica_id in ids
+                           }), \
+         mock.patch.object(serve_state, 'set_service_uptime'):
+        (published,) = manager._probe_all_replicas()
+    (durable,) = manager._rows.values()
+    assert published is durable
+    return durable
+
+
 class TestConsecutiveFailureWindow(unittest.TestCase):
-    """Window start / reset / teardown semantics across probe rounds."""
+    """Window start / reset / teardown semantics across probe rounds.
+
+    Since the plan/commit/publish probe reducer, a round never mutates the
+    opening row: it plans a desired row, commits it through
+    ``_commit_probe_row_plans`` and publishes the accepted row. Each round
+    below therefore feeds the previously accepted row back in, exactly like
+    the next probe round reads it from the database.
+    """
 
     def _run_round(self, manager, info, probe_succeeded, probe_time):
         info.probe = mock.Mock(return_value=(info, probe_succeeded, probe_time))
-        with mock.patch.object(serve_state, 'get_replica_infos',
-                               return_value=[info]), \
-             mock.patch.object(serve_state, 'get_specs',
-                               return_value={1: mock.Mock()}), \
-             mock.patch.object(serve_state, 'add_or_update_replicas'), \
-             mock.patch.object(serve_state, 'get_replica_infos_from_ids',
-                               return_value={info.replica_id: info}), \
-             mock.patch.object(serve_state, 'set_service_uptime'):
-            manager._probe_all_replicas()
+        accepted = _probe_round(manager, info)
+        self.assertIsNot(accepted, info)
+        return accepted
 
     def test_window_opens_on_first_failure_and_keeps_start(self):
         manager = _make_manager(failure_threshold=60)
-        info = _replica_info(1)
-        self._run_round(manager, info, False, probe_time=100.0)
+        info = self._run_round(manager,
+                               _replica_info(1),
+                               False,
+                               probe_time=100.0)
         self.assertEqual(info.first_consecutive_failure_time, 100.0)
-        self._run_round(manager, info, False, probe_time=130.0)
+        info = self._run_round(manager, info, False, probe_time=130.0)
         # Window start is preserved, not moved to the latest failure.
         self.assertEqual(info.first_consecutive_failure_time, 100.0)
         manager._terminate_replica.assert_not_called()
+        self.assertFalse(manager._teardown_wakeup.is_set())
 
     def test_teardown_fires_when_window_reaches_threshold(self):
         manager = _make_manager(failure_threshold=60)
-        info = _replica_info(1)
-        self._run_round(manager, info, False, probe_time=100.0)
-        self._run_round(manager, info, False, probe_time=159.9)
-        manager._terminate_replica.assert_not_called()
-        self._run_round(manager, info, False, probe_time=160.0)
+        info = self._run_round(manager,
+                               _replica_info(1),
+                               False,
+                               probe_time=100.0)
+        info = self._run_round(manager, info, False, probe_time=159.9)
+        self.assertIsNone(info.status_property.sky_down_status)
+        self.assertFalse(manager._teardown_wakeup.is_set())
+        info = self._run_round(manager, info, False, probe_time=160.0)
+        # Teardown is a durable intent on the committed row plus a cleanup
+        # wakeup; provider cleanup never starts under the fleet mutex.
         manager._terminate_replica.assert_not_called()
         self.assertEqual(info.status_property.sky_down_status,
                          common_utils.ProcessStatus.SCHEDULED)
+        self.assertFalse(info.status_property.service_ready_now)
+        self.assertTrue(manager._teardown_wakeup.is_set())
 
     def test_successful_probe_resets_window(self):
         manager = _make_manager(failure_threshold=60)
-        info = _replica_info(1)
-        self._run_round(manager, info, False, probe_time=100.0)
-        self._run_round(manager, info, True, probe_time=110.0)
+        info = self._run_round(manager,
+                               _replica_info(1),
+                               False,
+                               probe_time=100.0)
+        info = self._run_round(manager, info, True, probe_time=110.0)
         self.assertIsNone(info.first_consecutive_failure_time)
         # A new failure run starts a fresh window: old failures at 100.0
         # must not count toward the threshold.
-        self._run_round(manager, info, False, probe_time=120.0)
+        info = self._run_round(manager, info, False, probe_time=120.0)
         self.assertEqual(info.first_consecutive_failure_time, 120.0)
-        self._run_round(manager, info, False, probe_time=170.0)
+        info = self._run_round(manager, info, False, probe_time=170.0)
+        self.assertIsNone(info.status_property.sky_down_status)
         manager._terminate_replica.assert_not_called()
+        self.assertFalse(manager._teardown_wakeup.is_set())
 
     def test_window_not_opened_before_first_ready(self):
         manager = _make_manager(failure_threshold=60)
         info = _replica_info(1)
         info.status_property.first_ready_time = None
-        self._run_round(manager, info, False, probe_time=100.0)
+        info = self._run_round(manager, info, False, probe_time=100.0)
         self.assertIsNone(info.first_consecutive_failure_time)
         self.assertEqual(info.first_not_ready_time, 100.0)
+
+    def test_rows_never_change_when_the_commit_seam_has_no_owner_fence(self):
+        # A manager without its exact owner fence must not publish evidence.
+        # This is the silent path the production commit seam takes; the
+        # published snapshot is then the unchanged opening row.
+        manager = _make_manager(failure_threshold=60)
+        manager._commit_probe_row_plans = (
+            replica_managers.SkyPilotReplicaManager._commit_probe_row_plans.
+            __get__(manager))
+        self.assertIsNone(manager._system_recovery_mutation_fence())
+        info = _replica_info(1)
+        info.probe = mock.Mock(return_value=(info, False, 100.0))
+        with mock.patch.object(serve_state,
+                               'commit_replica_observations_batch') as commit:
+            published = _probe_round(manager, info)
+        commit.assert_not_called()
+        self.assertIs(published, info)
+        self.assertIsNone(info.first_consecutive_failure_time)
 
 
 class TestFailureBookkeepingIsConstantSize(unittest.TestCase):
@@ -136,25 +211,16 @@ class TestFailureBookkeepingIsConstantSize(unittest.TestCase):
             common_utils.ProcessStatus.SUCCEEDED)
         info.status_property.first_ready_time = 1.0
 
-        def size_after_failed_rounds(num_rounds):
+        def size_after_failed_rounds(info, num_rounds):
             for i in range(num_rounds):
                 probe = mock.Mock(return_value=(info, False, 100.0 + i))
-                with mock.patch.object(serve_state, 'get_replica_infos',
-                                       return_value=[info]), \
-                     mock.patch.object(serve_state, 'get_specs',
-                                       return_value={1: mock.Mock()}), \
-                     mock.patch.object(serve_state,
-                                       'add_or_update_replicas'), \
-                     mock.patch.object(serve_state,
-                                       'get_replica_infos_from_ids',
-                                       return_value={1: info}), \
-                     mock.patch.object(replica_managers.ReplicaInfo, 'probe',
+                with mock.patch.object(replica_managers.ReplicaInfo, 'probe',
                                        probe):
-                    manager._probe_all_replicas()
-            return len(pickle.dumps(info))
+                    info = _probe_round(manager, info)
+            return info, len(pickle.dumps(info))
 
-        size_after_2 = size_after_failed_rounds(2)
-        size_after_100 = size_after_failed_rounds(98)
+        info, size_after_2 = size_after_failed_rounds(info, 2)
+        info, size_after_100 = size_after_failed_rounds(info, 98)
         self.assertEqual(size_after_2, size_after_100)
         self.assertEqual(info.first_consecutive_failure_time, 100.0)
 

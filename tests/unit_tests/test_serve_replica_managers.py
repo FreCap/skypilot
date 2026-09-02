@@ -5596,6 +5596,13 @@ def test_ordinary_kubernetes_endpoint_owns_detached_job_liveness(
     mgr._terminate_replica = mock.Mock()
     mgr._handle_job_status_results = mock.Mock()
 
+    mgr._launch_completion_state = mock.Mock(
+        return_value=(mock.Mock(), mgr._launch_completion_event))
+    mgr._commit_probe_row_plans = mock.Mock(side_effect=lambda plans: ({
+        plan.opening_info.replica_id: copy.deepcopy(plan.desired_info)
+        for plan in plans
+    }, set()))
+
     # Model an already-exited detached job. If exact status were consulted it
     # would be terminal, but ordinary Kubernetes liveness must not consult it.
     backend = replica_managers.backends.CloudVmRayBackend()
@@ -6694,6 +6701,16 @@ class TestProbeRouteSuspensionTransaction:
     _ROUTE_URL = 'http://10.0.0.1:8080'
     _SERVICE_HASH = 'incarnation-a'
     _CONTROLLER_OWNER = (123, '10.0.0.10')
+    _OWNER_FENCE = (
+        replica_managers.system_recovery_persistence.ReplicaObserverOwnerFence(
+            service_name='svc',
+            service_hash=_SERVICE_HASH,
+            service_lifecycle_epoch=1,
+            controller_pid=_CONTROLLER_OWNER[0],
+            controller_ip=_CONTROLLER_OWNER[1],
+            controller_incarnation=uuid.UUID(
+                '33333333-3333-4333-8333-333333333333'),
+            controller_owner_epoch=1))
 
     @staticmethod
     def _recovered_info(replica_id):
@@ -6714,22 +6731,35 @@ class TestProbeRouteSuspensionTransaction:
             retry_submitted_adopted_at=25.0,
             completed_at=30.0)
         info.service_job_id = 9
+        # The probe reducer deep-copies its opening row; the v13 contract
+        # quarantines a recovery bundle without its launch identity.
+        info.launch_request_id = f'launch-request-{replica_id}'
+        info.system_recovery_launch_intent = (
+            recovery_state.SystemRecoveryLaunchIntent(
+                version=1,
+                controller_contract_version=2,
+                recovery_authorization_version=3,
+                recovery_authorization_profile_id='profile-v3',
+                recovery_authorization_sha256='a' * 64,
+                runtime_profile_version=2,
+                expected_runtime_capability=(
+                    recovery_state.SYSTEM_RECOVERY_CAPABILITY),
+                service_hash='service-hash',
+                replica_id=replica_id,
+                launch_generation=1,
+                launch_nonce='b' * 64,
+                workspace='default',
+                resource_envelope_sha256='c' * 64,
+                task_sha256='d' * 64,
+                runtime_image_digest=f'sha256:{"e" * 64}',
+                owned_container_spec_sha256='f' * 64,
+                execution_envelope_sha256='1' * 64))
         info.status_property.sky_launch_status = (
             common_utils.ProcessStatus.SUCCEEDED)
         info.status_property.first_ready_time = 1.0
         info.status_property.service_ready_now = True
         info.probe = mock.Mock(return_value=(info, False, 100.0))
         return info
-
-    @staticmethod
-    def _off_route_reduction(info):
-        return recovery_state.RecoveryReduction(
-            state=info.system_recovery,
-            changed=False,
-            force_off_route=True,
-            clear_probe_failure_window=False,
-            mark_ready=False,
-            schedule_legacy_teardown=False)
 
     def _manager(self, infos):
         manager = _make_manager()
@@ -6754,10 +6784,10 @@ class TestProbeRouteSuspensionTransaction:
         manager._is_interruptible_replica = mock.Mock(return_value=False)
         manager._consecutive_failure_threshold_timeout = mock.Mock(
             return_value=1000)
-        manager._changed_only_readiness_persistence = False
-        manager._reduce_capable_probe = mock.Mock(
-            side_effect=lambda info, **_kwargs:
-            (info, self._off_route_reduction(info), False))
+        manager._replica_observer_owner_fence = self._OWNER_FENCE
+        assert manager._system_recovery_mutation_fence() is self._OWNER_FENCE
+        manager._launch_completion_state = mock.Mock(
+            return_value=(mock.Mock(), threading.Event()))
         return manager
 
     def _owner_record(self):
@@ -6796,15 +6826,24 @@ class TestProbeRouteSuspensionTransaction:
         assert registry.heartbeat_payload()['entries']
         return registry, generation
 
-    def _run_probe(self, manager, infos, persist, readback_infos=None):
+    @staticmethod
+    def _accept_all(infos, writes):
+        """Apply every observation write to its exact current row."""
+        current = {info.replica_id: info for info in infos}
+        updated = []
+        for write in writes:
+            row = copy.deepcopy(current[write.replica_id])
+            row = write.desired_observation_state.apply_to(row)
+            row = write.desired_recovery.apply_to(row)
+            updated.append(row)
+        return replica_managers.serve_state.ReplicaObservationBatchResult(
+            updated_infos=tuple(updated),
+            unchanged_infos=(),
+            stale_replica_ids=())
+
+    def _run_probe(self, manager, infos, commit):
+        """Run one probe round with ``commit`` at the batch commit seam."""
         current_infos = {info.replica_id: info for info in infos}
-        if readback_infos is None:
-            readbacks = current_infos
-        else:
-            # The first exact-row read fences the probe reduction. A second
-            # read is only made after an ambiguous persistence exception and
-            # must model the independently supplied durable outcome.
-            readbacks = mock.Mock(side_effect=[current_infos, readback_infos])
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=infos), \
@@ -6819,75 +6858,114 @@ class TestProbeRouteSuspensionTransaction:
                                return_value=self._owner_record()), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos_from_ids',
-                               return_value=readbacks,
-                               side_effect=(readbacks.side_effect if
-                                            isinstance(readbacks, mock.Mock)
-                                            else None)), \
+                               return_value=current_infos), \
              mock.patch.object(replica_managers.serve_state,
-                               'add_or_update_replicas',
-                               side_effect=persist):
+                               'commit_replica_observations_batch',
+                               side_effect=commit):
             return manager._probe_all_replicas()
 
-    def test_exception_before_batch_commit_restores_exact_route(self):
+    def test_owner_fence_rejection_defers_rows_and_keeps_exact_route(self):
         info = self._recovered_info(1)
-        durable = self._durable_copy(info)
         manager = self._manager([info])
         registry, generation = self._activate_route(manager, info)
         marker_before = registry.marker(1, generation, self._ROUTE_URL)
         assert marker_before is not None
 
-        def _persist(_service_name, updates, **_kwargs):
-            assert [replica_id for replica_id, _ in updates] == [1]
-            assert updates[0][1].replica_record_id == info.replica_record_id
-            assert registry.marker(1, generation, self._ROUTE_URL) is None
-            assert registry.heartbeat_payload()['entries'] == []
-            assert registry.probe_targets() == []
-            raise RuntimeError('database unavailable')
+        def _reject(_service_name, writes, *, owner_fence):
+            assert owner_fence is self._OWNER_FENCE
+            assert [write.replica_id for write in writes] == [1]
+            assert writes[0].replica_record_id == info.replica_record_id
+            assert not writes[0].desired_observation_state.service_ready_now
+            # The token stays live while the durable write is in flight.
+            assert registry.marker(1, generation,
+                                   self._ROUTE_URL) == marker_before
+            raise replica_managers.serve_state.ReplicaSystemRecoveryMutationRejected(
+                'owner changed')
 
         with mock.patch.object(registry,
                                'suspend_record',
-                               wraps=registry.suspend_record) as suspend, \
-             pytest.raises(RuntimeError):
-            self._run_probe(manager, [info], _persist, {1: durable})
+                               wraps=registry.suspend_record) as suspend:
+            (published,) = self._run_probe(manager, [info], _reject)
 
-        suspend.assert_called_once_with(1, info.replica_record_id)
+        # A rejected owner fence publishes no evidence and touches no route.
+        assert published is info
+        assert published.status_property.service_ready_now is True
+        suspend.assert_not_called()
         assert registry.marker(1, generation, self._ROUTE_URL) == marker_before
         assert len(registry.heartbeat_payload()['entries']) == 1
         assert len(registry.probe_targets()) == 1
         assert not registry.is_retired(1, generation)
 
-    def test_false_batch_result_permanently_retires_route(self):
+    def test_accepted_off_route_row_retires_route_after_commit(self):
         info = self._recovered_info(1)
         manager = self._manager([info])
         registry, generation = self._activate_route(manager, info)
+        marker_before = registry.marker(1, generation, self._ROUTE_URL)
+        assert marker_before is not None
 
-        def _persist(_service_name, _updates, **_kwargs):
-            assert registry.marker(1, generation, self._ROUTE_URL) is None
-            return False
+        def _commit(_service_name, writes, *, owner_fence):
+            assert owner_fence is self._OWNER_FENCE
+            # Suspension is a postcommit effect of the accepted window.
+            assert registry.marker(1, generation,
+                                   self._ROUTE_URL) == marker_before
+            return self._accept_all([info], writes)
 
-        with pytest.raises(RuntimeError, match='ownership changed'):
-            self._run_probe(manager, [info], _persist,
-                            {1: self._durable_copy(info)})
+        with mock.patch.object(registry,
+                               'suspend_record',
+                               wraps=registry.suspend_record) as suspend:
+            self._run_probe(manager, [info], _commit)
 
+        suspend.assert_called_once_with(1, info.replica_record_id)
         assert registry.marker(1, generation, self._ROUTE_URL) is None
+        assert registry.heartbeat_payload()['entries'] == []
+        assert registry.probe_targets() == []
         assert registry.is_retired(1, generation)
 
-    def test_commit_then_raise_batch_permanently_retires_route(self):
+    def test_stale_row_is_deferred_without_touching_the_route(self):
         info = self._recovered_info(1)
         manager = self._manager([info])
         registry, generation = self._activate_route(manager, info)
+        marker_before = registry.marker(1, generation, self._ROUTE_URL)
 
-        def _persist(_service_name, _updates, **_kwargs):
-            assert registry.marker(1, generation, self._ROUTE_URL) is None
+        def _stale(_service_name, writes, *, owner_fence):
+            del owner_fence
+            return replica_managers.serve_state.ReplicaObservationBatchResult(
+                updated_infos=(),
+                unchanged_infos=(),
+                stale_replica_ids=tuple(write.replica_id for write in writes))
+
+        with mock.patch.object(registry,
+                               'suspend_record',
+                               wraps=registry.suspend_record) as suspend:
+            (published,) = self._run_probe(manager, [info], _stale)
+
+        assert published is info
+        suspend.assert_not_called()
+        assert registry.marker(1, generation, self._ROUTE_URL) == marker_before
+        assert not registry.is_retired(1, generation)
+
+    def test_batch_exception_propagates_and_leaves_route_untouched(self):
+        # An exception from the batch commit aborts the round; the prober
+        # logs it and the next round re-reduces from the durable row. The
+        # local route state must not be changed by the aborted round.
+        info = self._recovered_info(1)
+        manager = self._manager([info])
+        registry, generation = self._activate_route(manager, info)
+        marker_before = registry.marker(1, generation, self._ROUTE_URL)
+
+        def _raise(_service_name, _writes, *, owner_fence):
+            del owner_fence
             raise RuntimeError('connection lost after commit')
 
-        with pytest.raises(RuntimeError, match='connection lost after commit'):
-            # The probe mutates this object before the DB call, modeling the
-            # committed row returned by the ambiguity readback.
-            self._run_probe(manager, [info], _persist, {1: info})
+        with mock.patch.object(registry,
+                               'suspend_record',
+                               wraps=registry.suspend_record) as suspend, \
+             pytest.raises(RuntimeError, match='connection lost after commit'):
+            self._run_probe(manager, [info], _raise)
 
-        assert registry.marker(1, generation, self._ROUTE_URL) is None
-        assert registry.is_retired(1, generation)
+        suspend.assert_not_called()
+        assert registry.marker(1, generation, self._ROUTE_URL) == marker_before
+        assert not registry.is_retired(1, generation)
 
     def test_exception_before_single_commit_restores_proven_route(self):
         durable = self._recovered_info(1)
@@ -7088,56 +7166,6 @@ class TestProbeRouteSuspensionTransaction:
             manager._remove_replicas([durable])
 
         assert registry.marker(1, generation, self._ROUTE_URL) == marker_before
-        assert not registry.is_retired(1, generation)
-
-    def test_successful_batch_permanently_retires_route(self):
-        info = self._recovered_info(1)
-        manager = self._manager([info])
-        registry, generation = self._activate_route(manager, info)
-
-        def _persist(_service_name, updates, **_kwargs):
-            assert [replica_id for replica_id, _ in updates] == [1]
-            assert updates[0][1].replica_record_id == info.replica_record_id
-            assert registry.marker(1, generation, self._ROUTE_URL) is None
-            assert registry.heartbeat_payload()['entries'] == []
-            assert registry.probe_targets() == []
-            return True
-
-        with mock.patch.object(registry,
-                               'suspend_record',
-                               wraps=registry.suspend_record) as suspend:
-            self._run_probe(manager, [info], _persist)
-
-        suspend.assert_called_once_with(1, info.replica_record_id)
-        assert registry.marker(1, generation, self._ROUTE_URL) is None
-        assert registry.heartbeat_payload()['entries'] == []
-        assert registry.probe_targets() == []
-        assert registry.is_retired(1, generation)
-
-    def test_exception_before_batch_restores_prior_suspension(self):
-        first = self._recovered_info(1)
-        second = self._recovered_info(2)
-        manager = self._manager([first, second])
-        registry, generation = self._activate_route(manager, first)
-        marker_before = registry.marker(1, generation, self._ROUTE_URL)
-        assert marker_before is not None
-        manager._reduce_capable_probe.side_effect = [
-            (first, self._off_route_reduction(first), False),
-            RuntimeError('second reduction failed'),
-        ]
-        persist = mock.Mock(return_value=True)
-
-        with mock.patch.object(registry,
-                               'suspend_record',
-                               wraps=registry.suspend_record) as suspend, \
-             pytest.raises(RuntimeError, match='second reduction failed'):
-            self._run_probe(manager, [first, second], persist)
-
-        persist.assert_not_called()
-        suspend.assert_called_once_with(1, first.replica_record_id)
-        assert registry.marker(1, generation, self._ROUTE_URL) == marker_before
-        assert len(registry.heartbeat_payload()['entries']) == 1
-        assert len(registry.probe_targets()) == 1
         assert not registry.is_retired(1, generation)
 
 

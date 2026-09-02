@@ -216,6 +216,7 @@ def run_with_log(
     streaming_prefix: str | None = None,
     log_cmd: bool = False,
     timeout: int | None = None,
+    bounded_capture: BoundedSubprocessCapture | None = None,
     **kwargs,
 ) -> int | tuple[int, str, str]:
     """Runs a command and logs its output to a file.
@@ -233,6 +234,9 @@ def run_with_log(
         timeout: Optional timeout in seconds. If the command does not complete
             within this time, it will be terminated and TimeoutExpired will be
             raised. None means no timeout (default).
+        bounded_capture: Typed deadline and output bound for a short POSIX
+            control-plane command. This mode requires buffered outputs,
+            disables stream processing, and owns process lifetime directly.
 
     Returns the returncode or returncode, stdout and stderr of the command.
       Note that the stdout and stderr is already decoded.
@@ -240,9 +244,14 @@ def run_with_log(
     Raises:
         subprocess.TimeoutExpired: If the command times out.
     """
-    assert process_stream or not require_outputs, (
-        process_stream, require_outputs,
-        'require_outputs should be False when process_stream is False')
+    if bounded_capture is not None:
+        if timeout is not None or process_stream or not require_outputs:
+            raise ValueError('Bounded capture requires require_outputs=True, '
+                             'process_stream=False, and no separate timeout.')
+    elif require_outputs and not process_stream:
+        raise ValueError(
+            'Buffered outputs without stream processing require bounded '
+            'capture.')
 
     log_path = os.path.expanduser(log_path)
     dirname = os.path.dirname(log_path)
@@ -251,7 +260,7 @@ def run_with_log(
     # stdout and stderr.
     stdout_arg = stderr_arg = None
     ctx = _get_context()
-    if process_stream or ctx is not None:
+    if process_stream or ctx is not None or require_outputs:
         # Capture stdout/stderr of the subprocess if:
         # 1. Post-processing is needed (process_stream=True)
         # 2. Potential contextual handling is needed (ctx is not None)
@@ -273,14 +282,17 @@ def run_with_log(
                           stdin=stdin,
                           **kwargs) as proc:
         try:
-            if ctx is not None:
-                # When runs in coroutine, use kill_pg if available to avoid
-                # the overhead of refreshing the process tree in the daemon.
-                subprocess_utils.kill_process_daemon(proc.pid, use_kill_pg=True)
-            else:
-                # For backward compatibility, do not specify use_kill_pg by
-                # default.
-                subprocess_utils.kill_process_daemon(proc.pid)
+            if bounded_capture is None:
+                if ctx is not None:
+                    # When runs in coroutine, use kill_pg if available to avoid
+                    # the overhead of refreshing the process tree in the
+                    # daemon.
+                    subprocess_utils.kill_process_daemon(proc.pid,
+                                                         use_kill_pg=True)
+                else:
+                    # For backward compatibility, do not specify use_kill_pg
+                    # by default.
+                    subprocess_utils.kill_process_daemon(proc.pid)
 
             # Format streaming_prefix with subprocess PID if it contains {pid}
             formatted_streaming_prefix = streaming_prefix
@@ -345,7 +357,21 @@ def run_with_log(
                 timer.start()
 
             try:
-                if ctx is not None:
+                if bounded_capture is not None:
+                    cancel_callback = functools.partial(
+                        _kill_process_group_nonblocking, proc)
+                    if ctx is not None:
+                        ctx.register_cancel_callback(cancel_callback)
+                    try:
+                        stdout, stderr = _capture_subprocess_bounded(
+                            proc, cmd, bounded_capture)
+                    finally:
+                        if ctx is not None:
+                            ctx.unregister_cancel_callback(cancel_callback)
+                    if ctx is not None and ctx.is_canceled():
+                        raise asyncio.CancelledError(
+                            'Bounded subprocess capture was cancelled.')
+                elif ctx is not None:
                     # When runs in a coroutine, always process the subprocess
                     # stream to:
                     # 1. handle context cancellation
@@ -367,12 +393,14 @@ def run_with_log(
 
             # Check if timeout was triggered during stream processing
             if timeout_triggered:
+                assert timeout is not None
                 logger.error(
                     f'Command timed out after {timeout} seconds: {cmd}')
                 raise subprocess.TimeoutExpired(cmd, timeout)
 
             # Ensure returncode is set.
-            if ctx is not None or process_stream:
+            if (ctx is not None or process_stream or
+                    bounded_capture is not None):
                 # Stream processing already waited for process completion, so
                 # proc.wait() will return immediately. We still call it to
                 # ensure proc.returncode is set.

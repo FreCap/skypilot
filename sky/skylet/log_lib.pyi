@@ -5,6 +5,7 @@ the return type based on the value of require_outputs.
 """
 from collections.abc import Iterable
 from collections.abc import Iterator
+import dataclasses
 import typing
 from typing import Literal
 
@@ -21,14 +22,14 @@ SKY_LOG_TAILING_GAP_SECONDS: float = ...
 LOG_FILE_START_STREAMING_AT: str = ...
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class BoundedSubprocessCapture:
     """Finite POSIX capture contract for short control-plane commands."""
 
     deadline_monotonic: int | float
     max_output_bytes: int
 
-    def __init__(self, *, deadline_monotonic: int | float,
-                 max_output_bytes: int) -> None:
+    def __post_init__(self) -> None:
         ...
 
 
