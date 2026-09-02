@@ -627,6 +627,30 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
                          ('L4', 4))
         self.assertEqual(info.handle.call_count, 1)
 
+    def test_recreated_numeric_id_does_not_reuse_predecessor_shape_or_cost(
+            self):
+        autoscaler = self._make_autoscaler()
+        predecessor = self._make_replica('L4',
+                                         common_utils.ProcessStatus.SUCCEEDED)
+        predecessor.replica_record_id = ('00000000-0000-4000-8000-000000000001')
+        predecessor.handle.return_value.launched_resources.get_cost.return_value \
+            = 0.1
+        self.assertEqual(
+            (autoscaler._get_gpu_shape_from_replica_info(predecessor),
+             autoscaler._get_hourly_cost_from_replica_info(predecessor)),
+            (('L4', 1), 0.1))
+
+        replacement = self._make_replica('A100',
+                                         common_utils.ProcessStatus.SUCCEEDED,
+                                         count=8)
+        replacement.replica_record_id = ('00000000-0000-4000-8000-000000000002')
+        replacement.handle.return_value.launched_resources.get_cost.return_value \
+            = 2.0
+        self.assertEqual(
+            (autoscaler._get_gpu_shape_from_replica_info(replacement),
+             autoscaler._get_hourly_cost_from_replica_info(replacement)),
+            (('A100', 8), 2.0))
+
     def test_upscale_uses_observed_replica_capacity(self):
         """Excess QPS equal to one 4-GPU replica's capacity must add ONE
         replica, not four (per-GPU key + count-weighted fleet)."""
