@@ -1299,6 +1299,198 @@ def test_aws_provider_reduction_counts_logical_width_and_allows_retry_history():
                                          volume_id='vol-old')))
 
 
+def test_aws_empty_root_attachment_retries_then_reduces_and_records(
+        monkeypatch, tmp_path):
+    """A bound EC2 instance may precede its root-EBS attachment snapshot."""
+    profile = qualifier.PROFILES['small']
+    identity = _aws_identity()
+    cluster = identity.cluster_name_on_cloud
+    tags = [{
+        'Key': qualifier.provision_constants.TAG_RAY_CLUSTER_NAME,
+        'Value': cluster,
+    }, {
+        'Key': qualifier.provision_constants.TAG_SKYPILOT_CLUSTER_NAME,
+        'Value': cluster,
+    }, {
+        'Key': qualifier.provision_constants.TAG_SKYPILOT_MANAGED,
+        'Value': qualifier.provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+    }]
+    raw_pending = {
+        'BlockDeviceMappings': [],
+        'ClientToken': identity.client_token,
+        'InstanceId': 'i-new',
+        'InstanceLifecycle': 'spot',
+        'InstanceType': identity.instance_type,
+        'Placement': {
+            'AvailabilityZone': identity.zone,
+        },
+        'State': {
+            'Name': 'pending',
+        },
+        'Tags': tags,
+    }
+    raw_attached = {
+        **raw_pending,
+        'BlockDeviceMappings': [{
+            'Ebs': {
+                'DeleteOnTermination': True,
+                'VolumeId': 'vol-new',
+            },
+        }],
+    }
+    raw_volume = {
+        'VolumeId': 'vol-new',
+        'State': 'in-use',
+        'Tags': tags,
+    }
+    instance_reads = 0
+
+    class Paginator:
+        """Expose an attachment only in the second complete census."""
+
+        def __init__(self, name):
+            self._name = name
+
+        def paginate(self, *, Filters):  # pylint: disable=invalid-name
+            del Filters
+            nonlocal instance_reads
+            if self._name == 'describe_instances':
+                instance_reads += 1
+                instance = (raw_pending
+                            if instance_reads <= 2 else raw_attached)
+                return ({'Reservations': [{'Instances': [instance]}]},)
+            return ({'Volumes': ([] if instance_reads <= 2 else [raw_volume])},)
+
+    class Ec2:
+
+        @staticmethod
+        def get_paginator(name):
+            return Paginator(name)
+
+        @staticmethod
+        def describe_instance_types(*, InstanceTypes):
+            assert InstanceTypes == [identity.instance_type]
+            return {
+                'InstanceTypes': [{
+                    'InstanceType': identity.instance_type,
+                    'GpuInfo': {
+                        'Gpus': [{
+                            'Name': 'L4',
+                            'Manufacturer': 'NVIDIA',
+                            'Count': identity.gpu_units_per_instance,
+                        }],
+                    },
+                }],
+            }
+
+    class Sts:
+
+        @staticmethod
+        def get_caller_identity():
+            return {'Account': identity.aws_account_id}
+
+    class Session:
+
+        @staticmethod
+        def client(name, *, region_name):
+            assert region_name == identity.region
+            return Sts() if name == 'sts' else Ec2()
+
+    monkeypatch.setattr(qualifier.aws_adaptor, 'session',
+                        lambda profile: Session())
+    aws = qualifier.AwsObserver(profile=profile,
+                                service_name='paid-e2e',
+                                scope=_provider_scope())
+    first_census = aws.census()
+    assert first_census.service_instances[0]['volume_ids'] == ()
+    with pytest.raises(qualifier.QualificationError,
+                       match='AWS instance EBS attachment is not yet visible'):
+        aws.reduce(first_census, (identity,))
+    second_census = aws.census()
+    settled_aws = aws.reduce(second_census, (identity,))
+    assert second_census.service_instances[0]['volume_ids'] == ('vol-new',)
+    assert settled_aws.instance_count == 1
+    assert settled_aws.disk_count == 1
+
+    database = _database_state(aws_provider_identities=(identity,))
+    settled = _observation(observed_at=time.time(),
+                           database=database,
+                           provider=qualifier.combine_provider_states(
+                               qualifier.empty_provider_state('gcp'),
+                               settled_aws))
+    outcomes = iter((
+        qualifier.QualificationError(
+            'AWS instance EBS attachment is not yet visible.'),
+        settled,
+    ))
+
+    class Observer:
+        """Narrow provider-observation interface with one transient miss."""
+
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
+            result = next(outcomes)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                service_name='paid-e2e',
+                                profile=profile)
+    observer = Observer()
+    progress = qualifier.Progress()
+    first = asyncio.run(
+        qualifier._validated_sample(observer=observer,
+                                    profile=profile,
+                                    progress=progress,
+                                    receipt=receipt,
+                                    phase='scale'))
+    second = asyncio.run(
+        qualifier._validated_sample(observer=observer,
+                                    profile=profile,
+                                    progress=progress,
+                                    receipt=receipt,
+                                    phase='scale'))
+
+    assert first is None
+    assert second is not None
+    assert second.provider.cloud('aws').instance_count == 1
+    assert second.provider.cloud('aws').disk_count == 1
+    assert [
+        sample.get('observation_error_type')
+        for sample in receipt._payload['samples']
+    ] == ['QualificationError', None]
+
+
+@pytest.mark.parametrize(('field', 'replacement'), [
+    ('availability_zone', 'us-east-2b'),
+    ('client_token', 'wrong-token'),
+    ('cluster_name_on_cloud', 'wrong-cluster'),
+    ('instance_id', ''),
+    ('instance_type', 'g6.12xlarge'),
+    ('market', 'on_demand'),
+    ('provider_gpu_units', 4),
+    ('region', 'us-west-2'),
+    ('state', 'unknown'),
+    ('volume_ids', []),
+    ('volume_ids', ('',)),
+])
+def test_aws_invalid_binding_remains_fatal_before_empty_ebs_retry(
+        field, replacement):
+    instance = {
+        **_aws_instance(state='pending'),
+        'volume_ids': (),
+        field: replacement,
+    }
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='escaped its retained launch binding'):
+        qualifier.parse_aws_state(identities=(_aws_identity(),),
+                                  profile=qualifier.PROFILES['small'],
+                                  service_instances=(instance,),
+                                  service_volumes=())
+
+
 @pytest.mark.parametrize(('field', 'replacement'), [
     ('availability_zone', 'us-east-2b'),
     ('client_token', 'different-token'),

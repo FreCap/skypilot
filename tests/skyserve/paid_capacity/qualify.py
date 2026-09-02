@@ -1930,7 +1930,6 @@ def parse_aws_state(*,
                 instance.get('market') != 'spot' or state not in {
                     'pending', 'running', 'shutting-down', 'stopping', 'stopped'
                 } or not isinstance(raw_volume_ids, tuple) or
-                not raw_volume_ids or
                 any(not isinstance(volume_id, str) or not volume_id
                     for volume_id in raw_volume_ids)):
             raise GuardViolation(
@@ -1938,6 +1937,12 @@ def parse_aws_state(*,
         if len(raw_volume_ids) != len(set(raw_volume_ids)):
             raise GuardViolation(
                 'AWS service instance repeats one EBS volume identity.')
+        if not raw_volume_ids:
+            # EC2 may expose a correctly bound instance before its root EBS
+            # mapping.  Identity and shape mismatches above remain fatal; this
+            # single provider snapshot is incomplete and can be retried.
+            raise QualificationError(
+                'AWS instance EBS attachment is not yet visible.')
         overlap = attached_volume_ids.intersection(raw_volume_ids)
         if overlap:
             raise GuardViolation('AWS service instances share an EBS volume.')
