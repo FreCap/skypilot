@@ -11,6 +11,7 @@ To update snapshots when intentional changes are made:
 import os
 from pathlib import Path
 import subprocess
+from typing import Any
 
 import pytest
 
@@ -146,6 +147,37 @@ def test_multi_node_2nodes():
 
     result = codegen.build()
     assert_codegen_matches_snapshot('multi_node_2nodes', result)
+
+
+def test_generated_logging_functions_are_self_contained(tmp_path: Path):
+    """Generated task drivers carry bounded-capture dependencies."""
+    codegen = task_codegen.TaskCodeGen()
+    codegen._add_common_imports()  # pylint: disable=protected-access
+    codegen._add_skylet_imports()  # pylint: disable=protected-access
+    codegen._add_logging_functions()  # pylint: disable=protected-access
+    namespace: dict[str, Any] = {'__name__': 'generated_task_logging_test'}
+    exec('\n'.join(codegen._code), namespace)  # pylint: disable=exec-used,protected-access
+
+    capture = namespace['BoundedSubprocessCapture'](
+        deadline_monotonic=namespace['time'].monotonic() + 5,
+        max_output_bytes=1024)
+    result = namespace['run_with_log'](['bash', '-c', 'printf ok'],
+                                       str(tmp_path / 'generated.log'),
+                                       require_outputs=True,
+                                       process_stream=False,
+                                       bounded_capture=capture)
+
+    assert result == (0, 'ok', '')
+
+    with pytest.raises(namespace['SubprocessOutputLimitExceeded']):
+        namespace['run_with_log'](
+            ['bash', '-c', 'head -c 2048 /dev/zero'],
+            str(tmp_path / 'bounded.log'),
+            require_outputs=True,
+            process_stream=False,
+            bounded_capture=namespace['BoundedSubprocessCapture'](
+                deadline_monotonic=namespace['time'].monotonic() + 5,
+                max_output_bytes=32))
 
 
 def test_system_oom_recovery_codegen_is_single_attempt_authority():
