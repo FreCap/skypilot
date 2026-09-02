@@ -138,18 +138,18 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
             resource_key=accelerator['resource_name'])
         priority = context['priority_class']
         if (admission.namespace != context['namespace'] or
-                admission.service_account_name
-                != context['service_account_name'] or
-                admission.pod_identity_role_arn
-                != context['pod_identity_role_arn'] or
+                admission.service_account_name !=
+                context['service_account_name'] or
+                admission.pod_identity_role_arn !=
+                context['pod_identity_role_arn'] or
                 admission.scheduler_name != context['scheduler_name'] or
                 admission.priority_class_name != priority['name'] or
                 admission.priority_value != priority['value'] or
                 admission.preemption_policy != priority['preemption_policy'] or
                 admission.admission_mode is not admission_mode or
                 admission.local_queue_name != local_queue_name or
-                admission.workload_priority_class_name
-                != workload_priority_class_name or
+                admission.workload_priority_class_name !=
+                workload_priority_class_name or
                 admission.accelerator_count != accelerator['count'] or
                 admission.accelerator_scheduling != expected_scheduling):
             raise reclaim.ReclaimAttestationError(
@@ -222,8 +222,8 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                 'The claim accelerator set is not allowlisted.')
         self._require_pool_key(edge.pool_key, edge.physical_cluster_uid,
                                edge.accelerator_names)
-        if ({item.accelerator for item in edge.projected_admissions}
-                != set(accelerator_names)):
+        if ({item.accelerator for item in edge.projected_admissions} !=
+                set(accelerator_names)):
             raise reclaim.ReclaimAttestationError(
                 'The claim admission set does not cover its accelerators.')
         for admission in edge.projected_admissions:
@@ -428,8 +428,8 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                 type(proof.namespace) is not str or
                 proof.namespace != fleet_context['namespace'] or
                 type(proof.service_account_name) is not str or
-                proof.service_account_name
-                != fleet_context['service_account_name'] or
+                proof.service_account_name !=
+                fleet_context['service_account_name'] or
                 proof.expected_role_arn != expected_role or
                 type(proof.association_count) is not int or
                 proof.association_count != expected_count or
@@ -490,8 +490,8 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         if (type(proof.kubernetes_context) is not str or
                 proof.kubernetes_context != context_name or
                 type(proof.physical_cluster_uid) is not str or
-                proof.physical_cluster_uid
-                != fleet_context['physical_cluster_uid'] or
+                proof.physical_cluster_uid !=
+                fleet_context['physical_cluster_uid'] or
                 type(proof.namespace_uid) is not str or
                 proof.namespace_uid != provider_context['namespace_uid'] or
                 type(proof.kueue_managed) is not bool or
@@ -500,13 +500,14 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                 proof.cluster_queue_name != expected_cluster_queue or
                 type(proof.pod_identity_irsa_annotation_absent) is not bool or
                 not proof.pod_identity_irsa_annotation_absent or
-                proof.assign_queue_labels_for_pods
-                != (True if managed else None) or
+                proof.assign_queue_labels_for_pods !=
+            (True if managed else None) or
             (proof.assign_queue_labels_for_pods is not None and
              type(proof.assign_queue_labels_for_pods) is not bool) or
-                proof.topology_aware_scheduling != (True if managed else None)
-                or (proof.topology_aware_scheduling is not None and
-                    type(proof.topology_aware_scheduling) is not bool) or
+                proof.topology_aware_scheduling !=
+            (True if managed else None) or
+            (proof.topology_aware_scheduling is not None and
+             type(proof.topology_aware_scheduling) is not bool) or
                 type(proof.custom_scheduler_deployment_proven) is not bool or
                 proof.custom_scheduler_deployment_proven
                 is not (provider_context['scheduler'] is not None) or
@@ -522,13 +523,13 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                     type(node.non_deleting_node_count) is not int or
                     node.non_deleting_node_count < 0 or
                     type(node.product_label_value) is not str or
-                    node.product_label_value
-                    != expected_node['product_label_value'] or
+                    node.product_label_value !=
+                    expected_node['product_label_value'] or
                     type(node.resource_name) is not str or
                     node.resource_name != expected_node['resource_name'] or
                     type(node.capacity_per_node) is not int or
-                    node.capacity_per_node
-                    != expected_node['capacity_per_node']):
+                    node.capacity_per_node !=
+                    expected_node['capacity_per_node']):
                 raise reclaim.ReclaimAttestationError(
                     'The cached Kubernetes provider proof has an invalid '
                     'reviewed Node flavor.')
@@ -853,8 +854,9 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                 future.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
         proofs = {
-            context_name: self._decode_context_proof_summary(
-                receipt.proof_payload, context_name=context_name)
+            context_name:
+            self._decode_context_proof_summary(receipt.proof_payload,
+                                               context_name=context_name)
             for context_name, receipt in receipts.items()
         }
         observed_fresh_publication = any(
