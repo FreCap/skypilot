@@ -165,6 +165,48 @@ def test_bulk_provision_tears_down_on_ordinary_failure(patched_bulk_provision,
     patched_bulk_provision.assert_called_once()
 
 
+def test_bulk_provision_retries_teardown_then_reraises_original_failure(
+        patched_bulk_provision, monkeypatch, tmp_path):
+    """Transient teardown failures are retried before failover continues."""
+    provisioning_error = RuntimeError('provisioning failed')
+    monkeypatch.setattr(provisioner, '_bulk_provision',
+                        mock.MagicMock(side_effect=provisioning_error))
+    patched_bulk_provision.side_effect = [
+        RuntimeError('teardown failed once'),
+        RuntimeError('teardown failed twice'),
+        None,
+    ]
+    sleep_mock = mock.MagicMock()
+    monkeypatch.setattr(provisioner.time, 'sleep', sleep_mock)
+
+    with pytest.raises(RuntimeError, match='provisioning failed') as exc_info:
+        _call_bulk_provision(tmp_path)
+
+    assert exc_info.value is provisioning_error
+    assert patched_bulk_provision.call_count == 3
+    assert sleep_mock.call_args_list == [mock.call(5), mock.call(5)]
+
+
+def test_bulk_provision_stops_failover_when_teardown_retries_exhausted(
+        patched_bulk_provision, monkeypatch, tmp_path):
+    """Failover stops after bounded teardown retries to avoid resource leaks."""
+    monkeypatch.setattr(
+        provisioner, '_bulk_provision',
+        mock.MagicMock(side_effect=RuntimeError('provisioning failed')))
+    teardown_error = RuntimeError('teardown still failing')
+    patched_bulk_provision.side_effect = teardown_error
+    sleep_mock = mock.MagicMock()
+    monkeypatch.setattr(provisioner.time, 'sleep', sleep_mock)
+
+    with pytest.raises(common.StopFailoverError,
+                       match='resource leakage') as exc_info:
+        _call_bulk_provision(tmp_path)
+
+    assert exc_info.value.__cause__ is teardown_error
+    assert patched_bulk_provision.call_count == 3
+    assert sleep_mock.call_args_list == [mock.call(5), mock.call(5)]
+
+
 def test_bulk_provision_skips_teardown_for_exact_provider_negative_ack(
         patched_bulk_provision, monkeypatch, tmp_path):
     receipt = _provider_negative_ack()
