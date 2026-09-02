@@ -485,8 +485,15 @@ def ordinary_paid_provider_terminal_shape_matches(
     if not isinstance(identity,
                       Mapping) or identity.get('use_spot') is not True:
         return False
-    if identity.get('cloud') == 'gcp' and identity.get('version') == 1:
-        return True
+    if identity.get('cloud') == 'gcp':
+        if identity.get('version') == 1:
+            return True
+        provider_identity = identity.get('provider_identity')
+        return bool(
+            identity.get('version') == 2 and
+            isinstance(provider_identity, Mapping) and
+            _GCP_PROJECT_ID_RE.fullmatch(
+                str(provider_identity.get('gcp_project_id'))) is not None)
     provider_identity = identity.get('provider_identity')
     return bool(
         identity.get('cloud') == 'aws' and identity.get('version') == 2 and
@@ -512,7 +519,13 @@ def paid_provider_reconciliation_pool_shape_matches(
                       Mapping) or identity.get('use_spot') is not True:
         return False
     return bool(
-        (identity.get('cloud') == 'gcp' and identity.get('version') == 1) or
+        (identity.get('cloud') == 'gcp' and
+         (identity.get('version') == 1 or
+          (identity.get('version') == 2 and
+           isinstance(identity.get('provider_identity'), Mapping) and
+           _GCP_PROJECT_ID_RE.fullmatch(
+               str(identity['provider_identity'].get('gcp_project_id')))
+           is not None))) or
         (identity.get('cloud') == 'aws' and identity.get('version') == 2 and
          isinstance(identity.get('provider_identity'), Mapping) and
          re.fullmatch(r'[0-9]{12}',
@@ -558,8 +571,11 @@ _ORDINARY_PAID_PROVIDER_TERMINAL_SQL = (
     "((terminal_status = 'FAILED' AND terminal_cause = 'handler_failed') OR "
     "(terminal_status = 'CANCELLED' AND terminal_cause = 'explicit_cancel' "
     "AND ((paid_capacity_pool_key::jsonb ->> 'cloud' = 'gcp' "
-    "AND paid_capacity_pool_key::jsonb ->> 'version' = '1' "
-    "AND paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true') OR "
+    "AND paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true' AND "
+    "((paid_capacity_pool_key::jsonb ->> 'version' = '1') OR "
+    "(paid_capacity_pool_key::jsonb ->> 'version' = '2' AND "
+    "paid_capacity_pool_key::jsonb -> 'provider_identity' ->> "
+    "'gcp_project_id' ~ '^[a-z][a-z0-9-]{4,28}[a-z0-9]$'))) OR "
     "(paid_capacity_pool_key::jsonb ->> 'cloud' = 'aws' "
     "AND paid_capacity_pool_key::jsonb ->> 'version' = '2' "
     "AND paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true' "
@@ -700,8 +716,11 @@ ordinary_launch_associations_table = sqlalchemy.Table(
         "THEN TRUE WHEN capability_cohort_epoch < 11 THEN TRUE "
         "WHEN profile_kind = 'UNKNOWN_CAPACITY_REPLACEMENT' THEN "
         "COALESCE((paid_capacity_pool_key::jsonb ->> 'cloud' = 'gcp' AND "
-        "paid_capacity_pool_key::jsonb ->> 'version' = '1' AND "
-        "paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true') OR "
+        "paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true' AND "
+        "((paid_capacity_pool_key::jsonb ->> 'version' = '1') OR "
+        "(paid_capacity_pool_key::jsonb ->> 'version' = '2' AND "
+        "paid_capacity_pool_key::jsonb -> 'provider_identity' ->> "
+        "'gcp_project_id' ~ '^[a-z][a-z0-9-]{4,28}[a-z0-9]$'))) OR "
         "(paid_capacity_pool_key::jsonb ->> 'cloud' = 'aws' AND "
         "paid_capacity_pool_key::jsonb ->> 'version' = '2' AND "
         "paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true' AND "
@@ -709,11 +728,18 @@ ordinary_launch_associations_table = sqlalchemy.Table(
         "'aws_account_id' ~ '^[0-9]{12}$'), FALSE) ELSE "
         "COALESCE((paid_capacity_pool_key::jsonb ->> 'cloud' = 'aws' AND "
         "paid_capacity_pool_key::jsonb ->> 'version' = '2' AND "
+        "paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true' AND "
         "paid_capacity_pool_key::jsonb -> 'provider_identity' ->> "
         "'aws_account_id' ~ '^[0-9]{12}$') OR "
-        "(paid_capacity_pool_key::jsonb ->> 'cloud' <> 'aws' AND "
+        "(paid_capacity_pool_key::jsonb ->> 'cloud' = 'gcp' AND "
+        "((capability_cohort_epoch < 15 AND "
         "paid_capacity_pool_key::jsonb ->> 'version' = '1' AND NOT "
-        "(paid_capacity_pool_key::jsonb ? 'provider_identity')), FALSE) END",
+        "(paid_capacity_pool_key::jsonb ? 'provider_identity')) OR "
+        "(paid_capacity_pool_key::jsonb ->> 'version' = '2' AND "
+        "paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true' AND "
+        "paid_capacity_pool_key::jsonb -> 'provider_identity' ->> "
+        "'gcp_project_id' ~ '^[a-z][a-z0-9-]{4,28}[a-z0-9]$'))), FALSE) "
+        "END",
         name='serve059_paid_pool_scope_ck'),
     sqlalchemy.CheckConstraint(
         "CASE WHEN profile_kind IS DISTINCT FROM 'ORDINARY_PAID' AND NOT "
@@ -897,8 +923,11 @@ ordinary_launch_associations_table = sqlalchemy.Table(
         "(profile_kind = 'ORDINARY_PAID' OR "
         "(profile_kind = 'UNKNOWN_CAPACITY_REPLACEMENT' AND "
         "((paid_capacity_pool_key::jsonb ->> 'cloud' = 'gcp' AND "
-        "paid_capacity_pool_key::jsonb ->> 'version' = '1' AND "
-        "paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true') OR "
+        "paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true' AND "
+        "((paid_capacity_pool_key::jsonb ->> 'version' = '1') OR "
+        "(paid_capacity_pool_key::jsonb ->> 'version' = '2' AND "
+        "paid_capacity_pool_key::jsonb -> 'provider_identity' ->> "
+        "'gcp_project_id' ~ '^[a-z][a-z0-9-]{4,28}[a-z0-9]$'))) OR "
         "(paid_capacity_pool_key::jsonb ->> 'cloud' = 'aws' AND "
         "paid_capacity_pool_key::jsonb ->> 'version' = '2' AND "
         "paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true' AND "
@@ -1565,6 +1594,38 @@ def _authority_from_service(
         non_pool_profile_set_digest=profile_set_digest,
         non_pool_capability_cohort_epoch=cohort_epoch,
         non_pool_receipt_protocol_version=receipt_protocol_version)
+
+
+def build_paid_launch_fence(
+    *,
+    service_name: str,
+    service_hash: str,
+    service_version: int,
+    replica_id: int,
+    replica_record_id: str,
+    service_lifecycle_epoch: int,
+    binding_epoch: int,
+    controller_incarnation: uuid.UUID,
+    controller_owner_epoch: int,
+    controller_pid: int,
+    controller_ip: str,
+) -> dict[str, Any]:
+    """Build and validate the complete immutable paid launch fence."""
+    fence = {
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: service_name,
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: service_hash,
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: service_version,
+        serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: controller_pid,
+        serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: controller_ip,
+        REPLICA_ID_KEY: replica_id,
+        REPLICA_RECORD_ID_KEY: replica_record_id,
+        LIFECYCLE_EPOCH_KEY: service_lifecycle_epoch,
+        BINDING_EPOCH_KEY: binding_epoch,
+        CONTROLLER_INCARNATION_KEY: str(controller_incarnation),
+        CONTROLLER_OWNER_EPOCH_KEY: controller_owner_epoch,
+    }
+    parse_unbound_launch_context(fence)
+    return fence
 
 
 def parse_unbound_launch_context(context: Mapping[str, Any]) -> BindingIntent:
@@ -3037,11 +3098,15 @@ def _resolve_non_pool_launch_profile_in_connection(
                      f'{predecessor["replica_record_id"]}:{generation}')
         if paid_claim is not None:
             pool_identity = paid_capacity.pool_key_payload(pool_key)
-            if (isinstance(pool_identity, Mapping) and
-                    pool_identity.get('cloud') == 'aws'):
-                aws_account_id = ordinary_paid_aws_account_id_from_pool_key(
-                    pool_key)
-                reference += f':aws-account:{aws_account_id}'
+            if isinstance(pool_identity, Mapping):
+                if pool_identity.get('cloud') == 'aws':
+                    aws_account_id = ordinary_paid_aws_account_id_from_pool_key(
+                        pool_key)
+                    reference += f':aws-account:{aws_account_id}'
+                elif pool_identity.get('cloud') == 'gcp':
+                    project_id = ordinary_paid_gcp_project_id_from_pool_key(
+                        pool_key)
+                    reference += f':gcp-project:{project_id}'
     elif kind == NonPoolLaunchProfileKind.COST_REBALANCE:
         payload, generation = _cost_rebalance_payload(connection, service,
                                                       replica, info)
@@ -5137,7 +5202,7 @@ def require_active_provider_effect_authorization(
 
 def record_paid_provider_allocation(
     launch_context: Mapping[str, Any],
-    receipt: 'paid_capacity_lib.PaidProviderAllocationReceipt',
+    receipt: paid_capacity_lib.PaidProviderAllocationReceipt,
     *,
     request_validator: PaidProviderAllocationRequestValidator,
 ) -> ProviderAllocationDisposition:
@@ -7300,26 +7365,36 @@ def ordinary_paid_cluster_name_on_cloud(association: Mapping[str, Any]) -> str:
 def ordinary_paid_gcp_provider_identity(
     association: Mapping[str, Any],
     *,
-    project_id: str,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Build the exact GCP allocation identity retained by a paid request.
 
-    The paid-pool key freezes placement while the request freezes its effective
-    workspace configuration.  The request layer must supply ``project_id``
-    from that exact retained request; this helper deliberately never consults
-    today's ambient workspace.
+    Fresh v2 pools freeze project and placement together.  ``project_id`` is
+    accepted only to settle retained v1 rows whose immutable request predates
+    project-scoped pools; it cannot override a v2 identity.
     """
-    if (not isinstance(project_id, str) or
-            _GCP_PROJECT_ID_RE.fullmatch(project_id) is None):
-        raise OrdinaryLaunchBindingConflict(
-            'Ordinary-paid GCP launch has no exact project ID.')
     pool_key = association.get('paid_capacity_pool_key')
     if not isinstance(pool_key, str) or not pool_key:
         raise OrdinaryLaunchBindingConflict(
             'Ordinary-paid GCP launch has no exact paid pool identity.')
     identity = paid_capacity.pool_key_payload(pool_key)
+    provider_scope = (identity.get('provider_identity') if isinstance(
+        identity, Mapping) else None)
+    frozen_project_id = (provider_scope.get('gcp_project_id') if isinstance(
+        provider_scope, Mapping) else None)
+    if isinstance(identity, Mapping) and identity.get('version') == 2:
+        if (not isinstance(frozen_project_id, str) or
+                _GCP_PROJECT_ID_RE.fullmatch(frozen_project_id) is None or
+                project_id is not None and project_id != frozen_project_id):
+            raise OrdinaryLaunchBindingConflict(
+                'Ordinary-paid GCP launch has no exact pool project ID.')
+        project_id = frozen_project_id
+    if (not isinstance(project_id, str) or
+            _GCP_PROJECT_ID_RE.fullmatch(project_id) is None):
+        raise OrdinaryLaunchBindingConflict(
+            'Legacy ordinary-paid GCP launch has no retained project ID.')
     if (not isinstance(identity, Mapping) or identity.get('cloud') != 'gcp' or
-            identity.get('version') != 1 or
+            identity.get('version') not in (1, 2) or
             identity.get('use_spot') is not True or
             not isinstance(identity.get('workspace'), str) or
             not identity['workspace'] or
@@ -7349,6 +7424,55 @@ def ordinary_paid_gcp_provider_identity(
         'workspace': identity['workspace'],
         'zone': identity['zone'],
     }
+
+
+def ordinary_paid_gcp_project_id_from_pool_key(pool_key: object) -> str:
+    """Decode the immutable project scope required for a fresh GCP effect."""
+    if not isinstance(pool_key, str) or not pool_key:
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid GCP launch has no exact paid pool identity.')
+    identity = paid_capacity.pool_key_payload(pool_key)
+    provider_scope = (identity.get('provider_identity') if isinstance(
+        identity, Mapping) else None)
+    project_id = (provider_scope.get('gcp_project_id') if isinstance(
+        provider_scope, Mapping) else None)
+    if (not isinstance(identity, Mapping) or identity.get('cloud') != 'gcp' or
+            identity.get('version') != 2 or not isinstance(project_id, str) or
+            _GCP_PROJECT_ID_RE.fullmatch(project_id) is None):
+        raise OrdinaryLaunchBindingConflict(
+            'Fresh ordinary-paid GCP launch has no immutable project scope.')
+    return project_id
+
+
+def ordinary_paid_gcp_project_id(context: BoundNonPoolLaunchContext) -> str:
+    """Decode the project frozen into one fresh paid GCP profile."""
+    if (not isinstance(context, BoundNonPoolLaunchContext) or
+            context.capability_cohort_epoch
+            != NON_POOL_CAPABILITY_COHORT_EPOCH):
+        raise OrdinaryLaunchBindingConflict(
+            'Launch has no current paid GCP project authority.')
+    reference = context.profile.authorization_reference
+    if context.profile.kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
+        prefix = 'paid-capacity:'
+        if not reference.startswith(prefix):
+            raise OrdinaryLaunchBindingConflict(
+                'Ordinary-paid authorization reference is malformed.')
+        parts = reference[len(prefix):].split(':', 2)
+        if len(parts) != 3 or parts[1] != str(context.replica_record_id):
+            raise OrdinaryLaunchBindingConflict(
+                'Ordinary-paid authorization names a different replica.')
+        return ordinary_paid_gcp_project_id_from_pool_key(parts[2])
+    if (context.profile.kind
+            is not NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT):
+        raise OrdinaryLaunchBindingConflict(
+            'Profile has no paid GCP project authority.')
+    match = re.fullmatch(
+        r'unknown-capacity:[0-9a-f-]{36}:[0-9]+:gcp-project:'
+        r'([a-z][a-z0-9-]{4,28}[a-z0-9])', reference)
+    if match is None:
+        raise OrdinaryLaunchBindingConflict(
+            'Paid GCP replacement has no immutable project authority.')
+    return match.group(1)
 
 
 def ordinary_paid_gcp_resource_name_matches(

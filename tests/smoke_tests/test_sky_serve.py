@@ -436,12 +436,22 @@ def test_skyserve_paid_spot_postgres_e2e(request: pytest.FixtureRequest):
     """Prove authenticated PostgreSQL admission through natural Spot drain.
 
     This is intentionally absent from ordinary test selection because even the
-    small profile creates billable cloud resources.  Both profiles execute the
-    same checked-in qualifier; only their bounded scale values differ.
+    small profile creates billable cloud resources. All profiles execute the
+    same checked-in qualifier; only typed scale/provider expectations differ.
     """
     profile = request.config.getoption('--serve-paid-provider-e2e')
     if profile is None:
-        pytest.skip('requires --serve-paid-provider-e2e={small,scale}')
+        pytest.skip(
+            'requires --serve-paid-provider-e2e={small,scale,provider-canary}')
+    provider = request.config.getoption('--serve-paid-provider-e2e-provider')
+    economic_receipt = request.config.getoption(
+        '--serve-paid-provider-e2e-economic-receipt')
+    if (profile == 'provider-canary') != (provider is not None):
+        pytest.fail('provider-canary requires exactly one explicit provider; '
+                    'economic profiles forbid provider pinning')
+    if (profile == 'provider-canary') != (economic_receipt is not None):
+        pytest.fail('provider-canary requires one completed economic receipt; '
+                    'economic profiles forbid that authorization input')
     if not pytest.terminate_on_failure:
         pytest.fail('billable E2E forbids --no-terminate-on-failure')
     if not smoke_tests_utils.is_postgres_backend_test():
@@ -457,13 +467,23 @@ def test_skyserve_paid_spot_postgres_e2e(request: pytest.FixtureRequest):
     rendered = f'/tmp/{name}-{profile}.yaml'
     receipt = f'/tmp/{name}-{profile}-receipt.json'
     scope_receipt = f'/tmp/{name}-{profile}-scope.json'
+    cleanup_receipt = f'/tmp/{name}-{profile}-cleanup.json'
     python = shlex.quote(sys.executable)
+    provider_arg = ('' if provider is None else
+                    f' --provider {shlex.quote(provider)}')
+    economic_receipt_arg = (
+        '' if economic_receipt is None else
+        f' --economic-receipt {shlex.quote(economic_receipt)}')
     render_command = (f'{python} {shlex.quote(qualifier)} render '
                       f'--profile {shlex.quote(profile)} '
+                      f'{provider_arg} '
+                      f'{economic_receipt_arg} '
                       f'--output {shlex.quote(rendered)}')
     qualify_command = (f'{_SERVE_ENDPOINT_WAIT.format(name=name)}; '
                        f'{python} {shlex.quote(qualifier)} run '
                        f'--profile {shlex.quote(profile)} '
+                       f'{provider_arg} '
+                       f'{economic_receipt_arg} '
                        f'--service-name {shlex.quote(name)} '
                        '--endpoint "$endpoint" '
                        f'--receipt {shlex.quote(receipt)} '
@@ -473,7 +493,9 @@ def test_skyserve_paid_spot_postgres_e2e(request: pytest.FixtureRequest):
                             f'--output {shlex.quote(scope_receipt)}')
     wait_cleanup_command = (f'{python} {shlex.quote(qualifier)} wait-cleanup '
                             f'--service-name {shlex.quote(name)} '
-                            f'--scope {shlex.quote(scope_receipt)}')
+                            f'--scope {shlex.quote(scope_receipt)} '
+                            f'--receipt {shlex.quote(receipt)} '
+                            f'--output {shlex.quote(cleanup_receipt)}')
     env = dict(smoke_tests_utils.LOW_CONTROLLER_RESOURCE_ENV)
     if auth_token:
         # A local API server started by this test must pass the same token to

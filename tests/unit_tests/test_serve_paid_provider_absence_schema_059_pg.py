@@ -29,6 +29,8 @@ _CURRENT_MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.063_aws_paid_replacement_reconciliation')
 _SERVICE_JOB_IO_MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.064_paid_service_job_io_reconciliation')
+_LATEST_MIGRATION = importlib.import_module(
+    'sky.schemas.db.serve_state.067_project_scoped_gcp_paid_admission')
 
 
 def _function_definition(engine: sqlalchemy.engine.Engine,
@@ -245,7 +247,8 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['066']
+    assert scripts.get_heads() == ['067']
+    assert scripts.get_revision('067').down_revision == '066'
     assert scripts.get_revision('065').down_revision == '064'
     assert scripts.get_revision('064').down_revision == '063'
     assert scripts.get_revision('063').down_revision == '062'
@@ -253,7 +256,7 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
     assert scripts.get_revision('061').down_revision == '060'
     assert scripts.get_revision('060').down_revision == '059'
     assert scripts.get_revision('059').down_revision == '058'
-    assert migration_utils.SERVE_VERSION == '066'
+    assert migration_utils.SERVE_VERSION == '067'
     assert migration_utils.serve_target_version(sqlite) == '037'
     assert (_CURRENT_MIGRATION._ASSOCIATION_PROFILE_SOURCE ==
             _GCP_REPLACEMENT_MIGRATION._ASSOCIATION_PROFILE_REPLACEMENT)
@@ -269,13 +272,13 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
         if item.name == _MIGRATION._PROJECTION_CONSTRAINT)
     assert _compact(str(constraint.sqltext)) == _compact(
-        _SERVICE_JOB_IO_MIGRATION._PROJECTION_CHECK)
+        _LATEST_MIGRATION._PROJECTION_CHECK)
     paid_pool_constraint = next(
         item for item in
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
         if item.name == _MIGRATION._PAID_POOL_SCOPE_CONSTRAINT)
     assert _compact(str(paid_pool_constraint.sqltext)) == _compact(
-        _CURRENT_MIGRATION._PAID_POOL_SCOPE_CHECK)
+        _LATEST_MIGRATION._PAID_POOL_SCOPE_CHECK)
     paid_receipt_constraint = next(
         item for item in
         ordinary_launch_binding.ordinary_launch_associations_table.constraints

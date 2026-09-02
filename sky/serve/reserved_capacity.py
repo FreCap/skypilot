@@ -1991,7 +1991,7 @@ def _sequenced_fill_pool_specs_from_current_claim_authority(
     except (TypeError, ValueError):
         return ()
     configured_edges: list[tuple[int, str, str, int,
-                                 tuple['spot_placer_lib.Location', ...]]] = []
+                                 tuple[spot_placer_lib.Location, ...]]] = []
     for candidate in candidates:
         for card, width in candidate.shapes:
             locations = tuple(location for location in candidate.locations
@@ -2191,7 +2191,7 @@ def _sequenced_fill_pool_specs_from_deployment_inventory(
         return ()
     inventory_by_context = {entry.access_context: entry for entry in inventory}
     configured_edges: list[tuple[int, str, str, int,
-                                 tuple['spot_placer_lib.Location', ...]]] = []
+                                 tuple[spot_placer_lib.Location, ...]]] = []
     for candidate in candidates:
         for card, width in candidate.shapes:
             locations = tuple(location for location in candidate.locations

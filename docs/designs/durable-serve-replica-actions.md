@@ -1,6 +1,6 @@
 # Durable SkyServe Replica Actions
 
-Last updated: 2026-08-26
+Last updated: 2026-09-01
 
 Status: the dedicated resource-action authority proposal is retired before
 activation. PRs #1112, #1239, #1240, #1336, #1338, and #1343 are closed. PR
@@ -640,29 +640,64 @@ unfenced stale replica snapshot and permission to start provider I/O.
 
 ### Commit-before-effect
 
-The generalized implementation has one internal atomic bind-and-enqueue seam
-after the existing planner-owned replica-intent commit.
-A dedicated versioned `/internal/serve/non-pool-launch` endpoint accepts one
-controller-generated stable submission UUID and one closed typed profile. It
-does not fall back to `/launch` or the ordinary-only endpoint: either would let
-an old server ignore unknown binding context and execute unbound. The
-controller reuses that UUID for every transport retry. The server
-deterministically derives the association and exact API request IDs from the
-submission UUID plus authenticated tenant scope, independent of the fresh ID
-assigned to each HTTP attempt by `RequestIDMiddleware`, and returns the exact
-bound request ID in the response body.
+The generalized implementation has one transport-neutral atomic
+bind-and-enqueue implementation after the existing planner-owned replica-intent
+commit. ``non_pool_admission.build`` and ``bind_in_transaction`` remain the sole
+request/identity constructors and writers. Entrypoints may provide either one
+member or an immutable ordered batch, but may not reimplement that suffix.
 
-The planner first commits its replica intent and exact domain authority using
-its existing transaction: paid claim, zero-cost sequence, reserved allocation,
-replacement observation, rebalance decision, or recovery intent. That row is
-not effect authority. In a second transaction the server locks the lifecycle
-fence, service row, exact replica row, and current association; revalidates the
-profile planner's exact authorization; constructs the complete bound request
-with one distinct generic handler on the normal executor topology; and inserts
-the association, `api_requests` row, generic request-retention pin, and
-`api_request_queue` row. The transaction also sets the replica row's exact
-association pointer. Queue visibility occurs only at transaction commit, after
-every effect fence and binding is durable.
+A dedicated versioned `/internal/serve/non-pool-launch` endpoint accepts one
+controller-generated stable submission UUID and one closed typed profile for
+rolling compatibility and generic non-paid actions. It does not fall back to
+`/launch` or the ordinary-only endpoint: either would let an old server ignore
+unknown binding context and execute unbound. The controller reuses that UUID
+for every transport retry. The server deterministically derives the association
+and exact API request IDs from the submission UUID plus authenticated tenant
+scope, independent of the fresh ID assigned to each HTTP attempt by
+`RequestIDMiddleware`, and returns the exact bound request ID in the response
+body.
+
+Planner-paid scale is an aggregate exception to the singleton transport, not a
+second binding implementation. Every provider-free ``PaidLaunchSpec`` carries
+its frozen launch bytes into the existing fused capacity repository. On the one
+transaction that writes the plan, paid debit, replica, and claim, the repository
+derives every retry-stable submission UUID and binds the accepted subset through
+the same shared builder/writer. It derives tenant and workspace from the locked
+service graph; there is no client-authenticated identity input, HTTP fanout,
+second request-admission transaction, or process-local handoff. Plan/debit/
+replica/claim/association/request/queue/pin/pointer commit all-or-none.
+Per-replica workers published afterward are optional adopters of those durable
+request IDs and cannot resubmit the singleton endpoint. The temporary
+ordinary-paid singleton compatibility use is instrumented and is removed after
+the homogeneous-fleet stale window and 420-member unpaid/paid rollout gates.
+
+Fresh GCP paid launch authority is protocol v2. Candidate preparation resolves
+the exact project from the locked workspace-and-region controller snapshot and
+freezes it in both the paid pool and ordinary-paid profile; a catalog location
+without that exact mapping is omitted. The elected catalog supplies one typed
+runtime resources map containing the `Cloud` object, while a separate map from
+the same location lowercases the cloud for canonical JSON storage. Locked
+request rebuilding first proves the stored map equals that catalog-derived
+canonical form, then serializes from the catalog's typed map and requires byte
+equality with the prepared body. The ordinary body carries the normal sanitized
+locked configuration, not a duplicate full-config snapshot. Both
+ordinary-paid and `UNKNOWN_CAPACITY_REPLACEMENT` GCP provider effects reject a
+missing or different project before bulk provisioning. Legacy GCP v1 remains
+readable only for settlement and cleanup. Cohort 15 is the first fresh-effect
+cohort for this contract, so activation requires a homogeneous cohort-15 API,
+controller, and executor fleet; older cohorts fail before planner entry,
+request commit, or provider I/O.
+
+For ordinary planner intents other than fused paid scale, the planner first
+commits its exact domain authority and a second request-admission transaction
+binds the executable request. Paid scale is deliberately stricter: the existing
+capacity transaction locks the protocol, lifecycle, service, capacity, and
+dependent request graph; writes the plan, accepted replica, and claim; resolves
+the exact just-written paid profile; constructs the complete bound request with
+the distinct generic handler; and inserts association, `api_requests`, generic
+request-retention pin, `api_request_queue`, and replica pointer before the same
+commit. Queue visibility occurs only after every paid effect fence and binding
+is durable.
 
 Serve047 adds one nullable `replicas.non_pool_launch_authorization` JSONB
 scalar for planner evidence that was previously process-local. It is populated

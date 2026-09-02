@@ -1158,7 +1158,9 @@ MAX_NUMBER_OF_SERVICES_REACHED_ERROR = 'Max number of services reached'
 # create-operation state. Protocol-v13 binds paid AWS replacement creates to
 # the exact account identity. Protocol-v14 checkpoints a full-fresh paid Spot
 # provider allocation before runtime setup and applies its pool feedback once.
+# Protocol-v15 scopes every fresh GCP paid pool/profile to the exact project
+# and rechecks that project at the terminal provider mutation boundary.
 # Every live API, controller, and executor participant and every service
 # capability tuple must agree before a new paid provider effect can rely on
 # these semantics; adjacent cohorts remain settlement-only.
-NON_POOL_CAPABILITY_COHORT_EPOCH = 14
+NON_POOL_CAPABILITY_COHORT_EPOCH = 15
