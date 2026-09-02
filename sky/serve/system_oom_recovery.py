@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 from typing import Any
+import uuid
 
 from sky import sky_logging
 from sky import skypilot_config
@@ -667,6 +668,9 @@ _V3_COMMON_CONTEXT_KEYS = frozenset({
     constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY,
     constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY,
     constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY,
+    constants.REPLICA_LAUNCH_FENCE_LIFECYCLE_EPOCH_KEY,
+    constants.REPLICA_LAUNCH_FENCE_CONTROLLER_INCARNATION_KEY,
+    constants.REPLICA_LAUNCH_FENCE_CONTROLLER_OWNER_EPOCH_KEY,
     constants.SYSTEM_OOM_RECOVERY_REPLICA_ID_KEY,
     constants.SYSTEM_OOM_RECOVERY_LAUNCH_GENERATION_KEY,
     constants.SYSTEM_OOM_RECOVERY_WORKSPACE_KEY,
@@ -744,6 +748,8 @@ def _validate_v3_context(value: object, *, bound: bool) -> dict[str, Any]:
             is None):
         raise ValueError('runtime image digest is invalid')
     for key in (constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY,
+                constants.REPLICA_LAUNCH_FENCE_LIFECYCLE_EPOCH_KEY,
+                constants.REPLICA_LAUNCH_FENCE_CONTROLLER_OWNER_EPOCH_KEY,
                 constants.SYSTEM_OOM_RECOVERY_REPLICA_ID_KEY,
                 constants.SYSTEM_OOM_RECOVERY_LAUNCH_GENERATION_KEY):
         if (type(context[key]) is not int or  # pylint: disable=unidiomatic-typecheck
@@ -755,6 +761,16 @@ def _validate_v3_context(value: object, *, bound: bool) -> dict[str, Any]:
         raise ValueError('controller PID is invalid')
     if not (controller_ip is None or isinstance(controller_ip, str)):
         raise ValueError('controller IP is invalid')
+    controller_incarnation = context[
+        constants.REPLICA_LAUNCH_FENCE_CONTROLLER_INCARNATION_KEY]
+    if not isinstance(controller_incarnation, str):
+        raise ValueError('controller incarnation is invalid')
+    try:
+        parsed_controller_incarnation = uuid.UUID(controller_incarnation)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError('controller incarnation is invalid') from error
+    if str(parsed_controller_incarnation) != controller_incarnation:
+        raise ValueError('controller incarnation is invalid')
     form_key = (constants.SYSTEM_OOM_RECOVERY_BOUND_REQUEST_ID_KEY
                 if bound else constants.SYSTEM_OOM_RECOVERY_LAUNCH_NONCE_KEY)
     form_value = context[form_key]
@@ -836,10 +852,11 @@ def new_launch_nonce() -> str:
     return secrets.token_hex(32)
 
 
-def create_unbound_launch_context(intent: object, *, service_name: object,
-                                  service_version: object,
-                                  controller_pid: object,
-                                  controller_ip: object) -> dict[str, Any]:
+def create_unbound_launch_context(
+        intent: object, *, service_name: object, service_version: object,
+        service_lifecycle_epoch: object, controller_pid: object,
+        controller_ip: object, controller_incarnation: object,
+        controller_owner_epoch: object) -> dict[str, Any]:
     """Create the sole closed endpoint context from a persisted intent."""
 
     def _field(name: str) -> object:
@@ -870,6 +887,10 @@ def create_unbound_launch_context(intent: object, *, service_name: object,
         constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: service_version,
         constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: controller_pid,
         constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: controller_ip,
+        constants.REPLICA_LAUNCH_FENCE_LIFECYCLE_EPOCH_KEY: service_lifecycle_epoch,
+        constants.REPLICA_LAUNCH_FENCE_CONTROLLER_INCARNATION_KEY:
+            str(controller_incarnation),
+        constants.REPLICA_LAUNCH_FENCE_CONTROLLER_OWNER_EPOCH_KEY: controller_owner_epoch,
         constants.SYSTEM_OOM_RECOVERY_REPLICA_ID_KEY: _field('replica_id'),
         constants.SYSTEM_OOM_RECOVERY_LAUNCH_GENERATION_KEY:
             _field('launch_generation'),

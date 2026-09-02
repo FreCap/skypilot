@@ -32,7 +32,8 @@ scale/traffic/drain receipt and clean `boltz-l4-fleet` recreation remain open.
 The `spot-e2e-0902a` attempt committed its first 100-member paid wave but
 exposed both a load-balancer cold-queue liveness defect and unbounded aggregate
 controller remote-I/O fan-out before the traffic receipt. Both defects are
-source-corrected and unpaid-interface-qualified in this checkpoint;
+source-corrected and production-interface component-qualified in this
+checkpoint;
 homogeneous deployment and billable requalification remain.** One
 PostgreSQL-authoritative planner
 is the canonical source path for reservation-aware actuation and paid Spot
@@ -69,32 +70,86 @@ cgroup allocation is no longer observable, so this evidence does not attribute
 every byte, but it disproves retained launch YAML as the dominant allocation
 and identifies an unbounded aggregate fan-out in the production source.
 
-The source-only correction gives one service owner a 32-worker aggregate
-remote-I/O budget. Explicit 16-worker readiness and job-status lanes sum to the
-one authority. Every production probe producer uses the readiness lane and
-every phased or unphased job-status producer uses the job-status lane. This
-avoids the FIFO convoy in which readiness workers wait for an incompatible
-provider phase while the phase owner's status children are queued behind them.
-Controller job status skips Skylet because tunnel repair happens before its RPC
-deadline. It instead uses one direct SSH/Kubernetes command with a hard
-10-second timeout; 100 worst-case calls therefore drain in seven batches, or at
-most 70 seconds. One ordinary 15-second readiness wave drains in at most 105
-seconds. Even the ordered recovery path's 15-second endpoint probe followed by
-the bounded status command takes at most 175 seconds for 100 replicas, below the
-five-minute provider-scale gate and 600-second request deadline.
+Merged PR #1874 gives one service owner a 72-worker aggregate
+remote-I/O budget. Explicit 48-worker readiness and 24-worker job-status lanes
+sum to that one authority. Their queues are hard-bounded at 48 items each, so
+the process admits at most 168 active-plus-queued remote operations. Every
+production probe producer uses the readiness lane and every phased or unphased
+job-status producer uses the job-status lane. This avoids the FIFO convoy in
+which readiness workers wait for an incompatible provider phase while the
+phase owner's status children are queued behind them. Controller job status
+skips Skylet because tunnel repair happens before its RPC deadline. It instead
+uses one direct SSH/Kubernetes command with a hard 10-second timeout. At the
+provider qualifier's explicit N=800 bound, the readiness lane drains a
+15-second endpoint wave in at most ``ceil(800 / 48) * 15 = 255`` seconds and the
+status lane drains in at most ``ceil(800 / 24) * 10 = 340`` seconds. Queue
+rejection prevents fleet cardinality from becoming resident queue cardinality;
+the controller schedules lane-sized waves instead.
 
-The clean-process scheduling integration test saturates both lanes with 100
-fake calls each, asserts an aggregate peak of 32 threads and bounded resident
-memory, and proves job-status progress while every readiness worker is blocked
-on the opposite phase. Separate producer-wiring tests enter the production
-probe and job-status methods and require their exact lane and status deadline.
-These are component/process integration gates, not full unpaid provider E2E;
-the latter requires the existing typed provider facet to subsume the remaining
-direct AWS/GCP observation and cleanup calls before one stateful fake can
-replace only provider I/O. This checkpoint changes no provider, placement,
-scheduler, database, Helm, storage, or memory-limit policy. It is
-source-qualified in this checkpoint; homogeneous deployment and current-writer
-qualification remain.
+That 72-worker owner bounds blocking readiness/provider and job-status I/O; it
+does not include the two existing asynchronous route-lease state machines.
+They answer different safety questions. The manager-local lease proves one
+exact recovery process/attempt and feeds the load balancer's constant-time
+heartbeat; the PostgreSQL lease proves renewable generic readiness and feeds
+provider-free route composition. In the current transitional topology each has
+one persistent event-loop thread and a connector acquisition limit of 1,000,
+so at most 2,000 route requests are active at once alongside 72 active blocking
+operations, 96 queued blocking operations, one in-flight route receipt batch,
+and at most 1,000 coalesced pending receipts. A connector limit alone does not
+bound idle connections retained across endpoint churn; pinning one TLS context
+per lifecycle restores steady-state reuse, but a cardinality-enforced idle-pool
+bound remains part of the transport-consolidation gate. Recovery-capable rows
+may appear in both route sources; ordinary rows appear only in the durable
+source. This is an explicit existing active-work bound, not the intended final
+ownership topology.
+
+Before merging the route transports, synchronous PostgreSQL target reads and
+composition must become bounded single-flight work outside the probe event
+loop. The eventual single transport owner must be selected before either
+daemon starts, preserve the manager state machine during indefinite PostgreSQL
+stalls, enforce at most one exact target generation per numeric replica, and
+share an HTTP result only when method, URL, headers, payload and timeout are
+identical. Cancellation publishes no negative result, and one target or sink
+failure cannot cancel siblings. This consolidation has a separate removal gate
+because combining the two authorities without those invariants is less safe
+than the bounded transitional topology.
+
+The clean-process scheduling integration test saturates both lanes, asserts an
+aggregate peak of exactly 72 threads, hard queue bounds, bounded resident
+memory, terminal shutdown, and job-status progress while every readiness
+worker is blocked on the opposite phase. Separate producer-wiring tests enter
+the production probe and job-status methods and require their exact lane and
+status deadline. A durable provider-inventory component gate loads the real
+controller-scoped plugin in two fresh spawned processes and proves delayed
+visibility, provider disappearance after restart, aggregate-only dispatch, and
+zero singleton fallback.
+
+These are honestly classified component/process integration gates, not full
+unpaid provider E2E. The registered provider facet now owns aggregate instance
+inventory, but a real public Serve launch still reaches built-in cloud
+credential, identity, image/catalog, and SSH/Ray-worker surfaces before or
+after that facet. The unpaid E2E gate remains open until those effects can be
+replaced at one narrow production interface; deep controller/database monkey
+patches are not accepted as a substitute. This checkpoint changes no provider,
+placement, scheduler, database schema, Helm, storage, or memory-limit policy.
+PR #1874 is merged and its release artifact exists; homogeneous production
+deployment and current-writer qualification remain. PR #1875 is also merged
+and makes the paid qualifier's lifecycle and exact cleanup one owned operation.
+The subsequent observer-fence checkpoint is source-qualified but not yet
+merged, built, deployed, activated, or production-proven.
+
+The clean unpaid-E2E prerequisite is one atomically registered typed provider
+bundle that owns cloud planning/identity/configuration, the complete
+materialize/observe/retire lifecycle (including volumes, ports, custom network
+cleanup and runtime command transport), and aggregate inventory. A provider
+declared through that complete bundle must fail closed on an absent operation;
+it must never fall through to a built-in cloud implementation. Only then may a
+durable ``unpaidtest`` provider run public ``serve up`` through the real API,
+load balancer, controller and executor processes against PostgreSQL and a real
+ephemeral Kubernetes control plane. Its event ledger must be the negative
+control for any provider-boundary bypass. Until this production boundary
+exists, the component gates above are the strongest honest deterministic
+coverage and the real AWS/GCP qualifier remains the end-to-end provider gate.
 
 The cold ``spot-e2e-0901k`` campaign reached 113
 concurrent provider-``RUNNING`` GCP Spot L4 VMs and returned its complete
@@ -284,7 +339,7 @@ structural unit test proves 10,000 zero-capacity dispatch polls never traverse
 the resident queue, and cancellation tests prove an abandoned waiter cannot
 consume a newly available exact-card slot. The serial, resource-heavy unpaid
 production-interface test in
-``tests/integration_tests/test_lb_cold_queue_e2e.py`` starts the real
+``tests/integration_tests/test_lb_cold_queue_component.py`` starts the real
 load-balancer process, queues 10,000 HTTP requests against zero ready replicas,
 waits through the disconnect-poll interval, probes the public liveness and
 capacity endpoints, observes the production demand-report contract at the fake
@@ -1912,6 +1967,9 @@ it has merged or been deployed.
 | Source base | Merged PR #1857 extends each accepted capacity-admission wave through its complete executable request graph. It prepares canonical request bytes provider-free, then commits plan/head/policy, debit, replica, claim, association, request, retention pin, queue row, and replica pointer all-or-none in one checkout and one atomic correctness commit. The existing optional minute-history projection then commits or rolls back best-effort on the same checkout. The durable queue is the recovery source; postcommit controller workers are optional adopters, not a correctness handoff. The controller and repository share one 100-member atomic-wave bound while the service target, paid cap, provider window, and launch concurrency remain independent. Paid-wave fairness is computed only across active, positively priced, exact-shape AWS/GCP Spot catalog cards, so configured reserved-only A100/A100-80GB/H200 cards consume no L4 transaction slots. Real PostgreSQL converges a 420-member target as 100/100/100/100/20 fresh generations and rejects a deliberately stale successor without changing the first graph. Merged PR #1854 is the sole provider-native AWS/GCP qualifier. Source merge and homogeneous deployment are complete; live qualification remains open. Neither PR changes a scheduler object, infrastructure, EFS/PVC, or provider placement policy. Serve067 is additive control-plane DDL that aligns existing constraints and guards without a table or service-data rewrite. |
 | Immutable planner correction | **The plan/replica/claim fusion and its extension through atomic request binding are deployed homogeneously; current-writer provider qualification remains open.** One keyword-only frozen snapshot feeds one pure durable logical planner invocation. Its typed candidate separately records cold demand attribution, supply-aware actuation, warm/transition retention, reservation commitments and whole-backend padding, genuine paid residual and cap-bounded cold-launch authority, completeness/infeasibility, source generation, and snapshot/candidate fingerprints. The current writer locks the elected version, exact server-owned service YAML, semantic controller configuration, catalog ordering, controller incarnation/owner epoch, demand, route, allocation, capacity/Kueue, prior plan, pools and dependent effects; invokes the planner once; and commits the exact accepted wave plus its complete generic request graph before releasing the service-row lock. Provider launch materialization consumes the exact committed spec/config/catalog/project evidence. Only disposable observations update postcommit. PR #1786 already carries exact per-node width times task-authoritative node count for physical backends. Lifecycle 152 emitted multiple schema-6 successor heads and paid waves, but its recovery failures prevented a complete scale receipt; its full cleanup graph is now exact zero. |
 | Deployed control plane | A fresh in-pod provenance query verifies healthy SkyPilot release `1.1.1618`, source commit `a89f13aa679ab369dcd766f9f991b19ca912db29`, and build 9936 for API, controller, and executor. Helm revision 739 resolves API, controller, executor, migration, and GCP-login-init containers to `1.1.1618@sha256:4493ced98d965d621bf0891968425854446b3c5a479e583c5ab8fb5c8d55143d`; two API, two controller, and seven executor Pods are updated, available, and Ready. Every fresh participant advertises non-pool capability cohort 15, and the ordinary, exact non-pool binding, and ordered-capacity-admission production predicates return true. PostgreSQL remains the sole central store, Helm storage is disabled, and both prepared physical launch limits remain 420. The rollout changed no scheduler, platform, infrastructure, EFS/PVC, or provider-policy configuration. |
+| Controller remote I/O | **Merged in PR #1874; not deployed or production-proven.** One controller owns 72 remote-I/O workers split into 48-readiness and 24-job-status progress lanes, with at most 48 queued items per lane. Provider inventory is aggregate-only, probe/status work is admitted in bounded waves, and persistent route polling owns one TLS/session lifecycle and isolates cancellation and target-local failures. Component gates exercise the production scheduling/handler boundaries at 800 rows, prove 72 aggregate workers and bounded queues/memory, and prohibit singleton provider lookup. This is not described as unpaid provider E2E. |
+| Replica observation persistence | **Source-qualified; merge, deployment, and live proof remain.** One frozen `ReplicaObserverOwnerFence` carries service/hash/lifecycle plus PID/IP/incarnation/owner epoch from controller claim through manager construction. Readiness and exact-status reducers commit only their owned fields in deterministic replica-ID windows of at most 256 rows, atomically revoke ineligible routes, and complete each accepted window's postcommit work before opening the next. Real PostgreSQL rejects same-PID/IP successor writers across all singleton operations, isolates every observation-field drift without overwriting launch/recovery state, bounds locks/statements, and proves reversed 257-row input commits the same first 256 rows before a second-window failure. There is no ownerless production fallback or process-local feature flag. |
+| Paid qualifier lifecycle | **Merged in PR #1875; the real current-writer campaign remains.** One runner owns service creation, qualification, normal down, lost-acknowledgement scope recovery, provider-native cleanup, and immutable receipts. AWS census covers its bounded region set concurrently on a monotonic cadence, GCP and AWS evidence join into one exact provider projection, and every Sky CLI command can pin the exact `mt_hybrid` workspace rather than inheriting the API Pod's `default` workspace. |
 | Fixed paid pacing | **Deployed since `1.1.1578`; final fast-scale qualification remains.** Durable logical services use one configured fixed wave and PostgreSQL owns the accepted paid-window cursor across takeover. Campaign `spot-e2e-0901k` proved that the bounded 120-unit service window no longer truncates the target; its delayed second wave identified terminal-only provider feedback as the remaining latency source. |
 | Atomic plan and paid admission | **Atomic executable-request binding is deployed homogeneously in `1.1.1618`; live provider qualification remains open.** The current writer invokes the one planner and inserts the accepted wave plus association/request/queue/pin/pointer before releasing the service-row lock. No freshness comparator or TTL is relaxed. There is no second request-admission transaction, singleton fanout, batch-to-singleton fallback, or process-local recovery handoff. Release `1.1.1583` separately closed restart-adoption mutation by making existing-claim replay validation-only. |
 | Paid restart replay and frozen cleanup | **The replay correction, historical repair, and final row settlement are production-complete; the temporary repair is ready for removal.** Recovery supplied priority 0 to an adoption UPSERT that rewrote nine existing priority-20 claims after their profiles were frozen. Release `1.1.1583` made existing claim replay/adoption validation-only and deployed a cleanup-only transition accepting solely a current priority of 0 whose historical-priority reconstruction exactly matches the frozen profile. Production released all nine claims. Release `1.1.1584` then consumed each exact same-record irreversible `COMMITTED` receipt atomically with its replica; supported cleanup also settled the two older `ACTIVE` rows. The affected PostgreSQL graph reached exact zero and stayed provider/cleanup-clean for 372 seconds, satisfying the strict-removal gate. |
@@ -3094,26 +3152,29 @@ The fleet manager lock protects short in-memory reductions. It must never be a
 lease for slow or blocking work.
 
 Readiness HTTP and remote job-status transport share one per-service aggregate
-remote-I/O budget of 32 workers. They must not own independently bounded pools:
+remote-I/O budget of 72 workers. They must not own independently bounded pools:
 ``256 + 256`` is still a 512-worker process fan-out when the supervised daemons
-overlap. Explicit 16/16 readiness/job-status duty lanes sum to the one budget
+overlap. Explicit 48-readiness/24-job-status duty lanes sum to the one budget
 and exist only to preserve progress when a status caller owns a provider phase.
-They are not separate concurrency authorities or policies. Terminal shutdown
-closes the owner before retiring either lane; no racing producer may recreate a
-pool. Component/process coverage must run both lanes concurrently through this
-production owner and assert the aggregate active count, worker count, memory
-high-water delta, terminal shutdown, and progress under an
-incompatible-provider-phase queue. Producer-wiring tests must also prove the
-real probe and job-status call sites cannot bypass or misclassify that owner.
+Each lane admits at most another 48 queued items, so the process owns at most
+72 active plus 96 queued remote operations regardless of fleet size. These are
+not separate concurrency authorities or policies. Terminal shutdown closes the
+owner before retiring either lane; no racing producer may recreate a pool.
+Component/process coverage runs both lanes concurrently through this production
+owner and asserts the aggregate active count, worker count, bounded queues and
+memory, terminal shutdown, and progress under an incompatible-provider-phase
+queue. Producer-wiring tests prove the real probe and job-status call sites
+cannot bypass or misclassify that owner.
 
 Every controller job-status transport in these lanes skips Skylet and its
 potentially unbounded tunnel-repair prelude, then uses the direct SSH/Kubernetes
-command runner with a hard 10-second timeout. Seven 16-worker batches therefore
-take at most 70 seconds. Ordinary endpoint readiness takes at most seven
-15-second batches, or 105 seconds. The longest ordered recovery probe can spend
-15 seconds on the endpoint plus the 10-second status command per batch, or at
-most 175 seconds for 100 replicas. Healthy, refused, and status-only calls
-normally free their slots much sooner.
+command runner with a hard 10-second timeout. At the paid qualifier's enforced
+``N = 800`` bound, job status takes at most
+``ceil(800 / 24) * 10 = 340`` seconds and ordinary endpoint readiness takes at
+most ``ceil(800 / 48) * 15 = 255`` seconds. A fully ordered two-stage wave is
+therefore bounded by 595 seconds; at one 100-replica atomic admission wave the
+same bound is 95 seconds. Healthy, refused, and status-only calls normally free
+their slots much sooner.
 
 The required probe/reconcile shape is:
 
@@ -3121,7 +3182,8 @@ The required probe/reconcile shape is:
 2. perform provider-fenced reads outside the manager lock;
 3. perform HTTP, URL resolution, Kubernetes, provider, SSH, join, cancel, and
    readiness waits outside the manager lock;
-4. exact-reread current records and apply one short reducer/CAS under the lock;
+4. reduce immutable rows without I/O, then commit field-scoped patches in
+   canonical replica-ID windows of at most 256 under the manager writer lock;
 5. enqueue durable cleanup claims under the lock but execute cleanup outside;
 6. carry exact replica record, owner, and worker identity in every completion;
 7. discard a stale completion with zero side effects, even if its numeric
@@ -3152,12 +3214,32 @@ external teardown is bounded by `D = 2P`, inline launch cleanup by `P`, and the
 absolute simultaneous `core.down` bound is `D + P = 3P`; the launch reservation
 cannot be released until the inline cleanup returns.
 
-The current deployed release does not yet satisfy this completely. The source
-candidate in `fix/serve-probe-scale-convoy-v3` moves the remaining probe,
-preemption, thread refresh, URL resolution, and completion paths across this
-boundary. It remains unmerged and unproven in production. The aggregate
-remote-I/O correction is also source-only and must merge into that one steady
-state before the current-writer billable qualification resumes.
+Merged PR #1874 moves the remaining probe, preemption, thread refresh, URL
+resolution, and completion paths across the shared 72-worker boundary. Its
+clean-process component gate saturates both lanes, proves an aggregate peak of
+exactly 72, bounded queues and memory, terminal worker release, and job-status
+progress while all 48 readiness workers wait on the opposite provider phase.
+The correction is source-complete but not deployed or current-writer
+production-proven. Merged PR #1875 makes one lifecycle runner own paid service
+creation, qualification, normal down, scope recovery, and exact provider
+cleanup; every CLI operation is pinned to the explicitly selected workspace.
+
+The current source checkpoint additionally replaces stale whole-row probe
+writes with one policy-independent observer protocol. Each transaction proves
+the service name/hash and lifecycle epoch plus PID/IP, controller incarnation,
+and monotonically changing owner epoch. It then locks and validates at most 256
+rows in canonical replica-ID order, compares exact record/version/recovery and
+probe-owned state, applies only the health/recovery fields owned by that
+observer, and revokes any now-ineligible route in the same transaction. A
+window's placement persistence, teardown wakeup, uptime, and route publication
+finish before the next window begins. Real-PostgreSQL regressions rotate
+incarnation or owner epoch while retaining PID/IP, drift every probe-owned
+field while preserving launch/recovery-owned fields, and reverse a 257-row
+input before failing transaction two; both orders commit the same lowest 256
+rows and finish their postcommit effects. The old process-local
+changed-readiness feature switch is deleted rather than retained as a second
+path. This checkpoint is source-qualified and awaiting merge, homogeneous
+deployment, and current-writer proof.
 
 Separately, the atomic-wave materializer can still create up to 100 local
 adopter thread objects after commit. PostgreSQL queue visibility is already the
@@ -4067,16 +4149,20 @@ these remaining current-writer acceptance gates:
    PostgreSQL remains the sole central store, Helm storage remains disabled,
    and both prepared physical launch limits remain 420. No scheduler,
    infrastructure, platform, EFS/PVC, or provider configuration changed.
-8. Homogeneously deploy both the cold-queue liveness correction and aggregate
-   32-worker controller remote-I/O owner without changing the controller
-   memory limit. Run the serial unpaid 10,000-request HTTP interface gate
-   against the release image. Also require the clean-process remote-I/O gate to
-   prove 100 readiness plus 100 job-status calls never exceed 32 active
-   workers, retain bounded memory, release every worker at terminal shutdown,
-   and let job-status children complete while all 16 readiness workers are
-   saturated on an incompatible phase. Producer-wiring tests must prove both
-   real callers select their exact lane and 10-second status bound. Only after
-   both pass, run the
+8. **Source complete; deployment and current-writer proof pending:** PR #1874
+   merged both the cold-queue liveness correction and aggregate 72-worker
+   controller remote-I/O owner. Its serial unpaid 10,000-request HTTP interface
+   gate and clean-process remote-I/O gate pass: concurrent readiness and
+   job-status saturation never exceeds 72 active workers, memory and both
+   48-item queues remain bounded, terminal shutdown releases every worker, and
+   job-status children complete while all 48 readiness workers are saturated
+   on an incompatible phase. Producer-wiring tests prove both real callers use
+   their exact lane and 10-second status bound. PR #1875 merged the sole paid
+   lifecycle owner. The following observer-fence checkpoint adds exact
+   six-field controller authority, deterministic 256-row PostgreSQL windows,
+   atomic route revocation, and per-window postcommit completion. Merge and
+   homogeneously deploy that combined source without changing the controller
+   memory limit, then run the
    provider-native scale profile against that exact image. Drive the
    800-logical-slot bounded Spot target to at least 100 provider-``RUNNING`` L4
    Spot VMs in aggregate within five minutes; do not require both providers to
@@ -4123,6 +4209,15 @@ these remaining current-writer acceptance gates:
 13. Retain the live multi-node paid physical-backend case as a full-design gate:
    charged paid units must equal per-node GPU width times task-authoritative node
    count while the pacing cursor advances in plan units.
+14. Complete the production provider substitution boundary described above,
+   then add the durable unpaid-provider E2E. It must run public service
+   creation, demand, 800-replica delayed convergence, controller restart with a
+   lost create acknowledgement, idempotent recovery, and delayed teardown
+   against PostgreSQL and ephemeral Kubernetes. The fake provider's exact
+   typed event ledger must prove no built-in cloud, port, volume, runtime, or
+   cleanup implementation was reached. This improves deterministic future
+   incident coverage; it does not replace the current-writer AWS/GCP acceptance
+   gate and is not a reason to delay the bounded fix-forward deployment.
 
 Zurich catalog activation is an independent capacity follow-up, not a blocker
 for fleet convergence. It remains gated on upstream source release, account

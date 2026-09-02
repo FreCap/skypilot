@@ -800,9 +800,14 @@ def test_system_recovery_persistence_fails_closed_on_sqlite(_mock_serve_db):
             'svc',
             1,
             _replica(1),
-            expected_service_hash='hash',
-            expected_lifecycle_epoch=1,
-            expected_controller_owner=(123, '10.0.0.1'),
+            owner_fence=serve_state.ReplicaObserverOwnerFence(
+                service_name='svc',
+                service_hash='hash',
+                service_lifecycle_epoch=1,
+                controller_pid=123,
+                controller_ip='10.0.0.1',
+                controller_incarnation=uuid.uuid4(),
+                controller_owner_epoch=1),
             expected_revision=0)
 
 
@@ -890,22 +895,33 @@ def test_system_recovery_transaction_advances_revision_once(
     desired.system_recovery_launch_intent = intent
     desired.system_recovery_disposition = (
         recovery_state.SystemRecoveryDisposition.CANDIDATE)
+    with engine.connect() as connection:
+        service_owner = connection.execute(
+            sqlalchemy.select(
+                serve_state.services_table.c.controller_incarnation,
+                serve_state.services_table.c.controller_owner_epoch).where(
+                    serve_state.services_table.c.name == 'svc')).one()
+    observer_fence = serve_state.ReplicaObserverOwnerFence(
+        service_name='svc',
+        service_hash='service-hash',
+        service_lifecycle_epoch=1,
+        controller_pid=owner[0],
+        controller_ip=owner[1],
+        controller_incarnation=service_owner.controller_incarnation,
+        controller_owner_epoch=service_owner.controller_owner_epoch)
     candidate = serve_state.create_replica_system_recovery_candidate(
-        'svc',
-        7,
-        desired,
-        expected_service_hash='service-hash',
-        expected_lifecycle_epoch=1,
-        expected_controller_owner=owner,
-        expected_revision=0)
+        'svc', 7, desired, owner_fence=observer_fence, expected_revision=0)
     assert candidate.system_recovery_revision == 1
 
     unbound = system_oom_recovery.create_unbound_launch_context(
         intent,
         service_name='svc',
         service_version=3,
+        service_lifecycle_epoch=1,
         controller_pid=owner[0],
-        controller_ip=owner[1])
+        controller_ip=owner[1],
+        controller_incarnation=service_owner.controller_incarnation,
+        controller_owner_epoch=service_owner.controller_owner_epoch)
     bound = serve_state.bind_replica_system_recovery_launch_request(
         unbound, 'request-1')
     assert bound.launch_request_id == 'request-1'

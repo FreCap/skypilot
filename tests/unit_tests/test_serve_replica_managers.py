@@ -1844,6 +1844,41 @@ def _make_manager(service_name='svc', next_replica_id=1):
     return mgr
 
 
+def test_system_recovery_mutation_fence_is_installed_and_has_no_db_io():
+    manager = _make_manager()
+    manager._service_hash = 'service-hash'
+    manager._controller_owner = (123, '10.0.0.2')
+    authority = (
+        replica_managers.system_recovery_persistence.ReplicaObserverOwnerFence(
+            service_name='svc',
+            service_hash='service-hash',
+            service_lifecycle_epoch=4,
+            controller_pid=123,
+            controller_ip='10.0.0.2',
+            controller_incarnation=uuid.UUID(
+                '33333333-3333-4333-8333-333333333333'),
+            controller_owner_epoch=6))
+    manager._replica_observer_owner_fence = authority
+
+    with mock.patch.object(
+            replica_managers.serve_state,
+            'get_service_controller_owner',
+            side_effect=AssertionError('unexpected database read')) as db_read:
+        assert manager._system_recovery_mutation_fence() is authority
+        rejected_authorities = (
+            None,
+            object(),
+            dataclasses.replace(authority, service_name='other-service'),
+            dataclasses.replace(authority, service_hash='other-hash'),
+            dataclasses.replace(authority, controller_pid=456),
+            dataclasses.replace(authority, controller_ip='10.0.0.3'),
+        )
+        for rejected_authority in rejected_authorities:
+            manager._replica_observer_owner_fence = rejected_authority
+            assert manager._system_recovery_mutation_fence() is None
+    db_read.assert_not_called()
+
+
 def _provider_free_paid_manager(next_replica_id=1):
     manager = _make_manager(next_replica_id=next_replica_id)
     manager._service_hash = 'hash'
@@ -5381,9 +5416,9 @@ def test_v2_job_status_batch_reuses_one_physical_uid_proof():
             with scope_lock:
                 active_scopes -= 1
 
-    def _consume(results, *, provider_error_phase_mode):
+    def _consume(results, *, provider_error_phase_mode, **_kwargs):
         assert provider_error_phase_mode is (
-            replica_managers.provider_phase.ProviderPhaseMode.V2_FENCED)
+            replica_managers.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY)
         for _, _, result in results:
             result.result()
 
@@ -5497,9 +5532,9 @@ def test_kubernetes_capable_recovery_retains_exact_remote_job_status():
         mock.Mock(source_handle=handle, transport=transport, error=None)
     ])
 
-    def _consume(results, *, provider_error_phase_mode):
+    def _consume(results, *, provider_error_phase_mode, **_kwargs):
         assert provider_error_phase_mode is (
-            replica_managers.provider_phase.ProviderPhaseMode.V2_FENCED)
+            replica_managers.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY)
         for _, _, result in results:
             result.result()
 
@@ -5558,9 +5593,7 @@ def test_ordinary_kubernetes_endpoint_owns_detached_job_liveness(
     mgr._get_readiness_headers = mock.Mock(return_value=None)
     mgr._is_interruptible_replica = mock.Mock(return_value=False)
     mgr._consecutive_failure_threshold_timeout = mock.Mock(return_value=30)
-    mgr._persist_replicas = mock.Mock()
     mgr._terminate_replica = mock.Mock()
-    mgr._changed_only_readiness_persistence = False
     mgr._handle_job_status_results = mock.Mock()
 
     # Model an already-exited detached job. If exact status were consulted it
@@ -5596,21 +5629,22 @@ def test_ordinary_kubernetes_endpoint_owns_detached_job_liveness(
     backend.get_job_status.assert_not_called()
     backend.get_job_status_with_system_recovery.assert_not_called()
     mgr._handle_job_status_results.assert_not_called()
-    assert info.status_property.service_ready_now is endpoint_ready
+    reduced = snapshot[0]
+    assert reduced.status_property.service_ready_now is endpoint_ready
     if expected_termination:
         # Probe reduction persists a durable teardown intent and wakes the
         # canonical cleanup refresher; it no longer starts provider cleanup
         # while holding the fleet mutex.
         mgr._terminate_replica.assert_not_called()
-        assert info.status_property.is_scale_down is False
-        assert (info.status_property.sky_down_status ==
+        assert reduced.status_property.is_scale_down is False
+        assert (reduced.status_property.sky_down_status ==
                 common_utils.ProcessStatus.SCHEDULED)
         assert mgr._launch_completion_event.is_set()
-        assert snapshot == [info]
+        assert reduced.replica_id == info.replica_id
     else:
         mgr._terminate_replica.assert_not_called()
-        assert info.first_consecutive_failure_time is None
-        assert snapshot == [info]
+        assert reduced.first_consecutive_failure_time is None
+        assert reduced.replica_id == info.replica_id
 
 
 def test_exact_non_kubernetes_job_status_does_not_hold_kubernetes_phase():
@@ -5625,6 +5659,7 @@ def test_exact_non_kubernetes_job_status_does_not_hold_kubernetes_phase():
     handle = replica_managers.backends.CloudVmRayResourceHandle.__new__(
         replica_managers.backends.CloudVmRayResourceHandle)
     handle.cluster_name = info.cluster_name
+    handle.launched_nodes = 1
     handle.launched_resources = types.SimpleNamespace(cloud=clouds.GCP(),
                                                       region='us-central1')
     records = {
@@ -5703,6 +5738,7 @@ def test_non_kubernetes_job_status_error_takes_phase_before_manager_lock():
     handle = replica_managers.backends.CloudVmRayResourceHandle.__new__(
         replica_managers.backends.CloudVmRayResourceHandle)
     handle.cluster_name = info.cluster_name
+    handle.launched_nodes = 1
     handle.launched_resources = types.SimpleNamespace(cloud=clouds.GCP(),
                                                       region='us-central1')
     records = {
@@ -5728,20 +5764,28 @@ def test_non_kubernetes_job_status_error_takes_phase_before_manager_lock():
         mock.Mock(source_handle=handle, transport=transport, error=None)
     ]
 
-    def _classify_liveness(fresh, *, phase_admission, handle):
-        assert fresh is info
-        assert handle is records[info.cluster_name]['handle']
-        assert phase_admission is not None
+    def _classify_liveness(handles, provider_configs, *, deadline_monotonic):
+        del deadline_monotonic
+        assert handles == {1: handle}
+        assert provider_configs == {1: {'region': 'us-central1'}}
         lease = (replica_managers.provider_phase._PROVIDER_PHASE_GATE.
                  _current_lease())
         assert lease is not None
         assert lease.mode == (
             replica_managers.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY)
         liveness_checked.set()
-        return replica_managers._PreemptionPrefilterResult(
-            replica_managers._PreemptionPrefilterDisposition.LIVE_OR_UNPROVEN)
-
-    mgr._cloud_instance_looks_alive = mock.Mock(side_effect=_classify_liveness)
+        return {
+            1: replica_managers.provider_facets.
+               InstanceStatusInventoryObservationV1(
+                   query_id='1',
+                   disposition=(replica_managers.provider_facets.
+                                InstanceStatusInventoryDispositionV1.OBSERVED),
+                   entries=(replica_managers.provider_facets.
+                            InstanceStatusInventoryEntryV1(
+                                instance_id='instance-1',
+                                status=replica_managers.status_lib.
+                                ClusterStatus.UP),))
+        }
 
     def _fetch():
         try:
@@ -5761,6 +5805,14 @@ def test_non_kubernetes_job_status_error_takes_phase_before_manager_lock():
          mock.patch.object(replica_managers.backends,
                            'CloudVmRayBackend',
                            return_value=backend), \
+         mock.patch.object(
+             replica_managers.serve_utils,
+             'get_provider_configs_for_handles',
+             return_value={1: {'region': 'us-central1'}}), \
+         mock.patch.object(
+             replica_managers.backend_utils,
+             'query_cluster_instance_statuses_batch',
+             side_effect=_classify_liveness) as inventory, \
          mock.patch.object(
              replica_managers.request_postgres,
              'inspect_bound_ordinary_launch',
@@ -5792,8 +5844,7 @@ def test_non_kubernetes_job_status_error_takes_phase_before_manager_lock():
 
     assert not errors
     assert not fetch_thread.is_alive()
-    mgr._cloud_instance_looks_alive.assert_called_once_with(
-        info, phase_admission=mock.ANY, handle=handle)
+    inventory.assert_called_once()
 
 
 def test_v2_cloud_liveness_uid_mismatch_is_unknown_not_preempted():
@@ -5895,7 +5946,7 @@ def test_v2_forced_preemption_uid_mismatch_never_refreshes_or_marks_loss():
     assert info.status_property.preempted is False
 
 
-def test_v2_exact_absence_preemption_skips_refresh_but_schedules_down():
+def test_v2_command_error_never_uses_singleton_presence_probe():
     info = replica_managers.ReplicaInfo(replica_id=1,
                                         cluster_name='svc-1',
                                         replica_port='8080',
@@ -5906,29 +5957,26 @@ def test_v2_exact_absence_preemption_skips_refresh_but_schedules_down():
     _stamp_protocol_v2_fill(info)
     info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
     mgr = _make_manager()
-    cleanup_fence = (replica_managers.reserved_capacity.
-                     parse_protocol_v2_cleanup_fence(info))
-    receipt = replica_managers._ExactKubernetesAbsenceProof(
-        cleanup_fence=cleanup_fence,
-        cluster_name=info.cluster_name,
-        replica_record_id=info.replica_record_id)
-
     failed = mock.Mock()
     failed.result.side_effect = exceptions.CommandError(255, 'status', 'lost',
                                                         None)
-    liveness = replica_managers._PreemptionPrefilterResult(
-        replica_managers._PreemptionPrefilterDisposition.
-        EXACT_KUBERNETES_ABSENT, receipt)
+    plans = []
+
+    def _commit(batch):
+        plans.extend(batch)
+        return ({
+            plan.opening_info.replica_id: plan.desired_info for plan in batch
+        }, set())
+
     with mock.patch.object(
             replica_managers.provider_phase,
             'provider_phase',
             return_value=contextlib.nullcontext(mock.Mock())), \
          mock.patch.object(mgr,
-                           '_cloud_instance_looks_alive',
-                           return_value=liveness), \
-         mock.patch.object(replica_managers.serve_state,
-                           'get_replica_info_from_id',
-                           return_value=info), \
+                           '_cloud_instance_looks_alive') as singleton_probe, \
+         mock.patch.object(mgr,
+                           '_commit_probe_row_plans',
+                           side_effect=_commit), \
          mock.patch.object(mgr, '_persist_replica') as persist, \
          mock.patch.object(mgr, '_terminate_replica') as terminate:
         mgr._handle_job_status_results(
@@ -5936,11 +5984,13 @@ def test_v2_exact_absence_preemption_skips_refresh_but_schedules_down():
             provider_error_phase_mode=(
                 replica_managers.provider_phase.ProviderPhaseMode.V2_FENCED))
 
-    assert info.status_property.preempted is True
-    persist.assert_called_once_with(1, info)
-    terminate.assert_called_once_with(1,
-                                      replica_drain_delay_seconds=0,
-                                      is_scale_down=True)
+    singleton_probe.assert_not_called()
+    assert len(plans) == 1
+    assert not plans[0].effects.preempted
+    assert not plans[0].effects.teardown
+    assert plans[0].desired_info.status_property.preempted is False
+    persist.assert_not_called()
+    terminate.assert_not_called()
 
 
 def test_v2_exact_absence_preemption_rejects_same_id_replacement():
@@ -6037,6 +6087,7 @@ def test_invalid_recovery_job_rows_terminate_in_v2_then_ambient_phases():
     mgr = _make_manager()
     mgr._is_pool = False
     events = []
+    committed_plans = []
 
     @contextlib.contextmanager
     def _phase(mode):
@@ -6065,8 +6116,14 @@ def test_invalid_recovery_job_rows_terminate_in_v2_then_ambient_phases():
         finally:
             events.append('batch-exit')
 
-    mgr._terminate_replica = mock.Mock(side_effect=lambda replica_id, **_kwargs:
-                                       events.append(f'terminate-{replica_id}'))
+    def _commit(plans):
+        events.append('commit')
+        committed_plans.extend(plans)
+        return ({
+            plan.opening_info.replica_id: plan.desired_info for plan in plans
+        }, set())
+
+    mgr._commit_probe_row_plans = _commit
     with mock.patch.object(replica_managers.serve_state,
                            'get_replica_infos',
                            return_value=[ordinary, fenced]), \
@@ -6088,9 +6145,10 @@ def test_invalid_recovery_job_rows_terminate_in_v2_then_ambient_phases():
 
     assert events == [
         'batch-enter', 'batch-exit', 'v2-fenced-enter', 'v2-fenced-exit',
-        'terminate-1', 'ambient-legacy-enter', 'ambient-legacy-exit',
-        'terminate-2'
+        'ambient-legacy-enter', 'ambient-legacy-exit', 'commit'
     ]
+    assert [plan.opening_info.replica_id for plan in committed_plans] == [1, 2]
+    assert all(plan.effects.teardown for plan in committed_plans)
 
 
 def test_system_recovery_process_guards_are_pruned_to_live_dispositions():
@@ -6115,121 +6173,11 @@ def test_system_recovery_process_guards_are_pruned_to_live_dispositions():
     assert manager._system_recovery_status_initialized == {2}
 
 
-def test_system_recovery_cas_loss_never_targets_same_id_replacement():
-    manager = _make_manager()
-    snapshot = _system_recovery_replica(
-        1, recovery_state.SystemRecoveryDisposition.CANDIDATE)
-    replacement = copy.deepcopy(snapshot)
-    replacement.replica_record_id = str(uuid.uuid4())
-    manager._patch_system_recovery_with_latest = mock.Mock(return_value=None)
-    manager._terminate_replica = mock.Mock()
-    manager._persist_replica = mock.Mock()
-
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_replica_info_from_id',
-            return_value=replacement) as reread, \
-         mock.patch.object(
-             replica_managers.system_oom_recovery_observability,
-             'record_for_replica') as observe:
-        reconciled = manager._reconcile_system_recovery_status(
-            snapshot, job_lib.JobStatus.RUNNING, None,
-            job_lib.JobSystemRecoveryDetailStatus.ABSENT)
-
-    assert reconciled is False
-    reread.assert_not_called()
-    manager._persist_replica.assert_not_called()
-    manager._terminate_replica.assert_not_called()
-    observe.assert_not_called()
-
-
-def test_candidate_guard_is_dropped_on_concurrent_capable_promotion():
-    manager = _make_manager()
-    manager._candidate_release_monotonic_deadlines = {1: 101.0}
-    candidate = _system_recovery_replica(
-        1, recovery_state.SystemRecoveryDisposition.CANDIDATE)
-    promoted = _system_recovery_replica(
-        1, recovery_state.SystemRecoveryDisposition.CAPABLE)
-    manager._patch_system_recovery_with_latest = mock.Mock(
-        return_value=promoted)
-
-    updated, off_route, teardown, stale = manager._reduce_candidate_probe(
-        candidate,
-        succeeded=True,
-        probe_started_at=100.0,
-        probe_monotonic_started_at=100.0,
-        exact_job_nonterminal=True,
-        exact_detail_absent=True)
-
-    assert updated is promoted
-    assert off_route is True
-    assert teardown is False
-    assert stale is False
-    assert not manager._candidate_release_monotonic_deadlines
-
-
-def test_candidate_probe_cas_loss_is_stale_not_teardown():
-    manager = _make_manager()
-    manager._candidate_release_monotonic_deadlines = {1: 101.0}
-    candidate = _system_recovery_replica(
-        1, recovery_state.SystemRecoveryDisposition.CANDIDATE)
-    manager._patch_system_recovery_with_latest = mock.Mock(return_value=None)
-
-    updated, off_route, teardown, stale = manager._reduce_candidate_probe(
-        candidate,
-        succeeded=False,
-        probe_started_at=100.0,
-        probe_monotonic_started_at=100.0,
-        exact_job_nonterminal=False,
-        exact_detail_absent=False)
-
-    assert updated is candidate
-    assert off_route is True
-    assert teardown is False
-    assert stale is True
-    assert manager._candidate_release_monotonic_deadlines == {1: 101.0}
-
-
-def test_capable_status_guard_is_dropped_on_concurrent_exhaustion():
-    manager = _make_manager()
-    capable = _system_recovery_replica(
-        2, recovery_state.SystemRecoveryDisposition.CAPABLE)
-    exhausted = dataclasses.replace(
-        capable.system_recovery,
-        state=recovery_state.ControllerRecoveryState.EXHAUSTED,
-        completed_at=100.0)
-    capable.system_recovery = exhausted
-    manager._system_recovery_status_initialized = {2}
-    manager._patch_system_recovery_with_latest = mock.Mock(return_value=capable)
-
-    _, reduction, stale = manager._reduce_capable_probe(capable,
-                                                        succeeded=False,
-                                                        probe_started_at=100.0)
-
-    assert reduction is None
-    assert stale is False
-    assert manager._system_recovery_status_initialized == set()
-
-
-def test_capable_probe_cas_loss_is_stale_not_teardown():
-    manager = _make_manager()
-    capable = _system_recovery_replica(
-        2, recovery_state.SystemRecoveryDisposition.CAPABLE)
-    manager._system_recovery_status_initialized = {2}
-    manager._patch_system_recovery_with_latest = mock.Mock(return_value=None)
-
-    updated, reduction, stale = manager._reduce_capable_probe(
-        capable, succeeded=False, probe_started_at=100.0)
-
-    assert updated is capable
-    assert reduction is None
-    assert stale is True
-    assert manager._system_recovery_status_initialized == {2}
-
-
 def _remote_recovery_detail(
     phase: job_lib.JobSystemRecoveryPhase = job_lib.JobSystemRecoveryPhase.
     ARMED,
+    *,
+    deadline: float = 140.0,
 ) -> job_lib.JobSystemRecoveryInfo:
     replacement_attempt_id = None
     event_id = None
@@ -6242,7 +6190,7 @@ def _remote_recovery_detail(
         event_id = '33333333-3333-4333-8333-333333333333'
         reason = 'RAY_NODE_OOM'
         occurred_at = 20.0
-        deadline_at = 140.0
+        deadline_at = deadline
         occurrence_count = 1
     return job_lib.JobSystemRecoveryInfo(
         capability=recovery_state.SYSTEM_RECOVERY_CAPABILITY,
@@ -6421,9 +6369,32 @@ class TestOrderedRouteIssuanceWorker:
                        recovery_state.SystemRecoveryDisposition.ORDINARY)
         info = _system_recovery_replica(replica_id, disposition)
         info.service_job_id = 9
+        if capable:
+            info.launch_request_id = f'launch-request-{replica_id}'
         info.status_property.sky_launch_status = (
             common_utils.ProcessStatus.SUCCEEDED)
         info.status_property.first_ready_time = 1.0
+        if capable:
+            info.system_recovery_launch_intent = (
+                recovery_state.SystemRecoveryLaunchIntent(
+                    version=1,
+                    controller_contract_version=2,
+                    recovery_authorization_version=3,
+                    recovery_authorization_profile_id='profile-v3',
+                    recovery_authorization_sha256='a' * 64,
+                    runtime_profile_version=2,
+                    expected_runtime_capability=(
+                        recovery_state.SYSTEM_RECOVERY_CAPABILITY),
+                    service_hash='service-hash',
+                    replica_id=replica_id,
+                    launch_generation=1,
+                    launch_nonce='b' * 64,
+                    workspace='default',
+                    resource_envelope_sha256='c' * 64,
+                    task_sha256='d' * 64,
+                    runtime_image_digest=f'sha256:{"e" * 64}',
+                    owned_container_spec_sha256='f' * 64,
+                    execution_envelope_sha256='1' * 64))
         return info
 
     @staticmethod
@@ -6450,15 +6421,22 @@ class TestOrderedRouteIssuanceWorker:
         manager._get_post_data = mock.Mock(return_value=None)
         manager._get_readiness_timeout_seconds = mock.Mock(return_value=15)
         manager._get_readiness_headers = mock.Mock(return_value=None)
+        manager._get_initial_delay_seconds = mock.Mock(return_value=0)
         manager._is_interruptible_replica = mock.Mock(return_value=False)
         manager._consecutive_failure_threshold_timeout = mock.Mock(
             return_value=1000)
-        manager._reduce_capable_probe = mock.Mock(
-            side_effect=lambda info, **_kwargs:
-            (info, self._routable_reduction(info), False))
-        manager._reconcile_system_recovery_status = mock.Mock(
-            return_value=False)
         manager._persist_replicas = mock.Mock()
+        manager._test_accepted_probe_infos = {}
+
+        def _commit(plans):
+            accepted = {
+                plan.opening_info.replica_id: copy.deepcopy(plan.desired_info)
+                for plan in plans
+            }
+            manager._test_accepted_probe_infos.update(accepted)
+            return accepted, set()
+
+        manager._commit_probe_row_plans = mock.Mock(side_effect=_commit)
         return manager
 
     def _run(self, manager, infos, capable, status_result):
@@ -6505,6 +6483,7 @@ class TestOrderedRouteIssuanceWorker:
                                'time',
                                mock.Mock(wraps=time)) as manager_time:
             manager_time.monotonic.return_value = 1.0
+            manager_time.time.return_value = 201.0
             result = manager._probe_all_replicas()
         return result, status_fetch
 
@@ -6563,7 +6542,11 @@ class TestOrderedRouteIssuanceWorker:
         assert targets[0].replica_id == capable.replica_id
         # Registry time is 150. Submission time is 1; only the callback's
         # exact HTTP start (100 + the 60s lease) can still be admitted.
-        assert capable.status_property.service_ready_now
+        # The immutable opening row stays unchanged; only the detached row
+        # accepted by the commit may be published locally.
+        assert not capable.status_property.service_ready_now
+        assert manager._test_accepted_probe_infos[
+            capable.replica_id].status_property.service_ready_now is False
 
     def test_adopted_replacement_issues_after_all_endpoint_evidence_drains(
             self):
@@ -6616,7 +6599,7 @@ class TestOrderedRouteIssuanceWorker:
         def _status(*_args, **_kwargs):
             ordering.append('status')
             detail = _remote_recovery_detail(
-                job_lib.JobSystemRecoveryPhase.RETRY_SUBMITTED)
+                job_lib.JobSystemRecoveryPhase.RETRY_SUBMITTED, deadline=240.0)
             return ({
                 9: job_lib.JobStatus.RUNNING
             }, {
@@ -6625,24 +6608,19 @@ class TestOrderedRouteIssuanceWorker:
                 9: job_lib.JobSystemRecoveryDetailStatus.PRESENT
             })
 
-        def _adopt(_info, *_evidence, **_kwargs):
-            assert capable.system_recovery is not None
-            capable.system_recovery = dataclasses.replace(
-                capable.system_recovery,
-                state=recovery_state.ControllerRecoveryState.RECOVERED,
-                completed_at=201.0)
-            return False
-
-        manager._reconcile_system_recovery_status = mock.Mock(
-            side_effect=_adopt)
         self._run(manager, [ordinary, capable], capable, _status)
 
         assert not ordinary_observation['issued_before_return']
-        assert ordering == ['readiness_response', 'status', 'issue']
-        targets = registry.probe_targets()
-        assert len(targets) == 1
-        assert targets[0].generation.recovery_state == 'RECOVERED'
-        assert capable.status_property.service_ready_now
+        # Adoption and route issuance are deliberately separate committed
+        # rounds. The first round persists RECOVERED off-route; no opening-row
+        # mutation can smuggle that newly predicted generation into routing.
+        assert ordering == ['readiness_response', 'status']
+        assert registry.probe_targets() == []
+        accepted = manager._test_accepted_probe_infos[capable.replica_id]
+        assert accepted.system_recovery is not None
+        assert accepted.system_recovery.state is (
+            recovery_state.ControllerRecoveryState.RECOVERED)
+        assert not accepted.status_property.service_ready_now
 
     @pytest.mark.parametrize('invoke_start_callback', [False, True])
     def test_missing_start_or_malformed_status_cannot_issue(
@@ -6662,10 +6640,10 @@ class TestOrderedRouteIssuanceWorker:
         assert manager._route_lease_registry().probe_targets() == []
         assert not capable.status_property.service_ready_now
 
-    @pytest.mark.parametrize(('adopted_at', 'expected_issued'), [(200.0, False),
-                                                                 (100.0, True)])
+    @pytest.mark.parametrize(('adopted_at', 'expected_adopted'),
+                             [(200.0, False), (100.0, True)])
     def test_retry_submitted_requires_probe_strictly_after_durable_adoption(
-            self, adopted_at, expected_issued):
+            self, adopted_at, expected_adopted):
         capable = self._ready_info(2, capable=True)
         assert capable.system_recovery is not None
         capable.system_recovery = dataclasses.replace(
@@ -6677,7 +6655,7 @@ class TestOrderedRouteIssuanceWorker:
             reason='RAY_NODE_OOM',
             occurrence_count=1,
             started_at=20.0,
-            deadline=140.0,
+            deadline=240.0,
             retry_submitted_adopted_at=adopted_at)
         manager = self._manager(capable)
 
@@ -6688,19 +6666,8 @@ class TestOrderedRouteIssuanceWorker:
 
         capable.probe = mock.Mock(side_effect=_probe)
 
-        def _adopt(_info, *_evidence, **_kwargs):
-            assert capable.system_recovery is not None
-            capable.system_recovery = dataclasses.replace(
-                capable.system_recovery,
-                state=recovery_state.ControllerRecoveryState.RECOVERED,
-                completed_at=201.0,
-                retry_submitted_adopted_at=adopted_at)
-            return False
-
-        manager._reconcile_system_recovery_status = mock.Mock(
-            side_effect=_adopt)
         detail = _remote_recovery_detail(
-            job_lib.JobSystemRecoveryPhase.RETRY_SUBMITTED)
+            job_lib.JobSystemRecoveryPhase.RETRY_SUBMITTED, deadline=240.0)
         self._run(
             manager, [capable], capable, lambda *_args, **_kwargs: ({
                 9: job_lib.JobStatus.RUNNING
@@ -6710,9 +6677,16 @@ class TestOrderedRouteIssuanceWorker:
                 9: job_lib.JobSystemRecoveryDetailStatus.PRESENT
             }))
 
-        assert bool(manager._route_lease_registry().probe_targets()) is (
-            expected_issued)
-        assert capable.status_property.service_ready_now is expected_issued
+        # This round durably adopts RETRY_SUBMITTED as RECOVERED, but route
+        # issuance waits for a subsequent probe of that committed generation.
+        assert manager._route_lease_registry().probe_targets() == []
+        accepted = manager._test_accepted_probe_infos[capable.replica_id]
+        assert accepted.system_recovery is not None
+        expected_state = (
+            recovery_state.ControllerRecoveryState.RECOVERED if expected_adopted
+            else recovery_state.ControllerRecoveryState.RETRY_SUBMITTED)
+        assert accepted.system_recovery.state is expected_state
+        assert not accepted.status_property.service_ready_now
 
 
 class TestProbeRouteSuspensionTransaction:
@@ -11811,8 +11785,10 @@ class TestInfrastructureInterruptionRecovery:
 
     @staticmethod
     def _handle():
-        return mock.Mock(
+        handle = mock.Mock(
             spec=replica_managers.backends.CloudVmRayResourceHandle)
+        handle.launched_nodes = 1
+        return handle
 
     def _manager(self, zero_cost):
         manager = _make_manager()
@@ -11828,23 +11804,44 @@ class TestInfrastructureInterruptionRecovery:
         return result
 
     def _reduce_interruption(self, manager, info, liveness):
-        persist = mock.Mock()
         terminate = mock.Mock()
+        committed = {}
+
+        def _commit(plans):
+            accepted = {
+                plan.opening_info.replica_id: copy.deepcopy(plan.desired_info)
+                for plan in plans
+            }
+            stale = set()
+            committed.update(accepted)
+            return accepted, stale
+
+        entries = ()
+        if liveness.disposition is (
+                replica_managers._PreemptionPrefilterDisposition.
+                LIVE_OR_UNPROVEN):
+            entries = (
+                replica_managers.provider_facets.InstanceStatusInventoryEntryV1(
+                    instance_id='instance-1',
+                    status=replica_managers.status_lib.ClusterStatus.UP),)
+        observation = (replica_managers.provider_facets.
+                       InstanceStatusInventoryObservationV1(
+                           query_id='1',
+                           disposition=(
+                               replica_managers.provider_facets.
+                               InstanceStatusInventoryDispositionV1.OBSERVED),
+                           entries=entries))
         with mock.patch.object(
                 replica_managers.provider_phase,
                 'provider_phase',
                 return_value=contextlib.nullcontext(mock.Mock())), \
-             mock.patch.object(manager,
-                               '_cloud_instance_looks_alive',
-                               return_value=liveness), \
-             mock.patch.object(replica_managers.serve_state,
-                               'get_replica_info_from_id',
-                               return_value=info), \
+             mock.patch.object(
+                 replica_managers.backend_utils,
+                 'query_cluster_instance_statuses_batch',
+                 return_value={1: observation}), \
              mock.patch.object(manager,
                                '_persist_spot_placement_state_if_dirty'), \
-             mock.patch.object(manager,
-                               '_persist_replica',
-                               persist), \
+             mock.patch.object(manager, '_commit_probe_row_plans', _commit), \
              mock.patch.object(manager,
                                '_terminate_replica',
                                terminate):
@@ -11852,7 +11849,7 @@ class TestInfrastructureInterruptionRecovery:
                 [(info, self._handle(), self._command_error_result())],
                 provider_error_phase_mode=(replica_managers.provider_phase.
                                            ProviderPhaseMode.AMBIENT_LEGACY))
-        return persist, terminate
+        return committed.get(info.replica_id), terminate
 
     def test_non_fill_research_replica_is_interruptible(self):
         research = self._location()
@@ -11875,20 +11872,22 @@ class TestInfrastructureInterruptionRecovery:
         info = self._info(research)
         liveness = replica_managers._PreemptionPrefilterResult(
             replica_managers._PreemptionPrefilterDisposition.INTERRUPTED)
-        persist, terminate = self._reduce_interruption(manager, info, liveness)
+        committed, terminate = self._reduce_interruption(
+            manager, info, liveness)
 
-        assert info.status_property.preempted is True
-        persist.assert_called_once_with(1, info)
-        terminate.assert_called_once_with(1,
-                                          replica_drain_delay_seconds=0,
-                                          is_scale_down=True)
+        assert committed is not None
+        assert committed.status_property.preempted is True
+        assert committed.status_property.is_scale_down is True
+        assert committed.status_property.sky_down_status == (
+            common_utils.ProcessStatus.SCHEDULED)
+        terminate.assert_not_called()
         manager._spot_placer.set_preemptive.assert_not_called()
 
         # A reclaimed backend before first readiness must not brick the
         # version as an unrecoverable application failure.
-        info.status_property.sky_down_status = (
+        committed.status_property.sky_down_status = (
             common_utils.ProcessStatus.SCHEDULED)
-        assert info.status_property.unrecoverable_failure() is False
+        assert committed.status_property.unrecoverable_failure() is False
 
     def test_running_research_replica_is_not_reclaimed(self):
         research = self._location()
@@ -11896,9 +11895,11 @@ class TestInfrastructureInterruptionRecovery:
         info = self._info(research)
         liveness = replica_managers._PreemptionPrefilterResult(
             replica_managers._PreemptionPrefilterDisposition.LIVE_OR_UNPROVEN)
-        persist, terminate = self._reduce_interruption(manager, info, liveness)
+        committed, terminate = self._reduce_interruption(
+            manager, info, liveness)
 
-        persist.assert_not_called()
+        assert committed is not None
+        assert committed.status_property.preempted is False
         terminate.assert_not_called()
 
     @pytest.mark.parametrize('is_spot', [False, True])
@@ -11913,13 +11914,15 @@ class TestInfrastructureInterruptionRecovery:
         liveness = manager._cloud_instance_looks_alive(info, handle=None)
         assert liveness.disposition is (
             replica_managers._PreemptionPrefilterDisposition.INTERRUPTED)
-        persist, terminate = self._reduce_interruption(manager, info, liveness)
+        committed, terminate = self._reduce_interruption(
+            manager, info, liveness)
 
-        assert info.status_property.preempted is True
-        persist.assert_called_once_with(1, info)
-        terminate.assert_called_once_with(1,
-                                          replica_drain_delay_seconds=0,
-                                          is_scale_down=True)
+        assert committed is not None
+        assert committed.status_property.preempted is True
+        assert committed.status_property.is_scale_down is True
+        assert committed.status_property.sky_down_status == (
+            common_utils.ProcessStatus.SCHEDULED)
+        terminate.assert_not_called()
         if is_spot:
             manager._spot_placer.set_preemptive.assert_called_once_with(
                 location, reason='preempted')
@@ -11962,6 +11965,12 @@ class TestInfrastructureInterruptionRecovery:
         manager._persist_replicas = mock.Mock()
         manager._changed_only_readiness_persistence = changed_only
 
+        def _commit(plans):
+            return ({
+                plan.opening_info.replica_id: copy.deepcopy(plan.desired_info)
+                for plan in plans
+            }, set())
+
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[info]), \
@@ -11970,13 +11979,25 @@ class TestInfrastructureInterruptionRecovery:
                                return_value={1: mock.Mock()}), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos_from_ids',
-                               return_value={1: info}):
+                               return_value={1: info}), \
+             mock.patch.object(manager,
+                               '_commit_probe_row_plans',
+                               side_effect=_commit):
             manager._probe_all_replicas()
 
         manager._cloud_instance_looks_alive.assert_not_called()
-        manager._apply_confirmed_preemption.assert_called_once_with(
-            info, None, persist_placement=False)
-        manager._persist_replicas.assert_called_once_with([(1, info)])
+        manager._apply_confirmed_preemption.assert_called_once()
+        accepted = manager._apply_confirmed_preemption.call_args.args[0]
+        # Postcommit effects consume the exact detached row accepted by the
+        # batch, never the mutable opening snapshot that produced the evidence.
+        assert accepted is not info
+        assert accepted.replica_record_id == info.replica_record_id
+        assert accepted.status_property.preempted is True
+        assert manager._apply_confirmed_preemption.call_args.args[1] is None
+        assert manager._apply_confirmed_preemption.call_args.kwargs == {
+            'persist_placement': False
+        }
+        manager._persist_replicas.assert_not_called()
 
     @pytest.mark.parametrize('persisted_intent', [False, True])
     def test_recovery_redrives_reclaimed_research_replica_without_bench(

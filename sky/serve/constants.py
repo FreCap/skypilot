@@ -42,6 +42,13 @@ REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY = 'sky_serve_service_hash'
 REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY = 'sky_serve_service_version'
 REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY = 'sky_serve_controller_pid'
 REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY = 'sky_serve_controller_ip'
+# ABA-safe controller ownership carried by closed launch contexts.  PID/IP are
+# routing metadata and may be reused by a replacement controller.
+REPLICA_LAUNCH_FENCE_LIFECYCLE_EPOCH_KEY = 'sky_serve_lifecycle_epoch'
+REPLICA_LAUNCH_FENCE_CONTROLLER_INCARNATION_KEY = (
+    'sky_serve_controller_incarnation')
+REPLICA_LAUNCH_FENCE_CONTROLLER_OWNER_EPOCH_KEY = (
+    'sky_serve_controller_owner_epoch')
 REPLICA_LAUNCH_FENCE_KEYS = (
     REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY,
     REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY,

@@ -235,6 +235,10 @@ class ManagerRouteLeaseRegistry:
         self._live_record_ids: dict[int, str] = {}
         self._retired: dict[int, RouteGeneration] = {}
         self._retired_record_ids: dict[int, set[str]] = {}
+        # Maintain the global bound incrementally.  Recomputing it by scanning
+        # every per-replica set on each ordered identity advance makes a
+        # fleet-wide recreation wave quadratic in the number of replicas.
+        self._retired_record_id_count = 0
         # Exhausting the bounded exact old-row history fails closed only for
         # the numeric ID whose next recreation could no longer be ordered.
         self._blocked_record_ids: set[int] = set()
@@ -268,10 +272,6 @@ class ManagerRouteLeaseRegistry:
         self._live_record_ids[replica_id] = replica_record_id
         return True
 
-    def _record_tombstone_count_locked(self) -> int:
-        return sum(
-            len(record_ids) for record_ids in self._retired_record_ids.values())
-
     def _advance_record_identity_locked(self, replica_id: int,
                                         replica_record_id: str) -> bool:
         """Apply an ordered identity, rejecting any known historical rewind."""
@@ -287,14 +287,18 @@ class ManagerRouteLeaseRegistry:
             # A delayed insertion callback or fleet snapshot observed an older
             # physical row.  It cannot revoke or rewind the newer live row.
             return False
-        if (self._record_tombstone_count_locked()
+        if (self._retired_record_id_count
                 >= constants.SYSTEM_RECOVERY_ROUTE_MAX_REPLICAS):
             self._blocked_record_ids.add(replica_id)
             state = self._targets.get(replica_id)
             if state is not None:
                 self._retire_locked(replica_id, state)
             return False
-        self._retired_record_ids.setdefault(replica_id, set()).add(current)
+        previous_count = len(retired_record_ids)
+        retired_record_ids.add(current)
+        self._retired_record_ids[replica_id] = retired_record_ids
+        self._retired_record_id_count += len(
+            retired_record_ids) - previous_count
         self._live_record_ids[replica_id] = replica_record_id
         # The old row identity now supplies its bounded tombstone.  Drop its
         # target and generation tombstone so neither can accumulate per row.
@@ -306,7 +310,12 @@ class ManagerRouteLeaseRegistry:
         self._targets.pop(replica_id, None)
         self._retired.pop(replica_id, None)
         self._live_record_ids.pop(replica_id, None)
-        self._retired_record_ids.pop(replica_id, None)
+        retired_record_ids = self._retired_record_ids.pop(replica_id, None)
+        if retired_record_ids is not None:
+            self._retired_record_id_count -= len(retired_record_ids)
+            if self._retired_record_id_count < 0:
+                raise RuntimeError(
+                    'Route record tombstone count is internally corrupt.')
         self._blocked_record_ids.discard(replica_id)
 
     def _retire_locked(self, replica_id: int, state: _TargetState) -> None:
@@ -351,6 +360,7 @@ class ManagerRouteLeaseRegistry:
 
     def needs_issuance(self, replica_id: int, generation: RouteGeneration,
                        route_url: str) -> bool:
+        """Observe whether postcommit issuance is needed, without mutating."""
         replica_id = self._replica_key(replica_id)
         route_url = normalize_route_url(route_url)
         now = self._clock()
@@ -366,28 +376,12 @@ class ManagerRouteLeaseRegistry:
             state = self._targets.get(replica_id)
             if state is None:
                 return True
-            if self._expire_locked(replica_id, state, now):
+            if now >= state.deadline:
                 return True
             if (state.target.generation == generation and
                     state.target.route_url == route_url and state.active and
                     state.suspension_count == 0):
                 return False
-            if state.suspension_count:
-                # A concurrent fenced mutation owns this omission.  Do not
-                # turn its reversible suspension into a permanent tombstone.
-                return True
-            if state.target.generation == generation:
-                # A URL transition within one exact generation can never
-                # rotate or re-enter.  Stop its renewal before the potentially
-                # blocking ordered remote read.
-                self._retire_locked(replica_id, state)
-                return True
-            if self._can_advance_generation(state.target.generation,
-                                            generation):
-                # Exact RETRY_SUBMITTED adoption is the only valid advance.
-                self._retire_locked(replica_id, state)
-            # Invalid/backward generations remain off-route, but cannot revoke
-            # the newer exact target already owned by this numeric ID.
             return True
 
     def issue(self, replica_id: int, generation: RouteGeneration,

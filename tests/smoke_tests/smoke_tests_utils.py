@@ -4,7 +4,9 @@ import enum
 import functools
 import inspect
 import json
+import math
 import os
+import pathlib
 import re
 import shlex
 import subprocess
@@ -389,6 +391,13 @@ class Test(NamedTuple):
     env: Optional[Dict[str, str]] = None
     # Config dictionary to override the skypilot config.
     config_dict: Optional[Dict[str, Any]] = None
+    # Time granted after SIGTERM for a command-owned finalizer to finish.  The
+    # paid Serve qualifier overrides this with its complete bounded cleanup
+    # budget; ordinary smoke commands retain a short process-reaping grace.
+    timeout_termination_grace_seconds: float = 10
+    # Optional lifecycle receipt whose completed, credential-free summary is
+    # reported after the timed-out process has been joined.
+    timeout_completion_receipt: Optional[str] = None
 
     def echo(self, message: str):
         # pytest's xdist plugin captures stdout; print to stderr so that the
@@ -652,6 +661,59 @@ def ensure_iterable_result(func):
         return [result]
 
 
+def _report_timeout_completion_receipt(test: Test, write: Callable[[str], Any],
+                                       flush: Callable[[], Any]) -> None:
+    """Report whether a joined timed-out command completed its finalizer."""
+    receipt_path = test.timeout_completion_receipt
+    if receipt_path is None:
+        return
+    try:
+        payload = json.loads(
+            pathlib.Path(receipt_path).read_text(encoding='utf-8'))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        write('Timed-out command produced no valid completion receipt; '
+              'operator escalation may be required.\n')
+        flush()
+        return
+    finished_at = payload.get('finished_at') if isinstance(payload,
+                                                           dict) else None
+    escalation = (payload.get('operator_escalation_required') if isinstance(
+        payload, dict) else None)
+    if (not isinstance(finished_at, (int, float)) or
+            isinstance(finished_at, bool) or not math.isfinite(finished_at) or
+            finished_at <= 0 or not isinstance(escalation, bool)):
+        write('Timed-out command produced an incomplete completion receipt; '
+              'operator escalation may be required.\n')
+        flush()
+        return
+    exact_cleanup = payload.get('exact_cleanup_proven')
+    write('Timed-out command finalizer completed: '
+          f'exact_cleanup_proven={exact_cleanup!r}, '
+          f'operator_escalation_required={escalation}.\n')
+    flush()
+
+
+def _terminate_timed_out_process(proc: subprocess.Popen, test: Test,
+                                 write: Callable[[str], Any],
+                                 flush: Callable[[], Any]) -> None:
+    """SIGTERM, grant bounded finalizer time, and always reap the process."""
+    grace_seconds = test.timeout_termination_grace_seconds
+    if (not isinstance(grace_seconds,
+                       (int, float)) or isinstance(grace_seconds, bool) or
+            not math.isfinite(grace_seconds) or grace_seconds < 0):
+        raise ValueError('Timeout termination grace must be finite and >= 0.')
+    proc.terminate()
+    try:
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        write('Timed-out command did not finish its finalizer within '
+              f'{grace_seconds} seconds; sending SIGKILL.\n')
+        flush()
+        proc.kill()
+        proc.wait()
+    _report_timeout_completion_receipt(test, write, flush)
+
+
 def run_one_test(test: Test, check_sky_status: bool = True) -> None:
     # Fail fast if `sky` CLI somehow errors out.
     if check_sky_status:
@@ -713,9 +775,14 @@ def run_one_test(test: Test, check_sky_status: bool = True) -> None:
                 test.echo(str(e))
                 write(f'Timeout after {test.timeout} seconds.\n')
                 flush()
-                # Kill the current process.
-                proc.terminate()
-                proc.returncode = 1  # None if we don't set it.
+                # A command may own billable-resource cleanup in its SIGTERM
+                # handler.  Join that bounded finalizer before treating the
+                # timeout as complete; never leave a child running behind a
+                # finished pytest process.
+                _terminate_timed_out_process(proc, test, write, flush)
+                # Preserve timeout as the command outcome even if a finalizer
+                # deliberately exits zero after cleaning up.
+                proc.returncode = 1
                 break
 
             if proc.returncode:

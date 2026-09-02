@@ -29,6 +29,7 @@ _MAX_DOCUMENT_BYTES = 256 * 1024
 _SYNTHETIC_REPLICA_ID = 1
 _VALIDATION_REQUEST_ID = 'system-oom-authorization-bootstrap-validation'
 _VALIDATION_NONCE = '0' * 64
+_VALIDATION_CONTROLLER_INCARNATION = '00000000-0000-4000-8000-000000000001'
 
 
 class AuthorizationBootstrapError(RuntimeError):
@@ -485,8 +486,11 @@ def validate_authorization_document(
                     intent,
                     service_name=target.service_name,
                     service_version=target.version,
+                    service_lifecycle_epoch=1,
                     controller_pid=None,
-                    controller_ip=None)
+                    controller_ip=None,
+                    controller_incarnation=(_VALIDATION_CONTROLLER_INCARNATION),
+                    controller_owner_epoch=1)
                 bound = system_oom_recovery.bind_launch_context(
                     unbound, _VALIDATION_REQUEST_ID)
                 matched = system_oom_recovery.match_trusted_profile(

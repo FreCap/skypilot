@@ -67,10 +67,12 @@ REPLICA_RECORD_ID_KEY = 'sky_serve_ordinary_launch_replica_record_id'
 LAUNCH_GENERATION_KEY = 'sky_serve_ordinary_launch_generation'
 BOUND_REQUEST_ID_KEY = 'sky_serve_ordinary_launch_request_id'
 INPUT_DIGEST_KEY = 'sky_serve_ordinary_launch_input_digest'
-CONTROLLER_INCARNATION_KEY = 'sky_serve_controller_incarnation'
-CONTROLLER_OWNER_EPOCH_KEY = 'sky_serve_controller_owner_epoch'
+CONTROLLER_INCARNATION_KEY = (
+    serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_INCARNATION_KEY)
+CONTROLLER_OWNER_EPOCH_KEY = (
+    serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_OWNER_EPOCH_KEY)
 OWNER_REVISION_KEY = 'sky_serve_ordinary_launch_owner_revision'
-LIFECYCLE_EPOCH_KEY = 'sky_serve_lifecycle_epoch'
+LIFECYCLE_EPOCH_KEY = serve_constants.REPLICA_LAUNCH_FENCE_LIFECYCLE_EPOCH_KEY
 BINDING_EPOCH_KEY = 'sky_serve_ordinary_launch_binding_epoch'
 BINDING_PROTOCOL_VERSION_KEY = 'sky_serve_non_pool_binding_protocol_version'
 PROFILE_KIND_KEY = 'sky_serve_non_pool_profile_kind'
@@ -3258,8 +3260,11 @@ def validate_non_pool_submission_execution_context_in_connection(
         intent,
         service_name=identity.service_name,
         service_version=identity.service_version,
+        service_lifecycle_epoch=service['lifecycle_epoch'],
         controller_pid=service['controller_pid'],
-        controller_ip=service['controller_ip'])
+        controller_ip=service['controller_ip'],
+        controller_incarnation=service['controller_incarnation'],
+        controller_owner_epoch=service['controller_owner_epoch'])
     try:
         submitted = system_oom_recovery.extract_unbound_launch_context(
             dict(launch_context))
@@ -3951,8 +3956,11 @@ def _validate_profile_execution_context(
         intent,
         service_name=str(service['name']),
         service_version=info.version,
+        service_lifecycle_epoch=service['lifecycle_epoch'],
         controller_pid=LEGACY_FAIL_CLOSED_CONTROLLER_PID,
-        controller_ip=LEGACY_FAIL_CLOSED_CONTROLLER_IP)
+        controller_ip=LEGACY_FAIL_CLOSED_CONTROLLER_IP,
+        controller_incarnation=service['controller_incarnation'],
+        controller_owner_epoch=service['controller_owner_epoch'])
     expected = system_oom_recovery.bind_launch_context(expected_unbound,
                                                        context.request_id)
     try:

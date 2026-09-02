@@ -58,18 +58,22 @@ class SkyCliLifecycle:
 
     def __init__(self, *, executable: str, command_timeout_seconds: float,
                  endpoint_timeout_seconds: float, down_timeout_seconds: float,
-                 poll_seconds: float) -> None:
+                 poll_seconds: float, workspace: str | None) -> None:
         self._executable = executable
         self._command_timeout_seconds = command_timeout_seconds
         self._endpoint_timeout_seconds = endpoint_timeout_seconds
         self._down_timeout_seconds = down_timeout_seconds
         self._poll_seconds = poll_seconds
+        self._workspace = workspace
 
     async def _run(self, *arguments: str, capture: bool) -> CommandResult:
+        command = list(arguments)
+        if self._workspace is not None:
+            command.extend(('--config', f'active_workspace={self._workspace}'))
         stdout = asyncio.subprocess.PIPE if capture else None
         stderr = asyncio.subprocess.STDOUT if capture else None
         process = await asyncio.create_subprocess_exec(self._executable,
-                                                       *arguments,
+                                                       *command,
                                                        stdout=stdout,
                                                        stderr=stderr)
         try:
@@ -271,6 +275,9 @@ async def run_lifecycle(args: argparse.Namespace,
                 args.cleanup_timeout_seconds, args.poll_seconds)
     if any(not math.isfinite(value) or value <= 0 for value in timeouts):
         raise LifecycleError('Lifecycle timeouts must be positive and finite.')
+    if (args.workspace is not None and
+        (not isinstance(args.workspace, str) or not args.workspace)):
+        raise LifecycleError('Workspace must be a non-empty string.')
     artifacts = LifecycleArtifacts.create(pathlib.Path(args.artifacts_dir),
                                           args.service_name)
     existing = [
@@ -287,7 +294,8 @@ async def run_lifecycle(args: argparse.Namespace,
         command_timeout_seconds=args.command_timeout_seconds,
         endpoint_timeout_seconds=args.endpoint_timeout_seconds,
         down_timeout_seconds=args.down_timeout_seconds,
-        poll_seconds=args.poll_seconds)
+        poll_seconds=args.poll_seconds,
+        workspace=args.workspace)
     primary_error: BaseException | None = None
     scope_recovery_error: BaseException | None = None
     serve_down_error: BaseException | None = None
@@ -376,20 +384,36 @@ async def run_lifecycle(args: argparse.Namespace,
                        cleanup_evidence_error=cleanup_evidence_error,
                        cleanup_required=lifecycle_owned,
                        cleanup_receipt=artifacts.cleanup_receipt)
+    finalizer_errors: list[BaseException] = []
+    if cleanup_evidence_error is not None:
+        error = LifecycleError(
+            'Normal teardown lacks exact-zero cleanup evidence; explicit '
+            'operator escalation is required.')
+        error.__cause__ = cleanup_evidence_error
+        finalizer_errors.append(error)
+    if scope_recovery_error is not None:
+        error = LifecycleError(
+            'Provider scope recovery failed before proven cleanup.')
+        error.__cause__ = scope_recovery_error
+        finalizer_errors.append(error)
+    if serve_down_error is not None:
+        error = LifecycleError(
+            'Normal sky serve down failed, but exact-zero cleanup was proven.')
+        error.__cause__ = serve_down_error
+        finalizer_errors.append(error)
+    if primary_error is not None and finalizer_errors:
+        raise BaseExceptionGroup(
+            'Paid qualification failed and its lifecycle finalizer also '
+            'failed; inspect the lifecycle receipt.',
+            [primary_error, *finalizer_errors])
     if primary_error is not None:
         raise primary_error
-    if cleanup_evidence_error is not None:
-        raise LifecycleError(
-            'Normal teardown lacks exact-zero cleanup evidence.'
-        ) from cleanup_evidence_error
-    if scope_recovery_error is not None:
-        raise LifecycleError(
-            'Provider scope recovery failed before proven cleanup.'
-        ) from scope_recovery_error
-    if serve_down_error is not None:
-        raise LifecycleError(
-            'Normal sky serve down failed, but exact-zero cleanup was proven.'
-        ) from serve_down_error
+    if len(finalizer_errors) == 1:
+        raise finalizer_errors[0]
+    if finalizer_errors:
+        raise BaseExceptionGroup(
+            'Paid qualification lifecycle finalization had multiple failures; '
+            'inspect the lifecycle receipt.', finalizer_errors)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -402,6 +426,7 @@ def _parser() -> argparse.ArgumentParser:
                         default=str(
                             pathlib.Path(__file__).with_name('service.yaml')))
     parser.add_argument('--economic-receipt')
+    parser.add_argument('--workspace')
     parser.add_argument('--sky-cli', default='sky')
     parser.add_argument('--command-timeout-seconds',
                         type=float,

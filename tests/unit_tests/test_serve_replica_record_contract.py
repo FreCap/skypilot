@@ -820,26 +820,27 @@ def test_pool_probe_propagates_explicit_provider_phase_admission():
     admission = mock.sentinel.provider_phase_admission
 
     with mock.patch.object(replica_info.global_user_state,
-                           'get_handle_from_cluster_name',
-                           return_value=handle), \
+                           'get_handle_from_cluster_name') as get_handle, \
          mock.patch.object(replica_info.backend_utils,
-                           'check_cluster_available',
-                           return_value=handle), \
+                           'check_cluster_available') as check_available, \
          mock.patch.object(replica_info.backend_utils,
                            'get_backend_from_handle',
                            return_value=backend), \
          mock.patch.object(reserved_capacity,
                            'protocol_v2_provider_fence',
                            provider_fence):
-        _, ready, _ = replica.probe_pool(provider_phase_admission=admission)
+        _, ready, _ = replica.probe_pool(handle=handle,
+                                         provider_phase_admission=admission)
 
     assert ready
+    get_handle.assert_not_called()
+    check_available.assert_not_called()
     assert provider_fence.call_args_list == [
-        mock.call(replica, handle, phase_admission=admission),
         mock.call(replica, handle, phase_admission=admission),
     ]
     backend.get_job_status.assert_called_once_with(handle, [1],
-                                                   stream_logs=False)
+                                                   stream_logs=False,
+                                                   serve_transport=None)
 
 
 def test_pool_probe_propagates_explicit_job_status_transport_bounds():

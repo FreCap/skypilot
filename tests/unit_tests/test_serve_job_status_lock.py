@@ -131,7 +131,6 @@ def test_never_ready_vm_version_uses_one_exact_bound_startup_sentinel(
     handles = {
         info.cluster_name: _vm_handle(info.cluster_name) for info in replicas
     }
-    by_id = {info.replica_id: info for info in replicas}
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         lambda _service: list(replicas))
     monkeypatch.setattr(serve_state, 'get_replica_info_from_id',
@@ -260,14 +259,12 @@ def test_ever_ready_vm_version_performs_zero_remote_status_reads(monkeypatch):
     read_job_ids.assert_not_called()
 
 
-def test_fetch_exact_status_samples_latest_version_first(monkeypatch):
-    """The latest-version replica's result is consumed (acted on) first.
+def test_fetch_exact_status_commits_in_deterministic_replica_order(monkeypatch):
+    """Ordinary exact-status writes do not depend on fetch/input ordering.
 
-    The SSH fetches run in parallel, so no ordering is asserted on the
-    fetches themselves -- only that every replica is fetched and that the
-    failure-handling consumption starts with the latest-version replica,
-    so a version-wide bad rollout is stopped without waiting behind every
-    old replica.
+    The newest-version startup sentinel is reduced separately before older
+    status work (covered below). Once an ordinary wave is complete, bounded
+    commit membership and postcommit effects use stable replica-ID order.
     """
     old = [_tracked_replica(1), _tracked_replica(2)]
     latest = _tracked_replica(3, version=2)
@@ -287,19 +284,23 @@ def test_fetch_exact_status_samples_latest_version_first(monkeypatch):
 
     monkeypatch.setattr(replica_managers.backends.CloudVmRayBackend,
                         'get_job_status', _get_job_status)
-    monkeypatch.setattr(serve_state, 'get_replica_info_from_id',
-                        lambda svc, rid: by_id.get(rid))
-
-    terminated = []
+    reduced_teardowns = []
     mgr = _build_manager()
     mgr.latest_version = 2
-    mgr._persist_replica = lambda rid, info: None
-    mgr._terminate_replica = (
-        lambda rid, replica_drain_delay_seconds: terminated.append(rid))
+
+    def _commit(plans):
+        reduced_teardowns.extend(plan.opening_info.replica_id
+                                 for plan in plans
+                                 if plan.effects.teardown)
+        return ({
+            plan.opening_info.replica_id: plan.desired_info for plan in plans
+        }, set())
+
+    mgr._commit_probe_row_plans = _commit
     mgr._fetch_exact_status()
 
     assert sorted(probed) == [1, 2, 3]
-    assert terminated == [3, 1, 2]
+    assert reduced_teardowns == [1, 2, 3]
 
 
 def test_latest_startup_failure_reduces_before_old_status_finishes(monkeypatch):
@@ -310,11 +311,8 @@ def test_latest_startup_failure_reduces_before_old_status_finishes(monkeypatch):
     handles = {
         info.replica_id: _vm_handle(info.cluster_name) for info in replicas
     }
-    by_id = {info.replica_id: info for info in replicas}
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         lambda _service: list(replicas))
-    monkeypatch.setattr(serve_state, 'get_replica_info_from_id',
-                        lambda _service, replica_id: by_id.get(replica_id))
     monkeypatch.setattr(
         replica_managers.global_user_state, 'get_clusters_from_names',
         lambda names: {
@@ -347,10 +345,16 @@ def test_latest_startup_failure_reduces_before_old_status_finishes(monkeypatch):
                         'get_job_status', _status)
     manager = _build_manager()
     manager.latest_version = latest.version
-    manager._persist_replica = lambda *_args, **_kwargs: None
-    manager._terminate_replica = (
-        lambda replica_id, **_kwargs: latest_terminated.set()
-        if replica_id == latest.replica_id else None)
+
+    def _commit(plans):
+        if any(plan.opening_info.replica_id == latest.replica_id and
+               plan.effects.teardown for plan in plans):
+            latest_terminated.set()
+        return ({
+            plan.opening_info.replica_id: plan.desired_info for plan in plans
+        }, set())
+
+    manager._commit_probe_row_plans = _commit
 
     fetch = threading.Thread(target=manager._fetch_exact_status)
     fetch.start()
@@ -477,34 +481,51 @@ def _raise_command_error(self, handle, job_ids, stream_logs=False, **_kwargs):
                                   detailed_reason=None)
 
 
-def test_preemption_path_acts_on_fresh_replica_not_stale_snapshot(monkeypatch):
-    """On CommandError, preemption handling must re-read the replica under the
-    lock and act on the FRESH state, not the pre-SSH snapshot (which another
-    thread may have mutated while we SSHed lock-free)."""
+def test_exact_status_worker_base_exception_reaches_daemon_supervision():
+    replica = _tracked_replica(6)
+    failed = mock.Mock()
+    failed.result.side_effect = KeyboardInterrupt()
+
+    with pytest.raises(KeyboardInterrupt):
+        _build_manager()._handle_job_status_results(
+            [(replica, _vm_handle(replica.cluster_name), failed)],
+            provider_error_phase_mode=(replica_managers.provider_phase.
+                                       ProviderPhaseMode.AMBIENT_LEGACY))
+
+
+def test_preemption_path_acts_only_on_batch_accepted_replica():
+    """Provider evidence has no local effect before the row CAS accepts it."""
     stale = _tracked_replica(7)
-    fresh = copy.deepcopy(stale)
-    monkeypatch.setattr(serve_state, 'get_replica_infos', lambda svc: [stale])
-    monkeypatch.setattr(replica_managers.ReplicaInfo,
-                        'handle',
-                        lambda self, cluster_record=None: object())
-    monkeypatch.setattr(replica_managers.backends.CloudVmRayBackend,
-                        'get_job_status', _raise_command_error)
-    monkeypatch.setattr(serve_state, 'get_replica_info_from_id',
-                        lambda svc, rid: fresh)
-
-    persisted = []
-    terminated = []
     mgr = _build_manager()
-    mgr._cloud_instance_looks_alive = lambda *_args, **_kwargs: (
-        replica_managers._PreemptionPrefilterResult(
-            replica_managers._PreemptionPrefilterDisposition.INTERRUPTED))
-    mgr._persist_replica = lambda rid, info: persisted.append((rid, info))
-    mgr._terminate_replica = lambda rid, **kwargs: terminated.append(rid)
-    mgr._fetch_exact_status()
+    accepted = {}
 
-    assert persisted == [(7, fresh)]
-    assert terminated == [7]
-    assert fresh.status_property.preempted
+    def _commit(plans):
+        for plan in plans:
+            accepted[plan.opening_info.replica_id] = copy.deepcopy(
+                plan.desired_info)
+        return accepted, set()
+
+    mgr._commit_probe_row_plans = _commit
+    mgr._apply_confirmed_preemption = mock.Mock()
+    mgr._persist_spot_placement_state_if_dirty = mock.Mock()
+    mgr._route_lease_registry = mock.Mock(return_value=mock.Mock())
+    mgr._launch_completion_state = mock.Mock(return_value=(mock.Mock(),
+                                                           mock.Mock()))
+    failed = mock.Mock()
+    failed.result.side_effect = exceptions.CommandError(
+        returncode=255,
+        command='get_job_status',
+        error_msg='ssh failed',
+        detailed_reason=None)
+
+    mgr._handle_job_status_results(
+        [(stale, None, failed)],
+        provider_error_phase_mode=(
+            replica_managers.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY))
+
+    applied = mgr._apply_confirmed_preemption.call_args.args[0]
+    assert applied is accepted[7]
+    assert applied.status_property.preempted
 
 
 def test_preemption_path_skips_vanished_replica(monkeypatch):
@@ -613,33 +634,28 @@ def test_command_error_on_one_replica_does_not_starve_the_rest(monkeypatch):
 
     monkeypatch.setattr(replica_managers.backends.CloudVmRayBackend,
                         'get_job_status', _get_job_status)
-    monkeypatch.setattr(serve_state, 'get_replica_info_from_id',
-                        lambda svc, rid: broken if rid == 1 else failed)
-    writes = []
-
-    def _persist_existing(_service_name, replica_id, info, *,
-                          expected_replica_exists, **_fence_kwargs):
-        assert expected_replica_exists is True
-        writes.append((replica_id, info))
-        return True
-
-    monkeypatch.setattr(serve_state, 'add_or_update_replica', _persist_existing)
-
-    terminated = []
+    committed_plans = []
     mgr = _build_manager()
-    # Provider still reports the backend live: this is a command failure, not
-    # interruption evidence.
-    mgr._cloud_instance_looks_alive = lambda *_args, **_kwargs: (
-        replica_managers._PreemptionPrefilterResult(
-            replica_managers._PreemptionPrefilterDisposition.LIVE_OR_UNPROVEN))
-    mgr._terminate_replica = lambda rid, **kwargs: terminated.append(rid)
+
+    def _commit(plans):
+        committed_plans.extend(plans)
+        return ({
+            plan.opening_info.replica_id: plan.desired_info for plan in plans
+        }, set())
+
+    mgr._commit_probe_row_plans = _commit
+    mgr._route_lease_registry = mock.Mock(return_value=mock.Mock())
+    mgr._launch_completion_state = mock.Mock(return_value=(mock.Mock(),
+                                                           mock.Mock()))
     mgr._fetch_exact_status()  # must not raise
 
-    assert terminated == [
-        2
-    ], ('the failed replica after the broken one must still be terminated')
-    assert failed.status_property.user_app_failed
-    assert writes == [(2, failed)]
+    plans_by_id = {
+        plan.opening_info.replica_id: plan for plan in committed_plans
+    }
+    assert plans_by_id[2].effects.teardown, (
+        'the failed replica after the broken one must still be reduced')
+    assert plans_by_id[2].desired_info.status_property.user_app_failed
+    assert not plans_by_id[1].effects.teardown
 
 
 def test_empty_job_statuses_skipped_without_aborting_walk(monkeypatch):
