@@ -107,7 +107,12 @@ terminal feedback and do not use this checkpoint.
 
 The paid claim stores a PostgreSQL timestamp and receipt SHA-256 as an
 all-or-none pair; the closed receipt contract name is covered by that digest.
-An exact replay is a no-op; a different or partial receipt fails closed. The
+An exact replay is a no-op; a different or partial receipt fails closed. That
+fail-closed result surfaces as the terminal replica launch fence, never as a
+provider failure: the provider already returned one running allocation, so
+the launch must not classify a lost or contradicted checkpoint as capacity,
+fail over, or tear the allocation down from the stale request; the durable
+service owner reconciles the created object. The
 provider-evidence fields on the launch association remain solely
 post-terminal cleanup/recovery evidence and are not overloaded. Once the claim
 contains the marker, every later terminal request outcome is economically

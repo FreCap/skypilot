@@ -623,25 +623,39 @@ def _record_full_fresh_paid_provider_allocation(
                 gcp_identity.market_type != 'spot'):
             return False
         provider_project_id = gcp_identity.project_id
-    receipt = paid_capacity.PaidProviderAllocationReceipt(
-        contract=paid_capacity.PAID_PROVIDER_ALLOCATION_CONTRACT,
-        association_id=str(context.association_id),
-        replica_record_id=str(context.replica_record_id),
-        provider=provider,
-        workspace=workspace,
-        provider_identity=provider_identity,
-        provider_project_id=provider_project_id,
-        region=provision_record.region,
-        zone=provision_record.zone,
-        instance_type=instance_type,
-        cluster_name_on_cloud=cluster_name_on_cloud,
-        requested_num_nodes=requested_num_nodes,
-        head_instance_id=head_instance_id,
-        created_instance_ids=created_ids,
-        resumed_instance_ids=resumed_ids,
-        use_spot=True)
-    disposition = ordinary_launch_request._record_paid_provider_allocation(  # pylint: disable=protected-access
-        launch_context, receipt)
+    try:
+        receipt = paid_capacity.PaidProviderAllocationReceipt(
+            contract=paid_capacity.PAID_PROVIDER_ALLOCATION_CONTRACT,
+            association_id=str(context.association_id),
+            replica_record_id=str(context.replica_record_id),
+            provider=provider,
+            workspace=workspace,
+            provider_identity=provider_identity,
+            provider_project_id=provider_project_id,
+            region=provision_record.region,
+            zone=provision_record.zone,
+            instance_type=instance_type,
+            cluster_name_on_cloud=cluster_name_on_cloud,
+            requested_num_nodes=requested_num_nodes,
+            head_instance_id=head_instance_id,
+            created_instance_ids=created_ids,
+            resumed_instance_ids=resumed_ids,
+            use_spot=True)
+        disposition = ordinary_launch_request._record_paid_provider_allocation(  # pylint: disable=protected-access
+            launch_context, receipt)
+    except exceptions.RequestCancelled:
+        raise
+    except Exception as error:  # pylint: disable=broad-except
+        # The checkpoint is economic pool feedback under the retained request
+        # authority, never provider cleanup evidence.  The provider already
+        # returned one RUNNING allocation, so a lost, contradicted, or
+        # indeterminate checkpoint is a terminal launch fence like every other
+        # authority failure at this boundary: the zone loop must not classify
+        # it as capacity, fail over, or tear the allocation down from this
+        # request.  The durable service owner reconciles the created object.
+        raise exceptions.ServeReplicaLaunchFenceError(
+            'Paid provider-allocation checkpoint lost or contradicted its '
+            'request authority.') from error
     logger.info('Recorded paid provider allocation %s for %s.',
                 disposition.value, cluster_name_on_cloud)
     return True
