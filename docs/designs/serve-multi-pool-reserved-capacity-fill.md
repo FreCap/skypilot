@@ -167,19 +167,34 @@ pre-admission absence. A separate cleanup correction accepts a later
 quiesced, claim-free and pin-free paid projection; every ambiguous or failed
 down marker remains rejected.
 
-The next billable qualification uses the observed 420-member service envelope:
-14 exact one-L4 Spot locations, a 30-member initial window per location, a
-480-member per-location adaptive ceiling, and a 420-member service ceiling.
-The 420-member value is a service target, not a required transaction size. The
-unpaid PostgreSQL gate must first prove a reviewed bound whose transactions fit
-the unchanged authority lease, preserve one atomic correctness commit per wave,
-and converge to that target through successive generations. The existing
+The next billable qualification is bounded at 800 logical L4 slots and requires
+at least 100 physical provider-``RUNNING`` workers. The logical bound is
+intentional: the unpinned catalog permits machines up to eight L4s wide, so a
+420-slot service could legally stop at only 52 physical machines and could
+never prove the physical gate. The campaign first submits 800 immutable async
+identities and proves that exact held prefix is resident before it submits the
+remaining 9,200 zero-duration identities. This removes client/network ordering
+from the load balancer's strict FIFO contract: the first 800 remain active for
+340 seconds while the tail stays queued behind them. Within the original
+60-second offered-arrival window, the qualifier joins a fresh PostgreSQL
+request reduction showing exactly 10,000 queued plus in-flight identities to
+the routed ACTIVE load balancer's exact 10,000 unique-job arrival counters.
+Queued identities do not yet have ledger rows; dispatched in-flight identities
+must exactly equal active ledger rows, and the terminal 10,000-row delta later
+proves that the whole queue was processed. The worker accepts at most 360
+seconds of synthetic work and the queue expires at 600 seconds, so demand
+survives the five-minute scale SLO without depending on timeout. The controller
+Helm throttle remains 420 prepared physical launches; neither that shared
+throttle nor `boltz-l4-fleet`'s paid cap changes. The real-cloud gate remains at
+least 100 provider-running workers within five minutes, exact request-ledger
+completion, fresh attributed demand telemetry, and natural exact-zero drain.
+The 100-member atomic PostgreSQL wave bound is independent from the logical
+service target, physical-launch throttle, per-location window, and provider
+concurrency. Successive fresh generations must converge to the target while
+each transaction stays inside the unchanged authority lease. The existing
 optional best-effort history projection may use a second transaction on the
-same checkout. The real-cloud gate remains at least 100 provider-running
-workers within five minutes, 10,000 authenticated completions with fresh
-positive request telemetry, and natural exact-zero drain. Those values are
-qualification inputs, not a change to scheduler policy or an authorization to
-raise the long-lived production paid cap.
+same checkout. These are qualification inputs, not a scheduler-policy change
+or authorization to raise the long-lived production paid cap.
 
 Provider availability and runtime/service readiness are separate facts. The
 write-once provider-allocation marker commits normal pool-success feedback
@@ -3668,6 +3683,43 @@ on-demand spill.
 
 ### Paid Spot provider-lifecycle proof
 
+The current qualification contract separates economic placement from provider
+reachability. One generic AWS/GCP economic service lets the production
+cheapest-first selector choose either cloud; its scale gate is at least 100
+physical provider-``RUNNING`` VMs in aggregate within five minutes, never a
+synthetic requirement that both clouds win. Exactly 10,000 stable async-ledger
+identities are the sole demand stimulus for that run. A joined exact-zero
+request/provider baseline immediately precedes traffic. The staged campaign
+then proves exactly 10,000 resident and deduplicated offered arrivals within 60
+seconds; every provider scale sample must itself retain positive PostgreSQL and
+load-balancer demand, and its dispatched in-flight gauge must equal active
+exact-ledger rows. Its 800 logical-slot cap and 800 held identities permit 100
+physical machines even when the cheapest catalog shape has eight L4s. If its
+completed receipt has no positive ``RUNNING`` evidence for one provider, that
+receipt may authorize exactly one provider-pinned canary rendered from the same
+source YAML. Rendering fails before ``sky serve up`` unless the requested cloud
+is exactly the provider absent from the economic result. The canary offers one
+exact async request, permits one physical backend (``max_replicas: 1``), and
+separately allows up to eight paid L4 units so any current whole-L4 catalog
+backend fits. It is provider reachability evidence, not a second
+economic-placement policy. No standalone or unnecessary canary is billable.
+
+The renderer removes only its typed profile/provider fields to derive one
+canonical source-task digest, then binds each allowed projection to that digest.
+The terminal aggregate gate requires every canary to carry the economic source
+digest, its exact canary projection digest, and the SHA-256 of the exact
+economic receipt that authorized it. It also joins every
+qualification receipt to its matching immutable service identity and cleanup
+receipt. It accepts only real provider scale samples, the exact AWS/GCP
+positive-provider union, positive attributed economic telemetry, the 10,000
+request terminal-ledger delta, and strict baseline-before-campaign-before-
+provider-scale-before-terminal-ledger-before-drain timing. Provider shapes and
+totals are reduced from complete raw samples, not trusted receipt scalars. The
+gate also requires the physical scale SLO, three distinct
+increasing pre-down natural-drain samples, and three distinct increasing
+post-down cleanup samples with canonical AWS and GCP zero projections. Runtime
+placement policy remains unchanged.
+
 PR #1813 is the canonical executable provider-native qualifier for the next
 run. Its merged code is source evidence only. The gate closes only when the
 qualifier emits one immutable live receipt from the intended deployed image and
@@ -3851,50 +3903,46 @@ these remaining current-writer acceptance gates:
    152 crossed the former clipping boundary and recorded repeated schema-6
    successor heads and accepted paid waves; its later restart-cleanup failure
    is tracked separately below.
-6. **Complete in source:** run the provider-free source gate against PostgreSQL with the
-   synchronous request pool fixed at one and provider adapters installed as
-   fail traps. Treat 420 members across 14 one-L4 pools, 30 initial members per
-   location, a 480-member per-location adaptive ceiling, and a 420-member
-   service ceiling as the convergence envelope, not one transaction. The
-   implemented 100-member atomic-wave bound is independent from those service,
-   pool, and provider limits; fresh successors account for every preceding
-   committed replica and claim. The real-PostgreSQL gate converges 420 as
-   100/100/100/100/20 and preserves exact cap/debit accounting across five
-   generations. For each fused correctness wave require one database checkout,
-   one atomic correctness commit, and exact cardinality across the nine graph components:
-   plan, head, claim, replica, association, request, queue, pin, and replica
-   pointer. Permit only the existing optional best-effort history transaction
-   on that same checkout, and prove both its commit and rollback outcomes leave
-   the correctness graph durable. Inject a failure after the final bind and
-   require that wave's nine components to remain zero. Lose the commit
-   acknowledgement after a real PostgreSQL COMMIT and prove the committed queue
-   rows are claimable without controller-local state or singleton HTTP
-   submission. The maximum 100-member wave passes rollback and real
-   post-COMMIT lost-acknowledgement recovery; a stale successor fails before
-   planner entry and resumes from the intact graph after a fresh report. Reject
-   an old executor cohort, a missing exact GCP project map, and every canonical body
-   mutation before planner entry, graph writes, or provider I/O. The mutation
-   matrix covers run, backend, retry-until-up, no-setup, fast, optimize target,
-   cloud, region, zone, instance type, image, Spot flag, accelerator, task and
-   request environments, security group, CPU, memory, cluster overrides, TLS
-   rotation, and locked-project change.
-7. Merge and deploy the atomic paid-wave correction on one immutable image.
-   Require all API, controller, executor, and GCP-login-init roles to resolve
-   to that digest and the API/controller/executor fleet to advertise cohort 15
-   homogeneously before creating the qualification service. Apply the
-   forward-only Serve067 additive control-plane migration before activation;
-   it aligns existing paid-pool constraints and guard functions without a
-   table or service-data rewrite. This adds no scheduler, infrastructure, or
-   provider configuration.
-8. Run the provider-native scale profile against that exact image and the
-   exact 14-location, 30-initial, 480-per-location, 420-service envelope. Drive
-   the bounded Spot target to at least 100 provider-`RUNNING` L4 Spot VMs in
-   aggregate within five minutes, with nonzero successful AWS and GCP cohorts.
-   Record physical VMs and logical L4 slots separately, complete 10,000
-   authenticated async identities, capture positive queued, processing,
-   in-flight and exact terminal-ledger/UI evidence, and require zero ordinary
-   on-demand or wrong-shape capacity. Then stop demand and retain three natural
-   exact-zero PostgreSQL, VM, disk, and provider-operation samples.
+6. **Complete in source:** run the provider-free source gate against PostgreSQL
+   with the synchronous request pool fixed at one and provider adapters
+   installed as fail traps. The implemented 100-member atomic-wave bound is
+   independent from service, pool, and provider limits; fresh successors
+   account for every preceding committed replica and claim. The real-PostgreSQL
+   gate converges 420 as 100/100/100/100/20 and preserves exact cap/debit
+   accounting across five generations. For each fused correctness wave require
+   one database checkout, one atomic correctness commit, and exact cardinality
+   across the nine graph components: plan, head, claim, replica, association,
+   request, queue, pin, and replica pointer. Permit only the existing optional
+   best-effort history transaction on that same checkout. Failure after the
+   final bind rolls back the whole graph; a lost post-COMMIT acknowledgement
+   leaves every durable queue row claimable. Stale source, old executor cohort,
+   missing provider identity, and canonical-body mutations reject before
+   planner entry, graph writes, or provider I/O. PR #1857 merged this source as
+   merge commit ``6696c24da``.
+7. Deploy the atomic paid-wave correction on one immutable image. Require all
+   API, controller, executor, and GCP-login-init roles to resolve to that digest
+   and the API/controller/executor fleet to advertise cohort 15 homogeneously
+   before creating the qualification service. Apply the forward-only Serve067
+   additive control-plane migration before activation; it aligns existing
+   paid-pool constraints and guard functions without a table or service-data
+   rewrite. This adds no scheduler, infrastructure, or provider configuration.
+8. Run the provider-native scale profile against that exact image. Drive the
+   800-logical-slot bounded Spot target to at least 100 provider-``RUNNING`` L4
+   Spot VMs in aggregate within five minutes; do not require both providers to
+   win the economic selection. Keep the shared 420-physical-launch Helm
+   throttle unchanged and record physical VMs and logical L4 slots separately.
+   Use exactly 10,000 authenticated async identities as the only scale
+   stimulus. Submit and observe the 800 held identities first, then submit the
+   9,200 zero-duration tail; within 60 seconds prove all 10,000 are resident
+   and appear in the ACTIVE load balancer's exact deduplicated offered-arrival
+   counters. Hold the prefix for 340 seconds, capture positive queued,
+   processing, in-flight, exact attribution, and exact terminal-ledger/UI
+   evidence, and require zero ordinary on-demand or wrong-shape capacity. Only
+   after the economic receipt proves a missing provider, run its one
+   provider-pinned, one-request canary projected from the same immutable source
+   task. Then stop demand, retain three natural exact-zero PostgreSQL, VM, disk,
+   and provider-operation samples for every service, and require the aggregate
+   receipt to join all identities and prove the exact AWS/GCP provider union.
 9. Restore the conservative Helm executor sizing, then recreate
    `boltz-l4-fleet` from the checked, current-only service definition.
    Under positive compatible demand, prove reserved capacity commits before

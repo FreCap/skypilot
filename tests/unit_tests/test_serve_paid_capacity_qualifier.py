@@ -25,6 +25,7 @@ from smoke_tests import smoke_tests_utils
 import yaml
 
 import sky
+from sky.serve import load_balancer
 from sky.serve import replica_managers
 from sky.serve import serve_utils
 
@@ -87,6 +88,13 @@ def _provider_scope(**overrides):
         ),
         'placement_catalog_sha256': 'c' * 64,
         'service_yaml_sha256': 'd' * 64,
+        'qualification_profile': 'small',
+        'qualification_source_sha256': 'e' * 64,
+        'qualification_projection_sha256':
+            qualifier._qualification_projection_sha256(
+                source_sha256='e' * 64,
+                profile=qualifier.PROFILES['small'],
+                providers=('aws', 'gcp')),
         'controller_config_digest': 'a' * 64,
         'controller_config_snapshot_id': 'b' * 64,
     }
@@ -342,7 +350,19 @@ def _qualification_config(*, persisted: bool, reverse: bool = False):
 def test_cross_cloud_service_contract_normalizes_one_canonical_shape(
         persisted, reverse):
     config = _qualification_config(persisted=persisted, reverse=reverse)
-    assert qualifier._validate_cross_cloud_service_config(config) == (2, 8)
+    assert qualifier._validate_qualification_service_config(config) == (
+        qualifier.QualificationServiceContract(
+            providers=('aws', 'gcp'),
+            min_replicas=0,
+            max_replicas=2,
+            max_live_paid_gpu_units=2,
+            scale_up_rate_min_replicas=2,
+            scale_up_rate_period_seconds=10,
+            request_queue_min_size=4,
+            request_queue_max_size=32,
+            request_queue_max_concurrency=4,
+            request_queue_timeout_seconds=600,
+            max_concurrency_per_replica=8))
 
 
 @pytest.mark.parametrize('mutation', [
@@ -351,7 +371,6 @@ def test_cross_cloud_service_contract_normalizes_one_canonical_shape(
     'branch_zone',
     'branch_instance_type',
     'duplicate_cloud',
-    'missing_cloud',
     'extra_cloud',
     'wrong_width',
     'wrong_card',
@@ -371,8 +390,6 @@ def test_cross_cloud_service_contract_rejects_scope_drift(mutation):
         branches[0][mutation.removeprefix('branch_')] = 'pinned'
     elif mutation == 'duplicate_cloud':
         branches[1]['infra'] = branches[0]['infra']
-    elif mutation == 'missing_cloud':
-        resources['any_of'] = branches[:1]
     elif mutation == 'extra_cloud':
         branches[1]['infra'] = 'azure'
     elif mutation == 'wrong_width':
@@ -391,22 +408,37 @@ def test_cross_cloud_service_contract_rejects_scope_drift(mutation):
         branches[0] = 'aws'
     else:
         raise AssertionError(mutation)
-    with pytest.raises(ValueError, match='not generic cross-cloud L4'):
-        qualifier._validate_cross_cloud_service_config(config)
+    with pytest.raises(ValueError, match='not generic whole-L4 Spot'):
+        qualifier._validate_qualification_service_config(config)
+
+
+@pytest.mark.parametrize('provider', ['aws', 'gcp'])
+def test_service_contract_accepts_provider_canary_projection(provider):
+    config = _qualification_config(persisted=True)
+    config['resources']['any_of'] = [
+        branch for branch in config['resources']['any_of']
+        if branch['infra'] == provider
+    ]
+
+    contract = qualifier._validate_qualification_service_config(config)
+
+    assert contract.providers == (provider,)
 
 
 def test_render_profiles_share_one_spot_only_service(tmp_path):
     source = _FIXTURE_DIR / 'service.yaml'
     for name, expected_units, expected_first_wave, expected_period in (
         ('small', 2, 2, 10),
-        ('scale', 420, 420, 10),
+        ('scale', 800, 800, 10),
     ):
         output = tmp_path / f'{name}.yaml'
-        args = type('Args', (), {
-            'profile': name,
-            'source': str(source),
-            'output': str(output),
-        })()
+        args = type(
+            'Args', (), {
+                'profile': name,
+                'provider': None,
+                'source': str(source),
+                'output': str(output),
+            })()
         qualifier.render_service(args)
         config = yaml.safe_load(output.read_text(encoding='utf-8'))
         assert (config['service']['load_balancing_policy'] ==
@@ -422,10 +454,10 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
         assert policy['cost_rebalance'] is False
         queue = config['service']['load_balancer']['request_queue']
         profile = qualifier.PROFILES[name]
-        assert queue['min_size'] == profile.pressure_concurrency
-        assert queue['max_size'] == max(32, profile.pressure_concurrency * 2)
-        assert queue['max_concurrency'] == max(
-            8, min(128, profile.pressure_concurrency))
+        assert queue['min_size'] == profile.request_concurrency
+        assert queue['max_size'] == max(32, profile.request_concurrency)
+        assert queue['max_concurrency'] == (
+            qualifier.request_queue_max_concurrency(profile))
         assert resources['use_spot'] is True
         assert resources['accelerators'] == 'L4:1'
         assert resources['any_of'] == [
@@ -447,6 +479,151 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
         serve_utils.validate_service_task(task, pool=False)
 
 
+def test_source_identity_rejects_nested_reserved_provenance(tmp_path):
+    canonical = _qualification_config(persisted=False)
+    altered = yaml.safe_load(yaml.safe_dump(canonical, sort_keys=False))
+    altered['run'] = 'echo attacker-controlled-outer-task'
+    altered['_user_specified_yaml'] = yaml.safe_dump(canonical, sort_keys=False)
+    persisted = _qualification_config(persisted=True)
+    persisted['_user_specified_yaml'] = yaml.safe_dump(altered, sort_keys=False)
+
+    with pytest.raises(ValueError, match='reserved provenance'):
+        qualifier._persisted_qualification_user_config(persisted)
+    with pytest.raises(ValueError, match='reserved provenance'):
+        qualifier._qualification_source_sha256(altered)
+
+    source = tmp_path / 'nested-provenance.yaml'
+    output = tmp_path / 'rendered.yaml'
+    source.write_text(yaml.safe_dump(altered, sort_keys=False),
+                      encoding='utf-8')
+    args = type(
+        'Args', (), {
+            'profile': 'scale',
+            'provider': None,
+            'economic_receipt': None,
+            'source': str(source),
+            'output': str(output),
+        })()
+    with pytest.raises(qualifier.QualificationError,
+                       match='invalid reserved provenance'):
+        qualifier.render_service(args)
+    assert not output.exists()
+
+
+def test_scale_profile_can_prove_one_hundred_max_width_physical_vms():
+    profile = qualifier.PROFILES['scale']
+
+    assert profile.max_replicas == 800
+    assert all((profile.max_units + width - 1) // width >= 100
+               for width in range(1, 9))
+    assert profile.exact_requests == 10_000
+    assert profile.request_concurrency == profile.exact_requests
+    assert qualifier.held_request_count(profile) == profile.max_units
+    assert profile.scale_up_min_replicas == profile.max_units
+
+
+def test_scale_queue_can_admit_full_campaign_while_dispatch_stays_bounded():
+    profile = qualifier.PROFILES['scale']
+    projection = qualifier._profile_projection(profile)
+    instance = object.__new__(load_balancer.SkyServeLoadBalancer)
+    instance._request_queue_config = {  # pylint: disable=protected-access
+        'max_size': projection['request_queue_max_size'],
+        'max_concurrency': projection['request_queue_max_concurrency'],
+    }
+
+    assert projection['request_queue_min_size'] == 10_000
+    assert projection['request_queue_max_size'] == 10_000
+    assert projection['request_queue_max_concurrency'] == 128
+    assert instance._request_queue_submission_limit() == 10_128
+    assert instance._request_queue_submission_limit() >= profile.exact_requests
+
+
+def test_fixture_holds_fit_worker_bound_below_queue_timeout():
+    config = yaml.safe_load(
+        (_FIXTURE_DIR / 'service.yaml').read_text(encoding='utf-8'))
+    duration_limit = qualifier._fixture_duration_limit(config)
+    queue_timeout = config['service']['load_balancer']['request_queue'][
+        'timeout_seconds']
+
+    assert duration_limit == 360
+    assert all(
+        qualifier.request_hold_seconds(profile) == 340
+        for profile in qualifier.PROFILES.values())
+    assert all(
+        qualifier.request_hold_seconds(profile) <= duration_limit
+        for profile in qualifier.PROFILES.values())
+    assert duration_limit < queue_timeout
+
+
+@pytest.mark.parametrize('provider', ['aws', 'gcp'])
+def test_provider_canary_is_rendered_from_the_canonical_fixture(
+        tmp_path, provider):
+    source_config = yaml.safe_load(
+        (_FIXTURE_DIR / 'service.yaml').read_text(encoding='utf-8'))
+    economic_args = _aggregate_args(
+        tmp_path,
+        with_canary=False,
+        source_sha256=qualifier._qualification_source_sha256(source_config),
+        economic_peaks={
+            'aws' if provider == 'gcp' else 'gcp': 100,
+            provider: 0,
+        })
+    output = tmp_path / f'{provider}.yaml'
+    qualifier.render_service(
+        type(
+            'Args', (), {
+                'profile': 'provider-canary',
+                'provider': provider,
+                'economic_receipt': economic_args.economic_receipt,
+                'source': str(_FIXTURE_DIR / 'service.yaml'),
+                'output': str(output),
+            })())
+
+    config = yaml.safe_load(output.read_text(encoding='utf-8'))
+    policy = config['service']['replica_policy']
+    assert policy['max_replicas'] == 1
+    assert policy['max_live_paid_gpu_units'] == 8
+    assert config['resources']['any_of'] == [{'infra': provider}]
+    assert qualifier._validate_qualification_service_config(
+        config).providers == (provider,)
+
+
+@pytest.mark.parametrize('authorization', ['missing', 'wrong', 'unnecessary'])
+def test_provider_canary_is_rejected_before_render_without_exact_economic_gap(
+        tmp_path, authorization):
+    source = _FIXTURE_DIR / 'service.yaml'
+    source_config = yaml.safe_load(source.read_text(encoding='utf-8'))
+    provider = 'gcp'
+    economic_peaks = ({
+        'aws': 100,
+        'gcp': 0,
+    } if authorization != 'unnecessary' else {
+        'aws': 50,
+        'gcp': 50,
+    })
+    economic = _aggregate_args(
+        tmp_path,
+        with_canary=False,
+        economic_peaks=economic_peaks,
+        source_sha256=qualifier._qualification_source_sha256(source_config))
+    economic_receipt = (None if authorization == 'missing' else
+                        economic.economic_receipt)
+    if authorization == 'wrong':
+        provider = 'aws'
+    args = type(
+        'Args', (), {
+            'profile': 'provider-canary',
+            'provider': provider,
+            'economic_receipt': economic_receipt,
+            'source': str(source),
+            'output': str(tmp_path / 'canary.yaml'),
+        })()
+
+    with pytest.raises(qualifier.QualificationError, match='Provider canary'):
+        qualifier.render_service(args)
+    assert not pathlib.Path(args.output).exists()
+
+
 def test_render_rejects_paid_fixture_without_exact_accelerator_routing(
         tmp_path):
     config = yaml.safe_load(
@@ -457,6 +634,7 @@ def test_render_rejects_paid_fixture_without_exact_accelerator_routing(
     args = type(
         'Args', (), {
             'profile': 'scale',
+            'provider': None,
             'source': str(source),
             'output': str(tmp_path / 'rendered.yaml'),
         })()
@@ -518,8 +696,11 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
                                                  instance_type='g2-standard-4'),
                   0.2)),
         num_nodes=1).to_dict()
-    user_service_yaml = (_FIXTURE_DIR /
-                         'service.yaml').read_text(encoding='utf-8')
+    user_service = yaml.safe_load(
+        (_FIXTURE_DIR / 'service.yaml').read_text(encoding='utf-8'))
+    user_service['service']['load_balancer']['request_queue'][
+        'max_concurrency'] = 8
+    user_service_yaml = yaml.safe_dump(user_service, sort_keys=False)
     persisted_service = yaml.safe_load(user_service_yaml)
     user_resources = persisted_service['resources']
     # The API stores effective resources inside each ``any_of`` branch and may
@@ -554,6 +735,33 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
     assert (scope.location_scope is qualifier.GcpLocationScope.PROJECT_WIDE)
     receipt = tmp_path / 'scope.json'
     qualifier.write_provider_scope(receipt, 'paid-e2e', scope)
+    assert qualifier.read_provider_scope(receipt, 'paid-e2e') == scope
+
+
+@pytest.mark.parametrize('provider', ['aws', 'gcp'])
+def test_provider_scope_receipt_accepts_one_provider_canary(tmp_path, provider):
+    base = _provider_scope()
+    scope = dataclasses.replace(
+        base,
+        max_live_paid_gpu_units=8,
+        providers=(provider,),
+        project_id=(base.project_id if provider == 'gcp' else None),
+        location_scope=(base.location_scope if provider == 'gcp' else None),
+        aws_location_scope=(base.aws_location_scope
+                            if provider == 'aws' else None),
+        aws_regions=(base.aws_regions if provider == 'aws' else ()),
+        qualification_profile='provider-canary',
+        qualification_projection_sha256=(
+            qualifier._qualification_projection_sha256(
+                source_sha256=base.qualification_source_sha256,
+                profile=qualifier.PROFILES['provider-canary'],
+                providers=(provider,))),
+        catalog_shapes=tuple(
+            shape for shape in base.catalog_shapes if shape.cloud == provider))
+    receipt = tmp_path / f'{provider}-scope.json'
+
+    qualifier.write_provider_scope(receipt, 'paid-e2e', scope)
+
     assert qualifier.read_provider_scope(receipt, 'paid-e2e') == scope
 
 
@@ -1509,6 +1717,83 @@ def test_cleanup_census_counts_instance_after_cluster_label_loss():
     assert state.running_count == 1
 
 
+def test_wait_cleanup_writes_identity_bound_sustained_zero_receipt(
+        monkeypatch, tmp_path):
+    base = _provider_scope()
+    scope = dataclasses.replace(
+        base,
+        max_live_paid_gpu_units=8,
+        providers=('gcp',),
+        aws_location_scope=None,
+        aws_regions=(),
+        qualification_profile='provider-canary',
+        qualification_projection_sha256=(
+            qualifier._qualification_projection_sha256(
+                source_sha256=base.qualification_source_sha256,
+                profile=qualifier.PROFILES['provider-canary'],
+                providers=('gcp',))),
+        catalog_shapes=tuple(
+            shape for shape in base.catalog_shapes if shape.cloud == 'gcp'))
+    scope_path = tmp_path / 'scope.json'
+    qualification_path = tmp_path / 'qualification.json'
+    output_path = tmp_path / 'cleanup.json'
+    qualifier.write_provider_scope(scope_path, 'paid-e2e', scope)
+    qualification_path.write_text('{"receipt": "test"}\n', encoding='utf-8')
+
+    class Postgres:
+        """Exact-zero database observer double."""
+
+        def __init__(self, *_args):
+            pass
+
+        def bind_provider_scope(self, observed_scope):
+            assert observed_scope == scope
+
+        @staticmethod
+        def cleanup_debits():
+            return (0, 0, 0)
+
+        @staticmethod
+        def close():
+            pass
+
+    class Gcp:
+        """Exact-zero provider observer double."""
+
+        @staticmethod
+        def census():
+            return qualifier.ProviderCensus(instances=[],
+                                            disks=[],
+                                            operations=[])
+
+    monkeypatch.setenv('TEST_DATABASE_URL', 'postgresql://unused')
+    monkeypatch.setattr(qualifier, 'PostgresObserver', Postgres)
+    monkeypatch.setattr(qualifier, '_provider_observers', lambda **_kwargs:
+                        (Gcp(), None))
+    args = type(
+        'Args', (), {
+            'postgres_url_env': 'TEST_DATABASE_URL',
+            'service_name': 'paid-e2e',
+            'scope': str(scope_path),
+            'receipt': str(qualification_path),
+            'output': str(output_path),
+            'timeout_seconds': 2,
+            'poll_seconds': 0,
+        })()
+
+    asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    assert payload['outcome'] == 'passed'
+    assert payload['service_hash'] == scope.service_hash
+    assert payload['expected_providers'] == ['gcp']
+    assert payload['zero_samples'] == 3
+    assert [sample['exact_zero'] for sample in payload['samples']
+           ] == [True, True, True]
+    assert payload['qualification_receipt_sha256'] == hashlib.sha256(
+        qualification_path.read_bytes()).hexdigest()
+
+
 @pytest.mark.parametrize('child_status', ('RUNNING', 'DONE'))
 def test_cleanup_census_attributes_bulk_insert_parent_by_operation_lineage(
         child_status):
@@ -1758,7 +2043,7 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
                                 profile=qualifier.PROFILES['small'])
     receipt.sample('scale', observation)
 
-    assert receipt._payload['schema_version'] == 3
+    assert receipt._payload['schema_version'] == 7
     assert receipt._payload['request_priority'] == 50
     sample = receipt._payload['samples'][0]
     assert sample['phase'] == 'scale'
@@ -2248,6 +2533,7 @@ def test_exact_provider_free_unbound_paid_debit_remains_visible_during_scale(
             provider_free_unbound_replica_ids=(7,))).is_exact_zero()
 
     class Observer:
+        """Return one provider-free phase-A observation."""
 
         async def snapshot(self, *, require_complete_demand_report=True):
             assert not require_complete_demand_report
@@ -2281,6 +2567,7 @@ def test_phase_a_observation_cannot_hide_a_provider_effect(tmp_path):
         load_balancer=_load_balancer_state(demand_units=4))
 
     class Observer:
+        """Return a phase-A observation that already has a provider effect."""
 
         async def snapshot(self, *, require_complete_demand_report=True):
             assert not require_complete_demand_report
@@ -2305,6 +2592,10 @@ def test_zero_gates_require_complete_demand_reports(tmp_path, phase):
 
     class Observer:
 
+        @staticmethod
+        async def request_telemetry():
+            return _request_telemetry()
+
         async def snapshot(self, *, require_complete_demand_report=True):
             assert require_complete_demand_report
             return observation
@@ -2320,6 +2611,65 @@ def test_zero_gates_require_complete_demand_reports(tmp_path, phase):
                                     phase=phase))
     assert observed is observation
     assert receipt._payload['samples'][-1]['phase'] == phase
+
+
+def test_provider_baseline_fails_on_first_valid_nonzero_sample(tmp_path):
+    profile = dataclasses.replace(qualifier.PROFILES['small'], poll_seconds=0)
+    observations = [
+        _observation(load_balancer=_load_balancer_state(demand_units=1)),
+        _observation(),
+    ]
+
+    class Observer:
+
+        @staticmethod
+        async def request_telemetry():
+            return _request_telemetry()
+
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert require_complete_demand_report
+            return observations.pop(0)
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='pre-demand provider observation is nonzero'):
+        asyncio.run(
+            qualifier._wait_for_joined_baseline(
+                observer=Observer(),
+                profile=profile,
+                progress=qualifier.Progress(),
+                receipt=qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                          service_name='paid-e2e',
+                                          profile=profile)))
+    assert len(observations) == 1
+
+
+def test_request_baseline_fails_on_first_valid_nonzero_sample(tmp_path):
+    profile = dataclasses.replace(qualifier.PROFILES['small'], poll_seconds=0)
+    telemetry = [
+        _request_telemetry(queue_depth=1, state_counts={'ACCEPTED': 1}),
+        _request_telemetry(),
+    ]
+
+    class Observer:
+
+        async def request_telemetry(self):
+            return telemetry.pop(0)
+
+        @staticmethod
+        async def snapshot(**_kwargs):
+            raise AssertionError('provider sampling must fail closed first')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='pre-demand request telemetry is nonzero'):
+        asyncio.run(
+            qualifier._wait_for_joined_baseline(
+                observer=Observer(),
+                profile=profile,
+                progress=qualifier.Progress(),
+                receipt=qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                          service_name='paid-e2e',
+                                          profile=profile)))
+    assert len(telemetry) == 1
 
 
 def test_demand_projection_is_zero_sensitive():
@@ -2360,6 +2710,17 @@ def test_retained_binding_allows_provider_effect_after_claim_release():
             claimed_units=0,
             bound_cluster_zones=(('paid-e2e-1', 'us-central1-a'),)))
     qualifier.validate_observation(bound, profile)
+
+
+def test_provider_canary_rejects_wrong_cloud_durable_binding():
+    profile = qualifier.PROFILES['provider-canary']
+    expectation = qualifier.provider_expectation(profile, 'aws')
+    observation = _observation(database=_database_state(
+        bound_cluster_zones=(('paid-e2e-gcp', 'us-central1-a'),)))
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='outside the qualification scope'):
+        qualifier.validate_observation(observation, profile, expectation)
 
 
 def test_route_authority_must_be_fresh_and_match_lifecycle():
@@ -2413,7 +2774,7 @@ def test_progress_requires_scale_slo_and_sustained_exact_zero():
                                    observed_at=800,
                                    observed_monotonic=2000)
     with pytest.raises(qualifier.QualificationError,
-                       match='physical RUNNING.*across AWS and GCP took'):
+                       match='physical RUNNING L4 Spot VMs took'):
         qualifier.Progress(scale_started_monotonic=1000).observe(
             too_slow, profile)
 
@@ -2431,7 +2792,7 @@ def test_progress_scale_counts_physical_vms_not_logical_gpu_units():
     assert progress.scale_reached_monotonic is None
 
 
-def test_progress_scale_requires_running_cohorts_in_aws_and_gcp():
+def test_economic_progress_does_not_require_an_artificial_provider_mix():
     profile = qualifier.PROFILES['scale']
     observation = _observation(provider=_cross_cloud_provider_state(
         gcp_running_count=100, aws_running_count=0))
@@ -2441,7 +2802,23 @@ def test_progress_scale_requires_running_cohorts_in_aws_and_gcp():
 
     assert progress.peak_running == 100
     assert progress.peak_running_by_cloud == {'gcp': 100, 'aws': 0}
-    assert progress.scale_reached_monotonic is None
+    assert progress.scale_reached_monotonic == 1000
+
+
+def test_provider_canary_enforces_one_physical_instance():
+    names = _provider_cluster_names('gcp', 2)
+    observation = _observation(
+        database=_database_state(bound_cluster_zones=tuple(
+            (name, 'us-central1-a') for name in names)),
+        provider=_cross_cloud_provider_state(gcp_running_count=2,
+                                             aws_running_count=0))
+    expectation = qualifier.provider_expectation(
+        qualifier.PROFILES['provider-canary'], 'gcp')
+
+    with pytest.raises(qualifier.GuardViolation, match='physical-instance cap'):
+        qualifier.validate_observation(observation,
+                                       qualifier.PROFILES['provider-canary'],
+                                       expectation)
 
 
 def test_scale_survives_transient_observer_blackout(tmp_path):
@@ -2449,6 +2826,8 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
     gcp_names = _provider_cluster_names('gcp', 32)
     aws_names = _provider_cluster_names('aws', 32)
     profile = dataclasses.replace(qualifier.PROFILES['scale'],
+                                  exact_requests=64,
+                                  request_concurrency=64,
                                   minimum_running=64,
                                   poll_seconds=0,
                                   scale_timeout_seconds=2)
@@ -2479,6 +2858,14 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
     ]
 
     class Observer:
+        """Attributed telemetry with transient provider observation loss."""
+
+        @staticmethod
+        async def request_telemetry():
+            return _request_telemetry(queue_depth=32,
+                                      in_flight=32,
+                                      processing=16,
+                                      state_counts={'ACCEPTED': 32})
 
         async def snapshot(self, *, require_complete_demand_report=True):
             assert not require_complete_demand_report
@@ -2493,17 +2880,18 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
                                     service_name='paid-e2e',
                                     profile=profile)
         keep_alive = asyncio.Event()
-        pressure = asyncio.create_task(keep_alive.wait())
+        traffic = asyncio.create_task(keep_alive.wait())
         try:
             await qualifier._wait_for_scale(observer=Observer(),
                                             profile=profile,
                                             progress=progress,
                                             receipt=receipt,
-                                            pressure=pressure)
+                                            traffic=traffic,
+                                            baseline=_request_telemetry())
             return progress, receipt
         finally:
-            pressure.cancel()
-            await asyncio.gather(pressure, return_exceptions=True)
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
 
     progress, receipt = asyncio.run(exercise())
     assert progress.peak_running == 64
@@ -2516,119 +2904,116 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
            ] == [None, 'QualificationError', None]
 
 
-def test_pressure_remains_continuous_until_scale_converges(monkeypatch):
-    calls = []
+def test_scale_rejects_unattributed_mixed_demand(tmp_path):
+    profile = dataclasses.replace(qualifier.PROFILES['small'], poll_seconds=0)
+
+    class Observer:
+        """Expose demand that cannot belong solely to the campaign."""
+
+        @staticmethod
+        async def request_telemetry():
+            # Three demand-bearing requests but only two exact ledger rows.
+            return _request_telemetry(queue_depth=2,
+                                      in_flight=1,
+                                      processing=1,
+                                      state_counts={'ACCEPTED': 2})
+
+        @staticmethod
+        async def snapshot(**_kwargs):
+            raise AssertionError('provider sampling must fail closed first')
 
     async def exercise():
-        stop = asyncio.Event()
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='not exactly attributable'):
+                await qualifier._wait_for_scale(
+                    observer=Observer(),
+                    profile=profile,
+                    progress=qualifier.Progress(
+                        scale_started_monotonic=time.monotonic()),
+                    receipt=qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                              service_name='paid-e2e',
+                                              profile=profile),
+                    traffic=traffic,
+                    baseline=_request_telemetry())
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
 
-        async def fake_request(_session, **kwargs):
-            calls.append(kwargs['request_id'])
-            if len(calls) >= 8:
-                stop.set()
-            await asyncio.sleep(0)
-
-        monkeypatch.setattr(qualifier, '_one_request', fake_request)
-        return await qualifier.send_continuous_pressure(
-            endpoint='http://unused.test',
-            token='secret',
-            prefix='pressure',
-            concurrency=2,
-            duration_seconds=30,
-            timeout_seconds=5,
-            stop=stop)
-
-    successes = asyncio.run(exercise())
-    assert successes >= 8
-    assert len(calls) == len(set(calls))
-    assert any(request_id.endswith('000002') for request_id in calls)
+    asyncio.run(exercise())
 
 
-def test_one_request_retries_capacity_failure_with_stable_identity():
+def test_scale_campaign_stages_held_prefix_then_joins_exact_arrival_window(
+        tmp_path):
+    profile = dataclasses.replace(qualifier.PROFILES['scale'], poll_seconds=0)
+    stage = _request_telemetry(queue_depth=800)
+    loaded = _request_telemetry(queue_depth=9872,
+                                in_flight=128,
+                                processing=64,
+                                state_counts={'ACCEPTED': 128})
+    observation = _observation(observed_at=1000,
+                               database=_database_state(demand_units=10_000),
+                               load_balancer=_load_balancer_state(
+                                   demand_units=10_000,
+                                   unique_job_arrivals_60s=10_000,
+                                   unique_job_arrivals_300s=10_000))
 
-    class Response:
-        """Minimal asynchronous HTTP response double."""
-
-        def __init__(self, status, body, headers=None):
-            self.status = status
-            self._body = body
-            self.headers = headers or {}
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return False
-
-        async def read(self):
-            return self._body
-
-    class Session:
-        """Return a capacity failure followed by a successful retry."""
+    class Observer:
 
         def __init__(self):
-            self.requests = []
-            self._responses = [
-                Response(503, b'', {'Retry-After': '0.1'}),
-                Response(
-                    200,
-                    json.dumps({
-                        'request_id': 'stable-id',
-                        'status': 'ok',
-                    }).encode()),
-            ]
+            self.telemetry = [stage, loaded]
 
-        def post(self, _url, *, headers, json):  # pylint: disable=redefined-outer-name
-            self.requests.append((headers, json))
-            return self._responses.pop(0)
+        async def request_telemetry(self):
+            return self.telemetry.pop(0)
 
-    session = Session()
-    asyncio.run(
-        qualifier._one_request(session,
-                               url='http://unused.test/predict',
-                               token='secret',
-                               request_id='stable-id',
-                               duration_seconds=30,
-                               deadline=qualifier.time.monotonic() + 2))
-    assert len(session.requests) == 2
-    assert {body['request_id'] for _, body in session.requests} == {'stable-id'}
+        @staticmethod
+        async def snapshot(*, require_complete_demand_report=True):
+            assert not require_complete_demand_report
+            return observation
 
+    async def exercise():
+        observer = Observer()
+        receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                    service_name='paid-e2e',
+                                    profile=profile)
+        progress = qualifier.Progress(scale_started_monotonic=time.monotonic(),
+                                      scale_started_at=999)
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            deadline = time.monotonic() + 1
+            observed_stage = await qualifier._wait_for_campaign_stage(
+                observer=observer,
+                profile=profile,
+                receipt=receipt,
+                traffic=traffic,
+                baseline=_request_telemetry(),
+                expected_resident=800,
+                deadline_monotonic=deadline)
+            observed_loaded = await qualifier._wait_for_campaign_loaded(
+                observer=observer,
+                profile=profile,
+                progress=progress,
+                receipt=receipt,
+                traffic=traffic,
+                baseline=_request_telemetry(),
+                expectation=qualifier.provider_expectation(profile, None),
+                deadline_monotonic=deadline)
+            return observed_stage, observed_loaded, progress, receipt
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
 
-def test_one_request_rejects_identity_only_acknowledgement():
-
-    class Response:
-        """Return an identity-bearing acknowledgement, not a completion."""
-
-        status = 200
-        headers = {}
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return False
-
-        async def read(self):
-            return json.dumps({
-                'request_id': 'stable-id',
-                'status': 'accepted',
-            }).encode()
-
-    class Session:
-        """Minimal session returning the incomplete acknowledgement."""
-
-        def post(self, _url, **_kwargs):
-            return Response()
-
-    with pytest.raises(qualifier.QualificationError,
-                       match='did not report completed processing'):
-        asyncio.run(
-            qualifier._one_request(Session(),
-                                   url='http://unused.test/predict',
-                                   token='secret',
-                                   request_id='stable-id',
-                                   duration_seconds=30,
-                                   deadline=qualifier.time.monotonic() + 2))
+    observed_stage, observed_loaded, progress, receipt = asyncio.run(exercise())
+    assert observed_stage == stage
+    assert observed_loaded == loaded
+    assert progress.campaign_loaded_observed_at == 1000
+    assert [
+        sample['phase']
+        for sample in receipt._payload['request_telemetry_samples']
+    ] == ['campaign-stage', 'campaign-loaded']
+    assert receipt._payload['samples'][-1]['lb_unique_job_arrivals_60s'] == (
+        10_000)
 
 
 def test_exact_async_request_uses_canonical_acceptance_and_completion():
@@ -2734,12 +3119,200 @@ def test_exact_async_request_never_replays_ambiguous_submission():
     assert session.calls == 1
 
 
+def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
+        monkeypatch):
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+
+    class Response:
+        """One exact async admission response."""
+
+        def __init__(self, status, state, revision, body=b'{}'):
+            self.status = status
+            self._body = body
+            self.headers = {
+                'Retry-After': '1',
+                'X-SkyServe-Async-Ledger-Protocol': '1',
+                'X-SkyServe-Service-Incarnation': 'incarnation-a',
+                'X-SkyServe-Async-Attempt-Id': attempt_id,
+                'X-SkyServe-Async-Attempt-No': '1',
+                'X-SkyServe-Async-Ledger-Revision': str(revision),
+                'X-SkyServe-Async-Ledger-State': state,
+            }
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def read(self):
+            return self._body
+
+    class Session:
+        """Return two pre-dispatch rejections and one acceptance."""
+
+        def __init__(self):
+            accepted = json.dumps({
+                'request_id': 'execution-1',
+                'status': 'accepted',
+            }).encode()
+            self.responses = [
+                Response(429, 'REJECTED_PRE_DISPATCH', 1),
+                Response(503, 'REJECTED_PRE_DISPATCH', 1),
+                Response(202, 'ACCEPTED', 2, accepted),
+            ]
+            self.calls = []
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return self.responses.pop(0)
+
+    delays = []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', fake_sleep)
+    session = Session()
+    asyncio.run(
+        qualifier._submit_exact_async_request(
+            session,
+            endpoint='https://service.test',
+            token='secret',
+            service_hash='incarnation-a',
+            request_id='execution-1',
+            stable_job_id='job-1',
+            duration_seconds=0,
+            deadline=qualifier.time.monotonic() + 2))
+
+    assert len(session.calls) == 3
+    assert len({call[1]['data'] for call in session.calls}) == 1
+    assert {call[1]['headers']['X-SkyServe-Job-Id'] for call in session.calls
+           } == {'job-1'}
+    assert len(delays) == 2
+    assert 0.1 <= delays[0] <= 10
+    assert 0.1 <= delays[1] <= 10
+    assert delays[0] != delays[1]
+    assert (qualifier._bounded_retry_delay('1',
+                                           attempt=0,
+                                           request_id='execution-1')
+            != qualifier._bounded_retry_delay('1',
+                                              attempt=0,
+                                              request_id='execution-2'))
+
+
+def test_exact_completion_retries_with_stable_exponential_jitter(monkeypatch):
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+
+    class Response:
+
+        def __init__(self, status, *, terminal=False):
+            self.status = status
+            self.headers = {'Retry-After': '0.5'}
+            if terminal:
+                self.headers.update({
+                    'X-SkyServe-Async-Ledger-Protocol': '1',
+                    'X-SkyServe-Service-Incarnation': 'incarnation-a',
+                    'X-SkyServe-Async-Attempt-Id': attempt_id,
+                    'X-SkyServe-Async-Attempt-No': '1',
+                    'X-SkyServe-Async-Ledger-Revision': '3',
+                    'X-SkyServe-Async-Ledger-State': 'SUCCEEDED',
+                })
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        @staticmethod
+        async def read():
+            return b''
+
+    class Session:
+
+        def __init__(self):
+            self.responses = [
+                Response(503),
+                Response(409),
+                Response(204, terminal=True),
+            ]
+            self.calls = []
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return self.responses.pop(0)
+
+    delays = []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', fake_sleep)
+    session = Session()
+    accepted = qualifier.ExactAsyncReceipt(attempt_id=attempt_id,
+                                           attempt_no=1,
+                                           state='ACCEPTED',
+                                           revision=2)
+    asyncio.run(
+        qualifier._complete_exact_async_request(
+            session,
+            endpoint='https://service.test',
+            token='secret',
+            service_hash='incarnation-a',
+            request_id='execution-1',
+            intent_sha256='a' * 64,
+            accepted=accepted,
+            processing_time_us=10,
+            deadline=qualifier.time.monotonic() + 2))
+
+    assert len(session.calls) == 3
+    assert len({
+        json.dumps(call[1]['json'], sort_keys=True) for call in session.calls
+    }) == 1
+    assert delays == [
+        qualifier._bounded_retry_delay('0.5',
+                                       attempt=attempt,
+                                       request_id='execution-1')
+        for attempt in (0, 1)
+    ]
+
+
+def test_scale_stimulus_has_exactly_ten_thousand_stable_ledger_identities(
+        monkeypatch):
+    calls = []
+
+    async def fake_request(_session, **kwargs):
+        calls.append((kwargs['request_id'], kwargs['stable_job_id'],
+                      kwargs['duration_seconds']))
+
+    monkeypatch.setattr(qualifier, '_one_exact_async_request', fake_request)
+    profile = qualifier.PROFILES['scale']
+    successes = asyncio.run(
+        qualifier.send_exact_async_requests(
+            endpoint='https://unused.test',
+            token='secret',
+            service_hash='incarnation-a',
+            prefix='scale-run',
+            count=profile.exact_requests,
+            concurrency=profile.request_concurrency,
+            hold_requests=profile.max_units,
+            hold_seconds=310,
+            timeout_seconds=900))
+
+    assert successes == 10_000
+    assert len(calls) == 10_000
+    assert len({request_id for request_id, _, _ in calls}) == 10_000
+    assert len({job_id for _, job_id, _ in calls}) == 10_000
+    assert sum(duration == 310 for _, _, duration in calls) == 800
+
+
 def test_request_telemetry_requires_exact_positive_and_terminal_delta(tmp_path):
     baseline = _request_telemetry()
     positive = _request_telemetry(queue_depth=7,
                                   in_flight=5,
                                   processing=3,
-                                  state_counts={'ACCEPTED': 3})
+                                  state_counts={'ACCEPTED': 5})
     final = _request_telemetry(state_counts={'SUCCEEDED': 16})
     assert baseline.is_exact_zero()
     assert positive.is_fresh_complete()
@@ -2788,6 +3361,747 @@ def test_request_telemetry_requires_exact_positive_and_terminal_delta(tmp_path):
         sample['phase']
         for sample in receipt._payload['request_telemetry_samples']
     ] == ['positive', 'final']
+
+
+def _request_evidence_sample(*,
+                             phase,
+                             queue_depth,
+                             in_flight,
+                             processing,
+                             accepted=0,
+                             succeeded=0,
+                             observed_at=1000.0,
+                             **extra):
+    values = {
+        'ACCEPTED': accepted,
+        'SUCCEEDED': succeeded,
+    }
+    counts = [[state.value, values.get(state.value, 0)]
+              for state in qualifier.async_request_ledger.AsyncRequestState]
+    return {
+        'phase': phase,
+        'observed_at': observed_at,
+        'state': 'fresh',
+        'reason': 'complete',
+        'compatibility_complete': True,
+        'queue_depth': queue_depth,
+        'in_flight_requests': in_flight,
+        'processing_requests': processing,
+        'confirmed_in_flight_requests': in_flight,
+        'confirmed_processing_requests': processing,
+        'ledger_state_counts': counts,
+        'ledger_active': accepted,
+        'ledger_succeeded': succeeded,
+        'ledger_total': accepted + succeeded,
+        **extra,
+    }
+
+
+def _qualification_provider_projection(peaks):
+    projection = {}
+    for cloud in ('aws', 'gcp'):
+        count = peaks.get(cloud, 0)
+        shapes = ([] if count == 0 else [{
+            'gpu_units_per_instance': 1,
+            'instance_count': count,
+            'instance_type': f'{cloud}-l4-qualification',
+            'running_count': count,
+            'running_gpu_units': count,
+        }])
+        projection[cloud] = {
+            'instances': count,
+            'running': count,
+            'gpu_units': count,
+            'running_gpu_units': count,
+            'disks': count,
+            'inflight_operations': 0,
+            'shapes': shapes,
+        }
+    return projection
+
+
+def _zero_qualification_sample(observed_at,
+                               *,
+                               phase='drain',
+                               iteration_id=None):
+    sample = {
+        'phase': phase,
+        'observed_at': observed_at,
+        'exact_zero': True,
+        **{
+            field: 0 for field in qualifier._ZERO_OBSERVATION_FIELDS
+        },
+        'provider_by_cloud': _qualification_provider_projection({}),
+        'lb_offered_arrival_tracking_saturated': False,
+    }
+    if phase == 'baseline':
+        sample['baseline_iteration_id'] = iteration_id
+        sample['baseline_pair_observed_at'] = observed_at
+    return sample
+
+
+def _write_aggregate_qualification(path,
+                                   *,
+                                   service_name,
+                                   kind,
+                                   providers,
+                                   peaks,
+                                   source_sha256='e' * 64,
+                                   authorized_economic_receipt_sha256=None):
+    economic = kind == 'economic'
+    count = 10_000 if economic else 1
+    profile = (qualifier.PROFILES['scale']
+               if economic else qualifier.PROFILES['provider-canary'])
+    active = profile.max_units if economic else 1
+    queue_depth = count - active if economic else 0
+    in_flight = active
+    processing = max(1, in_flight // 2)
+    provider_projection = _qualification_provider_projection(peaks)
+    scale_started_at = 4.0
+    scale_observed_at = 250.0 if economic else 130.0
+    scale_sample = {
+        **{
+            field: 0 for field in qualifier._ZERO_OBSERVATION_FIELDS
+        },
+        'phase': 'scale',
+        'scale_iteration_id': 1,
+        'observed_at': scale_observed_at,
+        'exact_zero': False,
+        'provider_instances': sum(peaks.values()),
+        'provider_running': sum(peaks.values()),
+        'provider_gpu_units': sum(peaks.values()),
+        'provider_running_gpu_units': sum(peaks.values()),
+        'provider_disks': sum(peaks.values()),
+        'provider_inflight_operations': 0,
+        'provider_by_cloud': provider_projection,
+        'postgres_demand_units': count,
+        'lb_demand_units': count,
+        'lb_unique_job_arrivals_300s': count,
+        'lb_offered_arrival_tracking_saturated': False,
+    }
+    campaign_sample = {
+        **_zero_qualification_sample(7.0, phase='campaign-loaded'),
+        'phase': 'campaign-loaded',
+        'exact_zero': False,
+        'campaign_iteration_id': 1,
+        'campaign_pair_observed_at': 7.0,
+        'postgres_demand_units': count,
+        'lb_demand_units': count,
+        'lb_unique_job_arrivals_60s': count,
+        'lb_unique_job_arrivals_300s': count,
+    }
+    payload = {
+        'schema_version': 7,
+        'service_name': service_name,
+        'service_hash': f'{service_name}-hash',
+        'lifecycle_epoch': 1,
+        'service_version': 1,
+        'controller_config_digest': 'a' * 64,
+        'controller_config_snapshot_id': 'b' * 64,
+        'service_yaml_sha256': ('c' if economic else 'd') * 64,
+        'qualification_profile': profile.name,
+        'qualification_source_sha256': source_sha256,
+        'qualification_projection_sha256':
+            qualifier._qualification_projection_sha256(
+                source_sha256=source_sha256,
+                profile=profile,
+                providers=tuple(providers)),
+        'profile': profile.name,
+        'expectation_kind': kind,
+        'expected_providers': providers,
+        'max_units': profile.max_units,
+        'minimum_running': 100 if economic else 1,
+        'peak_running': sum(peaks.values()),
+        'peak_running_by_cloud': {
+            cloud: peaks.get(cloud, 0) for cloud in ('aws', 'gcp')
+        },
+        'peak_running_gpu_units': sum(peaks.values()),
+        'peak_running_gpu_units_by_cloud': {
+            cloud: peaks.get(cloud, 0) for cloud in ('aws', 'gcp')
+        },
+        'scale_started_at': scale_started_at,
+        'scale_qualified_observed_at': scale_observed_at,
+        'scale_qualified_iteration_id': 1,
+        'baseline_qualified_iteration_id': 3,
+        'baseline_qualified_observed_at': 3.0,
+        'campaign_loaded_iteration_id': 1 if economic else None,
+        'campaign_loaded_observed_at': 7.0 if economic else None,
+        'campaign_loaded_request_observed_at': 6.0 if economic else None,
+        'exact_request_count': count,
+        'exact_request_successes': count,
+        'ledger_request_delta': count,
+        'ledger_succeeded_delta': count,
+        'samples': [
+            _zero_qualification_sample(1.0, phase='baseline', iteration_id=1),
+            _zero_qualification_sample(2.0, phase='baseline', iteration_id=2),
+            _zero_qualification_sample(3.0, phase='baseline', iteration_id=3),
+            *([campaign_sample] if economic else []),
+            scale_sample,
+            _zero_qualification_sample(1000.0),
+            _zero_qualification_sample(1180.0),
+            _zero_qualification_sample(1360.0),
+        ],
+        'request_telemetry_samples': [
+            *[
+                _request_evidence_sample(phase='baseline',
+                                         queue_depth=0,
+                                         in_flight=0,
+                                         processing=0,
+                                         observed_at=pair_at - 0.25,
+                                         baseline_iteration_id=iteration_id,
+                                         baseline_pair_observed_at=pair_at)
+                for iteration_id, pair_at in ((1, 1.0), (2, 2.0), (3, 3.0))
+            ],
+            *([
+                _request_evidence_sample(phase='campaign-stage',
+                                         queue_depth=profile.max_units,
+                                         in_flight=0,
+                                         processing=0,
+                                         observed_at=5.0),
+                _request_evidence_sample(phase='campaign-loaded',
+                                         queue_depth=count - 128,
+                                         in_flight=128,
+                                         processing=64,
+                                         accepted=128,
+                                         observed_at=6.0,
+                                         campaign_iteration_id=1,
+                                         campaign_pair_observed_at=7.0),
+                _request_evidence_sample(phase='positive',
+                                         queue_depth=queue_depth,
+                                         in_flight=in_flight,
+                                         processing=processing,
+                                         accepted=active,
+                                         observed_at=8.0)
+            ] if economic else []),
+            _request_evidence_sample(phase='scale',
+                                     queue_depth=queue_depth,
+                                     in_flight=in_flight,
+                                     processing=processing,
+                                     accepted=active,
+                                     observed_at=(249.0 if economic else 129.0))
+            | {
+                'scale_iteration_id': 1,
+            },
+            _request_evidence_sample(phase='final',
+                                     queue_depth=0,
+                                     in_flight=0,
+                                     processing=0,
+                                     succeeded=count,
+                                     observed_at=500.0),
+        ],
+        'finished_at': 1400.0,
+        'outcome': 'passed',
+    }
+    if not economic:
+        payload['authorized_economic_receipt_sha256'] = (
+            authorized_economic_receipt_sha256)
+    path.write_text(json.dumps(payload), encoding='utf-8')
+
+
+def _write_aggregate_cleanup(path,
+                             qualification_path,
+                             *,
+                             service_name,
+                             providers,
+                             service_hash=None,
+                             outcome='passed'):
+    qualification = json.loads(qualification_path.read_text(encoding='utf-8'))
+
+    def zero(index):
+        return {
+            'observed_at': float(index),
+            'exact_zero': True,
+            'zero_samples': index,
+            'cleanup_claims': 0,
+            'cleanup_debit_units': 0,
+            'cleanup_provider_disks': 0,
+            'cleanup_provider_instances': 0,
+            'cleanup_provider_operations': 0,
+            'cleanup_waiters': 0,
+            'cleanup_provider_by_cloud': {
+                cloud: {
+                    'cloud': cloud,
+                    'instance_count': 0,
+                    'running_count': 0,
+                    'gpu_units': 0,
+                    'running_gpu_units': 0,
+                    'disk_count': 0,
+                    'inflight_operation_count': 0,
+                    'shapes': [],
+                } for cloud in ('aws', 'gcp')
+            },
+        }
+
+    payload = {
+        'schema_version': 2,
+        'service_name': service_name,
+        'service_hash': service_hash or f'{service_name}-hash',
+        'lifecycle_epoch': 1,
+        'service_version': 1,
+        'controller_config_digest': 'a' * 64,
+        'controller_config_snapshot_id': 'b' * 64,
+        'expected_providers': providers,
+        'service_yaml_sha256': qualification['service_yaml_sha256'],
+        'qualification_profile': qualification['qualification_profile'],
+        'qualification_source_sha256':
+            qualification['qualification_source_sha256'],
+        'qualification_projection_sha256':
+            qualification['qualification_projection_sha256'],
+        'qualification_receipt_sha256': hashlib.sha256(
+            qualification_path.read_bytes()).hexdigest(),
+        'outcome': outcome,
+        'zero_samples': 3,
+        'samples': [zero(1), zero(2), zero(3)],
+    }
+    path.write_text(json.dumps(payload), encoding='utf-8')
+
+
+def _aggregate_args(tmp_path,
+                    *,
+                    with_canary=True,
+                    economic_peaks=None,
+                    source_sha256='e' * 64):
+    economic = tmp_path / 'economic.json'
+    economic_cleanup = tmp_path / 'economic-cleanup.json'
+    _write_aggregate_qualification(economic,
+                                   service_name='economic',
+                                   kind='economic',
+                                   providers=['aws', 'gcp'],
+                                   source_sha256=source_sha256,
+                                   peaks=economic_peaks or {
+                                       'aws': 100,
+                                       'gcp': 0,
+                                   })
+    _write_aggregate_cleanup(economic_cleanup,
+                             economic,
+                             service_name='economic',
+                             providers=['aws', 'gcp'])
+    canary_receipts = []
+    canary_cleanup_receipts = []
+    if with_canary:
+        canary = tmp_path / 'gcp-canary.json'
+        canary_cleanup = tmp_path / 'gcp-canary-cleanup.json'
+        economic_sha256 = hashlib.sha256(economic.read_bytes()).hexdigest()
+        _write_aggregate_qualification(
+            canary,
+            service_name='gcp-canary',
+            kind='provider-canary',
+            providers=['gcp'],
+            source_sha256=source_sha256,
+            peaks={'gcp': 1},
+            authorized_economic_receipt_sha256=(economic_sha256))
+        _write_aggregate_cleanup(canary_cleanup,
+                                 canary,
+                                 service_name='gcp-canary',
+                                 providers=['gcp'])
+        canary_receipts.append(str(canary))
+        canary_cleanup_receipts.append(str(canary_cleanup))
+    return type(
+        'Args', (), {
+            'economic_receipt': str(economic),
+            'economic_cleanup_receipt': str(economic_cleanup),
+            'canary_receipt': canary_receipts,
+            'canary_cleanup_receipt': canary_cleanup_receipts,
+            'output': str(tmp_path / 'aggregate.json'),
+        })()
+
+
+def test_aggregate_accepts_economic_aws_plus_absent_gcp_canary(tmp_path):
+    args = _aggregate_args(tmp_path)
+
+    qualifier.aggregate_evidence(args)
+
+    payload = json.loads(pathlib.Path(args.output).read_text(encoding='utf-8'))
+    assert payload['outcome'] == 'passed'
+    assert payload['positive_provider_union'] == ['aws', 'gcp']
+    assert payload['economic_exact_request_count'] == 10_000
+
+
+def test_aggregate_needs_no_canary_when_economic_run_proves_both(tmp_path):
+    args = _aggregate_args(tmp_path,
+                           with_canary=False,
+                           economic_peaks={
+                               'aws': 60,
+                               'gcp': 40,
+                           })
+
+    qualifier.aggregate_evidence(args)
+
+    payload = json.loads(pathlib.Path(args.output).read_text(encoding='utf-8'))
+    assert len(payload['qualification_receipts']) == 1
+
+
+def test_aggregate_rejects_unnecessary_provider_canary(tmp_path):
+    args = _aggregate_args(tmp_path, economic_peaks={
+        'aws': 60,
+        'gcp': 40,
+    })
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='exactly cover providers absent'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_missing_provider_union(tmp_path):
+    args = _aggregate_args(tmp_path, with_canary=False)
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='exactly cover providers absent'):
+        qualifier.aggregate_evidence(args)
+
+
+@pytest.mark.parametrize('missing_field',
+                         ['samples', 'request_telemetry_samples'])
+def test_aggregate_rejects_receipt_without_production_evidence(
+        tmp_path, missing_field):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    del payload[missing_field]
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError, match='lacks .* evidence'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_unattributed_scale_demand(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    scale = next(sample for sample in payload['request_telemetry_samples']
+                 if sample['phase'] == 'scale')
+    scale['queue_depth'] += 1
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='unattributed scale demand'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_zero_scale_demand_even_with_provider_capacity(
+        tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    scale = next(sample for sample in payload['request_telemetry_samples']
+                 if sample['phase'] == 'scale')
+    scale.update(
+        _request_evidence_sample(phase='scale',
+                                 queue_depth=0,
+                                 in_flight=0,
+                                 processing=0))
+    scale['scale_iteration_id'] = 1
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='unattributed scale demand'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_unpaired_provider_scale_iteration(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    scale = next(
+        sample for sample in payload['samples'] if sample['phase'] == 'scale')
+    scale['scale_iteration_id'] = 2
+    payload['scale_qualified_iteration_id'] = 2
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='paired exact demand'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_provider_scale_before_campaign_load(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    scale = next(
+        sample for sample in payload['samples'] if sample['phase'] == 'scale')
+    scale['observed_at'] = 6.5
+    payload['scale_qualified_observed_at'] = 6.5
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='paired exact demand|campaign-load'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_provider_qualification_after_terminal_ledger(
+        tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    final = next(sample for sample in payload['request_telemetry_samples']
+                 if sample['phase'] == 'final')
+    final['observed_at'] = 249.5
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='provider scale evidence'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_scale_without_same_observation_demand(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    scale = next(
+        sample for sample in payload['samples'] if sample['phase'] == 'scale')
+    scale['postgres_demand_units'] = 0
+    scale['lb_demand_units'] = 0
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='same-observation demand'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_nonfinite_request_timestamp(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    positive = next(sample for sample in payload['request_telemetry_samples']
+                    if sample['phase'] == 'positive')
+    positive['observed_at'] = float('nan')
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError, match='strict timestamp'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_partial_exact_arrival_campaign(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    campaign = next(sample for sample in payload['samples']
+                    if sample['phase'] == 'campaign-loaded')
+    campaign['lb_unique_job_arrivals_60s'] = 9_999
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='offered-arrival campaign'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_impossible_provider_shape_sample(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    scale = next(
+        sample for sample in payload['samples'] if sample['phase'] == 'scale')
+    scale['provider_by_cloud']['aws']['shapes'] = []
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='contradictory provider shape'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_canary_above_one_physical_instance(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.canary_receipt[0])
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    scale = next(
+        sample for sample in payload['samples'] if sample['phase'] == 'scale')
+    gcp = scale['provider_by_cloud']['gcp']
+    for field in ('instances', 'running', 'gpu_units', 'running_gpu_units',
+                  'disks'):
+        gcp[field] = 2
+    shape = gcp['shapes'][0]
+    for field in ('instance_count', 'running_count', 'running_gpu_units'):
+        shape[field] = 2
+    for field in ('provider_instances', 'provider_running',
+                  'provider_gpu_units', 'provider_running_gpu_units',
+                  'provider_disks'):
+        scale[field] = 2
+    payload['peak_running'] = 2
+    payload['peak_running_gpu_units'] = 2
+    payload['peak_running_by_cloud']['gcp'] = 2
+    payload['peak_running_gpu_units_by_cloud']['gcp'] = 2
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError, match='totals or cap'):
+        qualifier.aggregate_evidence(args)
+
+
+@pytest.mark.parametrize('mutation', ['slow', 'nan', 'unbound'])
+def test_aggregate_derives_scale_elapsed_from_bound_sample(tmp_path, mutation):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    scale = next(
+        sample for sample in payload['samples'] if sample['phase'] == 'scale')
+    if mutation == 'slow':
+        scale['observed_at'] = payload['scale_started_at'] + 301
+        payload['scale_qualified_observed_at'] = scale['observed_at']
+        payload['scale_elapsed_seconds'] = 0
+    elif mutation == 'nan':
+        payload['scale_started_at'] = float('nan')
+    else:
+        payload['scale_qualified_observed_at'] += 1
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='timestamp|provider scale evidence'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_nonzero_provider_baseline_before_zero(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    first = payload['samples'][0]
+    first.update({
+        'exact_zero': False,
+        'provider_instances': 1,
+        'provider_running': 1,
+        'provider_gpu_units': 1,
+        'provider_running_gpu_units': 1,
+        'provider_disks': 1,
+        'provider_by_cloud': _qualification_provider_projection({'aws': 1}),
+    })
+    payload['samples'].insert(3, _zero_qualification_sample(4,
+                                                            phase='baseline'))
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='nonzero provider baseline'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_nonzero_telemetry_baseline_before_zero(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    baseline = payload['request_telemetry_samples'][0]
+    baseline['queue_depth'] = 1
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='nonzero.*request baseline'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_noncanonical_ledger_state_projection(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    del payload['request_telemetry_samples'][0]['ledger_state_counts'][0]
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='telemetry evidence is malformed'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_canary_from_a_different_task_source(tmp_path):
+    args = _aggregate_args(tmp_path)
+    canary = pathlib.Path(args.canary_receipt[0])
+    economic_sha256 = hashlib.sha256(
+        pathlib.Path(args.economic_receipt).read_bytes()).hexdigest()
+    _write_aggregate_qualification(
+        canary,
+        service_name='gcp-canary',
+        kind='provider-canary',
+        providers=['gcp'],
+        peaks={'gcp': 1},
+        source_sha256='f' * 64,
+        authorized_economic_receipt_sha256=(economic_sha256))
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='not projections of the economic task'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_canary_authorized_by_replaced_economic_receipt(
+        tmp_path):
+    args = _aggregate_args(tmp_path)
+    economic = pathlib.Path(args.economic_receipt)
+    payload = json.loads(economic.read_text(encoding='utf-8'))
+    payload['service_hash'] = 'replacement-economic-hash'
+    economic.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='not authorized by the exact economic receipt'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_rejects_replayed_natural_drain_sample(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    payload['samples'][-1]['observed_at'] = payload['samples'][-2][
+        'observed_at']
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='sustained natural-drain evidence'):
+        qualifier.aggregate_evidence(args)
+
+
+@pytest.mark.parametrize('mutation', ['running', 'shape', 'nonfinite'])
+def test_aggregate_rejects_incomplete_natural_drain_projection(
+        tmp_path, mutation):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    sample = payload['samples'][-1]
+    if mutation == 'running':
+        sample['provider_running'] = 1
+    elif mutation == 'shape':
+        sample['provider_by_cloud']['aws']['shapes'] = [{
+            'gpu_units_per_instance': 1,
+            'instance_count': 1,
+            'instance_type': 'impossible-zero-shape',
+            'running_count': 0,
+            'running_gpu_units': 0,
+        }]
+    else:
+        sample['observed_at'] = float('nan')
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError):
+        qualifier.aggregate_evidence(args)
+
+
+@pytest.mark.parametrize('mutation', ['identity', 'outcome'])
+def test_aggregate_rejects_cleanup_without_matching_exact_zero(
+        tmp_path, mutation):
+    args = _aggregate_args(tmp_path)
+    cleanup_path = pathlib.Path(args.economic_cleanup_receipt)
+    payload = json.loads(cleanup_path.read_text(encoding='utf-8'))
+    if mutation == 'identity':
+        payload['service_hash'] = 'wrong-hash'
+    else:
+        payload['outcome'] = 'failed'
+    cleanup_path.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='Cleanup receipt is malformed'):
+        qualifier.aggregate_evidence(args)
+
+
+@pytest.mark.parametrize('mutation', ['timestamp', 'counter', 'per_cloud'])
+def test_aggregate_rejects_replayed_or_incomplete_cleanup_samples(
+        tmp_path, mutation):
+    args = _aggregate_args(tmp_path)
+    cleanup_path = pathlib.Path(args.economic_cleanup_receipt)
+    payload = json.loads(cleanup_path.read_text(encoding='utf-8'))
+    if mutation == 'timestamp':
+        payload['samples'][-1]['observed_at'] = payload['samples'][-2][
+            'observed_at']
+    elif mutation == 'counter':
+        payload['samples'][-1]['zero_samples'] = payload['samples'][-2][
+            'zero_samples']
+    else:
+        del payload['samples'][-1]['cleanup_provider_by_cloud']['aws']
+    cleanup_path.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='sustained exact zero'):
+        qualifier.aggregate_evidence(args)
 
 
 @pytest.mark.parametrize('gpu_units', (1, 4))
