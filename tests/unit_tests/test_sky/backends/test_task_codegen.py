@@ -8,7 +8,6 @@ for various configurations. The expected outputs are stored in:
 To update snapshots when intentional changes are made:
     UPDATE_SNAPSHOT=1 pytest tests/unit_tests/test_sky/backends/test_task_codegen.py
 """
-import ast
 import builtins
 import os
 from pathlib import Path
@@ -183,15 +182,49 @@ def test_generated_logging_functions_are_self_contained(tmp_path: Path):
                 max_output_bytes=32))
 
 
-def test_generated_logging_fragment_binds_every_referenced_global():
-    """Every global the generated driver fragment references is bound by it.
+def _find_unbound_globals(source: str) -> set[str]:
+    """Returns referenced globals absent from the executed module namespace."""
+    namespace: dict[str, Any] = {'__name__': 'generated_bindings_test'}
+    exec(source, namespace)  # pylint: disable=exec-used
 
-    The executable-fragment test above only reaches the branches it runs.  A
-    name that is referenced only on the deadline or kill path would still
-    crash a driver in production, so bind-check the whole fragment
-    statically.  ``_get_context`` deliberately probes ``globals()`` for the
-    optional ``context`` module, so the two context names are the only
-    tolerated unbound references.
+    referenced_globals: set[str] = set()
+
+    def _collect(table: symtable.SymbolTable) -> None:
+        referenced_globals.update(
+            symbol.get_name()
+            for symbol in table.get_symbols()
+            if symbol.is_global() and symbol.is_referenced())
+        for child in table.get_children():
+            _collect(child)
+
+    _collect(symtable.symtable(source, '<generated>', 'exec'))
+    return {
+        name for name in referenced_globals
+        if name not in namespace and not hasattr(builtins, name)
+    }
+
+
+def test_unbound_global_analysis_does_not_treat_nested_locals_as_bindings():
+    source = '''
+def local_only():
+    hidden_dependency = object()
+
+def generated_path():
+    return hidden_dependency
+'''
+
+    assert _find_unbound_globals(source) == {'hidden_dependency'}
+
+
+def test_generated_logging_fragment_has_only_compatibility_globals():
+    """The fragment has no globals beyond its explicit compatibility pair.
+
+    The executable-fragment test above only reaches the branches it runs. A
+    name referenced only on the deadline or kill path would still crash a
+    driver in production, so inspect every function's global references.
+    ``_get_context`` deliberately probes ``globals()`` for the optional
+    ``context`` module; ``context_utils`` is reachable only when that context
+    exists. Requiring this exact pair makes any dependency drift fail closed.
     """
     codegen = task_codegen.TaskCodeGen()
     codegen._add_common_imports()  # pylint: disable=protected-access
@@ -199,36 +232,11 @@ def test_generated_logging_fragment_binds_every_referenced_global():
     codegen._add_logging_functions()  # pylint: disable=protected-access
     source = '\n'.join(codegen._code)  # pylint: disable=protected-access
 
-    bound: set[str] = set()
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            bound.update((alias.asname or alias.name).split('.')[0]
-                         for alias in node.names)
-        elif isinstance(node,
-                        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            bound.add(node.name)
-        elif isinstance(node, ast.Assign):
-            bound.update(name.id
-                         for target in node.targets
-                         for name in ast.walk(target)
-                         if isinstance(name, ast.Name))
+    assert _find_unbound_globals(source) == {'context', 'context_utils'}
 
-    referenced: set[str] = set()
-
-    def _collect(table: symtable.SymbolTable) -> None:
-        referenced.update(symbol.get_name()
-                          for symbol in table.get_symbols()
-                          if symbol.is_global() and symbol.is_referenced())
-        for child in table.get_children():
-            _collect(child)
-
-    _collect(symtable.symtable(source, '<generated>', 'exec'))
-
-    unbound = {
-        name for name in referenced
-        if name not in bound and not hasattr(builtins, name)
-    }
-    assert unbound <= {'context', 'context_utils'}, sorted(unbound)
+    namespace: dict[str, Any] = {'__name__': 'generated_no_context_test'}
+    exec(source, namespace)  # pylint: disable=exec-used
+    assert namespace['_get_context']() is None
 
 
 def test_system_oom_recovery_codegen_is_single_attempt_authority():
