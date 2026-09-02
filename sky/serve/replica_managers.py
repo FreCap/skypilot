@@ -41,12 +41,12 @@ from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
 from sky.serve import autoscaler_decisions
-from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
 from sky.serve import drain_observability
 from sky.serve import non_pool_launch_reconciliation
 from sky.serve import ordinary_launch_handoff
 from sky.serve import paid_capacity
+from sky.serve import paid_launch_request
 from sky.serve import paid_retirement
 from sky.serve import provider_phase
 from sky.serve import replica_info as replica_info_lib
@@ -89,6 +89,8 @@ if typing.TYPE_CHECKING:
     from sky.serve.ordinary_launch_binding import ControllerBindingAuthority
     from sky.serve.replica_info import ReplicaInfo
     from sky.serve.replica_info import ReplicaStatusProperty
+    from sky.server.requests.paid_wave_admission import (
+        FusedBindingReceiptMember)
     SpotPlacerType: typing.TypeAlias = spot_placer.SpotPlacer
 else:
     ReplicaStatusProperty = replica_info_lib.ReplicaStatusProperty
@@ -98,6 +100,8 @@ logger = sky_logging.init_logger(__name__)
 ordinary_launch_binding = adaptors_common.LazyImport(
     'sky.serve.ordinary_launch_binding')
 request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
+paid_wave_admission = adaptors_common.LazyImport(
+    'sky.server.requests.paid_wave_admission')
 reserved_fill_admission = adaptors_common.LazyImport(
     'sky.server.requests.reserved_fill_admission')
 kueue_lane_observer = adaptors_common.LazyImport(
@@ -333,16 +337,17 @@ class _PaidPhaseARecoveryIdentity:
 
 
 @dataclasses.dataclass(frozen=True)
-class _PaidLaunchMaterializationHandoff:
-    """Exact process-local ownership spanning paid commit to publication."""
+class _PreparedPaidLaunchAdopter:
+    """Process-local adopter for one already committed paid request."""
 
-    prepared_specs: tuple[paid_capacity.PaidLaunchSpec, ...]
-
-    @property
-    def identities(self) -> frozenset[_PaidPhaseARecoveryIdentity]:
-        return frozenset(
-            _PaidPhaseARecoveryIdentity(spec.replica_id, spec.replica_record_id)
-            for spec in self.prepared_specs)
+    info: ReplicaInfo
+    spec: paid_capacity.PaidLaunchSpec
+    receipt: paid_capacity.PaidLaunchReceiptMember
+    binding: 'FusedBindingReceiptMember'
+    launch_spec: Any
+    yaml_content: str
+    launch_result: _ReplicaLaunchResult
+    location: spot_placer.Location
 
 
 @dataclasses.dataclass
@@ -666,82 +671,14 @@ class _SystemRecoveryLaunchCaptureError(RuntimeError):
 
 def _scope_security_group_to_service(task: 'task_lib.Task',
                                      service_name: str | None) -> None:
-    """Pins a service's replicas to ONE security group instead of one each.
-
-    A cluster that declares ports gets its own group, named after the cluster.
-    For a service that is one group per replica, and this fleet replaces spot
-    replicas continuously across 20 AWS regions, so the count grows without
-    bound: measured at ~3000 groups against a 2500-per-VPC quota, ~99% of them
-    referenced by no network interface because teardown cannot wait long enough
-    for the interface to detach.
-
-    Naming the group after the SERVICE collapses that to one per service, and
-    is the tightest scope that still bounds growth. It is not the same as
-    sharing a group across services: the group carries a self-referencing rule
-    that grants ALL protocols and ports between its members, and skylet listens
-    on an unauthenticated port, so members of one group can execute code on each
-    other. Replicas of a single service already share an image, a spec and their
-    secrets, so that is within an existing trust boundary; two different
-    services are not, and must never share.
-
-    Implemented through ``aws.security_group_name``, which additionally gives
-    exactly the lifecycle we need for free: SkyPilot marks a caller-specified
-    group as not-managed-by-SkyPilot, so a single replica's teardown will not
-    delete a group its siblings are still using, while ``open_ports`` still
-    reconciles the service's ports onto it.
-
-    Only applies when the caller did not already pin a group, so an explicit
-    operator override always wins.
-    """
-    if not service_name:
-        return
-    scoped = f'sky-sg-{service_name}'
-    new_resources = []
-    for resource in task.resources:
-        existing = dict(resource.cluster_config_overrides or {})
-        aws_overrides = dict(existing.get('aws', {}))
-        if aws_overrides.get('security_group_name'):
-            # An operator pinned a group explicitly; do not second-guess it.
-            return
-        aws_overrides['security_group_name'] = scoped
-        existing['aws'] = aws_overrides
-        new_resources.append(resource.copy(_cluster_config_overrides=existing))
-    task.set_resources(type(task.resources)(new_resources))
+    """Compatibility alias for the shared canonical task builder."""
+    paid_launch_request.scope_security_group_to_service(task, service_name)
 
 
 def _inject_replica_tls_material(task: 'task_lib.Task') -> None:
-    """Hand a replica the TLS material its proxy needs, if TLS is enabled.
-
-    The certificate is public and travels as an ordinary env var; the private
-    key travels as a task SECRET so it is redacted from task YAML dumps and
-    logs rather than sitting in plain text next to it.
-
-    Only the material is delivered here. Terminating TLS is the task's job:
-    its setup is expected to start a proxy on the service port that forwards
-    to the model server on loopback. A task that ignores the material keeps
-    serving plaintext, which the load balancer will then fail to reach over
-    https -- deliberately visible rather than silently unencrypted.
-    """
-    mode = serve_utils.replica_tls_mode()
-    if mode != serve_constants.REPLICA_TLS_MODE_PINNED:
-        # 'unverified' intentionally ships no material: it exists for
-        # deployments that terminate TLS with their own certificate.
-        return
-    certificate_pem = os.environ.get(serve_constants.REPLICA_TLS_CERT_ENV_VAR,
-                                     '')
-    private_key_pem = os.environ.get(
-        serve_constants.REPLICA_TLS_KEY_SECRET_ENV_VAR, '')
-    if not certificate_pem or not private_key_pem:
-        raise RuntimeError(
-            f'{serve_constants.REPLICA_TLS_MODE_ENV_VAR}='
-            f'{serve_constants.REPLICA_TLS_MODE_PINNED} requires both '
-            f'{serve_constants.REPLICA_TLS_CERT_ENV_VAR} and '
-            f'{serve_constants.REPLICA_TLS_KEY_SECRET_ENV_VAR} in the '
-            'controller environment.')
-    task.update_envs(
-        {serve_constants.REPLICA_TLS_CERT_ENV_VAR: certificate_pem})
-    task.update_secrets(
-        {serve_constants.REPLICA_TLS_KEY_SECRET_ENV_VAR: private_key_pem})
+    """Compatibility alias for the shared canonical task builder."""
+    paid_launch_request.inject_replica_tls_material(
+        task, paid_launch_request.capture_replica_launch_runtime())
 
 
 def _build_replica_launch_task(
@@ -754,36 +691,16 @@ def _build_replica_launch_task(
     service_name: str | None,
     task_template: task_lib.Task | None = None,
 ) -> task_lib.Task:
-    """Build the exact pre-policy task submitted by a replica launch.
-
-    Candidate authorization and the launch worker must hash/submit the same
-    task. Keeping their construction in one helper also makes a later
-    controller-side environment or security-group change fail closed through
-    the backend's post-policy rematch instead of silently widening recovery.
-    """
-    task = (copy.deepcopy(task_template)
-            if task_template is not None else load_task_with_service_spec(
-                yaml_content, authoritative_service_spec))
-    # The original user YAML is retained in the immutable service-version row
-    # for status/display. Embedding the same text in every executable replica
-    # request duplicates a potentially large payload and has no execution
-    # semantics; keep only the structured task fields in controller launches.
-    task._user_specified_yaml = None  # pylint: disable=protected-access
-    if resources_override is not None:
-        resources = task.resources
-        if exact_resources_override:
-            # Placement already selected the complete location and shape.
-            resource = next(iter(resources)).copy(**resources_override)
-            task.set_resources(resource)
-        else:
-            overridden_resources = [
-                resource.copy(**resources_override) for resource in resources
-            ]
-            task.set_resources(type(resources)(overridden_resources))
-    task.update_envs({serve_constants.REPLICA_ID_ENV_VAR: str(replica_id)})
-    _inject_replica_tls_material(task)
-    _scope_security_group_to_service(task, service_name)
-    return task
+    """Compatibility alias for the shared canonical task builder."""
+    return paid_launch_request.build_replica_launch_task(
+        yaml_content,
+        replica_id,
+        resources_override,
+        exact_resources_override=exact_resources_override,
+        authoritative_service_spec=authoritative_service_spec,
+        service_name=service_name,
+        runtime=paid_launch_request.capture_replica_launch_runtime(),
+        task_template=task_template)
 
 
 def _task_is_known_non_aws(task: task_lib.Task) -> bool:
@@ -883,7 +800,7 @@ def _bound_reduction_request_id(reduction: Any) -> str:
 
 def _wait_for_bound_ordinary_launch(
     replica_id: int,
-    cluster_name: str,
+    cluster_name: str,  # pylint: disable=unused-argument
     request_id: str,
     stream_logs: bool,
     launch_cloud: clouds.Cloud | None,
@@ -3857,8 +3774,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._non_pool_reconciliation_attempts: dict[int, int] = {}
         self._non_pool_reconciliation_retry_at: dict[int, float] = {}
         self._paid_phase_a_recovery_lock = threading.Lock()
-        self._paid_launch_materialization_identities: set[
-            _PaidPhaseARecoveryIdentity] = set()
         self._paid_phase_a_recoveries: dict[_PaidPhaseARecoveryIdentity,
                                             _PaidPhaseARecovery] = {}
         self._ordinary_launch_binding_authority: (ControllerBindingAuthority |
@@ -4153,15 +4068,17 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         The only mutable inputs consulted under ``self.lock`` are the elected
         manager configuration and its already-materialized placement catalog.
-        No database/provider operation or worker construction occurs here.
+        Candidate construction and request serialization are CPU-only: no
+        database, provider, HTTP, or launch-worker operation occurs here.
         Prepared identities do not advance the process allocator; only the
         committed receipt does.
         """
         if (type(max_candidates) is not int or max_candidates < 0 or  # pylint: disable=unidiomatic-typecheck
-                max_candidates > paid_capacity.MAX_PREPARED_LAUNCH_SPECS):
+                max_candidates
+                > paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS):
             raise ValueError(
                 'max_candidates is outside the provider-free preparation '
-                'bound.')
+                'wave bound.')
         shapes: dict[str, int] = {}
         caps: dict[str, int] = {}
         for raw_card, raw_width in accelerator_shapes.items():
@@ -4196,6 +4113,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                            paid_capacity.LaunchBudget) or
                 not paid_location_launch_budget.globally_managed):
             raise ValueError('Paid launch budget is malformed.')
+        launch_runtime = paid_launch_request.capture_replica_launch_runtime()
 
         with self.lock:
             if self._update_recovery_required or self._is_pool:
@@ -4228,6 +4146,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             replica_port = _get_resources_ports(launch_yaml_content,
                                                 launch_spec,
                                                 launch_task_template)
+            frozen_controller_config = (
+                serve_utils.parse_and_validate_version_controller_config(
+                    version_authority.controller_config, self._workspace,
+                    'prepared paid launch controller config'))
             controller_config_path = (
                 serve_utils.generate_versioned_config_yaml_file_name(
                     self._service_name, version, self._resource_scope))
@@ -4330,13 +4252,40 @@ class SkyPilotReplicaManager(ReplicaManager):
                 log_file_name = (
                     serve_utils.generate_replica_launch_log_file_name(
                         self._service_name, replica_id, self._resource_scope))
-                raw_override = selected_location.to_dict()
-                raw_override['cloud'] = cloud
-                storage_override = _encode_replica_resource_state(raw_override)
+                runtime_override = selected_location.to_dict()
+                canonical_storage_override = dict(runtime_override)
+                canonical_storage_override['cloud'] = cloud
+                storage_override = _encode_replica_resource_state(
+                    canonical_storage_override)
                 assert storage_override is not None
                 planned_capacity = width if self._uses_logical_replicas else 1
                 frozen_override = paid_capacity.freeze_paid_launch_payload(
                     storage_override)
+                launch_fence = ordinary_launch_binding.build_paid_launch_fence(
+                    service_name=self._service_name,
+                    service_hash=service_hash,
+                    service_version=version,
+                    replica_id=replica_id,
+                    replica_record_id=replica_record_id,
+                    service_lifecycle_epoch=(authority.service_lifecycle_epoch),
+                    binding_epoch=authority.binding_epoch,
+                    controller_incarnation=authority.controller_incarnation,
+                    controller_owner_epoch=authority.controller_owner_epoch,
+                    controller_pid=authority.controller_pid,
+                    controller_ip=authority.controller_ip)
+                prepared_request = (
+                    paid_launch_request.prepare_paid_launch_request(
+                        yaml_content=launch_yaml_content,
+                        authoritative_service_spec=launch_spec,
+                        frozen_controller_config=frozen_controller_config,
+                        resources_override=runtime_override,
+                        replica_id=replica_id,
+                        cluster_name=cluster_name,
+                        workspace=self._workspace,
+                        service_name=self._service_name,
+                        launch_fence=launch_fence,
+                        runtime=launch_runtime,
+                        task_template=launch_task_template))
                 worker_construction = paid_capacity.freeze_paid_launch_payload({
                     'schema_version': 1,
                     'launch_yaml_content': launch_yaml_content,
@@ -4352,6 +4301,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 provider_account = (provider_identity.get('aws_account_id')
                                     if isinstance(provider_identity, dict) else
                                     None)
+                provider_project_id = (provider_identity.get('gcp_project_id')
+                                       if isinstance(provider_identity, dict)
+                                       else None)
                 paid_spec = paid_capacity.PaidLaunchSpec(
                     ordinal=len(prepared),
                     service_name=self._service_name,
@@ -4362,7 +4314,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                     replica_record_id=replica_record_id,
                     cluster_name_seed=cluster_name,
                     worker_construction=worker_construction,
+                    prepared_launch_request=prepared_request.submitted_bytes,
                     provider_account=provider_account,
+                    provider_project_id=provider_project_id,
                     cloud=cloud,
                     workspace=self._workspace,
                     region=selected_location.region,
@@ -4395,13 +4349,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     selected_location)
             return tuple(prepared)
 
-    def _build_paid_launch_worker_postcommit(
+    def _prepare_paid_launch_adopter_postcommit(
         self,
         spec: paid_capacity.PaidLaunchSpec,
         member: paid_capacity.PaidLaunchReceiptMember,
+        binding: 'FusedBindingReceiptMember',
         info: ReplicaInfo,
-    ) -> tuple[_ReplicaLaunchThread, _ReplicaLaunchResult]:
-        """Construct one normal bound worker from an acknowledged commit."""
+    ) -> _PreparedPaidLaunchAdopter:
+        """Reconstruct one optional worker for an already queued request."""
         worker = paid_capacity.thaw_paid_launch_payload(
             spec.worker_construction)
         stored_override = paid_capacity.thaw_paid_launch_payload(
@@ -4454,11 +4409,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         launch_yaml_content = worker['launch_yaml_content']
         if not isinstance(launch_yaml_content, str):
             raise ValueError('Paid launch YAML construction is malformed.')
-        version_authority = spec.catalog_evidence.version_authority
-        frozen_controller_config = (
-            serve_utils.parse_and_validate_version_controller_config(
-                version_authority.controller_config, self._workspace,
-                'committed paid launch controller config'))
         task_template = load_task_with_service_spec(launch_yaml_content,
                                                     launch_spec)
         replica_port = _get_resources_ports(launch_yaml_content, launch_spec,
@@ -4476,143 +4426,49 @@ class SkyPilotReplicaManager(ReplicaManager):
             decoded_override)
         if location is None:
             raise ValueError('Paid launch location cannot be reconstructed.')
-        resources_override = location.to_dict()
-        bound_task = _build_replica_launch_task(
-            launch_yaml_content,
-            spec.replica_id,
-            resources_override,
-            exact_resources_override=True,
-            authoritative_service_spec=launch_spec,
-            service_name=self._service_name,
-            task_template=task_template)
-        bound_cloud = next(iter(bound_task.resources)).cloud
-        launch_fence = self._bound_ordinary_launch_fence_context(
-            info, spec.service_version)
-        submission_id = (
-            request_postgres.stable_bound_ordinary_launch_submission_id(
-                self._service_name, info.replica_id, info.replica_record_id))
-        inspect_bound, reduce_bound, cancel_bound = (
-            self._bound_ordinary_launch_callbacks(info, bound_cloud))
-        completion_queue, completion_event = self._launch_completion_state()
-        teardown_requested = threading.Event()
-        launch_thread_ref: list[_ReplicaLaunchThread | None] = [None]
-
-        def _cloud_launch_guard() -> bool | tuple[bool, str]:
-            generation = self._queued_launch_generation_decision(
-                spec.service_version)
-            if not generation[0]:
-                return generation
-            launch_thread = launch_thread_ref[0]
-            if (launch_thread is None or
-                    not _bound_ordinary_paid_claim_owns_provider_effect(
-                        info, launch_thread=launch_thread)):
-                return False, 'missing-committed-paid-receipt'
-            return generation
-
-        launch_kwargs: dict[str, Any] = {
-            'availability_max_retry': 1,
-            'exact_resources_override': True,
-            'pre_launch_guard':
-                self._ordinary_binding_profile_launch_is_authorized,
-            'cloud_launch_guard': _cloud_launch_guard,
-            'supersession_guard': functools.partial(
-                self._queued_launch_generation_decision, spec.service_version),
-            'continue_guard': self._launch_owner_watchdog_allows_continue,
-            'cleanup_continue_guard': self._service_is_cleanup_authorized,
-            'launch_fence': launch_fence,
-            'service_spec': launch_spec,
-            'task_template': task_template,
-            'service_name': self._service_name,
-            'workspace': self._workspace,
-            'frozen_controller_config': frozen_controller_config,
-            'frozen_controller_config_path':
-                worker['frozen_controller_config_path'],
-            'ordinary_launch_submission_uuid': submission_id,
-            'non_pool_launch_profile_kind': profile_kind.value,
-            'inspect_bound_ordinary_launch': inspect_bound,
-            'reduce_bound_ordinary_launch': reduce_bound,
-            'cancel_bound_ordinary_launch': cancel_bound,
-        }
-        input_digest = ordinary_launch_handoff.redacted_input_digest(
-            launch_yaml_content, resources_override)
-        if input_digest is not None:
-            launch_kwargs['ordinary_launch_handoff_context'] = {
-                'context_version':
-                    serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_VERSION,
-                'service_name': self._service_name,
-                'service_version': spec.service_version,
-                'replica_id': spec.replica_id,
-                'replica_record_id': spec.replica_record_id,
-                'controller_route_epoch':
-                    self._ordinary_launch_handoff_route_epoch,
-                'input_digest': input_digest,
-            }
-            launch_kwargs['ordinary_launch_event'] = functools.partial(
-                self._emit_ordinary_launch_handoff_event,
-                info,
-                input_digest=input_digest,
-                allow_demoted_candidate=False)
-        launch_thread = _ReplicaLaunchThread(
-            target=launch_cluster_with_frozen_controller_config,
-            replica_id=spec.replica_id,
-            replica_record_id=spec.replica_record_id,
-            service_hash=self._service_hash,
-            controller_owner=self._controller_owner,
-            teardown_requested=teardown_requested,
-            completion_queue=completion_queue,
-            completion_event=completion_event,
-            bound_ordinary_launch=True,
-            ordinary_legacy_launch=False,
-            paid_claim_commit_receipt=member,
-            args=(spec.replica_id, launch_yaml_content,
-                  spec.cluster_name_seed, worker['log_file_name'],
-                  self._legacy_mutation_runtime_state().replica_to_request_id,
-                  resources_override, False),
-            kwargs={
-                **launch_kwargs,
-                'teardown_requested': teardown_requested,
-            })
-        launch_thread_ref[0] = launch_thread
-        return (launch_thread,
-                _ReplicaLaunchResult(replica_id=spec.replica_id,
-                                     planned_capacity=expected_plan_units,
-                                     funding=_ReplicaLaunchFunding.PAID))
+        return _PreparedPaidLaunchAdopter(
+            info=info,
+            spec=spec,
+            receipt=member,
+            binding=binding,
+            launch_spec=launch_spec,
+            yaml_content=launch_yaml_content,
+            launch_result=_ReplicaLaunchResult(
+                replica_id=spec.replica_id,
+                planned_capacity=expected_plan_units,
+                funding=_ReplicaLaunchFunding.PAID),
+            location=location)
 
     def materialize_paid_launch_receipt(
         self,
         receipt: paid_capacity.PaidLaunchReceipt,
-        handoff: _PaidLaunchMaterializationHandoff,
+        bindings: tuple['FusedBindingReceiptMember', ...],
+        prepared_specs: Iterable[paid_capacity.PaidLaunchSpec],
     ) -> tuple[_ReplicaLaunchResult, ...]:
-        """Build and publish only the acknowledged sparse committed subset.
+        """Publish optional local adopters for the committed paid subset.
 
-        Exact row reads and every worker construction happen before the short
-        manager-lock publication section.  Fresh acknowledged members do not
-        have associations yet: the normal bound worker creates the unchanged
-        association/request/queue/pin graph when the shared launch executor
-        grants it a process slot.  Association read/adoption remains solely an
-        ambiguity and restart-recovery path.
+        Queue visibility is the durable handoff.  The capacity transaction has
+        already committed each exact request graph, so this method performs no
+        database admission or provider effect and is safe to skip on process
+        death; the ordinary unowned-request reconciler can adopt every member.
         """
         if not isinstance(receipt, paid_capacity.PaidLaunchReceipt):
             raise TypeError('receipt must be a PaidLaunchReceipt.')
-        if not isinstance(handoff, _PaidLaunchMaterializationHandoff):
-            raise TypeError('handoff must be a paid materialization handoff.')
-        specs = handoff.prepared_specs
+        if (type(bindings) is not tuple or any(not isinstance(
+                binding, paid_wave_admission.FusedBindingReceiptMember)
+                                               for binding in bindings)):
+            raise TypeError('bindings must be a fused binding receipt tuple.')
+        specs = tuple(prepared_specs)
+        if any(not isinstance(spec, paid_capacity.PaidLaunchSpec)
+               for spec in specs):
+            raise TypeError('prepared_specs contains a non-launch spec.')
         spec_by_identity = {
             (spec.replica_id, spec.replica_record_id): spec for spec in specs
         }
         if len(spec_by_identity) != len(specs):
             raise ValueError('Prepared paid launch identities must be unique.')
-        receipt_identities = frozenset(
-            _PaidPhaseARecoveryIdentity(member.replica_id,
-                                        member.replica_record_id)
-            for member in receipt.members)
-        with self._paid_phase_a_recovery_lock:
-            if (not receipt_identities.issubset(handoff.identities) or
-                    not receipt_identities.issubset(
-                        self._paid_launch_materialization_identities)):
-                raise ValueError(
-                    'Paid launch receipt has no active materialization handoff.'
-                )
+        if len(bindings) != len(receipt.members):
+            raise ValueError('Paid launch receipt has incomplete bindings.')
         authority = self._ordinary_launch_binding_authority
         if (receipt.service_name != self._service_name or
                 receipt.service_hash != self._service_hash or
@@ -4622,8 +4478,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 != authority.service_lifecycle_epoch):
             raise ValueError('Paid launch receipt is stale for this manager.')
 
-        built: list[tuple[ReplicaInfo, _ReplicaLaunchThread,
-                          _ReplicaLaunchResult]] = []
+        prepared: list[_PreparedPaidLaunchAdopter] = []
+        built: list[tuple[_PreparedPaidLaunchAdopter, _ReplicaLaunchThread,
+                          str]] = []
         accepted_locations: set[spot_placer.Location] = set()
         # Every receipt member committed before this process-local operation.
         # If construction fails at any position, transfer the complete sparse
@@ -4639,7 +4496,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 (info.replica_id, info.replica_record_id): info
                 for info in serve_state.get_replica_infos(self._service_name)
             }
-            for member in receipt.members:
+            for member, binding in zip(receipt.members, bindings, strict=True):
                 identity = (member.replica_id, member.replica_record_id)
                 spec = spec_by_identity.get(identity)
                 if (spec is None or spec.service_name != receipt.service_name or
@@ -4653,22 +4510,32 @@ class SkyPilotReplicaManager(ReplicaManager):
                     raise ValueError(
                         'Paid launch receipt member has no exact prepared spec.'
                     )
+                binding_context = binding.context
+                if ((binding.replica_id,
+                     binding.replica_record_id) != identity or
+                        binding_context.service_name != receipt.service_name or
+                        binding_context.replica_id != member.replica_id or
+                        str(binding_context.replica_record_id)
+                        != member.replica_record_id or
+                        binding_context.request_id != binding.request_id or
+                        str(binding_context.association_id)
+                        != binding.association_id or
+                        binding_context.launch_generation
+                        != binding.launch_generation or
+                        binding_context.profile.kind
+                        is not ordinary_launch_binding.NonPoolLaunchProfileKind.
+                        ORDINARY_PAID):
+                    raise ValueError(
+                        'Paid launch receipt member has no exact fused binding.'
+                    )
                 info = committed_by_identity.get(identity)
                 if info is None:
                     raise _BoundOrdinaryLaunchUnresolvedError(
                         'Committed paid receipt lost its exact replica row.')
-                launch_thread, launch_result = (
-                    self._build_paid_launch_worker_postcommit(
-                        spec, member, info))
-                built.append((info, launch_thread, launch_result))
-                stored_override = paid_capacity.thaw_paid_launch_payload(
-                    spec.resources_override)
-                location = spot_placer.Location.from_resources_override(
-                    _decode_replica_resource_state(stored_override))
-                if location is None:
-                    raise ValueError(
-                        'Committed paid launch lost its exact retry location.')
-                accepted_locations.add(location)
+                prepared_member = (self._prepare_paid_launch_adopter_postcommit(
+                    spec, member, binding, info))
+                prepared.append(prepared_member)
+                accepted_locations.add(prepared_member.location)
             placer = self._spot_placer
             if accepted_locations and placer is None:
                 raise _BoundOrdinaryLaunchUnresolvedError(
@@ -4680,6 +4547,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # Persist accepted probe reservations before a worker can
                 # publish or perform a provider effect.
                 self._persist_spot_placement_state_if_dirty()
+
+            for item in prepared:
+                launch_thread = self._build_bound_launch_adopter(
+                    item.info,
+                    item.binding.context,
+                    yaml_content=item.yaml_content,
+                    spec=item.launch_spec)
+                built.append((item, launch_thread, item.binding.request_id))
         except BaseException:
             self._enqueue_paid_phase_a_recovery_identities(recovery_identities)
             raise
@@ -4697,7 +4572,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         self._next_replica_id,
                         max(member.replica_id for member in receipt.members) +
                         1)
-                for info, launch_thread, _ in built:
+                for item, launch_thread, _ in built:
+                    info = item.info
                     existing = runtime.launch_thread_pool.get(info.replica_id)
                     if (existing is not None and
                             getattr(existing, 'replica_record_id',
@@ -4705,16 +4581,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                         raise _BoundOrdinaryLaunchUnresolvedError(
                             'Committed paid receipt collided with another '
                             'local replica worker.')
-                for info, launch_thread, launch_result in built:
+                for item, launch_thread, request_id in built:
+                    info = item.info
                     existing = runtime.launch_thread_pool.get(info.replica_id)
                     if existing is None:
-                        # Fresh bound workers publish their request ID only
-                        # after generic binding commits.  Association adopters
-                        # use `_register_bound_launch_adopter`; this path must
-                        # not manufacture a process-local request pointer.
-                        runtime.launch_thread_pool[info.replica_id] = (
-                            launch_thread)
-                    published.append(launch_result)
+                        self._register_bound_launch_adopter(
+                            info, request_id, launch_thread)
+                    elif runtime.replica_to_request_id.get(
+                            info.replica_id) != request_id:
+                        raise _BoundOrdinaryLaunchUnresolvedError(
+                            'Committed paid receipt collided with another '
+                            'local request identity.')
+                    published.append(item.launch_result)
                 if published:
                     runtime.launch_completion_event.set()
         except BaseException:
@@ -5561,7 +5439,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     serve_state.ReplicaStatus.PROVISIONING) or
                     info.replica_id in runtime.launch_thread_pool or
                     info.replica_id in runtime.down_thread_pool or
-                    self._paid_launch_materialization_is_pending(info) or
                     self._paid_phase_a_recovery_is_pending(info)):
                 continue
             try:
@@ -10571,54 +10448,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         # refresh pass returns. Waking it here never performs database or
         # provider I/O under the scale-up manager lock.
         self._legacy_mutation_runtime_state().launch_completion_event.set()
-
-    def begin_paid_launch_materialization(
-        self,
-        prepared_specs: Iterable[paid_capacity.PaidLaunchSpec],
-    ) -> _PaidLaunchMaterializationHandoff:
-        """Fence exact prepared identities before their PostgreSQL commit.
-
-        The fence is deliberately process-local.  It only distinguishes a
-        live controller's commit-to-worker-publication handoff from genuinely
-        abandoned Phase-A rows.  If the process exits, the fence disappears
-        and the replacement controller's existing durable recovery path owns
-        those rows.
-        """
-        specs = tuple(prepared_specs)
-        if any(not isinstance(spec, paid_capacity.PaidLaunchSpec)
-               for spec in specs):
-            raise TypeError('prepared_specs contains a non-launch spec.')
-        identities = frozenset(
-            _PaidPhaseARecoveryIdentity(spec.replica_id, spec.replica_record_id)
-            for spec in specs)
-        if (len(identities) != len(specs) or
-                len({identity.replica_id for identity in identities
-                    }) != len(identities)):
-            raise ValueError('Prepared paid launch identities must be unique.')
-        with self._paid_phase_a_recovery_lock:
-            overlap = ((self._paid_launch_materialization_identities |
-                        set(self._paid_phase_a_recoveries)) & identities)
-            if overlap:
-                raise RuntimeError(
-                    'Paid launch materialization identity is already owned.')
-            self._paid_launch_materialization_identities.update(identities)
-        return _PaidLaunchMaterializationHandoff(specs)
-
-    def end_paid_launch_materialization(
-            self, handoff: _PaidLaunchMaterializationHandoff) -> None:
-        """Release one exact handoff after publication or recovery transfer."""
-        if not isinstance(handoff, _PaidLaunchMaterializationHandoff):
-            raise TypeError('handoff must be a paid materialization handoff.')
-        with self._paid_phase_a_recovery_lock:
-            self._paid_launch_materialization_identities.difference_update(
-                handoff.identities)
-
-    def _paid_launch_materialization_is_pending(self,
-                                                info: ReplicaInfo) -> bool:
-        identity = _PaidPhaseARecoveryIdentity(info.replica_id,
-                                               info.replica_record_id)
-        with self._paid_phase_a_recovery_lock:
-            return identity in self._paid_launch_materialization_identities
 
     def _paid_phase_a_recovery_is_pending(self, info: ReplicaInfo) -> bool:
         identity = _PaidPhaseARecoveryIdentity(info.replica_id,

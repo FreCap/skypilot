@@ -1,12 +1,13 @@
 """Deterministic, side-effect-free exact-card capacity planning contracts."""
 
+from collections.abc import Mapping
 import dataclasses
 import enum
 import hashlib
 import json
 import math
 import typing
-from typing import Mapping, TypeVar
+from typing import TypeVar
 
 from sky.serve import autoscaler_compatibility
 from sky.serve import compatibility_matching

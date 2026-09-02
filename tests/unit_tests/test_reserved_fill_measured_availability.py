@@ -422,7 +422,10 @@ class TestProtocolV2DurableRoundBootstrap:
             'last_observed_free_ts': time.time(),
         }
 
-        def _capture_budgets(_global_budget, _service_floor, inputs):
+        def _capture_budgets(_global_budget, _service_floor, inputs, *, mode,
+                             demand_target_capacity, acquisition_classes):
+            del demand_target_capacity, acquisition_classes
+            captured['budget_mode'] = mode
             captured['capacity_hints'] = [
                 entry.capacity_hint for entry in inputs
             ]

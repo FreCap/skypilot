@@ -53,12 +53,17 @@ YAPF_EXCLUDES=(
     '--exclude' 'infra/terraform/modules/skypilot-control-plane/scripts/seed_config.py'
     '--exclude' 'sky/schemas/generated/**'
     '--exclude' 'tests/unit_tests/test_sky/backends/testdata/**'
+    # The reclaim policy package is review-owned source: its implementation
+    # bytes are pinned to a reviewed POLICY_REVISION digest, so formatter
+    # churn must not touch it.
+    '--exclude' 'boltz/reserved_fill_reclaim_policy/**'
 )
 
 ISORT_YAPF_EXCLUDES=(
     '--sg' 'build/**'
     '--sg' 'sky/schemas/generated/**'
     '--sg' 'tests/unit_tests/test_sky/backends/testdata/**'
+    '--sg' 'boltz/reserved_fill_reclaim_policy/**'
 )
 
 PYLINT_FLAGS=(

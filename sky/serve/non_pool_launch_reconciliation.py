@@ -167,13 +167,17 @@ def apply_exact_provider_absence_replica_projection(
             assert isinstance(evidence_payload, Mapping)
             pool_identity = (paid_capacity.pool_key_payload(pool_key)
                              if isinstance(pool_key, str) else None)
+            # A GCP replacement census is exact for both the cleanup-only v1
+            # pool and the project-scoped v2 pool; share the one pool-shape
+            # contract with the association-side reducer instead of pinning
+            # this replica-side copy to the legacy key version.
             replacement_shape_matches = bool(
                 context.profile.kind is ordinary_launch_binding.
                 NonPoolLaunchProfileKind.ORDINARY_PAID or
                 (isinstance(pool_identity, Mapping) and
-                 pool_identity.get('cloud') == 'gcp' and
-                 pool_identity.get('version') == 1 and
-                 pool_identity.get('use_spot') is True))
+                 pool_identity.get('cloud') == 'gcp' and ordinary_launch_binding
+                 .paid_provider_reconciliation_pool_shape_matches(
+                     context.profile.kind, pool_key)))
             if (not replacement_shape_matches or not replica_shape_matches or
                     not ordinary_launch_binding.
                     ordinary_paid_provider_terminal_shape_matches(

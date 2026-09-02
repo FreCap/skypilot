@@ -1802,14 +1802,6 @@ class SkyServeLoadBalancer:
         """Grant available slots by strict priority and FIFO within a tie."""
         if self._waiting_request_count <= 0:
             return
-        for bucket in list(self._request_queue_waiters_for_instance().values()):
-            for waiter in list(bucket.values()):
-                if not waiter.abandoned:
-                    continue
-                self._remove_request_queue_waiter_locked(waiter)
-                self._resolve_request_queue_waiter_locked(waiter)
-        if self._waiting_request_count <= 0:
-            return
         if self._draining or not self._accepts_new_requests():
             while True:
                 queued_waiter = self._pop_request_queue_waiter_locked()
@@ -2195,6 +2187,23 @@ class SkyServeLoadBalancer:
             status_code=503,
             detail=f'Load balancer slot is {role.value.lower()}.',
             headers=headers)
+
+    def _eligible_role_fence_error(
+            self, request: fastapi.Request) -> fastapi.HTTPException:
+        """Build the drain/role 503 for a request that is already eligible.
+
+        The retry loop re-checks the drain and role fences on every attempt.
+        A request that trips one there has passed admission, so its attempt
+        is already counted and the final classification guard would report
+        it as a non-rejected request that received service.  Classify it as
+        a terminal load-balancer rejection instead.  It is not autoscaling
+        pressure: the reject-window gauge and the history rejection counter
+        stay untouched, exactly as for pre-admission drain and role exits.
+        """
+        self._record_request_classification_once(request, rejected=True)
+        if self._draining:
+            return self._draining_request_error()
+        return self._inactive_role_request_error()
 
     def _begin_draining(self) -> None:
         """Start draining (idempotent): fail readiness + stop syncing."""
@@ -6093,10 +6102,8 @@ class SkyServeLoadBalancer:
             track_async_attempt = False
             if async_occupancy_request is None:
                 with self._client_pool_lock:
-                    if self._draining:
-                        raise self._draining_request_error()
                     if not self._accepts_new_requests():
-                        raise self._inactive_role_request_error()
+                        raise self._eligible_role_fence_error(request)
                     queue_tracks_occupancy = self._queue_uses_async_occupancy()
                     declared_urls = set(self._occupancy_declared_urls)
                     routable_urls = self._routable_ready_urls_locked()
@@ -6114,10 +6121,8 @@ class SkyServeLoadBalancer:
                 # Every attempt owns a fresh role/drain fence.  An admitted
                 # handler cannot select a replacement replica after this LB
                 # begins draining or loses its serving role during backoff.
-                if self._draining:
-                    raise self._draining_request_error()
                 if not self._accepts_new_requests():
-                    raise self._inactive_role_request_error()
+                    raise self._eligible_role_fence_error(request)
                 queue_tracks_occupancy = self._queue_uses_async_occupancy()
                 all_ready_urls = set(self._load_balancing_policy.ready_replicas)
                 routable_urls = self._routable_ready_urls_locked()
