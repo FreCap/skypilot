@@ -21,6 +21,7 @@ import urllib.error
 import urllib.request
 import uuid
 
+import aiohttp.web
 import pytest
 from smoke_tests import smoke_tests_utils
 import yaml
@@ -91,6 +92,7 @@ class _HttpSession:
 def _provider_scope(**overrides):
     values = {
         'service_hash': 'incarnation',
+        'resource_scope': 'resource-scope',
         'lifecycle_epoch': 7,
         'service_version': 11,
         'max_live_paid_gpu_units': 2,
@@ -501,10 +503,11 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
         assert policy['cost_rebalance'] is False
         queue = config['service']['load_balancer']['request_queue']
         profile = qualifier.PROFILES[name]
-        assert queue['min_size'] == profile.request_concurrency
-        assert queue['max_size'] == max(32, profile.request_concurrency)
+        projection = qualifier._profile_projection(profile)
+        assert queue['min_size'] == projection['request_queue_min_size']
+        assert queue['max_size'] == projection['request_queue_max_size']
         assert queue['max_concurrency'] == (
-            qualifier.request_queue_max_concurrency(profile))
+            projection['request_queue_max_concurrency'])
         assert resources['use_spot'] is True
         assert resources['accelerators'] == 'L4:1'
         assert resources['any_of'] == [
@@ -566,12 +569,13 @@ def test_scale_profile_exceeds_physical_gate_for_rendered_shape():
     assert profile.max_units == 800
     assert profile.max_units // 1 >= 100
     assert profile.exact_requests == 10_000
-    assert profile.request_concurrency == profile.exact_requests
-    assert qualifier.held_request_count(profile) == profile.max_units
+    assert profile.request_concurrency == 128
+    assert profile.request_concurrency < profile.exact_requests
+    assert qualifier.scale_stimulus_count(profile) == profile.max_units
     assert profile.scale_up_min_replicas == profile.max_units
 
 
-def test_scale_queue_can_admit_full_campaign_while_dispatch_stays_bounded():
+def test_scale_queue_only_admits_one_stimulus_plus_one_tail_batch():
     profile = qualifier.PROFILES['scale']
     projection = qualifier._profile_projection(profile)
     instance = object.__new__(load_balancer.SkyServeLoadBalancer)
@@ -580,14 +584,14 @@ def test_scale_queue_can_admit_full_campaign_while_dispatch_stays_bounded():
         'max_concurrency': projection['request_queue_max_concurrency'],
     }
 
-    assert projection['request_queue_min_size'] == 10_000
-    assert projection['request_queue_max_size'] == 10_000
+    assert projection['request_queue_min_size'] == 800
+    assert projection['request_queue_max_size'] == 1_200
     assert projection['request_queue_max_concurrency'] == 128
-    assert instance._request_queue_submission_limit() == 10_128
-    assert instance._request_queue_submission_limit() >= profile.exact_requests
+    assert instance._request_queue_submission_limit() == 1_328
+    assert instance._request_queue_submission_limit() < profile.exact_requests
 
 
-def test_fixture_holds_fit_worker_bound_below_queue_timeout():
+def test_fixture_processing_fits_worker_bound_below_queue_timeout():
     config = yaml.safe_load(
         (_FIXTURE_DIR / 'service.yaml').read_text(encoding='utf-8'))
     duration_limit = qualifier._fixture_duration_limit(config)
@@ -595,11 +599,10 @@ def test_fixture_holds_fit_worker_bound_below_queue_timeout():
         'timeout_seconds']
 
     assert duration_limit == 360
+    assert qualifier.request_processing_seconds(
+        qualifier.PROFILES['scale']) == 20
     assert all(
-        qualifier.request_hold_seconds(profile) == 340
-        for profile in qualifier.PROFILES.values())
-    assert all(
-        qualifier.request_hold_seconds(profile) <= duration_limit
+        qualifier.request_processing_seconds(profile) <= duration_limit
         for profile in qualifier.PROFILES.values())
     assert duration_limit < queue_timeout
 
@@ -770,6 +773,7 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
     service_yaml = yaml.safe_dump(persisted_service, sort_keys=False)
     authority = {
         'service_hash': 'incarnation',
+        'resource_scope': 'resource-scope',
         'service_lifecycle_epoch': 7,
         'current_version': 11,
         'workspace': 'workspace-a',
@@ -781,6 +785,7 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
     }
     scope = qualifier.provider_scope_from_controller_config(authority)
     assert scope.project_id == 'durable-project'
+    assert scope.resource_scope == 'resource-scope'
     assert (scope.location_scope is qualifier.GcpLocationScope.PROJECT_WIDE)
     receipt = tmp_path / 'scope.json'
     qualifier.write_provider_scope(receipt, 'paid-e2e', scope)
@@ -2258,7 +2263,7 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
                                 profile=qualifier.PROFILES['small'])
     receipt.sample('scale', observation)
 
-    assert receipt._payload['schema_version'] == 7
+    assert receipt._payload['schema_version'] == 8
     assert receipt._payload['request_priority'] == 50
     sample = receipt._payload['samples'][0]
     assert sample['phase'] == 'scale'
@@ -3093,14 +3098,20 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
                          database, provider_free_unbound_replica_ids=(7,)),
                      provider=_cross_cloud_provider_state(gcp_running_count=10,
                                                           aws_running_count=10),
-                     load_balancer=_load_balancer_state(demand_units=64)),
+                     load_balancer=_load_balancer_state(
+                         demand_units=64,
+                         unique_job_arrivals_60s=64,
+                         unique_job_arrivals_300s=64)),
         qualifier.QualificationError('transient observer blackout'),
         _observation(observed_at=now + 2,
                      database=database,
                      provider=_cross_cloud_provider_state(gcp_running_count=32,
                                                           aws_running_count=32),
-                     load_balancer=_load_balancer_state(demand_units=64,
-                                                        ready_replicas=20)),
+                     load_balancer=_load_balancer_state(
+                         demand_units=64,
+                         ready_replicas=20,
+                         unique_job_arrivals_60s=64,
+                         unique_job_arrivals_300s=64)),
     ]
 
     class Observer:
@@ -3190,45 +3201,25 @@ def test_scale_rejects_unattributed_mixed_demand(tmp_path):
     asyncio.run(exercise())
 
 
-def test_scale_campaign_stages_held_prefix_then_joins_exact_arrival_window(
-        tmp_path):
+def test_scale_stimulus_requires_only_the_bounded_resident_cohort(tmp_path):
     profile = dataclasses.replace(qualifier.PROFILES['scale'], poll_seconds=0)
-    stage = _request_telemetry(queue_depth=800)
-    loaded = _request_telemetry(queue_depth=9872,
-                                in_flight=128,
-                                processing=64,
-                                state_counts={'ACCEPTED': 128})
-    observation = _observation(observed_at=1000,
-                               database=_database_state(demand_units=10_000),
-                               load_balancer=_load_balancer_state(
-                                   demand_units=10_000,
-                                   unique_job_arrivals_60s=10_000,
-                                   unique_job_arrivals_300s=10_000))
+    stimulus = _request_telemetry(queue_depth=800)
 
     class Observer:
 
-        def __init__(self):
-            self.telemetry = [stage, loaded]
-
-        async def request_telemetry(self):
-            return self.telemetry.pop(0)
-
         @staticmethod
-        async def snapshot(*, require_complete_demand_report=True):
-            assert not require_complete_demand_report
-            return observation
+        async def request_telemetry():
+            return stimulus
 
     async def exercise():
         observer = Observer()
         receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
                                     service_name='paid-e2e',
                                     profile=profile)
-        progress = qualifier.Progress(scale_started_monotonic=time.monotonic(),
-                                      scale_started_at=999)
         traffic = asyncio.create_task(asyncio.Event().wait())
         try:
             deadline = time.monotonic() + 1
-            observed_stage = await qualifier._wait_for_campaign_stage(
+            observed_stimulus = await qualifier._wait_for_scale_stimulus(
                 observer=observer,
                 profile=profile,
                 receipt=receipt,
@@ -3236,30 +3227,17 @@ def test_scale_campaign_stages_held_prefix_then_joins_exact_arrival_window(
                 baseline=_request_telemetry(),
                 expected_resident=800,
                 deadline_monotonic=deadline)
-            observed_loaded = await qualifier._wait_for_campaign_loaded(
-                observer=observer,
-                profile=profile,
-                progress=progress,
-                receipt=receipt,
-                traffic=traffic,
-                baseline=_request_telemetry(),
-                expectation=qualifier.provider_expectation(profile, None),
-                deadline_monotonic=deadline)
-            return observed_stage, observed_loaded, progress, receipt
+            return observed_stimulus, receipt
         finally:
             traffic.cancel()
             await asyncio.gather(traffic, return_exceptions=True)
 
-    observed_stage, observed_loaded, progress, receipt = asyncio.run(exercise())
-    assert observed_stage == stage
-    assert observed_loaded == loaded
-    assert progress.campaign_loaded_observed_at == 1000
+    observed_stimulus, receipt = asyncio.run(exercise())
+    assert observed_stimulus == stimulus
     assert [
         sample['phase']
         for sample in receipt._payload['request_telemetry_samples']
-    ] == ['campaign-stage', 'campaign-loaded']
-    assert receipt._payload['samples'][-1]['lb_unique_job_arrivals_60s'] == (
-        10_000)
+    ] == ['scale-stimulus']
 
 
 def test_exact_async_request_uses_canonical_acceptance_and_completion():
@@ -3524,33 +3502,204 @@ def test_exact_completion_retries_with_stable_exponential_jitter(monkeypatch):
     ]
 
 
-def test_scale_stimulus_has_exactly_ten_thousand_stable_ledger_identities(
-        monkeypatch):
-    calls = []
-
-    async def fake_request(_session, **kwargs):
-        calls.append((kwargs['request_id'], kwargs['stable_job_id'],
-                      kwargs['duration_seconds']))
-
-    monkeypatch.setattr(qualifier, '_one_exact_async_request', fake_request)
+def test_scale_campaign_is_one_stimulus_plus_bounded_tail_batches():
     profile = qualifier.PROFILES['scale']
-    successes = asyncio.run(
-        qualifier.send_exact_async_requests(
-            endpoint='https://unused.test',
-            token='secret',
-            service_hash='incarnation-a',
-            prefix='scale-run',
-            count=profile.exact_requests,
-            concurrency=profile.request_concurrency,
-            hold_requests=profile.max_units,
-            hold_seconds=310,
-            timeout_seconds=900))
+    stimulus = qualifier.scale_stimulus_count(profile)
+    plan = qualifier.ExactRequestBatchPlan(
+        total_count=profile.exact_requests - stimulus,
+        batch_size=qualifier._SCALE_TAIL_BATCH_SIZE,
+        concurrency=qualifier.request_queue_max_concurrency(profile))
 
-    assert successes == 10_000
-    assert len(calls) == 10_000
-    assert len({request_id for request_id, _, _ in calls}) == 10_000
-    assert len({job_id for _, job_id, _ in calls}) == 10_000
-    assert sum(duration == 310 for _, _, duration in calls) == 800
+    assert stimulus == 800
+    assert plan.batch_size == 400
+    assert plan.concurrency == 128
+    assert plan.batch_counts() == (400,) * 23
+    assert stimulus + sum(plan.batch_counts()) == 10_000
+
+
+def test_exact_async_completion_gate_holds_real_http_requests_until_release():
+    """The scale cohort stays durable without long-running GPU work."""
+    admitted: set[str] = set()
+    completed: set[str] = set()
+    active_requests = 0
+    peak_active_requests = 0
+
+    def receipt_headers(request_id, *, state, revision):
+        attempt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, request_id))
+        return {
+            qualifier.serve_constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: '1',
+            qualifier.serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: 'incarnation-a',
+            qualifier.serve_constants.LB_ASYNC_ATTEMPT_ID_HEADER: attempt_id,
+            qualifier.serve_constants.LB_ASYNC_ATTEMPT_NO_HEADER: '1',
+            qualifier.serve_constants.LB_ASYNC_LEDGER_REVISION_HEADER:
+                str(revision),
+            qualifier.serve_constants.LB_ASYNC_LEDGER_STATE_HEADER: state,
+        }
+
+    async def predict(request):
+        nonlocal active_requests, peak_active_requests
+        active_requests += 1
+        peak_active_requests = max(peak_active_requests, active_requests)
+        try:
+            payload = await request.json()
+            request_id = payload['request_id']
+            await asyncio.sleep(0.002)
+            assert request_id not in admitted
+            admitted.add(request_id)
+            return aiohttp.web.json_response(
+                {
+                    'request_id': request_id,
+                    'status': 'accepted',
+                },
+                status=202,
+                headers=receipt_headers(request_id,
+                                        state='ACCEPTED',
+                                        revision=1))
+        finally:
+            active_requests -= 1
+
+    async def complete(request):
+        payload = await request.json()
+        request_id = payload['request_id']
+        assert request_id in admitted
+        assert request_id not in completed
+        completed.add(request_id)
+        return aiohttp.web.Response(status=204,
+                                    headers=receipt_headers(request_id,
+                                                            state='SUCCEEDED',
+                                                            revision=2))
+
+    async def exercise():
+        app = aiohttp.web.Application()
+        app.router.add_post('/v1/models/model:predict', predict)
+        app.router.add_post(
+            qualifier.serve_constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+            complete)
+        runner = aiohttp.web.AppRunner(app)
+        await runner.setup()
+        site = aiohttp.web.TCPSite(runner, '127.0.0.1', 0)
+        await site.start()
+        assert site._server is not None
+        endpoint = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
+        gate = qualifier.ExactRequestCompletionGate()
+        traffic = asyncio.create_task(
+            qualifier.send_exact_async_requests(endpoint=endpoint,
+                                                token='secret',
+                                                service_hash='incarnation-a',
+                                                prefix='held',
+                                                count=24,
+                                                concurrency=24,
+                                                hold_requests=24,
+                                                hold_seconds=0.01,
+                                                timeout_seconds=5,
+                                                completion_gate=gate))
+        try:
+            deadline = time.monotonic() + 3
+            while len(admitted) < 24 and time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
+            assert len(admitted) == 24
+            assert not completed
+            assert not traffic.done()
+            gate.release()
+            assert await asyncio.wait_for(traffic, timeout=3) == 24
+        finally:
+            gate.release()
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+            await runner.cleanup()
+
+    asyncio.run(exercise())
+    assert completed == admitted
+    assert peak_active_requests <= 24
+
+
+def test_exact_async_tail_batches_use_bounded_real_http_concurrency():
+    """A large logical campaign does not become one socket-sized wave."""
+    admitted: set[str] = set()
+    completed: set[str] = set()
+    active_requests = 0
+    peak_active_requests = 0
+
+    def receipt_headers(request_id, *, state, revision):
+        return {
+            qualifier.serve_constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: '1',
+            qualifier.serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: 'incarnation-a',
+            qualifier.serve_constants.LB_ASYNC_ATTEMPT_ID_HEADER: str(
+                uuid.uuid5(uuid.NAMESPACE_OID, request_id)),
+            qualifier.serve_constants.LB_ASYNC_ATTEMPT_NO_HEADER: '1',
+            qualifier.serve_constants.LB_ASYNC_LEDGER_REVISION_HEADER:
+                str(revision),
+            qualifier.serve_constants.LB_ASYNC_LEDGER_STATE_HEADER: state,
+        }
+
+    async def predict(request):
+        nonlocal active_requests, peak_active_requests
+        active_requests += 1
+        peak_active_requests = max(peak_active_requests, active_requests)
+        try:
+            payload = await request.json()
+            request_id = payload['request_id']
+            await asyncio.sleep(0.005)
+            admitted.add(request_id)
+            return aiohttp.web.json_response(
+                {
+                    'request_id': request_id,
+                    'status': 'accepted',
+                },
+                status=202,
+                headers=receipt_headers(request_id,
+                                        state='ACCEPTED',
+                                        revision=1))
+        finally:
+            active_requests -= 1
+
+    async def complete(request):
+        nonlocal active_requests, peak_active_requests
+        active_requests += 1
+        peak_active_requests = max(peak_active_requests, active_requests)
+        try:
+            payload = await request.json()
+            request_id = payload['request_id']
+            await asyncio.sleep(0.005)
+            completed.add(request_id)
+            return aiohttp.web.Response(status=204,
+                                        headers=receipt_headers(
+                                            request_id,
+                                            state='SUCCEEDED',
+                                            revision=2))
+        finally:
+            active_requests -= 1
+
+    async def exercise():
+        app = aiohttp.web.Application()
+        app.router.add_post('/v1/models/model:predict', predict)
+        app.router.add_post(
+            qualifier.serve_constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+            complete)
+        runner = aiohttp.web.AppRunner(app)
+        await runner.setup()
+        site = aiohttp.web.TCPSite(runner, '127.0.0.1', 0)
+        await site.start()
+        assert site._server is not None
+        endpoint = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
+        try:
+            return await qualifier.send_exact_async_request_batches(
+                endpoint=endpoint,
+                token='secret',
+                service_hash='incarnation-a',
+                prefix='tail',
+                count=41,
+                batch_size=16,
+                concurrency=4,
+                timeout_seconds=10)
+        finally:
+            await runner.cleanup()
+
+    assert asyncio.run(exercise()) == 41
+    assert len(admitted) == 41
+    assert completed == admitted
+    assert peak_active_requests <= 4
+    assert all('-batch-' in request_id for request_id in admitted)
 
 
 def test_request_telemetry_requires_exact_positive_and_terminal_delta(tmp_path):
@@ -3698,9 +3847,10 @@ def _write_aggregate_qualification(path,
     count = 10_000 if economic else 1
     profile = (qualifier.PROFILES['scale']
                if economic else qualifier.PROFILES['provider-canary'])
-    active = profile.max_units if economic else 1
-    queue_depth = count - active if economic else 0
-    in_flight = active
+    stimulus = qualifier.scale_stimulus_count(profile)
+    in_flight = min(128, stimulus) if economic else 1
+    active = in_flight
+    queue_depth = stimulus - in_flight if economic else 0
     processing = max(1, in_flight // 2)
     provider_projection = _qualification_provider_projection(peaks)
     scale_started_at = 4.0
@@ -3720,24 +3870,14 @@ def _write_aggregate_qualification(path,
         'provider_disks': sum(peaks.values()),
         'provider_inflight_operations': 0,
         'provider_by_cloud': provider_projection,
-        'postgres_demand_units': count,
-        'lb_demand_units': count,
-        'lb_unique_job_arrivals_300s': count,
+        'postgres_demand_units': stimulus,
+        'lb_demand_units': stimulus,
+        'lb_unique_job_arrivals_60s': stimulus,
+        'lb_unique_job_arrivals_300s': stimulus,
         'lb_offered_arrival_tracking_saturated': False,
     }
-    campaign_sample = {
-        **_zero_qualification_sample(7.0, phase='campaign-loaded'),
-        'phase': 'campaign-loaded',
-        'exact_zero': False,
-        'campaign_iteration_id': 1,
-        'campaign_pair_observed_at': 7.0,
-        'postgres_demand_units': count,
-        'lb_demand_units': count,
-        'lb_unique_job_arrivals_60s': count,
-        'lb_unique_job_arrivals_300s': count,
-    }
     payload = {
-        'schema_version': 7,
+        'schema_version': 8,
         'service_name': service_name,
         'service_hash': f'{service_name}-hash',
         'lifecycle_epoch': 1,
@@ -3770,9 +3910,6 @@ def _write_aggregate_qualification(path,
         'scale_qualified_iteration_id': 1,
         'baseline_qualified_iteration_id': 3,
         'baseline_qualified_observed_at': 3.0,
-        'campaign_loaded_iteration_id': 1 if economic else None,
-        'campaign_loaded_observed_at': 7.0 if economic else None,
-        'campaign_loaded_request_observed_at': 6.0 if economic else None,
         'exact_request_count': count,
         'exact_request_successes': count,
         'ledger_request_delta': count,
@@ -3781,7 +3918,6 @@ def _write_aggregate_qualification(path,
             _zero_qualification_sample(1.0, phase='baseline', iteration_id=1),
             _zero_qualification_sample(2.0, phase='baseline', iteration_id=2),
             _zero_qualification_sample(3.0, phase='baseline', iteration_id=3),
-            *([campaign_sample] if economic else []),
             scale_sample,
             _zero_qualification_sample(1000.0),
             _zero_qualification_sample(1180.0),
@@ -3799,19 +3935,11 @@ def _write_aggregate_qualification(path,
                 for iteration_id, pair_at in ((1, 1.0), (2, 2.0), (3, 3.0))
             ],
             *([
-                _request_evidence_sample(phase='campaign-stage',
-                                         queue_depth=profile.max_units,
+                _request_evidence_sample(phase='scale-stimulus',
+                                         queue_depth=stimulus,
                                          in_flight=0,
                                          processing=0,
                                          observed_at=5.0),
-                _request_evidence_sample(phase='campaign-loaded',
-                                         queue_depth=count - 128,
-                                         in_flight=128,
-                                         processing=64,
-                                         accepted=128,
-                                         observed_at=6.0,
-                                         campaign_iteration_id=1,
-                                         campaign_pair_observed_at=7.0),
                 _request_evidence_sample(phase='positive',
                                          queue_depth=queue_depth,
                                          in_flight=in_flight,
@@ -4059,7 +4187,8 @@ def test_aggregate_rejects_unpaired_provider_scale_iteration(tmp_path):
         qualifier.aggregate_evidence(args)
 
 
-def test_aggregate_rejects_provider_scale_before_campaign_load(tmp_path):
+def test_aggregate_rejects_provider_scale_before_paired_request_sample(
+        tmp_path):
     args = _aggregate_args(tmp_path)
     receipt = pathlib.Path(args.economic_receipt)
     payload = json.loads(receipt.read_text(encoding='utf-8'))
@@ -4070,7 +4199,7 @@ def test_aggregate_rejects_provider_scale_before_campaign_load(tmp_path):
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
     with pytest.raises(qualifier.QualificationError,
-                       match='paired exact demand|campaign-load'):
+                       match='paired exact demand|scale-stimulus'):
         qualifier.aggregate_evidence(args)
 
 
@@ -4117,17 +4246,17 @@ def test_aggregate_rejects_nonfinite_request_timestamp(tmp_path):
         qualifier.aggregate_evidence(args)
 
 
-def test_aggregate_rejects_partial_exact_arrival_campaign(tmp_path):
+def test_aggregate_rejects_unattributed_scale_stimulus_arrivals(tmp_path):
     args = _aggregate_args(tmp_path)
     receipt = pathlib.Path(args.economic_receipt)
     payload = json.loads(receipt.read_text(encoding='utf-8'))
-    campaign = next(sample for sample in payload['samples']
-                    if sample['phase'] == 'campaign-loaded')
-    campaign['lb_unique_job_arrivals_60s'] = 9_999
+    scale = next(
+        sample for sample in payload['samples'] if sample['phase'] == 'scale')
+    scale['lb_unique_job_arrivals_300s'] = 799
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
     with pytest.raises(qualifier.QualificationError,
-                       match='offered-arrival campaign'):
+                       match='unattributed offered arrivals'):
         qualifier.aggregate_evidence(args)
 
 

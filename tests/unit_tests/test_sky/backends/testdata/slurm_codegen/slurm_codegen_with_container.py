@@ -1,24 +1,28 @@
+import asyncio
+import copy
+import dataclasses
 import functools
 import getpass
 import hashlib
 import io
+import logging
+import math
+import multiprocessing.pool
 import os
 import pathlib
 import selectors
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from typing import Dict, List, Optional, Tuple, Union
 
 import colorama
-import copy
 import json
-import multiprocessing
-import signal
-import threading
 from sky.backends import backend_utils
 
 from sky.skylet import autostop_lib
@@ -30,6 +34,114 @@ from sky.utils import subprocess_utils
 SKY_REMOTE_WORKDIR = '~/sky_workdir'
 
 CANCELLED_RETURN_CODE = 137
+
+logger = logging.getLogger(__name__)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class BoundedSubprocessCapture:
+    """Finite POSIX capture contract for short control-plane commands."""
+
+    deadline_monotonic: int | float
+    max_output_bytes: int
+
+    def __post_init__(self) -> None:
+        deadline = self.deadline_monotonic
+        if (isinstance(deadline, bool) or
+                not isinstance(deadline,
+                               (int, float)) or not math.isfinite(deadline)):
+            raise ValueError('Capture deadline must be finite.')
+        if (isinstance(self.max_output_bytes, bool) or
+                not isinstance(self.max_output_bytes, int) or
+                self.max_output_bytes < 1):
+            raise ValueError('Capture output limit must be a positive integer.')
+
+class SubprocessOutputLimitExceeded(RuntimeError):
+    """A bounded subprocess emitted more bytes than its capture contract."""
+
+def _kill_and_reap_process_group(proc: subprocess.Popen) -> None:
+    """Immediately retire a start_new_session process and its local children."""
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            logger.error('Failed to reap bounded subprocess %s.', proc.pid)
+
+def _kill_process_group_nonblocking(proc: subprocess.Popen) -> None:
+    """Signal a bounded process group from a cancellation callback."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+def _capture_subprocess_bounded(
+    proc: subprocess.Popen,
+    cmd: list[str] | str,
+    capture: BoundedSubprocessCapture,
+) -> tuple[str, str]:
+    """Capture stdout/stderr with one deadline, byte cap, and no threads."""
+    if os.name != 'posix':
+        _kill_and_reap_process_group(proc)
+        raise RuntimeError('Bounded subprocess capture requires POSIX.')
+    deadline = capture.deadline_monotonic
+    streams = {
+        'stdout': proc.stdout,
+        'stderr': proc.stderr,
+    }
+    buffers: dict[str, list[bytes]] = {'stdout': [], 'stderr': []}
+    captured_bytes = 0
+    selector = selectors.DefaultSelector()
+    try:
+        for name, stream in streams.items():
+            if stream is not None:
+                selector.register(stream, selectors.EVENT_READ, name)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(cmd, max(0, remaining))
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(cmd, max(0, remaining))
+            for key, _ in events:
+                chunk = os.read(key.fd, 64 * 1024)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                captured_bytes += len(chunk)
+                if captured_bytes > capture.max_output_bytes:
+                    raise SubprocessOutputLimitExceeded(
+                        'Subprocess output exceeded '
+                        f'{capture.max_output_bytes} bytes: {cmd}')
+                buffers[key.data].append(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(cmd, max(0, remaining))
+        proc.wait(timeout=remaining)
+    except BaseException:
+        _kill_and_reap_process_group(proc)
+        raise
+    finally:
+        selector.close()
+    stdout = b''.join(buffers['stdout']).decode('utf-8', errors='replace')
+    stderr = b''.join(buffers['stderr']).decode('utf-8', errors='replace')
+    return stdout, stderr
 
 class _ProcessingArgs:
     """Arguments for processing logs."""
@@ -151,6 +263,7 @@ def run_with_log(
     streaming_prefix: str | None = None,
     log_cmd: bool = False,
     timeout: int | None = None,
+    bounded_capture: BoundedSubprocessCapture | None = None,
     **kwargs,
 ) -> int | tuple[int, str, str]:
     """Runs a command and logs its output to a file.
@@ -168,6 +281,9 @@ def run_with_log(
         timeout: Optional timeout in seconds. If the command does not complete
             within this time, it will be terminated and TimeoutExpired will be
             raised. None means no timeout (default).
+        bounded_capture: Typed deadline and output bound for a short POSIX
+            control-plane command. This mode requires buffered outputs,
+            disables stream processing, and owns process lifetime directly.
 
     Returns the returncode or returncode, stdout and stderr of the command.
       Note that the stdout and stderr is already decoded.
@@ -175,9 +291,14 @@ def run_with_log(
     Raises:
         subprocess.TimeoutExpired: If the command times out.
     """
-    assert process_stream or not require_outputs, (
-        process_stream, require_outputs,
-        'require_outputs should be False when process_stream is False')
+    if bounded_capture is not None:
+        if timeout is not None or process_stream or not require_outputs:
+            raise ValueError('Bounded capture requires require_outputs=True, '
+                             'process_stream=False, and no separate timeout.')
+    elif require_outputs and not process_stream:
+        raise ValueError(
+            'Buffered outputs without stream processing require bounded '
+            'capture.')
 
     log_path = os.path.expanduser(log_path)
     dirname = os.path.dirname(log_path)
@@ -186,7 +307,7 @@ def run_with_log(
     # stdout and stderr.
     stdout_arg = stderr_arg = None
     ctx = _get_context()
-    if process_stream or ctx is not None:
+    if process_stream or ctx is not None or require_outputs:
         # Capture stdout/stderr of the subprocess if:
         # 1. Post-processing is needed (process_stream=True)
         # 2. Potential contextual handling is needed (ctx is not None)
@@ -208,14 +329,17 @@ def run_with_log(
                           stdin=stdin,
                           **kwargs) as proc:
         try:
-            if ctx is not None:
-                # When runs in coroutine, use kill_pg if available to avoid
-                # the overhead of refreshing the process tree in the daemon.
-                subprocess_utils.kill_process_daemon(proc.pid, use_kill_pg=True)
-            else:
-                # For backward compatibility, do not specify use_kill_pg by
-                # default.
-                subprocess_utils.kill_process_daemon(proc.pid)
+            if bounded_capture is None:
+                if ctx is not None:
+                    # When runs in coroutine, use kill_pg if available to avoid
+                    # the overhead of refreshing the process tree in the
+                    # daemon.
+                    subprocess_utils.kill_process_daemon(proc.pid,
+                                                         use_kill_pg=True)
+                else:
+                    # For backward compatibility, do not specify use_kill_pg
+                    # by default.
+                    subprocess_utils.kill_process_daemon(proc.pid)
 
             # Format streaming_prefix with subprocess PID if it contains {pid}
             formatted_streaming_prefix = streaming_prefix
@@ -280,7 +404,21 @@ def run_with_log(
                 timer.start()
 
             try:
-                if ctx is not None:
+                if bounded_capture is not None:
+                    cancel_callback = functools.partial(
+                        _kill_process_group_nonblocking, proc)
+                    if ctx is not None:
+                        ctx.register_cancel_callback(cancel_callback)
+                    try:
+                        stdout, stderr = _capture_subprocess_bounded(
+                            proc, cmd, bounded_capture)
+                    finally:
+                        if ctx is not None:
+                            ctx.unregister_cancel_callback(cancel_callback)
+                    if ctx is not None and ctx.is_canceled():
+                        raise asyncio.CancelledError(
+                            'Bounded subprocess capture was cancelled.')
+                elif ctx is not None:
                     # When runs in a coroutine, always process the subprocess
                     # stream to:
                     # 1. handle context cancellation
@@ -302,12 +440,14 @@ def run_with_log(
 
             # Check if timeout was triggered during stream processing
             if timeout_triggered:
+                assert timeout is not None
                 logger.error(
                     f'Command timed out after {timeout} seconds: {cmd}')
                 raise subprocess.TimeoutExpired(cmd, timeout)
 
             # Ensure returncode is set.
-            if ctx is not None or process_stream:
+            if (ctx is not None or process_stream or
+                    bounded_capture is not None):
                 # Stream processing already waited for process completion, so
                 # proc.wait() will return immediately. We still call it to
                 # ensure proc.returncode is set.

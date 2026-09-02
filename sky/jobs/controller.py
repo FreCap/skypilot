@@ -2247,6 +2247,23 @@ def _prepare_job_log_path(job_id: int) -> str:
     return os.path.join(log_dir, f'{job_id}.log')
 
 
+class _ControllerApiAccessLease:
+    """Every controller-only bearer owned by one exact job attempt."""
+
+    def __init__(
+        self,
+        current_token_id: str,
+        previous_token_id: str | None = None,
+        pending_revoke_ids: set[str] | None = None,
+        renewal_task: asyncio.Task[None] | None = None,
+    ) -> None:
+        self.current_token_id = current_token_id
+        self.previous_token_id = previous_token_id
+        self.pending_revoke_ids = (set() if pending_revoke_ids is None else
+                                   pending_revoke_ids)
+        self.renewal_task = renewal_task
+
+
 class ControllerManager:
     """Main loop for a job controller process.
 
@@ -2278,7 +2295,8 @@ class ControllerManager:
         # Populated by cancel_job() and consumed by run_job().
         self._cancel_info: dict[int, tuple[bool, int | None]] = {}
         self._cancel_info_lock = asyncio.Lock()
-        self._controller_api_token_ids: dict[int, str] = {}
+        self._controller_api_access_leases: dict[
+            int, _ControllerApiAccessLease] = {}
 
         self._pid = os.getpid()
         self._pid_started_at = psutil.Process(self._pid).create_time()
@@ -2306,6 +2324,28 @@ class ControllerManager:
                 'API server access token for job %s was already '
                 'revoked by a sibling finalizer.', job_id)
 
+    def _create_controller_api_access_token(self,
+                                            job_id: int) -> tuple[str, str]:
+        """Mint one controller-only bearer as the job's original user."""
+        tasks = managed_job_state.get_managed_job_tasks(job_id)
+        if not tasks or not tasks[0].get('user_hash'):
+            raise RuntimeError(
+                f'Cannot determine the original user for managed job {job_id}.')
+        return managed_job_api_access.create_job_api_token(
+            tasks[0]['user_hash'],
+            f'controller-{job_id}-{self._require_controller_slot_attempt()[:8]}',
+        )
+
+    @staticmethod
+    def _install_controller_api_access_token(token: str) -> None:
+        """Publish one bearer to the current job's explicit context."""
+        ctx = context.get()
+        assert ctx is not None, 'Context is not initialized'
+        ctx.override_envs({constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR: token})
+        # A health probe may have cached NEEDS_AUTH before this credential was
+        # installed. Force the next probe to use the new bearer immediately.
+        server_common.get_api_server_status_response.cache_clear()
+
     def _initialize_controller_api_access(self, job_id: int) -> str | None:
         """Authenticate nested SDK requests from a guarded controller.
 
@@ -2317,29 +2357,114 @@ class ControllerManager:
         """
         if controller_capability.get_process_local() is None:
             return None
-
-        tasks = managed_job_state.get_managed_job_tasks(job_id)
-        if not tasks or not tasks[0].get('user_hash'):
+        if job_id in self._controller_api_access_leases:
             raise RuntimeError(
-                f'Cannot determine the original user for managed job {job_id}.')
-        user_hash = tasks[0]['user_hash']
-        token, token_id = managed_job_api_access.create_job_api_token(
-            user_hash,
-            f'controller-{job_id}-{self._require_controller_slot_attempt()[:8]}',
-        )
-        ctx = context.get()
-        assert ctx is not None, 'Context is not initialized'
+                f'Managed job {job_id} already has controller API access.')
+
+        token, token_id = self._create_controller_api_access_token(job_id)
         try:
-            ctx.override_envs({constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR: token})
-            # A health probe may have cached NEEDS_AUTH before the per-job
-            # credential was installed. Force the first authenticated probe
-            # to observe the new credential immediately.
-            server_common.get_api_server_status_response.cache_clear()
+            self._install_controller_api_access_token(token)
         except Exception:
             global_user_state.delete_service_account_token(token_id)
             raise
-        self._controller_api_token_ids[job_id] = token_id
+        self._controller_api_access_leases[job_id] = (_ControllerApiAccessLease(
+            current_token_id=token_id))
         return token_id
+
+    def _revoke_pending_controller_api_access(
+            self, job_id: int, lease: _ControllerApiAccessLease) -> None:
+        """Best-effort revoke every superseded bearer this lease owns."""
+        for token_id in tuple(lease.pending_revoke_ids):
+            try:
+                self._cleanup_controller_api_access(token_id, job_id)
+            except Exception as e:  # pylint: disable=broad-except
+                # The short TTL remains the fail-safe for a token whose eager
+                # revocation failed. Keep it tracked for release-time retry.
+                logger.warning(
+                    'Failed to revoke superseded controller API access token '
+                    'for job %s: %s', job_id, e)
+            else:
+                lease.pending_revoke_ids.discard(token_id)
+
+    def _renew_controller_api_access_once(self, job_id: int) -> None:
+        """Install a fresh token while preserving one overlap generation."""
+        lease = self._controller_api_access_leases.get(job_id)
+        if lease is None:
+            raise RuntimeError(
+                f'Managed job {job_id} has no controller API token to renew.')
+        if not managed_job_state.controller_job_attempt_is_current(job_id):
+            raise managed_job_state.ControllerLeadershipLostError(
+                f'Managed job {job_id} lost its exact controller attempt.')
+
+        # Keep mint, ownership recheck, and publication synchronous on this
+        # event-loop thread. Release therefore cannot snapshot the lease while
+        # an untracked token-creation thread is still committing a new row.
+        token, token_id = self._create_controller_api_access_token(job_id)
+        lease.pending_revoke_ids.add(token_id)
+        try:
+            attempt_is_current = (
+                managed_job_state.controller_job_attempt_is_current(job_id))
+        except Exception:
+            # The new bearer has not been published, so a failed fencing read
+            # must not strand one token row on every retry.
+            self._revoke_pending_controller_api_access(job_id, lease)
+            raise
+        if not attempt_is_current:
+            self._revoke_pending_controller_api_access(job_id, lease)
+            raise managed_job_state.ControllerLeadershipLostError(
+                f'Managed job {job_id} lost its exact controller attempt.')
+        try:
+            # Publish the new bearer before retiring any old generation. An
+            # admitted request may still be authenticating on another API pod.
+            self._install_controller_api_access_token(token)
+        except Exception:
+            self._revoke_pending_controller_api_access(job_id, lease)
+            raise
+
+        stale_token_id = lease.previous_token_id
+        lease.previous_token_id = lease.current_token_id
+        lease.current_token_id = token_id
+        lease.pending_revoke_ids.discard(token_id)
+        if stale_token_id is not None:
+            lease.pending_revoke_ids.add(stale_token_id)
+        self._revoke_pending_controller_api_access(job_id, lease)
+
+    async def _renew_controller_api_access_loop(self, job_id: int) -> None:
+        """Keep one guarded controller credential inside its bounded TTL."""
+        delay = jobs_constants.MANAGED_JOB_CONTROLLER_TOKEN_RENEWAL_SECONDS
+        while True:
+            await asyncio.sleep(delay)
+            try:
+                self._renew_controller_api_access_once(job_id)
+            except managed_job_state.ControllerLeadershipLostError as e:
+                logger.info(
+                    'Stopping controller API access renewal for job '
+                    '%s: %s', job_id, e)
+                return
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    'Failed to renew controller API access token for job %s; '
+                    'retrying in %ss: %s', job_id,
+                    jobs_constants.MANAGED_JOB_CONTROLLER_TOKEN_RETRY_SECONDS,
+                    e)
+                delay = jobs_constants.MANAGED_JOB_CONTROLLER_TOKEN_RETRY_SECONDS
+            else:
+                logger.info('Renewed controller API access token for job %s',
+                            job_id)
+                delay = jobs_constants.MANAGED_JOB_CONTROLLER_TOKEN_RENEWAL_SECONDS
+
+    def _start_controller_api_access(self, job_id: int) -> None:
+        """Install and begin renewing guarded nested-request credentials."""
+        token_id = self._initialize_controller_api_access(job_id)
+        if token_id is None:
+            return
+        lease = self._controller_api_access_leases[job_id]
+        if lease.renewal_task is not None:
+            raise RuntimeError(
+                f'Managed job {job_id} already has API token renewal.')
+        lease.renewal_task = asyncio.create_task(
+            self._renew_controller_api_access_loop(job_id),
+            name=f'managed-job-{job_id}-api-token-renewal')
 
     @staticmethod
     def _cleanup_controller_api_access(token_id: str | None,
@@ -2675,20 +2800,44 @@ class ControllerManager:
                 self._starting_signal.notify()
             self.job_tasks.pop(job_id, None)
             self._cleanup_only_job_ids.discard(job_id)
-            controller_api_token_id = self._controller_api_token_ids.pop(
-                job_id, None)
+            controller_api_access_lease = (
+                self._controller_api_access_leases.pop(job_id, None))
 
         # A cancellation that lands after the job task already finished
         # stores cancel info that no CancelledError handler will consume.
         async with self._cancel_info_lock:
             self._cancel_info.pop(job_id, None)
 
-        try:
-            await asyncio.to_thread(self._cleanup_controller_api_access,
-                                    controller_api_token_id, job_id)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to revoke controller API access token '
-                           f'for job {job_id}: {e}')
+        renewal_task = (None if controller_api_access_lease is None else
+                        controller_api_access_lease.renewal_task)
+        if renewal_task is not None:
+            renewal_task.cancel()
+            try:
+                await renewal_task
+            except asyncio.CancelledError:  # noqa: ASYNC103
+                # This is the child cancellation requested immediately above,
+                # not cancellation of the shielded release coroutine.
+                pass
+            except Exception as e:  # pylint: disable=broad-except
+                # Renewal is best-effort, but teardown must still revoke every
+                # bearer already registered in the lease.
+                logger.warning(
+                    'Controller API access renewal task failed for '
+                    'job %s during release: %s', job_id, e)
+
+        token_ids: set[str] = set()
+        if controller_api_access_lease is not None:
+            token_ids.add(controller_api_access_lease.current_token_id)
+            if controller_api_access_lease.previous_token_id is not None:
+                token_ids.add(controller_api_access_lease.previous_token_id)
+            token_ids.update(controller_api_access_lease.pending_revoke_ids)
+        for token_id in sorted(token_ids):
+            try:
+                await asyncio.to_thread(self._cleanup_controller_api_access,
+                                        token_id, job_id)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning('Failed to revoke controller API access token '
+                               f'for job {job_id}: {e}')
 
     @context.contextual_async
     async def run_job_loop(self,
@@ -2743,7 +2892,7 @@ class ControllerManager:
         task_id = None
         dag = None
         try:
-            self._initialize_controller_api_access(job_id)
+            self._start_controller_api_access(job_id)
             controller = JobController(job_id, self.starting,
                                        self._job_tasks_lock,
                                        self._starting_signal, pool, job_rank)
@@ -2924,7 +3073,7 @@ class ControllerManager:
                 try:
                     if not initialized:
                         self._initialize_job_context(job_id, log_file, pool)
-                        self._initialize_controller_api_access(job_id)
+                        self._start_controller_api_access(job_id)
                         initialized = True
                     if not cleanup_complete:
                         # This is the same canonical provider/storage cleanup

@@ -41,18 +41,26 @@ class TaskCodeGen:
         """Add common imports for both Ray and Slurm execution."""
         self._code.append(
             textwrap.dedent("""\
+            import asyncio
+            import copy
+            import dataclasses
             import functools
             import getpass
             import hashlib
             import io
+            import logging
+            import math
+            import multiprocessing.pool
             import os
             import pathlib
             import selectors
             import shlex
+            import signal
             import subprocess
             import sys
             import tempfile
             import textwrap
+            import threading
             import time
             from typing import Dict, List, Optional, Tuple, Union
             """))
@@ -74,6 +82,13 @@ class TaskCodeGen:
             # FIXME: This is a hack to make sure that the functions can be found
             # by ray.remote. This should be removed once we have a better way to
             # specify dependencies for ray.
+            'logger = logging.getLogger(__name__)',
+            inspect.getsource(log_lib.BoundedSubprocessCapture),
+            inspect.getsource(log_lib.SubprocessOutputLimitExceeded),
+            inspect.getsource(getattr(log_lib, '_kill_and_reap_process_group')),
+            inspect.getsource(
+                getattr(log_lib, '_kill_process_group_nonblocking')),
+            inspect.getsource(getattr(log_lib, '_capture_subprocess_bounded')),
             inspect.getsource(log_lib._ProcessingArgs),  # pylint: disable=protected-access
             inspect.getsource(log_lib._get_context),  # pylint: disable=protected-access
             inspect.getsource(log_lib._handle_io_stream),  # pylint: disable=protected-access
@@ -812,11 +827,7 @@ class SlurmCodeGen(TaskCodeGen):
         self._code.append(
             textwrap.dedent("""\
             import colorama
-            import copy
             import json
-            import multiprocessing
-            import signal
-            import threading
             from sky.backends import backend_utils
             """))
         self._add_skylet_imports()

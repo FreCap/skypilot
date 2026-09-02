@@ -4052,7 +4052,10 @@ class TestTerminalCleanupAdoption:
         ctx.override_envs.assert_called_once_with(
             {token_env_var: 'sky_raw-token'})
         clear.assert_called_once_with()
-        assert manager._controller_api_token_ids == {37: 'token-id'}
+        lease = manager._controller_api_access_leases[37]
+        assert lease.current_token_id == 'token-id'
+        assert lease.previous_token_id is None
+        assert not lease.pending_revoke_ids
 
     def test_controller_api_access_is_not_needed_without_capability(self):
         manager = _make_controller_manager()
@@ -4068,14 +4071,170 @@ class TestTerminalCleanupAdoption:
     @pytest.mark.asyncio
     async def test_releasing_job_revokes_only_controller_token(self):
         manager = _make_controller_manager()
-        manager._controller_api_token_ids[37] = 'controller-token-id'
+        renewal_task = asyncio.create_task(asyncio.sleep(3600))
+        manager._controller_api_access_leases[37] = (
+            controller_lib._ControllerApiAccessLease(
+                current_token_id='controller-token-id',
+                previous_token_id='previous-token-id',
+                pending_revoke_ids={'pending-token-id'},
+                renewal_task=renewal_task))
         manager._cleanup_controller_api_access = MagicMock()
 
         await manager._release_job_loop_ownership(37)
 
-        manager._cleanup_controller_api_access.assert_called_once_with(
-            'controller-token-id', 37)
-        assert not manager._controller_api_token_ids
+        assert renewal_task.cancelled()
+        assert manager._cleanup_controller_api_access.call_args_list == [
+            call('controller-token-id', 37),
+            call('pending-token-id', 37),
+            call('previous-token-id', 37),
+        ]
+        assert not manager._controller_api_access_leases
+
+    def test_controller_api_access_renewal_keeps_one_overlap(self):
+        manager = _make_controller_manager()
+        manager._controller_api_access_leases[37] = (
+            controller_lib._ControllerApiAccessLease(
+                current_token_id='token-1'))
+        ctx = MagicMock()
+
+        with patch('sky.jobs.controller.managed_job_state.'
+                   'controller_job_attempt_is_current', return_value=True), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_managed_job_tasks', return_value=[{
+                          'user_hash': 'nima-user-hash',
+                      }]), \
+                patch('sky.jobs.controller.managed_job_api_access.'
+                      'create_job_api_token', side_effect=[
+                          ('sky_token-2', 'token-2'),
+                          ('sky_token-3', 'token-3'),
+                      ]), \
+                patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.server_common.'
+                      'get_api_server_status_response.cache_clear'), \
+                patch.object(manager,
+                             '_cleanup_controller_api_access') as cleanup:
+            manager._renew_controller_api_access_once(37)
+            lease = manager._controller_api_access_leases[37]
+            assert lease.current_token_id == 'token-2'
+            assert lease.previous_token_id == 'token-1'
+            cleanup.assert_not_called()
+
+            manager._renew_controller_api_access_once(37)
+
+        lease = manager._controller_api_access_leases[37]
+        assert lease.current_token_id == 'token-3'
+        assert lease.previous_token_id == 'token-2'
+        assert not lease.pending_revoke_ids
+        cleanup.assert_called_once_with('token-1', 37)
+        assert ctx.override_envs.call_args_list == [
+            call({constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR: 'sky_token-2'}),
+            call({constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR: 'sky_token-3'}),
+        ]
+
+    def test_controller_api_access_renewal_fences_stale_attempt(self):
+        manager = _make_controller_manager()
+        manager._controller_api_access_leases[37] = (
+            controller_lib._ControllerApiAccessLease(
+                current_token_id='token-1'))
+        ctx = MagicMock()
+
+        with patch('sky.jobs.controller.managed_job_state.'
+                   'controller_job_attempt_is_current',
+                   side_effect=[True, False]), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_managed_job_tasks', return_value=[{
+                          'user_hash': 'nima-user-hash',
+                      }]), \
+                patch('sky.jobs.controller.managed_job_api_access.'
+                      'create_job_api_token',
+                      return_value=('sky_token-2', 'token-2')), \
+                patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch.object(manager,
+                             '_cleanup_controller_api_access') as cleanup:
+            with pytest.raises(managed_job_state.ControllerLeadershipLostError):
+                manager._renew_controller_api_access_once(37)
+
+        lease = manager._controller_api_access_leases[37]
+        assert lease.current_token_id == 'token-1'
+        assert lease.previous_token_id is None
+        assert not lease.pending_revoke_ids
+        cleanup.assert_called_once_with('token-2', 37)
+        ctx.override_envs.assert_not_called()
+
+    def test_controller_api_access_cleans_up_after_fencing_error(self):
+        manager = _make_controller_manager()
+        manager._controller_api_access_leases[37] = (
+            controller_lib._ControllerApiAccessLease(
+                current_token_id='token-1'))
+        ctx = MagicMock()
+
+        with patch('sky.jobs.controller.managed_job_state.'
+                   'controller_job_attempt_is_current',
+                   side_effect=[True, RuntimeError('recheck unavailable')]), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_managed_job_tasks', return_value=[{
+                          'user_hash': 'nima-user-hash',
+                      }]), \
+                patch('sky.jobs.controller.managed_job_api_access.'
+                      'create_job_api_token',
+                      return_value=('sky_token-2', 'token-2')), \
+                patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch.object(manager,
+                             '_cleanup_controller_api_access') as cleanup:
+            with pytest.raises(RuntimeError, match='recheck unavailable'):
+                manager._renew_controller_api_access_once(37)
+
+        lease = manager._controller_api_access_leases[37]
+        assert lease.current_token_id == 'token-1'
+        assert lease.previous_token_id is None
+        assert not lease.pending_revoke_ids
+        cleanup.assert_called_once_with('token-2', 37)
+        ctx.override_envs.assert_not_called()
+
+    def test_controller_api_access_retries_failed_revocation(self):
+        manager = _make_controller_manager()
+        lease = controller_lib._ControllerApiAccessLease(
+            current_token_id='token-2',
+            previous_token_id='token-1',
+            pending_revoke_ids={'token-0'})
+
+        with patch.object(
+                manager,
+                '_cleanup_controller_api_access',
+                side_effect=[RuntimeError('temporary database failure'),
+                             None]) as cleanup:
+            manager._revoke_pending_controller_api_access(37, lease)
+            assert lease.pending_revoke_ids == {'token-0'}
+
+            manager._revoke_pending_controller_api_access(37, lease)
+
+        assert not lease.pending_revoke_ids
+        assert cleanup.call_args_list == [call('token-0', 37)] * 2
+
+    @pytest.mark.asyncio
+    async def test_controller_api_access_renewal_retry_schedule(self):
+        manager = _make_controller_manager()
+        leadership_lost = managed_job_state.ControllerLeadershipLostError(
+            'stale attempt')
+
+        with patch('sky.jobs.controller.asyncio.sleep',
+                   new=AsyncMock()) as sleep, \
+                patch.object(
+                    manager,
+                    '_renew_controller_api_access_once',
+                    side_effect=[RuntimeError('database unavailable'), None,
+                                 leadership_lost]) as renew:
+            await manager._renew_controller_api_access_loop(37)
+
+        assert sleep.await_args_list == [
+            call(controller_lib.jobs_constants.
+                 MANAGED_JOB_CONTROLLER_TOKEN_RENEWAL_SECONDS),
+            call(controller_lib.jobs_constants.
+                 MANAGED_JOB_CONTROLLER_TOKEN_RETRY_SECONDS),
+            call(controller_lib.jobs_constants.
+                 MANAGED_JOB_CONTROLLER_TOKEN_RENEWAL_SECONDS),
+        ]
+        assert renew.call_args_list == [call(37)] * 3
 
     def test_cleanup_context_overrides_persisted_job_origin_last(self):
         manager = _make_controller_manager()

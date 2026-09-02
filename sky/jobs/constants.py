@@ -73,14 +73,19 @@ MANAGED_JOBS_VERSION = 22  # add submitted_after/submitted_before to job table
 # Keep this in sync with sky/jobs/api_access.py::create_job_api_token.
 MANAGED_JOB_TOKEN_NAME_PREFIX = 'managed-job-'
 
-# TTL for service-account tokens issued to managed jobs with
-# api_server_access. Kept short so any tokens that leak past the controller
-# cleanup are reaped quickly by the expired-token-cleanup daemon.
-# TODO(lloyd-brown): The controller does not renew this token while the job is
-# still running, so long-running jobs (e.g. multi-day training) can have their
-# api_server_access token expire mid-run. Add token renewal so the TTL only
-# bounds leaked-token lifetime, not in-use token lifetime.
+# TTL for service-account tokens issued to managed jobs. Kept short so any
+# tokens that leak past controller cleanup are reaped quickly by the
+# expired-token-cleanup daemon. Active guarded controllers renew their private
+# credential below this TTL; workload-facing api_server_access tokens retain
+# their existing lifecycle.
 MANAGED_JOB_TOKEN_TTL_DAYS = 3
+
+# Rotate a guarded controller's private API credential with two days of TTL
+# remaining. Keep one prior credential valid until the following successful
+# renewal so an already in-flight authenticated request is never cut off by
+# the rotation boundary.
+MANAGED_JOB_CONTROLLER_TOKEN_RENEWAL_SECONDS = 24 * 60 * 60
+MANAGED_JOB_CONTROLLER_TOKEN_RETRY_SECONDS = 5 * 60
 
 # Immutable runtime-owned ControllerManager owner and slot identity.  These
 # values use the server-only prefix so they cannot be supplied or overwritten
