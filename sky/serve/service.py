@@ -466,6 +466,17 @@ class _BoundLaunchTeardownSettlement:
     provider_reconciliation_failures: dict[tuple[int, str], str]
 
 
+def _replica_needs_exact_provider_cleanup_retry(info: Any) -> bool:
+    """Whether durable replica state requires another exact cleanup pass.
+
+    The projected-absence predicate is intentionally the closed union of the
+    immediate provider-present marker and its post-ABSENT projection.  Keep
+    that representation detail behind a teardown-specific name here.
+    """
+    return (ordinary_launch_binding.
+            replica_has_projected_provider_absence_cleanup_marker(info))
+
+
 def _retire_stale_paid_projected_absence_cluster_record(
         cluster_name: str) -> str | None:
     """Retire one hash-fenced INIT row after exact paid provider absence.
@@ -2335,11 +2346,29 @@ def _run_cleanup_and_finalize_locked(
             logger.warning(f'Lost ownership before publishing '
                            f'FAILED_CLEANUP for {service_name!r}.')
             return
-        if provider_reconciliation_failures:
+        retryable_exact_provider_cleanup = bool(
+            provider_reconciliation_failures)
+        if not retryable_exact_provider_cleanup:
+            try:
+                remaining_replica_infos = serve_state.get_replica_infos(
+                    service_name)
+            except Exception as e:  # pylint: disable=broad-except
+                # A failed authoritative read is not proof that exact provider
+                # cleanup finished. Preserve recovery so a later owner can
+                # classify the durable rows instead of orphaning them.
+                logger.warning(
+                    'Could not classify remaining exact provider cleanup for '
+                    f'{service_name!r}; retaining its HA recovery script: '
+                    f'{common_utils.format_exception(e)}')
+                retryable_exact_provider_cleanup = True
+            else:
+                retryable_exact_provider_cleanup = any(
+                    _replica_needs_exact_provider_cleanup_retry(info)
+                    for info in remaining_replica_infos)
+        if retryable_exact_provider_cleanup:
             logger.warning(
                 f'Retaining the HA recovery script for {service_name!r}; '
-                f'{len(provider_reconciliation_failures)} exact provider '
-                'reconciliation row(s) remain unresolved.')
+                'exact provider cleanup remains retryable.')
         else:
             try:
                 serve_state.remove_ha_recovery_script_if_owner(
