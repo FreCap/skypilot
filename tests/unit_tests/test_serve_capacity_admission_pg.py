@@ -3765,6 +3765,174 @@ def test_paid_maximum_atomic_wave_survives_lost_ack_and_is_claimable(
     assert claimed.execution_generation == graph[0]['launch_generation']
 
 
+def _bounded_paid_wave_call_kwargs(engine, member_count):
+    return {
+        **_current_owner_kwargs(engine),
+        'service_name': 'svc',
+        'service_hash': 'svc-hash',
+        'service_lifecycle_epoch': 3,
+        'service_version': 1,
+        'accounting_cards': {
+            'l4': 1
+        },
+        'backend_num_nodes': 1,
+        'sequenced_reserved_fill': False,
+        'planner': lambda snapshot, supply: _current_decision(
+            snapshot, supply, member_count),
+    }
+
+
+def _single_pool_paid_wave(engine, incarnation, monkeypatch, *, member_count,
+                           first_replica_id):
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           max_replicas=member_count)
+    ranks = _install_paid_wave_catalog(engine, pool_count=1)
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: member_count)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 480)
+    monkeypatch.setattr(paid_capacity, 'service_limit', lambda: member_count)
+    monkeypatch.setattr(paid_capacity, 'max_service_limit',
+                        lambda **_: member_count)
+    return _paid_wave_specs(engine,
+                            ranks,
+                            members_per_pool=member_count,
+                            first_replica_id=first_replica_id)
+
+
+def test_committed_fused_wave_is_adoptable_and_unretirable_from_durable_state(
+        capacity_database, monkeypatch):
+    """No process-local fence is needed between commit and publication.
+
+    PR #1857 removed the controller-local materialization handoff that kept
+    the unowned-row scanner away from freshly committed paid rows.  The fused
+    writer must therefore leave every member in a shape the scanner can only
+    adopt: an association already pointed at by the replica row, so the
+    pre-admission retirement path reports ASSOCIATED rather than deleting the
+    intent, and the durable reduction classifies the request as adoptable.
+    """
+    engine, incarnation, _ = capacity_database
+    member_count = 3
+    specs = _single_pool_paid_wave(engine,
+                                   incarnation,
+                                   monkeypatch,
+                                   member_count=member_count,
+                                   first_replica_id=2300)
+    provider_io = mock.Mock(
+        side_effect=AssertionError('admission must not submit provider work'))
+    monkeypatch.setattr(sdk, 'submit_prepared_non_pool_launch_request',
+                        provider_io)
+    monkeypatch.setattr(pathlib.Path, 'touch', mock.Mock())
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(**_bounded_paid_wave_call_kwargs(
+            engine, member_count),
+                                       prepared_paid_launch_specs=specs)
+    assert len(committed.paid_launch_bindings) == member_count
+
+    with engine.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).mappings().one()
+    owner = _current_owner_kwargs(engine)
+    authority = ordinary_launch_binding._authority_from_service(  # pylint: disable=protected-access
+        service,
+        controller_pid=service['controller_pid'],
+        controller_ip=service['controller_ip'],
+        controller_incarnation=owner['expected_controller_incarnation'],
+        controller_owner_epoch=owner['expected_controller_owner_epoch'],
+        capable=service['ordinary_launch_binding_capable'] is True)
+    assert authority.retained_non_pool_settlement_allowed
+
+    for binding in committed.paid_launch_bindings:
+        reduction = request_postgres.inspect_bound_ordinary_launch(
+            'svc', binding.replica_id, binding.replica_record_id)
+        assert reduction is not None
+        assert reduction.disposition is (
+            request_postgres.OrdinaryLaunchReductionDisposition.ADOPT_ACTIVE)
+        assert replica_managers._bound_projection_classification(  # pylint: disable=protected-access
+            reduction) == 'ADOPT_ACTIVE'
+        assert reduction.context.request_id == binding.request_id
+        assert str(reduction.context.association_id) == binding.association_id
+        assert reduction.context.launch_generation == binding.launch_generation
+        # The scanner's only destructive branch is unreachable: the replica
+        # pointer and association committed with the request.
+        retirement = (
+            ordinary_launch_binding.retire_pre_admission_non_pool_launch_intent(
+                authority, binding.replica_id, binding.replica_record_id))
+        assert retirement.disposition is (
+            ordinary_launch_binding.PreAdmissionRetirementDisposition.ASSOCIATED
+        )
+    assert _fused_paid_graph_counts(engine) == (1, 1, member_count,
+                                                member_count, member_count,
+                                                member_count, member_count,
+                                                member_count, member_count)
+    provider_io.assert_not_called()
+
+
+def test_paid_correctness_transaction_takes_no_second_database_checkout(
+        capacity_database, monkeypatch):
+    """The fused wave binds on its own connection and never re-enters a pool.
+
+    The production request-control pool is bounded to one connection with no
+    overflow, so any second checkout while the correctness transaction holds
+    the service locks would serialize behind itself and time out.  Count pool
+    checkouts on both engines while the transaction is open and forbid engine
+    initialization inside it.
+    """
+    engine, incarnation, _ = capacity_database
+    specs = _single_pool_paid_wave(engine,
+                                   incarnation,
+                                   monkeypatch,
+                                   member_count=2,
+                                   first_replica_id=2400)
+    request_engine = request_postgres.initialize_and_get_db()
+    engines = {id(engine): engine, id(request_engine): request_engine}
+    correctness_open = False
+    checkouts_under_lock = []
+
+    def _count_checkout(*_args, **_kwargs):
+        if correctness_open:
+            checkouts_under_lock.append(1)
+
+    real_transaction = capacity_admission._capacity_admission_transaction
+    real_initialize = request_postgres.initialize_and_get_db
+
+    @contextlib.contextmanager
+    def _guarded_transaction(*args, **kwargs):
+        nonlocal correctness_open
+        with real_transaction(*args, **kwargs) as transaction:
+            correctness_open = True
+            try:
+                yield transaction
+            finally:
+                correctness_open = False
+
+    def _guarded_initialize(*args, **kwargs):
+        assert not correctness_open, (
+            'request engine initialization under correctness locks')
+        return real_initialize(*args, **kwargs)
+
+    monkeypatch.setattr(capacity_admission, '_capacity_admission_transaction',
+                        _guarded_transaction)
+    monkeypatch.setattr(request_postgres, 'initialize_and_get_db',
+                        _guarded_initialize)
+    monkeypatch.setattr(pathlib.Path, 'touch', mock.Mock())
+    for candidate in engines.values():
+        sqlalchemy.event.listen(candidate, 'checkout', _count_checkout)
+    try:
+        committed = capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_bounded_paid_wave_call_kwargs(
+                engine, 2),
+                                           prepared_paid_launch_specs=specs)
+    finally:
+        for candidate in engines.values():
+            sqlalchemy.event.remove(candidate, 'checkout', _count_checkout)
+    assert len(committed.paid_launch_bindings) == 2
+    assert checkouts_under_lock == []
+    assert _fused_paid_graph_counts(engine) == (1, 1, 2, 2, 2, 2, 2, 2, 2)
+
+
 def test_paid_420_target_converges_across_fresh_bounded_atomic_waves(
         capacity_database, monkeypatch):
     """A stale successor stops, then fresh 100/100/100/100/20 reach 420."""
