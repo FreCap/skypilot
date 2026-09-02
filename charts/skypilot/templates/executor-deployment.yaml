@@ -25,6 +25,11 @@
 {{- end -}}
 {{- $executorTerminationGracePeriodSeconds := dig "terminationGracePeriodSeconds" 60 $executorService -}}
 {{- $executorResources := dig "resources" .Values.apiService.resources $executorService -}}
+{{- $executorResourceLimits := get $executorResources "limits" | default (dict) -}}
+{{- $executorMemoryBudgetResource := "requests.memory" -}}
+{{- if not (empty (get $executorResourceLimits "memory")) -}}
+{{- $executorMemoryBudgetResource = "limits.memory" -}}
+{{- end -}}
 {{- $executorExtraEnvs := get $executorService "extraEnvs" -}}
 {{- $executorExtraVolumes := get $executorService "extraVolumes" -}}
 {{- $executorExtraVolumeMounts := get $executorService "extraVolumeMounts" -}}
@@ -305,7 +310,7 @@ spec:
           valueFrom:
             resourceFieldRef:
               containerName: skypilot-executor
-              resource: requests.memory
+              resource: {{ $executorMemoryBudgetResource }}
         {{- if .Values.gcpCredentials.enabled }}
         - name: GOOGLE_APPLICATION_CREDENTIALS
           value: /root/gcp-cred.json

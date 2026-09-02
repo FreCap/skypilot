@@ -2,6 +2,7 @@
 # pylint: disable=missing-class-docstring,protected-access
 
 import asyncio
+import copy
 import dataclasses
 import datetime
 import hashlib
@@ -234,7 +235,7 @@ def _database_state(**overrides):
             incarnation='12345678-1234-5678-9234-567812345678'),
         'paid_debit_units': 0,
         'claimed_units': 0,
-        'claim_priorities': (),
+        'claim_priority_units': (),
         'waiter_count': 0,
         'demand_units': 0,
         'gcp_provider_identities': tuple(
@@ -359,9 +360,10 @@ def _request_telemetry(*,
                        queue_depth=0,
                        in_flight=0,
                        processing=0,
-                       state_counts=None):
+                       state_counts=None,
+                       observed_at=1000.0):
     summary = {
-        'request_telemetry_observed_at': 1000.0,
+        'request_telemetry_observed_at': observed_at,
         'request_telemetry_state': 'fresh',
         'request_telemetry_reason': 'complete',
         'request_telemetry_compatibility_complete': True,
@@ -508,6 +510,8 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
         assert queue['max_size'] == projection['request_queue_max_size']
         assert queue['max_concurrency'] == (
             projection['request_queue_max_concurrency'])
+        assert queue['timeout_seconds'] == (
+            projection['request_queue_timeout_seconds'])
         assert resources['use_spot'] is True
         assert resources['accelerators'] == 'L4:1'
         assert resources['any_of'] == [
@@ -575,6 +579,22 @@ def test_scale_profile_exceeds_physical_gate_for_rendered_shape():
     assert profile.scale_up_min_replicas == profile.max_units
 
 
+def test_positive_telemetry_deadline_uses_frozen_queue_timeout_margin():
+    profile = qualifier.PROFILES['scale']
+    small = qualifier.PROFILES['small']
+
+    assert profile.request_queue_timeout_seconds == 600
+    assert qualifier.positive_telemetry_deadline_monotonic(
+        profile, scale_started_monotonic=100.0) == 690.0
+
+    with pytest.raises(ValueError, match='polling margin'):
+        qualifier.positive_telemetry_window_seconds(
+            dataclasses.replace(profile, request_queue_timeout_seconds=10))
+    assert qualifier.positive_telemetry_window_seconds(small) == 120
+    assert qualifier.positive_telemetry_deadline_monotonic(
+        small, scale_started_monotonic=100.0) == 220.0
+
+
 def test_scale_queue_only_admits_one_stimulus_plus_one_tail_batch():
     profile = qualifier.PROFILES['scale']
     projection = qualifier._profile_projection(profile)
@@ -587,6 +607,7 @@ def test_scale_queue_only_admits_one_stimulus_plus_one_tail_batch():
     assert projection['request_queue_min_size'] == 800
     assert projection['request_queue_max_size'] == 1_200
     assert projection['request_queue_max_concurrency'] == 128
+    assert projection['request_queue_timeout_seconds'] == 600
     assert instance._request_queue_submission_limit() == 1_328
     assert instance._request_queue_submission_limit() < profile.exact_requests
 
@@ -1276,6 +1297,275 @@ def test_aws_provider_reduction_counts_logical_width_and_allows_retry_history():
             service_volumes=(_aws_volume(cluster_name=cluster),
                              _aws_volume(cluster_name=cluster,
                                          volume_id='vol-old')))
+
+
+def test_aws_empty_root_attachment_retries_then_reduces_and_records(
+        monkeypatch, tmp_path):
+    """A bound EC2 instance may precede its root-EBS attachment snapshot."""
+    profile = qualifier.PROFILES['small']
+    identity = _aws_identity()
+    cluster = identity.cluster_name_on_cloud
+    tags = [{
+        'Key': qualifier.provision_constants.TAG_RAY_CLUSTER_NAME,
+        'Value': cluster,
+    }, {
+        'Key': qualifier.provision_constants.TAG_SKYPILOT_CLUSTER_NAME,
+        'Value': cluster,
+    }, {
+        'Key': qualifier.provision_constants.TAG_SKYPILOT_MANAGED,
+        'Value': qualifier.provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+    }]
+    raw_pending = {
+        'BlockDeviceMappings': [],
+        'ClientToken': identity.client_token,
+        'InstanceId': 'i-new',
+        'InstanceLifecycle': 'spot',
+        'InstanceType': identity.instance_type,
+        'Placement': {
+            'AvailabilityZone': identity.zone,
+        },
+        'State': {
+            'Name': 'pending',
+        },
+        'Tags': tags,
+    }
+    raw_attached = {
+        **raw_pending,
+        'BlockDeviceMappings': [{
+            'Ebs': {
+                'DeleteOnTermination': True,
+                'VolumeId': 'vol-new',
+            },
+        }],
+    }
+    raw_volume = {
+        'VolumeId': 'vol-new',
+        'State': 'in-use',
+        'Tags': tags,
+    }
+    instance_reads = 0
+
+    class Paginator:
+        """Expose an attachment only in the second complete census."""
+
+        def __init__(self, name):
+            self._name = name
+
+        def paginate(self, *, Filters):  # pylint: disable=invalid-name
+            del Filters
+            nonlocal instance_reads
+            if self._name == 'describe_instances':
+                instance_reads += 1
+                instance = (raw_pending
+                            if instance_reads <= 2 else raw_attached)
+                return ({'Reservations': [{'Instances': [instance]}]},)
+            return ({'Volumes': ([] if instance_reads <= 2 else [raw_volume])},)
+
+    class Ec2:
+
+        @staticmethod
+        def get_paginator(name):
+            return Paginator(name)
+
+        @staticmethod
+        def describe_instance_types(*, InstanceTypes):
+            assert InstanceTypes == [identity.instance_type]
+            return {
+                'InstanceTypes': [{
+                    'InstanceType': identity.instance_type,
+                    'GpuInfo': {
+                        'Gpus': [{
+                            'Name': 'L4',
+                            'Manufacturer': 'NVIDIA',
+                            'Count': identity.gpu_units_per_instance,
+                        }],
+                    },
+                }],
+            }
+
+    class Sts:
+
+        @staticmethod
+        def get_caller_identity():
+            return {'Account': identity.aws_account_id}
+
+    class Session:
+
+        @staticmethod
+        def client(name, *, region_name):
+            assert region_name == identity.region
+            return Sts() if name == 'sts' else Ec2()
+
+    monkeypatch.setattr(qualifier.aws_adaptor, 'session',
+                        lambda profile: Session())
+    aws = qualifier.AwsObserver(profile=profile,
+                                service_name='paid-e2e',
+                                scope=_provider_scope())
+    first_census = aws.census()
+    assert first_census.service_instances[0]['volume_ids'] == ()
+    with pytest.raises(qualifier.QualificationError,
+                       match='AWS instance EBS attachment is not yet visible'):
+        aws.reduce(first_census, (identity,))
+    second_census = aws.census()
+    settled_aws = aws.reduce(second_census, (identity,))
+    assert second_census.service_instances[0]['volume_ids'] == ('vol-new',)
+    assert settled_aws.instance_count == 1
+    assert settled_aws.disk_count == 1
+
+    database = _database_state(aws_provider_identities=(identity,))
+    settled = _observation(observed_at=time.time(),
+                           database=database,
+                           provider=qualifier.combine_provider_states(
+                               qualifier.empty_provider_state('gcp'),
+                               settled_aws))
+    outcomes = iter((
+        qualifier.QualificationError(
+            'AWS instance EBS attachment is not yet visible.'),
+        settled,
+    ))
+
+    class Observer:
+        """Narrow provider-observation interface with one transient miss."""
+
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
+            result = next(outcomes)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                service_name='paid-e2e',
+                                profile=profile)
+    observer = Observer()
+    progress = qualifier.Progress()
+    first = asyncio.run(
+        qualifier._validated_sample(observer=observer,
+                                    profile=profile,
+                                    progress=progress,
+                                    receipt=receipt,
+                                    phase='scale'))
+    second = asyncio.run(
+        qualifier._validated_sample(observer=observer,
+                                    profile=profile,
+                                    progress=progress,
+                                    receipt=receipt,
+                                    phase='scale'))
+
+    assert first is None
+    assert second is not None
+    assert second.provider.cloud('aws').instance_count == 1
+    assert second.provider.cloud('aws').disk_count == 1
+    assert [
+        sample.get('observation_error_type')
+        for sample in receipt._payload['samples']
+    ] == ['QualificationError', None]
+
+
+@pytest.mark.parametrize(('field', 'replacement'), [
+    ('availability_zone', 'us-east-2b'),
+    ('client_token', 'wrong-token'),
+    ('cluster_name_on_cloud', 'wrong-cluster'),
+    ('instance_id', ''),
+    ('instance_type', 'g6.12xlarge'),
+    ('market', 'on_demand'),
+    ('provider_gpu_units', 4),
+    ('region', 'us-west-2'),
+    ('state', 'unknown'),
+    ('volume_ids', []),
+    ('volume_ids', ('',)),
+])
+def test_aws_invalid_binding_remains_fatal_before_empty_ebs_retry(
+        field, replacement):
+    instance = {
+        **_aws_instance(state='pending'),
+        'volume_ids': (),
+        field: replacement,
+    }
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='escaped its retained launch binding'):
+        qualifier.parse_aws_state(identities=(_aws_identity(),),
+                                  profile=qualifier.PROFILES['small'],
+                                  service_instances=(instance,),
+                                  service_volumes=())
+
+
+@pytest.mark.parametrize(('field', 'replacement'), [
+    ('market', 'on_demand'),
+    ('client_token', 'wrong-token'),
+    ('instance_type', 'g6.12xlarge'),
+    ('provider_gpu_units', 4),
+])
+def test_aws_empty_ebs_does_not_mask_later_invalid_instance(field, replacement):
+    first = {
+        **_aws_instance(state='pending'),
+        'volume_ids': (),
+    }
+    invalid = {
+        **_aws_instance(instance_id='i-later'),
+        field: replacement,
+    }
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='escaped its retained launch binding'):
+        qualifier.parse_aws_state(identities=(_aws_identity(),),
+                                  profile=qualifier.PROFILES['small'],
+                                  service_instances=(first, invalid),
+                                  service_volumes=(_aws_volume(),))
+
+
+def test_aws_empty_ebs_does_not_mask_later_unbound_volume():
+    pending = {
+        **_aws_instance(state='pending'),
+        'volume_ids': (),
+    }
+    unbound = _aws_volume(cluster_name='unbound-cluster')
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='EBS effect has no retained launch binding'):
+        qualifier.parse_aws_state(identities=(_aws_identity(),),
+                                  profile=qualifier.PROFILES['small'],
+                                  service_instances=(pending,),
+                                  service_volumes=(unbound,))
+
+
+def test_aws_empty_ebs_does_not_mask_later_duplicate_instance():
+    pending = {
+        **_aws_instance(state='pending'),
+        'volume_ids': (),
+    }
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='escaped its retained launch binding'):
+        qualifier.parse_aws_state(identities=(_aws_identity(),),
+                                  profile=qualifier.PROFILES['small'],
+                                  service_instances=(pending, dict(pending)),
+                                  service_volumes=())
+
+
+def test_aws_empty_ebs_does_not_mask_later_gpu_cap_violation():
+    first_identity = _aws_identity()
+    second_identity = _aws_identity(client_token='token-second',
+                                    cluster_name='paid-e2e-2-tenant')
+    pending = {
+        **_aws_instance(state='pending'),
+        'volume_ids': (),
+    }
+    second = _aws_instance(client_token=second_identity.client_token,
+                           cluster_name=second_identity.cluster_name_on_cloud,
+                           instance_id='i-second',
+                           volume_id='vol-second')
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='GPU units exceeded the armed cap'):
+        qualifier.parse_aws_state(
+            identities=(first_identity, second_identity),
+            profile=qualifier.PROFILES['provider-canary'],
+            service_instances=(pending, second),
+            service_volumes=(_aws_volume(
+                cluster_name=second_identity.cluster_name_on_cloud,
+                volume_id='vol-second'),))
 
 
 @pytest.mark.parametrize(('field', 'replacement'), [
@@ -2238,13 +2528,31 @@ def test_paid_claim_requires_exact_offered_priority_and_plan():
     }
     census = qualifier.paid_claim_census([claim, dict(claim)])
     assert census.gpu_units == 2
-    assert census.priorities == (50, 50)
+    assert census.priority_units == (qualifier.PaidClaimPriorityUnits(
+        priority=50, gpu_units=2),)
 
     for invalid_priority in (49, 51, True, None):
         with pytest.raises(qualifier.GuardViolation, match='not priority 50'):
             qualifier.paid_claim_census([{
                 **claim, 'priority': invalid_priority
             }])
+
+
+def test_paid_claim_census_aggregates_multi_gpu_claim_units_by_priority():
+    claims = [{
+        'priority': 50,
+        'capacity_plan_generation': 9,
+        'capacity_plan_sha256': 'a' * 64,
+        'persisted_plan_sha256': 'a' * 64,
+        'capacity_plan_accelerator': 'L4',
+        'capacity_plan_units': width,
+    } for width in (4, 8)]
+
+    census = qualifier.paid_claim_census(claims)
+
+    assert census.gpu_units == 12
+    assert census.priority_units == (qualifier.PaidClaimPriorityUnits(
+        priority=50, gpu_units=12),)
 
 
 def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
@@ -2257,13 +2565,16 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
     }
     controller = qualifier.controller_identity_from_authority(authority)
     observation = _observation(database=_database_state(
-        controller=controller, claimed_units=1, claim_priorities=(50,)))
+        controller=controller,
+        claimed_units=1,
+        claim_priority_units=(
+            qualifier.PaidClaimPriorityUnits(priority=50, gpu_units=1),)))
     receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
                                 service_name='paid-e2e',
                                 profile=qualifier.PROFILES['small'])
     receipt.sample('scale', observation)
 
-    assert receipt._payload['schema_version'] == 8
+    assert receipt._payload['schema_version'] == 9
     assert receipt._payload['request_priority'] == 50
     sample = receipt._payload['samples'][0]
     assert sample['phase'] == 'scale'
@@ -2273,7 +2584,10 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
     assert sample['controller_pid'] == 321
     assert sample['controller_owner_epoch'] == 12
     assert sample['claimed_units'] == 1
-    assert sample['paid_claim_priorities'] == [50]
+    assert sample['paid_claim_priority_units'] == [{
+        'priority': 50,
+        'gpu_units': 1,
+    }]
     assert sample['provider_instances'] == 0
     assert sample['provider_gpu_units'] == 0
     assert sample['provider_running_gpu_units'] == 0
@@ -2743,7 +3057,8 @@ def test_exact_provider_free_unbound_paid_debit_remains_visible_during_scale(
     phase_a = _observation(database=_database_state(
         paid_debit_units=1,
         claimed_units=1,
-        claim_priorities=(50,),
+        claim_priority_units=(qualifier.PaidClaimPriorityUnits(priority=50,
+                                                               gpu_units=1),),
         demand_units=4,
         provider_free_unbound_replica_ids=(7,)),
                            load_balancer=_load_balancer_state(demand_units=4))
@@ -2780,11 +3095,13 @@ def test_exact_provider_free_unbound_paid_debit_remains_visible_during_scale(
 
 def test_phase_a_observation_cannot_hide_a_provider_effect(tmp_path):
     phase_a_with_effect = _observation(
-        database=_database_state(paid_debit_units=1,
-                                 claimed_units=1,
-                                 claim_priorities=(50,),
-                                 demand_units=4,
-                                 provider_free_unbound_replica_ids=(7,)),
+        database=_database_state(
+            paid_debit_units=1,
+            claimed_units=1,
+            claim_priority_units=(qualifier.PaidClaimPriorityUnits(
+                priority=50, gpu_units=1),),
+            demand_units=4,
+            provider_free_unbound_replica_ids=(7,)),
         provider=_provider_state(instance_count=1,
                                  cluster_names=frozenset({'paid-e2e-7'})),
         load_balancer=_load_balancer_state(demand_units=4))
@@ -3119,10 +3436,9 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
 
         @staticmethod
         async def request_telemetry():
-            return _request_telemetry(queue_depth=32,
-                                      in_flight=32,
-                                      processing=16,
-                                      state_counts={'ACCEPTED': 32})
+            # Before a replica is READY, all exact stimulus identities are
+            # attributable but queued and therefore have no ledger row.
+            return _request_telemetry(queue_depth=64)
 
         async def snapshot(self, *, require_complete_demand_report=True):
             assert not require_complete_demand_report
@@ -3159,6 +3475,406 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
     assert samples[2]['provider_free_unbound_replicas'] == 0
     assert [sample.get('observation_error_type') for sample in samples
            ] == [None, 'QualificationError', None]
+
+
+def test_scale_and_positive_gates_accept_fully_dispatched_cohort_concurrently(
+        tmp_path):
+    """Positive telemetry must not wait for the physical provider gate."""
+    profile = dataclasses.replace(qualifier.PROFILES['scale'], poll_seconds=0)
+    gcp_names = _provider_cluster_names('gcp', 50)
+    aws_names = _provider_cluster_names('aws', 50)
+    database = _database_state(
+        paid_debit_units=100,
+        demand_units=800,
+        bound_cluster_zones=tuple(
+            (name, 'us-central1-a') for name in gcp_names),
+        aws_provider_identities=tuple(
+            _aws_identity(client_token=f'token-aws-{index}', cluster_name=name)
+            for index, name in enumerate(aws_names)))
+    started_monotonic = time.monotonic()
+    started_at = time.time()
+    gate = qualifier.ExactRequestCompletionGate()
+
+    class Observer:
+        """Dispatch the whole cohort while provider scale is still at 99."""
+
+        def __init__(self):
+            self.provider_reads = 0
+
+        @staticmethod
+        async def request_telemetry():
+            return _request_telemetry(queue_depth=0,
+                                      in_flight=800,
+                                      processing=100,
+                                      state_counts={'ACCEPTED': 800})
+
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
+            self.provider_reads += 1
+            running = 99 if self.provider_reads == 1 else 100
+            gcp_running = running - 50
+            observation = _observation(
+                observed_at=started_at + self.provider_reads,
+                observed_monotonic=started_monotonic + self.provider_reads,
+                database=database,
+                provider=_cross_cloud_provider_state(
+                    gcp_running_count=gcp_running, aws_running_count=50),
+                load_balancer=_load_balancer_state(
+                    demand_units=800,
+                    unique_job_arrivals_60s=800,
+                    unique_job_arrivals_300s=800))
+            if running == 99:
+                await asyncio.sleep(0)
+                assert not gate.released
+            return observation
+
+    async def exercise():
+        observer = Observer()
+        progress = qualifier.Progress(scale_started_monotonic=started_monotonic,
+                                      scale_started_at=started_at)
+        receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                    service_name='paid-e2e',
+                                    profile=profile)
+        receipt.request_telemetry('scale-stimulus',
+                                  _request_telemetry(queue_depth=800))
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            await qualifier._wait_for_scale_and_positive_request_telemetry(
+                observer=observer,
+                profile=profile,
+                progress=progress,
+                receipt=receipt,
+                traffic=traffic,
+                completion_gate=gate,
+                baseline=_request_telemetry(),
+                expectation=qualifier.provider_expectation(profile, None),
+                positive_deadline_monotonic=started_monotonic + 590)
+            return observer, progress, receipt
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+
+    observer, progress, receipt = asyncio.run(exercise())
+    assert observer.provider_reads == 2
+    assert progress.scale_reached_monotonic == started_monotonic + 2
+    assert gate.released
+    phases = [
+        sample['phase']
+        for sample in receipt._payload['request_telemetry_samples']
+    ]
+    assert phases == ['scale-stimulus', 'scale', 'positive', 'scale']
+    positive = next(
+        sample for sample in receipt._payload['request_telemetry_samples']
+        if sample['phase'] == 'positive')
+    assert positive['queue_depth'] == 0
+    assert positive['in_flight_requests'] == 800
+    assert positive['processing_requests'] == 100
+
+
+def test_generated_concurrent_receipt_passes_aggregate_gate(tmp_path):
+    """Exercise the production proof join before validating its receipt."""
+    canonical_profile = qualifier.PROFILES['scale']
+    profile = dataclasses.replace(canonical_profile, poll_seconds=0)
+    service_name = 'generated-economic'
+    source_sha256 = 'e' * 64
+    scope = _provider_scope(service_hash=f'{service_name}-hash',
+                            lifecycle_epoch=1,
+                            service_version=1,
+                            max_live_paid_gpu_units=canonical_profile.max_units,
+                            qualification_profile=canonical_profile.name,
+                            qualification_source_sha256=source_sha256,
+                            qualification_projection_sha256=(
+                                qualifier._qualification_projection_sha256(
+                                    source_sha256=source_sha256,
+                                    profile=canonical_profile,
+                                    providers=('aws', 'gcp'))))
+    gcp_names = _provider_cluster_names('gcp', 50)
+    aws_names = _provider_cluster_names('aws', 50)
+    claims = [{
+        'priority': qualifier._REQUEST_PRIORITY,
+        'capacity_plan_generation': 9,
+        'capacity_plan_sha256': 'f' * 64,
+        'persisted_plan_sha256': 'f' * 64,
+        'capacity_plan_accelerator': 'L4',
+        'capacity_plan_units': width,
+    } for width in (4, 8)]
+    claim_census = qualifier.paid_claim_census(claims)
+    paid_database = _database_state(
+        service_hash=scope.service_hash,
+        paid_debit_units=100,
+        claimed_units=claim_census.gpu_units,
+        claim_priority_units=claim_census.priority_units,
+        demand_units=canonical_profile.max_units,
+        bound_cluster_zones=tuple(
+            (name, 'us-central1-a') for name in gcp_names),
+        aws_provider_identities=tuple(
+            _aws_identity(client_token=f'token-aws-{index}', cluster_name=name)
+            for index, name in enumerate(aws_names)))
+    zero_database = _database_state(service_hash=scope.service_hash)
+    baseline = _request_telemetry(observed_at=0.75)
+    started_monotonic = time.monotonic()
+    gate = qualifier.ExactRequestCompletionGate()
+    receipt_path = tmp_path / 'generated-economic.json'
+    receipt = qualifier.Receipt(path=receipt_path,
+                                service_name=service_name,
+                                profile=profile,
+                                expectation=qualifier.provider_expectation(
+                                    profile, None),
+                                scope=scope)
+    progress = qualifier.Progress(baseline_qualified_iteration_id=3,
+                                  baseline_qualified_observed_at=3.0,
+                                  scale_started_monotonic=started_monotonic,
+                                  scale_started_at=4.0)
+
+    for iteration_id, observed_at in ((1, 1.0), (2, 2.0), (3, 3.0)):
+        paired = _request_telemetry(observed_at=observed_at - 0.25)
+        receipt.request_telemetry('baseline',
+                                  paired,
+                                  baseline_iteration_id=iteration_id,
+                                  baseline_pair_observed_at=observed_at)
+        receipt.sample('baseline',
+                       _observation(observed_at=observed_at,
+                                    database=zero_database,
+                                    load_balancer=_load_balancer_state(
+                                        service_hash=scope.service_hash)),
+                       baseline_iteration_id=iteration_id,
+                       baseline_pair_observed_at=observed_at)
+    receipt.request_telemetry(
+        'scale-stimulus',
+        _request_telemetry(queue_depth=canonical_profile.max_units,
+                           observed_at=5.0))
+
+    class Observer:
+        """Yield positive demand before the second physical scale sample."""
+
+        def __init__(self):
+            self.request_reads = 0
+            self.provider_reads = 0
+
+        async def request_telemetry(self):
+            self.request_reads += 1
+            return _request_telemetry(
+                queue_depth=0,
+                in_flight=canonical_profile.max_units,
+                processing=100,
+                state_counts={'ACCEPTED': canonical_profile.max_units},
+                observed_at=100.0 + 10.0 * self.request_reads)
+
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
+            self.provider_reads += 1
+            running = 99 if self.provider_reads == 1 else 100
+            if running == 99:
+                await asyncio.sleep(0)
+            provider = _cross_cloud_provider_state(gcp_running_count=running -
+                                                   50,
+                                                   aws_running_count=50)
+            provider = dataclasses.replace(
+                provider,
+                clouds=tuple(
+                    dataclasses.replace(
+                        cloud,
+                        shapes=(qualifier.ProviderShapeState(
+                            gpu_units_per_instance=1,
+                            instance_count=cloud.instance_count,
+                            instance_type=('g2-standard-4' if cloud.cloud ==
+                                           'gcp' else 'g6.xlarge'),
+                            running_count=cloud.running_count,
+                            running_gpu_units=cloud.running_gpu_units),))
+                    for cloud in provider.clouds))
+            return _observation(
+                observed_at=240.0 + 10.0 * self.provider_reads,
+                observed_monotonic=(started_monotonic + self.provider_reads),
+                database=paid_database,
+                provider=provider,
+                load_balancer=_load_balancer_state(
+                    service_hash=scope.service_hash,
+                    demand_units=canonical_profile.max_units,
+                    unique_job_arrivals_60s=canonical_profile.max_units,
+                    unique_job_arrivals_300s=canonical_profile.max_units))
+
+    async def generate_concurrent_proof():
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            await qualifier._wait_for_scale_and_positive_request_telemetry(
+                observer=Observer(),
+                profile=profile,
+                progress=progress,
+                receipt=receipt,
+                traffic=traffic,
+                completion_gate=gate,
+                baseline=baseline,
+                expectation=qualifier.provider_expectation(profile, None),
+                positive_deadline_monotonic=started_monotonic + 590)
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+
+    asyncio.run(generate_concurrent_proof())
+    assert gate.released
+    final = _request_telemetry(state_counts={'SUCCEEDED': 10_000},
+                               observed_at=500.0)
+    receipt.request_telemetry('final', final)
+    for observed_at in (1000.0, 1180.0, 1360.0):
+        receipt.sample(
+            'drain',
+            _observation(observed_at=observed_at,
+                         database=zero_database,
+                         load_balancer=_load_balancer_state(
+                             service_hash=scope.service_hash)))
+    receipt.finish(progress=progress,
+                   exact_request_successes=10_000,
+                   ledger_baseline=baseline,
+                   ledger_final=final)
+
+    cleanup_path = tmp_path / 'generated-economic-cleanup.json'
+    _write_aggregate_cleanup(cleanup_path,
+                             receipt_path,
+                             service_name=service_name,
+                             providers=['aws', 'gcp'])
+    output = tmp_path / 'generated-aggregate.json'
+    qualifier.aggregate_evidence(
+        type(
+            'Args', (), {
+                'economic_receipt': str(receipt_path),
+                'economic_cleanup_receipt': str(cleanup_path),
+                'canary_receipt': [],
+                'canary_cleanup_receipt': [],
+                'output': str(output),
+            })())
+
+    assert json.loads(output.read_text(encoding='utf-8'))['outcome'] == 'passed'
+
+
+def test_scale_and_positive_gate_failure_cancels_sibling_without_release():
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+    gate = qualifier.ExactRequestCompletionGate()
+
+    async def fail_scale():
+        await sibling_started.wait()
+        raise qualifier.QualificationError('physical gate failed')
+
+    async def wait_positive():
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_cancelled.set()
+
+    async def exercise():
+        with pytest.raises(qualifier.QualificationError,
+                           match='physical gate failed'):
+            await qualifier._join_independent_proofs(fail_scale(),
+                                                     wait_positive(), gate)
+        assert sibling_cancelled.is_set()
+        assert not gate.released
+
+    asyncio.run(exercise())
+
+
+def test_scale_wait_stops_at_absolute_physical_slo(tmp_path):
+    profile = dataclasses.replace(qualifier.PROFILES['scale'],
+                                  poll_seconds=1,
+                                  scale_slo_seconds=300,
+                                  scale_timeout_seconds=900)
+
+    class Observer:
+
+        def __init__(self):
+            self.telemetry_reads = 0
+
+        async def request_telemetry(self):
+            self.telemetry_reads += 1
+            raise AssertionError('polled after the physical scale SLO')
+
+    async def exercise():
+        observer = Observer()
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='Provider did not reach'):
+                await qualifier._wait_for_scale(
+                    observer=observer,
+                    profile=profile,
+                    progress=qualifier.Progress(
+                        scale_started_monotonic=time.monotonic() - 301),
+                    receipt=qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                              service_name='paid-e2e',
+                                              profile=profile),
+                    traffic=traffic,
+                    baseline=_request_telemetry())
+            assert observer.telemetry_reads == 0
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+def test_non_scale_wait_retains_relative_profile_timeout(tmp_path):
+    profile = dataclasses.replace(qualifier.PROFILES['small'],
+                                  scale_timeout_seconds=1)
+
+    async def exercise():
+
+        async def complete():
+            return 0
+
+        traffic = asyncio.create_task(complete())
+        assert await traffic == 0
+        with pytest.raises(qualifier.QualificationError,
+                           match='ended before scale convergence'):
+            await qualifier._wait_for_scale(
+                observer=object(),
+                profile=profile,
+                progress=qualifier.Progress(
+                    scale_started_monotonic=time.monotonic() - 301),
+                receipt=qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                          service_name='paid-e2e',
+                                          profile=profile),
+                traffic=traffic,
+                baseline=_request_telemetry())
+
+    asyncio.run(exercise())
+
+
+def test_aggregate_accepts_queued_only_physical_scale_before_positive(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    request_scale = next(
+        sample for sample in payload['request_telemetry_samples']
+        if sample['phase'] == 'scale')
+    request_scale.update(
+        _request_evidence_sample(phase='scale',
+                                 queue_depth=800,
+                                 in_flight=0,
+                                 processing=0,
+                                 observed_at=249.0,
+                                 scale_iteration_id=1))
+    positive = next(sample for sample in payload['request_telemetry_samples']
+                    if sample['phase'] == 'positive')
+    positive['observed_at'] = 251.0
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    qualifier.aggregate_evidence(args)
+
+
+@pytest.mark.parametrize('positive_observed_at', [4.5, 595.0])
+def test_aggregate_rejects_positive_outside_post_scale_queue_window(
+        tmp_path, positive_observed_at):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    positive = next(sample for sample in payload['request_telemetry_samples']
+                    if sample['phase'] == 'positive')
+    positive['observed_at'] = positive_observed_at
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='scale demand|scale-stimulus'):
+        qualifier.aggregate_evidence(args)
 
 
 def test_scale_rejects_unattributed_mixed_demand(tmp_path):
@@ -3737,7 +4453,8 @@ def test_request_telemetry_requires_exact_positive_and_terminal_delta(tmp_path):
                     profile=profile,
                     receipt=receipt,
                     traffic=held,
-                    baseline=baseline))
+                    baseline=baseline,
+                    deadline_monotonic=time.monotonic() + 1))
             observed_final = await qualifier._wait_for_final_request_telemetry(
                 observer=Observer([final]),
                 profile=profile,
@@ -3827,6 +4544,7 @@ def _zero_qualification_sample(observed_at,
             field: 0 for field in qualifier._ZERO_OBSERVATION_FIELDS
         },
         'provider_by_cloud': _qualification_provider_projection({}),
+        'paid_claim_priority_units': [],
         'lb_offered_arrival_tracking_saturated': False,
     }
     if phase == 'baseline':
@@ -3870,6 +4588,7 @@ def _write_aggregate_qualification(path,
         'provider_disks': sum(peaks.values()),
         'provider_inflight_operations': 0,
         'provider_by_cloud': provider_projection,
+        'paid_claim_priority_units': [],
         'postgres_demand_units': stimulus,
         'lb_demand_units': stimulus,
         'lb_unique_job_arrivals_60s': stimulus,
@@ -3877,7 +4596,7 @@ def _write_aggregate_qualification(path,
         'lb_offered_arrival_tracking_saturated': False,
     }
     payload = {
-        'schema_version': 8,
+        'schema_version': 9,
         'service_name': service_name,
         'service_hash': f'{service_name}-hash',
         'lifecycle_epoch': 1,
@@ -3895,6 +4614,7 @@ def _write_aggregate_qualification(path,
         'profile': profile.name,
         'expectation_kind': kind,
         'expected_providers': providers,
+        'request_priority': qualifier._REQUEST_PRIORITY,
         'max_units': profile.max_units,
         'minimum_running': 100 if economic else 1,
         'peak_running': sum(peaks.values()),
@@ -3939,23 +4659,25 @@ def _write_aggregate_qualification(path,
                                          queue_depth=stimulus,
                                          in_flight=0,
                                          processing=0,
-                                         observed_at=5.0),
+                                         observed_at=5.0)
+            ] if economic else []),
+            _request_evidence_sample(
+                phase='scale',
+                queue_depth=(stimulus if economic else queue_depth),
+                in_flight=(0 if economic else in_flight),
+                processing=(0 if economic else processing),
+                accepted=(0 if economic else active),
+                observed_at=(249.0 if economic else 129.0)) | {
+                    'scale_iteration_id': 1,
+                },
+            *([
                 _request_evidence_sample(phase='positive',
                                          queue_depth=queue_depth,
                                          in_flight=in_flight,
                                          processing=processing,
                                          accepted=active,
-                                         observed_at=8.0)
+                                         observed_at=251.0)
             ] if economic else []),
-            _request_evidence_sample(phase='scale',
-                                     queue_depth=queue_depth,
-                                     in_flight=in_flight,
-                                     processing=processing,
-                                     accepted=active,
-                                     observed_at=(249.0 if economic else 129.0))
-            | {
-                'scale_iteration_id': 1,
-            },
             _request_evidence_sample(phase='final',
                                      queue_depth=0,
                                      in_flight=0,
@@ -4091,6 +4813,310 @@ def test_aggregate_accepts_economic_aws_plus_absent_gcp_canary(tmp_path):
     assert payload['economic_exact_request_count'] == 10_000
 
 
+@pytest.mark.parametrize('positive_observed_at', [200.0, 251.0])
+def test_schema_nine_accepts_positive_before_or_after_physical_scale(
+        tmp_path, positive_observed_at):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    positive = next(sample for sample in payload['request_telemetry_samples']
+                    if sample['phase'] == 'positive')
+    positive['observed_at'] = positive_observed_at
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    evidence = qualifier._read_qualification_evidence(
+        receipt, qualifier.ExpectationKind.ECONOMIC)
+
+    assert evidence.scale_elapsed_seconds == 246.0
+
+
+def test_schema_nine_accepts_positive_after_queue_fully_dispatches(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    positive = next(sample for sample in payload['request_telemetry_samples']
+                    if sample['phase'] == 'positive')
+    positive.update(
+        _request_evidence_sample(phase='positive',
+                                 queue_depth=0,
+                                 in_flight=800,
+                                 processing=100,
+                                 accepted=800,
+                                 observed_at=200.0))
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    qualifier._read_qualification_evidence(receipt,
+                                           qualifier.ExpectationKind.ECONOMIC)
+
+
+@pytest.mark.parametrize(
+    ('positive_observed_at', 'final_observed_at'),
+    [(4.5, 500.0), (595.0, 700.0), (501.0, 500.0)],
+)
+def test_schema_nine_rejects_positive_outside_stimulus_queue_and_final_bounds(
+        tmp_path, positive_observed_at, final_observed_at):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    positive = next(sample for sample in payload['request_telemetry_samples']
+                    if sample['phase'] == 'positive')
+    final = next(sample for sample in payload['request_telemetry_samples']
+                 if sample['phase'] == 'final')
+    positive['observed_at'] = positive_observed_at
+    final['observed_at'] = final_observed_at
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='scale-stimulus|Terminal request evidence'):
+        qualifier._read_qualification_evidence(
+            receipt, qualifier.ExpectationKind.ECONOMIC)
+
+
+@pytest.mark.parametrize('iteration_ids', [(1, 3), (2, 1)])
+def test_request_scale_iteration_ids_are_contiguous_in_receipt_order(
+        tmp_path, iteration_ids):
+    args = _aggregate_args(tmp_path)
+    payload = json.loads(
+        pathlib.Path(args.economic_receipt).read_text(encoding='utf-8'))
+    samples = payload['request_telemetry_samples']
+    scale_index = next(index for index, sample in enumerate(samples)
+                       if sample['phase'] == 'scale')
+    original = samples[scale_index]
+    replacements = []
+    for offset, iteration_id in enumerate(iteration_ids):
+        sample = copy.deepcopy(original)
+        sample['scale_iteration_id'] = iteration_id
+        sample['observed_at'] = 240.0 + offset
+        replacements.append(sample)
+    samples[scale_index:scale_index + 1] = replacements
+
+    with pytest.raises(qualifier.QualificationError, match='contiguous'):
+        qualifier._validate_request_evidence(
+            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+
+
+def test_request_scale_timestamps_are_strictly_increasing(tmp_path):
+    args = _aggregate_args(tmp_path)
+    payload = json.loads(
+        pathlib.Path(args.economic_receipt).read_text(encoding='utf-8'))
+    samples = payload['request_telemetry_samples']
+    scale_index = next(index for index, sample in enumerate(samples)
+                       if sample['phase'] == 'scale')
+    second_scale = copy.deepcopy(samples[scale_index])
+    second_scale['scale_iteration_id'] = 2
+    second_scale['observed_at'] = samples[scale_index]['observed_at']
+    samples.insert(scale_index + 1, second_scale)
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='scale timestamps.*strictly increasing'):
+        qualifier._validate_request_evidence(
+            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+
+
+def test_request_evidence_requires_canonical_phase_order(tmp_path):
+    args = _aggregate_args(tmp_path)
+    payload = json.loads(
+        pathlib.Path(args.economic_receipt).read_text(encoding='utf-8'))
+    samples = payload['request_telemetry_samples']
+    scale = next(sample for sample in samples if sample['phase'] == 'scale')
+    samples.remove(scale)
+    samples.append(scale)
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='canonical request phase order'):
+        qualifier._validate_request_evidence(
+            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [('queue_depth', None), ('queue_depth', '800'),
+     ('in_flight_requests', None), ('in_flight_requests', [])],
+)
+def test_malformed_request_scale_fields_raise_qualification_error(
+        tmp_path, field, value):
+    args = _aggregate_args(tmp_path)
+    payload = json.loads(
+        pathlib.Path(args.economic_receipt).read_text(encoding='utf-8'))
+    scale = next(sample for sample in payload['request_telemetry_samples']
+                 if sample['phase'] == 'scale')
+    if value is None:
+        del scale[field]
+    else:
+        scale[field] = value
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='request telemetry|scale demand'):
+        qualifier._validate_request_evidence(
+            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+
+
+def test_provider_scale_must_precede_terminal_request_evidence(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    request_samples = payload['request_telemetry_samples']
+    first_request_scale = next(
+        sample for sample in request_samples if sample['phase'] == 'scale')
+    second_request_scale = copy.deepcopy(first_request_scale)
+    second_request_scale['scale_iteration_id'] = 2
+    second_request_scale['observed_at'] = 490.0
+    positive_index = next(index for index, sample in enumerate(request_samples)
+                          if sample['phase'] == 'positive')
+    request_samples.insert(positive_index, second_request_scale)
+    request_samples[positive_index + 1]['observed_at'] = 495.0
+
+    provider_samples = payload['samples']
+    first_provider_scale = next(
+        sample for sample in provider_samples if sample['phase'] == 'scale')
+    second_provider_scale = copy.deepcopy(first_provider_scale)
+    second_provider_scale['scale_iteration_id'] = 2
+    second_provider_scale['observed_at'] = 600.0
+    first_drain_index = next(
+        index for index, sample in enumerate(provider_samples)
+        if sample['phase'] == 'drain')
+    provider_samples.insert(first_drain_index, second_provider_scale)
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='provider scale evidence|lifecycle evidence'):
+        qualifier._read_qualification_evidence(
+            receipt, qualifier.ExpectationKind.ECONOMIC)
+
+
+def test_provider_samples_require_canonical_phase_order(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    samples = payload['samples']
+    final_baseline = samples.pop(2)
+    scale_index = next(index for index, sample in enumerate(samples)
+                       if sample['phase'] == 'scale')
+    samples.insert(scale_index + 1, final_baseline)
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='canonical provider phase order'):
+        qualifier._read_qualification_evidence(
+            receipt, qualifier.ExpectationKind.ECONOMIC)
+
+
+def test_provider_sample_timestamps_are_strictly_increasing(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    samples = payload['samples']
+    first_drain_index = next(index for index, sample in enumerate(samples)
+                             if sample['phase'] == 'drain')
+    samples[first_drain_index]['observed_at'] = samples[first_drain_index -
+                                                        1]['observed_at']
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='provider timestamps.*strictly increasing'):
+        qualifier._read_qualification_evidence(
+            receipt, qualifier.ExpectationKind.ECONOMIC)
+
+
+@pytest.mark.parametrize('request_priority', [49, 51, True, None, '50'])
+def test_qualification_receipt_binds_exact_request_priority(
+        tmp_path, request_priority):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    payload['request_priority'] = request_priority
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='request priority|malformed'):
+        qualifier._read_qualification_evidence(
+            receipt, qualifier.ExpectationKind.ECONOMIC)
+
+
+@pytest.mark.parametrize(
+    ('claimed_units', 'priority_units'),
+    [(1, [{
+        'priority': 49,
+        'gpu_units': 1
+    }]), (2, [{
+        'priority': 50,
+        'gpu_units': 1
+    }]), (1, [{
+        'priority': '50',
+        'gpu_units': 1
+    }]), (1, [{
+        'priority': True,
+        'gpu_units': 1
+    }]), (1, [{
+        'priority': 50,
+        'gpu_units': True
+    }]), (1, [{
+        'priority': 50,
+        'gpu_units': 0
+    }]),
+     (2, [{
+         'priority': 50,
+         'gpu_units': 1
+     }, {
+         'priority': 50,
+         'gpu_units': 1
+     }]),
+     (2, [{
+         'priority': 51,
+         'gpu_units': 1
+     }, {
+         'priority': 50,
+         'gpu_units': 1
+     }]), (1, [{
+         'priority': 50,
+         'gpu_units': 1,
+         'unexpected': 0
+     }]), (0, [{
+         'priority': 50,
+         'gpu_units': 1
+     }]), (801, [{
+         'priority': 50,
+         'gpu_units': 801
+     }]), (1, [{
+         'priority': 50
+     }]), (1, ['not-an-entry']), (0, None)],
+)
+def test_qualification_receipt_rejects_tampered_paid_claim_priority_units(
+        tmp_path, claimed_units, priority_units):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    scale = next(
+        sample for sample in payload['samples'] if sample['phase'] == 'scale')
+    scale['claimed_units'] = claimed_units
+    if priority_units is None:
+        del scale['paid_claim_priority_units']
+    else:
+        scale['paid_claim_priority_units'] = priority_units
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='paid claim priorit'):
+        qualifier._read_qualification_evidence(
+            receipt, qualifier.ExpectationKind.ECONOMIC)
+
+
+def test_qualification_receipt_rejects_legacy_paid_claim_priority_field(
+        tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    scale = next(
+        sample for sample in payload['samples'] if sample['phase'] == 'scale')
+    scale['paid_claim_priorities'] = []
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='paid claim priority-unit'):
+        qualifier._read_qualification_evidence(
+            receipt, qualifier.ExpectationKind.ECONOMIC)
+
+
 def test_aggregate_needs_no_canary_when_economic_run_proves_both(tmp_path):
     args = _aggregate_args(tmp_path,
                            with_canary=False,
@@ -4183,7 +5209,7 @@ def test_aggregate_rejects_unpaired_provider_scale_iteration(tmp_path):
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
     with pytest.raises(qualifier.QualificationError,
-                       match='paired exact demand'):
+                       match='canonical contiguous request pairing'):
         qualifier.aggregate_evidence(args)
 
 
@@ -4203,8 +5229,7 @@ def test_aggregate_rejects_provider_scale_before_paired_request_sample(
         qualifier.aggregate_evidence(args)
 
 
-def test_aggregate_rejects_provider_qualification_after_terminal_ledger(
-        tmp_path):
+def test_aggregate_rejects_terminal_before_post_scale_positive(tmp_path):
     args = _aggregate_args(tmp_path)
     receipt = pathlib.Path(args.economic_receipt)
     payload = json.loads(receipt.read_text(encoding='utf-8'))
@@ -4214,7 +5239,7 @@ def test_aggregate_rejects_provider_qualification_after_terminal_ledger(
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
     with pytest.raises(qualifier.QualificationError,
-                       match='provider scale evidence'):
+                       match='Terminal request evidence'):
         qualifier.aggregate_evidence(args)
 
 
@@ -4412,7 +5437,7 @@ def test_aggregate_rejects_replayed_natural_drain_sample(tmp_path):
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
     with pytest.raises(qualifier.QualificationError,
-                       match='sustained natural-drain evidence'):
+                       match='provider timestamps.*strictly increasing'):
         qualifier.aggregate_evidence(args)
 
 

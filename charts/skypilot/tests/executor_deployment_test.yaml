@@ -257,6 +257,36 @@ tests:
           path: spec.strategy.rollingUpdate.maxUnavailable
           value: 0
 
+  - it: should derive the executor memory budget from its memory limit
+    set:
+      apiService.highAvailability.enabled: true
+      executorService.resources.requests.memory: 8Gi
+      executorService.resources.limits.memory: 48Gi
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_POD_MEMORY_BYTES_LIMIT
+            valueFrom:
+              resourceFieldRef:
+                containerName: skypilot-executor
+                resource: limits.memory
+
+  - it: should fall back to the executor memory request without a limit
+    set:
+      apiService.highAvailability.enabled: true
+      executorService.resources.requests.memory: 8Gi
+      executorService.resources.limits.memory: null
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_POD_MEMORY_BYTES_LIMIT
+            valueFrom:
+              resourceFieldRef:
+                containerName: skypilot-executor
+                resource: requests.memory
+
   - it: should use in-place executor rollout defaults when retained values omit the map
     set:
       apiService.highAvailability.enabled: true
