@@ -3611,6 +3611,32 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(autoscaler._rejected_compatibility_work(),
                          [(50, ('A100',), 5.0)])
 
+    def test_rejected_profile_count_pair_guards(self):
+        for count, recent_count, kept in ((5, 6, False), (0, 0, False), (5, 0,
+                                                                         True)):
+            autoscaler = _make_autoscaler()
+            autoscaler.set_configured_accelerator_shapes({'A100': 1})
+            _report(autoscaler,
+                    in_flight={},
+                    rejected=count,
+                    recent_rejected=recent_count,
+                    rejected_profiles=[{
+                        'priority': 50,
+                        'compatible_accelerators': ['A100'],
+                        'count': count,
+                        'recent_count': recent_count,
+                    }],
+                    compatibility_complete=True)
+
+            profiles = autoscaler.rejected_compatibility_profiles
+            with self.subTest(count=count, recent_count=recent_count):
+                if kept:
+                    self.assertEqual(
+                        [(p['count'], p['recent_count']) for p in profiles],
+                        [(count, recent_count)])
+                else:
+                    self.assertEqual(profiles, [])
+
     def test_logical_exact_card_preserves_production_arrival_floor(self):
         autoscaler = _make_autoscaler(
             knob=1,
