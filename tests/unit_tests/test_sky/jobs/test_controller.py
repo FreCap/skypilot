@@ -4617,6 +4617,8 @@ class TestControllerApiAccessLifecycle:
         manager._cleanup = AsyncMock()
         manager._cleanup_api_server_access_token = MagicMock()
         manager._cleanup_controller_api_access = MagicMock()
+        # #1891 starts a renewal task next to the credential; keep it inert.
+        manager._renew_controller_api_access_loop = AsyncMock()
         order: list[str] = []
         ctx = MagicMock()
         ctx.override_envs.side_effect = (
@@ -4650,7 +4652,7 @@ class TestControllerApiAccessLifecycle:
         assert order == ['credential', 'controller']
         manager._cleanup_controller_api_access.assert_called_once_with(
             'token-id', 3)
-        assert not manager._controller_api_token_ids
+        assert not manager._controller_api_access_leases
 
     def test_install_failure_revokes_the_fresh_token(self):
         manager = _make_controller_manager()
@@ -4664,7 +4666,7 @@ class TestControllerApiAccessLifecycle:
                 manager._initialize_controller_api_access(37)
 
         delete.assert_called_once_with('token-id')
-        assert not manager._controller_api_token_ids
+        assert not manager._controller_api_access_leases
 
     @pytest.mark.asyncio
     async def test_cleanup_only_installs_the_credential_once_and_revokes_it(
@@ -4677,6 +4679,8 @@ class TestControllerApiAccessLifecycle:
             side_effect=[RuntimeError('provider unavailable'), None])
         manager._cleanup_api_server_access_token = MagicMock()
         manager._cleanup_controller_api_access = MagicMock()
+        # #1891 starts a renewal task next to the credential; keep it inert.
+        manager._renew_controller_api_access_loop = AsyncMock()
         ctx = MagicMock()
 
         with _issuing_controller_credential(ctx) as create, \
@@ -4693,7 +4697,7 @@ class TestControllerApiAccessLifecycle:
             {constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR: 'sky_job-token'})
         manager._cleanup_controller_api_access.assert_called_once_with(
             'token-id', 3)
-        assert not manager._controller_api_token_ids
+        assert not manager._controller_api_access_leases
 
     def test_leaked_controller_token_is_reaped_by_the_expiry_sweep(self):
         manager = ControllerManager('test-uuid', _TEST_CONTROLLER_SLOT_ID,
