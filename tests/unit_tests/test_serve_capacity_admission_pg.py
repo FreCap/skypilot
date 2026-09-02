@@ -5971,7 +5971,7 @@ def test_controller_suppresses_actuation_on_committed_candidate_drift(
         0,
         0,
         planning_fingerprint,
-        prepared_inputs, [],
+        prepared_inputs,
         sequenced_reserved_fill=False,
         prepared_paid_launch_specs=manager.prepare_paid_launch_specs())
 
