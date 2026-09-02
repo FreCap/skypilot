@@ -56,6 +56,10 @@ jobs:
             test-name: "Serve Reclaim Pressure"
             python-version: "3.14"
             runner: namespace-profile-skypilot-ci-4x16
+          - test-path: tests/integration_tests/test_lb_cold_queue_e2e.py
+            test-name: "Serve LB 10k Interface"
+            python-version: "3.14"
+            runner: namespace-profile-skypilot-ci-4x8
           - python-version: "3.14"
             test-path: >-
               tests/unit_tests/test_asyncio_utils.py
