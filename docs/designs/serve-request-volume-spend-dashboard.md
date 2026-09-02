@@ -75,8 +75,14 @@ classification guard covers every eligible return, exception, and cancellation,
 while the terminal rejection path classifies rejected outcomes first. The
 `classified` fence makes the final guard a no-op for those rejected exits.
 
-Pre-admission body limits and drain or role-fence exits are outside the
-classified subset. Internal replica retries stay inside one eligible request and
+Pre-admission body limits and the drain or role-fence exits that precede
+eligibility are outside the classified subset. The retry loop re-checks the
+drain and role fences on every attempt; a request that trips one of those
+per-attempt fences is already eligible and already counted as an attempt, so it
+is classified as a terminal load-balancer rejection rather than left to the
+final non-rejected guard. Like the pre-admission drain exits, it is not
+autoscaling pressure and does not enter the reject-window gauge or the history
+rejection counter. Internal replica retries stay inside one eligible request and
 never create another classification.
 
 `serve_history.record_status_snapshot()` runs on the existing history cadence

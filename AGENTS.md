@@ -282,6 +282,17 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
   correctness and useful output per engineering/token cost, not for preserving
   sunk implementation effort.
 
+### Critical-Path Complexity
+
+- Do not put a whole-registry scan inside each item's retry, reconciliation,
+  enqueue/dequeue operation, or periodic poll. One O(N) aggregate pass per
+  bounded tick is valid when cardinality and latency budgets are explicit.
+- O(N²) work is forbidden on critical paths unless N is hard-enforced as small
+  and a max-bound benchmark or structural complexity test proves the budget.
+- Scale tests must enter through the production interface at the maximum
+  configured cardinality and prove health/control-plane responsiveness, not
+  only call helpers against pre-populated internal state.
+
 ### Typed Internal State and Compatibility Boundaries
 
 - Represent cross-module domain state that has multiple fields, invariants, or
