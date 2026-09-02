@@ -462,6 +462,74 @@ class TestManagedJobControllerOwnership:
             False,
         )
 
+    def test_done_orphan_is_requeued_only_when_every_task_is_terminal(
+            self, _mock_managed_jobs_db_conn):
+        terminal_job_id = self._seed_waiting_job()
+        nonterminal_job_id = self._seed_waiting_job()
+        unknown_job_id = self._seed_waiting_job()
+        pool_job_id = self._seed_waiting_job()
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            session.execute(state.spot_table.update().where(
+                state.spot_table.c.spot_job_id == terminal_job_id).values(
+                    status=state.ManagedJobStatus.SUCCEEDED.value, end_at=10.0))
+            session.execute(state.spot_table.update().where(
+                state.spot_table.c.spot_job_id == pool_job_id).values(
+                    status=state.ManagedJobStatus.FAILED.value, end_at=10.0))
+            session.execute(state.spot_table.update().where(
+                state.spot_table.c.spot_job_id == unknown_job_id).values(
+                    status=None))
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id.in_([
+                    terminal_job_id, nonterminal_job_id, unknown_job_id,
+                    pool_job_id
+                ])).values(
+                    schedule_state=state.ManagedJobScheduleState.DONE.value,
+                    controller_pid=111,
+                    controller_pid_started_at=1.0,
+                    controller_instance_id=_OLD_OWNER_INSTANCE_ID,
+                    controller_generation=21,
+                    controller_slot_id=_SLOT_ID,
+                    controller_slot_attempt=_SLOT_ATTEMPT,
+                    controller_slot_quiescing=True))
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id == pool_job_id).values(
+                    pool='shared-pool'))
+            session.commit()
+
+        assert state.requeue_terminal_done_jobs_for_cleanup([
+            terminal_job_id, terminal_job_id, nonterminal_job_id,
+            unknown_job_id, pool_job_id
+        ]) == 1
+
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            rows = session.execute(
+                sqlalchemy.select(
+                    state.job_info_table.c.spot_job_id,
+                    state.job_info_table.c.schedule_state,
+                    state.job_info_table.c.controller_pid,
+                    state.job_info_table.c.controller_instance_id,
+                    state.job_info_table.c.controller_slot_attempt,
+                    state.job_info_table.c.controller_slot_quiescing,
+                ).where(
+                    state.job_info_table.c.spot_job_id.in_([
+                        terminal_job_id, nonterminal_job_id, unknown_job_id,
+                        pool_job_id
+                    ])).order_by(state.job_info_table.c.spot_job_id)).all()
+        assert tuple(rows[0]) == (
+            terminal_job_id,
+            state.ManagedJobScheduleState.WAITING.value,
+            None,
+            None,
+            None,
+            False,
+        )
+        assert rows[1].schedule_state == (
+            state.ManagedJobScheduleState.DONE.value)
+        assert rows[2].schedule_state == (
+            state.ManagedJobScheduleState.DONE.value)
+        assert rows[3].schedule_state == (
+            state.ManagedJobScheduleState.DONE.value)
+
     def test_first_slot_rollout_adopts_only_non_done_legacy_jobs(
             self, _mock_managed_jobs_db_conn, monkeypatch):
         nonterminal_job_id = self._seed_waiting_job()

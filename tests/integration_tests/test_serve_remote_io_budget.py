@@ -48,10 +48,10 @@ def _run_remote_io_budget_probe(result_connection) -> None:
     }
     if sum(work_items_by_lane.values()) != manager._REMOTE_IO_MAX_OUTSTANDING:
         raise RuntimeError('Remote-I/O lane budgets do not sum to the owner.')
-    if (work_items_by_lane[replica_managers._ReplicaRemoteIOLane.PROBE] <=
-            probe_workers or
-            work_items_by_lane[replica_managers._ReplicaRemoteIOLane.STATUS] <=
-            status_workers):
+    if (work_items_by_lane[replica_managers._ReplicaRemoteIOLane.PROBE]
+            <= probe_workers or
+            work_items_by_lane[replica_managers._ReplicaRemoteIOLane.STATUS]
+            <= status_workers):
         raise RuntimeError('Remote-I/O component gate must exercise multiple '
                            'production-sized waves in every lane.')
     manager._get_remote_io_executor()
