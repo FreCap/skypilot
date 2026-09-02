@@ -70,8 +70,7 @@ MANAGED_JOBS_VERSION = 22  # add submitted_after/submitted_before to job table
 # Prefix used for service-account tokens issued to managed jobs that opt in
 # to api_server_access. The expired-token-cleanup daemon uses this prefix to
 # identify managed-job tokens that should be swept once their TTL passes.
-# Keep this in sync with the token name format in
-# sky/jobs/server/core.py::_create_job_api_token.
+# Keep this in sync with sky/jobs/api_access.py::create_job_api_token.
 MANAGED_JOB_TOKEN_NAME_PREFIX = 'managed-job-'
 
 # TTL for service-account tokens issued to managed jobs with

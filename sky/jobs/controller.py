@@ -30,6 +30,7 @@ from sky.backends import cloud_vm_ray_backend
 from sky.batch import coordinator as batch_coordinator
 from sky.client import sdk
 from sky.data import data_utils
+from sky.jobs import api_access as managed_job_api_access
 from sky.jobs import constants as jobs_constants
 from sky.jobs import file_content_utils
 from sky.jobs import job_group_networking
@@ -40,6 +41,7 @@ from sky.jobs import scheduler
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
 from sky.metrics import utils as metrics_lib
+from sky.server import common as server_common
 from sky.server import plugins
 from sky.skylet import constants
 from sky.skylet import job_lib
@@ -2276,6 +2278,7 @@ class ControllerManager:
         # Populated by cancel_job() and consumed by run_job().
         self._cancel_info: dict[int, tuple[bool, int | None]] = {}
         self._cancel_info_lock = asyncio.Lock()
+        self._controller_api_token_ids: dict[int, str] = {}
 
         self._pid = os.getpid()
         self._pid_started_at = psutil.Process(self._pid).create_time()
@@ -2302,6 +2305,51 @@ class ControllerManager:
             logger.debug(
                 'API server access token for job %s was already '
                 'revoked by a sibling finalizer.', job_id)
+
+    def _initialize_controller_api_access(self, job_id: int) -> str | None:
+        """Authenticate nested SDK requests from a guarded controller.
+
+        The process-local controller capability authenticates the controller
+        origin but deliberately does not replace ordinary user
+        authentication. Issue a distinct, coroutine-local token as the job's
+        original user so launch, status, and cleanup requests satisfy both
+        checks.
+        """
+        if controller_capability.get_process_local() is None:
+            return None
+
+        tasks = managed_job_state.get_managed_job_tasks(job_id)
+        if not tasks or not tasks[0].get('user_hash'):
+            raise RuntimeError(
+                f'Cannot determine the original user for managed job {job_id}.')
+        user_hash = tasks[0]['user_hash']
+        token, token_id = managed_job_api_access.create_job_api_token(
+            user_hash,
+            f'controller-{job_id}-{self._require_controller_slot_attempt()[:8]}',
+        )
+        ctx = context.get()
+        assert ctx is not None, 'Context is not initialized'
+        try:
+            ctx.override_envs({constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR: token})
+            # A health probe may have cached NEEDS_AUTH before the per-job
+            # credential was installed. Force the first authenticated probe
+            # to observe the new credential immediately.
+            server_common.get_api_server_status_response.cache_clear()
+        except Exception:
+            global_user_state.delete_service_account_token(token_id)
+            raise
+        self._controller_api_token_ids[job_id] = token_id
+        return token_id
+
+    @staticmethod
+    def _cleanup_controller_api_access(token_id: str | None,
+                                       job_id: int) -> None:
+        """Revoke a controller-only token without touching workload tokens."""
+        if token_id is None:
+            return
+        if global_user_state.delete_service_account_token(token_id):
+            logger.info('Revoked controller API access token for job %s',
+                        job_id)
 
     async def _cleanup(self,
                        job_id: int,
@@ -2627,11 +2675,20 @@ class ControllerManager:
                 self._starting_signal.notify()
             self.job_tasks.pop(job_id, None)
             self._cleanup_only_job_ids.discard(job_id)
+            controller_api_token_id = self._controller_api_token_ids.pop(
+                job_id, None)
 
         # A cancellation that lands after the job task already finished
         # stores cancel info that no CancelledError handler will consume.
         async with self._cancel_info_lock:
             self._cancel_info.pop(job_id, None)
+
+        try:
+            await asyncio.to_thread(self._cleanup_controller_api_access,
+                                    controller_api_token_id, job_id)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to revoke controller API access token '
+                           f'for job {job_id}: {e}')
 
     @context.contextual_async
     async def run_job_loop(self,
@@ -2686,6 +2743,7 @@ class ControllerManager:
         task_id = None
         dag = None
         try:
+            self._initialize_controller_api_access(job_id)
             controller = JobController(job_id, self.starting,
                                        self._job_tasks_lock,
                                        self._starting_signal, pool, job_rank)
@@ -2866,6 +2924,7 @@ class ControllerManager:
                 try:
                     if not initialized:
                         self._initialize_job_context(job_id, log_file, pool)
+                        self._initialize_controller_api_access(job_id)
                         initialized = True
                     if not cleanup_complete:
                         # This is the same canonical provider/storage cleanup
