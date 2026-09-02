@@ -5765,3 +5765,118 @@ describe('service replica table sorting', () => {
     expect(screen.queryByText('$8.00')).not.toBeInTheDocument();
   });
 });
+
+describe('committed capacity-plan lease clock', () => {
+  it('fails the projection closed to STALE when the DB-relative lease passes before the next poll', async () => {
+    jest.useFakeTimers();
+    const consoleError = jest.spyOn(console, 'error').mockImplementation();
+    const controllerPending = deferred();
+    try {
+      const now = Date.now() / 1000;
+      mockUseRouter.mockReturnValue({
+        isReady: true,
+        query: { service: 'svc' },
+      });
+      dashboardCache.get.mockReturnValue(controllerPending.promise);
+      getServiceReplicaSummaries.mockResolvedValue({
+        available: true,
+        serviceMetadataIncluded: true,
+        summaries: [
+          {
+            name: 'svc',
+            serviceHash: 'hash-a',
+            persistedMetadataLoaded: true,
+            status: 'READY',
+            uptime: null,
+            policy: 'fixed',
+            requestedResources: 'L4:1',
+            replicaUnit: 'physical',
+            replicaStatusCounts: {},
+            replicasReady: null,
+            replicasTotal: null,
+            replicasFailed: 0,
+            currentOrUncertainCount: 2,
+            pastAttemptCount: 0,
+          },
+        ],
+      });
+      getServiceReplicas.mockResolvedValue({
+        available: true,
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        scope: 'current_or_uncertain',
+        total: 2,
+        nextCursor: null,
+        observedAt: now,
+        replicas: [],
+      });
+      getServiceDemand.mockResolvedValue({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        requestTelemetryState: 'unavailable',
+        requestTelemetryReason: 'unsupported',
+        legacyFallback: true,
+      });
+      getServicePricing.mockResolvedValue(
+        pricingAggregateResult({
+          aggregate: {
+            available: true,
+            unavailableReason: null,
+            coverage: 'empty',
+            estimatedHourlyCost: 0,
+            spotHourlyCost: 0,
+            nonSpotHourlyCost: 0,
+            costTrackedReplicaCount: 0,
+            pricedReplicaCount: 0,
+            hourlyCostExcludedReplicaCount: 0,
+            hourlyCostExclusionReasons: {},
+          },
+        })
+      );
+      // The plan lease outlives the read by six seconds, shorter than the
+      // ten-second history poll: expiry must be applied by the local lease
+      // clock, not by the next fetch.
+      getServiceHistory.mockResolvedValue({
+        ...committedPlanHistory({
+          demandTarget: 240,
+          observedAt: now - 1,
+          validUntil: now + 6,
+          windowEnd: now,
+          receivedAt: now,
+        }),
+        bucketSeconds: 60,
+        windowStart: 0,
+        samples: [],
+        requestSamples: [],
+        predictionTimeHistogramVersion: 1,
+        predictionTimeLatestHourReportedAt: null,
+        predictionTimeBucketUpperBoundsSeconds: [1],
+        predictionTimeSamples: [],
+      });
+
+      render(<ServiceDetailsPage />);
+
+      expect(await screen.findByText('(target: 240)')).toBeVisible();
+      expect(screen.queryByText(/Current committed plan stale/)).toBeNull();
+
+      await act(async () => {
+        jest.advanceTimersByTime(4 * 1000);
+      });
+      expect(screen.getByText('(target: 240)')).toBeVisible();
+
+      await act(async () => {
+        jest.advanceTimersByTime(3 * 1000);
+      });
+      expect(
+        screen.getByText(
+          /Current committed plan stale: capacity_plan_expired\. Planned values are unavailable, not zero\./
+        )
+      ).toBeVisible();
+      expect(screen.queryByText('(target: 240)')).toBeNull();
+      expect(getServiceHistory).toHaveBeenCalledTimes(1);
+    } finally {
+      consoleError.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+});
