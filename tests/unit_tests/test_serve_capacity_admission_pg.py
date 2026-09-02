@@ -2958,7 +2958,7 @@ def test_current_planner_existing_paid_wave_prevents_duplicate_launch(
 
 def test_current_planner_admits_residual_while_terminal_request_awaits_reducer(
         capacity_database):
-    """A charged predecessor's cross-transaction receipt gap is not global."""
+    """A charged predecessor awaiting its reducer does not block the residual."""
     engine, incarnation, route_receipt = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
     repository = capacity_admission.CapacityAdmissionRepository(engine)
@@ -2976,83 +2976,17 @@ def test_current_planner_admits_residual_while_terminal_request_awaits_reducer(
     assert [member.replica_id for member in first.paid_launch_receipt.members
            ] == [180]
 
+    # The fused writer already committed the exact executable request graph
+    # for replica 180; locate its durable association instead of hand-building
+    # a second binding for the same replica.
     associations = ordinary_launch_binding.ordinary_launch_associations_table
     with engine.begin() as connection:
         serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
             connection)
-        service = connection.execute(
-            sqlalchemy.select(serve_state_schema.services_table).where(
-                serve_state_schema.services_table.c.name ==
-                'svc')).mappings().one()
-        replica = connection.execute(
-            sqlalchemy.select(serve_state_schema.replicas_table).where(
-                serve_state_schema.replicas_table.c.service_name == 'svc',
-                serve_state_schema.replicas_table.c.replica_id ==
-                180)).mappings().one()
-        profile = (ordinary_launch_binding.
-                   resolve_non_pool_launch_profile_in_connection(
-                       connection,
-                       service,
-                       replica,
-                       protocol_and_service_prelocked=True))
-        info = replica_managers.ReplicaInfo.from_storage_dict(
-            replica['replica_state'])
-        intent = ordinary_launch_binding.BindingIntent(
-            service_name='svc',
-            service_hash='svc-hash',
-            service_version=1,
-            replica_id=180,
-            replica_record_id=uuid.UUID(info.replica_record_id),
-            lifecycle_epoch=3,
-            binding_epoch=service['ordinary_launch_binding_epoch'],
-            controller_incarnation=service['controller_incarnation'],
-            controller_owner_epoch=service['controller_owner_epoch'],
-            controller_pid=service['controller_pid'],
-            controller_ip=service['controller_ip'])
-        launch_body = request_payloads.LaunchBody(
-            task='name: paid-launch\nrun: echo bound\n',
-            cluster_name=info.cluster_name,
-            is_launched_by_sky_serve_controller=True,
-            env_vars={skylet_constants.USER_ID_ENV_VAR: 'tenant-a'},
-            extra_launch_context={})
-        identity = ordinary_launch_binding.build_non_pool_binding_identity(
-            intent,
-            submission_id=uuid.uuid4(),
-            tenant_scope='tenant-a',
-            service_workspace='workspace-a',
-            cluster_name=info.cluster_name,
-            input_digest=(
-                ordinary_launch_binding.canonical_launch_digest(launch_body)),
-            profile=profile,
-            capability_cohort_epoch=(
-                service['non_pool_launch_capability_cohort_epoch']),
-            capability_profile_set_digest=(
-                service['non_pool_launch_capability_profile_set_digest']),
-            receipt_protocol_version=(
-                service['non_pool_launch_receipt_protocol_version']))
-        admission = ordinary_launch_binding.insert_or_get_locked(
-            connection, identity)
-        assert admission.created
-        ordinary_launch_binding.install_bound_non_pool_context(
-            launch_body, identity, admission.launch_generation)
-        bound_request = request_lib.Request(
-            request_id=identity.request_id,
-            name='sky.launch',
-            entrypoint=non_pool_launch_request.launch,
-            request_body=launch_body,
-            status=request_lib.RequestStatus.PENDING,
-            created_at=time.time(),
-            user_id='tenant-a',
-            cluster_name=info.cluster_name,
-            schedule_type=request_lib.ScheduleType.LONG,
-            retryable=False,
-            should_enqueue=True)
-        assert request_postgres.insert_bound_non_pool_request_and_queue_in_transaction(
-            connection, bound_request, identity=identity)
         association = connection.execute(
             sqlalchemy.select(associations).where(
-                associations.c.association_id ==
-                identity.association_id).with_for_update()).mappings().one()
+                associations.c.service_name == 'svc', associations.c.replica_id
+                == 180).with_for_update()).mappings().one()
         assert association['resolution'] == 'BOUND'
         assert association['terminal_status'] is None
         request = connection.execute(
@@ -4589,6 +4523,43 @@ def test_current_planner_recomputes_prior_claims_after_stale_cleanup(
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 1),
         prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 160),))
     assert len(first_commit.paid_launch_receipt.members) == 1
+    # The fused writer bound replica 160's executable request, so its claim is
+    # owned by that association until the production reducer settles it. A
+    # teardown that cancels the never-executed request settles the association
+    # pre-effect and releases the claim; only then is the replica's cleanup
+    # label a stale claim rather than a still-charged purchase.
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with engine.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).mappings().one()
+        association = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.service_name == 'svc',
+                associations.c.replica_id == 160)).mappings().one()
+    context = ordinary_launch_binding.bound_context_from_association(
+        association)
+    authority = ordinary_launch_binding._authority_from_service(  # pylint: disable=protected-access
+        service,
+        controller_pid=service['controller_pid'],
+        controller_ip=service['controller_ip'],
+        controller_incarnation=service['controller_incarnation'],
+        controller_owner_epoch=service['controller_owner_epoch'],
+        capable=service['ordinary_launch_binding_capable'] is True)
+    facts = request_postgres.request_bound_ordinary_launch_cancel(
+        context, authority, 'stale-cleanup')
+    assert facts.status is request_lib.RequestStatus.CANCELLED
+    reduction = request_postgres.reduce_bound_ordinary_launch(
+        context, authority, project_replica_result=lambda _c, _p: True)
+    assert reduction.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.PRE_EFFECT_TERMINAL)
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table).where(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == 'svc')).scalar_one() == 0
     replicas = serve_state_schema.replicas_table
     with engine.begin() as connection:
         state = connection.execute(

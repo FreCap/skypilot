@@ -3506,7 +3506,7 @@ def test_gcp_paid_unknown_replacement_absence_uses_frozen_cleanup_graph(
 }])
 def test_paid_unknown_replacement_database_guards_reject_pool_near_misses(
         bound_request_database, monkeypatch, pool_override) -> None:
-    """Fresh pointer and association transitions require exact GCP v2."""
+    """The association pool-scope CHECK rejects every GCP v2 near miss."""
     graph = _prepare_paid_provider_absence_graph(
         bound_request_database,
         monkeypatch,
@@ -3542,36 +3542,25 @@ def test_paid_unknown_replacement_database_guards_reject_pool_near_misses(
                                   sort_keys=True,
                                   separators=(',', ':'))
     associations = ordinary_launch_binding.ordinary_launch_associations_table
-    with graph.engine.begin() as connection:
-        connection.exec_driver_sql(
-            f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
-        try:
+    # Serve067's pool-scope CHECK is a table constraint, not a trigger: a
+    # near-miss key cannot even be planted on the replacement association, so
+    # no pointer or resolution transition can ever observe one.
+    with pytest.raises(sqlalchemy.exc.DBAPIError) as rejected:
+        with graph.engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
             connection.execute(
                 sqlalchemy.update(associations).where(
                     associations.c.association_id ==
                     graph.context.association_id).values(
                         paid_capacity_pool_key=invalid_pool_key))
-        finally:
-            connection.exec_driver_sql(
-                f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
-
-    with pytest.raises(sqlalchemy.exc.DBAPIError):
-        with graph.engine.begin() as connection:
-            connection.execute(
-                sqlalchemy.update(serve_state_schema.replicas_table).where(
-                    serve_state_schema.replicas_table.c.service_name ==
-                    'gc-service',
-                    serve_state_schema.replicas_table.c.replica_id == 3).values(
-                        ordinary_launch_association_id=None))
-    with pytest.raises(sqlalchemy.exc.DBAPIError):
-        with graph.engine.begin() as connection:
-            connection.execute(
-                sqlalchemy.update(associations).where(
-                    associations.c.association_id ==
-                    graph.context.association_id).values(
-                        resolution='PROJECTED',
-                        reconciliation_outcome='PROJECTED',
-                        ambiguity_code=None))
+    assert 'serve059_paid_pool_scope_ck' in str(rejected.value)
+    with graph.engine.connect() as connection:
+        retained_pool_key = connection.execute(
+            sqlalchemy.select(associations.c.paid_capacity_pool_key).where(
+                associations.c.association_id ==
+                graph.context.association_id)).scalar_one()
+    assert retained_pool_key == graph.pool_key
 
 
 def test_gcp_paid_identity_accepts_http_post_normalization_body(
