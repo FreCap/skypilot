@@ -5734,9 +5734,12 @@ def test_current_planner_callback_failure_rolls_back(capacity_database):
         ).scalar_one() == 0
 
 
-def test_controller_installs_finalized_partial_paid_wave_and_successor(
-        capacity_database):
-    """The controller consumes the repository-finalized paid policy state."""
+@pytest.mark.parametrize(
+    'successor_mutation',
+    ('probe_bookkeeping', 'replica_set_identity', 'version', 'shape'))
+def test_controller_successor_admission_tolerates_only_nonstructural_churn(
+        capacity_database, successor_mutation):
+    """A paid successor ignores probe churn but rejects structural drift."""
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine,
                            incarnation,
@@ -5817,7 +5820,7 @@ def test_controller_installs_finalized_partial_paid_wave_and_successor(
 
     autoscaler.install_committed_capacity_projection = _install
 
-    def _admit(replica_infos):
+    def _admit(replica_infos, mutate_after_prepare=None):
         planning_fingerprint = (
             serve_state.get_scale_planning_state_fingerprint(
                 'svc', require_version=True))
@@ -5826,6 +5829,10 @@ def test_controller_installs_finalized_partial_paid_wave_and_successor(
             autoscalers.prepare_controller_scaling_decision_inputs(
                 autoscaler, replica_infos))
         prepared_specs = manager.prepare_paid_launch_specs()
+        if mutate_after_prepare is not None:
+            mutate_after_prepare()
+            assert (serve_state.get_scale_planning_state_fingerprint(
+                'svc', require_version=True) != planning_fingerprint)
         result = ctrl._plan_and_admit_current_capacity(
             autoscaler,
             1,
@@ -5835,10 +5842,11 @@ def test_controller_installs_finalized_partial_paid_wave_and_successor(
             prepared_inputs,
             sequenced_reserved_fill=False,
             prepared_paid_launch_specs=prepared_specs)
-        assert result is not None
         return result
 
-    first, first_local, first_prepared = _admit([])
+    first_result = _admit([])
+    assert first_result is not None
+    first, first_local, first_prepared = first_result
     pre_finalized = capacity_planning.plan_capacity(first.planner_snapshot)
 
     assert first_prepared == (first_spec,)
@@ -5861,7 +5869,57 @@ def test_controller_installs_finalized_partial_paid_wave_and_successor(
     demand_state.ingest_report('svc', 'svc-hash', _queued_report(3))
     replica_infos = serve_state.get_replica_infos('svc')
     assert [info.replica_id for info in replica_infos] == [101]
-    successor, successor_local, successor_prepared = _admit(replica_infos)
+
+    def _mutate_successor_source():
+        with engine.begin() as connection:
+            replicas = serve_state_schema.replicas_table
+            row = connection.execute(
+                sqlalchemy.select(replicas).where(
+                    replicas.c.service_name == 'svc',
+                    replicas.c.replica_id == 101)).mappings().one()
+            state = copy.deepcopy(row['replica_state'])
+            updates = {}
+            if successor_mutation == 'probe_bookkeeping':
+                # A failed-probe clock changes no identity, version, shape,
+                # lifecycle status, paid debit, or usable capacity.
+                state['first_consecutive_failure_time'] = time.time()
+            elif successor_mutation == 'replica_set_identity':
+                connection.execute(
+                    sqlalchemy.insert(replicas).values(
+                        **_replica_values(103, zero_cost=False)))
+                return
+            elif successor_mutation == 'version':
+                state['version'] = 2
+                updates['version'] = 2
+            else:
+                assert successor_mutation == 'shape'
+                wide = _paid_launch_spec(engine, 0, 999, accelerator_count=8)
+                resources = json.loads(wide.resources_override)
+                state['location'] = copy.deepcopy(resources)
+                state['resources_override'] = copy.deepcopy(resources)
+                state['planned_capacity'] = 8
+                state['paid_capacity_pool_key'] = wide.pool_key
+                updates['paid_capacity_pool_key'] = wide.pool_key
+            connection.execute(
+                sqlalchemy.update(replicas).where(
+                    replicas.c.service_name == 'svc',
+                    replicas.c.replica_id == 101).values(replica_state=state,
+                                                         **updates))
+
+    successor_result = _admit(replica_infos, _mutate_successor_source)
+    if successor_mutation != 'probe_bookkeeping':
+        assert successor_result is None
+        replica_ids = {
+            info.replica_id for info in serve_state.get_replica_infos('svc')
+        }
+        assert replica_ids == ({101, 103} if successor_mutation
+                               == 'replica_set_identity' else {101})
+        assert 102 not in replica_ids
+        assert installed == [first.candidate]
+        return
+
+    assert successor_result is not None
+    successor, successor_local, successor_prepared = successor_result
 
     assert successor_prepared == (second_spec,)
     assert successor.authority.generation == first.authority.generation + 1
