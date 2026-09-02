@@ -229,7 +229,11 @@ def _canonical_intent_key(**overrides) -> str:
 def admission_database(empty_postgres):  # noqa: F811
     config = migration_utils.get_alembic_config(empty_postgres,
                                                 migration_utils.SERVE_DB_NAME)
-    alembic_command.upgrade(config, '057')
+    # Run at the current PostgreSQL Serve head: the production reducers
+    # exercised by these tests read every claim column the table metadata
+    # declares (Serve066 added provider-allocation markers), and a schema
+    # pinned at Serve057 no longer matches that metadata.
+    alembic_command.upgrade(config, migration_utils.SERVE_VERSION)
     migration_utils.safe_alembic_upgrade(empty_postgres,
                                          migration_utils.API_REQUESTS_DB_NAME,
                                          migration_utils.API_REQUESTS_VERSION)
@@ -4806,9 +4810,9 @@ def test_serve057_is_linear_postgresql_only_predecessor() -> None:
     config = migration_utils.get_alembic_config(sqlite,
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
-    assert scripts.get_heads() == ['066']
+    assert scripts.get_heads() == ['067']
     assert scripts.get_revision('057').down_revision == '056'
-    assert migration_utils.SERVE_VERSION == '066'
+    assert migration_utils.SERVE_VERSION == '067'
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
         alembic_command.upgrade(config, '057')

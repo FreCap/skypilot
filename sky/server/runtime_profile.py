@@ -1,9 +1,10 @@
 """Derived API-server runtime profiles and fail-closed local-byte guards."""
 
+from collections.abc import Iterable
 import ipaddress
 import os
 import re
-from typing import Any, Iterable
+from typing import Any
 import urllib.parse
 
 from sky import exceptions

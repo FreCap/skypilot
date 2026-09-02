@@ -3,6 +3,7 @@
 
 import os
 import pathlib
+import pickle
 import shutil
 import uuid
 
@@ -12,11 +13,15 @@ import sqlalchemy
 from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
 
+from sky import clouds
 from sky import global_user_state_schema
+from sky.serve import paid_capacity
 from sky.serve import replica_managers
 from sky.serve import resource_action_m4_state_schema as m4_schema
 from sky.serve import resource_action_state_schema as action_schema
 from sky.serve import serve_state
+from sky.serve import service_spec
+from sky.serve import spot_placer
 from sky.utils.db import migration_utils
 
 pytest.importorskip('psycopg2')
@@ -79,8 +84,7 @@ def empty_postgres(postgres_engine):
     with postgres_engine.begin() as connection:
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
         connection.exec_driver_sql('CREATE SCHEMA public')
-    global_user_state_schema.user_table.create(postgres_engine,
-                                               checkfirst=True)
+    global_user_state_schema.user_table.create(postgres_engine, checkfirst=True)
     return postgres_engine
 
 
@@ -242,6 +246,31 @@ def _replica(replica_id: int, version: int = 1) -> replica_managers.ReplicaInfo:
                                         location=None,
                                         version=version,
                                         resources_override=None)
+
+
+def _paid_pool_key() -> str:
+    """Exact provider pool identity accepted by paid GPU attribution."""
+    location = spot_placer.Location(cloud=clouds.AWS(),
+                                    region='us-east-1',
+                                    zone='us-east-1a',
+                                    accelerators={'A100-80GB': 1},
+                                    use_spot=True,
+                                    instance_type='p4d.24xlarge')
+    return paid_capacity.pool_key(location,
+                                  workspace='default',
+                                  num_nodes=1,
+                                  aws_account_id='123456789012')
+
+
+def _seed_readable_version_spec(engine, service_name: str) -> None:
+    """Paid admission reads the elected version spec for its paid GPU cap."""
+    spec = service_spec.SkyServiceSpec.from_yaml_config({'replicas': 1})
+    with engine.begin() as connection:
+        connection.execute(serve_state.version_specs_table.insert().values(
+            service_name=service_name,
+            version=1,
+            spec=pickle.dumps(spec, protocol=4),
+            yaml_content='service: {}'))
 
 
 def test_pg_upgrade_from_032_and_catalog_are_exact(empty_postgres):
@@ -517,11 +546,17 @@ def test_pg_replica_updates_preserve_actions_and_admissions_reject_duplicates(
     with engine.begin() as connection:
         connection.execute(serve_state.services_table.insert().values(
             name='svc', hash=service_hash, status='READY'))
+    _seed_readable_version_spec(engine, 'svc')
 
+    # Fresh paid admission fails closed on any cleanup-unproven row whose
+    # relational pool key and zero-cost copy disagree, so the pre-existing
+    # rows carry the same exact paid pool the admission below targets.
+    pool_key = _paid_pool_key()
     expected_by_replica = {}
     for replica_id in range(1, 5):
-        assert serve_state.add_or_update_replica('svc', replica_id,
-                                                 _replica(replica_id))
+        existing = _replica(replica_id)
+        existing.paid_capacity_pool_key = pool_key
+        assert serve_state.add_or_update_replica('svc', replica_id, existing)
         action_values = {
             'replica_incarnation': uuid.UUID(int=replica_id * 100 + 1),
             'desired_generation': replica_id,
@@ -547,6 +582,7 @@ def test_pg_replica_updates_preserve_actions_and_admissions_reject_duplicates(
             'resource_action_spec_identity_sha256': 'f' * 64,
             'ordinary_launch_association_id': None,
             'non_pool_launch_authorization': None,
+            'reserved_fill_intent_idempotency_key': None,
         }
         expected_by_replica[replica_id] = action_values
         with orm.Session(engine) as session:
@@ -575,7 +611,7 @@ def test_pg_replica_updates_preserve_actions_and_admissions_reject_duplicates(
             service_hash,
             3,
             _replica(3, version=2),
-            pool_key='test-paid-pool',
+            pool_key=pool_key,
             priority=1,
             base_limit=1,
             max_limit=2,

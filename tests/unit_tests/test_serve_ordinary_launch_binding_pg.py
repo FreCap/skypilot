@@ -50,7 +50,7 @@ _RECORD_ID = uuid.UUID('22222222-2222-4222-8222-222222222222')
 _CONTROLLER_ID = uuid.UUID('33333333-3333-4333-8333-333333333333')
 _CURRENT_PAID_POOL_KEY = json.dumps(
     {
-        'version': 1,
+        'version': 2,
         'workspace': 'workspace-a',
         'cloud': 'gcp',
         'region': 'us-central1',
@@ -59,6 +59,9 @@ _CURRENT_PAID_POOL_KEY = json.dumps(
         'accelerators': [['l4', 1.0]],
         'use_spot': True,
         'num_nodes': 1,
+        'provider_identity': {
+            'gcp_project_id': 'boltz-spot-project',
+        },
     },
     sort_keys=True,
     separators=(',', ':'))
@@ -957,7 +960,7 @@ def _assert_current_paid_provider_effect_is_permitted(database,) -> None:
 
 def test_paid_provider_allocation_first_commit_replay_and_conflict(
         binding_database, monkeypatch) -> None:
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 14
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 15
     monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 4)
     monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 120)
     monkeypatch.setattr(paid_capacity, 'success_ttl_seconds', lambda: 600)
@@ -1384,11 +1387,11 @@ def test_paid_plan_is_mutable_only_before_provider_effect(
 def test_historical_cohort_cannot_start_provider_effect(
         binding_database, monkeypatch, history_distance) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
-    assert current_cohort == 14
+    assert current_cohort == 15
     assert current_cohort > history_distance
     historical_cohort = current_cohort - history_distance
     if history_distance == 1:
-        assert historical_cohort == 13
+        assert historical_cohort == 14
     with monkeypatch.context() as old_code:
         old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
                          historical_cohort)
@@ -1567,7 +1570,7 @@ def _reserved_fill_cleanup_rows(
 def test_reserved_fill_cleanup_accepts_exact_adjacent_cohort_tuple(
         binding_database, monkeypatch) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
-    assert current_cohort == 14
+    assert current_cohort == 15
     service, replica, association, expected_profile = (
         _reserved_fill_cleanup_rows(current_cohort - 1, current_cohort - 1))
     validated: list[binding.NonPoolLaunchProfile] = []
@@ -1596,7 +1599,7 @@ def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
     current_projection = (
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    assert (current_cohort, current_projection) == (14, 10)
+    assert (current_cohort, current_projection) == (15, 10)
     historical_cohort = current_cohort - history_distance
     historical_projection = current_projection - history_distance
     info = _reserved_fill_replica_info()
@@ -2555,7 +2558,7 @@ def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
 def test_reserved_fill_cleanup_rejects_older_or_mismatched_cohorts(
         binding_database, monkeypatch, service_cohort,
         association_cohort) -> None:
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 14
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 15
     service, replica, association, _ = _reserved_fill_cleanup_rows(
         service_cohort, association_cohort)
     profile_validation_called = False

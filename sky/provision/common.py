@@ -369,6 +369,10 @@ class ProvisionerError(RuntimeError):
     # higher layers distinguish a full-demand failure from filling a partial or
     # orphaned cluster without parsing provider-specific messages.
     requested_count: int | None = None
+    # Closed provider-native zero-effect receipt.  Declared without a class
+    # default on purpose: only ProviderCreateRejectedError producers and the
+    # stable history projection attach it, and consumers probe hasattr().
+    provider_negative_ack: dict[str, Any] | None
 
 
 class ProviderCreateRejectedError(ProvisionerError):

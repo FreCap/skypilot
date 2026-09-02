@@ -1290,7 +1290,7 @@ def test_heterogenous_gpu_detection():
 
     with mock.patch('sky.clouds.cloud_in_iterable', return_value=True), \
          mock.patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name', return_value='doesntexist'), \
-         mock.patch('sky.provision.kubernetes.utils.check_credentials', return_value=[True]), \
+         mock.patch('sky.provision.kubernetes.utils.check_credentials', return_value=(True, None)), \
          mock.patch('sky.provision.kubernetes.utils.detect_accelerator_resource', return_value=True), \
          mock.patch('sky.provision.kubernetes.utils.detect_gpu_label_formatter', return_value=[utils.GKELabelFormatter(), None]), \
          mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes_uncached', return_value=[mock_node1, mock_node2]), \
@@ -1324,7 +1324,7 @@ def test_realtime_gpu_detection_observes_uncordon_without_cache_clear():
     realtime_cordoned_node = make_node(cordoned=True)
     uncordoned_node = make_node(cordoned=False)
     with mock.patch('sky.clouds.cloud_in_iterable', return_value=True), \
-         mock.patch('sky.provision.kubernetes.utils.check_credentials', return_value=[True]), \
+         mock.patch('sky.provision.kubernetes.utils.check_credentials', return_value=(True, None)), \
          mock.patch('sky.provision.kubernetes.utils.detect_accelerator_resource', return_value=True), \
          mock.patch('sky.provision.kubernetes.utils.detect_gpu_label_formatter', return_value=[utils.GKELabelFormatter(), None]), \
          mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes_uncached', side_effect=[[cached_cordoned_node], [realtime_cordoned_node], [uncordoned_node]]) as get_nodes, \

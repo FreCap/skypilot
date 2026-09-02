@@ -20,6 +20,8 @@ pytestmark = pytest.mark.xdist_group(
 
 _MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.060_cancelled_gcp_paid_cleanup')
+_LATEST_MIGRATION = importlib.import_module(
+    'sky.schemas.db.serve_state.067_project_scoped_gcp_paid_admission')
 
 
 def _function_definition(engine: sqlalchemy.engine.Engine,
@@ -121,15 +123,15 @@ def test_serve060_lineage_and_runtime_metadata() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['066']
+    assert scripts.get_heads() == ['067']
     assert scripts.get_revision('060').down_revision == '059'
-    assert migration_utils.SERVE_VERSION == '066'
+    assert migration_utils.SERVE_VERSION == '067'
     constraint = next(
         item for item in
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
         if item.name == _MIGRATION._PROJECTION_CONSTRAINT)
     assert _compact(str(constraint.sqltext)) == _compact(
-        _MIGRATION._PROJECTION_CHECK)
+        _LATEST_MIGRATION._PROJECTION_CHECK)
 
 
 def test_serve060_migrates_the_live_059_constraint_and_guards(
