@@ -7515,7 +7515,6 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                     )).order_by(job_info.c.spot_job_id).with_for_update()
             ).mappings().all()
             stale_job_ids = [int(row['spot_job_id']) for row in stale_jobs]
-            legacy_job_ids: list[int] = []
             for row in stale_jobs:
                 try:
                     identity = (managed_job_controller_fencing.
@@ -7526,30 +7525,20 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                     raise request_storage.ManagedJobRequestQuiescenceError(
                         f'Managed job {row["spot_job_id"]} has unsafe prior '
                         'controller identity.') from e
-                if identity is None:
-                    legacy_job_ids.append(int(row['spot_job_id']))
-                else:
+                if identity is not None:
                     target_identities.add(identity)
             if stale_job_ids:
                 connection.execute(
                     sqlalchemy.update(job_info).where(
                         job_info.c.spot_job_id.in_(stale_job_ids)).values(
                             controller_slot_quiescing=True))
-            if legacy_job_ids:
-                correlated_legacy_requests = connection.execute(
-                    sqlalchemy.select(
-                        REQUESTS.c.request_id, REQUESTS.c.managed_job_id).where(
-                            REQUESTS.c.managed_job_id.in_(legacy_job_ids)).
-                    order_by(REQUESTS.c.managed_job_id,
-                             REQUESTS.c.request_id).with_for_update()).all()
-                if correlated_legacy_requests:
-                    details = ', '.join(f'{row.managed_job_id}:{row.request_id}'
-                                        for row in correlated_legacy_requests)
-                    raise request_storage.ManagedJobRequestQuiescenceError(
-                        'Cannot adopt pre-slot managed jobs with correlated '
-                        f'nested requests: {details}.')
             # Include retained nested tombstones even when their job has
-            # already become terminal or a prior failed reset cleared it.
+            # already become terminal or a prior reset cleared its slot.  The
+            # latter is a normal handoff state: request origins retain the old
+            # exact attempt after the job row closes admission and returns to
+            # WAITING.  Quiesce those origins before adopting the job instead
+            # of treating their durable tombstones as an impossible legacy
+            # combination.
             request_origins = connection.execute(
                 sqlalchemy.select(
                     REQUESTS.c.managed_job_controller_instance_id,
