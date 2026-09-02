@@ -12,11 +12,14 @@ import pytest
 import sqlalchemy
 from test_serve_resource_action_state_pg import postgres_engine
 
+from sky import clouds
 from sky.serve import constants
 from sky.serve import paid_capacity
 from sky.serve import replica_info
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
+from sky.serve import service_spec
+from sky.serve import spot_placer
 from sky.serve import system_oom_recovery
 from sky.serve import system_recovery_state as recovery_state
 from sky.utils import common_utils
@@ -81,6 +84,20 @@ def _replica(replica_id: int) -> replica_info.ReplicaInfo:
                                     location=None,
                                     version=3,
                                     resources_override=None)
+
+
+def _paid_pool_key() -> str:
+    """Return one canonical account-scoped exact paid provider pool."""
+    location = spot_placer.Location(cloud=clouds.AWS(),
+                                    region='us-east-1',
+                                    zone='us-east-1a',
+                                    accelerators={'L4': 1},
+                                    use_spot=True,
+                                    instance_type='g6.xlarge')
+    return paid_capacity.pool_key(location,
+                                  workspace=_WORKSPACE,
+                                  num_nodes=1,
+                                  aws_account_id='123456789012')
 
 
 def _intent(
@@ -849,13 +866,36 @@ def test_initial_replica_paths_are_insert_only_on_key_conflict(
                                            **_fence())
     assert serve_state.get_replica_info_from_id(_SERVICE_NAME, 8) is None
 
+    # Paid admission now reads the elected version's spec, decodes the exact
+    # provider pool identity, and fails closed on any live row without paid or
+    # zero-cost attribution before it reaches the replica INSERT.  Seed that
+    # upstream authority so the INSERT is what conflicts.
+    paid_pool_key = _paid_pool_key()
+    paid_row_state = _raw_replica_row(engine, 7)['replica_state']
+    paid_row_state['paid_capacity_pool_key'] = paid_pool_key
+    with engine.begin() as connection:
+        connection.execute(serve_state.version_specs_table.insert().values(
+            service_name=_SERVICE_NAME,
+            version=3,
+            spec=pickle.dumps(
+                service_spec.SkyServiceSpec.from_yaml_config({'replicas': 1})),
+            yaml_content='replicas: 1\n'))
+        connection.execute(serve_state.services_table.update().where(
+            serve_state.services_table.c.name == _SERVICE_NAME).values(
+                current_version=3))
+        connection.execute(
+            sqlalchemy.update(serve_state.replicas_table).where(
+                serve_state.replicas_table.c.service_name == _SERVICE_NAME,
+                serve_state.replicas_table.c.replica_id == 7).values(
+                    paid_capacity_pool_key=paid_pool_key,
+                    replica_state=paid_row_state))
     with pytest.raises(sqlalchemy.exc.IntegrityError):
         serve_state.try_add_replica_with_paid_capacity_claim(
             _SERVICE_NAME,
             _SERVICE_HASH,
             7,
             _replica(7),
-            pool_key='paid-pool',
+            pool_key=paid_pool_key,
             priority=1,
             base_limit=1,
             max_limit=2,

@@ -2571,6 +2571,177 @@ def test_materialize_paid_launch_receipt_builds_only_sparse_members():
     assert specs[0].replica_id not in manager._launch_thread_pool
 
 
+def _committed_paid_member_for_adoption():
+    """Prepare one committed paid member plus its fused binding and row."""
+    manager, cheap, _ = _provider_free_paid_manager()
+    with mock.patch.object(manager,
+                           '_task_template_for_version',
+                           return_value=mock.Mock()), \
+         mock.patch.object(replica_managers,
+                           '_get_resources_ports',
+                           return_value='8080'), \
+         mock.patch.object(replica_managers.skypilot_config,
+                           'to_dict',
+                           return_value={}):
+        specs = manager.prepare_paid_launch_specs(
+            accelerator_shapes={'l4': 1},
+            max_gpu_units_by_accelerator={'l4': 1},
+            max_candidates=1,
+            occupied_replica_ids=(),
+            version_authority=_paid_version_authority(manager),
+            paid_location_launch_budget=_provider_free_paid_budget(
+                manager, {cheap: 1}, service_remaining=1))
+    spec = specs[0]
+    member = paid_capacity.PaidLaunchReceiptMember(
+        replica_id=spec.replica_id,
+        replica_record_id=spec.replica_record_id,
+        pool_key=spec.pool_key,
+        priority=50,
+        accelerator=spec.accelerator,
+        plan_units=1,
+        physical_gpu_units=1)
+    receipt = paid_capacity.PaidLaunchReceipt(service_name='svc',
+                                              service_hash='hash',
+                                              service_lifecycle_epoch=1,
+                                              service_version=1,
+                                              capacity_plan_generation=9,
+                                              capacity_plan_sha256='a' * 64,
+                                              capacity_unit='physical-backend',
+                                              members=(member,))
+    binding = _fused_paid_binding(spec, member)
+    # PROVISIONING carries a RUNNING launch slot, so scanner adoption starts
+    # the adopter without a database reservation.
+    info = _fake_replica_info(
+        spec.replica_id,
+        replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+    info.replica_record_id = spec.replica_record_id
+    info.paid_capacity_pool_key = spec.pool_key
+    location = replica_managers.spot_placer.Location.from_resources_override(
+        replica_managers._decode_replica_resource_state(
+            paid_capacity.thaw_paid_launch_payload(spec.resources_override)))
+    assert location is not None
+    launch_result = replica_managers._ReplicaLaunchResult(
+        replica_id=spec.replica_id,
+        planned_capacity=1,
+        funding=replica_managers._ReplicaLaunchFunding.PAID)
+    prepared = mock.Mock(info=info,
+                         binding=binding,
+                         launch_spec=mock.Mock(),
+                         yaml_content='resources: {}',
+                         launch_result=launch_result,
+                         location=location)
+    return manager, specs, receipt, binding, info, prepared, launch_result
+
+
+def _scanner_adopts_committed_member(manager, binding, info):
+    """Run the real unowned-row scanner against one committed fused row."""
+    reduction = request_postgres.OrdinaryLaunchReduction(
+        context=binding.context,
+        disposition=request_postgres.OrdinaryLaunchReductionDisposition.
+        ADOPT_ACTIVE,
+        request=mock.Mock(request_id=binding.request_id),
+        service_job_id=None,
+        cancel_reason=None,
+        projected=False)
+    scanner_worker = mock.Mock(replica_record_id=info.replica_record_id)
+    with mock.patch.object(request_postgres,
+                           'inspect_bound_ordinary_launch',
+                           return_value=reduction) as inspect, \
+         mock.patch.object(ordinary_launch_binding,
+                           'retire_pre_admission_non_pool_launch_intent'
+                          ) as retire, \
+         mock.patch.object(manager,
+                           '_build_bound_launch_adopter',
+                           return_value=scanner_worker):
+        manager._reconcile_unowned_bound_non_pool_launches([info])
+    inspect.assert_called_once_with('svc', info.replica_id,
+                                    info.replica_record_id)
+    retire.assert_not_called()
+    scanner_worker.start.assert_called_once_with()
+    assert manager._launch_thread_pool == {info.replica_id: scanner_worker}
+    return scanner_worker
+
+
+def test_scanner_adoption_before_paid_publication_is_idempotent():
+    """Queue visibility is the handoff: an early adopter is not a collision.
+
+    PR #1857 removed the process-local materialization fence, so the unowned
+    row scanner may adopt a committed paid member before the controller
+    publishes its optional worker.  Publication must then keep the scanner's
+    worker, publish the launch result once, never start a second worker, and
+    a later scanner pass must skip the owned row.
+    """
+    (manager, specs, receipt, binding, info, prepared,
+     launch_result) = _committed_paid_member_for_adoption()
+    scanner_worker = _scanner_adopts_committed_member(manager, binding, info)
+    runtime = manager._legacy_mutation_runtime_state()
+    assert runtime.replica_to_request_id[info.replica_id] == binding.request_id
+
+    publication_worker = mock.Mock(replica_record_id=info.replica_record_id)
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=[info]), \
+         mock.patch.object(manager,
+                           '_prepare_paid_launch_adopter_postcommit',
+                           return_value=prepared), \
+         mock.patch.object(manager,
+                           '_build_bound_launch_adopter',
+                           return_value=publication_worker), \
+         mock.patch.object(manager._spot_placer, 'reserve_retry'), \
+         mock.patch.object(manager, '_persist_spot_placement_state_if_dirty'):
+        materialized = manager.materialize_paid_launch_receipt(
+            receipt, (binding,), specs)
+
+    assert materialized == (launch_result,)
+    assert manager._launch_thread_pool == {info.replica_id: scanner_worker}
+    assert runtime.replica_to_request_id[info.replica_id] == binding.request_id
+    publication_worker.start.assert_not_called()
+    scanner_worker.start.assert_called_once_with()
+    with manager._paid_phase_a_recovery_lock:
+        assert not manager._paid_phase_a_recoveries
+
+    with mock.patch.object(request_postgres,
+                           'inspect_bound_ordinary_launch') as inspect, \
+         mock.patch.object(ordinary_launch_binding,
+                           'retire_pre_admission_non_pool_launch_intent'
+                          ) as retire:
+        manager._reconcile_unowned_bound_non_pool_launches([info])
+    inspect.assert_not_called()
+    retire.assert_not_called()
+
+
+def test_paid_publication_refuses_foreign_local_request_identity():
+    """A local worker bound to a different request is a fail-closed collision."""
+    (manager, specs, receipt, binding, info, prepared,
+     _) = _committed_paid_member_for_adoption()
+    scanner_worker = _scanner_adopts_committed_member(manager, binding, info)
+    runtime = manager._legacy_mutation_runtime_state()
+    runtime.replica_to_request_id[info.replica_id] = 'stale-request'
+
+    publication_worker = mock.Mock(replica_record_id=info.replica_record_id)
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=[info]), \
+         mock.patch.object(manager,
+                           '_prepare_paid_launch_adopter_postcommit',
+                           return_value=prepared), \
+         mock.patch.object(manager,
+                           '_build_bound_launch_adopter',
+                           return_value=publication_worker), \
+         mock.patch.object(manager._spot_placer, 'reserve_retry'), \
+         mock.patch.object(manager, '_persist_spot_placement_state_if_dirty'):
+        with pytest.raises(replica_managers._BoundOrdinaryLaunchUnresolvedError,
+                           match='local request identity'):
+            manager.materialize_paid_launch_receipt(receipt, (binding,), specs)
+
+    assert manager._launch_thread_pool == {info.replica_id: scanner_worker}
+    publication_worker.start.assert_not_called()
+    identity = replica_managers._PaidPhaseARecoveryIdentity(
+        info.replica_id, info.replica_record_id)
+    with manager._paid_phase_a_recovery_lock:
+        assert set(manager._paid_phase_a_recoveries) == {identity}
+
+
 def test_paid_materialization_failure_recovers_complete_sparse_receipt():
     manager, _, _ = _provider_free_paid_manager()
     with mock.patch.object(manager,
@@ -4548,10 +4719,10 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         one_or_none = (
             connection.execute.return_value.mappings.return_value.one_or_none)
         one_or_none.side_effect = [None, predecessor, predecessor]
-        engine = mock.MagicMock()
-        engine.begin.return_value.__enter__.return_value = connection
         connection.dialect.name = 'postgresql'
         connection.in_transaction.return_value = True
+        engine = mock.MagicMock()
+        engine.begin.return_value.__enter__.return_value = connection
         with mock.patch.object(request_postgres,
                                'initialize_and_get_db',
                                return_value=engine):
@@ -4579,10 +4750,10 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         connection = mock.MagicMock()
         (connection.execute.return_value.mappings.return_value.one_or_none.
          return_value) = predecessor
-        engine = mock.MagicMock()
-        engine.begin.return_value.__enter__.return_value = connection
         connection.dialect.name = 'postgresql'
         connection.in_transaction.return_value = True
+        engine = mock.MagicMock()
+        engine.begin.return_value.__enter__.return_value = connection
         with mock.patch.object(request_postgres,
                                'initialize_and_get_db',
                                return_value=engine), \
@@ -8033,8 +8204,7 @@ run: echo hi
         persisted_spec = mock.sentinel.persisted_spec
 
         with mock.patch(
-                'sky.serve.paid_launch_request.serve_utils.'
-                'load_task_with_service_spec',
+                'sky.serve.serve_utils.load_task_with_service_spec',
                 return_value=task) as load_task, \
              mock.patch('sky.serve.replica_managers.usage_lib'), \
              mock.patch('sky.serve.replica_managers.sdk') as mock_sdk:

@@ -619,15 +619,15 @@ class ReservedFillPlanAuthority:
                              'fill reservation evidence.')
 
     @classmethod
-    def not_applicable(cls) -> 'ReservedFillPlanAuthority':
+    def not_applicable(cls) -> ReservedFillPlanAuthority:
         return cls(ReservedFillPlanAuthorityMode.NOT_APPLICABLE)
 
     @classmethod
-    def zero_revocation(cls) -> 'ReservedFillPlanAuthority':
+    def zero_revocation(cls) -> ReservedFillPlanAuthority:
         return cls(ReservedFillPlanAuthorityMode.UNBOUND_ZERO_REVOCATION)
 
     @classmethod
-    def bound(cls, identity: Any) -> 'ReservedFillPlanAuthority':
+    def bound(cls, identity: Any) -> ReservedFillPlanAuthority:
         if not isinstance(identity,
                           reserved_fill_planner.ReservedFillAllocationIdentity):
             raise ValueError(
@@ -638,7 +638,7 @@ class ReservedFillPlanAuthority:
     def gate_ineligible(
         cls,
         reservation_evidence_sha256: str,
-    ) -> 'ReservedFillPlanAuthority':
+    ) -> ReservedFillPlanAuthority:
         """Compatibility spelling for unavailable reservation evidence."""
         return cls.reservation_ineligible(reservation_evidence_sha256)
 
@@ -646,7 +646,7 @@ class ReservedFillPlanAuthority:
     def reservation_ineligible(
         cls,
         reservation_evidence_sha256: str,
-    ) -> 'ReservedFillPlanAuthority':
+    ) -> ReservedFillPlanAuthority:
         """Bind paid authority to exact unavailable reservation evidence."""
         return cls(ReservedFillPlanAuthorityMode.GATE_INELIGIBLE,
                    reservation_evidence_sha256=(reservation_evidence_sha256))
@@ -656,14 +656,14 @@ class ReservedFillPlanAuthority:
         cls,
         accelerators: Sequence[str],
         worker_projection_sha256: str,
-    ) -> 'ReservedFillPlanAuthority':
+    ) -> ReservedFillPlanAuthority:
         canonical = tuple(sorted({card.casefold() for card in accelerators}))
         return cls(ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE,
                    incompatible_accelerators=canonical,
                    worker_projection_sha256=worker_projection_sha256)
 
     @classmethod
-    def from_mapping(cls, value: Any) -> 'ReservedFillPlanAuthority':
+    def from_mapping(cls, value: Any) -> ReservedFillPlanAuthority:
         allowed = {
             'mode', 'allocation', 'incompatible_accelerators',
             'worker_projection_sha256', 'reservation_evidence_sha256'
@@ -1375,6 +1375,17 @@ def autoscaler_history_snapshot_from_committed_plan(
         peak_queue_depth=queue_depth,
         accelerator_breakdown=accelerator_breakdown,
         observed_at=observed_at)
+
+
+def _resolve_lazy_transaction_dependencies(*resolved: object) -> None:
+    """Force lazy module resolution before a correctness transaction opens.
+
+    Evaluating each argument at the call site imports its lazily bound module
+    (including nested lazy modules), so cold import order cannot lengthen
+    correctness locks or introduce import-time I/O inside the transaction.
+    The resolved attributes themselves are intentionally unused.
+    """
+    del resolved
 
 
 @contextlib.contextmanager
@@ -4312,7 +4323,6 @@ def _canonical_prepared_paid_launch_specs(
             if current_balancing_tier is not None:
                 closed_balancing_tiers.add(current_balancing_tier)
             current_balancing_tier = balancing_tier
-        identity = (spec.replica_id, spec.replica_record_id)
         if spec.replica_id in identities or spec.replica_record_id in record_ids:
             raise ValueError('Prepared paid launch identities are duplicated.')
         identities.add(spec.replica_id)
@@ -4423,7 +4433,7 @@ def _resolve_locked_policy_history(
     backend_num_nodes: int,
     locked_capacity: _LockedCapacityRows,
     lane_projection: kueue_lane_capacity.KueueAdmissionCapacityProjection,
-    allocation_reserved: Mapping[str, int],
+    allocation_reserved: Mapping[str, int],  # pylint: disable=unused-argument
     raw_claim_count: int,
     raw_waiter_count: int,
     dependent_effect_count: int,
@@ -5320,9 +5330,9 @@ class CapacityAdmissionRepository:
         authority_valid_until: datetime.datetime,
     ) -> _WrittenCapacityPlan:
         """Persist one plan without reacquiring its prelocked history."""
-        capacity_target = _canonical_counts(plan.capacity_target_by_accelerator,
-                                            'capacity_target_by_accelerator')
-        accounting_cards = set(capacity_target)
+        # Validation only: a noncanonical target must still fail closed here.
+        _canonical_counts(plan.capacity_target_by_accelerator,
+                          'capacity_target_by_accelerator')
         watermark_sha256 = _sha256(_canonical_watermark(plan.receipt_watermark))
         previous = locked_history.previous
         duplicate_payload = None
@@ -5484,21 +5494,24 @@ class CapacityAdmissionRepository:
         # module-level APIs.  Resolve every lazy module they may enter before
         # opening the correctness transaction so cold import order cannot
         # lengthen locks or introduce import-time I/O.
-        serve_state.lock_zero_cost_protocol_for_bound_launch_observation  # pylint: disable=pointless-statement
-        reserved_fill_allocation.ReservedFillAllocationRepository  # pylint: disable=pointless-statement
-        reserved_fill_planner.FillCapacityUnit  # pylint: disable=pointless-statement
-        zero_cost_actuation.replica_capacity_for_unit  # pylint: disable=pointless-statement
-        ordinary_launch_binding.ControllerBindingAuthority  # pylint: disable=pointless-statement
-        ordinary_launch_binding.system_oom_recovery.has_v3_system_oom_recovery_context  # pylint: disable=pointless-statement
-        serve_state.replica_managers.ReplicaInfo  # pylint: disable=pointless-statement
-        serve_paid_capacity.replica_info_lib.ReplicaInfo  # pylint: disable=pointless-statement
-        service_spec.SkyServiceSpec  # pylint: disable=pointless-statement
-        kubernetes_identity.validate_worker_placement_projections  # pylint: disable=pointless-statement
-        request_postgres.non_pool_launch_binding_fleet_capable  # pylint: disable=pointless-statement
-        # Resolve request modules and run the complete canonical reconstruction
-        # before correctness locks.  The advisory source facts are compared to
-        # the locked service/version rows below; they never authorize a launch.
-        paid_launch_request.prepare_paid_launch_request  # pylint: disable=pointless-statement
+        _resolve_lazy_transaction_dependencies(
+            serve_state.lock_zero_cost_protocol_for_bound_launch_observation,
+            reserved_fill_allocation.ReservedFillAllocationRepository,
+            reserved_fill_planner.FillCapacityUnit,
+            zero_cost_actuation.replica_capacity_for_unit,
+            ordinary_launch_binding.ControllerBindingAuthority,
+            ordinary_launch_binding.system_oom_recovery.
+            has_v3_system_oom_recovery_context,
+            serve_state.replica_managers.ReplicaInfo,
+            serve_paid_capacity.replica_info_lib.ReplicaInfo,
+            service_spec.SkyServiceSpec,
+            kubernetes_identity.validate_worker_placement_projections,
+            request_postgres.non_pool_launch_binding_fleet_capable,
+            # Resolve request modules and run the complete canonical
+            # reconstruction before correctness locks.  The advisory source
+            # facts are compared to the locked service/version rows below;
+            # they never authorize a launch.
+            paid_launch_request.prepare_paid_launch_request)
         bind_paid_executables = (
             paid_wave_admission.bind_accepted_in_transaction)
         record_paid_executable_commit = paid_wave_admission.record_fused_commit

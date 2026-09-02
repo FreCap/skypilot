@@ -948,7 +948,12 @@ def _stage_durable_fill(
         transaction = connection.begin()
         try:
             staged, _ = reserved_fill_admission._stage_and_bind(
-                connection, spec, 7, require_existing=False)
+                connection,
+                spec,
+                7,
+                runtime=request_postgres.
+                prepare_non_pool_launch_binding_runtime(),
+                require_existing=False)
         except reserved_fill_admission._Rejected:
             transaction.rollback()
             return False

@@ -6284,12 +6284,15 @@ def _validate_paid_capacity_admission_inputs(
 
 
 def _paid_capacity_admission_census_in_session(
-    session: orm.Session,
-    service_name: str,
-    service_hash: str,
-    persistence_specs: list[paid_capacity.PaidClaimPersistenceSpec],
-    *,
-    max_live_paid_gpu_units: int | None,
+        session: orm.Session,
+        service_name: str,
+        service_hash: str,
+        persistence_specs: list[paid_capacity.PaidClaimPersistenceSpec],
+        *,
+        # The caller enforces the cap through
+        # _paid_capacity_admission_is_immediately_saturated; the census keeps the
+        # keyword for its existing production and test callers.
+        max_live_paid_gpu_units: int | None,  # pylint: disable=unused-argument
 ) -> _PaidCapacityAdmissionCensus | None:
     """Read exact service/physical-GPU debits under its owner lock."""
     try:
@@ -7620,7 +7623,7 @@ def _transition_paid_retirement(
     with write_session(service_name) as locked_session:
         if locked_session is None:
             return False
-        engine, session = locked_session
+        engine, session = locked_session  # pylint: disable=unpacking-non-sequence
         if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
             raise RuntimeError('Paid retirement requires PostgreSQL.')
         owner = session.execute(
@@ -8222,7 +8225,7 @@ def cancel_paid_retirements(
         if locked_record_ids is None:
             session.rollback()
             return set()
-        cancelled_infos: list[tuple[int, 'replica_managers.ReplicaInfo']] = []
+        cancelled_infos: list[tuple[int, replica_managers.ReplicaInfo]] = []
         try:
             for replica_id in sorted(infos_by_id):
                 info = infos_by_id[replica_id]
@@ -9468,8 +9471,7 @@ def reserve_replica_launches_running_if_capacity(
             service_name, guard_launch_authority=True) as admission:
         if admission is None:
             return {}
-        engine = admission[0]
-        session = admission[1]
+        engine, session = admission  # pylint: disable=unpacking-non-sequence
         if not _prelock_serve_mutation_rows(
                 session, engine, service_name, expected_service_hash,
                 expected_lifecycle_epoch, expected_controller_owner):
@@ -9491,7 +9493,7 @@ def reserve_replica_launches_running_if_capacity(
                         replicas_table.c.replica_id).with_for_update()
         ).mappings().all()
         rows_by_id = {int(row['replica_id']): row for row in rows}
-        selected: dict[int, 'replica_managers.ReplicaInfo'] = {}
+        selected: dict[int, replica_managers.ReplicaInfo] = {}
         for replica_id, replica_record_id, require_bound in candidates:
             if len(selected) >= remaining:
                 break
@@ -9563,8 +9565,7 @@ def restore_never_started_replica_launch_to_scheduled(
             service_name, guard_launch_authority=True) as admission:
         if admission is None:
             return None
-        engine = admission[0]
-        session = admission[1]
+        engine, session = admission  # pylint: disable=unpacking-non-sequence
         if not _prelock_serve_mutation_rows(
                 session, engine, service_name, expected_service_hash,
                 expected_lifecycle_epoch, expected_controller_owner):
@@ -9619,8 +9620,7 @@ def restore_never_started_replica_teardown_to_scheduled(
             service_name, guard_launch_authority=True) as admission:
         if admission is None:
             return None
-        engine = admission[0]
-        session = admission[1]
+        engine, session = admission  # pylint: disable=unpacking-non-sequence
         if not _prelock_serve_mutation_rows(
                 session, engine, service_name, expected_service_hash,
                 expected_lifecycle_epoch, expected_controller_owner):
@@ -9786,8 +9786,7 @@ def reserve_replica_teardowns_running_if_capacity(
             service_name, guard_launch_authority=True) as admission:
         if admission is None:
             return {}
-        engine = admission[0]
-        session = admission[1]
+        engine, session = admission  # pylint: disable=unpacking-non-sequence
         if not _prelock_serve_mutation_rows(
                 session, engine, service_name, expected_service_hash,
                 expected_lifecycle_epoch, expected_controller_owner):
@@ -9808,7 +9807,7 @@ def reserve_replica_teardowns_running_if_capacity(
                 replicas_table.c.replica_id.in_(candidate_ids)).order_by(
                     replicas_table.c.replica_id).with_for_update()).fetchall()
         by_id = {int(row.replica_id): row for row in rows}
-        selected: list[tuple[int, 'replica_managers.ReplicaInfo']] = []
+        selected: list[tuple[int, replica_managers.ReplicaInfo]] = []
         for replica_id, replica_record_id in candidates:
             if len(selected) >= remaining:
                 break
@@ -12799,6 +12798,10 @@ def replace_reserved_fill_claim_set(
                     reserved_fill_claims_table.c.service_name == service_name))
             session.commit()
             return None
+        expected_scope: (reserved_fill_reclaim_attestation.ReclaimClaimSetScope
+                         | None) = None
+        identity: (reserved_fill_reclaim_attestation.ReclaimPolicyIdentity |
+                   None) = None
         if gate_state == pool_capacity_observation_schema.SEQUENCED_ACTIVE:
             assert service_version is not None
             assert reclaim_claim_authorizer is not None
@@ -12860,6 +12863,7 @@ def replace_reserved_fill_claim_set(
                 session, service_name))
         if gate_state == pool_capacity_observation_schema.SEQUENCED_ACTIVE:
             assert reclaim_claim_authorizer is not None
+            assert expected_scope is not None and identity is not None
             try:
                 # All SQL locks defining ``expected_scope`` and the complete
                 # current write set are now held. Mint and validate the

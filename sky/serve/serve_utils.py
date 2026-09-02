@@ -4513,7 +4513,7 @@ def run_bounded_serve_teardown_threads(
                                     raise RuntimeError(
                                         'Serve teardown restoration changed '
                                         'exact replica identity '
-                                        f'{identity!r}.')
+                                        f'{identity!r}.') from error
                                 effective_infos[identity] = restored
                         if worker.ident is not None:
                             logger.warning(

@@ -34,8 +34,7 @@ def upgrade() -> None:
     _require_postgresql()
     inspector = sa.inspect(op.get_bind())
     if (not inspector.has_table('users') or 'id' not in {
-            str(column['name'])
-            for column in inspector.get_columns('users')
+            str(column['name']) for column in inspector.get_columns('users')
     }):
         raise RuntimeError(
             'Serve055 requires the global user-state users(id) schema. '

@@ -1391,7 +1391,7 @@ def test_historical_cohort_cannot_start_provider_effect(
     assert current_cohort > history_distance
     historical_cohort = current_cohort - history_distance
     if history_distance == 1:
-        assert historical_cohort == 13
+        assert historical_cohort == 14
     with monkeypatch.context() as old_code:
         old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
                          historical_cohort)
@@ -1599,7 +1599,7 @@ def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
     current_projection = (
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    assert (current_cohort, current_projection) == (14, 10)
+    assert (current_cohort, current_projection) == (15, 10)
     historical_cohort = current_cohort - history_distance
     historical_projection = current_projection - history_distance
     info = _reserved_fill_replica_info()

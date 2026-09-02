@@ -619,7 +619,7 @@ def _resolved_request_backend_capability() -> tuple[str, str, bool]:
 
 def prepare_non_pool_launch_binding_runtime() -> NonPoolLaunchBindingRuntime:
     """Resolve handler and backend globals before a caller opens its txn."""
-    ordinary_launch_binding.NonPoolBindingIdentity  # pylint: disable=pointless-statement
+    ordinary_launch_binding.load_module()
     try:
         registration = request_registry.registration_for_handler(
             non_pool_launch_request.launch)
@@ -3904,9 +3904,10 @@ def _paid_capacity_claim_is_released(
         return False
     claims = serve_state_schema.paid_capacity_claims_table
     claim_count = connection.execute(
-        sqlalchemy.select(sqlalchemy.func.count()).select_from(claims).where(
-            claims.c.service_name == association['service_name'],
-            claims.c.replica_id == association['replica_id'])).scalar_one()
+        sqlalchemy.select(sqlalchemy.func.count()).select_from(  # pylint: disable=not-callable
+            claims).where(
+                claims.c.service_name == association['service_name'],
+                claims.c.replica_id == association['replica_id'])).scalar_one()
     replica_pool_key = connection.execute(
         sqlalchemy.select(
             serve_state_schema.replicas_table.c.paid_capacity_pool_key).where(
@@ -4395,6 +4396,23 @@ def _gcp_launch_task_supports_plain_compute_disk_reconciliation(
                                                reject_duplicate_keys=True)
     except Exception:  # pylint: disable=broad-except
         return False
+
+    def _has_unsupported_provider_identity(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if key == 'volumes' and child not in (None, {}, []):
+                    return True
+                if key == 'diskName' and child is not None:
+                    return True
+                if (key == 'managed_instance_group' and child is not None):
+                    return True
+                if _has_unsupported_provider_identity(child):
+                    return True
+        elif isinstance(value, list):
+            return any(
+                _has_unsupported_provider_identity(item) for item in value)
+        return False
+
     saw_task = False
     for config in configs:
         if not isinstance(config, Mapping):
@@ -4408,23 +4426,6 @@ def _gcp_launch_task_supports_plain_compute_disk_reconciliation(
         resources = config.get('resources')
         if resources is None:
             continue
-
-        def _has_unsupported_provider_identity(value: Any) -> bool:
-            if isinstance(value, Mapping):
-                for key, child in value.items():
-                    if key == 'volumes' and child not in (None, {}, []):
-                        return True
-                    if key == 'diskName' and child is not None:
-                        return True
-                    if (key == 'managed_instance_group' and child is not None):
-                        return True
-                    if _has_unsupported_provider_identity(child):
-                        return True
-            elif isinstance(value, list):
-                return any(
-                    _has_unsupported_provider_identity(item) for item in value)
-            return False
-
         if _has_unsupported_provider_identity(resources):
             return False
     return saw_task

@@ -10,17 +10,20 @@ import threading
 import time
 import typing
 
+from alembic import command as alembic_command
 import pytest
 import sqlalchemy
 from test_serve_resource_action_state_pg import postgres_engine
 
 from sky import global_user_state
+from sky import global_user_state_schema
 from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import service_spec
 from sky.utils import locks
 from sky.utils.db import db_utils
+from sky.utils.db import migration_utils
 
 _SERVICE_NAME = 'launch-authority-primary'
 _OTHER_SERVICE_NAME = 'launch-authority-peer'
@@ -29,6 +32,7 @@ _OTHER_SERVICE_HASH = '22222222-2222-4222-8222-222222222222'
 _RECREATED_SERVICE_HASH = '33333333-3333-4333-8333-333333333333'
 _CONTROLLER_PID = 123
 _CONTROLLER_IP = '10.0.0.1'
+_LIFECYCLE_EPOCH = 4
 _REPLACEMENT_CONTROLLER_PID = 456
 _REPLACEMENT_CONTROLLER_IP = '10.0.0.2'
 _WAIT_TIMEOUT_SECONDS = 10
@@ -52,7 +56,17 @@ def launch_authority_database(postgres_engine, monkeypatch):  # noqa: F811
     with postgres_engine.begin() as connection:
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
         connection.exec_driver_sql('CREATE SCHEMA public')
-    serve_state_schema.Base.metadata.create_all(postgres_engine)
+    # Version elections read the alembic revision and the Kueue admission
+    # tables (#1659), so the fixture must carry the migrated schema rather
+    # than bare metadata.  Serve055 requires the global users(id) table.
+    global_user_state_schema.user_table.create(postgres_engine, checkfirst=True)
+    config = migration_utils.get_alembic_config(postgres_engine,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, migration_utils.SERVE_VERSION)
+    # Final deletion sweeps the bound launch requests of the service.
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         migration_utils.API_REQUESTS_VERSION)
     monkeypatch.setattr(serve_state._db_manager, '_engine', postgres_engine)
     _seed_service(postgres_engine, _SERVICE_NAME, _SERVICE_HASH)
     _seed_service(postgres_engine, _OTHER_SERVICE_NAME, _OTHER_SERVICE_HASH)
@@ -64,6 +78,10 @@ def _seed_service(engine: sqlalchemy.engine.Engine, service_name: str,
     config, config_digest, snapshot_id = _controller_config_snapshot(
         service_name, 1)
     with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.service_lifecycle_fences_table).values(
+                    name=service_name, epoch=_LIFECYCLE_EPOCH))
         connection.execute(serve_state.services_table.insert().values(
             name=service_name,
             status=serve_state.ServiceStatus.READY.value,
@@ -72,6 +90,7 @@ def _seed_service(engine: sqlalchemy.engine.Engine, service_name: str,
             controller_pid=_CONTROLLER_PID,
             controller_ip=_CONTROLLER_IP,
             hash=service_hash,
+            lifecycle_epoch=_LIFECYCLE_EPOCH,
             logical_replica_semantics=0,
             lb_ha_enabled=0))
         connection.execute(serve_state.version_specs_table.insert().values(
@@ -83,6 +102,16 @@ def _seed_service(engine: sqlalchemy.engine.Engine, service_name: str,
             controller_config_digest=config_digest,
             controller_config_snapshot_id=snapshot_id,
             controller_applied_at=time.time()))
+
+
+def _mark_shutting_down(engine: sqlalchemy.engine.Engine,
+                        service_name: str) -> None:
+    """Move a seeded service into the lifecycle final deletion requires."""
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state.services_table).where(
+                serve_state.services_table.c.name == service_name).values(
+                    status=serve_state.ServiceStatus.SHUTTING_DOWN.value))
 
 
 def _controller_config_snapshot(
@@ -363,6 +392,7 @@ def test_shared_provider_guard_blocks_deletion_and_stales_reader(
     engine = launch_authority_database
     launch_context = _launch_context(_SERVICE_NAME, _SERVICE_HASH)
     assert serve_state.service_replica_launch_fence_holds(launch_context)
+    _mark_shutting_down(engine, _SERVICE_NAME)
 
     result = _run_writer_behind_shared_guard(
         engine, _SERVICE_NAME, lambda: serve_state.remove_service_completely(
@@ -376,6 +406,7 @@ def test_shared_provider_guard_blocks_same_name_creation(
         launch_authority_database):
     engine = launch_authority_database
     old_context = _launch_context(_SERVICE_NAME, _SERVICE_HASH)
+    _mark_shutting_down(engine, _SERVICE_NAME)
     assert serve_state.remove_service_completely(
         _SERVICE_NAME, _SERVICE_HASH, (_CONTROLLER_PID, _CONTROLLER_IP))
     assert not serve_state.service_replica_launch_fence_holds(old_context)
