@@ -4,6 +4,7 @@
 import datetime
 import importlib
 import json
+import pathlib
 
 from alembic import command as alembic_command
 from alembic import script as alembic_script
@@ -34,6 +35,24 @@ def _function_definition(engine: sqlalchemy.engine.Engine,
 
 def _compact(expression: str) -> str:
     return ''.join(expression.split())
+
+
+def _newest_projection_check() -> str:
+    """Return the projection CHECK text of the newest owning migration.
+
+    Later migrations rewrite ``serve047_provider_absence_projection_ck`` in
+    place, so the live table metadata tracks the newest owner rather than this
+    migration's own text.
+    """
+    newest = None
+    for path in sorted(pathlib.Path(_MIGRATION.__file__).parent.glob('0*.py')):
+        module = importlib.import_module(
+            f'{_MIGRATION.__name__.rsplit(".", 1)[0]}.{path.stem}')
+        if getattr(module, '_PROJECTION_CONSTRAINT',
+                   None) == _MIGRATION._PROJECTION_CONSTRAINT:
+            newest = module._PROJECTION_CHECK
+    assert newest is not None
+    return newest
 
 
 def _pool_key(*,
@@ -121,7 +140,7 @@ def test_serve061_lineage_and_runtime_metadata() -> None:
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
         if item.name == _MIGRATION._PROJECTION_CONSTRAINT)
     assert _compact(str(constraint.sqltext)) == _compact(
-        _MIGRATION._PROJECTION_CHECK)
+        _newest_projection_check())
 
 
 def test_serve061_migrates_the_live_060_constraint_and_guards(

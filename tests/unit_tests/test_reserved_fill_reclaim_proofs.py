@@ -319,7 +319,7 @@ def _provider_proof(
         local_queue_name=(None if admission is None else
                           admission['local_queue_name']),
         cluster_queue_name=(None if admission is None else
-                            admission['queues']['inference_cluster_queue']),
+                            admission['cluster_queue_name']),
         pod_identity_irsa_annotation_absent=True,
         assign_queue_labels_for_pods=(True if kueue_managed else None),
         topology_aware_scheduling=(True if kueue_managed else None),
@@ -522,7 +522,8 @@ def test_serve054_is_forward_only(proof_engine):
     with pytest.raises(RuntimeError, match='forward-only'):
         alembic_command.downgrade(config, '053')
     assert migration_utils.get_current_alembic_revision(
-        proof_engine, migration_utils.SERVE_DB_NAME) == '058'
+        proof_engine,
+        migration_utils.SERVE_DB_NAME) == migration_utils.SERVE_VERSION
     assert (proof_schema.serve_reserved_fill_reclaim_provider_proofs_table.name
             in sqlalchemy.inspect(proof_engine).get_table_names())
 

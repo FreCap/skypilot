@@ -162,12 +162,11 @@ def test_broker_lock_exit_timeout_after_commit_hydrates_not_rejects(
         launch_generation=1,
         context=mock.sentinel.context)
     staged = mock.Mock()
-    lock = SimpleNamespace(
-        acquire=mock.Mock(side_effect=(_ExitTimeout(),
-                                       contextlib.nullcontext())))
-    monkeypatch.setattr(reserved_fill_admission, '_frozen_identity',
-                        lambda _spec: (mock.sentinel.body,
-                                       mock.sentinel.intent))
+    lock = SimpleNamespace(acquire=mock.Mock(
+        side_effect=(_ExitTimeout(), contextlib.nullcontext())))
+    monkeypatch.setattr(
+        reserved_fill_admission, '_frozen_identity', lambda _spec:
+        (mock.sentinel.body, mock.sentinel.intent))
     monkeypatch.setattr(reserved_fill_admission.request_postgres,
                         'non_pool_launch_binding_fleet_capable', lambda: True)
     monkeypatch.setattr(reserved_fill_admission.reserved_capacity_broker.locks,
@@ -205,9 +204,9 @@ def test_broker_lock_acquisition_timeout_is_definite_rejection(
     acquisition = mock.MagicMock()
     acquisition.__enter__.side_effect = locks.LockTimeout('busy')
     lock = SimpleNamespace(acquire=mock.Mock(return_value=acquisition))
-    monkeypatch.setattr(reserved_fill_admission, '_frozen_identity',
-                        lambda _spec: (mock.sentinel.body,
-                                       mock.sentinel.intent))
+    monkeypatch.setattr(
+        reserved_fill_admission, '_frozen_identity', lambda _spec:
+        (mock.sentinel.body, mock.sentinel.intent))
     monkeypatch.setattr(reserved_fill_admission.request_postgres,
                         'non_pool_launch_binding_fleet_capable', lambda: True)
     monkeypatch.setattr(reserved_fill_admission.reserved_capacity_broker.locks,
@@ -230,13 +229,27 @@ def test_connection_close_error_cannot_mask_transaction_interrupt(
     engine.connect.return_value = connection
     monkeypatch.setattr(reserved_fill_admission.request_postgres,
                         'initialize_and_get_db', lambda: engine)
+    # The transaction acquires Serve mutation admission, replica launch
+    # authority, and the mutation count before staging (#1728); a bare Mock
+    # connection has no dialect, so grant them and keep the interrupt at
+    # staging.
+    monkeypatch.setattr(reserved_fill_admission.serve_state,
+                        'try_acquire_serve_mutation_admission_in_transaction',
+                        lambda _connection: True)
+    monkeypatch.setattr(reserved_fill_admission.serve_state,
+                        'try_acquire_replica_launch_authority_in_transaction',
+                        lambda _connection, _engine, _service_name: True)
+    monkeypatch.setattr(reserved_fill_admission.serve_state,
+                        'get_replica_mutation_counts_in_transaction',
+                        lambda _connection: (0, 0))
     monkeypatch.setattr(reserved_fill_admission, '_stage_and_bind',
                         mock.Mock(side_effect=_InjectedInterrupt()))
+    spec = mock.Mock()
+    spec.authority.service_name = 'service-a'
+    spec.launch_limit = 1
 
     with pytest.raises(_InjectedInterrupt) as raised:
-        reserved_fill_admission._transaction(mock.sentinel.spec,
-                                              37,
-                                              require_existing=False)
+        reserved_fill_admission._transaction(spec, 37, require_existing=False)
 
     assert isinstance(raised.value.__cause__, RuntimeError)
     connection.begin.return_value.rollback.assert_called_once_with()
@@ -254,8 +267,8 @@ def test_nonexception_baseexception_is_re_raised_after_evidence_handling(
         context=mock.sentinel.context)
     staged = mock.Mock()
     if point == 'commit':
-        transaction = mock.Mock(side_effect=(_InjectedFault(),
-                                             (staged, receipt)))
+        transaction = mock.Mock(side_effect=(_InjectedFault(), (staged,
+                                                                receipt)))
     elif point == 'hydration':
         transaction = mock.Mock(side_effect=(_InjectedFault(),
                                              _InjectedFault()))
