@@ -236,7 +236,7 @@ describe('ServeHistorySection', () => {
   it('renders explicit loading and unavailable placeholders', () => {
     const { rerender } = render(<ServeHistorySection history={null} loading />);
     expect(
-      screen.getByText('Loading request and capacity history...')
+      screen.getByText('Loading recorded request and capacity history...')
     ).toBeInTheDocument();
 
     rerender(
@@ -246,7 +246,7 @@ describe('ServeHistorySection', () => {
     );
     expect(
       screen.getByText(
-        /Request and capacity history is temporarily unavailable/
+        /Recorded request and capacity history is temporarily unavailable/
       )
     ).toBeInTheDocument();
   });

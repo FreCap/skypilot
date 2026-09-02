@@ -831,7 +831,7 @@ describe('getServiceDemand', () => {
     apiClient.get.mockResolvedValue({
       ok: true,
       status: 200,
-      headers: { get: () => '92' },
+      headers: { get: () => '94' },
       json: async () => ({
         service_name: 'boltz/l4',
         service_hash: 'hash/a',
@@ -851,6 +851,11 @@ describe('getServiceDemand', () => {
         http_in_flight_requests: 1,
         request_queue_depth: 1,
         rejected_requests: 0,
+        unique_job_arrivals_60s: 10,
+        unique_job_arrivals_300s: 12,
+        headerless_arrivals_60s: 2,
+        headerless_arrivals_300s: 3,
+        offered_arrival_tracking_saturated: false,
         request_stats_age_seconds: 1.5,
         request_telemetry_source: 'postgresql_lb_demand_reports',
         async_request_summary: {
@@ -916,6 +921,13 @@ describe('getServiceDemand', () => {
       processingRequests: 2,
       confirmedProcessingRequests: 2,
       httpInFlightRequests: 1,
+      offeredArrivalTelemetryAvailable: true,
+      offeredArrivalTelemetryValid: true,
+      uniqueJobArrivals60s: 10,
+      uniqueJobArrivals300s: 12,
+      headerlessArrivals60s: 2,
+      headerlessArrivals300s: 3,
+      offeredArrivalTrackingSaturated: false,
       asyncRequestSummary: {
         available: true,
         source: 'postgresql_async_request_ledger',
@@ -1002,6 +1014,76 @@ describe('getServiceDemand', () => {
     ).rejects.toThrow('Service demand response was malformed');
   });
 
+  it('requires offered-arrival telemetry only from servers advertising it', async () => {
+    const payload = {
+      service_name: 'svc',
+      service_hash: 'hash-a',
+      request_telemetry_state: 'fresh',
+      request_telemetry_source: 'postgresql_lb_demand_reports',
+      async_request_summary: {
+        available: false,
+        reason: 'no_ledger_rows',
+      },
+    };
+    apiClient.get.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => '93' },
+      json: async () => payload,
+    });
+    await expect(
+      getServiceDemand({ serviceName: 'svc', serviceHash: 'hash-a' })
+    ).resolves.toMatchObject({ offeredArrivalTelemetryAvailable: false });
+
+    apiClient.get.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => '94' },
+      json: async () => payload,
+    });
+    await expect(
+      getServiceDemand({ serviceName: 'svc', serviceHash: 'hash-a' })
+    ).rejects.toThrow('Service demand response was malformed');
+
+    apiClient.get.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => '94' },
+      json: async () => ({
+        ...payload,
+        request_telemetry_state: 'stale',
+        unique_job_arrivals_60s: null,
+        unique_job_arrivals_300s: null,
+        headerless_arrivals_60s: null,
+        headerless_arrivals_300s: null,
+        offered_arrival_tracking_saturated: null,
+      }),
+    });
+    await expect(
+      getServiceDemand({ serviceName: 'svc', serviceHash: 'hash-a' })
+    ).resolves.toMatchObject({
+      offeredArrivalTelemetryAvailable: false,
+      offeredArrivalTelemetryValid: true,
+    });
+
+    apiClient.get.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => '94' },
+      json: async () => ({
+        ...payload,
+        unique_job_arrivals_60s: 'invalid',
+        unique_job_arrivals_300s: 'invalid',
+        headerless_arrivals_60s: 'invalid',
+        headerless_arrivals_300s: 'invalid',
+        offered_arrival_tracking_saturated: 'invalid',
+      }),
+    });
+    await expect(
+      getServiceDemand({ serviceName: 'svc', serviceHash: 'hash-a' })
+    ).rejects.toThrow('Service demand response was malformed');
+  });
+
   it('rejects an exact summary from a different incarnation', async () => {
     apiClient.get.mockResolvedValue({
       ok: true,
@@ -1061,6 +1143,11 @@ describe('getServiceDemand', () => {
         http_in_flight_requests: 1,
         unknown_in_flight_replica_count: 3,
         request_telemetry_compatibility_complete: 'yes',
+        unique_job_arrivals_60s: 4,
+        unique_job_arrivals_300s: 8,
+        headerless_arrivals_60s: -1,
+        headerless_arrivals_300s: 3,
+        offered_arrival_tracking_saturated: true,
       })
     ).toMatchObject({
       recentRequestCount: 0,
@@ -1074,6 +1161,13 @@ describe('getServiceDemand', () => {
       httpInFlightRequests: 1,
       unknownInFlightReplicaCount: 3,
       requestTelemetryCompatibilityComplete: null,
+      offeredArrivalTelemetryAvailable: false,
+      offeredArrivalTelemetryValid: false,
+      uniqueJobArrivals60s: 4,
+      uniqueJobArrivals300s: 8,
+      headerlessArrivals60s: null,
+      headerlessArrivals300s: 3,
+      offeredArrivalTrackingSaturated: true,
     });
     expect(
       normalizeServiceDemand({
@@ -1086,6 +1180,13 @@ describe('getServiceDemand', () => {
       processingRequests: null,
       confirmedProcessingRequests: null,
       httpInFlightRequests: null,
+      offeredArrivalTelemetryAvailable: false,
+      offeredArrivalTelemetryValid: false,
+      uniqueJobArrivals60s: null,
+      uniqueJobArrivals300s: null,
+      headerlessArrivals60s: null,
+      headerlessArrivals300s: null,
+      offeredArrivalTrackingSaturated: null,
     });
   });
 });
