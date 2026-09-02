@@ -1,4 +1,5 @@
 """Lifecycle/finalizer contracts for the billable SkyServe qualifier."""
+# pylint: disable=protected-access
 
 import argparse
 import asyncio
@@ -48,22 +49,60 @@ class _FakeLifecycle:
 
 
 def _args(tmp_path):
-    return argparse.Namespace(profile='small',
-                              provider=None,
-                              service_name='paid-e2e-unit',
-                              artifacts_dir=str(tmp_path),
-                              source='source.yaml',
-                              economic_receipt=None,
-                              workspace='paid-workspace',
-                              sky_cli='sky',
-                              command_timeout_seconds=60,
-                              endpoint_timeout_seconds=60,
-                              scope_timeout_seconds=60,
-                              down_timeout_seconds=60,
-                              cleanup_timeout_seconds=60,
-                              poll_seconds=1,
-                              auth_token_env='TOKEN',
-                              postgres_url_env='DATABASE')
+    return argparse.Namespace(
+        profile='small',
+        provider=None,
+        service_name='paid-e2e-unit',
+        artifacts_dir=str(tmp_path),
+        source='source.yaml',
+        economic_receipt=None,
+        workspace='paid-workspace',
+        sky_cli='sky',
+        command_timeout_seconds=60,
+        endpoint_timeout_seconds=60,
+        scope_timeout_seconds=60,
+        down_timeout_seconds=60,
+        cleanup_timeout_seconds=60,
+        poll_seconds=1,
+        endpoint_mode=(lifecycle_module.EndpointMode.PUBLISHED),
+        auth_token_env='TOKEN',
+        postgres_url_env='DATABASE')
+
+
+def _provider_scope(**overrides):
+    values = {
+        'service_hash': 'provider-service-hash',
+        'resource_scope': 'authoritative-resource-scope',
+        'lifecycle_epoch': 7,
+        'service_version': 11,
+        'max_live_paid_gpu_units': 1,
+        'providers': ('gcp',),
+        'project_id': 'durable-project',
+        'workspace': 'workspace-a',
+        'location_scope':
+            lifecycle_module.qualify.GcpLocationScope.PROJECT_WIDE,
+        'aws_location_scope': None,
+        'aws_regions': (),
+        'catalog_shapes': (lifecycle_module.qualify.CatalogShape(
+            cloud='gcp',
+            region='us-central1',
+            zone='us-central1-a',
+            instance_type='g2-standard-4',
+            gpu_units_per_instance=1),),
+        'placement_catalog_sha256': 'c' * 64,
+        'service_yaml_sha256': 'd' * 64,
+        'qualification_profile': 'provider-canary',
+        'qualification_source_sha256': 'e' * 64,
+        'qualification_projection_sha256':
+            lifecycle_module.qualify._qualification_projection_sha256(
+                source_sha256='e' * 64,
+                profile=lifecycle_module.qualify.PROFILES['provider-canary'],
+                providers=('gcp',)),
+        'controller_config_digest': 'a' * 64,
+        'controller_config_snapshot_id': 'b' * 64,
+    }
+    values.update(overrides)
+    return lifecycle_module.qualify.ProviderScope(**values)
 
 
 def _install_operations(monkeypatch,
@@ -81,7 +120,9 @@ def _install_operations(monkeypatch,
         events.append(('freeze', args.service_name))
         if freeze_error is not None:
             raise freeze_error
-        pathlib.Path(args.output).write_text('{}\n', encoding='utf-8')
+        lifecycle_module.qualify.write_provider_scope(pathlib.Path(args.output),
+                                                      args.service_name,
+                                                      _provider_scope())
 
     async def qualify(args):
         events.append(('qualify', args.endpoint))
@@ -158,6 +199,97 @@ def test_sky_cli_lifecycle_pins_workspace_at_command_boundary(
     assert commands == [('sky', 'serve', 'up', '-n', 'paid-e2e', '-y',
                          str(tmp_path / 'service.yaml'), '--config',
                          'active_workspace=mt_hybrid')]
+
+
+def test_in_cluster_endpoint_uses_frozen_resource_scope(tmp_path):
+    service_name = 'paid-e2e-unit'
+    provider_scope = tmp_path / 'scope.json'
+    resource_scope = 'authoritative-resource-scope'
+    lifecycle_module.qualify.write_provider_scope(
+        provider_scope, service_name,
+        _provider_scope(resource_scope=resource_scope))
+    resolver = lifecycle_module.InClusterEndpointResolver(namespace='skypilot')
+
+    endpoint = asyncio.run(
+        resolver.resolve(
+            lifecycle_module.EndpointResolutionRequest(
+                service_name=service_name, provider_scope=provider_scope)))
+
+    scoped_name = lifecycle_module.lb_k8s.lb_service_name(
+        service_name, resource_scope)
+    legacy_name = lifecycle_module.lb_k8s.lb_service_name(service_name)
+    assert endpoint == (
+        f'http://{scoped_name}.skypilot:'
+        f'{lifecycle_module.serve_constants.LOAD_BALANCER_PORT_START}')
+    assert scoped_name != legacy_name
+    assert endpoint != (
+        f'http://{legacy_name}.skypilot:'
+        f'{lifecycle_module.serve_constants.LOAD_BALANCER_PORT_START}')
+
+
+@pytest.mark.parametrize('resource_scope', ['', False])
+def test_in_cluster_endpoint_rejects_malformed_resource_scope(
+        tmp_path, resource_scope):
+    service_name = 'paid-e2e-unit'
+    provider_scope = tmp_path / 'scope.json'
+    lifecycle_module.qualify.write_provider_scope(
+        provider_scope, service_name,
+        _provider_scope(resource_scope=resource_scope))
+    resolver = lifecycle_module.InClusterEndpointResolver(namespace='skypilot')
+
+    with pytest.raises(lifecycle_module.qualify.QualificationError,
+                       match='Provider-scope receipt is malformed'):
+        asyncio.run(
+            resolver.resolve(
+                lifecycle_module.EndpointResolutionRequest(
+                    service_name=service_name, provider_scope=provider_scope)))
+
+
+def test_in_cluster_endpoint_rejects_missing_resource_scope(tmp_path):
+    service_name = 'paid-e2e-unit'
+    provider_scope = tmp_path / 'scope.json'
+    lifecycle_module.qualify.write_provider_scope(provider_scope, service_name,
+                                                  _provider_scope())
+    payload = json.loads(provider_scope.read_text(encoding='utf-8'))
+    assert payload['schema_version'] == 6
+    del payload['resource_scope']
+    provider_scope.write_text(json.dumps(payload), encoding='utf-8')
+    resolver = lifecycle_module.InClusterEndpointResolver(namespace='skypilot')
+
+    with pytest.raises(lifecycle_module.qualify.QualificationError,
+                       match='Provider-scope receipt is malformed'):
+        asyncio.run(
+            resolver.resolve(
+                lifecycle_module.EndpointResolutionRequest(
+                    service_name=service_name, provider_scope=provider_scope)))
+
+
+def test_in_cluster_mode_bypasses_unreachable_published_endpoint(
+        monkeypatch, tmp_path):
+    events = []
+    _install_operations(monkeypatch, events)
+    monkeypatch.setenv('SKYPILOT_POD_NAMESPACE', 'skypilot')
+    args = _args(tmp_path)
+    args.endpoint_mode = lifecycle_module.EndpointMode.IN_CLUSTER
+
+    asyncio.run(lifecycle_module.run_lifecycle(args, _FakeLifecycle(events)))
+
+    expected_name = lifecycle_module.lb_k8s.lb_service_name(
+        args.service_name, 'authoritative-resource-scope')
+    assert ('endpoint', args.service_name) not in events
+    assert ('qualify',
+            f'http://{expected_name}.skypilot:'
+            f'{lifecycle_module.serve_constants.LOAD_BALANCER_PORT_START}') \
+        in events
+
+
+def test_parser_defaults_to_published_endpoint():
+    args = lifecycle_module._parser().parse_args([
+        '--profile', 'small', '--service-name', 'paid-e2e-unit',
+        '--artifacts-dir', '/tmp/paid-e2e-unit'
+    ])
+
+    assert args.endpoint_mode is lifecycle_module.EndpointMode.PUBLISHED
 
 
 def test_lifecycle_success_owns_normal_down_and_exact_cleanup(

@@ -71,7 +71,7 @@ class GuardViolation(QualificationError):
     """An authoritative market, card, cap, or identity guard failed."""
 
 
-_PROVIDER_SCOPE_SCHEMA_VERSION = 5
+_PROVIDER_SCOPE_SCHEMA_VERSION = 6
 _QUALIFICATION_RECEIPT_SCHEMA_VERSION = 7
 _CLEANUP_RECEIPT_SCHEMA_VERSION = 2
 _AGGREGATE_RECEIPT_SCHEMA_VERSION = 2
@@ -633,6 +633,7 @@ class ProviderScope:
     """Exact cross-cloud provider scope frozen by the committed version."""
 
     service_hash: str
+    resource_scope: str
     lifecycle_epoch: int
     service_version: int
     max_live_paid_gpu_units: int
@@ -949,12 +950,14 @@ def provider_scope_from_controller_config(
         raise GuardViolation(
             'Current service version controller config is invalid.') from error
     service_hash = authority.get('service_hash')
+    resource_scope = authority.get('resource_scope')
     lifecycle_epoch = authority.get('service_lifecycle_epoch')
     service_version = authority.get('current_version')
     placement_catalog = authority.get('placement_catalog')
     yaml_content = authority.get('yaml_content')
     if (not isinstance(config_snapshot, collections.abc.Mapping) or
             not isinstance(service_hash, str) or not service_hash or
+            not isinstance(resource_scope, str) or not resource_scope or
             type(lifecycle_epoch) is not int or lifecycle_epoch < 1 or
             type(service_version) is not int or service_version < 1 or
             not isinstance(placement_catalog, dict) or
@@ -1075,6 +1078,7 @@ def provider_scope_from_controller_config(
             'Current service version has inconsistent AWS catalog regions.')
     return ProviderScope(
         service_hash=service_hash,
+        resource_scope=resource_scope,
         lifecycle_epoch=lifecycle_epoch,
         service_version=service_version,
         max_live_paid_gpu_units=(contract.max_live_paid_gpu_units),
@@ -1143,6 +1147,8 @@ def read_provider_scope(path: pathlib.Path, service_name: str) -> ProviderScope:
         raise QualificationError('Provider-scope receipt is malformed.') \
             from error
     if (not isinstance(scope.service_hash, str) or not scope.service_hash or
+            not isinstance(scope.resource_scope, str) or
+            not scope.resource_scope or
             type(scope.lifecycle_epoch) is not int or
             scope.lifecycle_epoch < 1 or
             type(scope.service_version) is not int or
@@ -2889,6 +2895,7 @@ class PostgresObserver:
             row = connection.execute(
                 sqlalchemy.text('''
                     SELECT s.hash AS service_hash,
+                           s.resource_scope,
                            s.lifecycle_epoch AS service_lifecycle_epoch,
                            s.current_version,
                            s.workspace,
