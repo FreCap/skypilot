@@ -56,6 +56,11 @@ jobs:
             test-name: "Hermetic Component Tests"
             python-version: "3.14"
             runner: namespace-profile-skypilot-ci-4x8
+          - test-path: >-
+              tests/integration_tests/test_managed_jobs_split_role_unpaid_e2e.py
+            test-name: "Managed Jobs Unpaid E2E"
+            python-version: "3.14"
+            runner: namespace-profile-skypilot-ci-4x8
           - test-path: tests/integration_tests/test_lb_cold_queue_component.py
             test-name: "Serve LB 10k Component"
             python-version: "3.14"
