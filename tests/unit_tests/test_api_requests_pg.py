@@ -5167,6 +5167,51 @@ def _claim_gc_bound_request(engine, _backend):
     return identity, context, queue, item
 
 
+def test_bound_status_job_ids_are_one_exact_batched_observation(
+        bound_request_database):
+    engine, backend = bound_request_database
+    identity, context, _, item = _claim_gc_bound_request(engine, backend)
+    assert backend.try_mark_running(item.request_id, 1234,
+                                    item.execution_generation, item.claim_token,
+                                    424242)
+    body = _legacy_serve_launch_request(identity.request_id).request_body
+    ordinary_launch_binding.install_bound_context(body, identity,
+                                                  context.launch_generation)
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    with ordinary_launch_binding.provider_effect_guard(
+            body.extra_launch_context,
+            claim,
+            claim_validator=(
+                request_postgres.
+                validate_bound_ordinary_launch_claim_in_transaction)):
+        ordinary_launch_binding.begin_service_job_io(body.extra_launch_context)
+        ordinary_launch_binding.record_service_job(body.extra_launch_context,
+                                                   42)
+
+    exact = request_postgres.BoundOrdinaryLaunchStatusIdentity(
+        replica_id=identity.replica_id,
+        replica_record_id=str(identity.replica_record_id))
+    missing = request_postgres.BoundOrdinaryLaunchStatusIdentity(
+        replica_id=4, replica_record_id='44444444-4444-4444-8444-444444444444')
+    statements = []
+
+    def _capture(_connection, _cursor, statement, _parameters, _context,
+                 _executemany):
+        if 'serve_ordinary_launch_associations' in statement:
+            statements.append(statement)
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _capture)
+    try:
+        result = request_postgres.read_bound_ordinary_launch_status_job_ids(
+            'gc-service', [missing, exact, exact])
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', _capture)
+
+    assert result == {exact: 42}
+    assert len(statements) == 1
+
+
 def _expire_claim(engine, request_id):
     with engine.begin() as connection:
         connection.execute(

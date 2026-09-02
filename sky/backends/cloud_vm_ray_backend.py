@@ -3610,6 +3610,70 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             **ssh_credentials)
         return runners
 
+    @context_utils.cancellation_guard
+    @timeline.event
+    def get_cached_command_runners(
+            self,
+            avoid_ssh_control: bool = False
+    ) -> list[command_runner.CommandRunner]:
+        """Build command runners without provider or Kubernetes refreshes.
+
+        This is a fail-closed control-plane primitive.  It consumes only
+        connection material already persisted on the handle; missing cached
+        IPs, ports, or cluster information are errors rather than authority to
+        query a provider.  Callers that need discovery must use
+        ``get_command_runners()`` explicitly.
+        """
+        ssh_credentials = backend_utils.ssh_credential_from_yaml(
+            self.cluster_yaml, self.docker_user, self.ssh_user)
+        return self._get_cached_command_runners_with_credentials(
+            ssh_credentials, avoid_ssh_control=avoid_ssh_control)
+
+    def _get_cached_command_runners_with_credentials(
+        self,
+        ssh_credentials: Mapping[str, Any],
+        *,
+        avoid_ssh_control: bool = False,
+    ) -> list[command_runner.CommandRunner]:
+        """Pure cached-runner construction after credential resolution."""
+        ssh_credentials = dict(ssh_credentials)
+        if avoid_ssh_control:
+            # ``SSHCommandRunner`` defaults an omitted value back to
+            # ControlMaster.  The bounded Serve path must explicitly disable
+            # it so runner construction cannot inherit a long-lived transport
+            # or its independent retry/lifecycle state.
+            ssh_credentials['ssh_control_name'] = None
+
+        launched_resources = self.launched_resources.assert_launchable()
+        updated_to_skypilot_provisioner_after_provisioned = (
+            launched_resources.cloud.PROVISIONER_VERSION
+            >= clouds.ProvisionerVersion.SKYPILOT and
+            self.cached_external_ips is not None and
+            self.cached_cluster_info is None)
+        if (clouds.ProvisionerVersion.RAY_PROVISIONER_SKYPILOT_TERMINATOR
+                >= launched_resources.cloud.PROVISIONER_VERSION or
+                updated_to_skypilot_provisioner_after_provisioned):
+            ip_list = self.cached_external_ips
+            port_list = self.cached_external_ssh_ports
+            if ip_list is None or port_list is None:
+                raise exceptions.FetchClusterInfoError(
+                    exceptions.FetchClusterInfoError.Reason.HEAD)
+            if len(ip_list) != len(port_list):
+                raise ValueError(
+                    f'Cluster {self.cluster_name!r}: expected the same number '
+                    f'of cached SSH ports {port_list} and IPs {ip_list}.')
+            return command_runner.SSHCommandRunner.make_runner_list(
+                zip(ip_list, port_list),  # noqa: B905
+                **ssh_credentials)
+
+        cluster_info = self.cached_cluster_info
+        if cluster_info is None:
+            raise exceptions.FetchClusterInfoError(
+                exceptions.FetchClusterInfoError.Reason.HEAD)
+        return provision_lib.get_command_runners(cluster_info.provider_name,
+                                                 cluster_info,
+                                                 **ssh_credentials)
+
     @property
     def cached_internal_ips(self) -> list[str] | None:
         if self.stable_internal_external_ips is not None:
@@ -4087,6 +4151,49 @@ setattr(cloud_vm_resource_handle_serialization, 'CloudVmRayResourceHandle',
         CloudVmRayResourceHandle)
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class ServeJobStatusTransport:
+    """Bounded transport contract for controller-owned Serve status reads.
+
+    The policy deliberately has one mode: use persisted connection material,
+    bypass Skylet/tunnel repair, run one buffered command without a subprocess
+    stream pool or detached watcher, and fail after the command deadline.
+    Generic CLI/backend status calls keep their established behavior by
+    omitting this policy.
+    """
+
+    source_handle: CloudVmRayResourceHandle
+    head_runner: command_runner.CommandRunner
+    command_timeout_seconds: int
+
+    def __post_init__(self) -> None:
+        if (isinstance(self.command_timeout_seconds, bool) or
+                not isinstance(self.command_timeout_seconds, int) or
+                self.command_timeout_seconds < 1):
+            raise ValueError(
+                'Serve job-status command timeout must be a positive integer.')
+        if getattr(self.head_runner, 'enable_interactive_auth', False):
+            raise ValueError(
+                'Serve job-status transport cannot use interactive auth.')
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class ServeJobStatusTransportPreparation:
+    """Per-handle result of isolated, batched transport preparation."""
+
+    source_handle: CloudVmRayResourceHandle
+    transport: ServeJobStatusTransport | None = None
+    error: Exception | None = None
+
+    def __post_init__(self) -> None:
+        if (self.transport is None) == (self.error is None):
+            raise ValueError(
+                'Transport preparation requires exactly one result or error.')
+        if (self.transport is not None and
+                self.transport.source_handle is not self.source_handle):
+            raise ValueError('Prepared transport belongs to another handle.')
+
+
 class LocalResourcesHandle(CloudVmRayResourceHandle):
     """A handle for local resources."""
 
@@ -4130,6 +4237,25 @@ class LocalResourcesHandle(CloudVmRayResourceHandle):
                            ) -> list[command_runner.CommandRunner]:
         """Returns a list of local command runners."""
         del force_cached, avoid_ssh_control  # Unused.
+        return [command_runner.LocalProcessCommandRunner()]
+
+    @context_utils.cancellation_guard
+    @timeline.event
+    def get_cached_command_runners(
+            self,
+            avoid_ssh_control: bool = False
+    ) -> list[command_runner.CommandRunner]:
+        """Return the local runner; local execution has no provider refresh."""
+        del avoid_ssh_control
+        return [command_runner.LocalProcessCommandRunner()]
+
+    def _get_cached_command_runners_with_credentials(
+        self,
+        ssh_credentials: Mapping[str, Any],
+        *,
+        avoid_ssh_control: bool = False,
+    ) -> list[command_runner.CommandRunner]:
+        del ssh_credentials, avoid_ssh_control
         return [command_runner.LocalProcessCommandRunner()]
 
 
@@ -4214,6 +4340,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         cloud = getattr(launched_resources, 'cloud', None)
         if isinstance(cloud, clouds.Kubernetes):
             return (backends.ServeReplicaJobStatusSource.PROVIDER_AND_ENDPOINT)
+        if cloud is not None:
+            return (backends.ServeReplicaJobStatusSource.
+                    STARTUP_SENTINEL_AND_PROVIDER_ENDPOINT)
         return backends.ServeReplicaJobStatusSource.REMOTE_JOB
 
     # --- Implementation of Backend APIs ---
@@ -6064,13 +6193,119 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
     # --- CloudVMRayBackend Specific APIs ---
 
+    def _run_job_status_command(
+        self,
+        handle: CloudVmRayResourceHandle,
+        code: str,
+        *,
+        stream_logs: bool,
+        serve_transport: ServeJobStatusTransport | None,
+    ) -> tuple[int, str, str]:
+        """Run one status command through the selected transport contract."""
+        if serve_transport is None:
+            result = self.run_on_head(handle,
+                                      code,
+                                      stream_logs=stream_logs,
+                                      require_outputs=True,
+                                      separate_stderr=True)
+        else:
+            if stream_logs:
+                raise ValueError(
+                    'Bounded Serve job-status transport cannot stream logs.')
+            if serve_transport.source_handle is not handle:
+                raise ValueError(
+                    'Serve job-status transport belongs to another handle.')
+            timeout = serve_transport.command_timeout_seconds
+            result = serve_transport.head_runner.run_driver(
+                code,
+                log_path=os.devnull,
+                stream_logs=False,
+                require_outputs=True,
+                separate_stderr=True,
+                process_stream=False,
+                connect_timeout=timeout,
+                bounded_capture=log_lib.BoundedSubprocessCapture(
+                    deadline_monotonic=time.monotonic() + timeout,
+                    max_output_bytes=1024 * 1024))
+        if not isinstance(result, tuple) or len(result) != 3:
+            raise RuntimeError('Job-status transport did not return outputs.')
+        return result
+
+    @staticmethod
+    def build_serve_job_status_transports(
+        handles: list[CloudVmRayResourceHandle],
+        *,
+        command_timeout_seconds: int,
+    ) -> list[ServeJobStatusTransportPreparation]:
+        """Build cache-only transports with per-handle failure isolation."""
+        if not handles:
+            return []
+        yaml_paths = list(
+            dict.fromkeys(handle.cluster_yaml
+                          for handle in handles
+                          if handle.cluster_yaml is not None))
+        configs: dict[str, dict[str, Any] | Exception] = {}
+        # Read every retained YAML in one database operation, then isolate
+        # decoding in memory.  Falling back from one malformed YAML to N
+        # singleton database reads made the error path materially worse than
+        # the healthy path at the 800-replica service bound.
+        yaml_strings = global_user_state.get_cluster_yaml_str_multiple(
+            yaml_paths)
+        for path, yaml_string in zip(yaml_paths, yaml_strings, strict=True):
+            try:
+                if yaml_string is None:
+                    raise ValueError(f'Cluster yaml {path} not found.')
+                config = yaml_utils.safe_load(yaml_string)
+                if not isinstance(config, dict):
+                    raise ValueError(f'Cluster yaml {path} is not a mapping.')
+                configs[path] = config
+            except Exception as error:  # pylint: disable=broad-except
+                configs[path] = error
+
+        preparations = []
+        for handle in handles:
+            try:
+                path = handle.cluster_yaml
+                config = None if path is None else configs[path]
+                if isinstance(config, Exception):
+                    raise config
+                credential = backend_utils.ssh_credential_from_yaml(
+                    path, handle.docker_user, handle.ssh_user, config=config)
+                runners = (
+                    handle._get_cached_command_runners_with_credentials(  # pylint: disable=protected-access
+                        credential,
+                        avoid_ssh_control=True))
+                if not runners:
+                    raise exceptions.FetchClusterInfoError(
+                        exceptions.FetchClusterInfoError.Reason.HEAD)
+                transport = ServeJobStatusTransport(
+                    source_handle=handle,
+                    head_runner=runners[0],
+                    command_timeout_seconds=command_timeout_seconds)
+            except Exception as error:  # pylint: disable=broad-except
+                preparations.append(
+                    ServeJobStatusTransportPreparation(source_handle=handle,
+                                                       error=error))
+            else:
+                preparations.append(
+                    ServeJobStatusTransportPreparation(source_handle=handle,
+                                                       transport=transport))
+        return preparations
+
     def get_job_status(
-            self,
-            handle: CloudVmRayResourceHandle,
-            job_ids: list[int] | None = None,
-            stream_logs: bool = True
+        self,
+        handle: CloudVmRayResourceHandle,
+        job_ids: list[int] | None = None,
+        stream_logs: bool = True,
+        *,
+        serve_transport: ServeJobStatusTransport | None = None,
     ) -> dict[int | None, job_lib.JobStatus | None]:
-        if handle.is_grpc_enabled_with_flag:
+        """Get job status through Skylet or the command runner.
+
+        ``serve_transport`` selects the bounded, cache-only controller
+        transport. Omitting it preserves the generic Skylet/SSH behavior.
+        """
+        if serve_transport is None and handle.is_grpc_enabled_with_flag:
             try:
                 request = jobsv1_pb2.GetJobStatusRequest(job_ids=job_ids)
                 response = backend_utils.invoke_skylet_with_retries(
@@ -6085,11 +6320,11 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 logger.debug(f'gRPC failed, falling back to SSH: {e}')
 
         code = job_lib.JobLibCodeGen.get_job_status(job_ids)
-        returncode, stdout, stderr = self.run_on_head(handle,
-                                                      code,
-                                                      stream_logs=stream_logs,
-                                                      require_outputs=True,
-                                                      separate_stderr=True)
+        returncode, stdout, stderr = self._run_job_status_command(
+            handle,
+            code,
+            stream_logs=stream_logs,
+            serve_transport=serve_transport)
         subprocess_utils.handle_returncode(returncode, code,
                                            'Failed to get job status.', stderr)
         if not stdout:
@@ -6110,6 +6345,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         handle: CloudVmRayResourceHandle,
         job_ids: list[int] | None = None,
         stream_logs: bool = True,
+        *,
+        serve_transport: ServeJobStatusTransport | None = None,
     ) -> tuple[dict[int | None, job_lib.JobStatus | None], dict[
             int, job_lib.JobSystemRecoveryInfo], dict[
                 int, job_lib.JobSystemRecoveryDetailStatus]]:
@@ -6118,8 +6355,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         This is an explicit internal capability for SkyServe.  The established
         ``get_job_status()`` path above stays independent, so an optional
         recovery-detail lookup can never make ordinary status unavailable.
+        ``serve_transport`` selects the bounded, cache-only controller
+        transport. Omitting it preserves the generic Skylet/SSH behavior.
         """
-        if handle.is_grpc_enabled_with_flag:
+        if serve_transport is None and handle.is_grpc_enabled_with_flag:
             try:
                 request = jobsv1_pb2.GetJobStatusRequest(job_ids=job_ids)
                 response = backend_utils.invoke_skylet_with_retries(
@@ -6166,11 +6405,11 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
         code = job_lib.JobLibCodeGen.get_job_status_with_system_recovery(
             job_ids)
-        returncode, stdout, stderr = self.run_on_head(handle,
-                                                      code,
-                                                      stream_logs=stream_logs,
-                                                      require_outputs=True,
-                                                      separate_stderr=True)
+        returncode, stdout, stderr = self._run_job_status_command(
+            handle,
+            code,
+            stream_logs=stream_logs,
+            serve_transport=serve_transport)
         subprocess_utils.handle_returncode(returncode, code,
                                            'Failed to get job status.', stderr)
         if not stdout:

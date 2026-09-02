@@ -2160,6 +2160,30 @@ def test_get_provider_configs_for_handles_fans_out_distinct_and_shared():
     assert failed_keys == {4, 5}
 
 
+def test_provider_config_batch_failure_never_amplifies_to_singleton_reads():
+    handles = {
+        replica_id: types.SimpleNamespace(cluster_yaml=f'/p/{replica_id}.yaml')
+        for replica_id in range(800)
+    }
+    failed_keys = set()
+    with mock.patch.object(
+            serve_utils.global_user_state,
+            'get_cluster_yaml_str_multiple',
+            side_effect=RuntimeError('database unavailable')) as read_batch, \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_cluster_yaml_str',
+             side_effect=AssertionError('N-read fallback used')) as read_one:
+        result = serve_utils.get_provider_configs_for_handles(
+            handles, failed_keys=failed_keys)
+
+    assert result == {}
+    assert failed_keys == set(handles)
+    read_batch.assert_called_once_with(
+        [f'/p/{replica_id}.yaml' for replica_id in range(800)])
+    read_one.assert_not_called()
+
+
 def test_bounded_teardown_empty_admission_fails_closed_without_hanging():
     info = types.SimpleNamespace(
         replica_id=1,

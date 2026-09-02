@@ -22,6 +22,10 @@ asyncio_mode = "strict"
 asyncio_debug = true
 asyncio_default_fixture_loop_scope = "function"
 markers = [
+    "component: production component/interface test with external systems replaced at an owned boundary",
+    "operator_fixture: component test requiring an operator-supplied external fixture; excluded from hermetic component CI",
+    "unpaid_e2e: end-to-end test using real external interfaces without creating billable resources; requires PostgreSQL",
+    "paid_e2e: billable provider end-to-end test gated by --serve-paid-provider-e2e",
     "serve054_process_pressure: 90-process Serve054 gate for dedicated non-xdist CI",
     "serve_lb_10k_interface: resource-heavy 10k-socket LB gate for dedicated non-xdist CI",
 ]

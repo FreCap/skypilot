@@ -53,6 +53,9 @@ from sky.serve import zero_cost_actuation_schema
 from sky.serve.lb_cutover_state import lb_cutover_kubernetes_guard as _lb_guard
 from sky.serve.serve_statuses import ReplicaStatus
 from sky.serve.serve_statuses import ServiceStatus
+from sky.serve.system_recovery_persistence import (
+    ReplicaSystemRecoveryBatchResult)
+from sky.serve.system_recovery_persistence import ReplicaSystemRecoveryWrite
 from sky.server.requests import postgres_schema as request_postgres_schema
 from sky.utils import common_utils
 from sky.utils import locks
@@ -5200,55 +5203,145 @@ def _lock_system_recovery_service_owner_in_session(
     return owner
 
 
+def _lock_replica_infos_for_system_recovery(
+    session: orm.Session,
+    service_name: str,
+    replica_ids: tuple[int, ...],
+) -> dict[int, 'replica_managers.ReplicaInfo']:
+    """Lock one sorted set of recovery rows with a single PostgreSQL read."""
+    if (replica_ids != tuple(sorted(set(replica_ids))) or any(
+            isinstance(replica_id, bool) or not isinstance(replica_id, int) or
+            replica_id <= 0 for replica_id in replica_ids)):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'System-recovery replica IDs must be sorted unique positives.')
+    if not replica_ids:
+        return {}
+    rows = session.execute(
+        sqlalchemy.select(
+            replicas_table.c.replica_id, replicas_table.c.replica_state_version,
+            replicas_table.c.replica_state).where(
+                replicas_table.c.service_name == service_name,
+                replicas_table.c.replica_id.in_(replica_ids)).order_by(
+                    replicas_table.c.replica_id).with_for_update()).fetchall()
+    locked_infos = {}
+    for row in rows:
+        replica_id = int(row.replica_id)
+        try:
+            info = _replica_from_state(row.replica_state_version,
+                                       row.replica_state)
+        except Exception as error:
+            raise ReplicaSystemRecoveryMutationRejected(
+                'System-recovery replica row is unreadable.') from error
+        if info.replica_id != replica_id:
+            raise ReplicaSystemRecoveryMutationRejected(
+                'System-recovery replica identity changed.')
+        locked_infos[replica_id] = info
+    return locked_infos
+
+
 def _lock_replica_info_for_system_recovery(
     session: orm.Session,
     service_name: str,
     replica_id: int,
 ) -> 'replica_managers.ReplicaInfo':
-    if (isinstance(replica_id, bool) or not isinstance(replica_id, int) or
-            replica_id <= 0):
-        raise ReplicaSystemRecoveryMutationRejected(
-            'System-recovery replica ID must be positive.')
-    row = session.execute(
-        sqlalchemy.select(replicas_table.c.replica_state_version,
-                          replicas_table.c.replica_state).where(
-                              replicas_table.c.service_name == service_name,
-                              replicas_table.c.replica_id ==
-                              replica_id).with_for_update()).fetchone()
-    if row is None:
+    locked_infos = _lock_replica_infos_for_system_recovery(
+        session, service_name, (replica_id,))
+    info = locked_infos.get(replica_id)
+    if info is None:
         raise ReplicaSystemRecoveryMutationRejected(
             'System-recovery replica row is absent.')
-    try:
-        replica_info = _replica_from_state(row.replica_state_version,
-                                           row.replica_state)
-    except Exception as error:
-        raise ReplicaSystemRecoveryMutationRejected(
-            'System-recovery replica row is unreadable.') from error
-    if replica_info.replica_id != replica_id:
-        raise ReplicaSystemRecoveryMutationRejected(
-            'System-recovery replica identity changed.')
-    return replica_info
+    return info
+
+
+def _write_locked_replica_infos_in_session(
+    session: orm.Session,
+    service_name: str,
+    replica_infos: list[tuple[int, 'replica_managers.ReplicaInfo']],
+) -> None:
+    """Write already-locked recovery rows in bounded executemany batches."""
+    if not replica_infos:
+        return
+    value_column_names = tuple(
+        column_name for column_name in _REPLICA_ROW_COLUMNS
+        if column_name not in ('service_name', 'replica_id'))
+    update_stmt = sqlalchemy.update(replicas_table).where(
+        replicas_table.c.service_name == sqlalchemy.bindparam(
+            '_expected_service_name'), replicas_table.c.replica_id ==
+        sqlalchemy.bindparam('_expected_replica_id')).values({
+            column_name: sqlalchemy.bindparam(
+                f'_replica_{column_name}',
+                type_=replicas_table.c[column_name].type)
+            for column_name in value_column_names
+        })
+    for start in range(0, len(replica_infos),
+                       _POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE):
+        chunk = replica_infos[start:start +
+                              _POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE]
+        parameters = []
+        try:
+            for replica_id, replica_info in chunk:
+                values = _replica_row_values(service_name, replica_id,
+                                             replica_info)
+                parameter = {
+                    '_expected_service_name': service_name,
+                    '_expected_replica_id': replica_id,
+                }
+                parameter.update({
+                    f'_replica_{column_name}': values[column_name]
+                    for column_name in value_column_names
+                })
+                parameters.append(parameter)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ReplicaSystemRecoveryMutationRejected(
+                'Replica recovery state could not be serialized.') from error
+        result = session.execute(update_stmt, parameters)
+        if result.rowcount != len(chunk):
+            raise ReplicaSystemRecoveryMutationRejected(
+                'System-recovery update lost a locked replica row.')
 
 
 def _write_locked_replica_info_in_session(
         session: orm.Session, service_name: str, replica_id: int,
         replica_info: 'replica_managers.ReplicaInfo') -> None:
+    _write_locked_replica_infos_in_session(session, service_name,
+                                           [(replica_id, replica_info)])
+
+
+def _prepare_system_recovery_update(
+    current: 'replica_managers.ReplicaInfo',
+    desired: 'replica_managers.ReplicaInfo',
+    *,
+    expected_service_hash: str,
+    expected_workspace: str,
+) -> tuple['replica_managers.ReplicaInfo', bool]:
+    """Validate and materialize one pure recovery reduction."""
+    replica_id = current.replica_id
+    if (not isinstance(desired, replica_managers.ReplicaInfo) or
+            desired.replica_id != replica_id):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'Recovery transition returned a different replica.')
+    desired_intent = desired.system_recovery_launch_intent
+    if (desired_intent is not None and
+        (desired_intent.service_hash != expected_service_hash or
+         desired_intent.replica_id != replica_id or
+         desired_intent.launch_generation != replica_id or
+         desired_intent.workspace != expected_workspace)):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'Recovery intent does not match its locked service generation.')
+    _validate_system_recovery_transition(current, desired)
+    if _system_recovery_snapshot(current) == _system_recovery_snapshot(desired):
+        return current, False
+    updated = copy.deepcopy(current)
     try:
-        values = _replica_row_values(service_name, replica_id, replica_info)
+        _copy_system_recovery_fields(desired, updated, increment_revision=True)
     except (AttributeError, TypeError, ValueError) as error:
         raise ReplicaSystemRecoveryMutationRejected(
-            'Replica recovery state could not be serialized.') from error
-    result = session.execute(
-        sqlalchemy.update(replicas_table).where(
-            replicas_table.c.service_name == service_name,
-            replicas_table.c.replica_id == replica_id).values({
-                key: value
-                for key, value in values.items()
-                if key not in ('service_name', 'replica_id')
-            }))
-    if result.rowcount != 1:
+            'Recovery transition produced an invalid v13 bundle.') from error
+    if (_system_recovery_revision(updated)
+            != _system_recovery_revision(current) + 1):
         raise ReplicaSystemRecoveryMutationRejected(
-            'System-recovery update lost its replica row.')
+            'Recovery transition did not increment its revision once.')
+    return updated, True
 
 
 def _mutate_replica_system_recovery(
@@ -5281,36 +5374,86 @@ def _mutate_replica_system_recovery(
             raise ReplicaSystemRecoveryRevisionConflict(expected_revision,
                                                         current_revision)
         desired = transition(copy.deepcopy(current))
-        if (not isinstance(desired, replica_managers.ReplicaInfo) or
-                desired.replica_id != replica_id):
-            raise ReplicaSystemRecoveryMutationRejected(
-                'Recovery transition returned a different replica.')
-        desired_intent = desired.system_recovery_launch_intent
-        if (desired_intent is not None and
-            (desired_intent.service_hash != expected_service_hash or
-             desired_intent.replica_id != replica_id or
-             desired_intent.launch_generation != replica_id or
-             desired_intent.workspace != owner.workspace)):
-            raise ReplicaSystemRecoveryMutationRejected(
-                'Recovery intent does not match its locked service generation.')
-        _validate_system_recovery_transition(current, desired)
-        if _system_recovery_snapshot(current) == _system_recovery_snapshot(
-                desired):
+        updated, changed = _prepare_system_recovery_update(
+            current,
+            desired,
+            expected_service_hash=expected_service_hash,
+            expected_workspace=owner.workspace)
+        if not changed:
             return current
-        try:
-            _copy_system_recovery_fields(desired,
-                                         current,
-                                         increment_revision=True)
-        except (AttributeError, TypeError, ValueError) as error:
-            raise ReplicaSystemRecoveryMutationRejected(
-                'Recovery transition produced an invalid v13 bundle.'
-            ) from error
-        if _system_recovery_revision(current) != current_revision + 1:
-            raise ReplicaSystemRecoveryMutationRejected(
-                'Recovery transition did not increment its revision once.')
         _write_locked_replica_info_in_session(session, service_name, replica_id,
-                                              current)
-        return current
+                                              updated)
+        return updated
+
+
+def patch_replica_system_recovery_batch(
+    service_name: str,
+    writes: typing.Sequence[ReplicaSystemRecoveryWrite],
+    *,
+    expected_service_hash: str,
+    expected_lifecycle_epoch: int,
+    expected_controller_owner: tuple[int | None, str | None],
+) -> ReplicaSystemRecoveryBatchResult:
+    """Commit independent recovery reductions under one owner/row snapshot.
+
+    Missing, recreated, upgraded, or concurrently reduced rows are reported as
+    stale independently.  Other rows still commit in the same transaction.
+    Invalid transitions are programmer/correctness errors and reject the whole
+    transaction; callers must not partially accept malformed reducer output.
+    """
+    engine = _require_system_recovery_postgres()
+    normalized_writes = []
+    for write in writes:
+        if not isinstance(write, ReplicaSystemRecoveryWrite):
+            raise ValueError('writes must contain ReplicaSystemRecoveryWrite.')
+        normalized_writes.append(write)
+    normalized_writes.sort(key=lambda write: write.replica_id)
+    replica_ids = tuple(write.replica_id for write in normalized_writes)
+    if len(set(replica_ids)) != len(replica_ids):
+        raise ValueError('writes must contain unique replica IDs.')
+    if not normalized_writes:
+        return ReplicaSystemRecoveryBatchResult(updated_infos=(),
+                                                unchanged_infos=(),
+                                                stale_replica_ids=())
+
+    with orm.Session(engine) as session, session.begin():
+        owner = _lock_system_recovery_service_owner_in_session(
+            session,
+            service_name,
+            expected_service_hash,
+            expected_lifecycle_epoch,
+            expected_controller_owner,
+            require_launch_allowed=True)
+        current_by_id = _lock_replica_infos_for_system_recovery(
+            session, service_name, replica_ids)
+        updated_infos = []
+        unchanged_infos = []
+        stale_replica_ids = []
+        for write in normalized_writes:
+            current = current_by_id.get(write.replica_id)
+            if (current is None or
+                    current.replica_record_id != write.replica_record_id or
+                    current.version != write.service_version or
+                    _system_recovery_revision(current)
+                    != write.expected_revision):
+                stale_replica_ids.append(write.replica_id)
+                continue
+            updated, changed = _prepare_system_recovery_update(
+                current,
+                write.desired_recovery.apply_to(current),
+                expected_service_hash=expected_service_hash,
+                expected_workspace=owner.workspace)
+            if changed:
+                updated_infos.append(updated)
+            else:
+                unchanged_infos.append(current)
+        _write_locked_replica_infos_in_session(
+            session, service_name,
+            [(info.replica_id, info) for info in updated_infos])
+        return ReplicaSystemRecoveryBatchResult(
+            updated_infos=tuple(updated_infos),
+            unchanged_infos=tuple(unchanged_infos),
+            stale_replica_ids=tuple(stale_replica_ids))
 
 
 def patch_replica_system_recovery(

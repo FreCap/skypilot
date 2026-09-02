@@ -134,6 +134,26 @@ def _fence() -> dict[str, Any]:
     }
 
 
+def _candidate_reduction(
+        info: replica_info.ReplicaInfo) -> replica_info.ReplicaInfo:
+    desired = copy.deepcopy(info)
+    desired.system_recovery_launch_intent = _intent(desired.replica_id)
+    desired.system_recovery_disposition = (
+        recovery_state.SystemRecoveryDisposition.CANDIDATE)
+    return desired
+
+
+def _recovery_write(
+    desired: replica_info.ReplicaInfo,
+) -> serve_state.ReplicaSystemRecoveryWrite:
+    return serve_state.ReplicaSystemRecoveryWrite(
+        replica_id=desired.replica_id,
+        replica_record_id=desired.replica_record_id,
+        service_version=desired.version,
+        expected_revision=desired.system_recovery_revision,
+        desired_info=desired)
+
+
 def _make_candidate(
     replica_id: int,
     *,
@@ -326,6 +346,159 @@ def _assert_replica_update_only(statements: list[str]) -> None:
     assert not any(
         statement.startswith('insert into replicas ')
         for statement in mutations)
+
+
+def test_batch_patch_locks_once_and_isolates_one_stale_from_799_updates(
+        recovery_database) -> None:
+    engine = recovery_database
+    replica_ids = list(range(7, 807))
+    assert serve_state.add_or_update_replicas(
+        _SERVICE_NAME,
+        [(replica_id, _replica(replica_id)) for replica_id in replica_ids[1:]],
+        **_fence())
+    snapshots = serve_state.get_replica_infos_from_ids(_SERVICE_NAME,
+                                                       replica_ids)
+    writes = [
+        _recovery_write(_candidate_reduction(snapshots[replica_id]))
+        for replica_id in replica_ids
+    ]
+    # Advance one row after the immutable observation was captured.  The
+    # stale reducer must be skipped without making the other 799 rows retry.
+    _make_candidate(replica_ids[0])
+
+    with _capture_sql(engine) as statements:
+        result = serve_state.patch_replica_system_recovery_batch(
+            _SERVICE_NAME, writes, **_fence())
+
+    assert result.stale_replica_ids == (7,)
+    assert result.unchanged_infos == ()
+    assert tuple(info.replica_id for info in result.updated_infos) == tuple(
+        replica_ids[1:])
+    assert all(
+        info.system_recovery_revision == 1 for info in result.updated_infos)
+    lock_statements = [
+        statement for statement in statements if 'for update' in statement
+    ]
+    assert sum('service_lifecycle_fences' in statement
+               for statement in lock_statements) == 1
+    assert sum(
+        'from services' in statement for statement in lock_statements) == 1
+    assert sum(
+        'from replicas' in statement for statement in lock_statements) == 1
+    updates = [
+        statement for statement in statements
+        if statement.lstrip().startswith('update replicas ')
+    ]
+    assert len(updates) == 3
+
+    persisted = serve_state.get_replica_infos_from_ids(_SERVICE_NAME,
+                                                       replica_ids)
+    assert len(persisted) == 800
+    assert all(
+        info.system_recovery_revision == 1 for info in persisted.values())
+    assert all(info.system_recovery_disposition ==
+               recovery_state.SystemRecoveryDisposition.CANDIDATE
+               for info in persisted.values())
+
+
+def test_batch_patch_isolates_every_stale_identity_facet(
+        recovery_database) -> None:
+    engine = recovery_database
+    replica_ids = list(range(7, 12))
+    assert serve_state.add_or_update_replicas(
+        _SERVICE_NAME,
+        [(replica_id, _replica(replica_id)) for replica_id in replica_ids[1:]],
+        **_fence())
+    snapshots = serve_state.get_replica_infos_from_ids(_SERVICE_NAME,
+                                                       replica_ids)
+    writes = [
+        _recovery_write(_candidate_reduction(snapshots[replica_id]))
+        for replica_id in replica_ids
+    ]
+
+    # Exercise absence, record recreation, service-version drift, and recovery
+    # revision drift in a single transaction; replica 11 remains current.
+    assert serve_state.remove_replica(
+        _SERVICE_NAME,
+        7,
+        expected_replica_record_id=snapshots[7].replica_record_id,
+        **_fence())
+    assert serve_state.remove_replica(
+        _SERVICE_NAME,
+        8,
+        expected_replica_record_id=snapshots[8].replica_record_id,
+        **_fence())
+    assert serve_state.add_or_update_replica(_SERVICE_NAME, 8, _replica(8),
+                                             **_fence())
+    upgraded = copy.deepcopy(snapshots[9])
+    upgraded.version += 1
+    assert serve_state.add_or_update_replica(_SERVICE_NAME,
+                                             9,
+                                             upgraded,
+                                             expected_replica_exists=True,
+                                             **_fence())
+    _make_candidate(10)
+
+    with _capture_sql(engine) as statements:
+        result = serve_state.patch_replica_system_recovery_batch(
+            _SERVICE_NAME, writes, **_fence())
+
+    assert result.stale_replica_ids == (7, 8, 9, 10)
+    assert result.unchanged_infos == ()
+    assert tuple(info.replica_id for info in result.updated_infos) == (11,)
+    assert result.updated_infos[0].system_recovery_revision == 1
+    replica_locks = [
+        statement for statement in statements
+        if 'for update' in statement and 'from replicas' in statement
+    ]
+    assert len(replica_locks) == 1
+    updates = [
+        statement for statement in statements
+        if statement.lstrip().startswith('update replicas ')
+    ]
+    assert len(updates) == 1
+
+
+def test_batch_patch_reports_noop_without_increment_or_update(
+        recovery_database) -> None:
+    engine = recovery_database
+    current = serve_state.get_replica_info_from_id(_SERVICE_NAME, 7)
+
+    with _capture_sql(engine) as statements:
+        result = serve_state.patch_replica_system_recovery_batch(
+            _SERVICE_NAME, [_recovery_write(current)], **_fence())
+
+    assert result.updated_infos == ()
+    assert tuple(info.replica_id for info in result.unchanged_infos) == (7,)
+    assert result.stale_replica_ids == ()
+    assert not any(statement.lstrip().startswith('update replicas ')
+                   for statement in statements)
+    persisted = serve_state.get_replica_info_from_id(_SERVICE_NAME, 7)
+    assert persisted.system_recovery_revision == 0
+
+
+def test_batch_patch_rejects_invalid_transition_without_partial_commit(
+        recovery_database) -> None:
+    assert serve_state.add_or_update_replica(_SERVICE_NAME, 8, _replica(8),
+                                             **_fence())
+    snapshots = serve_state.get_replica_infos_from_ids(_SERVICE_NAME, [7, 8])
+    invalid = copy.deepcopy(snapshots[7])
+    invalid.system_recovery_disposition = (
+        recovery_state.SystemRecoveryDisposition.CAPABLE)
+    valid = _candidate_reduction(snapshots[8])
+
+    with pytest.raises(serve_state.ReplicaSystemRecoveryMutationRejected,
+                       match='requires an exact launch intent'):
+        serve_state.patch_replica_system_recovery_batch(
+            _SERVICE_NAME, [_recovery_write(invalid),
+                            _recovery_write(valid)], **_fence())
+
+    persisted = serve_state.get_replica_infos_from_ids(_SERVICE_NAME, [7, 8])
+    assert all(
+        info.system_recovery_revision == 0 for info in persisted.values())
+    assert all(info.system_recovery_disposition ==
+               recovery_state.SystemRecoveryDisposition.ORDINARY
+               for info in persisted.values())
 
 
 def test_nonce_bind_is_locked_update_only_and_one_shot(

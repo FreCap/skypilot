@@ -5,6 +5,8 @@ from sky.backends.backend import ServeReplicaJobStatusSource
 from sky.backends.cloud_vm_ray_backend import CloudVmRayBackend
 from sky.backends.cloud_vm_ray_backend import CloudVmRayResourceHandle
 from sky.backends.cloud_vm_ray_backend import LocalResourcesHandle
+from sky.backends.cloud_vm_ray_backend import ServeJobStatusTransport
+from sky.backends.cloud_vm_ray_backend import ServeJobStatusTransportPreparation
 from sky.backends.cloud_vm_ray_backend import SkyletClient
 from sky.backends.local_docker_backend import LocalDockerBackend
 from sky.backends.local_docker_backend import LocalDockerResourceHandle
@@ -12,5 +14,7 @@ from sky.backends.local_docker_backend import LocalDockerResourceHandle
 __all__ = [
     'Backend', 'ResourceHandle', 'ServeReplicaJobStatusSource',
     'CloudVmRayBackend', 'CloudVmRayResourceHandle', 'SkyletClient',
-    'LocalResourcesHandle', 'LocalDockerBackend', 'LocalDockerResourceHandle'
+    'LocalResourcesHandle', 'ServeJobStatusTransport',
+    'ServeJobStatusTransportPreparation', 'LocalDockerBackend',
+    'LocalDockerResourceHandle'
 ]

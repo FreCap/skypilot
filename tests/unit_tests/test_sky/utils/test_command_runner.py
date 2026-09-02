@@ -1031,6 +1031,31 @@ def test_kubernetes_runner_run_does_not_enrich_on_success() -> None:
     mock_diagnose.assert_not_called()
 
 
+def test_kubernetes_bounded_capture_skips_post_deadline_diagnosis() -> None:
+    """The strict Serve transport cannot append an unbounded API read."""
+    pod_gone_stderr = ('error: cannot exec into a container in a completed '
+                       'pod; current phase is Failed')
+    capture = command_runner.log_lib.BoundedSubprocessCapture(
+        deadline_monotonic=time.monotonic() + 10,
+        max_output_bytes=1024,
+    )
+    run_with_log = mock.Mock(return_value=(1, '', pod_gone_stderr))
+    with mock.patch.object(command_runner.log_lib, 'run_with_log',
+                           run_with_log), \
+         mock.patch('sky.provision.kubernetes.utils.diagnose_terminated_pod'
+                   ) as mock_diagnose:
+        runner = command_runner.KubernetesCommandRunner((('ns', 'ctx'), 'pod'))
+        result = runner.run('echo hi',
+                            require_outputs=True,
+                            stream_logs=False,
+                            process_stream=False,
+                            bounded_capture=capture)
+
+    assert result == (1, '', pod_gone_stderr)
+    assert run_with_log.call_args.kwargs['bounded_capture'] is capture
+    mock_diagnose.assert_not_called()
+
+
 def test_slurm_rsync_preserves_ssh_home_resolver_contract() -> None:
     """A Slurm runner remains substitutable for an SSH command runner."""
     runner = object.__new__(command_runner.SlurmCommandRunner)

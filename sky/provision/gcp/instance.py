@@ -13,6 +13,7 @@ from sky import sky_logging
 from sky.adaptors import gcp
 from sky.provision import common
 from sky.provision import constants as provision_constants
+from sky.provision import provider_facets
 from sky.provision.gcp import config as gcp_config
 from sky.provision.gcp import constants
 from sky.provision.gcp import instance_utils
@@ -21,6 +22,8 @@ from sky.utils import resources_utils
 from sky.utils import status_lib
 
 logger = sky_logging.init_logger(__name__)
+
+_SERVE_INVENTORY_HTTP_TIMEOUT_SECONDS = 10
 
 _INSTANCE_RESOURCE_NOT_FOUND_PATTERN = re.compile(
     r'The resource \'projects/.*/zones/.*/instances/.*\' was not found')
@@ -115,6 +118,133 @@ def query_instances(
             terminate_instances(cluster_name_on_cloud, provider_config)
     # TODO(zhwu): TPU node should check the status of the attached TPU as well.
     return statuses
+
+
+def query_instances_batch(
+    queries: tuple[provider_facets.InstanceStatusInventoryQueryV1, ...],
+    *,
+    deadline_monotonic: float,
+) -> tuple[provider_facets.InstanceStatusInventoryObservationV1, ...]:
+    """Read one bounded GCE inventory per project and zone."""
+    partitioned: dict[tuple[
+        str, str], list[provider_facets.InstanceStatusInventoryQueryV1]] = {}
+    observations: dict[
+        str, provider_facets.InstanceStatusInventoryObservationV1] = {}
+    for query in queries:
+        config = query.provider_config
+        project_id = config.get('project_id')
+        zone = config.get('availability_zone')
+        if config.get('_has_tpus', False):
+            error = 'GCP TPU batch status inventory is unsupported'
+        elif not isinstance(project_id, str) or not project_id:
+            error = 'GCP provider config has no project_id'
+        elif not isinstance(zone, str) or not zone:
+            error = 'GCP provider config has no availability_zone'
+        else:
+            partitioned.setdefault((project_id, zone), []).append(query)
+            continue
+        observations[query.query_id] = (
+            provider_facets.InstanceStatusInventoryObservationV1(
+                query_id=query.query_id,
+                disposition=(provider_facets.
+                             InstanceStatusInventoryDispositionV1.UNKNOWN),
+                error=error))
+
+    handler = instance_utils.GCPComputeInstance
+    for (project_id, zone), partition in partitioned.items():
+        query_ids_by_cluster: dict[str, list[str]] = {}
+        for query in partition:
+            query_ids_by_cluster.setdefault(query.cluster_name_on_cloud,
+                                            []).append(query.query_id)
+        label_key = provision_constants.TAG_RAY_CLUSTER_NAME
+        entries_by_query_id: dict[
+            str, list[provider_facets.InstanceStatusInventoryEntryV1]] = {
+                query.query_id: [] for query in partition
+            }
+        try:
+            if deadline_monotonic - time.monotonic() < 1:
+                raise TimeoutError(
+                    'GCP batch inventory exhausted its aggregate deadline')
+            compute = handler.load_resource()
+            page_token = None
+            seen_instance_ids: set[str] = set()
+            while True:
+                request_kwargs = {
+                    'project': project_id,
+                    'zone': zone,
+                    # List the zone once and project requested SkyPilot
+                    # cluster labels locally.  An OR expression containing
+                    # hundreds of labels can exceed the HTTP/filter limit.
+                    'maxResults': 500,
+                }
+                if page_token is not None:
+                    request_kwargs['pageToken'] = page_token
+                request = compute.instances().list(**request_kwargs)
+                remaining = deadline_monotonic - time.monotonic()
+                if remaining < 1:
+                    raise TimeoutError(
+                        'GCP batch inventory exhausted its aggregate deadline')
+                request.http.timeout = min(
+                    _SERVE_INVENTORY_HTTP_TIMEOUT_SECONDS, remaining)
+                response = request.execute(num_retries=0)
+                for instance in response.get('items', []):
+                    instance_id = instance.get('name')
+                    raw_status = instance.get(handler.STATUS_FIELD)
+                    labels = instance.get('labels')
+                    if (not isinstance(instance_id, str) or
+                            not isinstance(raw_status, str) or
+                            not isinstance(labels, dict)):
+                        raise ValueError(
+                            'GCE returned malformed instance inventory')
+                    cluster_name = labels.get(label_key)
+                    if not isinstance(cluster_name, str):
+                        continue
+                    matching_query_ids = query_ids_by_cluster.get(
+                        cluster_name, [])
+                    if not matching_query_ids:
+                        continue
+                    if instance_id in seen_instance_ids:
+                        raise ValueError(
+                            'GCE returned duplicate instance inventory')
+                    seen_instance_ids.add(instance_id)
+                    if raw_status in handler.PENDING_STATES:
+                        status = status_lib.ClusterStatus.INIT
+                    elif raw_status in (handler.STOPPING_STATES +
+                                        handler.STOPPED_STATES):
+                        status = status_lib.ClusterStatus.STOPPED
+                    elif raw_status == handler.RUNNING_STATE:
+                        status = status_lib.ClusterStatus.UP
+                    else:
+                        continue
+                    entry = provider_facets.InstanceStatusInventoryEntryV1(
+                        instance_id=instance_id, status=status)
+                    for query_id in matching_query_ids:
+                        entries_by_query_id[query_id].append(entry)
+                page_token = response.get('nextPageToken')
+                if not page_token:
+                    break
+        except Exception as error:  # pylint: disable=broad-except
+            message = f'{type(error).__name__}: {error}'
+            for query in partition:
+                observations[query.query_id] = (
+                    provider_facets.InstanceStatusInventoryObservationV1(
+                        query_id=query.query_id,
+                        disposition=(
+                            provider_facets.
+                            InstanceStatusInventoryDispositionV1.UNKNOWN),
+                        error=message))
+            continue
+        for query in partition:
+            entries = tuple(
+                sorted(entries_by_query_id[query.query_id],
+                       key=lambda entry: entry.instance_id))
+            observations[query.query_id] = (
+                provider_facets.InstanceStatusInventoryObservationV1(
+                    query_id=query.query_id,
+                    disposition=(provider_facets.
+                                 InstanceStatusInventoryDispositionV1.OBSERVED),
+                    entries=entries))
+    return tuple(observations[query.query_id] for query in queries)
 
 
 def _managed_compute_resource_name_pattern(

@@ -70,6 +70,7 @@ from sky.serve import spot_placer
 from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
 from sky.serve import zero_cost_actuation
+from sky.server import plugins
 from sky.server import runtime_profile
 from sky.server.requests import process as request_process
 from sky.skylet import constants
@@ -8285,6 +8286,12 @@ def run_controller(service_name: str,
     os.environ[constants.OVERRIDE_CONSOLIDATION_MODE] = 'true'
     # Hijack sys.stdout/stderr to be context aware.
     context_utils.hijack_sys_attrs()
+    # Serve controllers use the ``spawn`` multiprocessing start method, so
+    # process-local provider registrations from the API server are not
+    # inherited.  Load controller-scoped plugins before any reconciliation
+    # object can resolve a provider facet.
+    plugins.load_plugins(
+        plugins.ExtensionContext(context=plugins.PluginContext.CONTROLLER))
     controller_kwargs: dict[str, Any] = {}
     if controller_binding_authority is not None:
         controller_kwargs['controller_binding_authority'] = (

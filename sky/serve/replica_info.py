@@ -1919,8 +1919,10 @@ class ReplicaInfo:
     def probe_pool(
         self,
         *,
+        handle: backends.CloudVmRayResourceHandle | None = None,
         provider_phase_admission: provider_phase.ProviderPhaseAdmission |
         None = None,
+        job_status_transport: backends.ServeJobStatusTransport | None = None,
     ) -> tuple['ReplicaInfo', bool, float]:
         """Probe the replica for pool management.
 
@@ -1937,20 +1939,18 @@ class ReplicaInfo:
             # See _resolve_url for the import-cycle rationale.
             # pylint: disable-next=import-outside-toplevel
             from sky.serve import reserved_capacity
-            durable_handle = global_user_state.get_handle_from_cluster_name(
-                self.cluster_name)
+            if handle is None:
+                handle = global_user_state.get_handle_from_cluster_name(
+                    self.cluster_name)
+            if handle is None:
+                return self, False, probe_time
             with reserved_capacity.protocol_v2_provider_fence(
-                    self, durable_handle,
-                    phase_admission=provider_phase_admission):
-                handle = backend_utils.check_cluster_available(
-                    self.cluster_name, operation='probing pool')
-                if handle is None:
-                    return self, False, probe_time
-                with reserved_capacity.protocol_v2_provider_fence(
-                        self, handle, phase_admission=provider_phase_admission):
-                    backend = backend_utils.get_backend_from_handle(handle)
-                    statuses = backend.get_job_status(handle, [1],
-                                                      stream_logs=False)
+                    self, handle, phase_admission=provider_phase_admission):
+                backend = backend_utils.get_backend_from_handle(handle)
+                statuses = backend.get_job_status(
+                    handle, [1],
+                    stream_logs=False,
+                    serve_transport=job_status_transport)
             if statuses[1] == job_lib.JobStatus.SUCCEEDED:
                 return self, True, probe_time
             return self, False, probe_time
@@ -2011,30 +2011,42 @@ class ReplicaInfo:
             request_started_at = time.monotonic()
             if request_started_callback is not None:
                 request_started_callback(request_started_at)
-            if post_data is not None:
-                msg += 'POST'
-                response = client.post(readiness_path,
-                                       json=post_data,
-                                       headers=headers,
-                                       timeout=timeout)
-            else:
-                msg += 'GET'
-                response = client.get(readiness_path,
-                                      headers=headers,
-                                      timeout=timeout)
-            msg += (f' request to {replica_identity} returned status '
-                    f'code {response.status_code}')
-            if response.status_code == 200:
-                msg += '.'
-                log_method = logger.info
-            else:
-                msg += f' and response {response.text}.'
-                msg = f'{colorama.Fore.YELLOW}{msg}{colorama.Style.RESET_ALL}'
-                log_method = logger.error
-            log_method(msg)
-            if response.status_code == 200:
-                logger.debug(f'{replica_identity.capitalize()} is ready.')
-                return self, True, probe_time
+            response = None
+            try:
+                # Readiness is a headers-only protocol. Streaming prevents a
+                # buggy endpoint from making each probe worker materialize an
+                # unbounded success or error body; even diagnostics must not
+                # turn application output into controller memory pressure.
+                if post_data is not None:
+                    msg += 'POST'
+                    response = client.post(readiness_path,
+                                           json=post_data,
+                                           headers=headers,
+                                           timeout=timeout,
+                                           stream=True)
+                else:
+                    msg += 'GET'
+                    response = client.get(readiness_path,
+                                          headers=headers,
+                                          timeout=timeout,
+                                          stream=True)
+                msg += (f' request to {replica_identity} returned status '
+                        f'code {response.status_code}')
+                if response.status_code == 200:
+                    msg += '.'
+                    log_method = logger.info
+                else:
+                    msg += '.'
+                    msg = (f'{colorama.Fore.YELLOW}{msg}'
+                           f'{colorama.Style.RESET_ALL}')
+                    log_method = logger.error
+                log_method(msg)
+                if response.status_code == 200:
+                    logger.debug(f'{replica_identity.capitalize()} is ready.')
+                    return self, True, probe_time
+            finally:
+                if response is not None:
+                    response.close()
         except Exception as e:  # pylint: disable=broad-except
             # Catch all errors, not just RequestException: probe inputs
             # (readiness path/headers/post data) come from user YAML and can
