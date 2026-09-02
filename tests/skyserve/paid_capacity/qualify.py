@@ -72,12 +72,12 @@ class GuardViolation(QualificationError):
 
 
 _PROVIDER_SCOPE_SCHEMA_VERSION = 6
-_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 7
+_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 8
 _CLEANUP_RECEIPT_SCHEMA_VERSION = 2
 _AGGREGATE_RECEIPT_SCHEMA_VERSION = 2
-_HELD_REQUEST_TAIL_SECONDS = 40
 _CAMPAIGN_LOAD_WINDOW_SECONDS = (
     serve_constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
+_SCALE_TAIL_BATCH_SIZE = 400
 _AWS_CENSUS_MAX_WORKERS = 8
 
 
@@ -119,7 +119,7 @@ PROFILES = {
                      max_units=800,
                      minimum_running=100,
                      exact_requests=10_000,
-                     request_concurrency=10_000,
+                     request_concurrency=128,
                      scale_timeout_seconds=15 * 60,
                      scale_slo_seconds=5 * 60,
                      drain_timeout_seconds=30 * 60,
@@ -145,9 +145,9 @@ PROFILES = {
 }
 
 
-def request_hold_seconds(profile: Profile) -> float:
-    """Keep exact demand alive slightly beyond the physical scale SLO."""
-    return profile.scale_slo_seconds + _HELD_REQUEST_TAIL_SECONDS
+def request_processing_seconds(profile: Profile) -> float:
+    """Keep synthetic work observable across at least two polling ticks."""
+    return max(10.0, 2 * profile.poll_seconds)
 
 
 def request_queue_max_concurrency(profile: Profile) -> int:
@@ -155,9 +155,49 @@ def request_queue_max_concurrency(profile: Profile) -> int:
     return max(8, min(128, profile.request_concurrency))
 
 
-def held_request_count(profile: Profile) -> int:
-    """Keep one logical-cap cohort occupied through the scale SLO."""
+def scale_stimulus_count(profile: Profile) -> int:
+    """Return the bounded cohort sufficient to request the configured cap."""
     return min(profile.max_units, profile.exact_requests)
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ExactRequestBatchPlan:
+    """A bounded network plan for one exact logical request campaign."""
+
+    total_count: int
+    batch_size: int
+    concurrency: int
+
+    def __post_init__(self) -> None:
+        if (type(self.total_count) is not int or self.total_count < 0 or
+                type(self.batch_size) is not int or self.batch_size < 1 or
+                type(self.concurrency) is not int or self.concurrency < 1 or
+                self.concurrency > self.batch_size):
+            raise ValueError('Exact request batch plan is invalid.')
+
+    def batch_counts(self) -> tuple[int, ...]:
+        full_batches, remainder = divmod(self.total_count, self.batch_size)
+        batches = [self.batch_size] * full_batches
+        if remainder:
+            batches.append(remainder)
+        return tuple(batches)
+
+
+class ExactRequestCompletionGate:
+    """Explicitly retain accepted scale work until its scale proof finishes."""
+
+    def __init__(self) -> None:
+        self._event = asyncio.Event()
+
+    @property
+    def released(self) -> bool:
+        return self._event.is_set()
+
+    async def wait(self) -> None:
+        await self._event.wait()
+
+    def release(self) -> None:
+        self._event.set()
 
 
 class ExpectationKind(str, enum.Enum):
@@ -687,13 +727,20 @@ def _fixture_duration_limit(config: collections.abc.Mapping[str, Any]) -> float:
 
 def _profile_projection(profile: Profile) -> dict[str, int]:
     """Return every field the canonical renderer may vary by profile."""
+    if profile.name == 'scale':
+        request_queue_min_size = scale_stimulus_count(profile)
+        request_queue_max_size = (request_queue_min_size +
+                                  _SCALE_TAIL_BATCH_SIZE)
+    else:
+        request_queue_min_size = profile.request_concurrency
+        request_queue_max_size = max(32, profile.request_concurrency)
     return {
         'max_replicas': profile.max_replicas,
         'max_live_paid_gpu_units': profile.max_units,
         'scale_up_rate_min_replicas': profile.scale_up_min_replicas,
         'scale_up_rate_period_seconds': profile.scale_up_period_seconds,
-        'request_queue_min_size': profile.request_concurrency,
-        'request_queue_max_size': max(32, profile.request_concurrency),
+        'request_queue_min_size': request_queue_min_size,
+        'request_queue_max_size': request_queue_max_size,
         'request_queue_max_concurrency': request_queue_max_concurrency(profile),
     }
 
@@ -979,7 +1026,7 @@ def provider_scope_from_controller_config(
         raise GuardViolation(
             'Current service version is not generic whole-L4 Spot.') \
             from error
-    if (request_hold_seconds(profile) > duration_limit or
+    if (request_processing_seconds(profile) > duration_limit or
             duration_limit >= contract.request_queue_timeout_seconds):
         raise GuardViolation(
             'Current service duration contract cannot preserve bounded demand.')
@@ -3670,9 +3717,6 @@ class Progress:
         default_factory=dict)
     baseline_qualified_iteration_id: int | None = None
     baseline_qualified_observed_at: float | None = None
-    campaign_loaded_iteration_id: int | None = None
-    campaign_loaded_observed_at: float | None = None
-    campaign_loaded_request_observed_at: float | None = None
     scale_started_monotonic: float | None = None
     scale_started_at: float | None = None
     scale_reached_monotonic: float | None = None
@@ -3855,9 +3899,7 @@ class Receipt:
                *,
                scale_iteration_id: int | None = None,
                baseline_iteration_id: int | None = None,
-               baseline_pair_observed_at: float | None = None,
-               campaign_iteration_id: int | None = None,
-               campaign_pair_observed_at: float | None = None) -> None:
+               baseline_pair_observed_at: float | None = None) -> None:
         sample = {
             'phase': phase,
             'exact_zero': observation.is_exact_zero(),
@@ -3868,9 +3910,6 @@ class Receipt:
         if baseline_iteration_id is not None:
             sample['baseline_iteration_id'] = baseline_iteration_id
             sample['baseline_pair_observed_at'] = baseline_pair_observed_at
-        if campaign_iteration_id is not None:
-            sample['campaign_iteration_id'] = campaign_iteration_id
-            sample['campaign_pair_observed_at'] = campaign_pair_observed_at
         self._payload['samples'].append(sample)
 
     def miss(self,
@@ -3894,9 +3933,7 @@ class Receipt:
             *,
             scale_iteration_id: int | None = None,
             baseline_iteration_id: int | None = None,
-            baseline_pair_observed_at: float | None = None,
-            campaign_iteration_id: int | None = None,
-            campaign_pair_observed_at: float | None = None) -> None:
+            baseline_pair_observed_at: float | None = None) -> None:
         sample = {
             'phase': phase,
             **dataclasses.asdict(telemetry),
@@ -3909,9 +3946,6 @@ class Receipt:
         if baseline_iteration_id is not None:
             sample['baseline_iteration_id'] = baseline_iteration_id
             sample['baseline_pair_observed_at'] = baseline_pair_observed_at
-        if campaign_iteration_id is not None:
-            sample['campaign_iteration_id'] = campaign_iteration_id
-            sample['campaign_pair_observed_at'] = campaign_pair_observed_at
         self._payload['request_telemetry_samples'].append(sample)
 
     def finish(self,
@@ -3935,11 +3969,6 @@ class Receipt:
                 progress.baseline_qualified_iteration_id,
             'baseline_qualified_observed_at':
                 progress.baseline_qualified_observed_at,
-            'campaign_loaded_iteration_id':
-                progress.campaign_loaded_iteration_id,
-            'campaign_loaded_observed_at': progress.campaign_loaded_observed_at,
-            'campaign_loaded_request_observed_at':
-                progress.campaign_loaded_request_observed_at,
             # Preserve the wall start and bind the exact provider observation
             # that qualified.  The aggregate gate derives elapsed time from
             # these two receipt facts; a free-standing elapsed scalar is not
@@ -4260,6 +4289,7 @@ async def _one_exact_async_request(
     stable_job_id: str,
     duration_seconds: float,
     deadline: float,
+    completion_gate: ExactRequestCompletionGate | None = None,
 ) -> None:
     receipt, intent_sha256 = await _submit_exact_async_request(
         session,
@@ -4273,6 +4303,8 @@ async def _one_exact_async_request(
     if receipt.state == 'SUCCEEDED':
         return
     await asyncio.sleep(duration_seconds)
+    if completion_gate is not None:
+        await completion_gate.wait()
     await _complete_exact_async_request(session,
                                         endpoint=endpoint,
                                         token=token,
@@ -4296,6 +4328,7 @@ async def send_exact_async_requests(
     hold_requests: int,
     hold_seconds: float,
     timeout_seconds: float,
+    completion_gate: ExactRequestCompletionGate | None = None,
 ) -> int:
     """Submit and durably complete exact synthetic async requests."""
     queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
@@ -4320,7 +4353,8 @@ async def send_exact_async_requests(
                 request_id=request_id,
                 stable_job_id=f'{prefix}-job-{index:05d}',
                 duration_seconds=(hold_seconds if index < hold_requests else 0),
-                deadline=deadline)
+                deadline=deadline,
+                completion_gate=completion_gate)
             async with lock:
                 successes += 1
             queue.task_done()
@@ -4331,6 +4365,41 @@ async def send_exact_async_requests(
                                      connector=connector) as session:
         await asyncio.gather(*(worker() for _ in range(min(count, concurrency)))
                             )
+    return successes
+
+
+async def send_exact_async_request_batches(
+    *,
+    endpoint: str,
+    token: str,
+    service_hash: str,
+    prefix: str,
+    count: int,
+    batch_size: int,
+    concurrency: int,
+    timeout_seconds: float,
+) -> int:
+    """Stream one exact campaign through bounded, sequential HTTP batches."""
+    plan = ExactRequestBatchPlan(total_count=count,
+                                 batch_size=batch_size,
+                                 concurrency=concurrency)
+    deadline = time.monotonic() + timeout_seconds
+    successes = 0
+    for batch_index, batch_count in enumerate(plan.batch_counts()):
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            raise QualificationError(
+                'Exact request batches exhausted their campaign deadline.')
+        successes += await send_exact_async_requests(
+            endpoint=endpoint,
+            token=token,
+            service_hash=service_hash,
+            prefix=f'{prefix}-batch-{batch_index:03d}',
+            count=batch_count,
+            concurrency=min(plan.concurrency, batch_count),
+            hold_requests=0,
+            hold_seconds=0,
+            timeout_seconds=remaining_seconds)
     return successes
 
 
@@ -4428,7 +4497,7 @@ def _resident_campaign_size(telemetry: RequestTelemetry) -> int:
     return telemetry.queue_depth + telemetry.in_flight_requests
 
 
-async def _wait_for_campaign_stage(
+async def _wait_for_scale_stimulus(
     *,
     observer: Observer,
     profile: Profile,
@@ -4438,7 +4507,7 @@ async def _wait_for_campaign_stage(
     expected_resident: int,
     deadline_monotonic: float,
 ) -> RequestTelemetry:
-    """Prove the held FIFO prefix is resident before offering the tail."""
+    """Prove the bounded cohort is resident before observing scale-out."""
     while time.monotonic() < deadline_monotonic:
         if traffic.done():
             try:
@@ -4461,101 +4530,11 @@ async def _wait_for_campaign_stage(
                 'Held campaign prefix contains unattributed demand.')
         if (_has_exact_campaign_demand(telemetry, baseline) and
                 _resident_campaign_size(telemetry) == expected_resident):
-            receipt.request_telemetry('campaign-stage', telemetry)
+            receipt.request_telemetry('scale-stimulus', telemetry)
             return telemetry
         await asyncio.sleep(profile.poll_seconds)
     raise QualificationError(
-        'Held campaign prefix did not enter the request queue in time.')
-
-
-async def _wait_for_campaign_loaded(
-    *,
-    observer: Observer,
-    profile: Profile,
-    progress: Progress,
-    receipt: Receipt,
-    traffic: asyncio.Task[int],
-    baseline: RequestTelemetry,
-    expectation: ProviderExpectation,
-    deadline_monotonic: float,
-) -> RequestTelemetry:
-    """Join the exact resident campaign to the LB's offered-arrival counter."""
-    campaign_iteration_id = 0
-    while time.monotonic() < deadline_monotonic:
-        if traffic.done():
-            try:
-                successes = traffic.result()
-            except BaseException as error:
-                raise QualificationError(
-                    'Exact campaign failed before its arrival proof.') \
-                    from error
-            raise QualificationError(
-                'Exact campaign ended before its arrival proof after '
-                f'{successes} successes.')
-        try:
-            telemetry = await observer.request_telemetry()
-        except Exception:  # pylint: disable=broad-except
-            await asyncio.sleep(profile.poll_seconds)
-            continue
-        resident = _resident_campaign_size(telemetry)
-        if (telemetry.is_fresh_complete() and
-                resident > expectation.exact_request_count):
-            raise QualificationError(
-                'Resident demand exceeds the exact campaign identity count.')
-        if (not _has_exact_campaign_demand(telemetry, baseline) or
-                resident != expectation.exact_request_count):
-            await asyncio.sleep(profile.poll_seconds)
-            continue
-        try:
-            observation = await observer.snapshot(
-                require_complete_demand_report=False)
-            validate_observation(observation, profile, expectation)
-        except GuardViolation:
-            raise
-        except Exception as error:  # pylint: disable=broad-except
-            receipt.miss('campaign-loaded', error)
-            await asyncio.sleep(profile.poll_seconds)
-            continue
-        arrivals = observation.load_balancer
-        if (arrivals.unique_job_arrivals_60s > expectation.exact_request_count
-                or arrivals.unique_job_arrivals_300s
-                > expectation.exact_request_count or
-                arrivals.headerless_arrivals_60s > 0 or
-                arrivals.headerless_arrivals_300s > 0 or
-                arrivals.offered_arrival_tracking_saturated):
-            raise QualificationError(
-                'Offered-arrival evidence is not exactly attributable to '
-                'the campaign.')
-        if (arrivals.unique_job_arrivals_60s != expectation.exact_request_count
-                or arrivals.unique_job_arrivals_300s
-                != expectation.exact_request_count or
-                observation.database.demand_units <= 0 or
-                observation.load_balancer.demand_units <= 0):
-            await asyncio.sleep(profile.poll_seconds)
-            continue
-        campaign_iteration_id += 1
-        paired_at = observation.observed_at
-        if (not math.isfinite(paired_at) or paired_at <= 0 or
-                progress.scale_started_at is None or
-                paired_at - progress.scale_started_at
-                > _CAMPAIGN_LOAD_WINDOW_SECONDS):
-            raise QualificationError(
-                'Exact campaign missed the offered-arrival scale window.')
-        receipt.request_telemetry('campaign-loaded',
-                                  telemetry,
-                                  campaign_iteration_id=campaign_iteration_id,
-                                  campaign_pair_observed_at=paired_at)
-        progress.observe(observation, profile, expectation, qualify_scale=False)
-        receipt.sample('campaign-loaded',
-                       observation,
-                       campaign_iteration_id=campaign_iteration_id,
-                       campaign_pair_observed_at=paired_at)
-        progress.campaign_loaded_iteration_id = campaign_iteration_id
-        progress.campaign_loaded_observed_at = paired_at
-        progress.campaign_loaded_request_observed_at = telemetry.observed_at
-        return telemetry
-    raise QualificationError(
-        'Exact campaign did not fill the offered-arrival window in time.')
+        'Scale stimulus did not enter the request queue in time.')
 
 
 async def _wait_for_positive_request_telemetry(
@@ -4595,7 +4574,9 @@ async def _wait_for_positive_request_telemetry(
                 telemetry.confirmed_processing_requests is not None and
                 telemetry.confirmed_processing_requests > 0 and
                 telemetry.ledger_total > baseline.ledger_total and
-                telemetry.ledger_count('ACCEPTED') > 0):
+                telemetry.ledger_count('ACCEPTED') > 0 and
+            (profile.name != 'scale' or _resident_campaign_size(telemetry)
+             == scale_stimulus_count(profile))):
             receipt.request_telemetry('positive', telemetry)
             return telemetry
         await asyncio.sleep(profile.poll_seconds)
@@ -4693,9 +4674,9 @@ async def _wait_for_scale(
                 'ledger identities.')
         active_delta = telemetry.ledger_active - baseline.ledger_active
         if (profile.name == 'scale' and _resident_campaign_size(telemetry)
-                != expectation.exact_request_count):
+                != scale_stimulus_count(profile)):
             raise QualificationError(
-                'Scale demand no longer contains the full exact campaign.')
+                'Scale demand no longer contains the exact bounded stimulus.')
         if active_delta <= 0 or active_delta > expectation.exact_request_count:
             raise QualificationError(
                 'Scale demand lacks positive exact dispatched identities.')
@@ -4718,6 +4699,16 @@ async def _wait_for_scale(
                 observation.load_balancer.demand_units <= 0):
             raise QualificationError(
                 'Provider scale sample has no same-observation demand.')
+        if profile.name == 'scale':
+            arrivals = observation.load_balancer
+            expected_arrivals = scale_stimulus_count(profile)
+            if (arrivals.unique_job_arrivals_300s != expected_arrivals or not 0
+                    <= arrivals.unique_job_arrivals_60s <= expected_arrivals or
+                    arrivals.headerless_arrivals_60s != 0 or
+                    arrivals.headerless_arrivals_300s != 0 or
+                    arrivals.offered_arrival_tracking_saturated):
+                raise QualificationError(
+                    'Scale stimulus contains unattributed offered arrivals.')
         if progress.scale_reached_monotonic is not None:
             if progress.scale_qualified_iteration_id is not None:
                 raise QualificationError(
@@ -5137,8 +5128,7 @@ class _RequestEvidence:
     """Validated request-side timing and provider-pair authority."""
 
     baseline_pairs: tuple[tuple[int, float], ...]
-    campaign_pair: tuple[int, float] | None
-    campaign_request_observed_at: float | None
+    scale_stimulus_observed_at: float | None
     positive_scale_iterations: frozenset[int]
     scale_observed_at_by_iteration: tuple[tuple[int, float], ...]
     first_positive_observed_at: float
@@ -5166,8 +5156,7 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
             'Qualification receipt lacks request telemetry evidence.')
     typed_samples = typing.cast(list[dict[str, Any]], samples)
     allowed_phases = {
-        'baseline', 'campaign-stage', 'campaign-loaded', 'positive', 'scale',
-        'final'
+        'baseline', 'scale-stimulus', 'positive', 'scale', 'final'
     }
     if any(
             sample.get('phase') not in allowed_phases
@@ -5213,45 +5202,28 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
     baseline_active = sum(
         baseline_counts.get(state, 0) for state in _ASYNC_ACTIVE_STATES)
 
-    campaign_pair: tuple[int, float] | None = None
-    campaign_request_observed_at: float | None = None
-    campaign_loaded = [
+    scale_stimulus_observed_at: float | None = None
+    scale_stimulus = [
         sample for sample in typed_samples
-        if sample.get('phase') == 'campaign-loaded'
-    ]
-    campaign_stage = [
-        sample for sample in typed_samples
-        if sample.get('phase') == 'campaign-stage'
+        if sample.get('phase') == 'scale-stimulus'
     ]
     if profile.name == 'scale':
-        if len(campaign_stage) != 1 or len(campaign_loaded) != 1:
+        if len(scale_stimulus) != 1:
             raise QualificationError(
-                'Qualification receipt lacks exact campaign-load evidence.')
-        stage = campaign_stage[0]
-        loaded = campaign_loaded[0]
-        if (not _telemetry_is_exactly_attributed(stage, baseline_active) or
-                stage['queue_depth'] + stage['in_flight_requests']
-                != held_request_count(profile) or
-                not _telemetry_is_exactly_attributed(loaded, baseline_active) or
-                loaded['queue_depth'] + loaded['in_flight_requests']
-                != exact_count):
+                'Qualification receipt lacks exact scale-stimulus evidence.')
+        stimulus = scale_stimulus[0]
+        if (not _telemetry_is_exactly_attributed(stimulus, baseline_active) or
+                stimulus['queue_depth'] + stimulus['in_flight_requests']
+                != scale_stimulus_count(profile)):
             raise QualificationError(
-                'Qualification receipt has an incomplete resident campaign.')
-        campaign_id = loaded.get('campaign_iteration_id')
-        campaign_at = _strict_timestamp(
-            {'observed_at': loaded.get('campaign_pair_observed_at')})
-        if type(campaign_id) is not int or campaign_id != 1:
+                'Qualification receipt has an incomplete scale stimulus.')
+        scale_stimulus_observed_at = _strict_timestamp(stimulus)
+        if baseline_pairs[-1][1] >= scale_stimulus_observed_at:
             raise QualificationError(
-                'Qualification receipt has unpaired campaign-load evidence.')
-        campaign_pair = (campaign_id, campaign_at)
-        campaign_request_observed_at = _strict_timestamp(loaded)
-        if (not baseline_pairs[-1][1] < _strict_timestamp(stage) <=
-                campaign_request_observed_at <= campaign_at):
-            raise QualificationError(
-                'Qualification receipt has reordered campaign-load evidence.')
-    elif campaign_stage or campaign_loaded:
+                'Qualification receipt has reordered scale-stimulus evidence.')
+    elif scale_stimulus:
         raise QualificationError(
-            'Provider canary contains economic campaign-load evidence.')
+            'Provider canary contains economic scale-stimulus evidence.')
 
     scale_iteration_ids: set[int] = set()
     scale_observed_at_by_iteration: list[tuple[int, float]] = []
@@ -5263,7 +5235,8 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
                 iteration_id in scale_iteration_ids or
                 not _telemetry_is_exactly_attributed(sample, baseline_active) or
                 sample.get('ledger_active', 0) - baseline_active <= 0 or
-                resident != (exact_count if profile.name == 'scale' else 1)):
+                resident != (scale_stimulus_count(profile)
+                             if profile.name == 'scale' else 1)):
             raise QualificationError(
                 'Qualification receipt contains unattributed scale demand.')
         scale_iteration_ids.add(iteration_id)
@@ -5284,7 +5257,7 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
                 positive[0]['in_flight_requests'] <= 0 or
                 positive[0]['processing_requests'] <= 0 or
                 positive[0]['queue_depth'] + positive[0]['in_flight_requests']
-                != exact_count):
+                != scale_stimulus_count(profile)):
             raise QualificationError(
                 'Qualification receipt lacks exact positive request telemetry.')
         positive_timestamps.append(_strict_timestamp(positive[0]))
@@ -5308,14 +5281,13 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
     if (not positive_timestamps or
             final_observed_at <= max(positive_timestamps) or
             baseline_pairs[-1][1] >= min(positive_timestamps) or
-        (campaign_pair is not None and
-         campaign_pair[1] >= min(positive_timestamps))):
+        (scale_stimulus_observed_at is not None and
+         scale_stimulus_observed_at > min(positive_timestamps))):
         raise QualificationError(
             'Terminal request evidence does not follow scale demand.')
     return _RequestEvidence(
         baseline_pairs=tuple(baseline_pairs),
-        campaign_pair=campaign_pair,
-        campaign_request_observed_at=campaign_request_observed_at,
+        scale_stimulus_observed_at=scale_stimulus_observed_at,
         positive_scale_iterations=frozenset(scale_iteration_ids),
         scale_observed_at_by_iteration=tuple(scale_observed_at_by_iteration),
         first_positive_observed_at=min(positive_timestamps),
@@ -5435,7 +5407,6 @@ def _validate_provider_scale_samples(
     qualified_at: float | None = None
     qualified_iteration_id: int | None = None
     baseline_pairs: list[tuple[int, float]] = []
-    campaign_pairs: list[tuple[int, float]] = []
     provider_scale_iterations: set[int] = set()
     request_scale_times = dict(request_evidence.scale_observed_at_by_iteration)
     first_scale_observed_at: float | None = None
@@ -5467,27 +5438,6 @@ def _validate_provider_scale_samples(
                 raise QualificationError(
                     'Qualification receipt has an unpaired provider baseline.')
             baseline_pairs.append((pair_id, pair_at))
-        if sample.get('phase') == 'campaign-loaded':
-            pair_id = sample.get('campaign_iteration_id')
-            pair_at = _strict_timestamp(
-                {'observed_at': sample.get('campaign_pair_observed_at')})
-            expected_arrivals = profile.exact_requests
-            if (type(pair_id) is not int or pair_id < 1 or
-                    pair_at != observed_at or
-                    sample.get('postgres_demand_units', 0) <= 0 or
-                    sample.get('lb_demand_units', 0) <= 0 or
-                    sample.get('lb_unique_job_arrivals_60s')
-                    != expected_arrivals or
-                    sample.get('lb_unique_job_arrivals_300s')
-                    != expected_arrivals or
-                    sample.get('lb_headerless_arrivals_60s') != 0 or
-                    sample.get('lb_headerless_arrivals_300s') != 0 or
-                    sample.get('lb_offered_arrival_tracking_saturated')
-                    is not False):
-                raise QualificationError(
-                    'Qualification receipt lacks exact offered-arrival '
-                    'campaign evidence.')
-            campaign_pairs.append((pair_id, pair_at))
         calculated_peak = max(calculated_peak, totals['running'])
         calculated_gpu_peak = max(calculated_gpu_peak,
                                   totals['running_gpu_units'])
@@ -5503,6 +5453,18 @@ def _validate_provider_scale_samples(
                 sample.get('lb_demand_units', 0) <= 0):
             raise QualificationError(
                 'Provider scale sample has no same-observation demand.')
+        if profile.name == 'scale':
+            expected_arrivals = scale_stimulus_count(profile)
+            arrivals_60s = sample.get('lb_unique_job_arrivals_60s')
+            if (sample.get('lb_unique_job_arrivals_300s') != expected_arrivals
+                    or type(arrivals_60s) is not int or
+                    not 0 <= arrivals_60s <= expected_arrivals or
+                    sample.get('lb_headerless_arrivals_60s') != 0 or
+                    sample.get('lb_headerless_arrivals_300s') != 0 or
+                    sample.get('lb_offered_arrival_tracking_saturated')
+                    is not False):
+                raise QualificationError(
+                    'Provider scale sample has unattributed offered arrivals.')
         iteration_id = sample.get('scale_iteration_id')
         if (type(iteration_id) is not int or iteration_id < 1 or
                 iteration_id in provider_scale_iterations or iteration_id
@@ -5550,23 +5512,15 @@ def _validate_provider_scale_samples(
         raise QualificationError(
             'Qualification receipt lacks provider scale evidence.')
     if profile.name == 'scale':
-        if (request_evidence.campaign_pair is None or
-                campaign_pairs != [request_evidence.campaign_pair] or
-                payload.get('campaign_loaded_iteration_id')
-                != request_evidence.campaign_pair[0] or
-                payload.get('campaign_loaded_observed_at')
-                != request_evidence.campaign_pair[1] or
-                payload.get('campaign_loaded_request_observed_at')
-                != request_evidence.campaign_request_observed_at or
-                not scale_started_at < request_evidence.campaign_pair[1] <=
+        stimulus_at = request_evidence.scale_stimulus_observed_at
+        if (stimulus_at is None or not scale_started_at <= stimulus_at <=
                 scale_started_at + _CAMPAIGN_LOAD_WINDOW_SECONDS or
-                not request_evidence.campaign_pair[1] < first_scale_observed_at
-                <= qualified_at):
+                not stimulus_at <= first_scale_observed_at <= qualified_at):
             raise QualificationError(
-                'Qualification receipt lacks joined campaign-load evidence.')
-    elif campaign_pairs or request_evidence.campaign_pair is not None:
+                'Qualification receipt lacks joined scale-stimulus evidence.')
+    elif request_evidence.scale_stimulus_observed_at is not None:
         raise QualificationError(
-            'Provider canary contains economic campaign-load evidence.')
+            'Provider canary contains economic scale-stimulus evidence.')
     return _ProviderEvidence(scale_elapsed_seconds=elapsed,
                              scale_started_at=scale_started_at,
                              first_scale_observed_at=first_scale_observed_at,
@@ -5934,6 +5888,7 @@ async def qualify(args: argparse.Namespace) -> None:
     ledger_final: RequestTelemetry | None = None
     failure: BaseException | None = None
     campaign_tasks: list[asyncio.Task[int]] = []
+    completion_gate: ExactRequestCompletionGate | None = None
     run_id = f'{args.service_name}-{int(time.time())}'
     try:
         await http.prove_authentication()
@@ -5945,71 +5900,49 @@ async def qualify(args: argparse.Namespace) -> None:
             expectation=expectation)
         progress.start_scale()
         if profile.name == 'scale':
-            held_count = held_request_count(profile)
+            stimulus_count = scale_stimulus_count(profile)
+            completion_gate = ExactRequestCompletionGate()
             held_traffic = asyncio.create_task(
                 send_exact_async_requests(
                     endpoint=args.endpoint,
                     token=token,
                     service_hash=provider_scope.service_hash,
-                    prefix=f'{run_id}-held',
-                    count=held_count,
-                    concurrency=held_count,
-                    hold_requests=held_count,
-                    hold_seconds=request_hold_seconds(profile),
+                    prefix=f'{run_id}-stimulus',
+                    count=stimulus_count,
+                    concurrency=stimulus_count,
+                    hold_requests=stimulus_count,
+                    hold_seconds=request_processing_seconds(profile),
                     timeout_seconds=(profile.scale_timeout_seconds +
-                                     profile.drain_timeout_seconds)))
+                                     profile.drain_timeout_seconds),
+                    completion_gate=completion_gate))
             campaign_tasks.append(held_traffic)
             assert progress.scale_started_monotonic is not None
-            campaign_deadline = (progress.scale_started_monotonic +
+            stimulus_deadline = (progress.scale_started_monotonic +
                                  _CAMPAIGN_LOAD_WINDOW_SECONDS)
-            await _wait_for_campaign_stage(observer=observer,
+            await _wait_for_scale_stimulus(observer=observer,
                                            profile=profile,
                                            receipt=receipt,
                                            traffic=held_traffic,
                                            baseline=ledger_baseline,
-                                           expected_resident=held_count,
-                                           deadline_monotonic=campaign_deadline)
-            tail_count = expectation.exact_request_count - held_count
-            tail_traffic = asyncio.create_task(
+                                           expected_resident=stimulus_count,
+                                           deadline_monotonic=stimulus_deadline)
+            traffic = held_traffic
+        else:
+            traffic = asyncio.create_task(
                 send_exact_async_requests(
                     endpoint=args.endpoint,
                     token=token,
                     service_hash=provider_scope.service_hash,
-                    prefix=f'{run_id}-tail',
-                    count=tail_count,
-                    concurrency=tail_count,
-                    hold_requests=0,
-                    hold_seconds=request_hold_seconds(profile),
+                    prefix=f'{run_id}-exact',
+                    count=expectation.exact_request_count,
+                    concurrency=profile.request_concurrency,
+                    hold_requests=scale_stimulus_count(profile),
+                    hold_seconds=request_processing_seconds(profile),
                     timeout_seconds=(profile.scale_timeout_seconds +
                                      profile.drain_timeout_seconds)))
-            campaign_tasks.append(tail_traffic)
-        else:
-            campaign_tasks.append(
-                asyncio.create_task(
-                    send_exact_async_requests(
-                        endpoint=args.endpoint,
-                        token=token,
-                        service_hash=provider_scope.service_hash,
-                        prefix=f'{run_id}-exact',
-                        count=expectation.exact_request_count,
-                        concurrency=profile.request_concurrency,
-                        hold_requests=held_request_count(profile),
-                        hold_seconds=request_hold_seconds(profile),
-                        timeout_seconds=(profile.scale_timeout_seconds +
-                                         profile.drain_timeout_seconds))))
-        traffic = asyncio.create_task(_sum_exact_request_tasks(campaign_tasks))
+            campaign_tasks.append(traffic)
         try:
             assert ledger_baseline is not None
-            if profile.name == 'scale':
-                await _wait_for_campaign_loaded(
-                    observer=observer,
-                    profile=profile,
-                    progress=progress,
-                    receipt=receipt,
-                    traffic=traffic,
-                    baseline=ledger_baseline,
-                    expectation=expectation,
-                    deadline_monotonic=campaign_deadline)
             if expectation.requires_full_request_telemetry:
                 await _wait_for_positive_request_telemetry(
                     observer=observer,
@@ -6024,8 +5957,29 @@ async def qualify(args: argparse.Namespace) -> None:
                                   traffic=traffic,
                                   baseline=ledger_baseline,
                                   expectation=expectation)
+            if profile.name == 'scale':
+                assert completion_gate is not None
+                completion_gate.release()
+                tail_count = (expectation.exact_request_count -
+                              scale_stimulus_count(profile))
+                tail_traffic = asyncio.create_task(
+                    send_exact_async_request_batches(
+                        endpoint=args.endpoint,
+                        token=token,
+                        service_hash=provider_scope.service_hash,
+                        prefix=f'{run_id}-tail',
+                        count=tail_count,
+                        batch_size=_SCALE_TAIL_BATCH_SIZE,
+                        concurrency=request_queue_max_concurrency(profile),
+                        timeout_seconds=(profile.scale_timeout_seconds +
+                                         profile.drain_timeout_seconds)))
+                campaign_tasks.append(tail_traffic)
+                traffic = asyncio.create_task(
+                    _sum_exact_request_tasks(campaign_tasks))
             exact_request_successes = await traffic
         except BaseException:
+            if completion_gate is not None:
+                completion_gate.release()
             traffic.cancel()
             await asyncio.gather(traffic, return_exceptions=True)
             raise
@@ -6044,6 +5998,8 @@ async def qualify(args: argparse.Namespace) -> None:
                               receipt=receipt,
                               expectation=expectation)
     except BaseException as error:
+        if completion_gate is not None:
+            completion_gate.release()
         for task in campaign_tasks:
             task.cancel()
         await asyncio.gather(*campaign_tasks, return_exceptions=True)
@@ -6057,6 +6013,8 @@ async def qualify(args: argparse.Namespace) -> None:
             ledger_baseline=ledger_baseline,
             ledger_final=ledger_final,
             error=failure)
+        if completion_gate is not None:
+            completion_gate.release()
         postgres.close()
     print(
         json.dumps(
@@ -6092,10 +6050,10 @@ def render_service(args: argparse.Namespace) -> None:
     duration_limit = _fixture_duration_limit(config)
     queue_timeout = config['service']['load_balancer']['request_queue'].get(
         'timeout_seconds')
-    if (not isinstance(queue_timeout,
-                       (int, float)) or isinstance(queue_timeout, bool) or any(
-                           request_hold_seconds(candidate) > duration_limit
-                           for candidate in PROFILES.values()) or
+    if (not isinstance(queue_timeout, (int, float)) or
+            isinstance(queue_timeout, bool) or any(
+                request_processing_seconds(candidate) > duration_limit
+                for candidate in PROFILES.values()) or
             duration_limit >= queue_timeout):
         raise QualificationError(
             'Fixture must bound every held request below its queue timeout.')
@@ -6119,10 +6077,11 @@ def render_service(args: argparse.Namespace) -> None:
         'scale_up_rate_period_seconds': profile.scale_up_period_seconds,
     })
     queue = config['service']['load_balancer']['request_queue']
+    projection = _profile_projection(profile)
     queue.update({
-        'min_size': profile.request_concurrency,
-        'max_size': max(32, profile.request_concurrency),
-        'max_concurrency': request_queue_max_concurrency(profile),
+        'min_size': projection['request_queue_min_size'],
+        'max_size': projection['request_queue_max_size'],
+        'max_concurrency': projection['request_queue_max_concurrency'],
     })
     resources = config['resources']
     expected_locations = [
