@@ -1,20 +1,14 @@
-"""Executable paid-Spot qualification shared by small and scale profiles.
+"""Read-only paid-Spot qualification shared by small and scale profiles.
 
-The driver never creates or deletes infrastructure.  A caller renders and
-starts the service, passes its authenticated endpoint here, and performs the
-normal ``sky serve down`` only after this program proves demand-led scale-down.
+This module never creates or deletes infrastructure.  Billable runs must use
+``lifecycle.py``, whose finalizer owns normal ``sky serve down`` and exact
+cleanup evidence.
 
 Examples::
 
-    python tests/skyserve/paid_capacity/qualify.py render \
-      --profile small --output /tmp/paid-e2e.yaml
-    sky serve up -n paid-e2e -y /tmp/paid-e2e.yaml
-    python tests/skyserve/paid_capacity/qualify.py freeze-scope \
-      --service-name paid-e2e --output /tmp/paid-e2e-scope.json
-    python tests/skyserve/paid_capacity/qualify.py run \
+    python tests/skyserve/paid_capacity/lifecycle.py \
       --profile small --service-name paid-e2e \
-      --endpoint https://example.test --receipt /tmp/paid-e2e.json \
-      --scope /tmp/paid-e2e-scope.json
+      --artifacts-dir /tmp/paid-e2e-artifacts
 
 The data-plane bearer is read from ``SKYPILOT_SERVE_E2E_AUTH_TOKEN`` when an
 external runner explicitly supplies it.  In an API-server pod, the normal
@@ -28,6 +22,7 @@ required in the API-server image.
 import argparse
 import asyncio
 import collections.abc
+import concurrent.futures
 import copy
 import dataclasses
 import datetime
@@ -83,6 +78,7 @@ _AGGREGATE_RECEIPT_SCHEMA_VERSION = 2
 _HELD_REQUEST_TAIL_SECONDS = 40
 _CAMPAIGN_LOAD_WINDOW_SECONDS = (
     serve_constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
+_AWS_CENSUS_MAX_WORKERS = 8
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -541,6 +537,17 @@ class AwsProviderCensus:
 
     service_instances: object
     service_volumes: object
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _AwsRegionCensus:
+    """One side-effect-isolated AWS region read."""
+
+    region: str
+    service_instances: tuple[dict[str, Any], ...]
+    service_volumes: tuple[dict[str, Any], ...]
+    retained_volume_ids: tuple[str, ...]
+    instance_type_widths: tuple[tuple[str, int], ...]
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -2090,8 +2097,8 @@ class AwsObserver:
                         'AWS provider GPU width disagrees with frozen catalog.')
                 self._instance_type_widths[(region, name)] = width
 
-    def _service_census(
-            self
+    def _service_census_serial(
+        self, region_scopes: collections.abc.Sequence[AwsRegionScope]
     ) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
         instances_by_id: dict[str, dict[str, Any]] = {}
         volumes_by_id: dict[str, dict[str, Any]] = {}
@@ -2099,7 +2106,7 @@ class AwsObserver:
                                        set[str]] = collections.defaultdict(set)
         tag_keys = (provision_constants.TAG_RAY_CLUSTER_NAME,
                     provision_constants.TAG_SKYPILOT_CLUSTER_NAME)
-        for region_scope in self._scope.aws_regions:
+        for region_scope in region_scopes:
             session = aws_adaptor.session(
                 profile=region_scope.credential_profile)
             caller = session.client(
@@ -2269,6 +2276,86 @@ class AwsObserver:
 
         for region, retained_ids in newly_retained_by_region.items():
             self._retained_volume_ids_by_region[region].update(retained_ids)
+        return (tuple(instances_by_id[key] for key in sorted(instances_by_id)),
+                tuple(volumes_by_id[key] for key in sorted(volumes_by_id)))
+
+    def _read_region(self, region_scope: AwsRegionScope) -> _AwsRegionCensus:
+        """Read one region with state isolated from concurrent siblings."""
+        # Each worker owns this child observer, so its otherwise-private state
+        # cannot race another region or the parent observer.
+        # pylint: disable=protected-access
+        retained = self._retained_volume_ids_by_region[region_scope.region]
+        child = AwsObserver(profile=self._profile,
+                            service_name=self._service_name,
+                            scope=self._scope,
+                            retained_volume_ids_by_region={
+                                region_scope.region: sorted(retained)
+                            } if self._cleanup_mode else None)
+        child._retained_volume_ids_by_region[region_scope.region].update(
+            retained)
+        child._instance_type_widths.update({
+            key: width
+            for key, width in self._instance_type_widths.items()
+            if key[0] == region_scope.region
+        })
+        instances, volumes = child._service_census_serial((region_scope,))
+        return _AwsRegionCensus(
+            region=region_scope.region,
+            service_instances=instances,
+            service_volumes=volumes,
+            retained_volume_ids=tuple(
+                sorted(
+                    child._retained_volume_ids_by_region[region_scope.region])),
+            instance_type_widths=tuple(
+                sorted((instance_type, width)
+                       for (region, instance_type
+                           ), width in child._instance_type_widths.items()
+                       if region == region_scope.region)))
+
+    def _service_census(
+            self
+    ) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+        """Read frozen regions concurrently and aggregate deterministically."""
+        region_scopes = tuple(
+            sorted(self._scope.aws_regions, key=lambda value: value.region))
+        if not region_scopes:
+            return (), ()
+        if len(region_scopes) == 1:
+            return self._service_census_serial(region_scopes)
+        workers = min(_AWS_CENSUS_MAX_WORKERS, len(region_scopes))
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix='paid-aws-census') as executor:
+            futures = [
+                executor.submit(self._read_region, region_scope)
+                for region_scope in region_scopes
+            ]
+            regions = [future.result() for future in futures]
+        instances_by_id: dict[str, dict[str, Any]] = {}
+        volumes_by_id: dict[str, dict[str, Any]] = {}
+        for expected_scope, result in zip(region_scopes, regions):
+            if result.region != expected_scope.region:
+                raise GuardViolation('AWS region census order changed.')
+            for instance in result.service_instances:
+                instance_id = str(instance['instance_id'])
+                previous = instances_by_id.setdefault(instance_id, instance)
+                if previous != instance:
+                    raise GuardViolation(
+                        'AWS service instance identity is duplicated.')
+            for volume in result.service_volumes:
+                volume_id = str(volume['volume_id'])
+                previous = volumes_by_id.setdefault(volume_id, volume)
+                if previous != volume:
+                    raise GuardViolation(
+                        'AWS service volume identity is duplicated.')
+            self._retained_volume_ids_by_region[result.region].update(
+                result.retained_volume_ids)
+            for instance_type, width in result.instance_type_widths:
+                key = (result.region, instance_type)
+                prior_width = self._instance_type_widths.setdefault(key, width)
+                if prior_width != width:
+                    raise GuardViolation(
+                        'AWS provider GPU width changed within one census.')
         return (tuple(instances_by_id[key] for key in sorted(instances_by_id)),
                 tuple(volumes_by_id[key] for key in sorted(volumes_by_id)))
 
@@ -3368,6 +3455,8 @@ class HttpObserver:
 class Observation:
     """One composed database, provider, and data-plane observation."""
 
+    observed_started_at: float
+    observed_started_monotonic: float
     observed_at: float
     observed_monotonic: float
     database: DatabaseState
@@ -3387,12 +3476,32 @@ class Observation:
                 self.load_balancer.ready_replicas == 0)
 
 
+async def _sleep_after_observation(observation: Observation,
+                                   poll_seconds: float) -> None:
+    """Subtract census latency instead of serially adding it to polling."""
+    await asyncio.sleep(
+        max(
+            0, poll_seconds - (observation.observed_monotonic -
+                               observation.observed_started_monotonic)))
+
+
 def validate_observation(
         observation: Observation,
         profile: Profile,
         expectation: ProviderExpectation | None = None) -> None:
     if expectation is None:
         expectation = provider_expectation(profile, None)
+    if (not math.isfinite(observation.observed_started_at) or
+            not math.isfinite(observation.observed_at) or
+            observation.observed_started_at <= 0 or
+            observation.observed_at < observation.observed_started_at or
+            not math.isfinite(observation.observed_started_monotonic) or
+            not math.isfinite(observation.observed_monotonic) or
+            observation.observed_started_monotonic < 0 or
+            observation.observed_monotonic
+            < observation.observed_started_monotonic):
+        raise QualificationError(
+            'Provider observation has an invalid sample interval.')
     database = observation.database
     provider = observation.provider
     gcp_identities = {
@@ -3461,6 +3570,8 @@ class Observer:
         *,
         require_complete_demand_report: bool = True,
     ) -> Observation:
+        observed_started_at = time.time()
+        observed_started_monotonic = time.monotonic()
         # Capture raw provider state first, then the durable authorization used
         # to classify it.  Since a binding commit precedes its provider effect,
         # this avoids both logical-name prefix guesses and an old-DB/new-VM
@@ -3494,11 +3605,14 @@ class Observer:
                      if self._aws is None else self._aws.reduce(
                          aws_census, database.aws_provider_identities))
         provider = combine_provider_states(gcp_state, aws_state)
-        return Observation(observed_at=time.time(),
-                           observed_monotonic=time.monotonic(),
-                           database=database,
-                           provider=provider,
-                           load_balancer=load_balancer)
+        return Observation(
+            observed_started_at=observed_started_at,
+            observed_started_monotonic=(observed_started_monotonic),
+            observed_at=time.time(),
+            observed_monotonic=time.monotonic(),
+            database=database,
+            provider=provider,
+            load_balancer=load_balancer)
 
 
 @dataclasses.dataclass
@@ -3591,6 +3705,11 @@ class Progress:
 
 def observation_summary(observation: Observation) -> dict[str, Any]:
     return {
+        'observation_started_at': observation.observed_started_at,
+        'observation_finished_at': observation.observed_at,
+        'observation_duration_seconds':
+            (observation.observed_monotonic -
+             observation.observed_started_monotonic),
         'observed_at': observation.observed_at,
         'controller_pid': observation.database.controller.pid,
         'controller_ip': observation.database.controller.ip,
@@ -4230,7 +4349,7 @@ async def _wait_for_joined_baseline(
             progress.baseline_qualified_iteration_id = baseline_iteration_id
             progress.baseline_qualified_observed_at = paired_at
             return telemetry
-        await asyncio.sleep(profile.poll_seconds)
+        await _sleep_after_observation(observation, profile.poll_seconds)
     raise QualificationError(
         'Service did not establish a joined exact-zero pre-demand baseline.')
 
@@ -4562,7 +4681,7 @@ async def _wait_for_scale(
                     'Provider scale qualification was recorded twice.')
             progress.scale_qualified_iteration_id = scale_iteration_id
             return
-        await asyncio.sleep(profile.poll_seconds)
+        await _sleep_after_observation(observation, profile.poll_seconds)
     raise QualificationError(
         f'Provider did not reach {expectation.minimum_physical_running} '
         f'physical RUNNING L4 Spot VMs for {expectation.kind.value} '
@@ -4590,7 +4709,7 @@ async def _wait_for_drain(
         progress.observe_zero(observation)
         if progress.drain_complete(observation, profile):
             return
-        await asyncio.sleep(profile.poll_seconds)
+        await _sleep_after_observation(observation, profile.poll_seconds)
     raise QualificationError(
         'Demand-led drain did not reach sustained exact zero.')
 
@@ -4688,6 +4807,8 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
     failure: BaseException | None = None
     try:
         while time.monotonic() < deadline:
+            observation_started_at = time.time()
+            observation_started_monotonic = time.monotonic()
             reads = []
             if gcp is not None:
                 reads.append(asyncio.to_thread(gcp.census))
@@ -4720,8 +4841,15 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
                           provider.inflight_operation_count == 0 and
                           debits == 0 and claims == 0 and waiters == 0)
             consecutive_zero = consecutive_zero + 1 if exact_zero else 0
+            observation_finished_at = time.time()
+            observation_finished_monotonic = time.monotonic()
             sample = {
-                'observed_at': time.time(),
+                'observation_started_at': observation_started_at,
+                'observation_finished_at': observation_finished_at,
+                'observation_duration_seconds':
+                    (observation_finished_monotonic -
+                     observation_started_monotonic),
+                'observed_at': observation_finished_at,
                 'cleanup_claims': claims,
                 'cleanup_debit_units': debits,
                 'cleanup_provider_disks': provider.disk_count,
@@ -4740,7 +4868,10 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
             print(json.dumps(sample, sort_keys=True), flush=True)
             if consecutive_zero >= 3:
                 return
-            await asyncio.sleep(args.poll_seconds)
+            await asyncio.sleep(
+                max(
+                    0, observation_started_monotonic + args.poll_seconds -
+                    time.monotonic()))
         raise QualificationError(
             'Teardown left paid database debits or scoped provider resources.')
     except BaseException as error:

@@ -13,6 +13,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 import types
 from typing import Any
@@ -299,11 +300,14 @@ def _observation(observed_at: float = 1000,
         'load_balancer': _load_balancer_state(),
     }
     values.update(overrides)
-    return qualifier.Observation(
-        observed_at=observed_at,
-        observed_monotonic=(observed_at if observed_monotonic is None else
-                            observed_monotonic),
-        **values)
+    finished_monotonic = (observed_at
+                          if observed_monotonic is None else observed_monotonic)
+    return qualifier.Observation(observed_started_at=observed_at - 0.5,
+                                 observed_started_monotonic=finished_monotonic -
+                                 0.5,
+                                 observed_at=observed_at,
+                                 observed_monotonic=finished_monotonic,
+                                 **values)
 
 
 def _request_telemetry(*,
@@ -1439,6 +1443,66 @@ def test_aws_observer_scans_every_frozen_catalog_region(monkeypatch):
         assert sum(call[1] == 'describe_volumes' for call in regional) == 2
 
 
+def test_aws_observer_bounds_parallel_regions_and_aggregates_in_order(
+        monkeypatch):
+    regions = ('ap-south-1', 'eu-west-1', 'us-east-2', 'us-west-2')
+    scopes = tuple(
+        qualifier.AwsRegionScope(aws_account_id='123456789012',
+                                 credential_profile=f'{region}-profile',
+                                 region=region) for region in regions)
+    shapes = tuple(
+        qualifier.CatalogShape(cloud='aws',
+                               region=region,
+                               zone=f'{region}a',
+                               instance_type='g6.xlarge',
+                               gpu_units_per_instance=1) for region in regions)
+    scope = _provider_scope(aws_regions=scopes,
+                            catalog_shapes=tuple(
+                                sorted(shapes,
+                                       key=qualifier._catalog_shape_key)))
+    observer = qualifier.AwsObserver(profile=qualifier.PROFILES['small'],
+                                     service_name='paid-e2e',
+                                     scope=scope)
+    monkeypatch.setattr(qualifier, '_AWS_CENSUS_MAX_WORKERS', 2)
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def read_region(region_scope):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        # Reverse completion order to prove aggregation is not completion-ordered.
+        time.sleep(0.01 * (len(regions) - regions.index(region_scope.region)))
+        with lock:
+            active -= 1
+        suffix = len(regions) - regions.index(region_scope.region)
+        return qualifier._AwsRegionCensus(
+            region=region_scope.region,
+            service_instances=({
+                'instance_id': f'i-{suffix}'
+            },),
+            service_volumes=({
+                'volume_id': f'vol-{suffix}'
+            },),
+            retained_volume_ids=(f'vol-{suffix}',),
+            instance_type_widths=(('g6.xlarge', 1),))
+
+    monkeypatch.setattr(observer, '_read_region', read_region)
+    instances, volumes = observer._service_census()
+
+    assert peak == 2
+    assert [item['instance_id'] for item in instances
+           ] == ['i-1', 'i-2', 'i-3', 'i-4']
+    assert [item['volume_id'] for item in volumes
+           ] == ['vol-1', 'vol-2', 'vol-3', 'vol-4']
+    assert observer.retained_volume_ids() == {
+        region: [f'vol-{len(regions) - regions.index(region)}']
+        for region in regions
+    }
+
+
 def test_aws_cleanup_census_retains_exact_legacy_ebs_identity(monkeypatch):
 
     class Paginator:
@@ -2049,6 +2113,9 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
     assert receipt._payload['request_priority'] == 50
     sample = receipt._payload['samples'][0]
     assert sample['phase'] == 'scale'
+    assert sample['observation_started_at'] == 999.5
+    assert sample['observation_finished_at'] == 1000
+    assert sample['observation_duration_seconds'] == 0.5
     assert sample['controller_pid'] == 321
     assert sample['controller_owner_epoch'] == 12
     assert sample['claimed_units'] == 1
@@ -2712,6 +2779,28 @@ def test_retained_binding_allows_provider_effect_after_claim_release():
             claimed_units=0,
             bound_cluster_zones=(('paid-e2e-1', 'us-central1-a'),)))
     qualifier.validate_observation(bound, profile)
+
+
+def test_provider_observation_rejects_reordered_sample_interval():
+    observation = dataclasses.replace(_observation(), observed_started_at=1001)
+    with pytest.raises(qualifier.QualificationError,
+                       match='invalid sample interval'):
+        qualifier.validate_observation(observation, qualifier.PROFILES['small'])
+
+
+def test_observation_census_latency_is_subtracted_from_poll_interval(
+        monkeypatch):
+    delays = []
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', sleep)
+    observation = _observation(observed_monotonic=2000)
+
+    asyncio.run(qualifier._sleep_after_observation(observation, 10))
+
+    assert delays == [9.5]
 
 
 def test_provider_canary_rejects_wrong_cloud_durable_binding():
