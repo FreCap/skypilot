@@ -3858,6 +3858,45 @@ workspaces:
         graph.context, graph.authority) is None
 
 
+@pytest.mark.parametrize('config_failure',
+                         ('missing', 'corrupt', 'wrong_workspace'))
+def test_gcp_paid_identity_fails_closed_without_version_config(
+        bound_request_database, monkeypatch, config_failure: str) -> None:
+    """GCP identity reads the immutable version config, never the request."""
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database, monkeypatch, pool_key=_gc_gcp_paid_pool_key())
+    assert request_postgres.bound_non_pool_gcp_provider_identity(
+        graph.context, graph.authority) is not None
+    if config_failure == 'missing':
+        values = {
+            'controller_config': None,
+            'controller_config_digest': None,
+            'controller_config_snapshot_id': None,
+        }
+    elif config_failure == 'corrupt':
+        values = {'controller_config_digest': '0' * 64}
+    else:
+        wrong_config = b'active_workspace: other-workspace\n'
+        values = {
+            'controller_config': wrong_config,
+            'controller_config_digest':
+                hashlib.sha256(wrong_config).hexdigest(),
+            'controller_config_snapshot_id': 'e' * 64,
+        }
+    with graph.engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name ==
+                'gc-service',
+                serve_state_schema.version_specs_table.c.version == 2).values(
+                    **values))
+
+    # The retained request snapshot still names the workspace, so a fallback
+    # to request-scoped configuration would resurrect a non-None identity.
+    assert request_postgres.bound_non_pool_gcp_provider_identity(
+        graph.context, graph.authority) is None
+
+
 @pytest.mark.parametrize('production_http_normalization', [False, True])
 @pytest.mark.parametrize('effect_phase', [
     ordinary_launch_binding.EffectPhase.PROVIDER_IO,
