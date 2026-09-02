@@ -72,7 +72,7 @@ class GuardViolation(QualificationError):
 
 
 _PROVIDER_SCOPE_SCHEMA_VERSION = 6
-_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 8
+_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 9
 _CLEANUP_RECEIPT_SCHEMA_VERSION = 2
 _AGGREGATE_RECEIPT_SCHEMA_VERSION = 2
 _CAMPAIGN_LOAD_WINDOW_SECONDS = (
@@ -91,6 +91,7 @@ class Profile:
     minimum_running: int
     exact_requests: int
     request_concurrency: int
+    request_queue_timeout_seconds: int
     scale_timeout_seconds: float
     scale_slo_seconds: float
     drain_timeout_seconds: float
@@ -107,6 +108,7 @@ PROFILES = {
                      minimum_running=2,
                      exact_requests=16,
                      request_concurrency=4,
+                     request_queue_timeout_seconds=600,
                      scale_timeout_seconds=15 * 60,
                      scale_slo_seconds=5 * 60,
                      drain_timeout_seconds=20 * 60,
@@ -120,6 +122,7 @@ PROFILES = {
                      minimum_running=100,
                      exact_requests=10_000,
                      request_concurrency=128,
+                     request_queue_timeout_seconds=600,
                      scale_timeout_seconds=15 * 60,
                      scale_slo_seconds=5 * 60,
                      drain_timeout_seconds=30 * 60,
@@ -135,6 +138,7 @@ PROFILES = {
                                minimum_running=1,
                                exact_requests=1,
                                request_concurrency=1,
+                               request_queue_timeout_seconds=600,
                                scale_timeout_seconds=15 * 60,
                                scale_slo_seconds=5 * 60,
                                drain_timeout_seconds=20 * 60,
@@ -158,6 +162,32 @@ def request_queue_max_concurrency(profile: Profile) -> int:
 def scale_stimulus_count(profile: Profile) -> int:
     """Return the bounded cohort sufficient to request the configured cap."""
     return min(profile.max_units, profile.exact_requests)
+
+
+def positive_telemetry_window_seconds(profile: Profile) -> float:
+    """Return the queue-bounded window for observing the first dispatch."""
+    minimum_waves = math.ceil(
+        scale_stimulus_count(profile) / profile.minimum_running)
+    drain_budget = minimum_waves * request_processing_seconds(profile)
+    observation_budget = max(1.0, profile.poll_seconds)
+    usable_queue_window = (profile.request_queue_timeout_seconds -
+                           drain_budget - observation_budget)
+    window = min(profile.scale_timeout_seconds, usable_queue_window)
+    if not math.isfinite(window) or window <= profile.scale_slo_seconds:
+        raise ValueError(
+            'Request queue cannot preserve the scale stimulus through '
+            'positive telemetry.')
+    return window
+
+
+def positive_telemetry_deadline_monotonic(
+        profile: Profile, *, scale_started_monotonic: float) -> float:
+    """Return an absolute first-dispatch deadline for one scale campaign."""
+    if (not math.isfinite(scale_started_monotonic) or
+            scale_started_monotonic < 0):
+        raise ValueError('Scale start must be a finite monotonic timestamp.')
+    return (scale_started_monotonic +
+            positive_telemetry_window_seconds(profile))
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -742,6 +772,7 @@ def _profile_projection(profile: Profile) -> dict[str, int]:
         'request_queue_min_size': request_queue_min_size,
         'request_queue_max_size': request_queue_max_size,
         'request_queue_max_concurrency': request_queue_max_concurrency(profile),
+        'request_queue_timeout_seconds': profile.request_queue_timeout_seconds,
     }
 
 
@@ -814,7 +845,7 @@ def _qualification_source_sha256(config: dict[str, Any]) -> str:
     for field in ('max_replicas', 'max_live_paid_gpu_units',
                   'scale_up_rate_min_replicas', 'scale_up_rate_period_seconds'):
         policy.pop(field, None)
-    for field in ('min_size', 'max_size', 'max_concurrency'):
+    for field in ('min_size', 'max_size', 'max_concurrency', 'timeout_seconds'):
         queue.pop(field, None)
     return hashlib.sha256(rfc8785.dumps(normalized)).hexdigest()
 
@@ -4544,9 +4575,9 @@ async def _wait_for_positive_request_telemetry(
     receipt: Receipt,
     traffic: asyncio.Task[int],
     baseline: RequestTelemetry,
+    deadline_monotonic: float,
 ) -> RequestTelemetry:
-    deadline = time.monotonic() + max(2 * 60, 4 * profile.poll_seconds)
-    while time.monotonic() < deadline:
+    while time.monotonic() < deadline_monotonic:
         if traffic.done():
             try:
                 successes = traffic.result()
@@ -4677,9 +4708,9 @@ async def _wait_for_scale(
                 != scale_stimulus_count(profile)):
             raise QualificationError(
                 'Scale demand no longer contains the exact bounded stimulus.')
-        if active_delta <= 0 or active_delta > expectation.exact_request_count:
+        if active_delta < 0 or active_delta > expectation.exact_request_count:
             raise QualificationError(
-                'Scale demand lacks positive exact dispatched identities.')
+                'Scale demand has contradictory exact dispatched identities.')
         scale_iteration_id += 1
         receipt.request_telemetry('scale',
                                   telemetry,
@@ -5129,10 +5160,9 @@ class _RequestEvidence:
 
     baseline_pairs: tuple[tuple[int, float], ...]
     scale_stimulus_observed_at: float | None
-    positive_scale_iterations: frozenset[int]
+    scale_iterations: frozenset[int]
     scale_observed_at_by_iteration: tuple[tuple[int, float], ...]
-    first_positive_observed_at: float
-    last_positive_observed_at: float
+    positive_observed_at: float | None
     final_observed_at: float
 
 
@@ -5227,14 +5257,13 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
 
     scale_iteration_ids: set[int] = set()
     scale_observed_at_by_iteration: list[tuple[int, float]] = []
-    positive_timestamps: list[float] = []
+    scale_timestamps: list[float] = []
     for sample in scale:
         iteration_id = sample.get('scale_iteration_id')
         resident = sample['queue_depth'] + sample['in_flight_requests']
         if (type(iteration_id) is not int or iteration_id < 1 or
                 iteration_id in scale_iteration_ids or
                 not _telemetry_is_exactly_attributed(sample, baseline_active) or
-                sample.get('ledger_active', 0) - baseline_active <= 0 or
                 resident != (scale_stimulus_count(profile)
                              if profile.name == 'scale' else 1)):
             raise QualificationError(
@@ -5242,10 +5271,11 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
         scale_iteration_ids.add(iteration_id)
         scale_observed_at = _strict_timestamp(sample)
         scale_observed_at_by_iteration.append((iteration_id, scale_observed_at))
-        positive_timestamps.append(scale_observed_at)
+        scale_timestamps.append(scale_observed_at)
     if not scale_iteration_ids:
         raise QualificationError(
             'Qualification receipt contains unattributed scale demand.')
+    positive_observed_at: float | None = None
     if profile.name == 'scale':
         positive = [
             sample for sample in typed_samples
@@ -5260,7 +5290,7 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
                 != scale_stimulus_count(profile)):
             raise QualificationError(
                 'Qualification receipt lacks exact positive request telemetry.')
-        positive_timestamps.append(_strict_timestamp(positive[0]))
+        positive_observed_at = _strict_timestamp(positive[0])
     elif any(sample.get('phase') == 'positive' for sample in typed_samples):
         raise QualificationError(
             'Provider canary contains economic request telemetry.')
@@ -5278,20 +5308,21 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
         raise QualificationError(
             'Qualification receipt lacks exact terminal ledger evidence.')
     final_observed_at = _strict_timestamp(final)
-    if (not positive_timestamps or
-            final_observed_at <= max(positive_timestamps) or
-            baseline_pairs[-1][1] >= min(positive_timestamps) or
+    if (not scale_timestamps or final_observed_at <= max(scale_timestamps) or
+            baseline_pairs[-1][1] >= min(scale_timestamps) or
         (scale_stimulus_observed_at is not None and
-         scale_stimulus_observed_at > min(positive_timestamps))):
+         scale_stimulus_observed_at > min(scale_timestamps)) or
+        (positive_observed_at is not None and
+         (max(scale_timestamps) >= positive_observed_at or
+          final_observed_at <= positive_observed_at))):
         raise QualificationError(
             'Terminal request evidence does not follow scale demand.')
     return _RequestEvidence(
         baseline_pairs=tuple(baseline_pairs),
         scale_stimulus_observed_at=scale_stimulus_observed_at,
-        positive_scale_iterations=frozenset(scale_iteration_ids),
+        scale_iterations=frozenset(scale_iteration_ids),
         scale_observed_at_by_iteration=tuple(scale_observed_at_by_iteration),
-        first_positive_observed_at=min(positive_timestamps),
-        last_positive_observed_at=max(positive_timestamps),
+        positive_observed_at=positive_observed_at,
         final_observed_at=final_observed_at)
 
 
@@ -5467,8 +5498,8 @@ def _validate_provider_scale_samples(
                     'Provider scale sample has unattributed offered arrivals.')
         iteration_id = sample.get('scale_iteration_id')
         if (type(iteration_id) is not int or iteration_id < 1 or
-                iteration_id in provider_scale_iterations or iteration_id
-                not in request_evidence.positive_scale_iterations or
+                iteration_id in provider_scale_iterations or
+                iteration_id not in request_evidence.scale_iterations or
                 observed_at < request_scale_times[iteration_id]):
             raise QualificationError(
                 'Provider scale sample has no paired exact demand evidence.')
@@ -5496,7 +5527,7 @@ def _validate_provider_scale_samples(
             payload.get('baseline_qualified_observed_at') != final_baseline_at
             or not baseline_is_immediate or first_scale_observed_at is None or
             scale_started_at > first_scale_observed_at or
-            scale_started_at > request_evidence.first_positive_observed_at or
+            scale_started_at > min(request_scale_times.values()) or
             qualified_at is None or
             qualified_at >= request_evidence.final_observed_at or
             bound_qualified_at != qualified_at or
@@ -5513,12 +5544,16 @@ def _validate_provider_scale_samples(
             'Qualification receipt lacks provider scale evidence.')
     if profile.name == 'scale':
         stimulus_at = request_evidence.scale_stimulus_observed_at
+        positive_at = request_evidence.positive_observed_at
         if (stimulus_at is None or not scale_started_at <= stimulus_at <=
                 scale_started_at + _CAMPAIGN_LOAD_WINDOW_SECONDS or
-                not stimulus_at <= first_scale_observed_at <= qualified_at):
+                not stimulus_at <= first_scale_observed_at <= qualified_at or
+                positive_at is None or not qualified_at < positive_at <=
+                scale_started_at + positive_telemetry_window_seconds(profile)):
             raise QualificationError(
                 'Qualification receipt lacks joined scale-stimulus evidence.')
-    elif request_evidence.scale_stimulus_observed_at is not None:
+    elif (request_evidence.scale_stimulus_observed_at is not None or
+          request_evidence.positive_observed_at is not None):
         raise QualificationError(
             'Provider canary contains economic scale-stimulus evidence.')
     return _ProviderEvidence(scale_elapsed_seconds=elapsed,
@@ -5617,9 +5652,14 @@ def _read_qualification_evidence(
     drain_first_at, drain_last_at = _validate_natural_drain_samples(
         payload.get('samples'), profile)
     finished_at = _strict_timestamp({'observed_at': payload.get('finished_at')})
-    if not (request_evidence.last_positive_observed_at
-            < request_evidence.final_observed_at and
-            provider_evidence.first_scale_observed_at < request_evidence.
+    preterminal_request_times = [
+        observed_at
+        for _, observed_at in request_evidence.scale_observed_at_by_iteration
+    ]
+    if request_evidence.positive_observed_at is not None:
+        preterminal_request_times.append(request_evidence.positive_observed_at)
+    if not (max(preterminal_request_times) < request_evidence.final_observed_at
+            and provider_evidence.first_scale_observed_at < request_evidence.
             final_observed_at < drain_first_at < drain_last_at < finished_at):
         raise QualificationError(
             'Qualification receipt has reordered lifecycle evidence.')
@@ -5899,6 +5939,9 @@ async def qualify(args: argparse.Namespace) -> None:
             receipt=receipt,
             expectation=expectation)
         progress.start_scale()
+        assert progress.scale_started_monotonic is not None
+        positive_deadline = positive_telemetry_deadline_monotonic(
+            profile, scale_started_monotonic=progress.scale_started_monotonic)
         if profile.name == 'scale':
             stimulus_count = scale_stimulus_count(profile)
             completion_gate = ExactRequestCompletionGate()
@@ -5916,7 +5959,6 @@ async def qualify(args: argparse.Namespace) -> None:
                                      profile.drain_timeout_seconds),
                     completion_gate=completion_gate))
             campaign_tasks.append(held_traffic)
-            assert progress.scale_started_monotonic is not None
             stimulus_deadline = (progress.scale_started_monotonic +
                                  _CAMPAIGN_LOAD_WINDOW_SECONDS)
             await _wait_for_scale_stimulus(observer=observer,
@@ -5943,13 +5985,15 @@ async def qualify(args: argparse.Namespace) -> None:
             campaign_tasks.append(traffic)
         try:
             assert ledger_baseline is not None
-            if expectation.requires_full_request_telemetry:
+            if (expectation.requires_full_request_telemetry and
+                    profile.name != 'scale'):
                 await _wait_for_positive_request_telemetry(
                     observer=observer,
                     profile=profile,
                     receipt=receipt,
                     traffic=traffic,
-                    baseline=ledger_baseline)
+                    baseline=ledger_baseline,
+                    deadline_monotonic=positive_deadline)
             await _wait_for_scale(observer=observer,
                                   profile=profile,
                                   progress=progress,
@@ -5958,6 +6002,13 @@ async def qualify(args: argparse.Namespace) -> None:
                                   baseline=ledger_baseline,
                                   expectation=expectation)
             if profile.name == 'scale':
+                await _wait_for_positive_request_telemetry(
+                    observer=observer,
+                    profile=profile,
+                    receipt=receipt,
+                    traffic=traffic,
+                    baseline=ledger_baseline,
+                    deadline_monotonic=positive_deadline)
                 assert completion_gate is not None
                 completion_gate.release()
                 tail_count = (expectation.exact_request_count -
@@ -6082,6 +6133,7 @@ def render_service(args: argparse.Namespace) -> None:
         'min_size': projection['request_queue_min_size'],
         'max_size': projection['request_queue_max_size'],
         'max_concurrency': projection['request_queue_max_concurrency'],
+        'timeout_seconds': projection['request_queue_timeout_seconds'],
     })
     resources = config['resources']
     expected_locations = [

@@ -508,6 +508,8 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
         assert queue['max_size'] == projection['request_queue_max_size']
         assert queue['max_concurrency'] == (
             projection['request_queue_max_concurrency'])
+        assert queue['timeout_seconds'] == (
+            projection['request_queue_timeout_seconds'])
         assert resources['use_spot'] is True
         assert resources['accelerators'] == 'L4:1'
         assert resources['any_of'] == [
@@ -575,6 +577,18 @@ def test_scale_profile_exceeds_physical_gate_for_rendered_shape():
     assert profile.scale_up_min_replicas == profile.max_units
 
 
+def test_positive_telemetry_deadline_reserves_queue_processing_headroom():
+    profile = qualifier.PROFILES['scale']
+
+    assert profile.request_queue_timeout_seconds == 600
+    assert qualifier.positive_telemetry_deadline_monotonic(
+        profile, scale_started_monotonic=100.0) == 530.0
+
+    with pytest.raises(ValueError, match='cannot preserve'):
+        qualifier.positive_telemetry_window_seconds(
+            dataclasses.replace(profile, request_queue_timeout_seconds=470))
+
+
 def test_scale_queue_only_admits_one_stimulus_plus_one_tail_batch():
     profile = qualifier.PROFILES['scale']
     projection = qualifier._profile_projection(profile)
@@ -587,6 +601,7 @@ def test_scale_queue_only_admits_one_stimulus_plus_one_tail_batch():
     assert projection['request_queue_min_size'] == 800
     assert projection['request_queue_max_size'] == 1_200
     assert projection['request_queue_max_concurrency'] == 128
+    assert projection['request_queue_timeout_seconds'] == 600
     assert instance._request_queue_submission_limit() == 1_328
     assert instance._request_queue_submission_limit() < profile.exact_requests
 
@@ -2263,7 +2278,7 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
                                 profile=qualifier.PROFILES['small'])
     receipt.sample('scale', observation)
 
-    assert receipt._payload['schema_version'] == 8
+    assert receipt._payload['schema_version'] == 9
     assert receipt._payload['request_priority'] == 50
     sample = receipt._payload['samples'][0]
     assert sample['phase'] == 'scale'
@@ -3119,10 +3134,9 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
 
         @staticmethod
         async def request_telemetry():
-            return _request_telemetry(queue_depth=32,
-                                      in_flight=32,
-                                      processing=16,
-                                      state_counts={'ACCEPTED': 32})
+            # Before a replica is READY, all exact stimulus identities are
+            # attributable but queued and therefore have no ledger row.
+            return _request_telemetry(queue_depth=64)
 
         async def snapshot(self, *, require_complete_demand_report=True):
             assert not require_complete_demand_report
@@ -3159,6 +3173,44 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
     assert samples[2]['provider_free_unbound_replicas'] == 0
     assert [sample.get('observation_error_type') for sample in samples
            ] == [None, 'QualificationError', None]
+
+
+def test_aggregate_accepts_queued_only_physical_scale_before_positive(tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    request_scale = next(
+        sample for sample in payload['request_telemetry_samples']
+        if sample['phase'] == 'scale')
+    request_scale.update(
+        _request_evidence_sample(phase='scale',
+                                 queue_depth=800,
+                                 in_flight=0,
+                                 processing=0,
+                                 observed_at=249.0,
+                                 scale_iteration_id=1))
+    positive = next(sample for sample in payload['request_telemetry_samples']
+                    if sample['phase'] == 'positive')
+    positive['observed_at'] = 251.0
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    qualifier.aggregate_evidence(args)
+
+
+@pytest.mark.parametrize('positive_observed_at', [248.0, 435.0])
+def test_aggregate_rejects_positive_outside_post_scale_queue_window(
+        tmp_path, positive_observed_at):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    positive = next(sample for sample in payload['request_telemetry_samples']
+                    if sample['phase'] == 'positive')
+    positive['observed_at'] = positive_observed_at
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='scale demand|scale-stimulus'):
+        qualifier.aggregate_evidence(args)
 
 
 def test_scale_rejects_unattributed_mixed_demand(tmp_path):
@@ -3737,7 +3789,8 @@ def test_request_telemetry_requires_exact_positive_and_terminal_delta(tmp_path):
                     profile=profile,
                     receipt=receipt,
                     traffic=held,
-                    baseline=baseline))
+                    baseline=baseline,
+                    deadline_monotonic=time.monotonic() + 1))
             observed_final = await qualifier._wait_for_final_request_telemetry(
                 observer=Observer([final]),
                 profile=profile,
@@ -3877,7 +3930,7 @@ def _write_aggregate_qualification(path,
         'lb_offered_arrival_tracking_saturated': False,
     }
     payload = {
-        'schema_version': 8,
+        'schema_version': 9,
         'service_name': service_name,
         'service_hash': f'{service_name}-hash',
         'lifecycle_epoch': 1,
@@ -3939,23 +3992,25 @@ def _write_aggregate_qualification(path,
                                          queue_depth=stimulus,
                                          in_flight=0,
                                          processing=0,
-                                         observed_at=5.0),
+                                         observed_at=5.0)
+            ] if economic else []),
+            _request_evidence_sample(
+                phase='scale',
+                queue_depth=(stimulus if economic else queue_depth),
+                in_flight=(0 if economic else in_flight),
+                processing=(0 if economic else processing),
+                accepted=(0 if economic else active),
+                observed_at=(249.0 if economic else 129.0)) | {
+                    'scale_iteration_id': 1,
+                },
+            *([
                 _request_evidence_sample(phase='positive',
                                          queue_depth=queue_depth,
                                          in_flight=in_flight,
                                          processing=processing,
                                          accepted=active,
-                                         observed_at=8.0)
+                                         observed_at=251.0)
             ] if economic else []),
-            _request_evidence_sample(phase='scale',
-                                     queue_depth=queue_depth,
-                                     in_flight=in_flight,
-                                     processing=processing,
-                                     accepted=active,
-                                     observed_at=(249.0 if economic else 129.0))
-            | {
-                'scale_iteration_id': 1,
-            },
             _request_evidence_sample(phase='final',
                                      queue_depth=0,
                                      in_flight=0,
@@ -4203,8 +4258,7 @@ def test_aggregate_rejects_provider_scale_before_paired_request_sample(
         qualifier.aggregate_evidence(args)
 
 
-def test_aggregate_rejects_provider_qualification_after_terminal_ledger(
-        tmp_path):
+def test_aggregate_rejects_terminal_before_post_scale_positive(tmp_path):
     args = _aggregate_args(tmp_path)
     receipt = pathlib.Path(args.economic_receipt)
     payload = json.loads(receipt.read_text(encoding='utf-8'))
@@ -4214,7 +4268,7 @@ def test_aggregate_rejects_provider_qualification_after_terminal_ledger(
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
     with pytest.raises(qualifier.QualificationError,
-                       match='provider scale evidence'):
+                       match='Terminal request evidence'):
         qualifier.aggregate_evidence(args)
 
 
