@@ -47,6 +47,7 @@ from sky import clouds
 from sky import estimated_spend
 from sky import global_user_state
 from sky import global_user_state_schema
+from sky.serve import capacity_admission_schema
 from sky.serve import constants
 from sky.serve import lb_ha
 from sky.serve import paid_capacity
@@ -4779,6 +4780,9 @@ def history_engine(pg_server, monkeypatch):
     engine = create_engine(url)
     serve_state.Base.metadata.create_all(engine)
     serve_history.metadata.create_all(engine)
+    # Status history joins the committed capacity plan head (#1838), so the
+    # PostgreSQL fixture must carry the admission tables alembic would create.
+    capacity_admission_schema.metadata.create_all(engine)
     placement_history.metadata.create_all(engine)
     monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
     placement_history.reset_request_buffer()
