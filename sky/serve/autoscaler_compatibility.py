@@ -270,9 +270,11 @@ def _allocate_deadline_capacity_target(
                 # supply keys tie.  The worse second-best supply option then
                 # breaks equal-width profiles.  Exact ties retain report
                 # order.
+                scarcity_keys = [
+                    _profile_scarcity_key(item[0], deadline) for item in pending
+                ]
                 selected_index = max(range(len(pending)),
-                                     key=lambda index: _profile_scarcity_key(
-                                         pending[index][0], deadline))
+                                     key=scarcity_keys.__getitem__)
                 compatible, remaining = pending.pop(selected_index)
 
                 # Reuse activated capacity before materializing another slot.
@@ -281,10 +283,13 @@ def _allocate_deadline_capacity_target(
                 compatible_active = [
                     slot for slot in active if slot.card in compatible
                 ]
-                for slot in sorted(
-                        compatible_active,
-                        key=lambda slot: _slot_capacity(slot, deadline),
-                        reverse=True):
+                slot_capacities = [
+                    _slot_capacity(slot, deadline) for slot in compatible_active
+                ]
+                for slot_index in sorted(range(len(compatible_active)),
+                                         key=slot_capacities.__getitem__,
+                                         reverse=True):
+                    slot = compatible_active[slot_index]
                     remaining = _consume(slot,
                                          deadline,
                                          remaining,

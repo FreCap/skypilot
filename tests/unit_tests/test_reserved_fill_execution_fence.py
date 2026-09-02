@@ -501,7 +501,10 @@ def test_historical_v7_decodes_but_cannot_publish_reclaim_admission():
             accelerator_count=1))
     assert decoded == projection
 
-    with pytest.raises(ValueError, match='required version 9'):
+    with pytest.raises(
+            ValueError,
+            match=f'required version '
+            f'{kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION}'):
         reserved_fill_projection_authority.projected_admissions_for_edge(
             [projection],
             access_context='phx-context',

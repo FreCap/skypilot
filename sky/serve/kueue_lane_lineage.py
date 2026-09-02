@@ -3051,8 +3051,12 @@ class KueueAdmissionRepository:
                     'Materialized retirement found malformed replica state.')
             if state.get('replica_record_id') != str(
                     expected_records[replica_id]):
-                raise KueueAdmissionConflict(
-                    'Materialized retirement found a replaced replica record.')
+                # A different record now owns this numeric id, so nothing of
+                # the expected record is left to retire here.  The caller's
+                # immutable-record fence rejects the stale delete as a whole
+                # (returning False) once it locks the replica rows; raising
+                # here would turn that documented fence into a conflict.
+                continue
             scalar_key = row['reserved_fill_intent_idempotency_key']
             projected_key = state.get('reserved_fill_intent_idempotency_key')
             if scalar_key is None:

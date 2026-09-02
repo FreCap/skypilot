@@ -5202,7 +5202,7 @@ def require_active_provider_effect_authorization(
 
 def record_paid_provider_allocation(
     launch_context: Mapping[str, Any],
-    receipt: 'paid_capacity_lib.PaidProviderAllocationReceipt',
+    receipt: paid_capacity_lib.PaidProviderAllocationReceipt,
     *,
     request_validator: PaidProviderAllocationRequestValidator,
 ) -> ProviderAllocationDisposition:

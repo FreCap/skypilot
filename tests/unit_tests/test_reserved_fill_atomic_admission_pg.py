@@ -584,6 +584,14 @@ def _install_failed_teardown_provider_observation(monkeypatch, engine, info,
     return provider_reads
 
 
+def _post_teardown_absence_receipt(info):
+    """Build the exact receipt a fenced protocol-v2 down returns (#1685)."""
+    fence = reserved_capacity.parse_protocol_v2_cleanup_fence(info)
+    assert fence is not None
+    return reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
+        cleanup_fence=fence, cluster_name=info.cluster_name)
+
+
 def test_failed_teardown_present_ambiguity_authorizes_cleanup_marker(
         atomic_database, monkeypatch) -> None:
     context, info, authority = _failed_teardown_reserved_fill_ambiguity(
@@ -634,9 +642,10 @@ def test_failed_teardown_present_ambiguity_authorizes_cleanup_marker(
     assert pin_count == 1
 
     # The cleanup owner must use the existing exact PRESENT path, not generic
-    # cancellation or a name-only down. That path performs the fenced down and
-    # then forces a new provider observation before releasing the association
-    # and retention pin.
+    # cancellation or a name-only down. Since #1685 the fenced down itself
+    # yields the exact post-teardown ABSENT receipt, and the projection reuses
+    # that receipt without a second provider read before releasing the
+    # association and retention pin.
     cleanup_reads = _install_failed_teardown_provider_observation(
         monkeypatch, atomic_database, persisted,
         ordinary_launch_binding.ProviderEvidence.ABSENT)
@@ -644,6 +653,7 @@ def test_failed_teardown_present_ambiguity_authorizes_cleanup_marker(
 
     def _terminate(*args, **kwargs):
         terminated.append((args, kwargs))
+        return _post_teardown_absence_receipt(persisted)
 
     monkeypatch.setattr(replica_managers, 'terminate_cluster', _terminate)
     replica_managers.terminate_bound_non_pool_provider_present_cluster(
@@ -652,8 +662,8 @@ def test_failed_teardown_present_ambiguity_authorizes_cleanup_marker(
                           authority), persisted.cluster_name)
 
     assert len(terminated) == 1
-    assert terminated[0][0] == (persisted.cluster_name,)
-    assert cleanup_reads == ['physical-cluster-uid', 'replica-presence']
+    assert terminated[0][0] == (persisted.cluster_name, 0)
+    assert cleanup_reads == []
     with atomic_database.connect() as connection:
         association = connection.execute(
             sqlalchemy.select(
@@ -799,8 +809,10 @@ def test_failed_teardown_absent_ambiguity_projects_exact_result(
         ordinary_launch_binding.ProviderEvidence.ABSENT.value)
     assert association['cancel_reason'] is None
     assert replica['ordinary_launch_association_id'] is None
+    # Exact post-quiescence reserved ABSENT evidence normalizes the replica to
+    # the immediate-cleanup INTERRUPTED marker (#1748), not FAILED.
     assert persisted.status_property.sky_launch_status == (
-        common_utils.ProcessStatus.FAILED)
+        common_utils.ProcessStatus.INTERRUPTED)
     assert pin_count == 0
 
 
@@ -1058,9 +1070,10 @@ def test_serve059_exposes_only_owner_attestation_symbol(
         atomic_database) -> None:
     del atomic_database
     assert hasattr(serve_state, 'attest_service_owner_user_id')
-    assert not hasattr(serve_state,
-                       'service_owner_attestation_transition_active')
     assert not hasattr(serve_state, 'verify_service_owner_user_id')
+    # The Serve055 transition predicate is not an owner-transition leftover:
+    # sky/users/server.py consumes it as the fail-closed user-deletion gate.
+    assert hasattr(serve_state, 'service_owner_attestation_transition_active')
 
 
 def test_service_owner_attestation_is_idempotent_and_restart_safe(
@@ -1992,8 +2005,9 @@ def test_remove_service_completely_removes_intent_linked_replica_graph(
     _install_failed_teardown_provider_observation(
         monkeypatch, atomic_database, persisted,
         ordinary_launch_binding.ProviderEvidence.ABSENT)
-    monkeypatch.setattr(replica_managers, 'terminate_cluster',
-                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        replica_managers, 'terminate_cluster',
+        lambda *_args, **_kwargs: _post_teardown_absence_receipt(persisted))
     replica_managers.terminate_bound_non_pool_provider_present_cluster(
         context, persisted, authority,
         functools.partial(service._project_bound_ordinary_launch_for_teardown,
