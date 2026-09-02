@@ -897,6 +897,34 @@ def test_late_provider_cleanup_failure_retains_recovery_script(monkeypatch):
     assert ('remove_script', 'svc') not in calls
 
 
+def test_replica_read_failure_after_cleanup_retains_recovery_script(
+        monkeypatch):
+    """A failed authoritative row read is not proof exact cleanup finished."""
+    calls = []
+    cleanup_finished = False
+
+    def _replica_infos(_service_name):
+        if cleanup_finished:
+            raise RuntimeError('replica rows unavailable')
+        return []
+
+    def _cleanup(*_args, **kwargs):
+        nonlocal cleanup_finished
+        assert not kwargs['provider_reconciliation_failures']
+        cleanup_finished = True
+        return True
+
+    _patch_finalize(monkeypatch, calls)
+    monkeypatch.setattr(serve_state, 'get_replica_infos', _replica_infos)
+    monkeypatch.setattr(service, '_cleanup', _cleanup)
+
+    service._run_cleanup_and_finalize('svc', types.SimpleNamespace(pool=False),
+                                      '/tmp/svc', 1, 'incarnation-a', 123, None)
+
+    assert ('status', serve_state.ServiceStatus.FAILED_CLEANUP) in calls
+    assert ('remove_script', 'svc') not in calls
+
+
 def test_finalize_contains_cleanup_exception_and_breaks_recovery_loop(
         monkeypatch):
     """A _cleanup that RAISES must be contained, leave the service
