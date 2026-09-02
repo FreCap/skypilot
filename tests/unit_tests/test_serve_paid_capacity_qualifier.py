@@ -1,5 +1,5 @@
 """Hermetic contracts for the paid-provider qualification harness."""
-# pylint: disable=protected-access
+# pylint: disable=missing-class-docstring,protected-access
 
 import asyncio
 import dataclasses
@@ -42,6 +42,50 @@ def _load_module(name: str, path: pathlib.Path):
 
 _FIXTURE_DIR = pathlib.Path(__file__).parents[1] / 'skyserve' / 'paid_capacity'
 qualifier = _load_module('paid_capacity_qualifier', _FIXTURE_DIR / 'qualify.py')
+
+
+class _HttpResponseContext:
+    """Minimal aiohttp request context for endpoint-readiness tests."""
+
+    def __init__(self, outcome):
+        self._outcome = outcome
+
+    async def __aenter__(self):
+        if isinstance(self._outcome, BaseException):
+            raise self._outcome
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    @property
+    def status(self):
+        return self._outcome
+
+    async def read(self):
+        return b''
+
+
+class _HttpSession:
+    """Scripted aiohttp session for endpoint-readiness tests."""
+
+    def __init__(self, outcomes, calls, timeout):
+        self._outcomes = outcomes
+        self._calls = calls
+        self.timeout = timeout
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    def get(self, url, **kwargs):
+        self._calls.append((url, kwargs))
+        outcome = self._outcomes.pop(0)
+        if callable(outcome):
+            outcome = outcome()
+        return _HttpResponseContext(outcome)
 
 
 def _provider_scope(**overrides):
@@ -134,7 +178,6 @@ def _aws_identity(*,
     return qualifier.AwsProviderIdentity(aws_account_id='123456789012',
                                          client_token=client_token,
                                          cluster_name_on_cloud=cluster_name,
-                                         credential_profile='durable-profile',
                                          gpu_units_per_instance=width,
                                          instance_type=instance_type,
                                          num_nodes=1,
@@ -785,6 +828,111 @@ def test_provider_scope_commands_are_regionless_by_default():
     assert not hasattr(run, 'region')
 
 
+def test_http_authentication_waits_for_dns_and_endpoint_readiness(monkeypatch):
+    now = [100.0]
+    sleeps = []
+    calls = []
+    outcomes = [
+        qualifier.aiohttp.ClientConnectorDNSError(None,
+                                                  OSError('not resolved')),
+        503,
+        401,
+        200,
+    ]
+
+    def client_session(*, timeout):
+        assert timeout.total == 15
+        return _HttpSession(outcomes, calls, timeout)
+
+    async def sleep(delay):
+        sleeps.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(qualifier.aiohttp, 'ClientSession', client_session)
+    monkeypatch.setattr(qualifier.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', sleep)
+
+    asyncio.run(
+        qualifier.HttpObserver('https://new-nlb.example.test',
+                               'token').prove_authentication())
+
+    assert sleeps == [2, 2]
+    assert len(calls) == 4
+    assert calls[-2][1] == {}
+    assert calls[-1][1] == {
+        'headers': {
+            qualifier._AUTH_HEADER: 'Bearer token',
+        }
+    }
+
+
+def test_http_authentication_fails_immediately_when_not_enforced(monkeypatch):
+    calls = []
+    outcomes = [200]
+
+    monkeypatch.setattr(
+        qualifier.aiohttp, 'ClientSession',
+        lambda *, timeout: _HttpSession(outcomes, calls, timeout))
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='authentication is not enforced'):
+        asyncio.run(
+            qualifier.HttpObserver('https://service.example.test',
+                                   'token').prove_authentication())
+
+    assert len(calls) == 1
+
+
+def test_http_authentication_fails_immediately_for_rejected_token(monkeypatch):
+    calls = []
+    outcomes = [401, 403]
+
+    monkeypatch.setattr(
+        qualifier.aiohttp, 'ClientSession',
+        lambda *, timeout: _HttpSession(outcomes, calls, timeout))
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='Authenticated capacity probe returned 403'):
+        asyncio.run(
+            qualifier.HttpObserver('https://service.example.test',
+                                   'bad-token').prove_authentication())
+
+    assert len(calls) == 2
+
+
+def test_http_authentication_dns_retry_has_monotonic_deadline(monkeypatch):
+    now = [100.0]
+    sleeps = []
+    calls = []
+    outcomes = [
+        lambda: qualifier.aiohttp.ClientConnectorDNSError(
+            None, OSError('not resolved')),
+        lambda: qualifier.aiohttp.ClientConnectorDNSError(
+            None, OSError('not resolved')),
+    ]
+
+    async def sleep(delay):
+        sleeps.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(
+        qualifier.aiohttp, 'ClientSession',
+        lambda *, timeout: _HttpSession(outcomes, calls, timeout))
+    monkeypatch.setattr(qualifier.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', sleep)
+    monkeypatch.setattr(qualifier, '_ENDPOINT_AUTHENTICATION_TIMEOUT_SECONDS',
+                        4)
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='authentication deadline'):
+        asyncio.run(
+            qualifier.HttpObserver('https://new-nlb.example.test',
+                                   'token').prove_authentication())
+
+    assert sleeps == [2, 2]
+    assert len(calls) == 2
+
+
 def test_retained_request_accepts_cross_region_and_rejects_scope_drift(
         monkeypatch):
     scope = _provider_scope()
@@ -1020,32 +1168,27 @@ def test_aws_retained_identity_is_bound_to_frozen_catalog(monkeypatch):
         'cloud': 'aws',
         'instance_type': 'g6.48xlarge',
         'num_nodes': 1,
+        'provider_identity': {
+            'aws_account_id': '123456789012',
+        },
         'region': 'us-east-2',
         'use_spot': True,
-        'version': 1,
+        'version': 2,
         'workspace': 'workspace-a',
         'zone': 'us-east-2c',
     }
-    config = {
-        'active_workspace': 'workspace-a',
-        'workspaces': {
-            'workspace-a': {
-                'aws': {
-                    'profile': 'durable-profile',
-                },
-            },
-        },
-    }
+    # Server-controller launch requests deliberately omit credentials and
+    # retain only the workspace selector.
+    config = {'active_workspace': 'workspace-a'}
     monkeypatch.setattr(qualifier, '_retained_launch_request', lambda *_args:
                         (config, pool, 'workspace-a'))
 
     def provider_identity(_binding, *, credential_profile):
-        assert credential_profile == 'durable-profile'
+        assert credential_profile is None
         return {
-            'aws_account_id': '123456789012',
+            'aws_account_id': pool['provider_identity']['aws_account_id'],
             'client_token': 'token-wide',
             'cluster_name_on_cloud': 'paid-e2e-1-1234567890-tenant',
-            'credential_profile': credential_profile,
             'instance_type': pool['instance_type'],
             'num_nodes': 1,
             'region': pool['region'],
@@ -1060,6 +1203,7 @@ def test_aws_retained_identity_is_bound_to_frozen_catalog(monkeypatch):
     identity = qualifier.aws_identity_from_retained_request({}, {}, scope)
     assert identity.instance_type == 'g6.48xlarge'
     assert identity.gpu_units_per_instance == 8
+    assert not hasattr(identity, 'credential_profile')
 
     pool['accelerators'] = [['L4', 4]]
     with pytest.raises(qualifier.GuardViolation,
@@ -1067,6 +1211,11 @@ def test_aws_retained_identity_is_bound_to_frozen_catalog(monkeypatch):
         qualifier.aws_identity_from_retained_request({}, {}, scope)
     pool['accelerators'] = [['L4', 8]]
     pool['instance_type'] = 'g6.xlarge'
+    with pytest.raises(qualifier.GuardViolation,
+                       match='retained-request AWS identity'):
+        qualifier.aws_identity_from_retained_request({}, {}, scope)
+    pool['instance_type'] = 'g6.48xlarge'
+    pool['provider_identity']['aws_account_id'] = '210987654321'
     with pytest.raises(qualifier.GuardViolation,
                        match='retained-request AWS identity'):
         qualifier.aws_identity_from_retained_request({}, {}, scope)

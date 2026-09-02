@@ -29,6 +29,17 @@ class LifecycleError(RuntimeError):
     """The qualification lifecycle could not complete safely."""
 
 
+class LifecycleFailureGroup(LifecycleError):
+    """Multiple lifecycle failures preserved on every supported Python."""
+
+    def __init__(self, message: str, exceptions: list[BaseException]) -> None:
+        if not exceptions:
+            raise ValueError('Lifecycle failure group must not be empty.')
+        self.exceptions = tuple(exceptions)
+        summary = ', '.join(type(error).__name__ for error in exceptions)
+        super().__init__(f'{message} Failures: {summary}.')
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class CommandResult:
     """Credential-free result of one SkyPilot CLI invocation."""
@@ -402,7 +413,7 @@ async def run_lifecycle(args: argparse.Namespace,
         error.__cause__ = serve_down_error
         finalizer_errors.append(error)
     if primary_error is not None and finalizer_errors:
-        raise BaseExceptionGroup(
+        raise LifecycleFailureGroup(
             'Paid qualification failed and its lifecycle finalizer also '
             'failed; inspect the lifecycle receipt.',
             [primary_error, *finalizer_errors])
@@ -411,7 +422,7 @@ async def run_lifecycle(args: argparse.Namespace,
     if len(finalizer_errors) == 1:
         raise finalizer_errors[0]
     if finalizer_errors:
-        raise BaseExceptionGroup(
+        raise LifecycleFailureGroup(
             'Paid qualification lifecycle finalization had multiple failures; '
             'inspect the lifecycle receipt.', finalizer_errors)
 
