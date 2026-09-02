@@ -56,26 +56,25 @@ def _replica_info(replica_id, probe_result):
 class TestProbeRoundBatching(unittest.TestCase):
     """Probe rounds snapshot shared state and persist bookkeeping in bulk."""
 
-    def test_readiness_executor_is_bounded_reused_and_replaced_after_shutdown(
+    def test_remote_io_executor_is_bounded_reused_and_replaced_after_shutdown(
             self):
         manager = self._make_manager()
         first = mock.Mock()
         second = mock.Mock()
-        with mock.patch.object(replica_managers.subprocess_utils,
-                               'ContextThreadPoolExecutor',
+        with mock.patch.object(replica_managers,
+                               '_ReplicaRemoteIOExecutor',
                                side_effect=[first, second]) as executor_factory:
-            self.assertIs(manager._get_readiness_executor(), first)
-            self.assertIs(manager._get_readiness_executor(), first)
+            self.assertIs(manager._get_remote_io_executor(), first)
+            self.assertIs(manager._get_remote_io_executor(), first)
             executor_factory.assert_called_once_with(
-                max_workers=manager._PROBE_ROUND_MAX_PARALLELISM,
-                thread_name_prefix='serve-readiness')
+                manager._REMOTE_IO_MAX_PARALLELISM)
 
-            manager._shutdown_readiness_executor()
+            manager._shutdown_remote_io_executor()
             first.shutdown.assert_called_once_with(wait=True,
                                                    cancel_futures=True)
-            self.assertIs(manager._get_readiness_executor(), second)
+            self.assertIs(manager._get_remote_io_executor(), second)
             self.assertEqual(executor_factory.call_count, 2)
-            manager._shutdown_readiness_executor()
+            manager._shutdown_remote_io_executor()
             second.shutdown.assert_called_once_with(wait=True,
                                                     cancel_futures=True)
 
@@ -790,8 +789,8 @@ class TestProbeRoundBatching(unittest.TestCase):
                         kubernetes_context='ctx',
                         physical_cluster_uid='physical-uid')),
                 cluster_name=info.cluster_name,
-                replica_record_id=str(uuid.UUID(int=info.replica_id)))
-            for info in infos
+                replica_record_id=str(
+                    uuid.UUID(int=info.replica_id))) for info in infos
         }
         for info in infos:
             info.replica_record_id = proofs[info.replica_id].replica_record_id
@@ -1269,7 +1268,7 @@ class TestProbeRoundBatching(unittest.TestCase):
              mock.patch.object(serve_state,
                                'add_or_update_replicas') as persist, \
              mock.patch.object(manager,
-                               '_get_readiness_executor') as get_executor:
+                               '_get_remote_io_executor') as get_executor:
             manager._probe_all_replicas()
 
         mock_get_specs.assert_not_called()

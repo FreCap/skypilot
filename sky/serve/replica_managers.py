@@ -12,7 +12,6 @@ import enum
 import functools
 import hashlib
 import math
-from multiprocessing import pool as mp_pool
 import os
 import pathlib
 import pickle
@@ -155,6 +154,44 @@ class ProbeRouteResult:
     resolved_routes: dict[int, route_projection.ResolvedRouteMaterial]
     identity_verified_replica_ids: set[int]
     complete: bool
+
+
+class _ReplicaRemoteIOExecutor:
+    """One aggregate worker budget with a non-convoying phase-child lane.
+
+    A job-status round holds a root provider phase while its remote workers
+    join that admission. General readiness workers may independently wait for
+    the opposite provider phase. Keeping a small admitted-child lane prevents
+    those general waiters from occupying every worker and stranding the root's
+    children. The two lane sizes sum to ``max_workers``; they are implementation
+    partitions of one service budget, not independent fan-out authorities.
+    """
+
+    def __init__(self, max_workers: int) -> None:
+        if max_workers < 2:
+            raise ValueError('Remote-I/O executor requires at least 2 workers.')
+        admitted_workers = max(1, max_workers // 4)
+        general_workers = max_workers - admitted_workers
+        self._general = subprocess_utils.ContextThreadPoolExecutor(
+            max_workers=general_workers, thread_name_prefix='serve-remote-io')
+        self._admitted = subprocess_utils.ContextThreadPoolExecutor(
+            max_workers=admitted_workers,
+            thread_name_prefix='serve-remote-io-admitted')
+
+    def submit(
+        self,
+        fn: Callable[..., Any],
+        /,
+        *args: Any,
+        provider_phase_admitted: bool = False,
+        **kwargs: Any,
+    ) -> concurrent.futures.Future[Any]:
+        executor = self._admitted if provider_phase_admitted else self._general
+        return executor.submit(fn, *args, **kwargs)
+
+    def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+        self._general.shutdown(wait=wait, cancel_futures=cancel_futures)
+        self._admitted.shutdown(wait=wait, cancel_futures=cancel_futures)
 
 
 class _PreemptionPrefilterDisposition(enum.Enum):
@@ -3744,9 +3781,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._ownership_lost = threading.Event()
         self._manager_daemon_stop = threading.Event()
         self._scale_reconciliation_event = threading.Event()
-        self._readiness_executor_lock = threading.Lock()
-        self._readiness_executor: concurrent.futures.ThreadPoolExecutor | None = (
-            None)
+        self._remote_io_executor_lock = threading.Lock()
+        self._remote_io_executor: _ReplicaRemoteIOExecutor | None = None
         # The controller installs its single generation coordinator after the
         # manager is constructed.  Keep the legacy event as a compatibility
         # signal for direct embedders, but route every committed feedback wake
@@ -13748,24 +13784,43 @@ class SkyPilotReplicaManager(ReplicaManager):
     # Thread-pool bound for the per-probe-round parallel cloud pre-filter
     # over failed-probe spot replicas (see _cloud_instance_looks_alive).
     _PREEMPTION_PREFILTER_PARALLELISM = 16
-    _PROBE_ROUND_MAX_PARALLELISM = 256
+    # One service may run readiness HTTP and remote job-status SSH at the same
+    # time. This is their aggregate process-memory budget, not a per-loop
+    # limit. The 24-worker general lane drains the maximum 100-member atomic
+    # paid wave in five default 15-second readiness batches (at most 75
+    # seconds). A fully phase-admitted 100-member probe takes at most thirteen
+    # such batches (195 seconds), still below the five-minute scale gate and
+    # 600-second request deadline. The eight admitted-phase workers guarantee
+    # progress and keep combined thread/child-process pressure bounded at 32.
+    _REMOTE_IO_MAX_PARALLELISM = 32
 
-    def _get_readiness_executor(self) -> concurrent.futures.ThreadPoolExecutor:
-        """Return the manager's bounded, reusable readiness I/O executor."""
-        with self._readiness_executor_lock:
-            executor = self._readiness_executor
+    def _get_remote_io_executor(self) -> _ReplicaRemoteIOExecutor:
+        """Return the manager's shared, bounded remote-I/O executor."""
+        with self._remote_io_executor_lock:
+            executor = self._remote_io_executor
             if executor is None:
-                executor = subprocess_utils.ContextThreadPoolExecutor(
-                    max_workers=self._PROBE_ROUND_MAX_PARALLELISM,
-                    thread_name_prefix='serve-readiness')
-                self._readiness_executor = executor
+                executor = _ReplicaRemoteIOExecutor(
+                    self._REMOTE_IO_MAX_PARALLELISM)
+                self._remote_io_executor = executor
             return executor
 
-    def _shutdown_readiness_executor(self) -> None:
-        """Release readiness workers after this manager is terminal."""
-        with self._readiness_executor_lock:
-            executor = self._readiness_executor
-            self._readiness_executor = None
+    def _submit_remote_io(self,
+                          fn: Callable[..., Any],
+                          *args: Any,
+                          provider_phase_admitted: bool = False,
+                          **kwargs: Any) -> concurrent.futures.Future[Any]:
+        """Submit one readiness or job-status operation to the shared budget."""
+        return self._get_remote_io_executor().submit(
+            fn,
+            *args,
+            provider_phase_admitted=provider_phase_admitted,
+            **kwargs)
+
+    def _shutdown_remote_io_executor(self) -> None:
+        """Release remote-I/O workers after this manager is terminal."""
+        with self._remote_io_executor_lock:
+            executor = self._remote_io_executor
+            self._remote_io_executor = None
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
 
@@ -16071,26 +16126,27 @@ class SkyPilotReplicaManager(ReplicaManager):
         def _run_fetches(
             fetches: list[tuple[ReplicaInfo, Any, list[int] | None, bool]],
             phase_admission: provider_phase.ProviderPhaseAdmission | None,
-        ) -> list[tuple[ReplicaInfo, Any, Any]]:
+        ) -> list[tuple[ReplicaInfo, Any, concurrent.futures.Future[Any]]]:
             if not fetches or self._manager_daemon_should_stop():
                 return []
             # The fetches are pure I/O and explicitly join the caller's phase.
             # Wait for every worker while the provider fence is held, but
             # classify/reduce only after the caller releases that fence. This
             # prevents provider-phase -> manager-lock inversion.
-            num_fetch_threads = min(len(fetches),
-                                    self._PROBE_ROUND_MAX_PARALLELISM)
-            with mp_pool.ThreadPool(num_fetch_threads) as pool:
-                fetch_results = [
-                    (info, handle,
-                     pool.apply_async(_get_job_status,
-                                      (info, handle, job_ids, with_recovery,
-                                       phase_admission)))
-                    for info, handle, job_ids, with_recovery in fetches
-                ]
-                for _, _, result in fetch_results:
-                    result.wait()
-                return fetch_results
+            fetch_results = [
+                (info, handle,
+                 self._submit_remote_io(_get_job_status,
+                                        info,
+                                        handle,
+                                        job_ids,
+                                        with_recovery,
+                                        phase_admission,
+                                        provider_phase_admitted=(phase_admission
+                                                                 is not None)))
+                for info, handle, job_ids, with_recovery in fetches
+            ]
+            concurrent.futures.wait([result for _, _, result in fetch_results])
+            return fetch_results
 
         fenced_invalid_infos = invalid_recovery_infos[
             provider_phase.ProviderPhaseMode.V2_FENCED]
@@ -16192,7 +16248,8 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _handle_job_status_results(
         self,
-        fetch_results: list[tuple[ReplicaInfo, Any, Any]],
+        fetch_results: list[tuple[ReplicaInfo, Any,
+                                  concurrent.futures.Future[Any]]],
         *,
         provider_error_phase_mode: provider_phase.ProviderPhaseMode,
     ) -> None:
@@ -16216,7 +16273,8 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _handle_job_status_result_unisolated(
         self,
-        fetch_results: list[tuple[ReplicaInfo, Any, Any]],
+        fetch_results: list[tuple[ReplicaInfo, Any,
+                                  concurrent.futures.Future[Any]]],
         *,
         provider_error_phase_mode: provider_phase.ProviderPhaseMode,
     ) -> None:
@@ -16226,7 +16284,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if self._manager_daemon_should_stop():
                 return
             try:
-                result_payload = result.get()
+                result_payload = result.result()
                 # The SSH result may arrive after a partial update has fenced
                 # this child.  Never reduce stale health evidence into a
                 # replica write or teardown in that process.
@@ -17330,10 +17388,8 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         recovery_backend = backends.CloudVmRayBackend()
         # Probes are pure I/O (HTTP GET/POST with a several-second timeout).
-        # Reuse one bounded executor across ticks: constructing and retiring
-        # up to 256 native threads every ten seconds retains allocator arenas
-        # and amplifies transient provider-response memory at fleet scale.
-        executor = self._get_readiness_executor()
+        # Submit them through the one service-wide remote-I/O budget shared
+        # with job-status SSH; neither daemon owns an independent fan-out.
         with contextlib.ExitStack() as route_suspension_rollback:
             pending_route_suspensions: list[
                 system_recovery_route_lease.RouteSuspension] = []
@@ -17485,7 +17541,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if self._is_pool:
                     replica_to_probe.append(f'replica_{info.replica_id}(cluster'
                                             f'_name={info.cluster_name})')
-                    probe_futures.append(executor.submit(_probe_pool, info))
+                    probe_futures.append(
+                        self._submit_remote_io(
+                            _probe_pool,
+                            info,
+                            provider_phase_admitted=(phase_admission
+                                                     is not None)))
                 else:
                     resolved_url = probe_urls[info.replica_id]
                     readiness_path = self._get_readiness_path(info.version)
@@ -17496,7 +17557,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     replica_to_probe.append(
                         f'replica_{info.replica_id}(url={resolved_url})')
                     probe_futures.append(
-                        executor.submit(
+                        self._submit_remote_io(
                             _probe_nonpool,
                             info,
                             readiness_path,
@@ -17504,6 +17565,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                             timeout,
                             readiness_headers,
                             resolved_url,
+                            provider_phase_admitted=(phase_admission
+                                                     is not None),
                         ),)
             logger.info(f'Replicas to probe: {", ".join(replica_to_probe)}')
 
@@ -17552,9 +17615,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                             handle, [info.service_job_id], stream_logs=False))
 
             candidate_status_futures = {
-                info.replica_id:
-                    (info, executor.submit(_candidate_status, info, handle))
-                for info, handle in candidate_status_inputs
+                info.replica_id: (info,
+                                  self._submit_remote_io(
+                                      _candidate_status,
+                                      info,
+                                      handle,
+                                      provider_phase_admitted=(phase_admission
+                                                               is not None))
+                                 ) for info, handle in candidate_status_inputs
             }
             candidate_cycle_evidence: dict[int, tuple[bool, bool]] = {}
             candidate_status_evidence: dict[int, tuple[
@@ -17664,8 +17732,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                     batch = failed_interruptible_infos[
                         offset:offset + self._PREEMPTION_PREFILTER_PARALLELISM]
                     futures = [(failed_info,
-                                executor.submit(_preemption_liveness,
-                                                failed_info))
+                                self._submit_remote_io(
+                                    _preemption_liveness,
+                                    failed_info,
+                                    provider_phase_admitted=(phase_admission
+                                                             is not None)))
                                for failed_info in batch]
                     for failed_info, liveness_future in futures:
                         try:
@@ -18263,7 +18334,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     return
         finally:
             if self._manager_daemon_stop.is_set():
-                self._shutdown_readiness_executor()
+                self._shutdown_remote_io_executor()
 
     def get_active_replica_urls(self) -> list[str]:
         """Get the urls of all active replicas."""

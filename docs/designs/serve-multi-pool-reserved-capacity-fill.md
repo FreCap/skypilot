@@ -28,11 +28,12 @@ Qualification source proves through the production durable planner adapter
 that the exact cold-start scale contract authorizes 800 logical L4 units. The rendered task's
 exact one-L4 backend shape therefore authorizes 800 physical backends and
 exceeds the 100-worker provider gate. The final current-writer AWS/GCP
-scale/traffic/drain receipt, and clean `boltz-l4-fleet` recreation remain
-open. The `spot-e2e-0902a` attempt committed its first 100-member paid wave but
-exposed a load-balancer cold-queue liveness defect before the traffic receipt;
-that defect is source-corrected and unpaid-interface-qualified in this
-checkpoint; homogeneous deployment and billable requalification remain.** One
+scale/traffic/drain receipt and clean `boltz-l4-fleet` recreation remain open.
+The `spot-e2e-0902a` attempt committed its first 100-member paid wave but
+exposed both a load-balancer cold-queue liveness defect and unbounded aggregate
+controller remote-I/O fan-out before the traffic receipt. Both defects are
+source-corrected and unpaid-interface-qualified in this checkpoint;
+homogeneous deployment and billable requalification remain.** One
 PostgreSQL-authoritative planner
 is the canonical source path for reservation-aware actuation and paid Spot
 residual. Historical production runs proved complete East occupancy,
@@ -55,6 +56,37 @@ PostgreSQL is the central store, Helm storage is disabled, and both prepared
 physical launch bounds remain 420. This release contains merged PRs #1857 and
 #1854. No scheduler, platform, infrastructure, EFS/PVC, or provider-policy
 configuration changed in the rollout.
+
+The first 100-member qualification on this writer exposed a controller-memory
+gate after atomic admission, not an atomic-payload or provider-capacity gate.
+All 100 durable ``sky.launch`` requests succeeded and were distributed across
+seven executor Pods. Their PostgreSQL request bodies totalled 484,411 bytes and
+their return values totalled 326,896 bytes. The controller nevertheless ran
+repeated 100-replica readiness rounds while the independent job-status daemon
+could create another pool of up to 256 SSH workers; recovery also adopted 44
+exact bound launches before the 8-GiB controller was OOM-killed. The exact dead
+cgroup allocation is no longer observable, so this evidence does not attribute
+every byte, but it disproves retained launch YAML as the dominant allocation
+and identifies an unbounded aggregate fan-out in the production source.
+
+The source-only correction gives one service owner a 32-worker aggregate
+remote-I/O budget. A 24-worker general lane handles readiness operations and an
+eight-worker admitted-phase lane guarantees progress for job-status children
+whose caller already owns a provider phase; their sum, rather than either lane,
+is the sole concurrency authority. This avoids the FIFO convoy in which every
+worker waits for an incompatible provider phase while the phase owner's child
+work is queued behind it. At the default 15-second readiness timeout, a fully
+blocked 100-member wave drains in five batches (at most 75 seconds), below both
+the five-minute provider-scale gate and 600-second request deadline. A fully
+phase-admitted 100-member wave would use the eight-worker child lane and take at
+most thirteen timeout batches (195 seconds), which remains inside both gates.
+The unpaid production-interface test saturates both lanes with 100 fake calls each,
+asserts an aggregate peak of 32 with no child-process growth, and proves
+admitted-phase progress while every general worker is blocked on the opposite
+phase. This checkpoint changes no provider, placement, scheduler, database,
+Helm, storage, or memory-limit policy. It is source-qualified in this
+checkpoint; homogeneous deployment and current-writer qualification remain.
+
 The cold ``spot-e2e-0901k`` campaign reached 113
 concurrent provider-``RUNNING`` GCP Spot L4 VMs and returned its complete
 provider/PostgreSQL graph to exact zero; it first crossed 100 at 343.5 seconds.
@@ -3052,6 +3084,23 @@ catalog evidence, and provider market establish what was selected and billed.
 The fleet manager lock protects short in-memory reductions. It must never be a
 lease for slow or blocking work.
 
+Readiness HTTP and remote job-status SSH share one per-service aggregate
+remote-I/O budget of 32 workers. They must not own independently bounded pools:
+``256 + 256`` is still a 512-worker process fan-out when the supervised daemons
+overlap. The internal 24/8 general/admitted-phase lane split sums to the one
+budget and exists only to preserve provider-phase progress. It is not a second
+readiness or job-status policy. Unpaid coverage must run both producers
+concurrently through this production owner and assert the aggregate active
+count, worker count, process count, memory high-water delta, terminal shutdown,
+and progress under an incompatible-provider-phase queue.
+
+Ordinary PHX endpoint readiness does not enter the eight-worker child lane: it
+uses the 24-worker general lane after URL/provider-fence resolution. Only work
+that receives an already-open provider admission uses the child lane. Even if
+all 100 readiness calls were explicitly phase-admitted and every call exhausted
+the default 15-second timeout, thirteen batches take at most 195 seconds.
+Healthy and connection-refused probes normally free their slots much sooner.
+
 The required probe/reconcile shape is:
 
 1. capture an immutable opening lifecycle and replica snapshot;
@@ -3092,7 +3141,16 @@ cannot be released until the inline cleanup returns.
 The current deployed release does not yet satisfy this completely. The source
 candidate in `fix/serve-probe-scale-convoy-v3` moves the remaining probe,
 preemption, thread refresh, URL resolution, and completion paths across this
-boundary. It remains unmerged and unproven in production.
+boundary. It remains unmerged and unproven in production. The aggregate
+remote-I/O correction is also source-only and must merge into that one steady
+state before the current-writer billable qualification resumes.
+
+Separately, the atomic-wave materializer can still create up to 100 local
+adopter thread objects after commit. PostgreSQL queue visibility is already the
+durable recovery authority, so a later cleanup may replace eager full-wave
+adoption with a bounded queue-native adopter. That is not required to make the
+remote-I/O aggregate bound correct and is deliberately outside this checkpoint;
+it needs its own retained-memory and restart-adoption evidence before removal.
 
 Launch and down workers use per-worker immutable identity and cancellation
 tokens, not a shared numeric-ID flag. Completion must exact-match the current
@@ -3995,12 +4053,17 @@ these remaining current-writer acceptance gates:
    PostgreSQL remains the sole central store, Helm storage remains disabled,
    and both prepared physical launch limits remain 420. No scheduler,
    infrastructure, platform, EFS/PVC, or provider configuration changed.
-8. Homogeneously deploy the cold-queue liveness correction, then run its serial
-   unpaid 10,000-request interface gate against the release image.
-   Only after that passes, run the provider-native scale profile against that
-   exact image. Drive the 800-logical-slot bounded Spot target to at least 100
-   provider-``RUNNING`` L4 Spot VMs in aggregate within five minutes; do not
-   require both providers to
+8. Homogeneously deploy both the cold-queue liveness correction and aggregate
+   32-worker controller remote-I/O owner without changing the controller
+   memory limit. Run the serial unpaid 10,000-request HTTP interface gate
+   against the release image. Also require the clean-subprocess remote-I/O gate
+   to prove 100 readiness plus 100 job-status calls never exceed 32 active
+   workers, create no child process, release every worker at shutdown, and let
+   admitted-phase children complete while the 24-worker general lane is
+   saturated on an incompatible phase. Only after both pass, run the
+   provider-native scale profile against that exact image. Drive the
+   800-logical-slot bounded Spot target to at least 100 provider-``RUNNING`` L4
+   Spot VMs in aggregate within five minutes; do not require both providers to
    win the economic selection. Keep the shared 420-physical-launch Helm
    throttle unchanged and record physical VMs and logical L4 slots separately.
    Use exactly 10,000 authenticated async identities as the only scale

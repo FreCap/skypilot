@@ -1140,7 +1140,7 @@ class TestBackgroundDutyOwnershipLifecycle:
 
         class _DelayedFailedResult:
 
-            def get(self):
+            def result(self):
                 result_started.set()
                 assert release_result.wait(timeout=5)
                 return ({1: job_lib.JobStatus.FAILED}, {}, {})
@@ -5183,7 +5183,7 @@ def test_v2_job_status_batch_reuses_one_physical_uid_proof():
         assert provider_error_phase_mode is (
             replica_managers.provider_phase.ProviderPhaseMode.V2_FENCED)
         for _, _, result in results:
-            result.get()
+            result.result()
 
     mgr._handle_job_status_results = _consume
     with mock.patch.object(replica_managers.serve_state,
@@ -5295,7 +5295,7 @@ def test_kubernetes_system_recovery_retains_exact_remote_job_status():
         assert provider_error_phase_mode is (
             replica_managers.provider_phase.ProviderPhaseMode.V2_FENCED)
         for _, _, result in results:
-            result.get()
+            result.result()
 
     mgr._handle_job_status_results = mock.Mock(side_effect=_consume)
     with mock.patch.object(replica_managers.serve_state,
@@ -5679,8 +5679,8 @@ def test_v2_exact_absence_preemption_skips_refresh_but_schedules_down():
         replica_record_id=info.replica_record_id)
 
     failed = mock.Mock()
-    failed.get.side_effect = exceptions.CommandError(255, 'status', 'lost',
-                                                     None)
+    failed.result.side_effect = exceptions.CommandError(255, 'status', 'lost',
+                                                        None)
     liveness = replica_managers._PreemptionPrefilterResult(
         replica_managers._PreemptionPrefilterDisposition.
         EXACT_KUBERNETES_ABSENT, receipt)
@@ -5723,8 +5723,8 @@ def test_v2_exact_absence_preemption_rejects_same_id_replacement():
         info.to_storage_dict())
     replacement.replica_record_id = str(uuid.uuid4())
     failed = mock.Mock()
-    failed.get.side_effect = exceptions.CommandError(255, 'status', 'lost',
-                                                     None)
+    failed.result.side_effect = exceptions.CommandError(255, 'status', 'lost',
+                                                        None)
     with mock.patch.object(
             replica_managers.provider_phase,
             'provider_phase',
@@ -11572,7 +11572,7 @@ class TestInfrastructureInterruptionRecovery:
     @staticmethod
     def _command_error_result():
         result = mock.Mock()
-        result.get.side_effect = exceptions.CommandError(
+        result.result.side_effect = exceptions.CommandError(
             255, 'get_job_status', 'backend unavailable', None)
         return result
 

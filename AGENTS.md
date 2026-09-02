@@ -293,6 +293,19 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
   configured cardinality and prove health/control-plane responsiveness, not
   only call helpers against pre-populated internal state.
 
+### Aggregate Concurrency Budgets
+
+- Bound fan-out at the narrowest owner shared by all work competing for the
+  same process memory, provider phase, database pool, or other finite resource.
+  Independently bounded sibling pools do not bound their simultaneous sum.
+- Before adding or changing a worker pool, inventory overlapping executors,
+  nested fan-out, and child processes. Give the shared owner one explicit
+  aggregate budget and make internal lanes sum to that budget.
+- Regression tests must exercise sibling producers concurrently through the
+  production scheduling interface and assert aggregate active work, workers,
+  child processes, and progress under dependency contention. Testing each
+  producer at its local limit is insufficient.
+
 ### Typed Internal State and Compatibility Boundaries
 
 - Represent cross-module domain state that has multiple fields, invariants, or
