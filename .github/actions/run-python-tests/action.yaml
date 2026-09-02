@@ -87,6 +87,11 @@ runs:
           SKYPILOT_DISABLE_USAGE_COLLECTION=1 SKYPILOT_SKIP_CLOUD_IDENTITY_CHECK=1 eval "pytest -n 0 --dist no $TEST_PATH"
         elif [[ "$TEST_NAME" == "Serve Reclaim Pressure" ]]; then
           SKYPILOT_DISABLE_USAGE_COLLECTION=1 SKYPILOT_SKIP_CLOUD_IDENTITY_CHECK=1 eval "pytest -n 0 --dist no -s -m serve054_process_pressure $TEST_PATH"
+        elif [[ "$TEST_NAME" == "Serve LB 10k Interface" ]]; then
+          # 10,000 client sockets plus their server-side peers exceed the
+          # default per-process descriptor limit. Serial: one LB process.
+          ulimit -n 65536 || true
+          SKYPILOT_DISABLE_USAGE_COLLECTION=1 SKYPILOT_SKIP_CLOUD_IDENTITY_CHECK=1 eval "pytest -n 0 --dist no -s -m serve_lb_10k_interface $TEST_PATH"
         elif [[ "$TEST_NAME" == "Unit Tests" ]]; then
           SKYPILOT_DISABLE_USAGE_COLLECTION=1 SKYPILOT_SKIP_CLOUD_IDENTITY_CHECK=1 eval "pytest -n 4 --dist worksteal -m 'not serve054_process_pressure' $TEST_PATH"
         else

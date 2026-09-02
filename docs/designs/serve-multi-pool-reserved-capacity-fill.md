@@ -255,6 +255,22 @@ and public queue depth returning to zero. The same test against pre-fix commit
 not reach 10,000 within 45 seconds while the event loop starved. Homogeneous
 Helm deployment and repetition of the billable qualification remain required.
 
+The post-merge audit of that correction found the second whole-registry pass
+on the same hot path. The exact-card grant planner traverses every resident
+waiter, and the dispatcher invokes it whenever the fleet has a dispatchable
+slot, so a fleet whose only free slots belong to cards no queued request
+accepts (a cold pool beside a warm one, or a ready replica whose identity has
+not synced) paid that traversal on every enqueue and on every waiter's
+one-second disconnect poll: 2.3 ms per dispatch with 10,000 resident waiters,
+about 32 times the removed purge, or 23 seconds of event-loop work per second
+of polling. The planner now consults an exactly maintained census of resident
+compatibility profiles, updated at the two registry mutation points and
+rebuilt once when a service update re-indexes queued requests, and skips the
+traversal when no free card is acceptable to any resident waiter. A structural
+test pins 10,000 mismatched-fleet dispatches to zero traversals, and the serial
+10,000-request interface gate runs as the dedicated ``Serve LB 10k Interface``
+CI job rather than only by hand.
+
 Provider availability and runtime/service readiness are separate facts. The
 write-once provider-allocation marker commits normal pool-success feedback
 after the in-tree provisioner returns a single-node full-fresh allocation

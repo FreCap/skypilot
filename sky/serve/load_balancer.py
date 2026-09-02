@@ -272,6 +272,7 @@ class SkyServeLoadBalancer:
     _waiting_request_count: int
     _waiting_request_body_bytes: int
     _request_queue_waiters: dict[int, dict[int, _RequestQueueWaiter]]
+    _request_queue_profile_census: dict[tuple[str, ...] | None, int]
     _request_queue_sequence: int
     _draining: bool
     _reject_last_seen: dict[str, tuple[float, int]]
@@ -494,6 +495,7 @@ class SkyServeLoadBalancer:
         self._waiting_request_count = 0
         self._waiting_request_body_bytes = 0
         self._request_queue_waiters = {}
+        self._request_queue_profile_census = {}
         self._request_queue_sequence = 0
         self._reject_last_seen = {}
         self._reject_compatibility_by_key = {}
@@ -1063,6 +1065,9 @@ class SkyServeLoadBalancer:
                     'update; retry against the active version.',
                     status_code=503)
                 self._resolve_request_queue_waiter_locked(waiter)
+        # Survivors were re-indexed in place, so their census keys moved.
+        self._request_queue_profile_census = (
+            self._count_request_queue_profile_census_locked())
 
     def _queue_uses_async_occupancy(self) -> bool:
         config = self._request_queue_config
@@ -1332,6 +1337,20 @@ class SkyServeLoadBalancer:
             self) -> dict[int, dict[int, _RequestQueueWaiter]]:
         return self._request_queue_waiters
 
+    @staticmethod
+    def _request_queue_profile_key(
+            waiter: _RequestQueueWaiter) -> tuple[str, ...] | None:
+        return getattr(waiter.request, _REQUEST_ACCELERATORS_ATTR, None)
+
+    def _add_request_queue_waiter_locked(self,
+                                         waiter: _RequestQueueWaiter) -> None:
+        waiters = self._request_queue_waiters_for_instance()
+        waiters.setdefault(waiter.priority, {})[waiter.sequence] = waiter
+        self._waiting_request_count += 1
+        profiles = self._request_queue_profile_census
+        key = self._request_queue_profile_key(waiter)
+        profiles[key] = profiles.get(key, 0) + 1
+
     def _remove_request_queue_waiter_locked(
             self, waiter: _RequestQueueWaiter) -> bool:
         waiters = self._request_queue_waiters_for_instance()
@@ -1341,7 +1360,46 @@ class SkyServeLoadBalancer:
         if not bucket:
             del waiters[waiter.priority]
         self._waiting_request_count = max(0, self._waiting_request_count - 1)
+        profiles = self._request_queue_profile_census
+        key = self._request_queue_profile_key(waiter)
+        remaining = profiles.get(key, 0) - 1
+        if remaining > 0:
+            profiles[key] = remaining
+        else:
+            profiles.pop(key, None)
         return True
+
+    def _count_request_queue_profile_census_locked(
+            self) -> dict[tuple[str, ...] | None, int]:
+        """Rebuild the resident compatibility-profile census by traversal."""
+        profiles: dict[tuple[str, ...] | None, int] = {}
+        for bucket in self._request_queue_waiters_for_instance().values():
+            for waiter in bucket.values():
+                key = self._request_queue_profile_key(waiter)
+                profiles[key] = profiles.get(key, 0) + 1
+        return profiles
+
+    def _request_queue_can_use_free_cards_locked(self,
+                                                 free_cards: set[str]) -> bool:
+        """Whether any resident waiter accepts a card with a free slot.
+
+        The exact-card matcher traverses every resident waiter. A fleet whose
+        only free slots belong to cards no queued request accepts (a cold pool
+        beside a warm one, or a ready replica without a synced identity) would
+        otherwise pay that traversal on every enqueue and on every waiter's
+        one-second disconnect poll. The census is maintained exactly at the
+        two registry mutation points; a registry replaced behind them is
+        recounted once instead of trusted.
+        """
+        waiters = self._request_queue_waiters_for_instance()
+        profiles = self._request_queue_profile_census
+        resident = sum(len(bucket) for bucket in waiters.values())
+        if sum(profiles.values()) != resident:
+            profiles = self._count_request_queue_profile_census_locked()
+            self._request_queue_profile_census = profiles
+        return any(profile is None or not free_cards.isdisjoint(profile)
+                   for profile, count in profiles.items()
+                   if count > 0)
 
     def _pop_request_queue_waiter_locked(
         self,
@@ -1456,6 +1514,10 @@ class SkyServeLoadBalancer:
             return []
         waiters = self._request_queue_waiters_for_instance()
         remaining = dict(accelerator_slots)
+        free_cards = {card for card, slots in remaining.items() if slots > 0}
+        if not free_cards or not self._request_queue_can_use_free_cards_locked(
+                free_cards):
+            return []
         plan: list[tuple[_RequestQueueWaiter, str]] = []
         configured = self._configured_accelerators or tuple(remaining)
         card_order = {card: index for index, card in enumerate(configured)}
@@ -1974,9 +2036,7 @@ class SkyServeLoadBalancer:
                     sequence=sequence,
                     deadline_monotonic=deadline,
                     future=asyncio.get_running_loop().create_future())
-                waiters = self._request_queue_waiters_for_instance()
-                waiters.setdefault(priority, {})[sequence] = waiter
-                self._waiting_request_count += 1
+                self._add_request_queue_waiter_locked(waiter)
                 self._dispatch_request_queue_locked()
 
             while True:
