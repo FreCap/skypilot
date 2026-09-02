@@ -1559,6 +1559,99 @@ def test_plan_cohort_subtracts_same_generation_debits_before_preparation():
     assert budget.service_claim_limit == 25
 
 
+def _plan_states(keys, remaining=4):
+    return {
+        key: {
+            'remaining': remaining,
+            'admission_state': 'active',
+            'admission_limit': remaining,
+            'last_success_at': None,
+        } for key in keys.values()
+    }
+
+
+def test_plan_cohort_counts_owned_pools_and_reuses_their_headroom():
+    """Owned pools consume frontier exposure and their exact-pool headroom
+    is spent before any new pool is opened, so the frontier stays minimal:
+    20 backend claims with two owned pools of 4 headroom each need exactly
+    three more pools, and the limit is owned + new, not new alone.
+
+    Ownership is recorded under the provider-identity pool keys the budget
+    derives (not the legacy identity-less key), exactly as Phase A stores
+    them on in-flight replicas."""
+    locations = [
+        make_location(f'us-central-{index}', {'L4': 1}, cloud_name='GCP')
+        for index in range(30)
+    ]
+    placer = make_placer({
+        location: float(index + 1) for index, location in enumerate(locations)
+    })
+    keys = {
+        location: paid_capacity.pool_key(
+            location, workspace='w', num_nodes=1,
+            gcp_project_id='test-project') for location in locations
+    }
+    owned = [locations[5], locations[7]]
+    infos = []
+    for replica_id, location in enumerate(owned, start=1):
+        info = _pending_info(replica_id, location)
+        info.paid_capacity_pool_key = keys[location]
+        infos.append(info)
+
+    budget = _plan_bound_budget(placer,
+                                _plan_states(keys),
+                                target={'l4': 20},
+                                widths={'l4': 1},
+                                infos=infos)
+
+    assert budget.plan_bound_cohort is not None
+    assert budget.plan_bound_cohort.backend_claim_count == 20
+    assert budget.frontier_limit_overrides == {('l4',): 5}
+
+
+def test_plan_cohort_over_debit_fails_closed_for_every_card():
+    """A debit ledger above its own target is malformed evidence: the whole
+    plan-bound cohort is disabled, including cards whose ledger is fine."""
+    l4_locations = [
+        make_location(f'us-central-{index}', {'L4': 1}, cloud_name='GCP')
+        for index in range(4)
+    ]
+    a10g_locations = [
+        make_location(f'us-east-{index}', {'A10G': 1}, cloud_name='AWS')
+        for index in range(4)
+    ]
+    locations = l4_locations + a10g_locations
+    placer = make_placer({
+        location: float(index + 1) for index, location in enumerate(locations)
+    })
+    keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in locations
+    }
+
+    budget = _plan_bound_budget(placer,
+                                _plan_states(keys),
+                                target={
+                                    'l4': 8,
+                                    'a10g': 8
+                                },
+                                widths={
+                                    'l4': 1,
+                                    'a10g': 1
+                                },
+                                claimed={'l4': 9})
+
+    assert budget.plan_bound_cohort is None
+    assert budget.service_remaining == 0
+    assert not budget.frontier_limit_overrides
+    assert all(units == 0 for units in budget.remaining_by_location.values())
+    assert paid_capacity.select_location(
+        placer,
+        budget,
+        skip_zero_cost_preference=True,
+        allowed_locations=set(locations)) is None
+
+
 def test_plan_cohort_skips_closed_cheapest_and_on_demand_pool():
     on_demand = make_location('on-demand', {'L4': 1},
                               use_spot=False,
