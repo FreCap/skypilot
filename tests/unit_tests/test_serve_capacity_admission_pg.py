@@ -6418,6 +6418,96 @@ def test_fill_demand_witness_retains_only_older_deadline_lower_bound(
         'svc', 'svc-hash', (123, '10.0.0.5'), max_age_seconds=60) is None
 
 
+def test_fill_demand_witness_fails_closed_on_head_or_feed_drift(
+        capacity_database, monkeypatch):
+    engine, incarnation, route_receipt = capacity_database
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_snapshots_table).values(
+                    producer_protocol_version=2))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_projection_protocol_version=2,
+                    route_projection_controller_incarnation=incarnation))
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=True,
+                           utilization_gate=True)
+    allocation = _allocation_map({'l4': 1},
+                                 utilization_gate_armed=True,
+                                 utilization_demonstrated_need=2,
+                                 utilization_ceiling=2)
+    _mock_current_allocation(monkeypatch, allocation)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    # Advance the feed past its first generation so a rewind below the plan
+    # stays a positive generation.
+    demand_state.ingest_report(
+        'svc', 'svc-hash', _demand_report(time.time(),
+                                          route_receipt,
+                                          sequence=2))
+    repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 1},
+        backend_num_nodes=1,
+        sequenced_reserved_fill=True,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2))
+
+    def read():
+        return repository.read_current_fill_demand_witness('svc',
+                                                           'svc-hash',
+                                                           (123, '10.0.0.5'),
+                                                           max_age_seconds=60)
+
+    initial = read()
+    assert initial is not None
+    plan_generation = initial.demand_feed_generation
+    heads = capacity_admission_schema.serve_capacity_plan_heads_table
+    feed = demand_state_schema.serve_demand_feed_generations_table
+
+    # A head whose demand generation disagrees with its own plan row is a
+    # torn write: no witness until the head is consistent again.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(heads).where(
+                heads.c.service_name == 'svc').values(
+                    demand_feed_generation=plan_generation + 1))
+    assert read() is None
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(heads).where(
+                heads.c.service_name == 'svc').values(
+                    demand_feed_generation=plan_generation))
+    assert read() is not None
+
+    # A plan committed against a demand generation the feed no longer reaches
+    # is ahead of its source; it is neither current nor an equivalent older
+    # heartbeat, so it cannot be rebound.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(feed).where(
+                feed.c.service_name == 'svc',
+                feed.c.service_hash == 'svc-hash').values(
+                    generation=plan_generation - 1))
+    assert read() is None
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(feed).where(
+                feed.c.service_name == 'svc',
+                feed.c.service_hash == 'svc-hash').values(
+                    generation=plan_generation))
+    restored = read()
+    assert restored is not None
+    assert restored.semantic_sha256 == initial.semantic_sha256
+    assert restored.capacity_plan_generation == (
+        initial.capacity_plan_generation)
+
+
 def test_gate_disabled_still_uses_current_reservation_without_witness(
         capacity_database, monkeypatch):
     engine, incarnation, _ = capacity_database
