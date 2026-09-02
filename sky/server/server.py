@@ -88,6 +88,7 @@ from sky.server.requests import launch_identity
 from sky.server.requests import log_provider
 from sky.server.requests import non_pool_admission
 from sky.server.requests import ordinary_launch as ordinary_launch_request
+from sky.server.requests import paid_wave_admission
 from sky.server.requests import payloads
 from sky.server.requests import preconditions
 from sky.server.requests import request_names
@@ -1464,6 +1465,9 @@ async def non_pool_serve_launch(
             f'{common_utils.format_exception(error)}') from error
     if reservation.created:
         built.request.log_path.touch()
+    if profile.kind is (
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+        paid_wave_admission.record_singleton_paid_compatibility_use()
     return responses.OrdinaryLaunchBindingResponse(
         submission_uuid=submission_uuid,
         association_id=reservation.association_id,

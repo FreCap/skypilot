@@ -59,6 +59,7 @@ from sky.serve import zero_cost_actuation
 from sky.serve import zero_cost_actuation_schema
 from sky.server import constants as server_constants
 from sky.server.requests import executor
+from sky.server.requests import non_pool_launch as non_pool_launch_request
 from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import requests as api_requests
@@ -75,6 +76,11 @@ _CONTROLLER_PORT = 8123
 _CONTROLLER_INCARNATION = uuid.UUID('11111111-1111-4111-8111-111111111111')
 _CONTROLLER_OWNER_EPOCH = 2
 _BINDING_EPOCH = 1
+_REQUEST_RUNTIME = request_postgres.NonPoolLaunchBindingRuntime(
+    handler_name=non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME,
+    storage_backend_type=(
+        request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE),
+    queue_backend_type=request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE)
 
 
 class _InjectedAdmissionFault(BaseException):
@@ -94,9 +100,10 @@ def atomic_database(allocation_engine, monkeypatch):
                         allocation_engine)
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         allocation_engine)
-    monkeypatch.setattr(request_postgres,
-                        '_resolved_request_backend_capability', lambda:
-                        ('postgres', 'postgres', True))
+    monkeypatch.setattr(
+        request_postgres, '_resolved_request_backend_capability', lambda:
+        (request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE,
+         request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE, True))
     profile_digest = ordinary_launch_binding.supported_non_pool_profile_set_digest(
     )
     with allocation_engine.begin() as connection:
@@ -857,6 +864,9 @@ def test_failed_teardown_uncertain_provider_ambiguity_stays_fail_closed(
 def _use_real_broker(monkeypatch, engine):
     monkeypatch.setattr(request_postgres,
                         'non_pool_launch_binding_fleet_capable', lambda: True)
+    monkeypatch.setattr(request_postgres,
+                        'prepare_non_pool_launch_binding_runtime',
+                        lambda: _REQUEST_RUNTIME)
 
     def get_postgres_lock(lock_id,
                           timeout=None,
@@ -882,13 +892,13 @@ def test_serve059_lineage_and_sqlite_ceiling() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['066']
+    assert scripts.get_heads() == ['067']
     assert scripts.get_revision('060').down_revision == '059'
     assert scripts.get_revision('059').down_revision == '058'
     assert scripts.get_revision('058').down_revision == '057'
     assert scripts.get_revision('056').down_revision == '055'
     assert scripts.get_revision('055').down_revision == '054'
-    assert migration_utils.SERVE_VERSION == '066'
+    assert migration_utils.SERVE_VERSION == '067'
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
         alembic_command.upgrade(config, '056')
@@ -1255,6 +1265,7 @@ def test_rejected_savepoint_leaves_outer_transaction_usable_and_empty(
             reserved_fill_admission._stage_and_bind(connection,
                                                     spec,
                                                     lease_token,
+                                                    runtime=_REQUEST_RUNTIME,
                                                     require_existing=False)
         assert connection.execute(sqlalchemy.select(1)).scalar_one() == 1
         assert _suffix_counts(connection) == (0, 0, 0, 0, 0)
@@ -1286,6 +1297,7 @@ def test_atomic_fill_rejects_caller_assigned_event_sequence(
             reserved_fill_admission._stage_and_bind(connection,
                                                     spec,
                                                     7,
+                                                    runtime=_REQUEST_RUNTIME,
                                                     require_existing=False)
         assert connection.execute(sqlalchemy.select(1)).scalar_one() == 1
         assert _suffix_counts(connection) == (0, 0, 0, 0, 0)
@@ -1395,7 +1407,11 @@ def test_inner_commit_is_savepoint_and_outer_rollback_removes_full_suffix(
     with atomic_database.connect() as connection:
         outer = connection.begin()
         staged, receipt = reserved_fill_admission._stage_and_bind(
-            connection, spec, 7, require_existing=False)
+            connection,
+            spec,
+            7,
+            runtime=_REQUEST_RUNTIME,
+            require_existing=False)
         assert not staged.already_committed
         assert receipt.replica_id == 1
         assert isinstance(receipt.context,
@@ -1454,10 +1470,12 @@ def test_every_suffix_insert_fault_rolls_back_to_usable_savepoint(
         with atomic_database.connect() as connection:
             outer = connection.begin()
             with pytest.raises(_InjectedSuffixFault):
-                reserved_fill_admission._stage_and_bind(connection,
-                                                        spec,
-                                                        7,
-                                                        require_existing=False)
+                reserved_fill_admission._stage_and_bind(
+                    connection,
+                    spec,
+                    7,
+                    runtime=_REQUEST_RUNTIME,
+                    require_existing=False)
             assert injected
             assert connection.execute(sqlalchemy.select(1)).scalar_one() == 1
             assert _suffix_counts(connection) == (0, 0, 0, 0, 0)
@@ -1500,6 +1518,7 @@ def test_savepoint_rollback_interrupt_preserves_original_operator_signal(
             reserved_fill_admission._stage_and_bind(connection,
                                                     spec,
                                                     7,
+                                                    runtime=_REQUEST_RUNTIME,
                                                     require_existing=False)
         assert raised.value is original_interrupt
         assert raised.value.__cause__ is rollback_interrupt
@@ -1605,6 +1624,7 @@ def test_atomic_suffix_uses_canonical_lock_order(atomic_database) -> None:
             reserved_fill_admission._stage_and_bind(connection,
                                                     spec,
                                                     7,
+                                                    runtime=_REQUEST_RUNTIME,
                                                     require_existing=False)
             outer.rollback()
     finally:

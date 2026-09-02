@@ -51,9 +51,13 @@ from sky.utils.db import db_utils
 
 if TYPE_CHECKING:
     from sky.serve import serve_history
+    from sky.serve.ordinary_launch_binding import ControllerBindingAuthority
+    from sky.serve.paid_launch_request import ReplicaLaunchRuntime
     from sky.serve.reserved_fill_planner import AuthenticatedAllocationMap
     from sky.serve.reserved_fill_planner import FillCapacityUnit
     from sky.serve.reserved_fill_planner import ReservedFillAllocationIdentity
+    from sky.server.requests.paid_wave_admission import (
+        FusedBindingReceiptMember)
 else:
     serve_history = adaptors_common.LazyImport('sky.serve.serve_history')
 
@@ -71,6 +75,12 @@ ordinary_launch_binding = adaptors_common.LazyImport(
     'sky.serve.ordinary_launch_binding')
 request_postgres_schema = adaptors_common.LazyImport(
     'sky.server.requests.postgres_schema')
+request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
+paid_wave_admission = adaptors_common.LazyImport(
+    'sky.server.requests.paid_wave_admission')
+paid_launch_request = adaptors_common.LazyImport(
+    'sky.serve.paid_launch_request')
+request_lib = adaptors_common.LazyImport('sky.server.requests.requests')
 
 logger = sky_logging.init_logger(__name__)
 
@@ -1232,6 +1242,7 @@ class CommittedCapacityPlan:
     candidate: capacity_planning.CapacityPlanCandidate
     allocation_map: AuthenticatedAllocationMap | None
     paid_launch_receipt: serve_paid_capacity.PaidLaunchReceipt
+    paid_launch_bindings: tuple[FusedBindingReceiptMember, ...]
 
     def __post_init__(self) -> None:
         if (not isinstance(self.authority, PaidLaunchAuthority) or
@@ -1243,6 +1254,10 @@ class CommittedCapacityPlan:
                                capacity_planning.CapacityPlanCandidate) or
                 not isinstance(self.paid_launch_receipt,
                                serve_paid_capacity.PaidLaunchReceipt) or
+                type(self.paid_launch_bindings) is not tuple or
+                any(not isinstance(
+                    binding, paid_wave_admission.FusedBindingReceiptMember)
+                    for binding in self.paid_launch_bindings) or
                 self.candidate.snapshot_fingerprint
                 != self.planner_snapshot.fingerprint):
             raise ValueError('Committed capacity plan is malformed.')
@@ -1256,6 +1271,11 @@ class CommittedCapacityPlan:
                 receipt.capacity_plan_sha256 != self.authority.content_sha256 or
                 receipt.capacity_unit != self.authority.capacity_unit.value):
             raise ValueError('Committed paid launch receipt is malformed.')
+        if tuple((member.replica_id, member.replica_record_id)
+                 for member in receipt.members) != tuple(
+                     (binding.replica_id, binding.replica_record_id)
+                     for binding in self.paid_launch_bindings):
+            raise ValueError('Committed paid launch bindings are incomplete.')
         if self.allocation_map is not None and not isinstance(
                 self.allocation_map,
                 reserved_fill_planner.AuthenticatedAllocationMap):
@@ -2011,25 +2031,65 @@ class _ReservedFillServiceConfig:
     paid_launch_version: _LockedPaidLaunchVersionAuthority | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class _PreparedPaidLaunchPreflight:
+    """Validated paid request bytes fenced to one advisory source read."""
+
+    specs: tuple[serve_paid_capacity.PaidLaunchSpec, ...]
+    replica_port: str
+    binding_authority: ControllerBindingAuthority
+    resource_scope: str
+    version_authority_sha256: str
+
+
+def _paid_launch_version_authority_sha256(
+    authority: _LockedPaidLaunchVersionAuthority | None,) -> str:
+    """Fingerprint every immutable input used to rebuild a paid request."""
+    if (authority is None or not isinstance(authority.service_spec, bytes) or
+            not isinstance(authority.launch_yaml_content, str) or
+            not isinstance(authority.placement_catalog, Mapping) or
+            not isinstance(authority.placement_contract,
+                           placement_policy.PlacementContract) or
+            not isinstance(authority.controller_config, bytes) or
+            not isinstance(authority.controller_config_digest, str) or
+            not isinstance(authority.controller_config_snapshot_id, str)):
+        raise ValueError('Paid launch version authority is incomplete.')
+    return _sha256({
+        'service_spec_sha256': hashlib.sha256(authority.service_spec
+                                             ).hexdigest(),
+        'launch_yaml_sha256': hashlib.sha256(
+            authority.launch_yaml_content.encode('utf-8')).hexdigest(),
+        'placement_catalog_sha256': _sha256(authority.placement_catalog),
+        'placement_contract': dataclasses.asdict(authority.placement_contract),
+        'controller_config_sha256': hashlib.sha256(authority.controller_config
+                                                  ).hexdigest(),
+        'controller_config_digest': authority.controller_config_digest,
+        'controller_config_snapshot_id':
+            authority.controller_config_snapshot_id,
+    })
+
+
 def _reserved_fill_service_config_in_connection(
     connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
+    *,
+    lock_version: bool = True,
 ) -> _ReservedFillServiceConfig:
-    """Read the immutable fill discriminator and ceiling under lock."""
-    version_row = connection.execute(
-        sqlalchemy.select(
-            _VERSION_SPECS.c.spec,
-            _VERSION_SPECS.c.worker_placement_projections,
-            _VERSION_SPECS.c.yaml_content, _VERSION_SPECS.c.placement_catalog,
-            _VERSION_SPECS.c.controller_config,
-            _VERSION_SPECS.c.controller_config_digest,
-            _VERSION_SPECS.c.controller_config_snapshot_id).where(
-                _VERSION_SPECS.c.service_name == service['name'],
-                _VERSION_SPECS.c.version == service['current_version'],
-                _VERSION_SPECS.c.yaml_content.isnot(None),
-                _VERSION_SPECS.c.quarantined_at.is_(None),
-                _VERSION_SPECS.c.retired_at.is_(None)).with_for_update(
-                    read=True)).one_or_none()
+    """Read the immutable fill discriminator and ceiling, optionally locked."""
+    query = sqlalchemy.select(
+        _VERSION_SPECS.c.spec, _VERSION_SPECS.c.worker_placement_projections,
+        _VERSION_SPECS.c.yaml_content, _VERSION_SPECS.c.placement_catalog,
+        _VERSION_SPECS.c.controller_config,
+        _VERSION_SPECS.c.controller_config_digest,
+        _VERSION_SPECS.c.controller_config_snapshot_id).where(
+            _VERSION_SPECS.c.service_name == service['name'],
+            _VERSION_SPECS.c.version == service['current_version'],
+            _VERSION_SPECS.c.yaml_content.isnot(None),
+            _VERSION_SPECS.c.quarantined_at.is_(None),
+            _VERSION_SPECS.c.retired_at.is_(None))
+    if lock_version:
+        query = query.with_for_update(read=True)
+    version_row = connection.execute(query).one_or_none()
     if version_row is None:
         raise CapacityAdmissionConflict(
             'Current service version has no immutable reserved-fill spec.')
@@ -3991,14 +4051,16 @@ def _canonical_prepared_paid_launch_specs(
     accounting_cards: Mapping[str, int],
     backend_num_nodes: int,
     locked_version: _LockedPaidLaunchVersionAuthority | None,
+    launch_runtime: ReplicaLaunchRuntime | None,
 ) -> tuple[tuple[serve_paid_capacity.PaidLaunchSpec, ...], str | None]:
     """Validate the provider-free candidate lock superset."""
     if (not isinstance(value, Sequence) or isinstance(value,
                                                       (str, bytes, bytearray))):
         raise ValueError('Prepared paid launch specs must be a sequence.')
     specs = tuple(value)
-    if len(specs) > serve_paid_capacity.MAX_PREPARED_LAUNCH_SPECS:
-        raise ValueError('Prepared paid launch cohort is too large.')
+    if (len(specs)
+            > serve_paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS):
+        raise ValueError('Prepared paid launch atomic wave is too large.')
     if any(not isinstance(spec, serve_paid_capacity.PaidLaunchSpec)
            for spec in specs):
         raise ValueError('Prepared paid launch spec is malformed.')
@@ -4010,6 +4072,13 @@ def _canonical_prepared_paid_launch_specs(
     if locked_version is None:
         raise CapacityAdmissionConflict(
             'Elected version has no immutable paid launch authority.')
+    if not isinstance(launch_runtime, paid_launch_request.ReplicaLaunchRuntime):
+        raise CapacityAdmissionConflict(
+            'Prepared paid launch has no frozen runtime inputs.')
+    workspace = service.get('workspace')
+    if not isinstance(workspace, str) or not workspace:
+        raise CapacityAdmissionConflict(
+            'Paid launch requires an exact service workspace.')
     try:
         controller_config = locked_version.controller_config
         controller_config_digest = locked_version.controller_config_digest
@@ -4027,6 +4096,10 @@ def _canonical_prepared_paid_launch_specs(
                 controller_config=controller_config,
                 controller_config_digest=controller_config_digest,
                 controller_config_snapshot_id=controller_config_snapshot_id))
+        frozen_controller_config = (
+            serve_utils.parse_and_validate_version_controller_config(
+                controller_config, workspace,
+                'locked paid launch controller config'))
         if (not isinstance(locked_version.launch_yaml_content, str) or
                 not locked_version.launch_yaml_content or
                 not isinstance(locked_version.placement_catalog, Mapping)):
@@ -4049,6 +4122,11 @@ def _canonical_prepared_paid_launch_specs(
         catalog_by_location = {
             entry.location: entry for entry in ranked_catalog
         }
+        gcp_project_id_by_location = (
+            serve_paid_capacity.resolve_gcp_project_ids_for_locations(
+                catalog_by_location,
+                workspace=workspace,
+                frozen_controller_config=frozen_controller_config))
         catalog_tier_by_location = {}
         for entry in ranked_catalog:
             try:
@@ -4062,7 +4140,6 @@ def _canonical_prepared_paid_launch_specs(
     except (TypeError, ValueError) as error:
         raise CapacityAdmissionConflict(
             'Elected version paid launch authority is malformed.') from error
-    workspace = service.get('workspace')
     resource_scope = service.get('resource_scope')
     if (not isinstance(resource_scope, str) or not resource_scope or
             resource_scope != service_hash):
@@ -4086,9 +4163,7 @@ def _canonical_prepared_paid_launch_specs(
     }
     for spec in specs:
         if ((spec.service_name, spec.service_hash, spec.service_lifecycle_epoch,
-             spec.service_version) != expected or
-                not isinstance(workspace, str) or not workspace or
-                spec.workspace != workspace or
+             spec.service_version) != expected or spec.workspace != workspace or
                 spec.accelerator not in accounting_cards or
                 spec.gpu_units_per_node != accounting_cards[spec.accelerator] or
                 spec.num_nodes != backend_num_nodes):
@@ -4106,12 +4181,22 @@ def _canonical_prepared_paid_launch_specs(
                 decoded_override)
             catalog_entry = (None if location is None else
                              catalog_by_location.get(location))
-            expected_pool_key = (None if location is None else
-                                 serve_paid_capacity.pool_key(
-                                     location,
-                                     workspace=spec.workspace,
-                                     num_nodes=spec.num_nodes,
-                                     aws_account_id=spec.provider_account))
+            if catalog_entry is None:
+                canonical_override = None
+            else:
+                canonical_override = catalog_entry.location.to_dict()
+                canonical_override['cloud'] = str(
+                    catalog_entry.location.cloud).casefold()
+            canonical_stored_override = (
+                None if canonical_override is None else
+                spot_placer.encode_resources_override(canonical_override))
+            expected_pool_key = (
+                None if location is None else serve_paid_capacity.pool_key(
+                    location,
+                    workspace=spec.workspace,
+                    num_nodes=spec.num_nodes,
+                    aws_account_id=spec.provider_account,
+                    gcp_project_id=(gcp_project_id_by_location.get(location))))
             expected_frontier_key = (None if location is None else
                                      serve_paid_capacity.frontier_key(location))
             expected_cluster_name = serve_utils.generate_replica_cluster_name(
@@ -4143,6 +4228,9 @@ def _canonical_prepared_paid_launch_specs(
                 catalog_entry.location.use_spot is not True or
                 str(catalog_entry.location.cloud).casefold() not in ('aws',
                                                                      'gcp') or
+            (str(catalog_entry.location.cloud).casefold() == 'gcp' and
+             spec.provider_project_id != gcp_project_id_by_location.get(
+                 catalog_entry.location)) or
                 not math.isfinite(catalog_entry.hourly_cost) or
                 catalog_entry.hourly_cost <= 0 or
                 not math.isfinite(catalog_entry.normalized_hourly_cost) or
@@ -4151,9 +4239,47 @@ def _canonical_prepared_paid_launch_specs(
                 expected_pool_key != spec.pool_key or
                 expected_frontier_key != spec.frontier_key or
                 worker.get('resources_override') != stored_override or
+                stored_override != canonical_stored_override or
                 not isinstance(replica_port, str) or not replica_port):
             raise CapacityAdmissionConflict(
                 'Prepared paid launch disagrees with the elected catalog.')
+        assert catalog_entry is not None
+        runtime_override = catalog_entry.location.to_dict()
+        try:
+            launch_fence = ordinary_launch_binding.build_paid_launch_fence(
+                service_name=service_name,
+                service_hash=service_hash,
+                service_version=service_version,
+                replica_id=spec.replica_id,
+                replica_record_id=spec.replica_record_id,
+                service_lifecycle_epoch=service_lifecycle_epoch,
+                binding_epoch=service['ordinary_launch_binding_epoch'],
+                controller_incarnation=service['controller_incarnation'],
+                controller_owner_epoch=service['controller_owner_epoch'],
+                controller_pid=service['controller_pid'],
+                controller_ip=service['controller_ip'])
+            expected_prepared_request = (
+                paid_launch_request.prepare_paid_launch_request(
+                    yaml_content=locked_version.launch_yaml_content,
+                    authoritative_service_spec=launch_spec,
+                    frozen_controller_config=frozen_controller_config,
+                    resources_override=runtime_override,
+                    replica_id=spec.replica_id,
+                    cluster_name=spec.cluster_name_seed,
+                    workspace=workspace,
+                    service_name=service_name,
+                    launch_fence=launch_fence,
+                    runtime=launch_runtime,
+                    task_template=launch_task))
+        except Exception as error:  # pylint: disable=broad-except
+            raise CapacityAdmissionConflict(
+                'Prepared paid executable cannot be rebuilt from its locked '
+                'service version.') from error
+        if (spec.prepared_launch_request
+                != expected_prepared_request.submitted_bytes):
+            raise CapacityAdmissionConflict(
+                'Prepared paid executable disagrees with its locked service '
+                'version and exact resources.')
         balancing_tier = catalog_tier_by_location.get(catalog_entry.location)
         try:
             expected_shape = serve_paid_capacity.PhysicalBackendShape(
@@ -4191,6 +4317,96 @@ def _canonical_prepared_paid_launch_specs(
         identities.add(spec.replica_id)
         record_ids.add(spec.replica_record_id)
     return specs, replica_port
+
+
+def _prepare_paid_launch_preflight(
+    engine: sqlalchemy.engine.Engine,
+    value: Sequence[serve_paid_capacity.PaidLaunchSpec],
+    *,
+    service_name: str,
+    service_hash: str,
+    service_lifecycle_epoch: int,
+    service_version: int,
+    expected_controller_incarnation: uuid.UUID,
+    expected_controller_owner_epoch: int,
+    accounting_cards: Mapping[str, int],
+    backend_num_nodes: int,
+) -> _PreparedPaidLaunchPreflight:
+    """Validate paid request bytes before taking correctness locks.
+
+    This advisory read cannot authorize a launch.  The correctness transaction
+    compares the complete service binding authority and immutable version facts
+    against its locked rows before using the validated bytes.
+    """
+    launch_runtime = paid_launch_request.capture_replica_launch_runtime()
+    with engine.connect() as connection:
+        service_row = connection.execute(
+            sqlalchemy.select(_SERVICES).where(
+                _SERVICES.c.name == service_name)).mappings().one_or_none()
+        if (service_row is None or service_row['hash'] != service_hash or
+                service_row['lifecycle_epoch'] != service_lifecycle_epoch or
+                service_row['current_version'] != service_version or
+                service_row['controller_incarnation']
+                != expected_controller_incarnation or
+                service_row['controller_owner_epoch']
+                != expected_controller_owner_epoch):
+            raise CapacityAdmissionConflict(
+                'Service changed before paid launch preflight.')
+        service = dict(service_row)
+        fill_config = _reserved_fill_service_config_in_connection(
+            connection, service, lock_version=False)
+    locked_version = fill_config.paid_launch_version
+    if locked_version is None:
+        raise CapacityAdmissionConflict(
+            'Elected version has no immutable paid launch authority.')
+    try:
+        binding_authority = (
+            ordinary_launch_binding._authority_from_service(  # pylint: disable=protected-access
+                service,
+                controller_pid=service.get('controller_pid'),
+                controller_ip=service.get('controller_ip'),
+                controller_incarnation=expected_controller_incarnation,
+                controller_owner_epoch=expected_controller_owner_epoch,
+                capable=(service.get('ordinary_launch_binding_capable')
+                         is True)))
+    except (TypeError, ValueError,
+            ordinary_launch_binding.OrdinaryLaunchBindingConflict) as error:
+        raise CapacityAdmissionConflict(
+            'Paid launch binding authority is malformed.') from error
+    if not binding_authority.generic_launches_required:
+        raise CapacityAdmissionConflict(
+            'Prepared paid launch requires generic request authority.')
+    specs, replica_port = _canonical_prepared_paid_launch_specs(
+        value,
+        service=service,
+        service_name=service_name,
+        service_hash=service_hash,
+        service_lifecycle_epoch=service_lifecycle_epoch,
+        service_version=service_version,
+        accounting_cards=accounting_cards,
+        backend_num_nodes=backend_num_nodes,
+        locked_version=locked_version,
+        launch_runtime=launch_runtime)
+    assert replica_port is not None
+    try:
+        paid_wave_admission.validate_prepared_specs(specs, binding_authority)
+    except (ordinary_launch_binding.OrdinaryLaunchBindingUnavailable,
+            ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+            ValueError) as error:
+        raise CapacityAdmissionConflict(
+            'Prepared paid executable admission was rejected: '
+            f'{error}') from error
+    resource_scope = service.get('resource_scope')
+    if not isinstance(resource_scope, str) or not resource_scope:
+        raise CapacityAdmissionConflict(
+            'Paid launch requires the current incarnation resource scope.')
+    return _PreparedPaidLaunchPreflight(
+        specs=specs,
+        replica_port=replica_port,
+        binding_authority=binding_authority,
+        resource_scope=resource_scope,
+        version_authority_sha256=(
+            _paid_launch_version_authority_sha256(locked_version)))
 
 
 def _resolve_locked_policy_history(
@@ -5263,15 +5479,64 @@ class CapacityAdmissionRepository:
         request_pins_table = request_postgres_schema.REQUEST_RETENTION_PINS
         history_writer = (
             serve_history.record_autoscaler_snapshot_in_connection)
+        # The transaction helpers below intentionally retain their canonical
+        # module-level APIs.  Resolve every lazy module they may enter before
+        # opening the correctness transaction so cold import order cannot
+        # lengthen locks or introduce import-time I/O.
+        serve_state.lock_zero_cost_protocol_for_bound_launch_observation  # pylint: disable=pointless-statement
+        reserved_fill_allocation.ReservedFillAllocationRepository  # pylint: disable=pointless-statement
+        reserved_fill_planner.FillCapacityUnit  # pylint: disable=pointless-statement
+        zero_cost_actuation.replica_capacity_for_unit  # pylint: disable=pointless-statement
+        ordinary_launch_binding.ControllerBindingAuthority  # pylint: disable=pointless-statement
+        ordinary_launch_binding.system_oom_recovery.has_v3_system_oom_recovery_context  # pylint: disable=pointless-statement
+        serve_state.replica_managers.ReplicaInfo  # pylint: disable=pointless-statement
+        serve_paid_capacity.replica_info_lib.ReplicaInfo  # pylint: disable=pointless-statement
+        service_spec.SkyServiceSpec  # pylint: disable=pointless-statement
+        kubernetes_identity.validate_worker_placement_projections  # pylint: disable=pointless-statement
+        request_postgres.non_pool_launch_binding_fleet_capable  # pylint: disable=pointless-statement
+        # Resolve request modules and run the complete canonical reconstruction
+        # before correctness locks.  The advisory source facts are compared to
+        # the locked service/version rows below; they never authorize a launch.
+        paid_launch_request.prepare_paid_launch_request  # pylint: disable=pointless-statement
+        bind_paid_executables = (
+            paid_wave_admission.bind_accepted_in_transaction)
+        record_paid_executable_commit = paid_wave_admission.record_fused_commit
+        has_prepared_paid_launches = bool(prepared_paid_launch_specs)
+        request_runtime = (
+            request_postgres.prepare_non_pool_launch_binding_runtime()
+            if has_prepared_paid_launches else None)
+        paid_preflight = (_prepare_paid_launch_preflight(
+            self.engine,
+            prepared_paid_launch_specs,
+            service_name=service_name,
+            service_hash=service_hash,
+            service_lifecycle_epoch=service_lifecycle_epoch,
+            service_version=service_version,
+            expected_controller_incarnation=(expected_controller_incarnation),
+            expected_controller_owner_epoch=(expected_controller_owner_epoch),
+            accounting_cards=canonical_cards,
+            backend_num_nodes=backend_num_nodes)
+                          if has_prepared_paid_launches else None)
         with _capacity_admission_transaction(
                 self.engine, history_writer) as (connection, project_history):
-            if sequenced_reserved_fill:
+            if sequenced_reserved_fill or has_prepared_paid_launches:
                 # Allocation writers use this protocol mutex before any
                 # service-local row.  Taking it even for a possible zero plan
                 # lets current demand choose bound-positive versus unbound-zero
                 # without changing lock order after the snapshot is known.
                 serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
                     connection)
+            if has_prepared_paid_launches:
+                lifecycle = connection.execute(
+                    sqlalchemy.select(
+                        serve_state_schema.service_lifecycle_fences_table
+                    ).where(serve_state_schema.service_lifecycle_fences_table.
+                            c.name == service_name).with_for_update()).mappings(
+                            ).one_or_none()
+                if (lifecycle is None or
+                        lifecycle['epoch'] != service_lifecycle_epoch):
+                    raise CapacityAdmissionConflict(
+                        'Service lifecycle changed before paid admission.')
             service = connection.execute(
                 sqlalchemy.select(_SERVICES).where(
                     _SERVICES.c.name ==
@@ -5307,17 +5572,53 @@ class CapacityAdmissionRepository:
                     backend_num_nodes != 1):
                 raise CapacityAdmissionConflict(
                     'Logical capacity requires one-node paid backends.')
-            prepared_specs, paid_replica_port = (
-                _canonical_prepared_paid_launch_specs(
-                    prepared_paid_launch_specs,
-                    service=service,
-                    service_name=service_name,
-                    service_hash=service_hash,
-                    service_lifecycle_epoch=service_lifecycle_epoch,
-                    service_version=service_version,
-                    accounting_cards=canonical_cards,
-                    backend_num_nodes=backend_num_nodes,
-                    locked_version=fill_config.paid_launch_version))
+            prepared_specs = (() if paid_preflight is None else
+                              paid_preflight.specs)
+            paid_replica_port = (None if paid_preflight is None else
+                                 paid_preflight.replica_port)
+            binding_authority = None
+            if prepared_specs:
+                try:
+                    binding_authority = (
+                        ordinary_launch_binding._authority_from_service(  # pylint: disable=protected-access
+                            service,
+                            controller_pid=service.get('controller_pid'),
+                            controller_ip=service.get('controller_ip'),
+                            controller_incarnation=(
+                                expected_controller_incarnation),
+                            controller_owner_epoch=(
+                                expected_controller_owner_epoch),
+                            capable=(
+                                service.get('ordinary_launch_binding_capable')
+                                is True)))
+                except (
+                        TypeError,
+                        ValueError,
+                        ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                ) as error:
+                    raise CapacityAdmissionConflict(
+                        'Locked paid launch binding authority is malformed.'
+                    ) from error
+                assert paid_preflight is not None
+                try:
+                    locked_version_sha256 = (
+                        _paid_launch_version_authority_sha256(
+                            fill_config.paid_launch_version))
+                except (TypeError, ValueError) as error:
+                    raise CapacityAdmissionConflict(
+                        'Locked paid launch version authority is malformed.'
+                    ) from error
+                if (binding_authority != paid_preflight.binding_authority or
+                        service.get('resource_scope')
+                        != paid_preflight.resource_scope or
+                        locked_version_sha256
+                        != paid_preflight.version_authority_sha256):
+                    raise CapacityAdmissionConflict(
+                        'Paid launch source changed after canonical preflight.')
+                if not request_postgres.non_pool_launch_binding_fleet_capable(
+                        connection=connection):
+                    raise CapacityAdmissionConflict(
+                        'The generic request fleet is not yet capable.')
 
             locked_generation = connection.execute(
                 sqlalchemy.select(_DEMAND_GENERATIONS.c.generation).where(
@@ -5933,6 +6234,28 @@ class CapacityAdmissionRepository:
                 service_lifecycle_epoch=service_lifecycle_epoch,
                 service_version=service_version,
                 accepted=accepted)
+            if accepted:
+                assert binding_authority is not None
+                assert request_runtime is not None
+                try:
+                    paid_launch_bindings = (bind_paid_executables(
+                        connection,
+                        service=service,
+                        authority=binding_authority,
+                        runtime=request_runtime,
+                        accepted=tuple(
+                            zip(paid_launch_receipt.members,
+                                (item.launch_spec for item in accepted),
+                                strict=True))))
+                except (ordinary_launch_binding.
+                        OrdinaryLaunchBindingUnavailable,
+                        ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                        ValueError) as error:
+                    raise CapacityAdmissionConflict(
+                        'Paid executable request graph was rejected: '
+                        f'{error}') from error
+            else:
+                paid_launch_bindings = ()
             _postwrite_revalidate_current_admission(
                 connection,
                 service_before=service,
@@ -5945,7 +6268,8 @@ class CapacityAdmissionRepository:
                 planner_snapshot=planner_snapshot,
                 candidate=candidate,
                 allocation_map=validated_allocation,
-                paid_launch_receipt=paid_launch_receipt)
+                paid_launch_receipt=paid_launch_receipt,
+                paid_launch_bindings=paid_launch_bindings)
             witness_semantic_sha256 = candidate.demand_witness_sha256
             assert witness_semantic_sha256 is not None
             try:
@@ -5960,6 +6284,15 @@ class CapacityAdmissionRepository:
                     'Failed to prepare committed capacity plan '
                     '%s/%s for autoscaler history: %s', service_name,
                     committed.authority.generation, error)
+        for binding in committed.paid_launch_bindings:
+            try:
+                request_lib.materialize_request_log_path_for_id(
+                    binding.request_id)
+            except OSError as error:
+                logger.warning(
+                    'Failed to materialize fused paid launch log '
+                    '%s: %s', binding.request_id, error)
+        record_paid_executable_commit(len(committed.paid_launch_bindings))
         _notify_fill_demand_witness(service_name, witness_semantic_sha256)
         return committed
 

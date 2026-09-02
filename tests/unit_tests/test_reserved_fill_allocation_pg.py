@@ -199,9 +199,10 @@ def allocation_engine(observation_engine, monkeypatch):  # noqa: F811
                         observation_engine)
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         observation_engine)
-    monkeypatch.setattr(request_postgres,
-                        '_resolved_request_backend_capability', lambda:
-                        ('postgres', 'postgres', True))
+    monkeypatch.setattr(
+        request_postgres, '_resolved_request_backend_capability', lambda:
+        (request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE,
+         request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE, True))
     with observation_engine.begin() as connection:
         connection.execute(global_user_state_schema.user_table.insert().values(
             id=_CREATOR_ID, name=_CREATOR_NAME, created_at=int(time.time())))

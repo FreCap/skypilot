@@ -4,7 +4,6 @@
 import datetime
 import importlib
 import json
-import pathlib
 
 from alembic import command as alembic_command
 from alembic import script as alembic_script
@@ -21,6 +20,8 @@ pytestmark = pytest.mark.xdist_group(
 
 _MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.060_cancelled_gcp_paid_cleanup')
+_LATEST_MIGRATION = importlib.import_module(
+    'sky.schemas.db.serve_state.067_project_scoped_gcp_paid_admission')
 
 
 def _function_definition(engine: sqlalchemy.engine.Engine,
@@ -43,24 +44,6 @@ def _constraint_definition(engine: sqlalchemy.engine.Engine) -> str:
 
 def _compact(expression: str) -> str:
     return ''.join(expression.split())
-
-
-def _newest_projection_check() -> str:
-    """Return the projection CHECK text of the newest owning migration.
-
-    Later migrations rewrite ``serve047_provider_absence_projection_ck`` in
-    place, so the live table metadata tracks the newest owner rather than this
-    migration's own text.
-    """
-    newest = None
-    for path in sorted(pathlib.Path(_MIGRATION.__file__).parent.glob('0*.py')):
-        module = importlib.import_module(
-            f'{_MIGRATION.__name__.rsplit(".", 1)[0]}.{path.stem}')
-        if getattr(module, '_PROJECTION_CONSTRAINT',
-                   None) == _MIGRATION._PROJECTION_CONSTRAINT:
-            newest = module._PROJECTION_CHECK
-    assert newest is not None
-    return newest
 
 
 def _pool_key(*,
@@ -140,15 +123,15 @@ def test_serve060_lineage_and_runtime_metadata() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['066']
+    assert scripts.get_heads() == ['067']
     assert scripts.get_revision('060').down_revision == '059'
-    assert migration_utils.SERVE_VERSION == '066'
+    assert migration_utils.SERVE_VERSION == '067'
     constraint = next(
         item for item in
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
         if item.name == _MIGRATION._PROJECTION_CONSTRAINT)
     assert _compact(str(constraint.sqltext)) == _compact(
-        _newest_projection_check())
+        _LATEST_MIGRATION._PROJECTION_CHECK)
 
 
 def test_serve060_migrates_the_live_059_constraint_and_guards(

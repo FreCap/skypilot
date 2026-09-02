@@ -1,12 +1,14 @@
 """PostgreSQL contracts for ordered SkyServe capacity admission."""
 # pylint: disable=not-callable,protected-access,redefined-outer-name,unused-import
 
+import contextlib
 import copy
 import dataclasses
 import datetime
 import hashlib
 import json
 import math
+import pathlib
 import pickle
 import threading
 import time
@@ -25,6 +27,8 @@ from test_kueue_lane_lineage_pg import _receipt as _kueue_receipt
 from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
+from sky import global_user_state_schema
+from sky.client import sdk
 from sky.serve import autoscaler_compatibility
 from sky.serve import autoscalers
 from sky.serve import capacity_admission
@@ -40,6 +44,7 @@ from sky.serve import kueue_lane_lineage_schema
 from sky.serve import lb_ha
 from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
+from sky.serve import paid_launch_request
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
@@ -53,11 +58,13 @@ from sky.serve import spot_placer
 from sky.serve import zero_cost_actuation
 from sky.serve import zero_cost_actuation_schema
 from sky.server.requests import non_pool_launch as non_pool_launch_request
+from sky.server.requests import paid_wave_admission
 from sky.server.requests import payloads as request_payloads
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import requests as request_lib
 from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
+from sky.utils import yaml_utils
 from sky.utils.db import migration_utils
 
 pytestmark = pytest.mark.xdist_group(
@@ -127,9 +134,13 @@ def _paid_controller_config_snapshot() -> tuple[bytes, str, str]:
 
 
 def _paid_location(accelerator_count: int = 1) -> spot_placer.Location:
+    instance_type = {
+        1: 'g2-standard-4',
+        8: 'g2-standard-96',
+    }[accelerator_count]
     location = make_location('us-central1', {'L4': accelerator_count},
                              cloud_name='GCP',
-                             instance_type=f'test-l4-{accelerator_count}')
+                             instance_type=instance_type)
     # The catalog must preserve a region-independent image key as Python None;
     # JSON's string "null" would change the exact launch authority.
     location.image_id = {None: 'skypilot:test-regionless-image'}
@@ -141,6 +152,32 @@ def _paid_placement_catalog(num_nodes: int = 1) -> dict:
     entries.sort(key=lambda item: item[0].sort_key())
     return spot_placer.PlacementCatalog(tuple(entries),
                                         num_nodes=num_nodes).to_dict()
+
+
+def _install_paid_wave_catalog(
+    engine: sqlalchemy.engine.Engine,
+    *,
+    pool_count: int,
+) -> tuple[int, ...]:
+    """Install equal-cost exact L4 pools and return canonical global ranks."""
+    entries = []
+    for index in range(pool_count):
+        location = make_location(f'us-test-{index:02d}', {'L4': 1},
+                                 cloud_name='GCP',
+                                 instance_type='g2-standard-4')
+        location.image_id = {None: 'skypilot:test-regionless-image'}
+        entries.append((location, 0.10))
+    entries.sort(key=lambda item: item[0].sort_key())
+    catalog = spot_placer.PlacementCatalog(tuple(entries), num_nodes=1)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    placement_catalog=catalog.to_dict()))
+    contract = _capacity_service_spec(False, max_replicas=pool_count *
+                                      30).placement_contract
+    return tuple(entry.rank for entry in catalog.ranked_entries(contract))
 
 
 def _current_owner_kwargs(
@@ -172,6 +209,128 @@ def _paid_write_counts(
             connection.execute(
                 sqlalchemy.select(sqlalchemy.func.count()).select_from(
                     table)).scalar_one() for table in tables)
+
+
+def _fused_paid_graph_counts(
+    engine: sqlalchemy.engine.Engine,
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    tables = (
+        capacity_admission_schema.serve_capacity_plans_table,
+        capacity_admission_schema.serve_capacity_plan_heads_table,
+        serve_state_schema.paid_capacity_claims_table,
+        serve_state_schema.replicas_table,
+        associations,
+        request_postgres.REQUESTS,
+        request_postgres.QUEUE,
+        request_postgres.REQUEST_RETENTION_PINS,
+    )
+    with engine.connect() as connection:
+        counts = tuple(
+            connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    table)).scalar_one() for table in tables)
+        pointers = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.
+                    ordinary_launch_association_id.is_not(None))).scalar_one()
+    return (*counts, pointers)
+
+
+@contextlib.contextmanager
+def _observe_engine_transactions(engine: sqlalchemy.engine.Engine):
+    """Record one paid call's advisory and correctness transactions."""
+    state = {
+        'active': 0,
+        'maximum': 0,
+        'checkouts': 0,
+        'commits': 0,
+        'rollbacks': 0,
+    }
+
+    def _checkout(_dbapi_connection, _connection_record, _connection_proxy):
+        state['active'] += 1
+        state['checkouts'] += 1
+        state['maximum'] = max(state['maximum'], state['active'])
+
+    def _checkin(_dbapi_connection, _connection_record):
+        state['active'] -= 1
+
+    def _commit(_connection):
+        state['commits'] += 1
+
+    def _rollback(_connection):
+        state['rollbacks'] += 1
+
+    sqlalchemy.event.listen(engine, 'checkout', _checkout)
+    sqlalchemy.event.listen(engine, 'checkin', _checkin)
+    sqlalchemy.event.listen(engine, 'commit', _commit)
+    sqlalchemy.event.listen(engine, 'rollback', _rollback)
+    try:
+        yield state
+    finally:
+        sqlalchemy.event.remove(engine, 'checkout', _checkout)
+        sqlalchemy.event.remove(engine, 'checkin', _checkin)
+        sqlalchemy.event.remove(engine, 'commit', _commit)
+        sqlalchemy.event.remove(engine, 'rollback', _rollback)
+        assert state['active'] == 0
+        assert state['maximum'] == 1
+        assert state['checkouts'] == 2
+
+
+def _fused_paid_graph_identities(
+    engine: sqlalchemy.engine.Engine,) -> list[sqlalchemy.engine.RowMapping]:
+    """Read every exact edge in the committed paid execution graph."""
+    replicas = serve_state_schema.replicas_table
+    claims = serve_state_schema.paid_capacity_claims_table
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    requests = request_postgres.REQUESTS
+    queue = request_postgres.QUEUE
+    pins = request_postgres.REQUEST_RETENTION_PINS
+    graph = (replicas.join(
+        claims,
+        sqlalchemy.and_(
+            claims.c.service_name == replicas.c.service_name,
+            claims.c.replica_id == replicas.c.replica_id)).join(
+                associations, associations.c.association_id ==
+                replicas.c.ordinary_launch_association_id).join(
+                    requests,
+                    sqlalchemy.and_(
+                        requests.c.request_id == associations.c.request_id,
+                        requests.c.ordinary_launch_association_id ==
+                        associations.c.association_id)).join(
+                            queue,
+                            queue.c.request_id == requests.c.request_id).join(
+                                pins,
+                                sqlalchemy.and_(
+                                    pins.c.request_id == requests.c.request_id,
+                                    pins.c.pin_id ==
+                                    associations.c.association_id)))
+    statement = sqlalchemy.select(
+        replicas.c.replica_id,
+        replicas.c.replica_state,
+        replicas.c.ordinary_launch_association_id.label('replica_pointer'),
+        claims.c.capacity_plan_generation,
+        claims.c.capacity_plan_sha256,
+        associations.c.association_id,
+        associations.c.replica_record_id,
+        associations.c.request_id,
+        associations.c.launch_generation,
+        associations.c.profile_kind,
+        requests.c.ordinary_launch_association_id.label('request_pointer'),
+        requests.c.status.label('request_status'),
+        requests.c.handler_name,
+        requests.c.profile_kind.label('request_profile_kind'),
+        queue.c.delivery_state,
+        queue.c.claim_generation,
+        pins.c.pin_kind,
+        pins.c.pin_id,
+        pins.c.request_id.label('pin_request_id'),
+    ).select_from(graph).where(replicas.c.service_name == 'svc').order_by(
+        replicas.c.replica_id)
+    with engine.connect() as connection:
+        return list(connection.execute(statement).mappings())
 
 
 def _insert_old_incarnation_tombstone(
@@ -602,9 +761,50 @@ def capacity_database(empty_postgres, monkeypatch):
     request_postgres._initialize_schema(empty_postgres)
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
+    monkeypatch.setattr(request_postgres._DB_MANAGER, '_engine', empty_postgres)
+    monkeypatch.setattr(
+        request_postgres, '_resolved_request_backend_capability', lambda:
+        (request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE,
+         request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE, True))
     incarnation = uuid.uuid4()
     controller_config = _paid_controller_config_snapshot()
     with empty_postgres.begin() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        connection.execute(
+            sqlalchemy.insert(global_user_state_schema.user_table).values(
+                id='tenant-a', name='Tenant A', created_at=int(time.time())))
+        capability_values = {
+            'version': 'capacity-admission-test',
+            'started_at': now,
+            'heartbeat_at': now,
+            'ready': True,
+            'health_detail': {},
+            'supported_payload_versions': {},
+            'non_pool_launch_binding_capable': True,
+            'non_pool_launch_binding_protocol_version':
+                (ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+            'non_pool_launch_capability_profile_set_digest': (
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            'non_pool_launch_capability_cohort_epoch':
+                (ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+            'non_pool_launch_receipt_protocol_version':
+                (ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION),
+        }
+        connection.execute(sqlalchemy.insert(
+            request_postgres.SERVER_INSTANCES), [{
+                **capability_values,
+                'instance_id': uuid.uuid4(),
+                'role': 'api',
+                'supported_handlers': [],
+            }, {
+                **capability_values,
+                'instance_id': uuid.uuid4(),
+                'role': 'executor',
+                'supported_handlers':
+                    [non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME],
+            }])
         connection.execute(
             sqlalchemy.insert(
                 serve_state_schema.service_lifecycle_fences_table).values(
@@ -624,6 +824,8 @@ def capacity_database(empty_postgres, monkeypatch):
                 controller_owner_epoch=4,
                 controller_pid=123,
                 controller_ip='10.0.0.5',
+                owner_user_id='tenant-a',
+                owner_user_name='Tenant A',
                 ordinary_launch_binding_capable=True,
                 ordinary_launch_binding_mode='bound',
                 ordinary_launch_binding_epoch=2))
@@ -1099,7 +1301,7 @@ def _paid_pool_key(accelerator: str = 'L4',
                    num_nodes: int = 1) -> str:
     return json.dumps(
         {
-            'version': 1,
+            'version': 2,
             'workspace': 'workspace-a',
             'cloud': 'gcp',
             'region': 'us-central1',
@@ -1108,6 +1310,9 @@ def _paid_pool_key(accelerator: str = 'L4',
             'accelerators': [[accelerator.casefold(), accelerator_count]],
             'use_spot': True,
             'num_nodes': num_nodes,
+            'provider_identity': {
+                'gcp_project_id': 'test-project',
+            },
         },
         sort_keys=True,
         separators=(',', ':'))
@@ -1139,6 +1344,10 @@ def _paid_launch_spec(
             where(
                 serve_state_schema.version_specs_table.c.service_name == 'svc',
                 serve_state_schema.version_specs_table.c.version == 1)).one()
+        service_row = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).mappings().one()
     serialized_spec = version_row[0]
     controller_config = version_row[3]
     if isinstance(serialized_spec, memoryview):
@@ -1156,9 +1365,13 @@ def _paid_launch_spec(
             persisted_spec.placement_contract)
         if entry.location.accelerators == {accelerator: accelerator_count})
     if pool_rank is None:
+        expected_instance_type = {
+            1: 'g2-standard-4',
+            8: 'g2-standard-96',
+        }[accelerator_count]
         catalog_entry = next(
             entry for entry in matching_entries
-            if entry.location.instance_type == f'test-l4-{accelerator_count}')
+            if entry.location.instance_type == expected_instance_type)
     else:
         catalog_entry = next(
             entry for entry in matching_entries if entry.rank == pool_rank)
@@ -1167,7 +1380,14 @@ def _paid_launch_spec(
     assert instance_type is not None
     exact_pool_key = paid_capacity.pool_key(location,
                                             workspace='workspace-a',
-                                            num_nodes=num_nodes)
+                                            num_nodes=num_nodes,
+                                            gcp_project_id='test-project')
+    runtime_override = location.to_dict()
+    canonical_storage_override = dict(runtime_override)
+    canonical_storage_override['cloud'] = str(location.cloud).casefold()
+    storage_override = spot_placer.encode_resources_override(
+        canonical_storage_override)
+    decoded_override = spot_placer.decode_resources_override(storage_override)
     info = replica_managers.ReplicaInfo(
         replica_id=replica_id,
         cluster_name=(serve_utils.generate_replica_cluster_name(
@@ -1176,14 +1396,14 @@ def _paid_launch_spec(
         is_spot=True,
         location=location,
         version=1,
-        resources_override=location.to_dict(),
+        resources_override=decoded_override,
         planned_capacity=planned_capacity)
     info.replica_record_id = str(uuid.uuid4())
     info.created_at = None
     info.is_zero_cost = False
     info.paid_capacity_pool_key = exact_pool_key
-    frozen_override = paid_capacity.freeze_paid_launch_payload(
-        info.to_storage_dict()['resources_override'])
+    assert info.to_storage_dict()['resources_override'] == storage_override
+    frozen_override = paid_capacity.freeze_paid_launch_payload(storage_override)
     worker = paid_capacity.freeze_paid_launch_payload({
         'schema_version': 1,
         'launch_yaml_content': version_row[1],
@@ -1196,6 +1416,36 @@ def _paid_launch_spec(
             (serve_utils.generate_versioned_config_yaml_file_name(
                 'svc', 1, 'svc-hash')),
     })
+    task_template = serve_utils.load_task_with_service_spec(
+        version_row[1], persisted_spec)
+    launch_fence = ordinary_launch_binding.build_paid_launch_fence(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_version=1,
+        replica_id=replica_id,
+        replica_record_id=info.replica_record_id,
+        service_lifecycle_epoch=service_row['lifecycle_epoch'],
+        binding_epoch=service_row['ordinary_launch_binding_epoch'],
+        controller_incarnation=service_row['controller_incarnation'],
+        controller_owner_epoch=service_row['controller_owner_epoch'],
+        controller_pid=service_row['controller_pid'],
+        controller_ip=service_row['controller_ip'])
+    frozen_controller_config = (
+        serve_utils.parse_and_validate_version_controller_config(
+            controller_config, 'workspace-a',
+            'test paid launch controller config'))
+    prepared_request = paid_launch_request.prepare_paid_launch_request(
+        yaml_content=version_row[1],
+        authoritative_service_spec=persisted_spec,
+        frozen_controller_config=frozen_controller_config,
+        resources_override=runtime_override,
+        replica_id=replica_id,
+        cluster_name=info.cluster_name,
+        workspace='workspace-a',
+        service_name='svc',
+        launch_fence=launch_fence,
+        runtime=paid_launch_request.capture_replica_launch_runtime(),
+        task_template=task_template)
     card = accelerator.casefold()
     occurrence = ordinal if pool_occurrence is None else pool_occurrence
     return paid_capacity.PaidLaunchSpec(
@@ -1208,7 +1458,9 @@ def _paid_launch_spec(
         replica_record_id=info.replica_record_id,
         cluster_name_seed=info.cluster_name,
         worker_construction=worker,
+        prepared_launch_request=prepared_request.submitted_bytes,
         provider_account=None,
+        provider_project_id='test-project',
         cloud=str(location.cloud).casefold(),
         workspace='workspace-a',
         region=location.region,
@@ -1232,6 +1484,27 @@ def _paid_launch_spec(
                 controller_config=controller_config,
                 controller_config_digest=version_row[4],
                 controller_config_snapshot_id=version_row[5])))
+
+
+def _paid_wave_specs(
+    engine: sqlalchemy.engine.Engine,
+    ranks: tuple[int, ...],
+    *,
+    members_per_pool: int,
+    first_replica_id: int,
+) -> tuple[paid_capacity.PaidLaunchSpec, ...]:
+    """Build the canonical rank-major production candidate traversal."""
+    specs = []
+    for rank in ranks:
+        for occurrence in range(members_per_pool):
+            ordinal = len(specs)
+            specs.append(
+                _paid_launch_spec(engine,
+                                  ordinal,
+                                  first_replica_id + ordinal,
+                                  pool_rank=rank,
+                                  pool_occurrence=occurrence))
+    return tuple(specs)
 
 
 def _validate_prepared_paid_specs(
@@ -1285,7 +1558,8 @@ def _validate_prepared_paid_specs(
         service_version=1,
         accounting_cards=accounting_cards,
         backend_num_nodes=1,
-        locked_version=locked_version)
+        locked_version=locked_version,
+        launch_runtime=paid_launch_request.capture_replica_launch_runtime())
 
 
 def _replica_values(replica_id: int,
@@ -2965,6 +3239,10 @@ def test_manager_prepared_heterogeneous_wave_cannot_starve_a100_at_global_cap(
         service_hash='svc-hash',
         requested_frontier_keys={('l4',), ('a100',)},
         max_live_paid_gpu_units=4,
+        gcp_project_id_by_location={
+            l4: 'test-project',
+            a100: 'test-project',
+        },
         prospective_backend_claims_by_accelerator={
             'l4': 4,
             'a100': 4,
@@ -3032,18 +3310,17 @@ def test_manager_prepared_heterogeneous_wave_cannot_starve_a100_at_global_cap(
 
 def test_current_planner_scans_third_pool_until_accepted_target(
         capacity_database, monkeypatch):
-    """A probe-limited middle pool cannot truncate a 100-member wave."""
+    """A probe-limited middle pool cannot truncate a bounded candidate wave."""
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine,
                            incarnation,
                            reserved_fill_enabled=False,
-                           max_replicas=120)
-    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 60)
+                           max_replicas=100)
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 40)
     locations = []
     for index, cost in enumerate((0.10, 0.20, 0.30)):
         location = _paid_location(1)
         location.region = f'us-central1-{chr(ord("a") + index)}'
-        location.instance_type = f'test-l4-pool-{index}'
         locations.append((location, cost))
     catalog = spot_placer.PlacementCatalog(tuple(locations),
                                            num_nodes=1).to_dict()
@@ -3056,8 +3333,8 @@ def test_current_planner_scans_third_pool_until_accepted_target(
 
     specs = []
     replica_id = 1000
-    for pool_rank in range(3):
-        for occurrence in range(60):
+    for pool_rank, candidate_count in enumerate((40, 20, 40)):
+        for occurrence in range(candidate_count):
             specs.append(
                 _paid_launch_spec(engine,
                                   len(specs),
@@ -3065,7 +3342,8 @@ def test_current_planner_scans_third_pool_until_accepted_target(
                                   pool_rank=pool_rank,
                                   pool_occurrence=occurrence))
             replica_id += 1
-    middle_pool_key = specs[60].pool_key
+    assert len(specs) == (paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS)
+    middle_pool_key = specs[40].pool_key
     now = time.time()
     with engine.begin() as connection:
         connection.execute(
@@ -3089,16 +3367,16 @@ def test_current_planner_scans_third_pool_until_accepted_target(
                                        backend_num_nodes=1,
                                        sequenced_reserved_fill=False,
                                        planner=lambda snapshot, supply:
-                                       _current_decision(snapshot, supply, 100),
+                                       _current_decision(snapshot, supply, 80),
                                        prepared_paid_launch_specs=tuple(specs))
 
     accepted = committed.paid_launch_receipt.members
-    assert len(accepted) == 100
+    assert len(accepted) == 80
     accepted_pool_keys = [member.pool_key for member in accepted]
-    assert accepted_pool_keys.count(specs[0].pool_key) == 60
+    assert accepted_pool_keys.count(specs[0].pool_key) == 40
     assert accepted_pool_keys.count(middle_pool_key) == 1
-    assert accepted_pool_keys.count(specs[120].pool_key) == 39
-    assert committed.candidate.paid_launch_target.as_dict() == {'l4': 100}
+    assert accepted_pool_keys.count(specs[60].pool_key) == 39
+    assert committed.candidate.paid_launch_target.as_dict() == {'l4': 80}
 
 
 def test_current_planner_accepts_equal_cost_pool_interleaving(
@@ -3150,6 +3428,790 @@ def test_current_planner_accepts_equal_cost_pool_interleaving(
     ] == [spec.pool_key for spec in specs]
 
 
+@pytest.mark.parametrize('history_fails', [False, True])
+def test_paid_atomic_commit_precedes_best_effort_history_transaction(
+        capacity_database, monkeypatch, history_fails):
+    """History commits or rolls back only after the exact graph is durable."""
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    ranks = _install_paid_wave_catalog(engine, pool_count=1)
+    spec = _paid_launch_spec(engine, 0, 1900, pool_rank=ranks[0])
+    provider_io = mock.Mock(
+        side_effect=AssertionError('admission must not submit provider work'))
+    monkeypatch.setattr(sdk, 'submit_prepared_non_pool_launch_request',
+                        provider_io)
+    correctness_committed = False
+
+    def _record_commit(_connection):
+        nonlocal correctness_committed
+        correctness_committed = True
+
+    def _materialize_log(_request_id):
+        assert correctness_committed
+
+    materialize_log = mock.Mock(side_effect=_materialize_log)
+    monkeypatch.setattr(request_lib, 'materialize_request_log_path_for_id',
+                        materialize_log)
+    history_error = RuntimeError('injected best-effort history failure')
+    history_writer = mock.Mock(
+        side_effect=history_error if history_fails else None, return_value=1)
+    monkeypatch.setattr(capacity_admission.serve_history,
+                        'record_autoscaler_snapshot_in_connection',
+                        history_writer)
+    call_kwargs = {
+        **_current_owner_kwargs(engine),
+        'service_name': 'svc',
+        'service_hash': 'svc-hash',
+        'service_lifecycle_epoch': 3,
+        'service_version': 1,
+        'accounting_cards': {
+            'l4': 1
+        },
+        'backend_num_nodes': 1,
+        'sequenced_reserved_fill': False,
+        'planner': lambda snapshot, supply: _current_decision(
+            snapshot, supply, 1),
+        'prepared_paid_launch_specs': (spec,),
+    }
+
+    sqlalchemy.event.listen(engine, 'commit', _record_commit)
+    try:
+        with _observe_engine_transactions(engine) as outcomes:
+            committed = capacity_admission.CapacityAdmissionRepository(
+                engine).plan_and_admit_current(**call_kwargs)
+    finally:
+        sqlalchemy.event.remove(engine, 'commit', _record_commit)
+
+    assert outcomes['commits'] == (1 if history_fails else 2)
+    assert outcomes['rollbacks'] == (2 if history_fails else 1)
+    assert len(committed.paid_launch_bindings) == 1
+    assert _fused_paid_graph_counts(engine) == (1,) * 9
+    history_writer.assert_called_once()
+    provider_io.assert_not_called()
+    materialize_log.assert_called_once()
+
+
+def test_paid_canonical_preflight_and_log_io_are_outside_correctness_locks(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    ranks = _install_paid_wave_catalog(engine, pool_count=1)
+    spec = _paid_launch_spec(engine, 0, 1950, pool_rank=ranks[0])
+    correctness_open = False
+    real_transaction = capacity_admission._capacity_admission_transaction
+    real_canonical = capacity_admission._canonical_prepared_paid_launch_specs
+    real_runtime_preflight = (capacity_admission.request_postgres.
+                              prepare_non_pool_launch_binding_runtime)
+
+    @contextlib.contextmanager
+    def _guarded_transaction(*args, **kwargs):
+        nonlocal correctness_open
+        with real_transaction(*args, **kwargs) as transaction:
+            correctness_open = True
+            try:
+                yield transaction
+            finally:
+                correctness_open = False
+
+    def _guarded_canonical(*args, **kwargs):
+        assert not correctness_open
+        return real_canonical(*args, **kwargs)
+
+    def _guarded_secho(*_args, **_kwargs):
+        assert not correctness_open
+
+    def _guarded_runtime_preflight():
+        assert not correctness_open
+        return real_runtime_preflight()
+
+    def _materialize_log(_request_id):
+        assert not correctness_open
+        assert _fused_paid_graph_counts(engine) == (1,) * 9
+
+    monkeypatch.setattr(capacity_admission, '_capacity_admission_transaction',
+                        _guarded_transaction)
+    monkeypatch.setattr(capacity_admission,
+                        '_canonical_prepared_paid_launch_specs',
+                        _guarded_canonical)
+    monkeypatch.setattr(sdk.click, 'secho', _guarded_secho)
+    runtime_preflight = mock.Mock(side_effect=_guarded_runtime_preflight)
+    monkeypatch.setattr(capacity_admission.request_postgres,
+                        'prepare_non_pool_launch_binding_runtime',
+                        runtime_preflight)
+    materialize_log = mock.Mock(side_effect=_materialize_log)
+    monkeypatch.setattr(request_lib, 'materialize_request_log_path_for_id',
+                        materialize_log)
+
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
+                                       service_hash='svc-hash',
+                                       service_lifecycle_epoch=3,
+                                       service_version=1,
+                                       accounting_cards={'l4': 1},
+                                       backend_num_nodes=1,
+                                       sequenced_reserved_fill=False,
+                                       planner=lambda snapshot, supply:
+                                       _current_decision(snapshot, supply, 1),
+                                       prepared_paid_launch_specs=(spec,))
+
+    assert len(committed.paid_launch_bindings) == 1
+    runtime_preflight.assert_called_once_with()
+    materialize_log.assert_called_once()
+
+
+@pytest.mark.parametrize('mutation', ('binding_epoch', 'launch_yaml'))
+def test_paid_preflight_rejects_locked_source_race(capacity_database,
+                                                   monkeypatch, mutation):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    ranks = _install_paid_wave_catalog(engine, pool_count=1)
+    spec = _paid_launch_spec(engine, 0, 1960, pool_rank=ranks[0])
+    real_transaction = capacity_admission._capacity_admission_transaction
+
+    @contextlib.contextmanager
+    def _mutating_transaction(*args, **kwargs):
+        with engine.begin() as connection:
+            if mutation == 'binding_epoch':
+                connection.execute(
+                    sqlalchemy.update(serve_state_schema.services_table).where(
+                        serve_state_schema.services_table.c.name ==
+                        'svc').values(ordinary_launch_binding_mode='legacy',
+                                      ordinary_launch_binding_epoch=(
+                                          serve_state_schema.services_table.c.
+                                          ordinary_launch_binding_epoch + 1)))
+            else:
+                connection.execute(
+                    sqlalchemy.update(
+                        serve_state_schema.version_specs_table).where(
+                            serve_state_schema.version_specs_table.c.
+                            service_name == 'svc',
+                            serve_state_schema.version_specs_table.c.version ==
+                            1).values(yaml_content=_PAID_LAUNCH_YAML +
+                                      '# changed\n'))
+        with real_transaction(*args, **kwargs) as transaction:
+            yield transaction
+
+    monkeypatch.setattr(capacity_admission, '_capacity_admission_transaction',
+                        _mutating_transaction)
+    planner = mock.Mock(
+        side_effect=AssertionError('stale preflight must not reach planner'))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='source changed after canonical preflight'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner,
+                                           prepared_paid_launch_specs=(spec,))
+
+    planner.assert_not_called()
+    assert _fused_paid_graph_counts(engine) == (0,) * 9
+
+
+def test_paid_maximum_atomic_wave_survives_lost_ack_and_is_claimable(
+        capacity_database, monkeypatch):
+    """A post-COMMIT error leaves one maximum bounded wave claimable."""
+    engine, incarnation, route_receipt = capacity_database
+    member_count = paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS
+    members_per_pool = 25
+    pool_count = member_count // members_per_pool
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           max_replicas=member_count)
+    ranks = _install_paid_wave_catalog(engine, pool_count=pool_count)
+    assert len(ranks) == pool_count
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: members_per_pool)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 480)
+    monkeypatch.setattr(paid_capacity, 'service_limit', lambda: member_count)
+    monkeypatch.setattr(paid_capacity, 'max_service_limit',
+                        lambda **_: member_count)
+    monkeypatch.setattr(paid_capacity, 'exploration_frontier',
+                        lambda: pool_count)
+    monkeypatch.setattr(paid_capacity, 'max_exploration_frontier',
+                        lambda: pool_count)
+    monkeypatch.setattr(paid_capacity, 'max_service_exploration_frontier',
+                        lambda **_: pool_count)
+    specs = _paid_wave_specs(engine,
+                             ranks,
+                             members_per_pool=members_per_pool,
+                             first_replica_id=2000)
+    assert len(specs) == member_count
+
+    provider_io = mock.Mock(
+        side_effect=AssertionError('admission must not submit provider work'))
+    monkeypatch.setattr(sdk, 'submit_prepared_non_pool_launch_request',
+                        provider_io)
+    touch = mock.Mock()
+    monkeypatch.setattr(pathlib.Path, 'touch', touch)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    call_kwargs = {
+        **_current_owner_kwargs(engine),
+        'service_name': 'svc',
+        'service_hash': 'svc-hash',
+        'service_lifecycle_epoch': 3,
+        'service_version': 1,
+        'accounting_cards': {
+            'l4': 1
+        },
+        'backend_num_nodes': 1,
+        'sequenced_reserved_fill': False,
+        'planner': lambda snapshot, supply: _current_decision(
+            snapshot, supply, member_count),
+        'prepared_paid_launch_specs': specs,
+    }
+
+    real_bind = paid_wave_admission.bind_accepted_in_transaction
+
+    def _reject_after_complete_bind(*args, **kwargs):
+        real_bind(*args, **kwargs)
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'injected after final fused member')
+
+    monkeypatch.setattr(paid_wave_admission, 'bind_accepted_in_transaction',
+                        _reject_after_complete_bind)
+    with _observe_engine_transactions(engine) as rolled_back:
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='injected after final fused member'):
+            repository.plan_and_admit_current(**call_kwargs)
+    assert rolled_back['commits'] == 0
+    assert rolled_back['rollbacks'] == 2
+    assert _fused_paid_graph_counts(engine) == (0,) * 9
+    provider_io.assert_not_called()
+    touch.assert_not_called()
+
+    monkeypatch.setattr(paid_wave_admission, 'bind_accepted_in_transaction',
+                        real_bind)
+    # Renew the durable demand generation after constructing and rolling back
+    # the maximum bounded graph.  This keeps the second attempt focused on
+    # the post-COMMIT acknowledgement boundary instead of the demand TTL.
+    demand_state.ingest_report(
+        'svc', 'svc-hash', _demand_report(time.time(),
+                                          route_receipt,
+                                          sequence=2))
+    real_do_commit = engine.dialect.do_commit
+    commit_calls = 0
+
+    class _LostCommitAcknowledgement(RuntimeError):
+        pass
+
+    def _commit_then_lose_ack(dbapi_connection):
+        nonlocal commit_calls
+        real_do_commit(dbapi_connection)
+        commit_calls += 1
+        if commit_calls == 1:
+            raise _LostCommitAcknowledgement(
+                'injected connection loss after PostgreSQL COMMIT')
+
+    with monkeypatch.context() as lost_ack:
+        lost_ack.setattr(engine.dialect, 'do_commit', _commit_then_lose_ack)
+        with _observe_engine_transactions(engine) as ambiguous:
+            with pytest.raises(_LostCommitAcknowledgement,
+                               match='after PostgreSQL COMMIT'):
+                repository.plan_and_admit_current(**call_kwargs)
+    assert ambiguous['commits'] == 1
+    assert commit_calls == 1
+    assert _fused_paid_graph_counts(engine) == (1, 1, member_count,
+                                                member_count, member_count,
+                                                member_count, member_count,
+                                                member_count, member_count)
+    graph = _fused_paid_graph_identities(engine)
+    assert len(graph) == member_count
+    assert [row['replica_id'] for row in graph
+           ] == [spec.replica_id for spec in specs]
+    assert [str(row['replica_record_id']) for row in graph
+           ] == [spec.replica_record_id for spec in specs]
+    plan_generations = {row['capacity_plan_generation'] for row in graph}
+    plan_digests = {row['capacity_plan_sha256'] for row in graph}
+    assert len(plan_generations) == len(plan_digests) == 1
+    for row in graph:
+        assert str(row['replica_pointer']) == str(row['association_id'])
+        assert str(row['request_pointer']) == str(row['association_id'])
+        assert str(row['pin_id']) == str(row['association_id'])
+        assert row['pin_request_id'] == row['request_id']
+        assert row['profile_kind'] == 'ORDINARY_PAID'
+        assert row['request_profile_kind'] == 'ORDINARY_PAID'
+        assert row['request_status'] == 'PENDING'
+        assert row['handler_name'] == (
+            non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME)
+        assert row['delivery_state'] == 'queued'
+        assert row['claim_generation'] is None
+        assert row['pin_kind'] == (
+            request_postgres.ORDINARY_LAUNCH_RETENTION_PIN_KIND)
+    # The exception was raised by the real DBAPI commit boundary before the
+    # repository could project history or run any local postcommit adoption.
+    touch.assert_not_called()
+    provider_io.assert_not_called()
+
+    # No manager materialization ran.  The generic executor claims the first
+    # durable provider mutation directly from PostgreSQL.
+    queue = request_postgres.PostgresQueueBackend(
+        'long',
+        supported_handler_names=frozenset(
+            {non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME}))
+    candidate = queue.peek_provider_mutation()
+    assert candidate is not None
+    assert candidate.request_id == graph[0]['request_id']
+    claimed = queue.claim_provider_mutation(candidate)
+    assert claimed is not None
+    assert claimed.request_id == graph[0]['request_id']
+    assert claimed.execution_generation == graph[0]['launch_generation']
+
+
+def test_paid_420_target_converges_across_fresh_bounded_atomic_waves(
+        capacity_database, monkeypatch):
+    """A stale successor stops, then fresh 100/100/100/100/20 reach 420."""
+    engine, incarnation, route_receipt = capacity_database
+    service_target = 420
+    members_per_full_pool = 25
+    pool_count = 17
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           max_replicas=service_target)
+    ranks = _install_paid_wave_catalog(engine, pool_count=pool_count)
+    assert len(ranks) == pool_count
+    monkeypatch.setattr(paid_capacity, 'base_limit',
+                        lambda: members_per_full_pool)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 480)
+    monkeypatch.setattr(paid_capacity, 'service_limit', lambda: service_target)
+    monkeypatch.setattr(paid_capacity, 'max_service_limit',
+                        lambda **_: service_target)
+    monkeypatch.setattr(paid_capacity, 'exploration_frontier',
+                        lambda: pool_count)
+    monkeypatch.setattr(paid_capacity, 'max_exploration_frontier',
+                        lambda: pool_count)
+    monkeypatch.setattr(paid_capacity, 'max_service_exploration_frontier',
+                        lambda **_: pool_count)
+    provider_io = mock.Mock(
+        side_effect=AssertionError('admission must not submit provider work'))
+    monkeypatch.setattr(sdk, 'submit_prepared_non_pool_launch_request',
+                        provider_io)
+    touch = mock.Mock()
+    monkeypatch.setattr(pathlib.Path, 'touch', touch)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+
+    def _commit(specs):
+        return repository.plan_and_admit_current(
+            **_current_owner_kwargs(engine),
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 1},
+            backend_num_nodes=1,
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot, supply, service_target),
+            prepared_paid_launch_specs=specs)
+
+    first_specs = _paid_wave_specs(engine,
+                                   ranks[:4],
+                                   members_per_pool=members_per_full_pool,
+                                   first_replica_id=6000)
+    assert len(first_specs) == (
+        paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS)
+    demand_state.ingest_report(
+        'svc', 'svc-hash', _demand_report(time.time(),
+                                          route_receipt,
+                                          sequence=2))
+    first = _commit(first_specs)
+    assert first.candidate.paid_launch_target.as_dict() == {
+        'l4': service_target
+    }
+    assert len(first.paid_launch_receipt.members) == 100
+    assert controller.SkyServeController._paid_launch_receipt_underfills_plan(
+        first.candidate, first.paid_launch_receipt)
+
+    second_specs = _paid_wave_specs(engine,
+                                    ranks[4:8],
+                                    members_per_pool=members_per_full_pool,
+                                    first_replica_id=6100)
+    assert len(second_specs) == 100
+    reports = demand_state_schema.serve_lb_demand_reports_table
+    with engine.begin() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        connection.execute(
+            sqlalchemy.update(reports).where(
+                reports.c.service_name == 'svc',
+                reports.c.service_hash == 'svc-hash').values(
+                    valid_until=now - datetime.timedelta(seconds=1)))
+    stale_planner = mock.Mock(
+        side_effect=lambda snapshot, supply: _current_decision(
+            snapshot, supply, service_target))
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict):
+        repository.plan_and_admit_current(
+            **_current_owner_kwargs(engine),
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 1},
+            backend_num_nodes=1,
+            sequenced_reserved_fill=False,
+            planner=stale_planner,
+            prepared_paid_launch_specs=second_specs)
+    stale_planner.assert_not_called()
+    assert _fused_paid_graph_counts(engine) == (1, 1, 100, 100, 100, 100, 100,
+                                                100, 100)
+
+    demand_state.ingest_report(
+        'svc', 'svc-hash', _demand_report(time.time(),
+                                          route_receipt,
+                                          sequence=3))
+    second = _commit(second_specs)
+    assert second.candidate.paid_launch_target.as_dict() == {'l4': 320}
+    assert len(second.paid_launch_receipt.members) == 100
+    assert controller.SkyServeController._paid_launch_receipt_underfills_plan(
+        second.candidate, second.paid_launch_receipt)
+
+    third_specs = _paid_wave_specs(engine,
+                                   ranks[8:12],
+                                   members_per_pool=members_per_full_pool,
+                                   first_replica_id=6200)
+    assert len(third_specs) == 100
+    demand_state.ingest_report(
+        'svc', 'svc-hash', _demand_report(time.time(),
+                                          route_receipt,
+                                          sequence=4))
+    third = _commit(third_specs)
+    assert third.candidate.paid_launch_target.as_dict() == {'l4': 220}
+    assert len(third.paid_launch_receipt.members) == 100
+    assert controller.SkyServeController._paid_launch_receipt_underfills_plan(
+        third.candidate, third.paid_launch_receipt)
+
+    fourth_specs = _paid_wave_specs(engine,
+                                    ranks[12:16],
+                                    members_per_pool=members_per_full_pool,
+                                    first_replica_id=6300)
+    assert len(fourth_specs) == 100
+    demand_state.ingest_report(
+        'svc', 'svc-hash', _demand_report(time.time(),
+                                          route_receipt,
+                                          sequence=5))
+    fourth = _commit(fourth_specs)
+    assert fourth.candidate.paid_launch_target.as_dict() == {'l4': 120}
+    assert len(fourth.paid_launch_receipt.members) == 100
+    assert controller.SkyServeController._paid_launch_receipt_underfills_plan(
+        fourth.candidate, fourth.paid_launch_receipt)
+
+    final_specs = _paid_wave_specs(engine,
+                                   ranks[16:],
+                                   members_per_pool=20,
+                                   first_replica_id=6400)
+    assert len(final_specs) == 20
+    demand_state.ingest_report(
+        'svc', 'svc-hash', _demand_report(time.time(),
+                                          route_receipt,
+                                          sequence=6))
+    final = _commit(final_specs)
+    assert final.candidate.paid_launch_target.as_dict() == {'l4': 20}
+    assert len(final.paid_launch_receipt.members) == 20
+    assert not controller.SkyServeController._paid_launch_receipt_underfills_plan(
+        final.candidate, final.paid_launch_receipt)
+    assert [
+        commit.authority.generation
+        for commit in (first, second, third, fourth, final)
+    ] == [1, 2, 3, 4, 5]
+    assert _fused_paid_graph_counts(engine) == (5, 1, 420, 420, 420, 420, 420,
+                                                420, 420)
+    graph = _fused_paid_graph_identities(engine)
+    assert len(graph) == service_target
+    assert len({row['replica_id'] for row in graph}) == service_target
+    assert len({str(row['replica_record_id']) for row in graph
+               }) == service_target
+    assert touch.call_count == service_target
+    provider_io.assert_not_called()
+
+
+def test_fresh_gcp_v2_wave_rejects_old_executor_cohort_before_commit(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.SERVER_INSTANCES).where(
+                request_postgres.SERVER_INSTANCES.c.role ==
+                'executor').values(non_pool_launch_capability_cohort_epoch=(
+                    ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH -
+                    1)))
+    provider_io = mock.Mock(
+        side_effect=AssertionError('old fleet must not receive provider work'))
+    monkeypatch.setattr(sdk, 'submit_prepared_non_pool_launch_request',
+                        provider_io)
+    monkeypatch.setattr(
+        pathlib.Path, 'touch',
+        mock.Mock(side_effect=AssertionError('rejected graph has no log')))
+    planner = mock.Mock(
+        side_effect=AssertionError('old fleet must be rejected pre-planner'))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='generic request fleet is not yet capable'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner,
+                                           prepared_paid_launch_specs=(
+                                               _paid_launch_spec(
+                                                   engine, 0, 2500),))
+    assert _fused_paid_graph_counts(engine) == (0,) * 9
+    provider_io.assert_not_called()
+    planner.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    'mutation',
+    ('run', 'backend', 'retry_until_up', 'no_setup', 'fast', 'optimize_target',
+     'cloud', 'region', 'zone', 'instance_type', 'image_id', 'use_spot',
+     'accelerator', 'task_env', 'request_env', 'security_group'))
+def test_paid_canonical_body_tamper_rejects_zero_graph_before_io(
+        capacity_database, monkeypatch, mutation):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    spec = _paid_launch_spec(engine, 0, 2600)
+    body = sdk.PreparedLaunchRequest(spec.prepared_launch_request).body
+    configs = yaml_utils.read_yaml_all_str(body.task,
+                                           reject_duplicate_keys=True)
+    task_config = next(config for config in reversed(configs)
+                       if isinstance(config, dict) and 'resources' in config)
+    resources = task_config['resources']
+    if isinstance(resources, list):
+        assert len(resources) == 1
+        resources = resources[0]
+    assert isinstance(resources, dict)
+    if mutation == 'run':
+        task_config['run'] = 'echo adversarial'
+    elif mutation == 'backend':
+        body.backend = 'adversarial-backend'
+    elif mutation == 'retry_until_up':
+        body.retry_until_up = True
+    elif mutation == 'no_setup':
+        body.no_setup = True
+    elif mutation == 'fast':
+        body.fast = True
+    elif mutation == 'optimize_target':
+        body.optimize_target = type(body.optimize_target).TIME
+    elif mutation == 'cloud':
+        resources['cloud'] = 'aws'
+    elif mutation == 'region':
+        resources['region'] = 'us-adversarial1'
+    elif mutation == 'zone':
+        resources['zone'] = 'us-adversarial1-a'
+    elif mutation == 'instance_type':
+        resources['instance_type'] = 'g2-adversarial-4'
+    elif mutation == 'image_id':
+        resources['image_id'] = 'skypilot:gpu-ubuntu-2204'
+    elif mutation == 'use_spot':
+        resources['use_spot'] = False
+    elif mutation == 'accelerator':
+        resources['accelerators'] = {'A100': 1}
+    elif mutation == 'task_env':
+        task_config.setdefault('envs', {})['ADVERSARIAL'] = '1'
+    elif mutation == 'request_env':
+        body.env_vars['ADVERSARIAL'] = '1'
+    else:
+        overrides = resources.setdefault('cluster_config_overrides', {})
+        overrides.setdefault('aws',
+                             {})['security_group_name'] = 'adversarial-sg'
+    body.task = yaml_utils.dump_yaml_str(configs)
+    tampered = dataclasses.replace(
+        spec, prepared_launch_request=sdk._canonical_launch_body_bytes(body))
+    provider_io = mock.Mock(
+        side_effect=AssertionError('invalid executable reached provider I/O'))
+    monkeypatch.setattr(sdk, 'submit_prepared_non_pool_launch_request',
+                        provider_io)
+    monkeypatch.setattr(
+        pathlib.Path, 'touch',
+        mock.Mock(side_effect=AssertionError('invalid graph touched a log')))
+    planner = mock.Mock(
+        side_effect=AssertionError('invalid body reached planner'))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='executable disagrees'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner,
+                                           prepared_paid_launch_specs=(
+                                               tampered,))
+    assert _fused_paid_graph_counts(engine) == (0,) * 9
+    provider_io.assert_not_called()
+    planner.assert_not_called()
+
+
+@pytest.mark.parametrize('extra_field',
+                         ('cpus', 'memory', 'cluster_config_overrides'))
+def test_paid_extra_resources_override_rejects_zero_graph_before_io(
+        capacity_database, monkeypatch, extra_field):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    spec = _paid_launch_spec(engine, 0, 2610)
+    stored_override = paid_capacity.thaw_paid_launch_payload(
+        spec.resources_override)
+    if extra_field == 'cpus':
+        stored_override['cpus'] = '8+'
+    elif extra_field == 'memory':
+        stored_override['memory'] = '32+'
+    else:
+        stored_override['cluster_config_overrides'] = {
+            'gcp': {
+                'managed_instance_group': 'adversarial-mig'
+            }
+        }
+    worker = paid_capacity.thaw_paid_launch_payload(spec.worker_construction)
+    worker['resources_override'] = stored_override
+    tampered = dataclasses.replace(
+        spec,
+        resources_override=paid_capacity.freeze_paid_launch_payload(
+            stored_override),
+        worker_construction=paid_capacity.freeze_paid_launch_payload(worker))
+    provider_io = mock.Mock(
+        side_effect=AssertionError('extra override reached provider I/O'))
+    monkeypatch.setattr(sdk, 'submit_prepared_non_pool_launch_request',
+                        provider_io)
+    monkeypatch.setattr(
+        pathlib.Path, 'touch',
+        mock.Mock(side_effect=AssertionError('invalid graph touched a log')))
+    planner = mock.Mock(
+        side_effect=AssertionError('extra override reached planner'))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='disagrees with the elected catalog'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner,
+                                           prepared_paid_launch_specs=(
+                                               tampered,))
+    assert _fused_paid_graph_counts(engine) == (0,) * 9
+    provider_io.assert_not_called()
+    planner.assert_not_called()
+
+
+def test_paid_tls_rotation_rejects_zero_graph_before_io(capacity_database,
+                                                        monkeypatch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    monkeypatch.setenv(constants.REPLICA_TLS_MODE_ENV_VAR,
+                       constants.REPLICA_TLS_MODE_OFF)
+    monkeypatch.delenv(constants.REPLICA_TLS_CERT_ENV_VAR, raising=False)
+    monkeypatch.delenv(constants.REPLICA_TLS_KEY_SECRET_ENV_VAR, raising=False)
+    spec = _paid_launch_spec(engine, 0, 2620)
+    monkeypatch.setenv(constants.REPLICA_TLS_MODE_ENV_VAR,
+                       constants.REPLICA_TLS_MODE_PINNED)
+    monkeypatch.setenv(constants.REPLICA_TLS_CERT_ENV_VAR, 'rotated-cert')
+    monkeypatch.setenv(constants.REPLICA_TLS_KEY_SECRET_ENV_VAR, 'rotated-key')
+    provider_io = mock.Mock(
+        side_effect=AssertionError('rotated TLS reached provider I/O'))
+    monkeypatch.setattr(sdk, 'submit_prepared_non_pool_launch_request',
+                        provider_io)
+    monkeypatch.setattr(
+        pathlib.Path, 'touch',
+        mock.Mock(side_effect=AssertionError('invalid graph touched a log')))
+    planner = mock.Mock(
+        side_effect=AssertionError('rotated TLS reached planner'))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='executable disagrees'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner,
+                                           prepared_paid_launch_specs=(spec,))
+    assert _fused_paid_graph_counts(engine) == (0,) * 9
+    provider_io.assert_not_called()
+    planner.assert_not_called()
+
+
+def test_paid_locked_gcp_project_change_rejects_pre_planner_and_pre_io(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    spec = _paid_launch_spec(engine, 0, 2630)
+    changed_config = serve_utils.sanitize_ha_recovery_config_bytes(
+        _PAID_CONTROLLER_CONFIG_SOURCE.replace(b'test-project',
+                                               b'different-project'))
+    changed_digest = hashlib.sha256(changed_config).hexdigest()
+    changed_snapshot_id = 'd' * 64
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    controller_config=changed_config,
+                    controller_config_digest=changed_digest,
+                    controller_config_snapshot_id=changed_snapshot_id))
+    old_authority = spec.catalog_evidence.version_authority
+    changed_authority = paid_capacity.PaidLaunchVersionAuthority(
+        service_spec=old_authority.service_spec,
+        service_spec_sha256=old_authority.service_spec_sha256,
+        controller_config=changed_config,
+        controller_config_digest=changed_digest,
+        controller_config_snapshot_id=changed_snapshot_id)
+    spec = dataclasses.replace(spec,
+                               catalog_evidence=dataclasses.replace(
+                                   spec.catalog_evidence,
+                                   version_authority=changed_authority))
+    provider_io = mock.Mock(
+        side_effect=AssertionError('wrong project reached provider I/O'))
+    monkeypatch.setattr(sdk, 'submit_prepared_non_pool_launch_request',
+                        provider_io)
+    monkeypatch.setattr(
+        pathlib.Path, 'touch',
+        mock.Mock(side_effect=AssertionError('invalid graph touched a log')))
+    planner = mock.Mock(
+        side_effect=AssertionError('wrong project reached planner'))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='disagrees with the elected catalog'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner,
+                                           prepared_paid_launch_specs=(spec,))
+    assert _fused_paid_graph_counts(engine) == (0,) * 9
+    provider_io.assert_not_called()
+    planner.assert_not_called()
+
+
 def test_paid_launch_validator_rejects_inexact_interleaved_rank_occurrence(
         capacity_database, monkeypatch):
     engine, incarnation, _ = capacity_database
@@ -3159,7 +4221,6 @@ def test_paid_launch_validator_rejects_inexact_interleaved_rank_occurrence(
     for index in range(2):
         location = _paid_location(1)
         location.region = f'us-central1-{chr(ord("a") + index)}'
-        location.instance_type = f'test-l4-occurrence-pool-{index}'
         locations.append((location, 0.424))
     catalog = spot_placer.PlacementCatalog(tuple(locations), num_nodes=1)
     with engine.begin() as connection:
@@ -3199,10 +4260,9 @@ def _install_equal_cost_shape_catalog(
     """Install two same-cost Spot tiers and return their global ranks."""
     l4 = _paid_location(1)
     l4.region = 'us-central1-a'
-    l4.instance_type = 'test-l4-exact-tier'
     a100 = make_location('us-central1-b', {'A100': 1},
                          cloud_name='GCP',
-                         instance_type='test-a100-exact-tier')
+                         instance_type='a2-highgpu-1g')
     a100.image_id = {None: 'skypilot:test-regionless-image'}
     entries = [(l4, 0.424), (a100, 0.424)]
     entries.sort(key=lambda item: item[0].sort_key())
@@ -4406,6 +5466,32 @@ def test_current_planner_accepts_semantic_noop_replica_rewrite(
 
     planner.assert_called_once()
     assert not authority.remaining_launch_capacity()
+
+
+def test_current_planner_rejects_paid_wave_above_atomic_bound(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    planner = mock.Mock()
+    oversized_wave = tuple(
+        mock.Mock()
+        for _ in range(paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS +
+                       1))
+
+    with pytest.raises(ValueError, match='atomic wave is too large'):
+        (capacity_admission.CapacityAdmissionRepository(engine).
+         plan_and_admit_current(**_current_owner_kwargs(engine),
+                                service_name='svc',
+                                service_hash='svc-hash',
+                                service_lifecycle_epoch=3,
+                                service_version=1,
+                                accounting_cards={'l4': 1},
+                                backend_num_nodes=1,
+                                sequenced_reserved_fill=False,
+                                planner=planner,
+                                prepared_paid_launch_specs=oversized_wave))
+
+    planner.assert_not_called()
 
 
 def test_current_planner_serializes_concurrent_report_writer(capacity_database):

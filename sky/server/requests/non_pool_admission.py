@@ -132,10 +132,12 @@ def build(
 def bind_in_transaction(
     connection: sqlalchemy.engine.Connection,
     admission: BuiltAdmission,
+    *,
+    runtime: request_postgres.NonPoolLaunchBindingRuntime,
 ) -> ordinary_launch_binding.BindingAdmission:
     """Bind the canonical suffix on a caller-owned PostgreSQL transaction."""
     result = request_postgres.bind_and_enqueue_non_pool_launch_in_transaction(
-        connection, admission.request, admission.identity)
+        connection, admission.request, admission.identity, runtime=runtime)
     validate_result(result, admission)
     return result
 

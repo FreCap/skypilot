@@ -78,7 +78,8 @@ def _provider_free_launch_spec() -> paid_capacity.PaidLaunchSpec:
     location.instance_type = 'g2-standard-4'
     pool_key = paid_capacity.pool_key(location,
                                       workspace='default',
-                                      num_nodes=1)
+                                      num_nodes=1,
+                                      gcp_project_id='test-project')
     info = _pending_info(7, location)
     info.cluster_name = serve_utils.generate_replica_cluster_name(
         'svc', 7, 'hash')
@@ -113,7 +114,9 @@ def _provider_free_launch_spec() -> paid_capacity.PaidLaunchSpec:
         replica_record_id=info.replica_record_id,
         cluster_name_seed=info.cluster_name,
         worker_construction=worker,
+        prepared_launch_request=b'prepared-launch',
         provider_account=None,
+        provider_project_id='test-project',
         cloud='gcp',
         workspace='default',
         region='us-central1',
@@ -163,6 +166,39 @@ def test_paid_launch_spec_is_deeply_immutable_and_provider_free():
         field.name for field in dataclasses.fields(spec))
     assert all(not isinstance(value, (dict, list, set))
                for value in vars(spec).values())
+
+
+def test_active_paid_spot_accelerator_shapes_excludes_unspendable_catalog():
+    l4 = make_location('l4', {'L4': 1}, cloud_name='GCP')
+    l4.instance_type = 'g2-standard-4'
+    a100 = make_location('a100', {'A100': 8}, cloud_name='AWS')
+    a100.instance_type = 'p4d.24xlarge'
+    reserved = make_location('reserved', {'H200': 8},
+                             use_spot=False,
+                             cloud_name='Kubernetes')
+    reserved.instance_type = 'reserved-h200'
+    on_demand = make_location('on-demand', {'L4': 1},
+                              use_spot=False,
+                              cloud_name='GCP')
+    on_demand.instance_type = 'g2-standard-4'
+    unpriced = make_location('unpriced', {'A100-80GB': 1}, cloud_name='GCP')
+    unpriced.instance_type = 'a2-ultragpu-1g'
+    cooling_down = make_location('cooling-down', {'L4': 1}, cloud_name='AWS')
+    cooling_down.instance_type = 'g6.xlarge'
+    placer = make_placer({
+        l4: 0.4,
+        a100: 3.0,
+        reserved: 0.0,
+        on_demand: 1.0,
+        unpriced: float('inf'),
+        cooling_down: 0.5,
+    })
+    placer.location2status[cooling_down] = spot_placer.LocationStatus.PREEMPTED
+
+    assert paid_capacity.active_paid_spot_accelerator_shapes(placer) == {
+        ('l4', 1),
+        ('a100', 8),
+    }
 
 
 def test_paid_launch_spec_decodes_only_inside_persistence_adapter():
@@ -293,6 +329,24 @@ def _paid_launch_authority(
             sorted((card.casefold(), width) for card, width in widths.items())))
 
 
+def _gcp_project_ids(locations,) -> dict[spot_placer.Location, str]:
+    """Return the exact locked-project input used by authoritative tests."""
+    return {
+        location: 'test-project'
+        for location in locations
+        if str(location.cloud).casefold() == 'gcp'
+    }
+
+
+def _authoritative_pool_key(location: spot_placer.Location, *,
+                            num_nodes: int) -> str:
+    project_ids = _gcp_project_ids((location,))
+    return paid_capacity.pool_key(location,
+                                  workspace='w',
+                                  num_nodes=num_nodes,
+                                  gcp_project_id=project_ids.get(location))
+
+
 def _exploration_budget(locations,
                         *,
                         owned_locations,
@@ -356,6 +410,75 @@ def test_non_aws_pool_key_retains_existing_v1_identity():
     stale_v2 = dict(payload, version=2, provider_identity=None)
     assert paid_capacity.pool_key_payload(
         json.dumps(stale_v2, sort_keys=True, separators=(',', ':'))) is None
+
+
+def test_gcp_pool_v2_freezes_exact_project_identity():
+    location = make_location('us-central1', {'L4': 1}, cloud_name='GCP')
+    location.instance_type = 'g2-standard-4'
+
+    key = paid_capacity.pool_key(location,
+                                 workspace='w1',
+                                 num_nodes=1,
+                                 gcp_project_id='boltz-spot-project')
+    payload = paid_capacity.pool_key_payload(key)
+
+    assert payload is not None
+    assert payload['version'] == 2
+    assert payload['provider_identity'] == {
+        'gcp_project_id': 'boltz-spot-project'
+    }
+    malformed = dict(payload,
+                     provider_identity={'gcp_project_id': 'INVALID_PROJECT'})
+    assert paid_capacity.pool_key_payload(
+        json.dumps(malformed, sort_keys=True, separators=(',', ':'))) is None
+
+
+def test_gcp_project_resolution_omits_only_invalid_locations(
+        monkeypatch, caplog):
+    aws = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    valid_gcp = make_location('us-central1', {'L4': 1}, cloud_name='GCP')
+    invalid_gcp = make_location('us-west1', {'L4': 1}, cloud_name='GCP')
+
+    def _resolve(_config, cloud, keys, *, region, workspace):
+        assert cloud == 'gcp'
+        assert keys == ('project_id',)
+        assert workspace == 'w'
+        return ('valid-project'
+                if region == valid_gcp.region else 'INVALID_PROJECT')
+
+    monkeypatch.setattr(paid_capacity.skypilot_config,
+                        'get_effective_workspace_region_config_from_snapshot',
+                        _resolve)
+
+    with caplog.at_level('WARNING'):
+        projects = paid_capacity.resolve_gcp_project_ids_for_locations(
+            (aws, invalid_gcp, valid_gcp),
+            workspace='w',
+            frozen_controller_config={})
+
+    assert projects == {valid_gcp: 'valid-project'}
+    assert 'Omitting GCP paid candidate' in caplog.text
+    assert invalid_gcp.region in caplog.text
+    assert aws.region not in caplog.text
+
+
+def test_gcp_project_resolution_preserves_global_validation(monkeypatch):
+    location = make_location('us-central1', {'L4': 1}, cloud_name='GCP')
+
+    with pytest.raises(ValueError, match='workspace must be nonempty'):
+        paid_capacity.resolve_gcp_project_ids_for_locations(
+            (location,), workspace='', frozen_controller_config={})
+    with pytest.raises(ValueError, match='must be a mapping'):
+        paid_capacity.resolve_gcp_project_ids_for_locations(
+            (location,), workspace='w', frozen_controller_config=[])
+
+    monkeypatch.setattr(
+        paid_capacity.skypilot_config,
+        'get_effective_workspace_region_config_from_snapshot',
+        mock.Mock(side_effect=ValueError('malformed config snapshot')))
+    with pytest.raises(ValueError, match='malformed config snapshot'):
+        paid_capacity.resolve_gcp_project_ids_for_locations(
+            (location,), workspace='w', frozen_controller_config={})
 
 
 def test_pool_key_normalizes_equivalent_accelerator_counts():
@@ -867,8 +990,9 @@ def test_prospective_budget_is_spot_only_state_aware_and_target_bounded():
         fallback: 0.30,
         on_demand: 0.05,
     })
+    project_ids = _gcp_project_ids((cheap, probe, fallback, on_demand))
     keys = {
-        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        location: _authoritative_pool_key(location, num_nodes=1)
         for location in (cheap, probe, fallback)
     }
     states = {
@@ -898,6 +1022,7 @@ def test_prospective_budget_is_spot_only_state_aware_and_target_bounded():
             service_hash='hash',
             existing_replica_infos=[],
             globally_managed=True,
+            gcp_project_id_by_location=project_ids,
             prospective_backend_claims_by_accelerator={'L4': 120})
 
     assert budget.service_remaining == 120
@@ -925,6 +1050,79 @@ def test_prospective_budget_is_spot_only_state_aware_and_target_bounded():
         allowed_locations={cheap, probe, fallback}) is None
 
 
+def test_authoritative_budget_omits_gcp_without_locked_project_mapping():
+    location = make_location('us-central1-a', {'L4': 1}, cloud_name='GCP')
+    placer = make_placer({location: 0.10})
+    authority = _paid_launch_authority({'l4': 1}, widths={'l4': 1})
+
+    with mock.patch.object(
+            paid_capacity, 'central_authority_available',
+            return_value=True), mock.patch.object(
+                paid_capacity.serve_state,
+                'get_paid_capacity_pool_states',
+                return_value={}) as get_states, mock.patch.object(
+                    paid_capacity.serve_state,
+                    'get_paid_capacity_plan_claimed_units',
+                    return_value={}):
+        budget = paid_capacity.build_launch_budget(
+            placer,
+            workspace='w',
+            service_name='svc',
+            service_hash='hash',
+            existing_replica_infos=[],
+            globally_managed=True,
+            paid_launch_authority=authority)
+
+    assert budget.remaining_by_location == {}
+    assert budget.pool_key_by_location == {}
+    assert budget.plan_bound_cohort is not None
+    assert budget.plan_bound_cohort.targets == ()
+    get_states.assert_called_once_with(
+        [],
+        base_limit=paid_capacity.base_limit(),
+        max_limit=paid_capacity.max_limit(),
+        now=None,
+        success_ttl_seconds=(paid_capacity.success_ttl_seconds()),
+        failure_cooldown_seconds=(paid_capacity.failure_cooldown_seconds()))
+
+
+def test_prospective_budget_keeps_aws_when_gcp_project_mapping_is_missing():
+    aws = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    aws.instance_type = 'g6.xlarge'
+    gcp = make_location('us-central1', {'L4': 1}, cloud_name='GCP')
+    gcp.instance_type = 'g2-standard-4'
+    placer = make_placer({gcp: 0.10, aws: 0.20})
+    aws_key = paid_capacity.pool_key(aws, workspace='w', num_nodes=1)
+
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'get_paid_capacity_pool_states',
+                               return_value={
+                                   aws_key: {
+                                       'remaining': 1,
+                                       'admission_state': 'active',
+                                       'admission_limit': 1,
+                                       'last_success_at': None,
+                                   }
+                               }):
+        budget = paid_capacity.build_launch_budget(
+            placer,
+            workspace='w',
+            service_name='svc',
+            service_hash='hash',
+            existing_replica_infos=[],
+            globally_managed=True,
+            gcp_project_id_by_location={},
+            prospective_backend_claims_by_accelerator={'l4': 1})
+
+    assert budget.remaining_by_location == {aws: 1}
+    assert budget.pool_key_by_location == {aws: aws_key}
+    assert budget.service_remaining == 1
+    assert paid_capacity.pool_key_payload(aws_key)['cloud'] == 'aws'
+
+
 def test_prospective_budget_rejects_committed_authority_and_nonstring_cards():
     location = make_location('us-central1-a', {'L4': 1}, cloud_name='GCP')
     placer = make_placer({location: 0.10})
@@ -950,8 +1148,9 @@ def test_prospective_budget_does_not_spend_global_cap_across_card_alternatives(
     l4 = make_location('us-central1-a', {'L4': 1}, cloud_name='GCP')
     a100 = make_location('us-central1-b', {'A100': 1}, cloud_name='GCP')
     placer = make_placer({l4: 0.10, a100: 0.20})
+    project_ids = _gcp_project_ids((l4, a100))
     keys = {
-        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        location: _authoritative_pool_key(location, num_nodes=1)
         for location in (l4, a100)
     }
     states = {
@@ -977,6 +1176,7 @@ def test_prospective_budget_does_not_spend_global_cap_across_card_alternatives(
             existing_replica_infos=[],
             globally_managed=True,
             max_live_paid_gpu_units=4,
+            gcp_project_id_by_location=project_ids,
             prospective_backend_claims_by_accelerator={
                 'L4': 4,
                 'A100': 4,
@@ -1013,15 +1213,31 @@ def _plan_bound_budget(
                                        widths=widths,
                                        capacity_unit=capacity_unit,
                                        backend_num_nodes=backend_num_nodes)
-    with mock.patch.object(paid_capacity,
-                           'central_authority_available',
-                           return_value=True), mock.patch.object(
-                               paid_capacity.serve_state,
-                               'get_paid_capacity_pool_states',
-                               return_value=states), mock.patch.object(
-                                   paid_capacity.serve_state,
-                                   'get_paid_capacity_plan_claimed_units',
-                                   return_value=claimed or {}):
+    locations = tuple(placer.ranked_active_locations())
+    project_ids = _gcp_project_ids(locations)
+    canonical_states = {}
+    for location in locations:
+        legacy_key = paid_capacity.pool_key(location,
+                                            workspace='w',
+                                            num_nodes=placer.num_nodes)
+        current_key = paid_capacity.pool_key(
+            location,
+            workspace='w',
+            num_nodes=placer.num_nodes,
+            gcp_project_id=project_ids.get(location))
+        if current_key in states:
+            canonical_states[current_key] = states[current_key]
+        elif legacy_key in states:
+            canonical_states[current_key] = states[legacy_key]
+    with mock.patch.object(
+            paid_capacity, 'central_authority_available',
+            return_value=True), mock.patch.object(
+                paid_capacity.serve_state,
+                'get_paid_capacity_pool_states',
+                return_value=canonical_states), mock.patch.object(
+                    paid_capacity.serve_state,
+                    'get_paid_capacity_plan_claimed_units',
+                    return_value=claimed or {}):
         return paid_capacity.build_launch_budget(
             placer,
             workspace='w',
@@ -1031,6 +1247,7 @@ def _plan_bound_budget(
             globally_managed=True,
             requested_frontier_keys={(card.casefold(),) for card in target},
             max_live_paid_gpu_units=max_live_paid_gpu_units,
+            gcp_project_id_by_location=project_ids,
             paid_launch_authority=authority)
 
 
