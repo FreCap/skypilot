@@ -7515,7 +7515,6 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                     )).order_by(job_info.c.spot_job_id).with_for_update()
             ).mappings().all()
             stale_job_ids = [int(row['spot_job_id']) for row in stale_jobs]
-            legacy_job_ids: list[int] = []
             for row in stale_jobs:
                 try:
                     identity = (managed_job_controller_fencing.
@@ -7526,30 +7525,20 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                     raise request_storage.ManagedJobRequestQuiescenceError(
                         f'Managed job {row["spot_job_id"]} has unsafe prior '
                         'controller identity.') from e
-                if identity is None:
-                    legacy_job_ids.append(int(row['spot_job_id']))
-                else:
+                if identity is not None:
                     target_identities.add(identity)
             if stale_job_ids:
                 connection.execute(
                     sqlalchemy.update(job_info).where(
                         job_info.c.spot_job_id.in_(stale_job_ids)).values(
                             controller_slot_quiescing=True))
-            if legacy_job_ids:
-                correlated_legacy_requests = connection.execute(
-                    sqlalchemy.select(
-                        REQUESTS.c.request_id, REQUESTS.c.managed_job_id).where(
-                            REQUESTS.c.managed_job_id.in_(legacy_job_ids)).
-                    order_by(REQUESTS.c.managed_job_id,
-                             REQUESTS.c.request_id).with_for_update()).all()
-                if correlated_legacy_requests:
-                    details = ', '.join(f'{row.managed_job_id}:{row.request_id}'
-                                        for row in correlated_legacy_requests)
-                    raise request_storage.ManagedJobRequestQuiescenceError(
-                        'Cannot adopt pre-slot managed jobs with correlated '
-                        f'nested requests: {details}.')
             # Include retained nested tombstones even when their job has
-            # already become terminal or a prior failed reset cleared it.
+            # already become terminal or a prior reset cleared its slot.  The
+            # latter is a normal handoff state: request origins retain the old
+            # exact attempt after the job row closes admission and returns to
+            # WAITING.  Quiesce those origins before adopting the job instead
+            # of treating their durable tombstones as an impossible legacy
+            # combination.
             request_origins = connection.execute(
                 sqlalchemy.select(
                     REQUESTS.c.managed_job_controller_instance_id,
@@ -8263,12 +8252,33 @@ class PostgresQueueBackend(queue_base.QueueBackend):
         # Handler filtering is repeated in candidate selection, locked claim,
         # and the guarded request UPDATE because observing a queue row never
         # grants execution authority by itself.
-        predicates: list[sqlalchemy.ColumnElement[bool]] = [
-            REQUESTS.c.handler_name.in_(self._supported_handler_names)
-        ]
-        if self._execution_classes is not None:
+        managed_job_request = REQUESTS.c.managed_job_id.is_not(None)
+        handler_is_supported = REQUESTS.c.handler_name.in_(
+            self._supported_handler_names)
+        predicates: list[sqlalchemy.ColumnElement[bool]] = []
+        if self._controller_generation is None:
+            # Nested managed-job work must run in the controller-authorized
+            # process that owns the matching outer generation.  A normal
+            # executor may understand the underlying handler, but it cannot
+            # transport controller authority into the disposable child.
+            predicates.extend(
+                [handler_is_supported,
+                 sqlalchemy.not_(managed_job_request)])
+        else:
+            # A verified managed-job origin routes through the authoritative
+            # controller worker even when its underlying API handler is
+            # normally executor-scoped (for example, launch or down).
             predicates.append(
-                REQUESTS.c.execution_class.in_(self._execution_classes))
+                sqlalchemy.or_(handler_is_supported, managed_job_request))
+        if self._execution_classes is not None:
+            execution_class_is_supported = REQUESTS.c.execution_class.in_(
+                self._execution_classes)
+            if self._controller_generation is None:
+                predicates.append(execution_class_is_supported)
+            else:
+                predicates.append(
+                    sqlalchemy.or_(execution_class_is_supported,
+                                   managed_job_request))
         controller_class = request_registry.ExecutionClass.CONTROLLER.value
         if self._controller_generation is None:
             # An unscoped queue without outer authority remains usable for
