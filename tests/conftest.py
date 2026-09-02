@@ -216,11 +216,25 @@ def pytest_addoption(parser):
     )
     parser.addoption(
         '--serve-paid-provider-e2e',
-        choices=('small', 'scale'),
+        choices=('small', 'scale', 'provider-canary'),
         default=None,
         help=('Explicitly enable the billable SkyServe paid-Spot E2E. '
-              'small launches at most two L4 VMs; scale arms 120 and requires '
-              'at least 100 concurrently RUNNING.'),
+              'small launches at most two L4 VMs; scale arms 800 paid GPU '
+              'units and requires at least 100 concurrently RUNNING physical '
+              'VMs; provider-canary launches one provider-pinned VM.'),
+    )
+    parser.addoption(
+        '--serve-paid-provider-e2e-provider',
+        choices=('aws', 'gcp'),
+        default=None,
+        help=('Provider for --serve-paid-provider-e2e=provider-canary; '
+              'economic profiles remain provider-neutral.'),
+    )
+    parser.addoption(
+        '--serve-paid-provider-e2e-economic-receipt',
+        default=None,
+        help=('Completed economic qualification receipt required before the '
+              'missing-provider canary can be rendered or launched.'),
     )
     parser.addoption(
         '--no-resource-heavy',

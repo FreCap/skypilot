@@ -28,15 +28,18 @@ required in the API-server image.
 import argparse
 import asyncio
 import collections.abc
+import copy
 import dataclasses
 import datetime
 import enum
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
 import time
+import typing
 from typing import Any
 import uuid
 
@@ -73,7 +76,13 @@ class GuardViolation(QualificationError):
     """An authoritative market, card, cap, or identity guard failed."""
 
 
-_PROVIDER_SCOPE_SCHEMA_VERSION = 3
+_PROVIDER_SCOPE_SCHEMA_VERSION = 5
+_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 7
+_CLEANUP_RECEIPT_SCHEMA_VERSION = 2
+_AGGREGATE_RECEIPT_SCHEMA_VERSION = 2
+_HELD_REQUEST_TAIL_SECONDS = 40
+_CAMPAIGN_LOAD_WINDOW_SECONDS = (
+    serve_constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -81,12 +90,11 @@ class Profile:
     """Bounded parameters for one qualification scale."""
 
     name: str
+    max_replicas: int
     max_units: int
     minimum_running: int
-    pressure_concurrency: int
-    pressure_duration_seconds: float
-    warm_requests: int
-    warm_concurrency: int
+    exact_requests: int
+    request_concurrency: int
     scale_timeout_seconds: float
     scale_slo_seconds: float
     drain_timeout_seconds: float
@@ -98,34 +106,117 @@ class Profile:
 
 PROFILES = {
     'small': Profile(name='small',
+                     max_replicas=2,
                      max_units=2,
                      minimum_running=2,
-                     pressure_concurrency=4,
-                     pressure_duration_seconds=30,
-                     warm_requests=16,
-                     warm_concurrency=4,
+                     exact_requests=16,
+                     request_concurrency=4,
                      scale_timeout_seconds=15 * 60,
-                     scale_slo_seconds=10 * 60,
+                     scale_slo_seconds=5 * 60,
                      drain_timeout_seconds=20 * 60,
                      zero_hold_seconds=6 * 60,
                      poll_seconds=5,
                      scale_up_min_replicas=2,
                      scale_up_period_seconds=10),
     'scale': Profile(name='scale',
-                     max_units=420,
+                     max_replicas=800,
+                     max_units=800,
                      minimum_running=100,
-                     pressure_concurrency=512,
-                     pressure_duration_seconds=30,
-                     warm_requests=10_000,
-                     warm_concurrency=256,
+                     exact_requests=10_000,
+                     request_concurrency=10_000,
                      scale_timeout_seconds=15 * 60,
                      scale_slo_seconds=5 * 60,
                      drain_timeout_seconds=30 * 60,
                      zero_hold_seconds=6 * 60,
                      poll_seconds=10,
-                     scale_up_min_replicas=420,
+                     scale_up_min_replicas=800,
                      scale_up_period_seconds=10),
+    # The provider canary uses the same exact one-L4 task shape as the economic
+    # run and permits one physical backend without naming an instance type.
+    'provider-canary': Profile(name='provider-canary',
+                               max_replicas=1,
+                               max_units=1,
+                               minimum_running=1,
+                               exact_requests=1,
+                               request_concurrency=1,
+                               scale_timeout_seconds=15 * 60,
+                               scale_slo_seconds=5 * 60,
+                               drain_timeout_seconds=20 * 60,
+                               zero_hold_seconds=6 * 60,
+                               poll_seconds=5,
+                               scale_up_min_replicas=1,
+                               scale_up_period_seconds=10),
 }
+
+
+def request_hold_seconds(profile: Profile) -> float:
+    """Keep exact demand alive slightly beyond the physical scale SLO."""
+    return profile.scale_slo_seconds + _HELD_REQUEST_TAIL_SECONDS
+
+
+def request_queue_max_concurrency(profile: Profile) -> int:
+    """Return the fixture's bounded HTTP admission concurrency."""
+    return max(8, min(128, profile.request_concurrency))
+
+
+def held_request_count(profile: Profile) -> int:
+    """Keep one logical-cap cohort occupied through the scale SLO."""
+    return min(profile.max_units, profile.exact_requests)
+
+
+class ExpectationKind(str, enum.Enum):
+    """Placement fact one qualification run is allowed to prove."""
+
+    ECONOMIC = 'economic'
+    PROVIDER_CANARY = 'provider-canary'
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ProviderExpectation:
+    """Typed evidence gate that never participates in runtime placement."""
+
+    kind: ExpectationKind
+    providers: tuple[str, ...]
+    minimum_physical_running: int
+    exact_request_count: int
+
+    def __post_init__(self) -> None:
+        if (self.providers not in (('aws',), ('gcp',), ('aws', 'gcp')) or
+                type(self.minimum_physical_running) is not int or
+                self.minimum_physical_running < 1 or
+                type(self.exact_request_count) is not int or
+                self.exact_request_count < 1 or
+            (self.kind is ExpectationKind.ECONOMIC and
+             self.providers != ('aws', 'gcp')) or
+            (self.kind is ExpectationKind.PROVIDER_CANARY and
+             len(self.providers) != 1)):
+            raise ValueError('Paid-provider expectation is malformed.')
+
+    @property
+    def requires_full_request_telemetry(self) -> bool:
+        return self.kind is ExpectationKind.ECONOMIC
+
+
+def provider_expectation(profile: Profile,
+                         provider: str | None) -> ProviderExpectation:
+    """Build the only two supported qualification evidence contracts."""
+    if profile.name == 'provider-canary':
+        if provider not in ('aws', 'gcp'):
+            raise QualificationError(
+                'Provider-canary profile requires --provider={aws,gcp}.')
+        kind = ExpectationKind.PROVIDER_CANARY
+        providers = (provider,)
+    else:
+        if provider is not None:
+            raise QualificationError(
+                'Economic profiles do not accept a provider override.')
+        kind = ExpectationKind.ECONOMIC
+        providers = ('aws', 'gcp')
+    return ProviderExpectation(kind=kind,
+                               providers=providers,
+                               minimum_physical_running=profile.minimum_running,
+                               exact_request_count=profile.exact_requests)
+
 
 _AUTH_HEADER = 'X-SkyPilot-Serve-Authorization'
 _JOB_ID_HEADER = 'X-SkyServe-Job-Id'
@@ -304,7 +395,8 @@ class RequestTelemetry:
         return self.ledger_count('SUCCEEDED')
 
     def is_fresh_complete(self) -> bool:
-        return (self.state == 'fresh' and self.reason == 'complete' and
+        return (math.isfinite(self.observed_at) and self.observed_at > 0 and
+                self.state == 'fresh' and self.reason == 'complete' and
                 self.compatibility_complete and self.queue_depth is not None and
                 self.in_flight_requests is not None and
                 self.processing_requests is not None)
@@ -339,10 +431,13 @@ def request_telemetry_from_summary(
         return value
 
     observed_at = summary.get('request_telemetry_observed_at')
-    if (not isinstance(observed_at, (int, float)) or
-            isinstance(observed_at, bool) or observed_at < 0):
+    if observed_at is None:
         # Unavailable/stale summaries intentionally have no source timestamp.
         observed_at = 0.0
+    elif (not isinstance(observed_at,
+                         (int, float)) or isinstance(observed_at, bool) or
+          not math.isfinite(observed_at) or observed_at <= 0):
+        raise QualificationError('Request telemetry timestamp is invalid.')
     state = summary.get('request_telemetry_state')
     reason = summary.get('request_telemetry_reason')
     complete = summary.get('request_telemetry_compatibility_complete')
@@ -541,8 +636,142 @@ class ProviderScope:
     catalog_shapes: tuple[CatalogShape, ...]
     placement_catalog_sha256: str
     service_yaml_sha256: str
+    qualification_profile: str
+    qualification_source_sha256: str
+    qualification_projection_sha256: str
     controller_config_digest: str
     controller_config_snapshot_id: str
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class QualificationServiceContract:
+    """Canonical provider-neutral contract persisted with one test service."""
+
+    providers: tuple[str, ...]
+    min_replicas: int
+    max_replicas: int
+    max_live_paid_gpu_units: int
+    scale_up_rate_min_replicas: int
+    scale_up_rate_period_seconds: int
+    request_queue_min_size: int
+    request_queue_max_size: int
+    request_queue_max_concurrency: int
+    request_queue_timeout_seconds: float
+    max_concurrency_per_replica: int
+
+
+def _fixture_duration_limit(config: collections.abc.Mapping[str, Any]) -> float:
+    """Read the worker's single bounded synthetic-duration contract."""
+    run = config.get('run')
+    if not isinstance(run, str):
+        raise ValueError('service YAML has no worker program')
+    matches = re.findall(
+        r'(?m)^_MAX_SYNTHETIC_DURATION_SECONDS = ([0-9]+(?:\.[0-9]+)?)$', run)
+    if len(matches) != 1:
+        raise ValueError('worker duration limit is not singular')
+    limit = float(matches[0])
+    if limit <= 0:
+        raise ValueError('worker duration limit is invalid')
+    return limit
+
+
+def _profile_projection(profile: Profile) -> dict[str, int]:
+    """Return every field the canonical renderer may vary by profile."""
+    return {
+        'max_replicas': profile.max_replicas,
+        'max_live_paid_gpu_units': profile.max_units,
+        'scale_up_rate_min_replicas': profile.scale_up_min_replicas,
+        'scale_up_rate_period_seconds': profile.scale_up_period_seconds,
+        'request_queue_min_size': profile.request_concurrency,
+        'request_queue_max_size': max(32, profile.request_concurrency),
+        'request_queue_max_concurrency': request_queue_max_concurrency(profile),
+    }
+
+
+def _profile_matches_contract(profile: Profile,
+                              contract: QualificationServiceContract) -> bool:
+    projection = _profile_projection(profile)
+    return all(
+        getattr(contract, field) == value
+        for field, value in projection.items())
+
+
+def _qualification_profile(contract: QualificationServiceContract) -> Profile:
+    """Resolve one exact typed projection from the persisted task."""
+    candidates = [
+        profile for profile in PROFILES.values()
+        if ((profile.name == 'provider-canary') == (
+            len(contract.providers) == 1)) and
+        _profile_matches_contract(profile, contract)
+    ]
+    if len(candidates) != 1:
+        raise ValueError('service YAML is not one exact qualification profile')
+    return candidates[0]
+
+
+_USER_SPECIFIED_YAML_KEY = '_user_specified_yaml'
+
+
+def _contains_reserved_user_yaml_key(value: object) -> bool:
+    if isinstance(value, collections.abc.Mapping):
+        return (_USER_SPECIFIED_YAML_KEY in value or any(
+            _contains_reserved_user_yaml_key(item) for item in value.values()))
+    if isinstance(value, (list, tuple)):
+        return any(_contains_reserved_user_yaml_key(item) for item in value)
+    return False
+
+
+def _persisted_qualification_user_config(
+        persisted_config: collections.abc.Mapping[str, Any]) -> dict[str, Any]:
+    """Extract exactly one server-owned provenance envelope."""
+    user_yaml = persisted_config.get(_USER_SPECIFIED_YAML_KEY)
+    if not isinstance(user_yaml, str):
+        raise ValueError('service has no immutable user task identity')
+    try:
+        user_config = yaml.safe_load(user_yaml)
+    except yaml.YAMLError as error:
+        raise ValueError('persisted user service YAML is invalid') from error
+    if (not isinstance(user_config, dict) or
+            _contains_reserved_user_yaml_key(user_config)):
+        raise ValueError(
+            'persisted user service YAML contains reserved provenance')
+    return user_config
+
+
+def _qualification_source_sha256(config: dict[str, Any]) -> str:
+    """Hash one user task after removing only the allowed projection."""
+    if _contains_reserved_user_yaml_key(config):
+        raise ValueError('user service YAML contains reserved provenance')
+    normalized = copy.deepcopy(config)
+    normalized['resources'] = _canonical_qualification_resources(
+        normalized['resources'])
+    normalized['resources']['any_of'] = [{
+        'infra': cloud,
+        'accelerators': {
+            'L4': 1,
+        },
+        'use_spot': True,
+    } for cloud in ('aws', 'gcp')]
+    policy = normalized['service']['replica_policy']
+    queue = normalized['service']['load_balancer']['request_queue']
+    for field in ('max_replicas', 'max_live_paid_gpu_units',
+                  'scale_up_rate_min_replicas', 'scale_up_rate_period_seconds'):
+        policy.pop(field, None)
+    for field in ('min_size', 'max_size', 'max_concurrency'):
+        queue.pop(field, None)
+    return hashlib.sha256(rfc8785.dumps(normalized)).hexdigest()
+
+
+def _qualification_projection_sha256(*, source_sha256: str, profile: Profile,
+                                     providers: tuple[str, ...]) -> str:
+    """Bind one allowed profile/provider projection to its source task."""
+    return hashlib.sha256(
+        rfc8785.dumps({
+            'source_sha256': source_sha256,
+            'profile': profile.name,
+            'providers': list(providers),
+            **_profile_projection(profile),
+        })).hexdigest()
 
 
 def _whole_l4_width(accelerators: object) -> int:
@@ -576,7 +805,8 @@ def _canonical_qualification_resources(
     branches = resources.get('any_of')
     if (resources.get('accelerators') != 'L4:1' or
             resources.get('use_spot') is not True or
-            not isinstance(branches, list) or len(branches) != 2 or not all(
+            not isinstance(branches, list) or len(branches) not in (1, 2) or
+            not all(
                 isinstance(branch, dict) and set(branch) == {'infra'}
                 for branch in branches)):
         return resources
@@ -595,8 +825,9 @@ def _canonical_qualification_resources(
     return result
 
 
-def _validate_cross_cloud_service_config(config: object) -> tuple[int, int]:
-    """Require the canonical persisted logical-L4 qualification contract."""
+def _validate_qualification_service_config(
+        config: object) -> QualificationServiceContract:
+    """Require the canonical provider-neutral logical-L4 test contract."""
     if not isinstance(config, dict):
         raise ValueError('service YAML is not a mapping')
     service = config.get('service')
@@ -612,10 +843,24 @@ def _validate_cross_cloud_service_config(config: object) -> tuple[int, int]:
         policy, dict) else None)
     per_replica_concurrency = (queue.get('max_concurrency_per_replica')
                                if isinstance(queue, dict) else None)
+    max_replicas = (policy.get('max_replicas')
+                    if isinstance(policy, dict) else None)
+    min_replicas = (policy.get('min_replicas')
+                    if isinstance(policy, dict) else None)
+    scale_up_min = (policy.get('scale_up_rate_min_replicas') if isinstance(
+        policy, dict) else None)
+    scale_up_period = (policy.get('scale_up_rate_period_seconds') if isinstance(
+        policy, dict) else None)
+    queue_min_size = queue.get('min_size') if isinstance(queue, dict) else None
+    queue_max_size = queue.get('max_size') if isinstance(queue, dict) else None
+    queue_max_concurrency = (queue.get('max_concurrency') if isinstance(
+        queue, dict) else None)
+    queue_timeout = queue.get('timeout_seconds') if isinstance(queue,
+                                                               dict) else None
     resource_branches = resources.get('any_of')
     canonical_clouds: set[str] = set()
     canonical_resources = (isinstance(resource_branches, list) and
-                           len(resource_branches) == 2 and
+                           len(resource_branches) in (1, 2) and
                            all(key not in resources
                                for key in ('infra', 'instance_type', 'region',
                                            'zone', 'accelerators', 'use_spot')))
@@ -637,19 +882,38 @@ def _validate_cross_cloud_service_config(config: object) -> tuple[int, int]:
                 canonical_resources = False
                 break
             canonical_clouds.add(cloud)
-        canonical_resources = (canonical_resources and
-                               canonical_clouds == {'aws', 'gcp'})
+        canonical_resources = (canonical_resources and canonical_clouds
+                               in ({'aws'}, {'gcp'}, {'aws', 'gcp'}))
     if (service.get('load_balancing_policy') != 'instance_aware_least_load' or
             not isinstance(policy, dict) or
             policy.get('spot_placer') != 'dynamic_fallback_per_gpu' or
+            type(min_replicas) is not int or min_replicas != 0 or
+            type(max_replicas) is not int or max_replicas < 1 or
             type(max_paid_units) is not int or max_paid_units < 1 or
-            not isinstance(queue, dict) or
+            type(scale_up_min) is not int or scale_up_min < 1 or
+            type(scale_up_period) is not int or scale_up_period < 1 or
+            not isinstance(queue, dict) or type(queue_min_size) is not int or
+            queue_min_size < 1 or type(queue_max_size) is not int or
+            queue_max_size < queue_min_size or
+            type(queue_max_concurrency) is not int or
+            queue_max_concurrency < 1 or not isinstance(queue_timeout,
+                                                        (int, float)) or
+            isinstance(queue_timeout, bool) or queue_timeout <= 0 or
             type(per_replica_concurrency) is not int or
-            per_replica_concurrency < 1 or
-            type(queue.get('max_concurrency')) is not int or
-            queue['max_concurrency'] < 1 or not canonical_resources):
-        raise ValueError('service YAML is not generic cross-cloud L4')
-    return max_paid_units, per_replica_concurrency
+            per_replica_concurrency < 1 or not canonical_resources):
+        raise ValueError('service YAML is not generic whole-L4 Spot')
+    return QualificationServiceContract(
+        providers=tuple(sorted(canonical_clouds)),
+        min_replicas=min_replicas,
+        max_replicas=max_replicas,
+        max_live_paid_gpu_units=max_paid_units,
+        scale_up_rate_min_replicas=scale_up_min,
+        scale_up_rate_period_seconds=scale_up_period,
+        request_queue_min_size=queue_min_size,
+        request_queue_max_size=queue_max_size,
+        request_queue_max_concurrency=queue_max_concurrency,
+        request_queue_timeout_seconds=float(queue_timeout),
+        max_concurrency_per_replica=per_replica_concurrency)
 
 
 def provider_scope_from_controller_config(
@@ -689,13 +953,24 @@ def provider_scope_from_controller_config(
         raise GuardViolation(
             'Current service version has no exact workspace authority.')
     try:
-        (max_live_paid_gpu_units,
-         max_concurrency_per_replica) = _validate_cross_cloud_service_config(
-             yaml.safe_load(yaml_content))
+        service_config = yaml.safe_load(yaml_content)
+        user_config = _persisted_qualification_user_config(service_config)
+        contract = _validate_qualification_service_config(service_config)
+        profile = _qualification_profile(contract)
+        source_sha256 = _qualification_source_sha256(user_config)
+        projection_sha256 = _qualification_projection_sha256(
+            source_sha256=source_sha256,
+            profile=profile,
+            providers=contract.providers)
+        duration_limit = _fixture_duration_limit(service_config)
     except (TypeError, ValueError, yaml.YAMLError) as error:
         raise GuardViolation(
-            'Current service version is not generic cross-cloud L4.') \
+            'Current service version is not generic whole-L4 Spot.') \
             from error
+    if (request_hold_seconds(profile) > duration_limit or
+            duration_limit >= contract.request_queue_timeout_seconds):
+        raise GuardViolation(
+            'Current service duration contract cannot preserve bounded demand.')
     try:
         catalog = spot_placer.PlacementCatalog.from_dict(placement_catalog)
     except (KeyError, TypeError, ValueError) as error:
@@ -708,7 +983,7 @@ def provider_scope_from_controller_config(
         }))
     try:
         catalog_is_exact = bool(
-            providers == ('aws', 'gcp') and catalog.num_nodes == 1 and
+            providers == contract.providers and catalog.num_nodes == 1 and
             all(location.use_spot is True and isinstance(location.region, str)
                 and bool(location.region) and isinstance(location.zone, str) and
                 bool(location.zone) and isinstance(location.instance_type, str)
@@ -720,7 +995,7 @@ def provider_scope_from_controller_config(
     if not catalog_is_exact:
         raise GuardViolation(
             'Current service version has no exact whole-L4 Spot catalog.')
-    if max_concurrency_per_replica < max(
+    if contract.max_concurrency_per_replica < max(
             _whole_l4_width(location.accelerators)
             for location, _ in catalog.entries):
         raise GuardViolation(
@@ -786,26 +1061,30 @@ def provider_scope_from_controller_config(
         raise GuardViolation(
             'Current service version has no exact AWS catalog authority.') \
             from error
-    if not aws_regions:
+    if ('aws' in providers) != bool(aws_regions):
         raise GuardViolation(
-            'Current service version has no AWS catalog regions.')
-    return ProviderScope(service_hash=service_hash,
-                         lifecycle_epoch=lifecycle_epoch,
-                         service_version=service_version,
-                         max_live_paid_gpu_units=max_live_paid_gpu_units,
-                         providers=providers,
-                         project_id=project_id,
-                         workspace=workspace,
-                         location_scope=gcp_location_scope,
-                         aws_location_scope=aws_location_scope,
-                         aws_regions=tuple(aws_regions),
-                         catalog_shapes=catalog_shapes,
-                         placement_catalog_sha256=hashlib.sha256(
-                             rfc8785.dumps(placement_catalog)).hexdigest(),
-                         service_yaml_sha256=hashlib.sha256(
-                             yaml_content.encode('utf-8')).hexdigest(),
-                         controller_config_digest=digest,
-                         controller_config_snapshot_id=snapshot_id)
+            'Current service version has inconsistent AWS catalog regions.')
+    return ProviderScope(
+        service_hash=service_hash,
+        lifecycle_epoch=lifecycle_epoch,
+        service_version=service_version,
+        max_live_paid_gpu_units=(contract.max_live_paid_gpu_units),
+        providers=providers,
+        project_id=project_id,
+        workspace=workspace,
+        location_scope=gcp_location_scope,
+        aws_location_scope=aws_location_scope,
+        aws_regions=tuple(aws_regions),
+        catalog_shapes=catalog_shapes,
+        placement_catalog_sha256=hashlib.sha256(
+            rfc8785.dumps(placement_catalog)).hexdigest(),
+        service_yaml_sha256=hashlib.sha256(
+            yaml_content.encode('utf-8')).hexdigest(),
+        qualification_profile=profile.name,
+        qualification_source_sha256=source_sha256,
+        qualification_projection_sha256=projection_sha256,
+        controller_config_digest=digest,
+        controller_config_snapshot_id=snapshot_id)
 
 
 def write_provider_scope(path: pathlib.Path, service_name: str,
@@ -861,7 +1140,7 @@ def read_provider_scope(path: pathlib.Path, service_name: str) -> ProviderScope:
             scope.service_version < 1 or
             type(scope.max_live_paid_gpu_units) is not int or
             scope.max_live_paid_gpu_units < 1 or
-            scope.providers != ('aws', 'gcp') or
+            scope.providers not in (('aws',), ('gcp',), ('aws', 'gcp')) or
         (('gcp' in scope.providers)
          != (isinstance(scope.project_id, str) and re.fullmatch(
              r'[a-z][a-z0-9-]{4,28}[a-z0-9]', scope.project_id) is not None)) or
@@ -871,7 +1150,7 @@ def read_provider_scope(path: pathlib.Path, service_name: str) -> ProviderScope:
         (('aws' in scope.providers)
          != (scope.aws_location_scope
              is AwsLocationScope.FROZEN_CATALOG_REGIONS)) or
-            not scope.aws_regions or
+        (('aws' in scope.providers) != bool(scope.aws_regions)) or
             tuple(sorted(scope.aws_regions, key=lambda region: region.region))
             != scope.aws_regions or
             len({region.region for region in scope.aws_regions}) != len(
@@ -898,6 +1177,21 @@ def read_provider_scope(path: pathlib.Path, service_name: str) -> ProviderScope:
                 r'[0-9a-f]{64}', scope.placement_catalog_sha256) is None or
             not isinstance(scope.service_yaml_sha256, str) or
             re.fullmatch(r'[0-9a-f]{64}', scope.service_yaml_sha256) is None or
+            scope.qualification_profile not in PROFILES or
+            scope.max_live_paid_gpu_units != PROFILES.get(
+                scope.qualification_profile, PROFILES['small']).max_units or
+        ((scope.qualification_profile == 'provider-canary') != (len(
+            scope.providers) == 1)) or
+            not isinstance(scope.qualification_source_sha256, str) or
+            re.fullmatch(r'[0-9a-f]{64}',
+                         scope.qualification_source_sha256) is None or
+            not isinstance(scope.qualification_projection_sha256, str) or
+            re.fullmatch(r'[0-9a-f]{64}', scope.qualification_projection_sha256)
+            is None or scope.qualification_projection_sha256
+            != _qualification_projection_sha256(
+                source_sha256=scope.qualification_source_sha256,
+                profile=PROFILES[scope.qualification_profile],
+                providers=scope.providers) or
             not isinstance(scope.controller_config_digest, str) or re.fullmatch(
                 r'[0-9a-f]{64}', scope.controller_config_digest) is None or
             not isinstance(scope.controller_config_snapshot_id, str) or
@@ -2932,6 +3226,11 @@ class LoadBalancerState:
     pod_uid: str
     slot: str
     role_generation: int
+    unique_job_arrivals_60s: int = 0
+    unique_job_arrivals_300s: int = 0
+    headerless_arrivals_60s: int = 0
+    headerless_arrivals_300s: int = 0
+    offered_arrival_tracking_saturated: bool = False
 
 
 def select_route_authoritative_report(
@@ -3034,11 +3333,24 @@ class HttpObserver:
         pod_uid = payload.get('lb_pod_uid')
         slot = payload.get('lb_slot')
         role_generation = payload.get('lb_role_generation')
+        offered_count_fields = (
+            'unique_job_arrivals_60s',
+            'unique_job_arrivals_300s',
+            'headerless_arrivals_60s',
+            'headerless_arrivals_300s',
+        )
+        offered_counts = {
+            field: payload.get(field) for field in offered_count_fields
+        }
         if (not isinstance(pod_uid, str) or not pod_uid or
                 slot not in ('a', 'b') or payload.get('lb_role') != 'ACTIVE' or
                 type(role_generation) is not int or role_generation < 1 or
                 payload.get('synced') is not True or
-                payload.get('draining') is not False):
+                payload.get('draining') is not False or any(
+                    type(value) is not int or value < 0
+                    for value in offered_counts.values()) or
+                type(payload.get('offered_arrival_tracking_saturated'))
+                is not bool):
             raise QualificationError(
                 'Capacity endpoint lacks routed ACTIVE LB authority.')
         return LoadBalancerState(service_hash=service_hash,
@@ -3046,7 +3358,10 @@ class HttpObserver:
                                  ready_replicas=ready,
                                  pod_uid=pod_uid,
                                  slot=slot,
-                                 role_generation=role_generation)
+                                 role_generation=role_generation,
+                                 **offered_counts,
+                                 offered_arrival_tracking_saturated=payload[
+                                     'offered_arrival_tracking_saturated'])
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -3072,7 +3387,12 @@ class Observation:
                 self.load_balancer.ready_replicas == 0)
 
 
-def validate_observation(observation: Observation, profile: Profile) -> None:
+def validate_observation(
+        observation: Observation,
+        profile: Profile,
+        expectation: ProviderExpectation | None = None) -> None:
+    if expectation is None:
+        expectation = provider_expectation(profile, None)
     database = observation.database
     provider = observation.provider
     gcp_identities = {
@@ -3080,6 +3400,10 @@ def validate_observation(observation: Observation, profile: Profile) -> None:
         for identity in database.gcp_provider_identities
     }
     aws_identities = database.aws_provider_identities
+    if (('gcp' not in expectation.providers and gcp_identities) or
+        ('aws' not in expectation.providers and aws_identities)):
+        raise GuardViolation(
+            'Durable launch binding exists outside the qualification scope.')
     bound_cluster_names = frozenset(gcp_identities) | frozenset(
         identity.cluster_name_on_cloud for identity in aws_identities)
     if database.service_hash != observation.load_balancer.service_hash:
@@ -3090,6 +3414,18 @@ def validate_observation(observation: Observation, profile: Profile) -> None:
         raise GuardViolation('PostgreSQL capacity exceeded the armed cap.')
     if provider.gpu_units > profile.max_units:
         raise GuardViolation('Provider capacity exceeded the armed GPU cap.')
+    if provider.instance_count > profile.max_replicas:
+        raise GuardViolation(
+            'Provider capacity exceeded the armed physical-instance cap.')
+    if tuple(cloud.cloud for cloud in provider.clouds) != ('gcp', 'aws'):
+        raise QualificationError(
+            'Provider census lacks the canonical AWS/GCP projection.')
+    for cloud in provider.clouds:
+        if cloud.cloud not in expectation.providers and (
+                cloud.instance_count != 0 or cloud.gpu_units != 0 or
+                cloud.disk_count != 0 or cloud.inflight_operation_count != 0):
+            raise GuardViolation(
+                'Provider effect exists outside the qualification scope.')
     gcp = provider.cloud('gcp')
     aws = provider.cloud('aws')
     if (gcp.instance_count > len(gcp_identities) or
@@ -3110,8 +3446,8 @@ def validate_observation(observation: Observation, profile: Profile) -> None:
 class Observer:
     """Compose raw provider state with newer durable/data-plane evidence."""
 
-    def __init__(self, *, postgres: PostgresObserver, gcp: GcpObserver,
-                 aws: AwsObserver, http: HttpObserver) -> None:
+    def __init__(self, *, postgres: PostgresObserver, gcp: GcpObserver | None,
+                 aws: AwsObserver | None, http: HttpObserver) -> None:
         self._postgres = postgres
         self._gcp = gcp
         self._aws = aws
@@ -3129,9 +3465,20 @@ class Observer:
         # to classify it.  Since a binding commit precedes its provider effect,
         # this avoids both logical-name prefix guesses and an old-DB/new-VM
         # ordering manufactured by the observer itself.
-        gcp_census, aws_census = await asyncio.gather(
-            asyncio.to_thread(self._gcp.census),
-            asyncio.to_thread(self._aws.census))
+        provider_reads = []
+        if self._gcp is not None:
+            provider_reads.append(asyncio.to_thread(self._gcp.census))
+        if self._aws is not None:
+            provider_reads.append(asyncio.to_thread(self._aws.census))
+        raw_censuses = await asyncio.gather(*provider_reads)
+        census_index = 0
+        gcp_census = None
+        aws_census = None
+        if self._gcp is not None:
+            gcp_census = raw_censuses[census_index]
+            census_index += 1
+        if self._aws is not None:
+            aws_census = raw_censuses[census_index]
         load_balancer = await self._http.snapshot()
         database = await asyncio.to_thread(
             self._postgres.snapshot,
@@ -3141,9 +3488,12 @@ class Observer:
             identity.cluster_name_on_cloud: identity
             for identity in database.gcp_provider_identities
         }
-        provider = combine_provider_states(
-            self._gcp.reduce(gcp_census, gcp_identities),
-            self._aws.reduce(aws_census, database.aws_provider_identities))
+        gcp_state = (empty_provider_state('gcp') if self._gcp is None else
+                     self._gcp.reduce(gcp_census, gcp_identities))
+        aws_state = (empty_provider_state('aws')
+                     if self._aws is None else self._aws.reduce(
+                         aws_census, database.aws_provider_identities))
+        provider = combine_provider_states(gcp_state, aws_state)
         return Observation(observed_at=time.time(),
                            observed_monotonic=time.monotonic(),
                            database=database,
@@ -3161,17 +3511,34 @@ class Progress:
                                 int] = dataclasses.field(default_factory=dict)
     peak_running_gpu_units_by_cloud: dict[str, int] = dataclasses.field(
         default_factory=dict)
+    baseline_qualified_iteration_id: int | None = None
+    baseline_qualified_observed_at: float | None = None
+    campaign_loaded_iteration_id: int | None = None
+    campaign_loaded_observed_at: float | None = None
+    campaign_loaded_request_observed_at: float | None = None
     scale_started_monotonic: float | None = None
+    scale_started_at: float | None = None
     scale_reached_monotonic: float | None = None
+    scale_qualified_observed_at: float | None = None
+    scale_qualified_iteration_id: int | None = None
     zero_since_monotonic: float | None = None
     zero_samples: int = 0
 
     def start_scale(self) -> None:
-        if self.scale_started_monotonic is not None:
+        if (self.scale_started_monotonic is not None or
+                self.scale_started_at is not None):
             raise QualificationError('Scale timer was already started.')
         self.scale_started_monotonic = time.monotonic()
+        self.scale_started_at = time.time()
 
-    def observe(self, observation: Observation, profile: Profile) -> None:
+    def observe(self,
+                observation: Observation,
+                profile: Profile,
+                expectation: ProviderExpectation | None = None,
+                *,
+                qualify_scale: bool = True) -> None:
+        if expectation is None:
+            expectation = provider_expectation(profile, None)
         self.peak_running = max(self.peak_running,
                                 observation.provider.running_count)
         self.peak_running_gpu_units = max(
@@ -3183,24 +3550,27 @@ class Progress:
             self.peak_running_gpu_units_by_cloud[cloud.cloud] = max(
                 self.peak_running_gpu_units_by_cloud.get(cloud.cloud, 0),
                 cloud.running_gpu_units)
-        aws_running = observation.provider.cloud('aws').running_count
-        gcp_running = observation.provider.cloud('gcp').running_count
-        if (self.scale_reached_monotonic is None and
-                observation.provider.running_count >= profile.minimum_running
-                and aws_running > 0 and gcp_running > 0):
+        if (qualify_scale and self.scale_reached_monotonic is None and
+                observation.provider.running_count
+                >= expectation.minimum_physical_running):
             if self.scale_started_monotonic is None:
                 raise QualificationError(
-                    'Provider reached the physical cross-cloud RUNNING target '
+                    'Provider reached the physical RUNNING target '
                     'before the scale timer.')
             elapsed = (observation.observed_monotonic -
                        self.scale_started_monotonic)
             if elapsed > profile.scale_slo_seconds:
                 raise QualificationError(
-                    f'Scale-out to {profile.minimum_running} physical RUNNING '
-                    f'L4 Spot VMs across AWS and GCP took {elapsed:.1f}s; '
+                    f'Scale-out to {expectation.minimum_physical_running} '
+                    f'physical RUNNING L4 Spot VMs took {elapsed:.1f}s; '
                     'limit is '
                     f'{profile.scale_slo_seconds:.1f}s.')
             self.scale_reached_monotonic = observation.observed_monotonic
+            if (not math.isfinite(observation.observed_at) or
+                    observation.observed_at < 0):
+                raise QualificationError(
+                    'Qualified provider sample has no finite wall timestamp.')
+            self.scale_qualified_observed_at = observation.observed_at
 
     def observe_zero(self, observation: Observation) -> None:
         if observation.is_exact_zero():
@@ -3256,55 +3626,136 @@ def observation_summary(observation: Observation) -> dict[str, Any]:
             (observation.provider.inflight_operation_count),
         'lb_demand_units': observation.load_balancer.demand_units,
         'lb_ready_replicas': observation.load_balancer.ready_replicas,
+        'lb_unique_job_arrivals_60s':
+            observation.load_balancer.unique_job_arrivals_60s,
+        'lb_unique_job_arrivals_300s':
+            observation.load_balancer.unique_job_arrivals_300s,
+        'lb_headerless_arrivals_60s':
+            observation.load_balancer.headerless_arrivals_60s,
+        'lb_headerless_arrivals_300s':
+            observation.load_balancer.headerless_arrivals_300s,
+        'lb_offered_arrival_tracking_saturated':
+            observation.load_balancer.offered_arrival_tracking_saturated,
     }
 
 
 class Receipt:
     """Credential-free evidence emitted even when qualification fails."""
 
-    def __init__(self, *, path: pathlib.Path, service_name: str,
-                 profile: Profile) -> None:
+    def __init__(self,
+                 *,
+                 path: pathlib.Path,
+                 service_name: str,
+                 profile: Profile,
+                 expectation: ProviderExpectation | None = None,
+                 scope: ProviderScope | None = None,
+                 authorized_economic_receipt_sha256: str | None = None) -> None:
+        if expectation is None:
+            expectation = provider_expectation(profile, None)
         self._path = path
         self._payload: dict[str, Any] = {
-            'schema_version': 3,
+            'schema_version': _QUALIFICATION_RECEIPT_SCHEMA_VERSION,
             'service_name': service_name,
             'profile': profile.name,
+            'expectation_kind': expectation.kind.value,
+            'expected_providers': list(expectation.providers),
             'request_priority': _REQUEST_PRIORITY,
             'max_units': profile.max_units,
-            'minimum_running': profile.minimum_running,
+            'minimum_running': expectation.minimum_physical_running,
+            'exact_request_count': expectation.exact_request_count,
             'started_at': time.time(),
             'samples': [],
             'request_telemetry_samples': [],
         }
+        if scope is not None:
+            self._payload.update({
+                'service_hash': scope.service_hash,
+                'lifecycle_epoch': scope.lifecycle_epoch,
+                'service_version': scope.service_version,
+                'controller_config_digest': scope.controller_config_digest,
+                'controller_config_snapshot_id':
+                    scope.controller_config_snapshot_id,
+                'service_yaml_sha256': scope.service_yaml_sha256,
+                'qualification_profile': scope.qualification_profile,
+                'qualification_source_sha256':
+                    scope.qualification_source_sha256,
+                'qualification_projection_sha256':
+                    scope.qualification_projection_sha256,
+                'placement_catalog_sha256': scope.placement_catalog_sha256,
+            })
+        if authorized_economic_receipt_sha256 is not None:
+            self._payload['authorized_economic_receipt_sha256'] = (
+                authorized_economic_receipt_sha256)
 
-    def sample(self, phase: str, observation: Observation) -> None:
-        self._payload['samples'].append({
+    def sample(self,
+               phase: str,
+               observation: Observation,
+               *,
+               scale_iteration_id: int | None = None,
+               baseline_iteration_id: int | None = None,
+               baseline_pair_observed_at: float | None = None,
+               campaign_iteration_id: int | None = None,
+               campaign_pair_observed_at: float | None = None) -> None:
+        sample = {
             'phase': phase,
+            'exact_zero': observation.is_exact_zero(),
             **observation_summary(observation),
-        })
+        }
+        if scale_iteration_id is not None:
+            sample['scale_iteration_id'] = scale_iteration_id
+        if baseline_iteration_id is not None:
+            sample['baseline_iteration_id'] = baseline_iteration_id
+            sample['baseline_pair_observed_at'] = baseline_pair_observed_at
+        if campaign_iteration_id is not None:
+            sample['campaign_iteration_id'] = campaign_iteration_id
+            sample['campaign_pair_observed_at'] = campaign_pair_observed_at
+        self._payload['samples'].append(sample)
 
-    def miss(self, phase: str, error: Exception) -> None:
-        self._payload['samples'].append({
+    def miss(self,
+             phase: str,
+             error: Exception,
+             *,
+             scale_iteration_id: int | None = None) -> None:
+        sample = {
             'phase': phase,
             'observed_at': time.time(),
             'observation_error_type': type(error).__name__,
-        })
+        }
+        if scale_iteration_id is not None:
+            sample['scale_iteration_id'] = scale_iteration_id
+        self._payload['samples'].append(sample)
 
-    def request_telemetry(self, phase: str,
-                          telemetry: RequestTelemetry) -> None:
-        self._payload['request_telemetry_samples'].append({
+    def request_telemetry(
+            self,
+            phase: str,
+            telemetry: RequestTelemetry,
+            *,
+            scale_iteration_id: int | None = None,
+            baseline_iteration_id: int | None = None,
+            baseline_pair_observed_at: float | None = None,
+            campaign_iteration_id: int | None = None,
+            campaign_pair_observed_at: float | None = None) -> None:
+        sample = {
             'phase': phase,
             **dataclasses.asdict(telemetry),
             'ledger_active': telemetry.ledger_active,
             'ledger_succeeded': telemetry.ledger_succeeded,
             'ledger_total': telemetry.ledger_total,
-        })
+        }
+        if scale_iteration_id is not None:
+            sample['scale_iteration_id'] = scale_iteration_id
+        if baseline_iteration_id is not None:
+            sample['baseline_iteration_id'] = baseline_iteration_id
+            sample['baseline_pair_observed_at'] = baseline_pair_observed_at
+        if campaign_iteration_id is not None:
+            sample['campaign_iteration_id'] = campaign_iteration_id
+            sample['campaign_pair_observed_at'] = campaign_pair_observed_at
+        self._payload['request_telemetry_samples'].append(sample)
 
     def finish(self,
                *,
                progress: Progress,
-               pressure_successes: int,
-               warm_successes: int,
+               exact_request_successes: int,
                aws_volume_ids: collections.abc.Mapping[str, list[str]] |
                None = None,
                ledger_baseline: RequestTelemetry | None = None,
@@ -3318,13 +3769,24 @@ class Receipt:
             'peak_running_by_cloud': progress.peak_running_by_cloud,
             'peak_running_gpu_units_by_cloud':
                 progress.peak_running_gpu_units_by_cloud,
-            'scale_elapsed_seconds':
-                (None if progress.scale_started_monotonic is None or
-                 progress.scale_reached_monotonic is None else
-                 progress.scale_reached_monotonic -
-                 progress.scale_started_monotonic),
-            'pressure_successes': pressure_successes,
-            'warm_successes': warm_successes,
+            'baseline_qualified_iteration_id':
+                progress.baseline_qualified_iteration_id,
+            'baseline_qualified_observed_at':
+                progress.baseline_qualified_observed_at,
+            'campaign_loaded_iteration_id':
+                progress.campaign_loaded_iteration_id,
+            'campaign_loaded_observed_at': progress.campaign_loaded_observed_at,
+            'campaign_loaded_request_observed_at':
+                progress.campaign_loaded_request_observed_at,
+            # Preserve the wall start and bind the exact provider observation
+            # that qualified.  The aggregate gate derives elapsed time from
+            # these two receipt facts; a free-standing elapsed scalar is not
+            # evidence.
+            'scale_started_at': progress.scale_started_at,
+            'scale_qualified_observed_at': progress.scale_qualified_observed_at,
+            'scale_qualified_iteration_id':
+                progress.scale_qualified_iteration_id,
+            'exact_request_successes': exact_request_successes,
             'aws_retained_volume_ids': dict(aws_volume_ids or {}),
         })
         if ledger_baseline is not None:
@@ -3364,7 +3826,8 @@ def read_aws_volume_ids_receipt(
             from error
     raw = (payload.get('aws_retained_volume_ids')
            if isinstance(payload, dict) else None)
-    if (not isinstance(payload, dict) or payload.get('schema_version') != 3 or
+    if (not isinstance(payload, dict) or payload.get('schema_version')
+            != _QUALIFICATION_RECEIPT_SCHEMA_VERSION or
             payload.get('service_name') != service_name or
             not isinstance(raw, dict)):
         raise QualificationError('Qualification receipt is malformed.')
@@ -3489,6 +3952,20 @@ def _exact_request_headers(*, token: str, service_hash: str, request_id: str,
     }
 
 
+def _bounded_retry_delay(retry_after: object, *, attempt: int,
+                         request_id: str) -> float:
+    """Return bounded exponential delay with stable per-request jitter."""
+    try:
+        base = max(0.1, float(retry_after))
+    except (TypeError, ValueError):
+        base = 1.0
+    exponential = base * 2**min(max(attempt, 0), 4)
+    digest = hashlib.sha256(f'{request_id}:{attempt}'.encode()).digest()
+    fraction = int.from_bytes(digest[:8], 'big') / float(2**64 - 1)
+    jittered = exponential * (0.75 + 0.5 * fraction)
+    return min(10.0, max(0.1, jittered))
+
+
 async def _submit_exact_async_request(
     session: aiohttp.ClientSession,
     *,
@@ -3508,6 +3985,7 @@ async def _submit_exact_async_request(
                                      request_id=request_id,
                                      stable_job_id=stable_job_id,
                                      intent_sha256=intent_sha256)
+    retry_attempt = 0
     while time.monotonic() < deadline:
         try:
             async with session.post(url, headers=headers,
@@ -3542,10 +4020,10 @@ async def _submit_exact_async_request(
             # fails closed instead of replaying a non-idempotent request.
             raise QualificationError(
                 f'{request_id} lost its exact admission response.') from error
-        try:
-            delay = min(10.0, max(0.1, float(retry_after)))
-        except ValueError:
-            delay = 1.0
+        delay = _bounded_retry_delay(retry_after,
+                                     attempt=retry_attempt,
+                                     request_id=request_id)
+        retry_attempt += 1
         await asyncio.sleep(delay)
     raise QualificationError(
         f'{request_id} exhausted its exact admission deadline.')
@@ -3581,6 +4059,7 @@ async def _complete_exact_async_request(
         'status': 'SUCCEEDED',
         'processing_time_us': processing_time_us,
     }
+    retry_attempt = 0
     while time.monotonic() < deadline:
         retry_after = '0.5'
         try:
@@ -3601,10 +4080,10 @@ async def _complete_exact_async_request(
                 retry_after = response.headers.get('Retry-After', '0.5')
         except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
             pass
-        try:
-            delay = min(5.0, max(0.1, float(retry_after)))
-        except ValueError:
-            delay = 0.5
+        delay = _bounded_retry_delay(retry_after,
+                                     attempt=retry_attempt,
+                                     request_id=request_id)
+        retry_attempt += 1
         await asyncio.sleep(delay)
     raise QualificationError(f'{request_id} exhausted its completion deadline.')
 
@@ -3693,136 +4172,228 @@ async def send_exact_async_requests(
     return successes
 
 
-async def _one_request(session: aiohttp.ClientSession, *, url: str, token: str,
-                       request_id: str, duration_seconds: float,
-                       deadline: float) -> None:
-    headers = {
-        _AUTH_HEADER: f'Bearer {token}',
-        _JOB_ID_HEADER: request_id,
-        _PRIORITY_HEADER: str(_REQUEST_PRIORITY),
-        _ACCELERATORS_HEADER: 'L4',
-    }
-    body = {
-        'request_id': request_id,
-        'duration_seconds': duration_seconds,
-    }
-    while time.monotonic() < deadline:
-        try:
-            async with session.post(url, headers=headers,
-                                    json=body) as response:
-                response_body = await response.read()
-                if response.status == 200:
-                    try:
-                        result = json.loads(response_body)
-                    except json.JSONDecodeError as error:
-                        raise QualificationError(
-                            f'{request_id} returned invalid JSON.') from error
-                    if result.get('request_id') != request_id:
-                        raise QualificationError(
-                            f'{request_id} returned a different identity.')
-                    if result.get('status') != 'ok':
-                        raise QualificationError(
-                            f'{request_id} did not report completed processing.'
-                        )
-                    return
-                if response.status not in _RETRYABLE_STATUSES:
-                    raise QualificationError(
-                        f'{request_id} returned HTTP {response.status}: '
-                        f'{response_body[:200]!r}')
-                retry_after = response.headers.get('Retry-After', '1')
-        except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
-            retry_after = '1'
-        try:
-            delay = min(10.0, max(0.1, float(retry_after)))
-        except ValueError:
-            delay = 1.0
-        await asyncio.sleep(delay)
-    raise QualificationError(f'{request_id} exhausted its retry deadline.')
+async def _sum_exact_request_tasks(
+        tasks: collections.abc.Sequence[asyncio.Task[int]]) -> int:
+    return sum(await asyncio.gather(*tasks))
 
 
-async def send_requests(*, endpoint: str, token: str, prefix: str, count: int,
-                        concurrency: int, duration_seconds: float,
-                        timeout_seconds: float) -> int:
-    url = endpoint.rstrip('/') + '/v1/models/model:predict'
-    queue: asyncio.Queue[str] = asyncio.Queue()
-    for index in range(count):
-        queue.put_nowait(f'{prefix}-{index:05d}')
-    deadline = time.monotonic() + timeout_seconds
-    successes = 0
-    lock = asyncio.Lock()
-
-    async def worker() -> None:
-        nonlocal successes
-        while True:
-            try:
-                request_id = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return
-            await _one_request(session,
-                               url=url,
-                               token=token,
-                               request_id=request_id,
-                               duration_seconds=duration_seconds,
-                               deadline=deadline)
-            async with lock:
-                successes += 1
-            queue.task_done()
-
-    timeout = aiohttp.ClientTimeout(total=11 * 60)
-    connector = aiohttp.TCPConnector(limit=concurrency)
-    async with aiohttp.ClientSession(timeout=timeout,
-                                     connector=connector) as session:
-        await asyncio.gather(*(worker() for _ in range(min(count, concurrency)))
-                            )
-    return successes
-
-
-async def send_continuous_pressure(*, endpoint: str, token: str, prefix: str,
-                                   concurrency: int, duration_seconds: float,
-                                   timeout_seconds: float,
-                                   stop: asyncio.Event) -> int:
-    """Keep stable, retryable requests offered until scale-out converges."""
-    url = endpoint.rstrip('/') + '/v1/models/model:predict'
-    deadline = time.monotonic() + timeout_seconds
-    successes = 0
-
-    async def worker(worker_index: int) -> None:
-        nonlocal successes
-        sequence = 0
-        while not stop.is_set():
-            request_id = f'{prefix}-{worker_index:03d}-{sequence:06d}'
-            await _one_request(session,
-                               url=url,
-                               token=token,
-                               request_id=request_id,
-                               duration_seconds=duration_seconds,
-                               deadline=deadline)
-            successes += 1
-            sequence += 1
-
-    timeout = aiohttp.ClientTimeout(total=11 * 60)
-    connector = aiohttp.TCPConnector(limit=concurrency)
-    async with aiohttp.ClientSession(timeout=timeout,
-                                     connector=connector) as session:
-        await asyncio.gather(*(worker(index) for index in range(concurrency)))
-    return successes
-
-
-async def _wait_for_telemetry_baseline(*, observer: Observer, profile: Profile,
-                                       receipt: Receipt) -> RequestTelemetry:
+async def _wait_for_joined_baseline(
+        *,
+        observer: Observer,
+        profile: Profile,
+        progress: Progress,
+        receipt: Receipt,
+        expectation: ProviderExpectation | None = None) -> RequestTelemetry:
+    """Prove paired request/provider zero immediately before traffic."""
     deadline = time.monotonic() + 5 * 60
+    baseline_iteration_id = 0
     while time.monotonic() < deadline:
         try:
             telemetry = await observer.request_telemetry()
         except Exception:  # pylint: disable=broad-except
             await asyncio.sleep(profile.poll_seconds)
             continue
-        receipt.request_telemetry('baseline', telemetry)
-        if telemetry.is_exact_zero():
+        if telemetry.is_fresh_complete() and not telemetry.is_exact_zero():
+            raise QualificationError(
+                'First valid pre-demand request telemetry is nonzero.')
+        if not telemetry.is_exact_zero():
+            await asyncio.sleep(profile.poll_seconds)
+            continue
+        try:
+            observation = await observer.snapshot(
+                require_complete_demand_report=True)
+            validate_observation(observation, profile, expectation)
+        except GuardViolation:
+            raise
+        except Exception as error:  # pylint: disable=broad-except
+            receipt.miss('baseline', error)
+            await asyncio.sleep(profile.poll_seconds)
+            continue
+        if not observation.is_exact_zero():
+            raise QualificationError(
+                'First valid pre-demand provider observation is nonzero.')
+        baseline_iteration_id += 1
+        paired_at = observation.observed_at
+        if not math.isfinite(paired_at) or paired_at <= 0:
+            raise QualificationError(
+                'Joined pre-demand baseline has no finite timestamp.')
+        receipt.request_telemetry('baseline',
+                                  telemetry,
+                                  baseline_iteration_id=baseline_iteration_id,
+                                  baseline_pair_observed_at=paired_at)
+        progress.observe(observation, profile, expectation)
+        receipt.sample('baseline',
+                       observation,
+                       baseline_iteration_id=baseline_iteration_id,
+                       baseline_pair_observed_at=paired_at)
+        if baseline_iteration_id >= 3:
+            progress.baseline_qualified_iteration_id = baseline_iteration_id
+            progress.baseline_qualified_observed_at = paired_at
             return telemetry
         await asyncio.sleep(profile.poll_seconds)
     raise QualificationError(
-        'Service did not establish a fresh exact request-telemetry baseline.')
+        'Service did not establish a joined exact-zero pre-demand baseline.')
+
+
+def _has_exact_campaign_demand(telemetry: RequestTelemetry,
+                               baseline: RequestTelemetry) -> bool:
+    """Return whether dispatched work is exactly ledger-attributed."""
+    if (not baseline.is_exact_zero() or not telemetry.is_fresh_complete() or
+            telemetry.queue_depth is None or
+            telemetry.in_flight_requests is None or
+            telemetry.processing_requests is None or
+            telemetry.confirmed_in_flight_requests is None or
+            telemetry.confirmed_processing_requests is None):
+        return False
+    if (telemetry.confirmed_in_flight_requests != telemetry.in_flight_requests
+            or telemetry.confirmed_processing_requests
+            != telemetry.processing_requests or
+            telemetry.processing_requests > telemetry.in_flight_requests):
+        return False
+    active_delta = telemetry.ledger_active - baseline.ledger_active
+    # A queued request has not selected a READY replica and therefore has no
+    # ledger row yet.  Exact async rows bind at dispatch, so ledger-active must
+    # equal in-flight—not queued + in-flight—while the immutable terminal
+    # ledger delta later proves that every queued identity was processed.
+    return (active_delta >= 0 and
+            active_delta == telemetry.in_flight_requests and
+            telemetry.queue_depth + telemetry.in_flight_requests > 0)
+
+
+def _resident_campaign_size(telemetry: RequestTelemetry) -> int:
+    if (telemetry.queue_depth is None or telemetry.in_flight_requests is None):
+        return -1
+    return telemetry.queue_depth + telemetry.in_flight_requests
+
+
+async def _wait_for_campaign_stage(
+    *,
+    observer: Observer,
+    profile: Profile,
+    receipt: Receipt,
+    traffic: asyncio.Task[int],
+    baseline: RequestTelemetry,
+    expected_resident: int,
+    deadline_monotonic: float,
+) -> RequestTelemetry:
+    """Prove the held FIFO prefix is resident before offering the tail."""
+    while time.monotonic() < deadline_monotonic:
+        if traffic.done():
+            try:
+                successes = traffic.result()
+            except BaseException as error:
+                raise QualificationError(
+                    'Held campaign prefix failed before queue admission.') \
+                    from error
+            raise QualificationError(
+                'Held campaign prefix ended before queue admission after '
+                f'{successes} successes.')
+        try:
+            telemetry = await observer.request_telemetry()
+        except Exception:  # pylint: disable=broad-except
+            await asyncio.sleep(profile.poll_seconds)
+            continue
+        if (telemetry.is_fresh_complete() and
+                _resident_campaign_size(telemetry) > expected_resident):
+            raise QualificationError(
+                'Held campaign prefix contains unattributed demand.')
+        if (_has_exact_campaign_demand(telemetry, baseline) and
+                _resident_campaign_size(telemetry) == expected_resident):
+            receipt.request_telemetry('campaign-stage', telemetry)
+            return telemetry
+        await asyncio.sleep(profile.poll_seconds)
+    raise QualificationError(
+        'Held campaign prefix did not enter the request queue in time.')
+
+
+async def _wait_for_campaign_loaded(
+    *,
+    observer: Observer,
+    profile: Profile,
+    progress: Progress,
+    receipt: Receipt,
+    traffic: asyncio.Task[int],
+    baseline: RequestTelemetry,
+    expectation: ProviderExpectation,
+    deadline_monotonic: float,
+) -> RequestTelemetry:
+    """Join the exact resident campaign to the LB's offered-arrival counter."""
+    campaign_iteration_id = 0
+    while time.monotonic() < deadline_monotonic:
+        if traffic.done():
+            try:
+                successes = traffic.result()
+            except BaseException as error:
+                raise QualificationError(
+                    'Exact campaign failed before its arrival proof.') \
+                    from error
+            raise QualificationError(
+                'Exact campaign ended before its arrival proof after '
+                f'{successes} successes.')
+        try:
+            telemetry = await observer.request_telemetry()
+        except Exception:  # pylint: disable=broad-except
+            await asyncio.sleep(profile.poll_seconds)
+            continue
+        resident = _resident_campaign_size(telemetry)
+        if (telemetry.is_fresh_complete() and
+                resident > expectation.exact_request_count):
+            raise QualificationError(
+                'Resident demand exceeds the exact campaign identity count.')
+        if (not _has_exact_campaign_demand(telemetry, baseline) or
+                resident != expectation.exact_request_count):
+            await asyncio.sleep(profile.poll_seconds)
+            continue
+        try:
+            observation = await observer.snapshot(
+                require_complete_demand_report=False)
+            validate_observation(observation, profile, expectation)
+        except GuardViolation:
+            raise
+        except Exception as error:  # pylint: disable=broad-except
+            receipt.miss('campaign-loaded', error)
+            await asyncio.sleep(profile.poll_seconds)
+            continue
+        arrivals = observation.load_balancer
+        if (arrivals.unique_job_arrivals_60s > expectation.exact_request_count
+                or arrivals.unique_job_arrivals_300s
+                > expectation.exact_request_count or
+                arrivals.headerless_arrivals_60s > 0 or
+                arrivals.headerless_arrivals_300s > 0 or
+                arrivals.offered_arrival_tracking_saturated):
+            raise QualificationError(
+                'Offered-arrival evidence is not exactly attributable to '
+                'the campaign.')
+        if (arrivals.unique_job_arrivals_60s != expectation.exact_request_count
+                or arrivals.unique_job_arrivals_300s
+                != expectation.exact_request_count or
+                observation.database.demand_units <= 0 or
+                observation.load_balancer.demand_units <= 0):
+            await asyncio.sleep(profile.poll_seconds)
+            continue
+        campaign_iteration_id += 1
+        paired_at = observation.observed_at
+        if (not math.isfinite(paired_at) or paired_at <= 0 or
+                progress.scale_started_at is None or
+                paired_at - progress.scale_started_at
+                > _CAMPAIGN_LOAD_WINDOW_SECONDS):
+            raise QualificationError(
+                'Exact campaign missed the offered-arrival scale window.')
+        receipt.request_telemetry('campaign-loaded',
+                                  telemetry,
+                                  campaign_iteration_id=campaign_iteration_id,
+                                  campaign_pair_observed_at=paired_at)
+        progress.observe(observation, profile, expectation, qualify_scale=False)
+        receipt.sample('campaign-loaded',
+                       observation,
+                       campaign_iteration_id=campaign_iteration_id,
+                       campaign_pair_observed_at=paired_at)
+        progress.campaign_loaded_iteration_id = campaign_iteration_id
+        progress.campaign_loaded_observed_at = paired_at
+        progress.campaign_loaded_request_observed_at = telemetry.observed_at
+        return telemetry
+    raise QualificationError(
+        'Exact campaign did not fill the offered-arrival window in time.')
 
 
 async def _wait_for_positive_request_telemetry(
@@ -3850,8 +4421,7 @@ async def _wait_for_positive_request_telemetry(
         except Exception:  # pylint: disable=broad-except
             await asyncio.sleep(profile.poll_seconds)
             continue
-        receipt.request_telemetry('positive', telemetry)
-        if (telemetry.is_fresh_complete() and
+        if (_has_exact_campaign_demand(telemetry, baseline) and
                 telemetry.queue_depth is not None and
                 telemetry.queue_depth > 0 and
                 telemetry.in_flight_requests is not None and
@@ -3864,6 +4434,7 @@ async def _wait_for_positive_request_telemetry(
                 telemetry.confirmed_processing_requests > 0 and
                 telemetry.ledger_total > baseline.ledger_total and
                 telemetry.ledger_count('ACCEPTED') > 0):
+            receipt.request_telemetry('positive', telemetry)
             return telemetry
         await asyncio.sleep(profile.poll_seconds)
     raise QualificationError(
@@ -3886,12 +4457,12 @@ async def _wait_for_final_request_telemetry(
         except Exception:  # pylint: disable=broad-except
             await asyncio.sleep(profile.poll_seconds)
             continue
-        receipt.request_telemetry('final', telemetry)
         if (telemetry.is_exact_zero() and
                 telemetry.ledger_total - baseline.ledger_total
                 == expected_succeeded_delta and
                 telemetry.ledger_succeeded - baseline.ledger_succeeded
                 == expected_succeeded_delta):
+            receipt.request_telemetry('final', telemetry)
             return telemetry
         await asyncio.sleep(profile.poll_seconds)
     raise QualificationError(
@@ -3899,86 +4470,120 @@ async def _wait_for_final_request_telemetry(
         'and current-work zero.')
 
 
-async def _validated_sample(*, observer: Observer, profile: Profile,
-                            progress: Progress, receipt: Receipt,
-                            phase: str) -> Observation | None:
+async def _validated_sample(
+        *,
+        observer: Observer,
+        profile: Profile,
+        progress: Progress,
+        receipt: Receipt,
+        phase: str,
+        expectation: ProviderExpectation | None = None,
+        scale_iteration_id: int | None = None) -> Observation | None:
     """Collect one sample without turning observer loss into launch control."""
     try:
         observation = await observer.snapshot(
             require_complete_demand_report=phase != 'scale')
-        validate_observation(observation, profile)
+        validate_observation(observation, profile, expectation)
     except GuardViolation:
         # Market, card, cap, and durable provider-identity guards are the only
         # evidence failures authoritative enough to stop offered traffic.
         raise
     except Exception as error:  # pylint: disable=broad-except
-        receipt.miss(phase, error)
+        receipt.miss(phase, error, scale_iteration_id=scale_iteration_id)
         return None
-    progress.observe(observation, profile)
-    receipt.sample(phase, observation)
+    progress.observe(observation, profile, expectation)
+    receipt.sample(phase, observation, scale_iteration_id=scale_iteration_id)
     return observation
 
 
-async def _wait_for_baseline(*, observer: Observer, profile: Profile,
-                             progress: Progress, receipt: Receipt) -> None:
-    zero_samples = 0
-    deadline = time.monotonic() + 5 * 60
-    while time.monotonic() < deadline:
-        observation = await _validated_sample(observer=observer,
-                                              profile=profile,
-                                              progress=progress,
-                                              receipt=receipt,
-                                              phase='baseline')
-        if observation is None:
-            await asyncio.sleep(profile.poll_seconds)
-            continue
-        zero_samples = zero_samples + 1 if observation.is_exact_zero() else 0
-        if zero_samples >= 3:
-            return
-        await asyncio.sleep(profile.poll_seconds)
-    raise QualificationError('Service did not establish a fresh zero baseline.')
-
-
-async def _wait_for_scale(*, observer: Observer, profile: Profile,
-                          progress: Progress, receipt: Receipt,
-                          pressure: asyncio.Task[int]) -> None:
+async def _wait_for_scale(
+        *,
+        observer: Observer,
+        profile: Profile,
+        progress: Progress,
+        receipt: Receipt,
+        traffic: asyncio.Task[int],
+        baseline: RequestTelemetry,
+        expectation: ProviderExpectation | None = None) -> None:
+    if expectation is None:
+        expectation = provider_expectation(profile, None)
     deadline = time.monotonic() + profile.scale_timeout_seconds
+    scale_iteration_id = 0
     while time.monotonic() < deadline:
-        if pressure.done():
+        if traffic.done():
             try:
-                successes = pressure.result()
+                successes = traffic.result()
             except BaseException as error:
                 raise QualificationError(
-                    'Continuous pressure failed before scale convergence.') \
+                    'Exact traffic failed before scale convergence.') \
                     from error
             raise QualificationError(
-                'Continuous pressure ended before scale convergence after '
+                'Exact traffic ended before scale convergence after '
                 f'{successes} successes.')
-        observation = await _validated_sample(observer=observer,
-                                              profile=profile,
-                                              progress=progress,
-                                              receipt=receipt,
-                                              phase='scale')
+        try:
+            telemetry = await observer.request_telemetry()
+        except Exception:  # pylint: disable=broad-except
+            await asyncio.sleep(profile.poll_seconds)
+            continue
+        if not _has_exact_campaign_demand(telemetry, baseline):
+            raise QualificationError(
+                'Scale demand is not exactly attributable to the campaign '
+                'ledger identities.')
+        active_delta = telemetry.ledger_active - baseline.ledger_active
+        if (profile.name == 'scale' and _resident_campaign_size(telemetry)
+                != expectation.exact_request_count):
+            raise QualificationError(
+                'Scale demand no longer contains the full exact campaign.')
+        if active_delta <= 0 or active_delta > expectation.exact_request_count:
+            raise QualificationError(
+                'Scale demand lacks positive exact dispatched identities.')
+        scale_iteration_id += 1
+        receipt.request_telemetry('scale',
+                                  telemetry,
+                                  scale_iteration_id=scale_iteration_id)
+        observation = await _validated_sample(
+            observer=observer,
+            profile=profile,
+            progress=progress,
+            receipt=receipt,
+            phase='scale',
+            expectation=expectation,
+            scale_iteration_id=(scale_iteration_id))
         if observation is None:
             await asyncio.sleep(profile.poll_seconds)
             continue
+        if (observation.database.demand_units <= 0 or
+                observation.load_balancer.demand_units <= 0):
+            raise QualificationError(
+                'Provider scale sample has no same-observation demand.')
         if progress.scale_reached_monotonic is not None:
+            if progress.scale_qualified_iteration_id is not None:
+                raise QualificationError(
+                    'Provider scale qualification was recorded twice.')
+            progress.scale_qualified_iteration_id = scale_iteration_id
             return
         await asyncio.sleep(profile.poll_seconds)
     raise QualificationError(
-        f'Provider did not reach {profile.minimum_running} physical RUNNING '
-        'L4 Spot VMs with nonzero AWS and GCP cohorts.')
+        f'Provider did not reach {expectation.minimum_physical_running} '
+        f'physical RUNNING L4 Spot VMs for {expectation.kind.value} '
+        f'providers {expectation.providers}.')
 
 
-async def _wait_for_drain(*, observer: Observer, profile: Profile,
-                          progress: Progress, receipt: Receipt) -> None:
+async def _wait_for_drain(
+        *,
+        observer: Observer,
+        profile: Profile,
+        progress: Progress,
+        receipt: Receipt,
+        expectation: ProviderExpectation | None = None) -> None:
     deadline = time.monotonic() + profile.drain_timeout_seconds
     while time.monotonic() < deadline:
         observation = await _validated_sample(observer=observer,
                                               profile=profile,
                                               progress=progress,
                                               receipt=receipt,
-                                              phase='drain')
+                                              phase='drain',
+                                              expectation=expectation)
         if observation is None:
             await asyncio.sleep(profile.poll_seconds)
             continue
@@ -3996,6 +4601,26 @@ def resolve_data_plane_token(explicit_env: str) -> str:
     if explicit:
         return explicit
     return auth_tokens.get_lb_auth_tokens(required=True)[0]
+
+
+def _provider_observers(
+    *,
+    service_name: str,
+    scope: ProviderScope,
+    profile: Profile,
+    retained_volume_ids_by_region: collections.abc.Mapping[str, list[str]] |
+    None = None,
+) -> tuple[GcpObserver | None, AwsObserver | None]:
+    """Construct only the provider clients frozen into this service version."""
+    gcp = (GcpObserver(service_name=service_name, scope=scope, profile=profile)
+           if 'gcp' in scope.providers else None)
+    aws = (AwsObserver(
+        profile=profile,
+        service_name=service_name,
+        scope=scope,
+        retained_volume_ids_by_region=retained_volume_ids_by_region,
+    ) if 'aws' in scope.providers else None)
+    return gcp, aws
 
 
 def freeze_provider_scope(args: argparse.Namespace) -> None:
@@ -4024,15 +4649,15 @@ def freeze_provider_scope(args: argparse.Namespace) -> None:
         postgres.close()
     if scope is None:
         raise QualificationError('Provider scope was not frozen.')
-    if (scope.location_scope is None or scope.aws_location_scope is None):
-        raise QualificationError('Provider scope lacks one cloud boundary.')
     print(
         json.dumps(
             {
                 'outcome': 'scope-frozen',
                 'providers': list(scope.providers),
-                'gcp_location_scope': scope.location_scope.value,
-                'aws_location_scope': scope.aws_location_scope.value,
+                'gcp_location_scope': (None if scope.location_scope is None else
+                                       scope.location_scope.value),
+                'aws_location_scope': (None if scope.aws_location_scope is None
+                                       else scope.aws_location_scope.value),
                 'receipt': str(pathlib.Path(args.output)),
             },
             sort_keys=True))
@@ -4051,27 +4676,43 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
     postgres.bind_provider_scope(scope)
     cleanup_profile = dataclasses.replace(
         PROFILES['scale'], max_units=scope.max_live_paid_gpu_units)
-    gcp = GcpObserver(service_name=args.service_name,
-                      scope=scope,
-                      profile=cleanup_profile)
-    aws = AwsObserver(profile=cleanup_profile,
-                      service_name=args.service_name,
-                      scope=scope,
-                      retained_volume_ids_by_region=retained_volume_ids)
+    gcp, aws = _provider_observers(
+        service_name=args.service_name,
+        scope=scope,
+        profile=cleanup_profile,
+        retained_volume_ids_by_region=retained_volume_ids)
     deadline = time.monotonic() + args.timeout_seconds
     consecutive_zero = 0
+    started_at = time.time()
+    samples: list[dict[str, Any]] = []
+    failure: BaseException | None = None
     try:
         while time.monotonic() < deadline:
-            gcp_census, aws_census = await asyncio.gather(
-                asyncio.to_thread(gcp.census), asyncio.to_thread(aws.census))
-            provider = combine_provider_states(
-                parse_gcp_cleanup_state(service_name=args.service_name,
-                                        instances=gcp_census.instances,
-                                        disks=gcp_census.disks,
-                                        operations=gcp_census.operations),
-                parse_aws_cleanup_state(
+            reads = []
+            if gcp is not None:
+                reads.append(asyncio.to_thread(gcp.census))
+            if aws is not None:
+                reads.append(asyncio.to_thread(aws.census))
+            censuses = await asyncio.gather(*reads)
+            census_index = 0
+            if gcp is None:
+                gcp_state = empty_provider_state('gcp')
+            else:
+                gcp_census = censuses[census_index]
+                census_index += 1
+                gcp_state = parse_gcp_cleanup_state(
+                    service_name=args.service_name,
+                    instances=gcp_census.instances,
+                    disks=gcp_census.disks,
+                    operations=gcp_census.operations)
+            if aws is None:
+                aws_state = empty_provider_state('aws')
+            else:
+                aws_census = censuses[census_index]
+                aws_state = parse_aws_cleanup_state(
                     service_instances=aws_census.service_instances,
-                    service_volumes=aws_census.service_volumes))
+                    service_volumes=aws_census.service_volumes)
+            provider = combine_provider_states(gcp_state, aws_state)
             debits, claims, waiters = await asyncio.to_thread(
                 postgres.cleanup_debits)
             exact_zero = (provider.instance_count == 0 and
@@ -4079,34 +4720,988 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
                           provider.inflight_operation_count == 0 and
                           debits == 0 and claims == 0 and waiters == 0)
             consecutive_zero = consecutive_zero + 1 if exact_zero else 0
-            print(json.dumps(
-                {
-                    'cleanup_claims': claims,
-                    'cleanup_debit_units': debits,
-                    'cleanup_provider_disks': provider.disk_count,
-                    'cleanup_provider_instances': provider.instance_count,
-                    'cleanup_provider_operations':
-                        provider.inflight_operation_count,
-                    'cleanup_provider_by_cloud': {
-                        cloud.cloud: dataclasses.asdict(cloud)
-                        for cloud in provider.clouds
-                    },
-                    'cleanup_waiters': waiters,
-                    'zero_samples': consecutive_zero,
+            sample = {
+                'observed_at': time.time(),
+                'cleanup_claims': claims,
+                'cleanup_debit_units': debits,
+                'cleanup_provider_disks': provider.disk_count,
+                'cleanup_provider_instances': provider.instance_count,
+                'cleanup_provider_operations':
+                    provider.inflight_operation_count,
+                'cleanup_provider_by_cloud': {
+                    cloud.cloud: dataclasses.asdict(cloud)
+                    for cloud in provider.clouds
                 },
-                sort_keys=True),
-                  flush=True)
+                'cleanup_waiters': waiters,
+                'exact_zero': exact_zero,
+                'zero_samples': consecutive_zero,
+            }
+            samples.append(sample)
+            print(json.dumps(sample, sort_keys=True), flush=True)
             if consecutive_zero >= 3:
                 return
             await asyncio.sleep(args.poll_seconds)
+        raise QualificationError(
+            'Teardown left paid database debits or scoped provider resources.')
+    except BaseException as error:
+        failure = error
+        raise
     finally:
         postgres.close()
-    raise QualificationError(
-        'Teardown left paid database debits or scoped provider resources.')
+        qualification_receipt = pathlib.Path(args.receipt)
+        try:
+            qualification_receipt_sha256 = hashlib.sha256(
+                qualification_receipt.read_bytes()).hexdigest()
+        except OSError:
+            qualification_receipt_sha256 = None
+        payload = {
+            'schema_version': _CLEANUP_RECEIPT_SCHEMA_VERSION,
+            'service_name': args.service_name,
+            'service_hash': scope.service_hash,
+            'lifecycle_epoch': scope.lifecycle_epoch,
+            'service_version': scope.service_version,
+            'controller_config_digest': scope.controller_config_digest,
+            'controller_config_snapshot_id':
+                scope.controller_config_snapshot_id,
+            'expected_providers': list(scope.providers),
+            'service_yaml_sha256': scope.service_yaml_sha256,
+            'qualification_profile': scope.qualification_profile,
+            'qualification_source_sha256': scope.qualification_source_sha256,
+            'qualification_projection_sha256':
+                scope.qualification_projection_sha256,
+            'qualification_receipt_sha256': qualification_receipt_sha256,
+            'started_at': started_at,
+            'finished_at': time.time(),
+            'outcome': 'passed' if failure is None else 'failed',
+            'zero_samples': consecutive_zero,
+            'samples': samples,
+        }
+        if failure is not None:
+            payload['error_type'] = type(failure).__name__
+        output = pathlib.Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n',
+                          encoding='utf-8')
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class QualificationEvidence:
+    """Strict, credential-free projection consumed by the aggregate gate."""
+
+    path: pathlib.Path
+    sha256: str
+    service_name: str
+    service_hash: str
+    lifecycle_epoch: int
+    service_version: int
+    controller_config_digest: str
+    controller_config_snapshot_id: str
+    service_yaml_sha256: str
+    qualification_source_sha256: str
+    qualification_projection_sha256: str
+    authorized_economic_receipt_sha256: str | None
+    expectation_kind: ExpectationKind
+    expected_providers: tuple[str, ...]
+    positive_providers: frozenset[str]
+    peak_running: int
+    scale_elapsed_seconds: float
+    exact_request_count: int
+
+
+def _read_json_object(path: pathlib.Path,
+                      description: str) -> tuple[dict[str, Any], str]:
+    try:
+        contents = path.read_bytes()
+        payload = json.loads(contents)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise QualificationError(f'{description} is unavailable.') from error
+    if not isinstance(payload, dict):
+        raise QualificationError(f'{description} is malformed.')
+    return payload, hashlib.sha256(contents).hexdigest()
+
+
+_ZERO_OBSERVATION_FIELDS = (
+    'paid_debit_units',
+    'claimed_units',
+    'waiters',
+    'provider_free_unbound_replicas',
+    'postgres_demand_units',
+    'provider_instances',
+    'provider_running',
+    'provider_gpu_units',
+    'provider_running_gpu_units',
+    'provider_disks',
+    'provider_inflight_operations',
+    'lb_demand_units',
+    'lb_ready_replicas',
+    'lb_unique_job_arrivals_60s',
+    'lb_unique_job_arrivals_300s',
+    'lb_headerless_arrivals_60s',
+    'lb_headerless_arrivals_300s',
+)
+_ZERO_PROVIDER_CLOUD_FIELDS = (
+    'instances',
+    'running',
+    'gpu_units',
+    'running_gpu_units',
+    'disks',
+    'inflight_operations',
+)
+_PROVIDER_CLOUD_FIELDS = frozenset((*_ZERO_PROVIDER_CLOUD_FIELDS, 'shapes'))
+_PROVIDER_SHAPE_FIELDS = frozenset({
+    'gpu_units_per_instance',
+    'instance_count',
+    'instance_type',
+    'running_count',
+    'running_gpu_units',
+})
+
+
+def _strict_timestamp(sample: collections.abc.Mapping[str, Any]) -> float:
+    value = sample.get('observed_at')
+    if (not isinstance(value, (int, float)) or isinstance(value, bool) or
+            not math.isfinite(value) or value <= 0):
+        raise QualificationError('Evidence sample has no strict timestamp.')
+    return float(value)
+
+
+def _canonical_zero_provider_projection(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {'aws', 'gcp'}:
+        return False
+    return all(
+        isinstance(value[cloud], dict) and set(value[cloud]) ==
+        _PROVIDER_CLOUD_FIELDS and value[cloud].get('shapes') == [] and all(
+            value[cloud].get(field) == 0
+            for field in _ZERO_PROVIDER_CLOUD_FIELDS)
+        for cloud in ('aws', 'gcp'))
+
+
+def _qualification_sample_is_exact_zero(sample: object,
+                                        *,
+                                        phase: str = 'drain') -> bool:
+    return (
+        isinstance(sample, dict) and sample.get('phase') == phase and
+        sample.get('exact_zero') is True and
+        sample.get('lb_offered_arrival_tracking_saturated') is False and
+        all(sample.get(field) == 0 for field in _ZERO_OBSERVATION_FIELDS) and
+        _canonical_zero_provider_projection(sample.get('provider_by_cloud')))
+
+
+def _validate_natural_drain_samples(samples: object,
+                                    profile: Profile) -> tuple[float, float]:
+    if not isinstance(samples, list) or len(samples) < 3:
+        raise QualificationError(
+            'Qualification receipt lacks natural-drain evidence.')
+    trailing: list[dict[str, Any]] = []
+    for sample in reversed(samples):
+        if not _qualification_sample_is_exact_zero(sample):
+            break
+        assert isinstance(sample, dict)
+        trailing.append(sample)
+    trailing.reverse()
+    if len(trailing) < 3:
+        raise QualificationError(
+            'Qualification receipt lacks natural-drain evidence.')
+    timestamps = [_strict_timestamp(sample) for sample in trailing]
+    if (any(current <= prior
+            for prior, current in zip(timestamps, timestamps[1:])) or
+            timestamps[-1] - timestamps[0] < profile.zero_hold_seconds):
+        raise QualificationError(
+            'Qualification receipt lacks sustained natural-drain evidence.')
+    return timestamps[0], timestamps[-1]
+
+
+def _ledger_counts(sample: collections.abc.Mapping[str, Any]) -> dict[str, int]:
+    raw = sample.get('ledger_state_counts')
+    expected_states = [
+        state.value for state in async_request_ledger.AsyncRequestState
+    ]
+    if not isinstance(raw, list) or len(raw) != len(expected_states):
+        raise QualificationError('Request telemetry evidence is malformed.')
+    counts: dict[str, int] = {}
+    for expected_state, item in zip(expected_states, raw):
+        if (not isinstance(item, list) or len(item) != 2 or
+                item[0] != expected_state or type(item[1]) is not int or
+                item[1] < 0):
+            raise QualificationError('Request telemetry evidence is malformed.')
+        counts[item[0]] = item[1]
+    return counts
+
+
+def _telemetry_is_fresh_complete(
+        sample: collections.abc.Mapping[str, Any]) -> bool:
+    return (sample.get('state') == 'fresh' and
+            sample.get('reason') == 'complete' and
+            sample.get('compatibility_complete') is True and all(
+                type(sample.get(field)) is int and sample[field] >= 0
+                for field in ('queue_depth', 'in_flight_requests',
+                              'processing_requests',
+                              'confirmed_in_flight_requests',
+                              'confirmed_processing_requests')))
+
+
+def _telemetry_is_exactly_attributed(sample: collections.abc.Mapping[str, Any],
+                                     baseline_active: int) -> bool:
+    if not _telemetry_is_fresh_complete(sample):
+        return False
+    counts = _ledger_counts(sample)
+    ledger_active = sum(counts.get(state, 0) for state in _ASYNC_ACTIVE_STATES)
+    ledger_total = sum(counts.values())
+    return (sample.get('ledger_active') == ledger_active and
+            sample.get('ledger_total') == ledger_total and
+            sample.get('ledger_succeeded') == counts.get('SUCCEEDED', 0) and
+            sample['confirmed_in_flight_requests']
+            == sample['in_flight_requests'] and
+            sample['confirmed_processing_requests']
+            == sample['processing_requests'] and
+            sample['processing_requests'] <= sample['in_flight_requests'] and
+            ledger_active - baseline_active == sample['in_flight_requests'])
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _RequestEvidence:
+    """Validated request-side timing and provider-pair authority."""
+
+    baseline_pairs: tuple[tuple[int, float], ...]
+    campaign_pair: tuple[int, float] | None
+    campaign_request_observed_at: float | None
+    positive_scale_iterations: frozenset[int]
+    scale_observed_at_by_iteration: tuple[tuple[int, float], ...]
+    first_positive_observed_at: float
+    last_positive_observed_at: float
+    final_observed_at: float
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _ProviderEvidence:
+    """Validated provider-side timing derived from physical samples."""
+
+    scale_elapsed_seconds: float
+    scale_started_at: float
+    first_scale_observed_at: float
+    qualified_observed_at: float
+
+
+def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
+                               profile: Profile,
+                               exact_count: int) -> _RequestEvidence:
+    samples = payload.get('request_telemetry_samples')
+    if (not isinstance(samples, list) or not samples or
+            any(not isinstance(sample, dict) for sample in samples)):
+        raise QualificationError(
+            'Qualification receipt lacks request telemetry evidence.')
+    typed_samples = typing.cast(list[dict[str, Any]], samples)
+    allowed_phases = {
+        'baseline', 'campaign-stage', 'campaign-loaded', 'positive', 'scale',
+        'final'
+    }
+    if any(
+            sample.get('phase') not in allowed_phases
+            for sample in typed_samples):
+        raise QualificationError(
+            'Qualification receipt has malformed request telemetry evidence.')
+    for sample in typed_samples:
+        _strict_timestamp(sample)
+    baselines = [
+        sample for sample in typed_samples if sample.get('phase') == 'baseline'
+    ]
+    finals = [
+        sample for sample in typed_samples if sample.get('phase') == 'final'
+    ]
+    scale = [
+        sample for sample in typed_samples if sample.get('phase') == 'scale'
+    ]
+    if len(baselines) != 3 or len(finals) != 1 or not scale:
+        raise QualificationError(
+            'Qualification receipt lacks request telemetry evidence.')
+
+    baseline_pairs: list[tuple[int, float]] = []
+    for expected_id, sample in enumerate(baselines, start=1):
+        pair_id = sample.get('baseline_iteration_id')
+        pair_at = _strict_timestamp(
+            {'observed_at': sample.get('baseline_pair_observed_at')})
+        if (pair_id != expected_id or
+                not _telemetry_is_exactly_attributed(sample, 0) or
+                sample.get('queue_depth') != 0 or
+                sample.get('in_flight_requests') != 0 or
+                sample.get('processing_requests') != 0):
+            raise QualificationError(
+                'Qualification receipt has a nonzero or unpaired request '
+                'baseline.')
+        baseline_pairs.append((expected_id, pair_at))
+    if any(current[1] <= prior[1]
+           for prior, current in zip(baseline_pairs, baseline_pairs[1:])):
+        raise QualificationError(
+            'Qualification receipt has replayed request baseline evidence.')
+    baseline = baselines[-1]
+    final = finals[0]
+    baseline_counts = _ledger_counts(baseline)
+    baseline_active = sum(
+        baseline_counts.get(state, 0) for state in _ASYNC_ACTIVE_STATES)
+
+    campaign_pair: tuple[int, float] | None = None
+    campaign_request_observed_at: float | None = None
+    campaign_loaded = [
+        sample for sample in typed_samples
+        if sample.get('phase') == 'campaign-loaded'
+    ]
+    campaign_stage = [
+        sample for sample in typed_samples
+        if sample.get('phase') == 'campaign-stage'
+    ]
+    if profile.name == 'scale':
+        if len(campaign_stage) != 1 or len(campaign_loaded) != 1:
+            raise QualificationError(
+                'Qualification receipt lacks exact campaign-load evidence.')
+        stage = campaign_stage[0]
+        loaded = campaign_loaded[0]
+        if (not _telemetry_is_exactly_attributed(stage, baseline_active) or
+                stage['queue_depth'] + stage['in_flight_requests']
+                != held_request_count(profile) or
+                not _telemetry_is_exactly_attributed(loaded, baseline_active) or
+                loaded['queue_depth'] + loaded['in_flight_requests']
+                != exact_count):
+            raise QualificationError(
+                'Qualification receipt has an incomplete resident campaign.')
+        campaign_id = loaded.get('campaign_iteration_id')
+        campaign_at = _strict_timestamp(
+            {'observed_at': loaded.get('campaign_pair_observed_at')})
+        if type(campaign_id) is not int or campaign_id != 1:
+            raise QualificationError(
+                'Qualification receipt has unpaired campaign-load evidence.')
+        campaign_pair = (campaign_id, campaign_at)
+        campaign_request_observed_at = _strict_timestamp(loaded)
+        if (not baseline_pairs[-1][1] < _strict_timestamp(stage) <=
+                campaign_request_observed_at <= campaign_at):
+            raise QualificationError(
+                'Qualification receipt has reordered campaign-load evidence.')
+    elif campaign_stage or campaign_loaded:
+        raise QualificationError(
+            'Provider canary contains economic campaign-load evidence.')
+
+    scale_iteration_ids: set[int] = set()
+    scale_observed_at_by_iteration: list[tuple[int, float]] = []
+    positive_timestamps: list[float] = []
+    for sample in scale:
+        iteration_id = sample.get('scale_iteration_id')
+        resident = sample['queue_depth'] + sample['in_flight_requests']
+        if (type(iteration_id) is not int or iteration_id < 1 or
+                iteration_id in scale_iteration_ids or
+                not _telemetry_is_exactly_attributed(sample, baseline_active) or
+                sample.get('ledger_active', 0) - baseline_active <= 0 or
+                resident != (exact_count if profile.name == 'scale' else 1)):
+            raise QualificationError(
+                'Qualification receipt contains unattributed scale demand.')
+        scale_iteration_ids.add(iteration_id)
+        scale_observed_at = _strict_timestamp(sample)
+        scale_observed_at_by_iteration.append((iteration_id, scale_observed_at))
+        positive_timestamps.append(scale_observed_at)
+    if not scale_iteration_ids:
+        raise QualificationError(
+            'Qualification receipt contains unattributed scale demand.')
+    if profile.name == 'scale':
+        positive = [
+            sample for sample in typed_samples
+            if sample.get('phase') == 'positive'
+        ]
+        if (len(positive) != 1 or not _telemetry_is_exactly_attributed(
+                positive[0], baseline_active) or
+                positive[0]['queue_depth'] <= 0 or
+                positive[0]['in_flight_requests'] <= 0 or
+                positive[0]['processing_requests'] <= 0 or
+                positive[0]['queue_depth'] + positive[0]['in_flight_requests']
+                != exact_count):
+            raise QualificationError(
+                'Qualification receipt lacks exact positive request telemetry.')
+        positive_timestamps.append(_strict_timestamp(positive[0]))
+    elif any(sample.get('phase') == 'positive' for sample in typed_samples):
+        raise QualificationError(
+            'Provider canary contains economic request telemetry.')
+
+    final_counts = _ledger_counts(final)
+    final_active = sum(
+        final_counts.get(state, 0) for state in _ASYNC_ACTIVE_STATES)
+    if (not _telemetry_is_exactly_attributed(final, baseline_active) or
+            final_active != 0 or final.get('queue_depth') != 0 or
+            final.get('in_flight_requests') != 0 or
+            final.get('processing_requests') != 0 or
+            sum(final_counts.values()) - sum(baseline_counts.values())
+            != exact_count or final_counts.get('SUCCEEDED', 0) -
+            baseline_counts.get('SUCCEEDED', 0) != exact_count):
+        raise QualificationError(
+            'Qualification receipt lacks exact terminal ledger evidence.')
+    final_observed_at = _strict_timestamp(final)
+    if (not positive_timestamps or
+            final_observed_at <= max(positive_timestamps) or
+            baseline_pairs[-1][1] >= min(positive_timestamps) or
+        (campaign_pair is not None and
+         campaign_pair[1] >= min(positive_timestamps))):
+        raise QualificationError(
+            'Terminal request evidence does not follow scale demand.')
+    return _RequestEvidence(
+        baseline_pairs=tuple(baseline_pairs),
+        campaign_pair=campaign_pair,
+        campaign_request_observed_at=campaign_request_observed_at,
+        positive_scale_iterations=frozenset(scale_iteration_ids),
+        scale_observed_at_by_iteration=tuple(scale_observed_at_by_iteration),
+        first_positive_observed_at=min(positive_timestamps),
+        last_positive_observed_at=max(positive_timestamps),
+        final_observed_at=final_observed_at)
+
+
+def _complete_provider_sample(
+    sample: collections.abc.Mapping[str, Any],
+    *,
+    max_units: int,
+    max_instances: int,
+) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+    """Validate and reduce one canonical physical-provider observation."""
+    by_cloud = sample.get('provider_by_cloud')
+    if not isinstance(by_cloud, dict) or set(by_cloud) != {'aws', 'gcp'}:
+        raise QualificationError(
+            'Qualification receipt has an incomplete provider sample.')
+    cloud_totals: dict[str, dict[str, int]] = {}
+    for cloud in ('aws', 'gcp'):
+        projection = by_cloud[cloud]
+        if (not isinstance(projection, dict) or
+                set(projection) != _PROVIDER_CLOUD_FIELDS):
+            raise QualificationError(
+                'Qualification receipt has an incomplete provider sample.')
+        fields = {
+            field: projection[field] for field in _ZERO_PROVIDER_CLOUD_FIELDS
+        }
+        if any(
+                type(value) is not int or value < 0
+                for value in fields.values()):
+            raise QualificationError(
+                'Qualification receipt has an invalid provider sample.')
+        if (fields['running'] > fields['instances'] or
+                fields['running_gpu_units'] > fields['gpu_units']):
+            raise QualificationError(
+                'Qualification receipt has an invalid provider sample.')
+        shapes = projection['shapes']
+        if not isinstance(shapes, list):
+            raise QualificationError(
+                'Qualification receipt has an incomplete provider sample.')
+        shape_keys: list[tuple[str, int]] = []
+        shape_instances = 0
+        shape_running = 0
+        shape_gpu_units = 0
+        shape_running_gpu_units = 0
+        for shape in shapes:
+            if (not isinstance(shape, dict) or
+                    set(shape) != _PROVIDER_SHAPE_FIELDS):
+                raise QualificationError(
+                    'Qualification receipt has an incomplete provider shape.')
+            instance_type = shape['instance_type']
+            width = shape['gpu_units_per_instance']
+            instances = shape['instance_count']
+            running = shape['running_count']
+            running_gpu_units = shape['running_gpu_units']
+            if (not isinstance(instance_type, str) or not instance_type or
+                    type(width) is not int or width < 1 or
+                    type(instances) is not int or instances < 1 or
+                    type(running) is not int or not 0 <= running <= instances or
+                    type(running_gpu_units) is not int or
+                    running_gpu_units != running * width):
+                raise QualificationError(
+                    'Qualification receipt has an invalid provider shape.')
+            shape_keys.append((instance_type, width))
+            shape_instances += instances
+            shape_running += running
+            shape_gpu_units += instances * width
+            shape_running_gpu_units += running_gpu_units
+        if (shape_keys != sorted(set(shape_keys)) or
+                shape_instances != fields['instances'] or
+                shape_running != fields['running'] or
+                shape_gpu_units != fields['gpu_units'] or
+                shape_running_gpu_units != fields['running_gpu_units']):
+            raise QualificationError(
+                'Qualification receipt has a contradictory provider shape.')
+        cloud_totals[cloud] = fields
+
+    top_level_names = {
+        'instances': 'provider_instances',
+        'running': 'provider_running',
+        'gpu_units': 'provider_gpu_units',
+        'running_gpu_units': 'provider_running_gpu_units',
+        'disks': 'provider_disks',
+        'inflight_operations': 'provider_inflight_operations',
+    }
+    totals = {
+        field: sample.get(top_level)
+        for field, top_level in top_level_names.items()
+    }
+    if (any(type(value) is not int or value < 0 for value in totals.values()) or
+            any(totals[field] != sum(cloud_totals[cloud][field]
+                                     for cloud in ('aws', 'gcp'))
+                for field in top_level_names) or
+            totals['running'] > totals['instances'] or
+            totals['running_gpu_units'] > totals['gpu_units'] or
+            totals['gpu_units'] > max_units or
+            totals['instances'] > max_instances):
+        raise QualificationError(
+            'Qualification receipt has contradictory provider totals or cap.')
+    return totals, cloud_totals
+
+
+def _validate_provider_scale_samples(
+        payload: collections.abc.Mapping[str, Any], *,
+        providers: tuple[str, ...], profile: Profile,
+        request_evidence: _RequestEvidence) -> _ProviderEvidence:
+    """Derive physical peaks and scale elapsed from complete bound samples."""
+    samples = payload.get('samples')
+    if not isinstance(samples, list):
+        raise QualificationError(
+            'Qualification receipt lacks provider scale evidence.')
+    scale_started_at = _strict_timestamp(
+        {'observed_at': payload.get('scale_started_at')})
+    bound_qualified_at = _strict_timestamp(
+        {'observed_at': payload.get('scale_qualified_observed_at')})
+    qualified_at: float | None = None
+    qualified_iteration_id: int | None = None
+    baseline_pairs: list[tuple[int, float]] = []
+    campaign_pairs: list[tuple[int, float]] = []
+    provider_scale_iterations: set[int] = set()
+    request_scale_times = dict(request_evidence.scale_observed_at_by_iteration)
+    first_scale_observed_at: float | None = None
+    calculated_peak = 0
+    calculated_gpu_peak = 0
+    calculated_by_cloud = {'aws': 0, 'gcp': 0}
+    calculated_gpu_by_cloud = {'aws': 0, 'gcp': 0}
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise QualificationError(
+                'Qualification receipt has a malformed provider sample.')
+        if 'observation_error_type' in sample:
+            continue
+        observed_at = _strict_timestamp(sample)
+        totals, by_cloud = _complete_provider_sample(
+            sample,
+            max_units=profile.max_units,
+            max_instances=profile.max_replicas)
+        if sample.get('phase') == 'baseline':
+            pair_id = sample.get('baseline_iteration_id')
+            pair_at = _strict_timestamp(
+                {'observed_at': sample.get('baseline_pair_observed_at')})
+            if not _qualification_sample_is_exact_zero(sample,
+                                                       phase='baseline'):
+                raise QualificationError(
+                    'Qualification receipt has a nonzero provider baseline.')
+            if (type(pair_id) is not int or pair_id < 1 or
+                    pair_at != observed_at):
+                raise QualificationError(
+                    'Qualification receipt has an unpaired provider baseline.')
+            baseline_pairs.append((pair_id, pair_at))
+        if sample.get('phase') == 'campaign-loaded':
+            pair_id = sample.get('campaign_iteration_id')
+            pair_at = _strict_timestamp(
+                {'observed_at': sample.get('campaign_pair_observed_at')})
+            expected_arrivals = profile.exact_requests
+            if (type(pair_id) is not int or pair_id < 1 or
+                    pair_at != observed_at or
+                    sample.get('postgres_demand_units', 0) <= 0 or
+                    sample.get('lb_demand_units', 0) <= 0 or
+                    sample.get('lb_unique_job_arrivals_60s')
+                    != expected_arrivals or
+                    sample.get('lb_unique_job_arrivals_300s')
+                    != expected_arrivals or
+                    sample.get('lb_headerless_arrivals_60s') != 0 or
+                    sample.get('lb_headerless_arrivals_300s') != 0 or
+                    sample.get('lb_offered_arrival_tracking_saturated')
+                    is not False):
+                raise QualificationError(
+                    'Qualification receipt lacks exact offered-arrival '
+                    'campaign evidence.')
+            campaign_pairs.append((pair_id, pair_at))
+        calculated_peak = max(calculated_peak, totals['running'])
+        calculated_gpu_peak = max(calculated_gpu_peak,
+                                  totals['running_gpu_units'])
+        for cloud in ('aws', 'gcp'):
+            calculated_by_cloud[cloud] = max(calculated_by_cloud[cloud],
+                                             by_cloud[cloud]['running'])
+            calculated_gpu_by_cloud[cloud] = max(
+                calculated_gpu_by_cloud[cloud],
+                by_cloud[cloud]['running_gpu_units'])
+        if sample.get('phase') != 'scale':
+            continue
+        if (sample.get('postgres_demand_units', 0) <= 0 or
+                sample.get('lb_demand_units', 0) <= 0):
+            raise QualificationError(
+                'Provider scale sample has no same-observation demand.')
+        iteration_id = sample.get('scale_iteration_id')
+        if (type(iteration_id) is not int or iteration_id < 1 or
+                iteration_id in provider_scale_iterations or iteration_id
+                not in request_evidence.positive_scale_iterations or
+                observed_at < request_scale_times[iteration_id]):
+            raise QualificationError(
+                'Provider scale sample has no paired exact demand evidence.')
+        provider_scale_iterations.add(iteration_id)
+        if first_scale_observed_at is None:
+            first_scale_observed_at = observed_at
+        if any(
+                any(by_cloud[cloud][field] != 0
+                    for field in _ZERO_PROVIDER_CLOUD_FIELDS)
+                for cloud in {'aws', 'gcp'} - set(providers)):
+            raise QualificationError(
+                'Qualification receipt contains out-of-scope scale evidence.')
+        if (qualified_at is None and
+                totals['running'] >= profile.minimum_running):
+            qualified_at = observed_at
+            qualified_iteration_id = iteration_id
+    elapsed = (None if qualified_at is None else qualified_at -
+               scale_started_at)
+    final_baseline_at = request_evidence.baseline_pairs[-1][1]
+    baseline_is_immediate = (0 <= scale_started_at - final_baseline_at <= max(
+        1.0, profile.poll_seconds))
+    if (tuple(baseline_pairs) != request_evidence.baseline_pairs or
+            payload.get('baseline_qualified_iteration_id')
+            != request_evidence.baseline_pairs[-1][0] or
+            payload.get('baseline_qualified_observed_at') != final_baseline_at
+            or not baseline_is_immediate or first_scale_observed_at is None or
+            scale_started_at > first_scale_observed_at or
+            scale_started_at > request_evidence.first_positive_observed_at or
+            qualified_at is None or
+            qualified_at >= request_evidence.final_observed_at or
+            bound_qualified_at != qualified_at or
+            payload.get('scale_qualified_iteration_id')
+            != qualified_iteration_id or elapsed is None or
+            not math.isfinite(elapsed) or elapsed < 0 or
+            elapsed > profile.scale_slo_seconds or
+            payload.get('peak_running') != calculated_peak or
+            payload.get('peak_running_gpu_units') != calculated_gpu_peak or
+            payload.get('peak_running_by_cloud') != calculated_by_cloud or
+            payload.get('peak_running_gpu_units_by_cloud')
+            != calculated_gpu_by_cloud):
+        raise QualificationError(
+            'Qualification receipt lacks provider scale evidence.')
+    if profile.name == 'scale':
+        if (request_evidence.campaign_pair is None or
+                campaign_pairs != [request_evidence.campaign_pair] or
+                payload.get('campaign_loaded_iteration_id')
+                != request_evidence.campaign_pair[0] or
+                payload.get('campaign_loaded_observed_at')
+                != request_evidence.campaign_pair[1] or
+                payload.get('campaign_loaded_request_observed_at')
+                != request_evidence.campaign_request_observed_at or
+                not scale_started_at < request_evidence.campaign_pair[1] <=
+                scale_started_at + _CAMPAIGN_LOAD_WINDOW_SECONDS or
+                not request_evidence.campaign_pair[1] < first_scale_observed_at
+                <= qualified_at):
+            raise QualificationError(
+                'Qualification receipt lacks joined campaign-load evidence.')
+    elif campaign_pairs or request_evidence.campaign_pair is not None:
+        raise QualificationError(
+            'Provider canary contains economic campaign-load evidence.')
+    return _ProviderEvidence(scale_elapsed_seconds=elapsed,
+                             scale_started_at=scale_started_at,
+                             first_scale_observed_at=first_scale_observed_at,
+                             qualified_observed_at=qualified_at)
+
+
+def _read_qualification_evidence(
+        path: pathlib.Path,
+        expected_kind: ExpectationKind) -> QualificationEvidence:
+    payload, sha256 = _read_json_object(path, 'Qualification receipt')
+    providers_raw = payload.get('expected_providers')
+    peaks = payload.get('peak_running_by_cloud')
+    exact_count = payload.get('exact_request_count')
+    exact_successes = payload.get('exact_request_successes')
+    authorized_economic_receipt_sha256 = payload.get(
+        'authorized_economic_receipt_sha256')
+    try:
+        kind = ExpectationKind(payload.get('expectation_kind'))
+    except (TypeError, ValueError) as error:
+        raise QualificationError('Qualification receipt is malformed.') \
+            from error
+    identity_fields = ('service_name', 'service_hash',
+                       'controller_config_digest',
+                       'controller_config_snapshot_id', 'service_yaml_sha256',
+                       'qualification_source_sha256',
+                       'qualification_projection_sha256')
+    if (payload.get('schema_version') != _QUALIFICATION_RECEIPT_SCHEMA_VERSION
+            or payload.get('outcome') != 'passed' or
+            kind is not expected_kind or not all(
+                isinstance(payload.get(field), str) and payload[field]
+                for field in identity_fields) or any(
+                    re.fullmatch(r'[0-9a-f]{64}', payload[field]) is None
+                    for field in identity_fields
+                    if field not in ('service_name', 'service_hash')) or
+            type(payload.get('lifecycle_epoch')) is not int or
+            payload['lifecycle_epoch'] < 1 or
+            type(payload.get('service_version')) is not int or
+            payload['service_version'] < 1 or
+            not isinstance(providers_raw, list) or
+            tuple(providers_raw) not in (('aws',), ('gcp',), ('aws', 'gcp')) or
+            not isinstance(peaks, dict) or
+            any(cloud not in ('aws',
+                              'gcp') or type(count) is not int or count < 0
+                for cloud, count in peaks.items()) or
+            type(payload.get('peak_running')) is not int or
+            payload['peak_running'] < 1 or type(exact_count) is not int or
+            exact_count < 1 or exact_successes != exact_count or
+            payload.get('ledger_request_delta') != exact_count or
+            payload.get('ledger_succeeded_delta') != exact_count or
+        (kind is ExpectationKind.ECONOMIC and
+         'authorized_economic_receipt_sha256' in payload) or
+        (kind is ExpectationKind.PROVIDER_CANARY and
+         (not isinstance(authorized_economic_receipt_sha256, str) or
+          re.fullmatch(r'[0-9a-f]{64}',
+                       authorized_economic_receipt_sha256) is None))):
+        raise QualificationError('Qualification receipt is malformed.')
+    providers = tuple(providers_raw)
+    profile = (PROFILES['scale'] if kind is ExpectationKind.ECONOMIC else
+               PROFILES['provider-canary'])
+    request_evidence = _validate_request_evidence(payload,
+                                                  profile=profile,
+                                                  exact_count=exact_count)
+    provider_evidence = _validate_provider_scale_samples(
+        payload,
+        providers=providers,
+        profile=profile,
+        request_evidence=request_evidence)
+    scale_elapsed = provider_evidence.scale_elapsed_seconds
+    if ((kind is ExpectationKind.ECONOMIC and
+         (providers != ('aws', 'gcp') or payload.get('profile') != 'scale' or
+          payload.get('minimum_running') != 100 or payload['peak_running'] < 100
+          or payload.get('max_units') != profile.max_units or scale_elapsed
+          > profile.scale_slo_seconds or exact_count != 10_000)) or
+        (kind is ExpectationKind.PROVIDER_CANARY and
+         (len(providers) != 1 or payload.get('profile') != 'provider-canary' or
+          payload.get('minimum_running') != 1 or
+          payload.get('max_units') != profile.max_units or exact_count != 1 or
+          peaks.get(providers[0], 0) < 1))):
+        raise QualificationError(
+            'Qualification receipt does not meet its typed evidence gate.')
+    if (payload.get('qualification_profile') != profile.name or
+            payload['qualification_projection_sha256']
+            != _qualification_projection_sha256(
+                source_sha256=payload['qualification_source_sha256'],
+                profile=profile,
+                providers=providers)):
+        raise QualificationError(
+            'Qualification receipt has a conflicting task projection.')
+    positive_providers = frozenset(
+        cloud for cloud, count in peaks.items() if count > 0)
+    if not positive_providers.issubset(providers):
+        raise QualificationError(
+            'Qualification receipt contains an out-of-scope provider effect.')
+    drain_first_at, drain_last_at = _validate_natural_drain_samples(
+        payload.get('samples'), profile)
+    finished_at = _strict_timestamp({'observed_at': payload.get('finished_at')})
+    if not (request_evidence.last_positive_observed_at
+            < request_evidence.final_observed_at and
+            provider_evidence.first_scale_observed_at < request_evidence.
+            final_observed_at < drain_first_at < drain_last_at < finished_at):
+        raise QualificationError(
+            'Qualification receipt has reordered lifecycle evidence.')
+    return QualificationEvidence(
+        path=path,
+        sha256=sha256,
+        service_name=payload['service_name'],
+        service_hash=payload['service_hash'],
+        lifecycle_epoch=payload['lifecycle_epoch'],
+        service_version=payload['service_version'],
+        controller_config_digest=payload['controller_config_digest'],
+        controller_config_snapshot_id=payload['controller_config_snapshot_id'],
+        service_yaml_sha256=payload['service_yaml_sha256'],
+        qualification_source_sha256=payload['qualification_source_sha256'],
+        qualification_projection_sha256=payload[
+            'qualification_projection_sha256'],
+        authorized_economic_receipt_sha256=(authorized_economic_receipt_sha256),
+        expectation_kind=kind,
+        expected_providers=providers,
+        positive_providers=positive_providers,
+        peak_running=payload['peak_running'],
+        scale_elapsed_seconds=scale_elapsed,
+        exact_request_count=exact_count)
+
+
+def _authorize_provider_canary(economic_receipt: object, *, provider: str,
+                               source_sha256: str) -> QualificationEvidence:
+    """Authorize one missing-provider canary before any billable launch."""
+    if not isinstance(economic_receipt, str) or not economic_receipt:
+        raise QualificationError(
+            'Provider canary requires the completed economic receipt.')
+    economic = _read_qualification_evidence(pathlib.Path(economic_receipt),
+                                            ExpectationKind.ECONOMIC)
+    missing = {'aws', 'gcp'} - economic.positive_providers
+    if missing != {provider}:
+        raise QualificationError(
+            'Provider canary is not the one provider missing from the '
+            'economic receipt.')
+    if economic.qualification_source_sha256 != source_sha256:
+        raise QualificationError(
+            'Provider canary source differs from the economic task identity.')
+    return economic
+
+
+def _validate_cleanup_evidence(path: pathlib.Path,
+                               qualification: QualificationEvidence) -> str:
+    payload, sha256 = _read_json_object(path, 'Cleanup receipt')
+    matching_identity = (
+        payload.get('service_name') == qualification.service_name and
+        payload.get('service_hash') == qualification.service_hash and
+        payload.get('lifecycle_epoch') == qualification.lifecycle_epoch and
+        payload.get('service_version') == qualification.service_version and
+        payload.get('controller_config_digest')
+        == qualification.controller_config_digest and
+        payload.get('controller_config_snapshot_id')
+        == qualification.controller_config_snapshot_id and
+        payload.get('service_yaml_sha256') == qualification.service_yaml_sha256
+        and payload.get('qualification_profile')
+        == ('scale' if qualification.expectation_kind
+            is ExpectationKind.ECONOMIC else 'provider-canary') and
+        payload.get('qualification_source_sha256')
+        == qualification.qualification_source_sha256 and
+        payload.get('qualification_projection_sha256')
+        == qualification.qualification_projection_sha256 and
+        tuple(payload.get('expected_providers',
+                          ())) == qualification.expected_providers and
+        payload.get('qualification_receipt_sha256') == qualification.sha256)
+    samples = payload.get('samples')
+    if (payload.get('schema_version') != _CLEANUP_RECEIPT_SCHEMA_VERSION or
+            payload.get('outcome') != 'passed' or not matching_identity or
+            type(payload.get('zero_samples')) is not int or
+            payload['zero_samples'] < 3 or not isinstance(samples, list) or
+            len(samples) < 3):
+        raise QualificationError('Cleanup receipt is malformed.')
+    final_samples = samples[-3:]
+    timestamps: list[float] = []
+    counters: list[int] = []
+    cleanup_cloud_fields = {
+        'cloud', 'instance_count', 'running_count', 'gpu_units',
+        'running_gpu_units', 'disk_count', 'inflight_operation_count', 'shapes'
+    }
+    for sample in final_samples:
+        by_cloud = (sample.get('cleanup_provider_by_cloud') if isinstance(
+            sample, dict) else None)
+        if (not isinstance(sample, dict) or
+                sample.get('exact_zero') is not True or any(
+                    sample.get(field) != 0
+                    for field in ('cleanup_claims', 'cleanup_debit_units',
+                                  'cleanup_provider_disks',
+                                  'cleanup_provider_instances',
+                                  'cleanup_provider_operations',
+                                  'cleanup_waiters')) or
+                not isinstance(by_cloud, dict) or
+                set(by_cloud) != {'aws', 'gcp'} or
+                any(not isinstance(by_cloud[cloud], dict) or
+                    set(by_cloud[cloud]) != cleanup_cloud_fields or
+                    by_cloud[cloud].get('cloud') != cloud or
+                    by_cloud[cloud].get('shapes') != [] or any(
+                        by_cloud[cloud].get(field) != 0
+                        for field in ('instance_count', 'running_count',
+                                      'gpu_units', 'running_gpu_units',
+                                      'disk_count', 'inflight_operation_count'))
+                    for cloud in ('aws', 'gcp')) or
+                type(sample.get('zero_samples')) is not int):
+            raise QualificationError(
+                'Cleanup receipt does not prove sustained exact zero.')
+        timestamps.append(_strict_timestamp(sample))
+        counters.append(sample['zero_samples'])
+    if (any(current <= prior
+            for prior, current in zip(timestamps, timestamps[1:])) or
+            any(current != prior + 1
+                for prior, current in zip(counters, counters[1:])) or
+            counters[-1] != payload['zero_samples']):
+        raise QualificationError(
+            'Cleanup receipt does not prove sustained exact zero.')
+    return sha256
+
+
+def aggregate_evidence(args: argparse.Namespace) -> None:
+    """Join economic, provider-union, request, and cleanup proof gates."""
+    economic = _read_qualification_evidence(pathlib.Path(args.economic_receipt),
+                                            ExpectationKind.ECONOMIC)
+    canaries = [
+        _read_qualification_evidence(pathlib.Path(path),
+                                     ExpectationKind.PROVIDER_CANARY)
+        for path in args.canary_receipt
+    ]
+    missing_providers = {'aws', 'gcp'} - economic.positive_providers
+    canary_providers = [item.expected_providers[0] for item in canaries]
+    if (len(canary_providers) != len(set(canary_providers)) or
+            set(canary_providers) != missing_providers):
+        raise QualificationError(
+            'Provider canaries must exactly cover providers absent from the '
+            'economic result.')
+    if any(canary.qualification_source_sha256 !=
+           economic.qualification_source_sha256 for canary in canaries):
+        raise QualificationError(
+            'Provider canaries are not projections of the economic task.')
+    if any(canary.authorized_economic_receipt_sha256 != economic.sha256
+           for canary in canaries):
+        raise QualificationError(
+            'Provider canary was not authorized by the exact economic '
+            'receipt.')
+    qualifications = [economic, *canaries]
+    if len({item.service_name for item in qualifications
+           }) != len(qualifications):
+        raise QualificationError(
+            'Qualification services must have unique immutable identities.')
+    canary_cleanup_paths = [
+        pathlib.Path(path) for path in args.canary_cleanup_receipt
+    ]
+    if len(canary_cleanup_paths) != len(canaries):
+        raise QualificationError(
+            'Every qualification receipt requires one cleanup receipt.')
+    canary_cleanup_by_service: dict[str, pathlib.Path] = {}
+    for path in canary_cleanup_paths:
+        payload, _ = _read_json_object(path, 'Cleanup receipt')
+        service_name = payload.get('service_name')
+        if (not isinstance(service_name, str) or not service_name or
+                service_name in canary_cleanup_by_service):
+            raise QualificationError('Cleanup receipt is malformed.')
+        canary_cleanup_by_service[service_name] = path
+    if set(canary_cleanup_by_service) != {
+            canary.service_name for canary in canaries
+    }:
+        raise QualificationError(
+            'Every qualification receipt requires one cleanup receipt.')
+    cleanup_sha256 = [
+        _validate_cleanup_evidence(pathlib.Path(args.economic_cleanup_receipt),
+                                   economic),
+        *(_validate_cleanup_evidence(
+            canary_cleanup_by_service[canary.service_name], canary)
+          for canary in canaries),
+    ]
+    provider_union = frozenset().union(
+        *(item.positive_providers for item in qualifications))
+    if provider_union != {'aws', 'gcp'}:
+        raise QualificationError(
+            'Aggregate evidence lacks a positive AWS/GCP provider union.')
+    payload = {
+        'schema_version': _AGGREGATE_RECEIPT_SCHEMA_VERSION,
+        'outcome': 'passed',
+        'economic_service_name': economic.service_name,
+        'economic_peak_running': economic.peak_running,
+        'economic_scale_elapsed_seconds': economic.scale_elapsed_seconds,
+        'economic_exact_request_count': economic.exact_request_count,
+        'qualification_source_sha256': economic.qualification_source_sha256,
+        'positive_provider_union': sorted(provider_union),
+        'qualification_receipts': [{
+            'service_name': item.service_name,
+            'expectation_kind': item.expectation_kind.value,
+            'expected_providers': list(item.expected_providers),
+            'service_yaml_sha256': item.service_yaml_sha256,
+            'qualification_projection_sha256':
+                item.qualification_projection_sha256,
+            'sha256': item.sha256,
+        } for item in qualifications],
+        'cleanup_receipt_sha256': cleanup_sha256,
+        'finished_at': time.time(),
+    }
+    output = pathlib.Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n',
+                      encoding='utf-8')
+    print(json.dumps(payload, sort_keys=True))
 
 
 async def qualify(args: argparse.Namespace) -> None:
     profile = PROFILES[args.profile]
+    expectation = provider_expectation(profile, getattr(args, 'provider', None))
     token = resolve_data_plane_token(args.auth_token_env)
     database_url = os.environ.get(args.postgres_url_env)
     if not database_url:
@@ -4121,131 +5716,187 @@ async def qualify(args: argparse.Namespace) -> None:
 
     frozen_scope = read_provider_scope(pathlib.Path(args.scope),
                                        args.service_name)
+    economic_receipt = getattr(args, 'economic_receipt', None)
+    authorized_economic: QualificationEvidence | None = None
+    if expectation.kind is ExpectationKind.PROVIDER_CANARY:
+        authorized_economic = _authorize_provider_canary(
+            economic_receipt,
+            provider=expectation.providers[0],
+            source_sha256=frozen_scope.qualification_source_sha256)
+    elif economic_receipt is not None:
+        raise QualificationError(
+            'Economic qualification does not accept an economic receipt.')
     postgres = PostgresObserver(database_url, args.service_name)
     provider_scope = postgres.provider_scope()
     if provider_scope != frozen_scope:
         postgres.close()
         raise GuardViolation(
             'Current service provider scope differs from the frozen receipt.')
-    if profile.max_units != provider_scope.max_live_paid_gpu_units:
+    if (profile.max_units != provider_scope.max_live_paid_gpu_units or
+            profile.name != provider_scope.qualification_profile):
         postgres.close()
         raise GuardViolation(
             'Run profile differs from the committed paid GPU cap.')
+    if provider_scope.providers != expectation.providers:
+        postgres.close()
+        raise GuardViolation(
+            'Run expectation differs from the committed provider scope.')
     http = HttpObserver(args.endpoint, token)
-    aws = AwsObserver(profile=profile,
-                      service_name=args.service_name,
-                      scope=provider_scope)
-    observer = Observer(postgres=postgres,
-                        gcp=GcpObserver(service_name=args.service_name,
-                                        scope=provider_scope,
-                                        profile=profile),
-                        aws=aws,
-                        http=http)
+    gcp, aws = _provider_observers(service_name=args.service_name,
+                                   scope=provider_scope,
+                                   profile=profile)
+    observer = Observer(postgres=postgres, gcp=gcp, aws=aws, http=http)
     progress = Progress()
-    receipt = Receipt(path=pathlib.Path(args.receipt),
-                      service_name=args.service_name,
-                      profile=profile)
-    warm_successes = 0
-    pressure_successes = 0
+    receipt = Receipt(
+        path=pathlib.Path(args.receipt),
+        service_name=args.service_name,
+        profile=profile,
+        expectation=expectation,
+        scope=provider_scope,
+        authorized_economic_receipt_sha256=(None if authorized_economic is None
+                                            else authorized_economic.sha256))
+    exact_request_successes = 0
     ledger_baseline: RequestTelemetry | None = None
     ledger_final: RequestTelemetry | None = None
     failure: BaseException | None = None
+    campaign_tasks: list[asyncio.Task[int]] = []
     run_id = f'{args.service_name}-{int(time.time())}'
     try:
         await http.prove_authentication()
-        await _wait_for_baseline(observer=observer,
-                                 profile=profile,
-                                 progress=progress,
-                                 receipt=receipt)
-        ledger_baseline = await _wait_for_telemetry_baseline(observer=observer,
-                                                             profile=profile,
-                                                             receipt=receipt)
+        ledger_baseline = await _wait_for_joined_baseline(
+            observer=observer,
+            profile=profile,
+            progress=progress,
+            receipt=receipt,
+            expectation=expectation)
         progress.start_scale()
-        pressure_stop = asyncio.Event()
-        pressure = asyncio.create_task(
-            send_continuous_pressure(
-                endpoint=args.endpoint,
-                token=token,
-                prefix=f'{run_id}-pressure',
-                concurrency=profile.pressure_concurrency,
-                duration_seconds=profile.pressure_duration_seconds,
-                timeout_seconds=profile.scale_timeout_seconds + 660,
-                stop=pressure_stop))
-        warm: asyncio.Task[int] | None = None
-        try:
-            await _wait_for_scale(observer=observer,
-                                  profile=profile,
-                                  progress=progress,
-                                  receipt=receipt,
-                                  pressure=pressure)
-            pressure_stop.set()
-            pressure_successes = await pressure
-            if pressure_successes < 1:
-                raise QualificationError('No pressure request completed.')
-            warm = asyncio.create_task(
+        if profile.name == 'scale':
+            held_count = held_request_count(profile)
+            held_traffic = asyncio.create_task(
                 send_exact_async_requests(
                     endpoint=args.endpoint,
                     token=token,
                     service_hash=provider_scope.service_hash,
-                    prefix=f'{run_id}-warm',
-                    count=profile.warm_requests,
-                    concurrency=profile.warm_concurrency,
-                    hold_requests=min(profile.minimum_running,
-                                      profile.warm_requests),
-                    hold_seconds=max(30, 3 * profile.poll_seconds + 10),
-                    timeout_seconds=profile.drain_timeout_seconds))
+                    prefix=f'{run_id}-held',
+                    count=held_count,
+                    concurrency=held_count,
+                    hold_requests=held_count,
+                    hold_seconds=request_hold_seconds(profile),
+                    timeout_seconds=(profile.scale_timeout_seconds +
+                                     profile.drain_timeout_seconds)))
+            campaign_tasks.append(held_traffic)
+            assert progress.scale_started_monotonic is not None
+            campaign_deadline = (progress.scale_started_monotonic +
+                                 _CAMPAIGN_LOAD_WINDOW_SECONDS)
+            await _wait_for_campaign_stage(observer=observer,
+                                           profile=profile,
+                                           receipt=receipt,
+                                           traffic=held_traffic,
+                                           baseline=ledger_baseline,
+                                           expected_resident=held_count,
+                                           deadline_monotonic=campaign_deadline)
+            tail_count = expectation.exact_request_count - held_count
+            tail_traffic = asyncio.create_task(
+                send_exact_async_requests(
+                    endpoint=args.endpoint,
+                    token=token,
+                    service_hash=provider_scope.service_hash,
+                    prefix=f'{run_id}-tail',
+                    count=tail_count,
+                    concurrency=tail_count,
+                    hold_requests=0,
+                    hold_seconds=request_hold_seconds(profile),
+                    timeout_seconds=(profile.scale_timeout_seconds +
+                                     profile.drain_timeout_seconds)))
+            campaign_tasks.append(tail_traffic)
+        else:
+            campaign_tasks.append(
+                asyncio.create_task(
+                    send_exact_async_requests(
+                        endpoint=args.endpoint,
+                        token=token,
+                        service_hash=provider_scope.service_hash,
+                        prefix=f'{run_id}-exact',
+                        count=expectation.exact_request_count,
+                        concurrency=profile.request_concurrency,
+                        hold_requests=held_request_count(profile),
+                        hold_seconds=request_hold_seconds(profile),
+                        timeout_seconds=(profile.scale_timeout_seconds +
+                                         profile.drain_timeout_seconds))))
+        traffic = asyncio.create_task(_sum_exact_request_tasks(campaign_tasks))
+        try:
             assert ledger_baseline is not None
-            await _wait_for_positive_request_telemetry(observer=observer,
-                                                       profile=profile,
-                                                       receipt=receipt,
-                                                       traffic=warm,
-                                                       baseline=ledger_baseline)
-            warm_successes = await warm
+            if profile.name == 'scale':
+                await _wait_for_campaign_loaded(
+                    observer=observer,
+                    profile=profile,
+                    progress=progress,
+                    receipt=receipt,
+                    traffic=traffic,
+                    baseline=ledger_baseline,
+                    expectation=expectation,
+                    deadline_monotonic=campaign_deadline)
+            if expectation.requires_full_request_telemetry:
+                await _wait_for_positive_request_telemetry(
+                    observer=observer,
+                    profile=profile,
+                    receipt=receipt,
+                    traffic=traffic,
+                    baseline=ledger_baseline)
+            await _wait_for_scale(observer=observer,
+                                  profile=profile,
+                                  progress=progress,
+                                  receipt=receipt,
+                                  traffic=traffic,
+                                  baseline=ledger_baseline,
+                                  expectation=expectation)
+            exact_request_successes = await traffic
         except BaseException:
-            pressure_stop.set()
-            pressure.cancel()
-            if warm is not None:
-                warm.cancel()
-            await asyncio.gather(pressure,
-                                 *([] if warm is None else [warm]),
-                                 return_exceptions=True)
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
             raise
-        if warm_successes != profile.warm_requests:
-            raise QualificationError('Warm request count is incomplete.')
-        await _wait_for_drain(observer=observer,
-                              profile=profile,
-                              progress=progress,
-                              receipt=receipt)
+        if exact_request_successes != expectation.exact_request_count:
+            raise QualificationError('Exact request count is incomplete.')
         assert ledger_baseline is not None
         ledger_final = await _wait_for_final_request_telemetry(
             observer=observer,
             profile=profile,
             receipt=receipt,
             baseline=ledger_baseline,
-            expected_succeeded_delta=profile.warm_requests)
+            expected_succeeded_delta=expectation.exact_request_count)
+        await _wait_for_drain(observer=observer,
+                              profile=profile,
+                              progress=progress,
+                              receipt=receipt,
+                              expectation=expectation)
     except BaseException as error:
+        for task in campaign_tasks:
+            task.cancel()
+        await asyncio.gather(*campaign_tasks, return_exceptions=True)
         failure = error
         raise
     finally:
-        receipt.finish(progress=progress,
-                       pressure_successes=pressure_successes,
-                       warm_successes=warm_successes,
-                       aws_volume_ids=aws.retained_volume_ids(),
-                       ledger_baseline=ledger_baseline,
-                       ledger_final=ledger_final,
-                       error=failure)
+        receipt.finish(
+            progress=progress,
+            exact_request_successes=exact_request_successes,
+            aws_volume_ids=(None if aws is None else aws.retained_volume_ids()),
+            ledger_baseline=ledger_baseline,
+            ledger_final=ledger_final,
+            error=failure)
         postgres.close()
     print(
         json.dumps(
             {
                 'outcome': 'passed',
                 'profile': profile.name,
+                'expectation_kind': expectation.kind.value,
+                'expected_providers': list(expectation.providers),
                 'peak_running': progress.peak_running,
                 'peak_running_gpu_units': progress.peak_running_gpu_units,
                 'peak_running_by_cloud': progress.peak_running_by_cloud,
                 'peak_running_gpu_units_by_cloud':
                     progress.peak_running_gpu_units_by_cloud,
-                'warm_successes': warm_successes,
+                'exact_request_successes': exact_request_successes,
                 'receipt': str(pathlib.Path(args.receipt)),
             },
             sort_keys=True))
@@ -4253,24 +5904,51 @@ async def qualify(args: argparse.Namespace) -> None:
 
 def render_service(args: argparse.Namespace) -> None:
     profile = PROFILES[args.profile]
+    expectation = provider_expectation(profile, getattr(args, 'provider', None))
     source = pathlib.Path(args.source)
     config = yaml.safe_load(source.read_text(encoding='utf-8'))
+    try:
+        if not isinstance(config, dict):
+            raise ValueError('source service YAML is not an object')
+        source_sha256 = _qualification_source_sha256(config)
+    except ValueError as error:
+        raise QualificationError(
+            'Source service YAML contains invalid reserved provenance.') \
+            from error
+    duration_limit = _fixture_duration_limit(config)
+    queue_timeout = config['service']['load_balancer']['request_queue'].get(
+        'timeout_seconds')
+    if (not isinstance(queue_timeout,
+                       (int, float)) or isinstance(queue_timeout, bool) or any(
+                           request_hold_seconds(candidate) > duration_limit
+                           for candidate in PROFILES.values()) or
+            duration_limit >= queue_timeout):
+        raise QualificationError(
+            'Fixture must bound every held request below its queue timeout.')
+    economic_receipt = getattr(args, 'economic_receipt', None)
+    if expectation.kind is ExpectationKind.PROVIDER_CANARY:
+        _authorize_provider_canary(economic_receipt,
+                                   provider=expectation.providers[0],
+                                   source_sha256=source_sha256)
+    elif economic_receipt is not None:
+        raise QualificationError(
+            'Economic rendering does not accept an economic receipt.')
     if config['service'].get(
             'load_balancing_policy') != 'instance_aware_least_load':
         raise QualificationError(
             'Paid qualification requires exact accelerator routing.')
     policy = config['service']['replica_policy']
     policy.update({
-        'max_replicas': profile.max_units,
+        'max_replicas': profile.max_replicas,
         'max_live_paid_gpu_units': profile.max_units,
         'scale_up_rate_min_replicas': profile.scale_up_min_replicas,
         'scale_up_rate_period_seconds': profile.scale_up_period_seconds,
     })
     queue = config['service']['load_balancer']['request_queue']
     queue.update({
-        'min_size': profile.pressure_concurrency,
-        'max_size': max(32, profile.pressure_concurrency * 2),
-        'max_concurrency': max(8, min(128, profile.pressure_concurrency)),
+        'min_size': profile.request_concurrency,
+        'max_size': max(32, profile.request_concurrency),
+        'max_concurrency': request_queue_max_concurrency(profile),
     })
     resources = config['resources']
     expected_locations = [
@@ -4287,11 +5965,23 @@ def render_service(args: argparse.Namespace) -> None:
             'infra' in resources or 'instance_type' in resources):
         raise QualificationError(
             'Service fixture is not cross-cloud whole-L4 Spot.')
+    # A provider canary is a projection of this same source fixture.  It does
+    # not add a second service template or any runtime placement hook.
+    resources['any_of'] = [
+        branch for branch in resources['any_of']
+        if branch['infra'] in expectation.providers
+    ]
     try:
-        _validate_cross_cloud_service_config(config)
+        contract = _validate_qualification_service_config(config)
     except ValueError as error:
         raise QualificationError(
-            'Rendered service lost the cross-cloud L4 contract.') from error
+            'Rendered service lost the whole-L4 Spot contract.') from error
+    if (contract.providers != expectation.providers or
+            contract.max_live_paid_gpu_units != profile.max_units or
+            _qualification_profile(contract) != profile or
+            _qualification_source_sha256(config) != source_sha256):
+        raise QualificationError(
+            'Rendered service differs from its typed provider expectation.')
     output = pathlib.Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(yaml.safe_dump(config, sort_keys=False), encoding='utf-8')
@@ -4302,9 +5992,11 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest='command', required=True)
     render = subparsers.add_parser('render')
     render.add_argument('--profile', choices=PROFILES, required=True)
+    render.add_argument('--provider', choices=('aws', 'gcp'))
     render.add_argument('--source',
                         default=str(
                             pathlib.Path(__file__).with_name('service.yaml')))
+    render.add_argument('--economic-receipt')
     render.add_argument('--output', required=True)
 
     freeze = subparsers.add_parser('freeze-scope')
@@ -4317,10 +6009,12 @@ def _parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser('run')
     run.add_argument('--profile', choices=PROFILES, required=True)
+    run.add_argument('--provider', choices=('aws', 'gcp'))
     run.add_argument('--service-name', required=True)
     run.add_argument('--endpoint', required=True)
     run.add_argument('--receipt', required=True)
     run.add_argument('--scope', required=True)
+    run.add_argument('--economic-receipt')
     run.add_argument('--auth-token-env',
                      default='SKYPILOT_SERVE_E2E_AUTH_TOKEN')
     run.add_argument('--postgres-url-env', default='SKYPILOT_DB_CONNECTION_URI')
@@ -4329,10 +6023,20 @@ def _parser() -> argparse.ArgumentParser:
     cleanup.add_argument('--service-name', required=True)
     cleanup.add_argument('--scope', required=True)
     cleanup.add_argument('--receipt', required=True)
+    cleanup.add_argument('--output', required=True)
     cleanup.add_argument('--timeout-seconds', type=float, default=10 * 60)
     cleanup.add_argument('--poll-seconds', type=float, default=10)
     cleanup.add_argument('--postgres-url-env',
                          default='SKYPILOT_DB_CONNECTION_URI')
+
+    aggregate = subparsers.add_parser('aggregate')
+    aggregate.add_argument('--economic-receipt', required=True)
+    aggregate.add_argument('--economic-cleanup-receipt', required=True)
+    aggregate.add_argument('--canary-receipt', action='append', default=[])
+    aggregate.add_argument('--canary-cleanup-receipt',
+                           action='append',
+                           default=[])
+    aggregate.add_argument('--output', required=True)
     return parser
 
 
@@ -4346,8 +6050,10 @@ def main() -> None:
         asyncio.run(wait_for_cleanup(args))
     elif args.command == 'run':
         asyncio.run(qualify(args))
+    elif args.command == 'aggregate':
+        aggregate_evidence(args)
     else:
-        asyncio.run(qualify(args))
+        raise AssertionError(args.command)
 
 
 if __name__ == '__main__':
