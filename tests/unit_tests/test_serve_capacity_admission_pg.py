@@ -27,6 +27,7 @@ from test_kueue_lane_lineage_pg import _receipt as _kueue_receipt
 from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
+from sky import clouds
 from sky import global_user_state_schema
 from sky.client import sdk
 from sky.serve import autoscaler_compatibility
@@ -2957,7 +2958,7 @@ def test_current_planner_existing_paid_wave_prevents_duplicate_launch(
 
 def test_current_planner_admits_residual_while_terminal_request_awaits_reducer(
         capacity_database):
-    """A charged predecessor's cross-transaction receipt gap is not global."""
+    """A charged predecessor awaiting its reducer does not block the residual."""
     engine, incarnation, route_receipt = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
     repository = capacity_admission.CapacityAdmissionRepository(engine)
@@ -2975,83 +2976,17 @@ def test_current_planner_admits_residual_while_terminal_request_awaits_reducer(
     assert [member.replica_id for member in first.paid_launch_receipt.members
            ] == [180]
 
+    # The fused writer already committed the exact executable request graph
+    # for replica 180; locate its durable association instead of hand-building
+    # a second binding for the same replica.
     associations = ordinary_launch_binding.ordinary_launch_associations_table
     with engine.begin() as connection:
         serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
             connection)
-        service = connection.execute(
-            sqlalchemy.select(serve_state_schema.services_table).where(
-                serve_state_schema.services_table.c.name ==
-                'svc')).mappings().one()
-        replica = connection.execute(
-            sqlalchemy.select(serve_state_schema.replicas_table).where(
-                serve_state_schema.replicas_table.c.service_name == 'svc',
-                serve_state_schema.replicas_table.c.replica_id ==
-                180)).mappings().one()
-        profile = (ordinary_launch_binding.
-                   resolve_non_pool_launch_profile_in_connection(
-                       connection,
-                       service,
-                       replica,
-                       protocol_and_service_prelocked=True))
-        info = replica_managers.ReplicaInfo.from_storage_dict(
-            replica['replica_state'])
-        intent = ordinary_launch_binding.BindingIntent(
-            service_name='svc',
-            service_hash='svc-hash',
-            service_version=1,
-            replica_id=180,
-            replica_record_id=uuid.UUID(info.replica_record_id),
-            lifecycle_epoch=3,
-            binding_epoch=service['ordinary_launch_binding_epoch'],
-            controller_incarnation=service['controller_incarnation'],
-            controller_owner_epoch=service['controller_owner_epoch'],
-            controller_pid=service['controller_pid'],
-            controller_ip=service['controller_ip'])
-        launch_body = request_payloads.LaunchBody(
-            task='name: paid-launch\nrun: echo bound\n',
-            cluster_name=info.cluster_name,
-            is_launched_by_sky_serve_controller=True,
-            env_vars={skylet_constants.USER_ID_ENV_VAR: 'tenant-a'},
-            extra_launch_context={})
-        identity = ordinary_launch_binding.build_non_pool_binding_identity(
-            intent,
-            submission_id=uuid.uuid4(),
-            tenant_scope='tenant-a',
-            service_workspace='workspace-a',
-            cluster_name=info.cluster_name,
-            input_digest=(
-                ordinary_launch_binding.canonical_launch_digest(launch_body)),
-            profile=profile,
-            capability_cohort_epoch=(
-                service['non_pool_launch_capability_cohort_epoch']),
-            capability_profile_set_digest=(
-                service['non_pool_launch_capability_profile_set_digest']),
-            receipt_protocol_version=(
-                service['non_pool_launch_receipt_protocol_version']))
-        admission = ordinary_launch_binding.insert_or_get_locked(
-            connection, identity)
-        assert admission.created
-        ordinary_launch_binding.install_bound_non_pool_context(
-            launch_body, identity, admission.launch_generation)
-        bound_request = request_lib.Request(
-            request_id=identity.request_id,
-            name='sky.launch',
-            entrypoint=non_pool_launch_request.launch,
-            request_body=launch_body,
-            status=request_lib.RequestStatus.PENDING,
-            created_at=time.time(),
-            user_id='tenant-a',
-            cluster_name=info.cluster_name,
-            schedule_type=request_lib.ScheduleType.LONG,
-            retryable=False,
-            should_enqueue=True)
-        assert request_postgres.insert_bound_non_pool_request_and_queue_in_transaction(
-            connection, bound_request, identity=identity)
         association = connection.execute(
             sqlalchemy.select(associations).where(
-                associations.c.association_id ==
-                identity.association_id).with_for_update()).mappings().one()
+                associations.c.service_name == 'svc', associations.c.replica_id
+                == 180).with_for_update()).mappings().one()
         assert association['resolution'] == 'BOUND'
         assert association['terminal_status'] is None
         request = connection.execute(
@@ -3158,9 +3093,13 @@ def test_current_planner_enforces_exact_multi_gpu_paid_cap(
 
 
 def test_manager_prepared_heterogeneous_wave_cannot_starve_a100_at_global_cap(
-        capacity_database):
+        capacity_database, monkeypatch):
     """Cheaper L4 alternatives cannot consume A100's locked paid authority."""
     engine, incarnation, _ = capacity_database
+    # The repository rebuilds every candidate through the real GCP cloud of
+    # the locked catalog; synthetic instance types have no catalog memory.
+    monkeypatch.setattr(clouds.GCP, 'get_vcpus_mem_from_instance_type',
+                        lambda *_args, **_kwargs: (4, 16.0))
     _enable_durable_intent(engine,
                            incarnation,
                            reserved_fill_enabled=False,
@@ -3176,6 +3115,9 @@ def test_manager_prepared_heterogeneous_wave_cannot_starve_a100_at_global_cap(
                          instance_type='test-a100-required')
     for location in (l4, a100):
         location.image_id = {None: 'skypilot:test-regionless-image'}
+        # Canonical request reconstruction serializes the task, which reads
+        # the synthetic instance type's memory from the mock cloud.
+        location.cloud.get_vcpus_mem_from_instance_type.return_value = (4, 16.0)
     service = serve_state.get_spec('svc', 1)
     assert service is not None
     placer = make_placer({
@@ -3383,6 +3325,8 @@ def test_current_planner_accepts_equal_cost_pool_interleaving(
         capacity_database, monkeypatch):
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    monkeypatch.setattr(clouds.GCP, 'get_vcpus_mem_from_instance_type',
+                        lambda *_args, **_kwargs: (4, 16.0))
     monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 60)
     locations = []
     for index in range(2):
@@ -3763,6 +3707,174 @@ def test_paid_maximum_atomic_wave_survives_lost_ack_and_is_claimable(
     assert claimed is not None
     assert claimed.request_id == graph[0]['request_id']
     assert claimed.execution_generation == graph[0]['launch_generation']
+
+
+def _bounded_paid_wave_call_kwargs(engine, member_count):
+    return {
+        **_current_owner_kwargs(engine),
+        'service_name': 'svc',
+        'service_hash': 'svc-hash',
+        'service_lifecycle_epoch': 3,
+        'service_version': 1,
+        'accounting_cards': {
+            'l4': 1
+        },
+        'backend_num_nodes': 1,
+        'sequenced_reserved_fill': False,
+        'planner': lambda snapshot, supply: _current_decision(
+            snapshot, supply, member_count),
+    }
+
+
+def _single_pool_paid_wave(engine, incarnation, monkeypatch, *, member_count,
+                           first_replica_id):
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           max_replicas=member_count)
+    ranks = _install_paid_wave_catalog(engine, pool_count=1)
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: member_count)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 480)
+    monkeypatch.setattr(paid_capacity, 'service_limit', lambda: member_count)
+    monkeypatch.setattr(paid_capacity, 'max_service_limit',
+                        lambda **_: member_count)
+    return _paid_wave_specs(engine,
+                            ranks,
+                            members_per_pool=member_count,
+                            first_replica_id=first_replica_id)
+
+
+def test_committed_fused_wave_is_adoptable_and_unretirable_from_durable_state(
+        capacity_database, monkeypatch):
+    """No process-local fence is needed between commit and publication.
+
+    PR #1857 removed the controller-local materialization handoff that kept
+    the unowned-row scanner away from freshly committed paid rows.  The fused
+    writer must therefore leave every member in a shape the scanner can only
+    adopt: an association already pointed at by the replica row, so the
+    pre-admission retirement path reports ASSOCIATED rather than deleting the
+    intent, and the durable reduction classifies the request as adoptable.
+    """
+    engine, incarnation, _ = capacity_database
+    member_count = 3
+    specs = _single_pool_paid_wave(engine,
+                                   incarnation,
+                                   monkeypatch,
+                                   member_count=member_count,
+                                   first_replica_id=2300)
+    provider_io = mock.Mock(
+        side_effect=AssertionError('admission must not submit provider work'))
+    monkeypatch.setattr(sdk, 'submit_prepared_non_pool_launch_request',
+                        provider_io)
+    monkeypatch.setattr(pathlib.Path, 'touch', mock.Mock())
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(**_bounded_paid_wave_call_kwargs(
+            engine, member_count),
+                                       prepared_paid_launch_specs=specs)
+    assert len(committed.paid_launch_bindings) == member_count
+
+    with engine.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).mappings().one()
+    owner = _current_owner_kwargs(engine)
+    authority = ordinary_launch_binding._authority_from_service(  # pylint: disable=protected-access
+        service,
+        controller_pid=service['controller_pid'],
+        controller_ip=service['controller_ip'],
+        controller_incarnation=owner['expected_controller_incarnation'],
+        controller_owner_epoch=owner['expected_controller_owner_epoch'],
+        capable=service['ordinary_launch_binding_capable'] is True)
+    assert authority.retained_non_pool_settlement_allowed
+
+    for binding in committed.paid_launch_bindings:
+        reduction = request_postgres.inspect_bound_ordinary_launch(
+            'svc', binding.replica_id, binding.replica_record_id)
+        assert reduction is not None
+        assert reduction.disposition is (
+            request_postgres.OrdinaryLaunchReductionDisposition.ADOPT_ACTIVE)
+        assert replica_managers._bound_projection_classification(  # pylint: disable=protected-access
+            reduction) == 'ADOPT_ACTIVE'
+        assert reduction.context.request_id == binding.request_id
+        assert str(reduction.context.association_id) == binding.association_id
+        assert reduction.context.launch_generation == binding.launch_generation
+        # The scanner's only destructive branch is unreachable: the replica
+        # pointer and association committed with the request.
+        retirement = (
+            ordinary_launch_binding.retire_pre_admission_non_pool_launch_intent(
+                authority, binding.replica_id, binding.replica_record_id))
+        assert retirement.disposition is (
+            ordinary_launch_binding.PreAdmissionRetirementDisposition.ASSOCIATED
+        )
+    assert _fused_paid_graph_counts(engine) == (1, 1, member_count,
+                                                member_count, member_count,
+                                                member_count, member_count,
+                                                member_count, member_count)
+    provider_io.assert_not_called()
+
+
+def test_paid_correctness_transaction_takes_no_second_database_checkout(
+        capacity_database, monkeypatch):
+    """The fused wave binds on its own connection and never re-enters a pool.
+
+    The production request-control pool is bounded to one connection with no
+    overflow, so any second checkout while the correctness transaction holds
+    the service locks would serialize behind itself and time out.  Count pool
+    checkouts on both engines while the transaction is open and forbid engine
+    initialization inside it.
+    """
+    engine, incarnation, _ = capacity_database
+    specs = _single_pool_paid_wave(engine,
+                                   incarnation,
+                                   monkeypatch,
+                                   member_count=2,
+                                   first_replica_id=2400)
+    request_engine = request_postgres.initialize_and_get_db()
+    engines = {id(engine): engine, id(request_engine): request_engine}
+    correctness_open = False
+    checkouts_under_lock = []
+
+    def _count_checkout(*_args, **_kwargs):
+        if correctness_open:
+            checkouts_under_lock.append(1)
+
+    real_transaction = capacity_admission._capacity_admission_transaction
+    real_initialize = request_postgres.initialize_and_get_db
+
+    @contextlib.contextmanager
+    def _guarded_transaction(*args, **kwargs):
+        nonlocal correctness_open
+        with real_transaction(*args, **kwargs) as transaction:
+            correctness_open = True
+            try:
+                yield transaction
+            finally:
+                correctness_open = False
+
+    def _guarded_initialize(*args, **kwargs):
+        assert not correctness_open, (
+            'request engine initialization under correctness locks')
+        return real_initialize(*args, **kwargs)
+
+    monkeypatch.setattr(capacity_admission, '_capacity_admission_transaction',
+                        _guarded_transaction)
+    monkeypatch.setattr(request_postgres, 'initialize_and_get_db',
+                        _guarded_initialize)
+    monkeypatch.setattr(pathlib.Path, 'touch', mock.Mock())
+    for candidate in engines.values():
+        sqlalchemy.event.listen(candidate, 'checkout', _count_checkout)
+    try:
+        committed = capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_bounded_paid_wave_call_kwargs(
+                engine, 2),
+                                           prepared_paid_launch_specs=specs)
+    finally:
+        for candidate in engines.values():
+            sqlalchemy.event.remove(candidate, 'checkout', _count_checkout)
+    assert len(committed.paid_launch_bindings) == 2
+    assert checkouts_under_lock == []
+    assert _fused_paid_graph_counts(engine) == (1, 1, 2, 2, 2, 2, 2, 2, 2)
 
 
 def test_paid_420_target_converges_across_fresh_bounded_atomic_waves(
@@ -4354,6 +4466,8 @@ def test_current_planner_rejects_descending_normalized_cost_traversal(
         capacity_database, monkeypatch):
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    monkeypatch.setattr(clouds.GCP, 'get_vcpus_mem_from_instance_type',
+                        lambda *_args, **_kwargs: (4, 16.0))
     monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 60)
     locations = []
     for index, cost in enumerate((0.10, 0.20)):
@@ -4409,6 +4523,43 @@ def test_current_planner_recomputes_prior_claims_after_stale_cleanup(
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 1),
         prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 160),))
     assert len(first_commit.paid_launch_receipt.members) == 1
+    # The fused writer bound replica 160's executable request, so its claim is
+    # owned by that association until the production reducer settles it. A
+    # teardown that cancels the never-executed request settles the association
+    # pre-effect and releases the claim; only then is the replica's cleanup
+    # label a stale claim rather than a still-charged purchase.
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with engine.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).mappings().one()
+        association = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.service_name == 'svc',
+                associations.c.replica_id == 160)).mappings().one()
+    context = ordinary_launch_binding.bound_context_from_association(
+        association)
+    authority = ordinary_launch_binding._authority_from_service(  # pylint: disable=protected-access
+        service,
+        controller_pid=service['controller_pid'],
+        controller_ip=service['controller_ip'],
+        controller_incarnation=service['controller_incarnation'],
+        controller_owner_epoch=service['controller_owner_epoch'],
+        capable=service['ordinary_launch_binding_capable'] is True)
+    facts = request_postgres.request_bound_ordinary_launch_cancel(
+        context, authority, 'stale-cleanup')
+    assert facts.status is request_lib.RequestStatus.CANCELLED
+    reduction = request_postgres.reduce_bound_ordinary_launch(
+        context, authority, project_replica_result=lambda _c, _p: True)
+    assert reduction.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.PRE_EFFECT_TERMINAL)
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table).where(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == 'svc')).scalar_one() == 0
     replicas = serve_state_schema.replicas_table
     with engine.begin() as connection:
         state = connection.execute(
@@ -5682,7 +5833,6 @@ def test_controller_installs_finalized_partial_paid_wave_and_successor(
             0,
             planning_fingerprint,
             prepared_inputs,
-            replica_infos,
             sequenced_reserved_fill=False,
             prepared_paid_launch_specs=prepared_specs)
         assert result is not None
@@ -5846,7 +5996,7 @@ def test_fresh_zero_multi_pool_admission_accepts_yaml_card_casing(
             0,
             0,
             planning_fingerprint,
-            prepared_inputs, [],
+            prepared_inputs,
             sequenced_reserved_fill=True,
             prepared_paid_launch_specs=prepared_specs)
         assert result is not None
@@ -7794,10 +7944,28 @@ def test_added_supply_keeps_retained_demand_and_paid_admission(
 
 def test_added_supply_retained_zero_revokes_spend_without_retirement_authority(
         capacity_database):
+    """Additive fresh zero rejects new paid spend inside fused admission.
+
+    Format-6 paid claims exist only through ``plan_and_admit_current``, so the
+    revocation must be proven at the fused boundary: a protocol-2 route owner
+    whose fresh reports prove aggregate zero must not commit a positive paid
+    target even though the added, unsampled replica leaves it without
+    retirement authority.
+    """
     engine, incarnation, reported_route = capacity_database
+    _plan_and_admit_target(engine, 2)
     _publish_added_supply_route(engine, incarnation, advertised=True)
-    repository = capacity_admission.CapacityAdmissionRepository(engine)
-    authority = _seed_committed_plan_for_consumer(engine, _plan(2))
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_snapshots_table).where(
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    service_name == 'svc').values(producer_protocol_version=2))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_projection_protocol_version=2,
+                    route_projection_controller_incarnation=incarnation))
 
     demand_state.ingest_report(
         'svc', 'svc-hash',
@@ -7806,9 +7974,19 @@ def test_added_supply_retained_zero_revokes_spend_without_retirement_authority(
 
     snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
     assert snapshot is not None
+    assert snapshot.fresh_aggregate_zero
     assert snapshot.reconcile_authority.deadline_monotonic <= time.monotonic()
-    with pytest.raises(capacity_admission.CapacityAdmissionConflict):
-        _insert_claim(engine, authority, 10)
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='Fresh aggregate zero'):
+        _plan_and_admit_target(engine, 2)
+    with engine.connect() as connection:
+        head = connection.execute(
+            sqlalchemy.select(
+                capacity_admission_schema.serve_capacity_plan_heads_table.c.
+                generation).where(
+                    capacity_admission_schema.serve_capacity_plan_heads_table.c.
+                    service_name == 'svc')).scalar_one()
+    assert head == 1
 
 
 def test_promotion_requires_exact_route_not_additive_compatibility(
@@ -8322,8 +8500,14 @@ def test_allocation_bound_claim_survives_unbound_zero_successor(
                          ids=['pod-waiting', 'quota-assigned'])
 def test_only_quota_assigned_kueue_capacity_is_reserved_supply(
         capacity_database, admitted, expected_paid):
-    engine, _, _ = capacity_database
+    engine, _, route_receipt = capacity_database
+    # Format-6 genesis is legal only beside an empty authority graph, so the
+    # policy head must exist before the retained Kueue graph is installed.
+    _plan_and_admit_target(engine, 0)
     _install_waiting_kueue_capacity(engine, admitted=admitted)
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=1))
 
     authority = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
@@ -8347,9 +8531,13 @@ def test_only_quota_assigned_kueue_capacity_is_reserved_supply(
 
 def test_missing_kueue_admission_does_not_revoke_committed_provider_effect(
         capacity_database):
-    engine, incarnation, _ = capacity_database
+    engine, incarnation, route_receipt = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    _plan_and_admit_target(engine, 0)
     key = _install_waiting_kueue_capacity(engine)
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=1))
     committed = capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(**_current_owner_kwargs(engine),
                                        service_name='svc',
@@ -8414,11 +8602,40 @@ def test_copied_kueue_identity_does_not_revoke_committed_provider_effect(
 
 def test_cross_card_reserved_capacity_satisfies_supply_aware_target(
         capacity_database):
-    engine, _, _ = capacity_database
+    engine, _, route_receipt = capacity_database
+    # Establish the two-card policy head before the retained reserved replica
+    # exists; genesis beside a provider-possible replica fails closed.
+    capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={
+                'l4': 1,
+                'a100': 1,
+            },
+            backend_num_nodes=1,
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot,
+                supply,
+                0,
+                target_by_accelerator={
+                    'l4': 0,
+                    'a100': 0,
+                },
+                compatible_accelerators=('l4', 'a100'),
+                cold_accelerator_order=('l4', 'a100'),
+                prospective_paid_accelerators=('l4', 'a100')))
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.insert(serve_state_schema.replicas_table).values(
                 **_replica_values(22, zero_cost=True, accelerator='A100')))
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=1))
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
             **_current_owner_kwargs(engine),

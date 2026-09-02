@@ -2079,18 +2079,30 @@ class RetryingVmProvisioner:
                                 ordinary_launch_binding.
                                 BINDING_PROTOCOL_VERSION_KEY
                                 in self._extra_launch_context):
-                            paid_gcp_context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
-                                self._extra_launch_context)
-                            if paid_gcp_context.profile.kind in (
-                                    ordinary_launch_binding.
-                                    NonPoolLaunchProfileKind.ORDINARY_PAID,
-                                    ordinary_launch_binding.
-                                    NonPoolLaunchProfileKind.
-                                    UNKNOWN_CAPACITY_REPLACEMENT):
-                                expected_project_id = (
-                                    ordinary_launch_binding.
-                                    ordinary_paid_gcp_project_id(
-                                        paid_gcp_context))
+                            try:
+                                paid_gcp_context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+                                    self._extra_launch_context)
+                                expected_project_id = None
+                                if paid_gcp_context.profile.kind in (
+                                        ordinary_launch_binding.
+                                        NonPoolLaunchProfileKind.ORDINARY_PAID,
+                                        ordinary_launch_binding.
+                                        NonPoolLaunchProfileKind.
+                                        UNKNOWN_CAPACITY_REPLACEMENT):
+                                    expected_project_id = (
+                                        ordinary_launch_binding.
+                                        ordinary_paid_gcp_project_id(
+                                            paid_gcp_context))
+                            except (ordinary_launch_binding.
+                                    OrdinaryLaunchBindingConflict) as error:
+                                # A malformed or historical-cohort paid GCP
+                                # context is a terminal correctness fence,
+                                # never a provider failure to clean up or
+                                # fail over from.
+                                raise exceptions.ServeReplicaLaunchFenceError(
+                                    'Ordinary-paid GCP launch has no current '
+                                    'project authority.') from error
+                            if expected_project_id is not None:
                                 active_project_id = (
                                     to_provision.cloud.get_project_id())
                                 if active_project_id != expected_project_id:

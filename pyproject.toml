@@ -23,6 +23,7 @@ asyncio_debug = true
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "serve054_process_pressure: 90-process Serve054 gate for dedicated non-xdist CI",
+    "serve_lb_10k_interface: resource-heavy 10k-socket LB gate for dedicated non-xdist CI",
 ]
 filterwarnings = [
     "error::RuntimeWarning",

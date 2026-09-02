@@ -597,7 +597,7 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 'unavailable before provider create.') from error
         raise
 
-    inventory: list[tuple[Any, str, str, list[dict[str, str]]]] = []
+    inventory: list[tuple[Any, str, str, list[Any]]] = []
     seen_instance_ids: set[str] = set()
     allowed_states = frozenset(
         {'pending', 'running', 'stopping', 'stopped', 'shutting-down'})

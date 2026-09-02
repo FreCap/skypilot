@@ -800,7 +800,7 @@ def _bound_reduction_request_id(reduction: Any) -> str:
 
 def _wait_for_bound_ordinary_launch(
     replica_id: int,
-    cluster_name: str,
+    cluster_name: str,  # pylint: disable=unused-argument
     request_id: str,
     stream_logs: bool,
     launch_cloud: clouds.Cloud | None,

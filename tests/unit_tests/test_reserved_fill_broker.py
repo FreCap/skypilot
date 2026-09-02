@@ -519,20 +519,18 @@ class TestConnectionLocalPaidAdmission:
                                        resource_scope='paid-core-scope')
 
     @staticmethod
-    def _spec(replica_id: int = 1,
-              accelerator_count: int = 1,
-              region: str = 'us-central1',
-              frontier_limit: int = 1
-             ) -> paid_capacity.PaidClaimPersistenceSpec:
-        location = spot_placer.Location(cloud=clouds.GCP(),
-                                        region=region,
-                                        zone=None,
-                                        accelerators={
-                                            'L4': accelerator_count
-                                        },
-                                        use_spot=True,
-                                        instance_type=(
-                                            f'test-l4-{accelerator_count}'))
+    def _spec(
+            replica_id: int = 1,
+            accelerator_count: int = 1,
+            region: str = 'us-central1',
+            frontier_limit: int = 1) -> paid_capacity.PaidClaimPersistenceSpec:
+        location = spot_placer.Location(
+            cloud=clouds.GCP(),
+            region=region,
+            zone=None,
+            accelerators={'L4': accelerator_count},
+            use_spot=True,
+            instance_type=(f'test-l4-{accelerator_count}'))
         info = replica_managers.ReplicaInfo(
             replica_id=replica_id,
             cluster_name=f'paid-core-svc-{replica_id}',
@@ -717,7 +715,8 @@ class TestConnectionLocalPaidAdmission:
                     base_limit=1,
                     now=100))
             decision = (
-                serve_state._admit_replicas_with_paid_capacity_claims_in_session(
+                serve_state.
+                _admit_replicas_with_paid_capacity_claims_in_session(
                     session,
                     broker_engine,
                     'paid-core-svc',
@@ -741,9 +740,7 @@ class TestConnectionLocalPaidAdmission:
             self, broker_engine):
         self._add_service()
         specs = [
-            self._spec(replica_id=index + 1,
-                       region=region,
-                       frontier_limit=3)
+            self._spec(replica_id=index + 1, region=region, frontier_limit=3)
             for index, region in enumerate((
                 'us-central1-a',
                 'us-central1-a',
@@ -756,13 +753,12 @@ class TestConnectionLocalPaidAdmission:
 
         with orm.Session(broker_engine) as session:
             session.execute(
-                sqlalchemy.insert(
-                    serve_state.paid_capacity_pools_table).values(
-                        pool_key=specs[2].pool_key,
-                        current_limit=1,
-                        successes_since_resize=0,
-                        last_failure_at=39,
-                        updated_at=39))
+                sqlalchemy.insert(serve_state.paid_capacity_pools_table).values(
+                    pool_key=specs[2].pool_key,
+                    current_limit=1,
+                    successes_since_resize=0,
+                    last_failure_at=39,
+                    updated_at=39))
             serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
                 session.connection())
             owner = serve_state._lock_service_owner_row_in_session(
@@ -793,7 +789,8 @@ class TestConnectionLocalPaidAdmission:
                     base_limit=2,
                     now=100))
             decision = (
-                serve_state._admit_replicas_with_paid_capacity_claims_in_session(
+                serve_state.
+                _admit_replicas_with_paid_capacity_claims_in_session(
                     session,
                     broker_engine,
                     'paid-core-svc',
@@ -3349,6 +3346,12 @@ class TestClaimLifecycle:
         _upsert('svc-b')
         engine = serve_state._db_manager.get_engine()
         with orm.Session(engine) as session:
+            # Every fenced service row is born beside its durable name fence
+            # (claim_service_lifecycle_epoch writes both in one transaction);
+            # PostgreSQL final deletion fails closed without that exact row.
+            session.execute(
+                serve_state.service_lifecycle_fences_table.insert().values(
+                    name='svc-a', epoch=1))
             session.execute(serve_state.services_table.insert().values(
                 name='svc-a',
                 hash='incarnation-a',
