@@ -22,7 +22,10 @@ accepts it only when an exact immutable service/version fingerprint still
 matches. Request-log directory creation is post-commit best effort, so no
 filesystem or EFS path can roll back paid admission. One invalid GCP project
 entry is omitted without suppressing healthy AWS or GCP siblings. Qualification
-runner merge, deployment, the final current-writer AWS/GCP
+source now proves through the production durable planner adapter that the exact
+cold-start scale contract authorizes 800 logical L4 units, including exactly
+100 widest eight-L4 backends. Qualification runner merge, deployment, the final
+current-writer AWS/GCP
 scale/traffic/drain receipt, and clean `boltz-l4-fleet` recreation remain
 open.** One
 PostgreSQL-authoritative planner
@@ -187,6 +190,16 @@ Helm throttle remains 420 prepared physical launches; neither that shared
 throttle nor `boltz-l4-fleet`'s paid cap changes. The real-cloud gate remains at
 least 100 provider-running workers within five minutes, exact request-ledger
 completion, fresh attributed demand telemetry, and natural exact-zero drain.
+The hermetic qualification gate enters through the production durable planner
+adapter with this exact cold-start contract: 10,000 priority-50 L4 requests,
+the 600-second default queue deadline, a ten-second configured service time,
+the 600-second automatic cold-lead seed, an 800-logical-slot service/paid
+ceiling, and the widest admitted eight-L4 backend. The canonical planner
+returns an 800-slot deadline, raw, supply-aware, wave-limited, paid-residual,
+and paid-launch target, which is exactly 100 widest backends. It also publishes
+all 10,000 requests as infeasible against the cold-start SLA; the 800 target is
+therefore explicitly bounded backlog recovery and not a claim that capacity
+arriving after the deadline can satisfy that deadline.
 The 100-member atomic PostgreSQL wave bound is independent from the logical
 service target, physical-launch throttle, per-location window, and provider
 concurrency. Successive fresh generations must converge to the target while

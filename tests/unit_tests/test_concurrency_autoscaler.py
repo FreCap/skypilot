@@ -489,6 +489,72 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             last_reduced_demand_generation, 1)
         self.assertIsNone(result.rollout_failure)
 
+    def test_paid_scale_qualification_reaches_one_hundred_widest_backends(self):
+        """The production adapter bounds the paid campaign at 100 VMs."""
+        autoscaler = _durable_autoscaler(max_replicas=800,
+                                         target_utilization_percentage=100,
+                                         expected_request_duration_seconds=10,
+                                         max_scale_up_rate_percentage=100,
+                                         scale_up_rate_min_replicas=800,
+                                         scale_up_rate_period_seconds=10,
+                                         lb_request_queue={
+                                             'timeout_seconds': 600,
+                                             'timeout_seconds_by_priority': [],
+                                         })
+        autoscaler.set_configured_accelerator_shapes({'L4': 8})
+        report = _durable_report(queue_depth=10_000,
+                                 queued_profiles=[{
+                                     'priority': 50,
+                                     'compatible_accelerators': ['L4'],
+                                     'count': 10_000,
+                                 }])
+        report.update({
+            'queue_depth_by_priority': {
+                50: 10_000,
+            },
+            'queued_request_deadline_buckets': [{
+                'priority': 50,
+                'compatible_accelerators': ['L4'],
+                'remaining_seconds': 600,
+                'count': 10_000,
+            }],
+        })
+
+        result = self._plan(autoscaler,
+                            report=report,
+                            max_live_paid_gpu_units=800)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        snapshot = result.envelope.snapshot
+        candidate = result.envelope.candidate
+        self.assertIsNotNone(snapshot.deadline)
+        assert snapshot.deadline is not None
+        self.assertEqual(snapshot.deadline.paid_cold_lead_seconds, 600)
+        expected_target = {'L4': 800}
+        self.assertEqual(candidate.deadline_target.as_dict(), expected_target)
+        self.assertEqual(candidate.aggregate_demand_target, 800)
+        self.assertEqual(candidate.raw_demand_target, 800)
+        self.assertEqual(candidate.demand_attribution.as_dict(),
+                         expected_target)
+        self.assertEqual(candidate.supply_aware_demand_target.as_dict(),
+                         expected_target)
+        self.assertEqual(candidate.supply_aware_actuation_target.as_dict(),
+                         expected_target)
+        self.assertEqual(candidate.wave_limited_actuation_target.as_dict(),
+                         expected_target)
+        self.assertEqual(candidate.paid_residual.as_dict(), expected_target)
+        self.assertEqual(candidate.paid_launch_target.as_dict(),
+                         expected_target)
+        self.assertEqual(candidate.physical_gpu_width_by_accelerator.as_dict(),
+                         {'L4': 8})
+        paid_units = candidate.paid_launch_target.get('L4')
+        width = candidate.physical_gpu_width_by_accelerator.get('L4')
+        self.assertEqual(divmod(paid_units, width), (100, 0))
+        self.assertEqual(candidate.infeasible_demand_by_priority,
+                         ((50, 10_000.0),))
+        self.assertIsNone(result.rollout_failure)
+
     def test_attribution_horizon_preserves_finalized_paid_successor(self):
         """Exact-card evidence survives as long as its aggregate arrival."""
         autoscaler = _durable_autoscaler(max_replicas=100,
