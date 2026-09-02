@@ -10524,20 +10524,19 @@ def get_placement_projection_record(
     return True, result[0], result[1], result[2]
 
 
-def get_version_controller_config(
+def get_version_controller_config_in_connection(
+    connection: sqlalchemy.engine.Connection,
     service_name: str,
     version: int,
 ) -> ControllerConfigSnapshot | None:
-    """Return and verify one version's sanitized controller config snapshot."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        result = session.execute(
-            sqlalchemy.select(
-                version_specs_table.c.controller_config,
-                version_specs_table.c.controller_config_digest,
-                version_specs_table.c.controller_config_snapshot_id).where(
-                    version_specs_table.c.service_name == service_name,
-                    version_specs_table.c.version == version)).fetchone()
+    """Read and verify one version config on the caller's DB snapshot."""
+    result = connection.execute(
+        sqlalchemy.select(
+            version_specs_table.c.controller_config,
+            version_specs_table.c.controller_config_digest,
+            version_specs_table.c.controller_config_snapshot_id).where(
+                version_specs_table.c.service_name == service_name,
+                version_specs_table.c.version == version)).fetchone()
     if result is None or all(value is None for value in result):
         return None
     controller_config = result[0]
@@ -10560,6 +10559,17 @@ def get_version_controller_config(
             f'Controller config snapshot for service {service_name!r}, '
             f'version {version} is incomplete.')
     return snapshot
+
+
+def get_version_controller_config(
+    service_name: str,
+    version: int,
+) -> ControllerConfigSnapshot | None:
+    """Return and verify one version's sanitized controller config snapshot."""
+    engine = _db_manager.get_engine()
+    with engine.connect() as connection:
+        return get_version_controller_config_in_connection(
+            connection, service_name, version)
 
 
 def get_paid_launch_version_authority(

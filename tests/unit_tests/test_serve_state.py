@@ -2566,6 +2566,20 @@ def test_initial_version_controller_config_persists_and_verifies(
                                 controller_config_snapshot_id=snapshot[2])
     assert (serve_state.get_version_controller_config('svc-initial-config',
                                                       1) == snapshot)
+    with _mock_serve_db.connect() as connection:
+        assert serve_state.get_version_controller_config_in_connection(
+            connection, 'svc-initial-config', 1) == snapshot
+    with _mock_serve_db.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state.version_specs_table).where(
+                serve_state.version_specs_table.c.service_name ==
+                'svc-initial-config',
+                serve_state.version_specs_table.c.version == 1).values(
+                    quarantined_at=1.0))
+        # Cleanup authority outlives routing eligibility. Reading the exact
+        # association version must never acquire an active-version filter.
+        assert serve_state.get_version_controller_config_in_connection(
+            connection, 'svc-initial-config', 1) == snapshot
 
 
 def test_version_controller_config_retry_requires_exact_snapshot(
