@@ -2,40 +2,41 @@
 
 Last updated: 2026-09-02
 
-Status: **the reservation-aware planner, exact-card compatibility, bounded
-Spot-only paid admission, historical at-least-100 Spot scale, 10,000-request
-transport, and exact provider teardown are production-qualified. The paid
-commit-to-worker-publication race and the singleton-admission fanout are
-source-corrected per admitted wave and deployed homogeneously, but not yet
-live-qualified on the current writer.
-Merged PR #1857 now enforces one 100-member atomic database-wave bound
-independently from the service target, paid cap, provider window, and launch
-concurrency. Real PostgreSQL proves a stale successor cannot run the planner or
-change the first committed graph and then proves fresh generations converge as
-100/100/100/100/20 with exact 420-member cardinality. The unchanged 15-second
-authority lease remains fail-closed. The canonical implementation extends the
-existing fused PostgreSQL capacity-admission transaction through
-executable-request binding and makes the durable request queue, not a
-process-local handoff, the recovery source. The principal unpaid PostgreSQL
-and adversarial source gates pass. Canonical request reconstruction now runs
-before correctness locks against one advisory source read; the transaction
-accepts it only when an exact immutable service/version fingerprint still
-matches. Request-log directory creation is post-commit best effort, so no
-filesystem or EFS path can roll back paid admission. One invalid GCP project
-entry is omitted without suppressing healthy AWS or GCP siblings. Merged PR
-#1854 supplies the canonical AWS/GCP provider-native qualification runner.
-Qualification source proves through the production durable planner adapter
-that the exact cold-start scale contract authorizes 800 logical L4 units. The rendered task's
-exact one-L4 backend shape therefore authorizes 800 physical backends and
-exceeds the 100-worker provider gate. The final current-writer AWS/GCP
-scale/traffic/drain receipt and clean `boltz-l4-fleet` recreation remain open.
-The `spot-e2e-0902a` attempt committed its first 100-member paid wave but
-exposed both a load-balancer cold-queue liveness defect and unbounded aggregate
-controller remote-I/O fan-out before the traffic receipt. Both defects are
-source-corrected and production-interface component-qualified in this
-checkpoint;
-homogeneous deployment and billable requalification remain.** One
-PostgreSQL-authoritative planner
+Status: **the PostgreSQL-authoritative reservation-aware planner, exact-card
+compatibility, bounded Spot-only paid admission, historical at-least-100 Spot
+scale, 10,000-request transport, and exact provider teardown are
+production-qualified. The latest `paid-e2e-1626b` campaign placed exactly
+10,000 stable request identities, reported queue depth and target 800, and
+reached 52 concurrent AWS Spot VMs before a qualifier-only credential-profile
+comparison stopped the scale observation. Provider-native census subsequently
+proved exact VM zero. Cleanup then exposed one controller defect: all 26
+retained ambiguous associations have a valid immutable version-1 controller
+config, but provider reconciliation used the sparse retained request's absent
+AWS profile and received `InvalidClientTokenId`; this left 26 PostgreSQL claims
+and debits after provider resources were already gone.
+
+This checkpoint keeps the existing
+`aws-client-token-instance-presence-v1` evidence identity byte-compatible and
+separates its access selector into one typed `BoundAwsProviderCensusScope`.
+Every STS/EC2 census and exact termination now resolves the profile from the
+association's immutable `(service_name, service_version)` snapshot, verifies
+the resulting AWS account against the frozen pool identity, and never consults
+the current or ambient controller config. Missing, corrupt, wrong-workspace,
+or wrong-account state remains `UNKNOWN`. PostgreSQL tests prove old evidence
+survives a current-service version rollover while cleanup retains the old
+version's access. GCP legacy project and managed-instance-group policy reads
+use the same exact-version rule. These changes are source-qualified but are
+not yet merged, deployed, or production-proven.
+
+The dashboard/API checkpoint also separates offered pre-admission arrivals
+from recorded request attempts. The direct demand response exposes bounded
+60-second and 300-second stable-ID/headerless arrivals plus saturation, while
+request history is explicitly labeled as admitted/recorded attempts. This
+explains the valid target-800/request-history-zero observation made after the
+held prefix was cancelled. No schema or historical-series migration is added.
+
+The final current-writer AWS/GCP scale/traffic/drain receipt and clean
+`boltz-l4-fleet` recreation remain open.** One PostgreSQL-authoritative planner
 is the canonical source path for reservation-aware actuation and paid Spot
 residual. Historical production runs proved complete East occupancy,
 Kueue-bounded PHX occupancy under the unchanged research policy, reclaim,
@@ -44,19 +45,16 @@ authenticated warm requests, and exact provider teardown. Full idle research
 occupancy is no longer a steady-state goal: `utilization_gate: true` permits
 only demand-backed fill and returns it to the unchanged scheduler when idle.
 
-The current production control plane is release ``1.1.1618`` from merge commit
-``a89f13aa679ab369dcd766f9f991b19ca912db29`` at Helm revision 739 on
-2026-09-02. API, controller, executor, migration, and GCP-login-init containers
-all resolve to image digest
-``sha256:4493ced98d965d621bf0891968425854446b3c5a479e583c5ab8fb5c8d55143d``.
-The two API, two controller, and seven executor participants all advertise
-non-pool capability cohort 15; the ordinary, exact non-pool binding, and
-ordered capacity-admission fleet checks pass after the predecessor stale
-window.
-PostgreSQL is the central store, Helm storage is disabled, and both prepared
-physical launch bounds remain 420. This release contains merged PRs #1857 and
-#1854. No scheduler, platform, infrastructure, EFS/PVC, or provider-policy
-configuration changed in the rollout.
+The current production control plane is release ``1.1.1628`` from merge commit
+``d4e433747`` at Helm revision 743 on 2026-09-02. API, controller, and executor
+containers resolve to image digest
+``sha256:dafbb0ccae69fc2077960b0bb1904c3b21daa5516f7f5ccac6c653cb559928c4``.
+Two API, two controller, and seven executor Pods are Ready. PostgreSQL is the
+central store and Helm storage is disabled. The source checkpoint also includes
+merged Managed Jobs authentication/claim-ownership PRs #1877 and #1878; they
+do not modify Serve planning or provider reconciliation. No scheduler,
+platform, infrastructure, EFS/PVC, or provider-policy configuration changed in
+the rollout.
 
 The first 100-member qualification on this writer exposed a controller-memory
 gate after atomic admission, not an atomic-payload or provider-capacity gate.
