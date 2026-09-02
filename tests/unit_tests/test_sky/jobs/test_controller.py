@@ -12,6 +12,7 @@ and file mount cleanup in task_cleanup().
 # pylint: disable=protected-access,redefined-outer-name,reimported
 # pylint: disable=unused-argument,unused-variable
 import asyncio
+import contextlib
 import os
 import pathlib
 import signal
@@ -25,17 +26,22 @@ from unittest.mock import AsyncMock
 from unittest.mock import call
 from unittest.mock import MagicMock
 from unittest.mock import patch
+import uuid
 
 import pytest
 
+from sky.client import service_account_auth
+from sky.jobs import api_access as managed_job_api_access
 from sky.jobs import controller as controller_lib
 from sky.jobs import state as managed_job_state
+from sky.jobs import utils as managed_job_utils
 from sky.jobs.controller import ControllerManager
 from sky.jobs.controller import JobController
 from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.utils import asyncio_utils
 from sky.utils import common
+from sky.utils import context
 from sky.utils import controller_capability
 from sky.utils import status_lib
 
@@ -4378,3 +4384,199 @@ asyncio.run(main())
 
         assert result.returncode == -signal.SIGKILL, result.stderr
         assert not sentinel.exists()
+
+
+@contextlib.contextmanager
+def _issuing_controller_credential(ctx=None):
+    """Patch credential issuance so only the controller wiring is exercised."""
+    with patch('sky.jobs.controller.controller_capability.get_process_local',
+               return_value='capability'), \
+            patch('sky.jobs.controller.managed_job_state.'
+                  'get_managed_job_tasks',
+                  return_value=[{
+                      'user_hash': 'job-user-hash',
+                  }]), \
+            patch('sky.jobs.controller.managed_job_api_access.'
+                  'create_job_api_token',
+                  return_value=('sky_job-token', 'token-id')) as create, \
+            patch('sky.jobs.controller.server_common.'
+                  'get_api_server_status_response.cache_clear'):
+        if ctx is None:
+            yield create
+        else:
+            with patch('sky.jobs.controller.context.get', return_value=ctx):
+                yield create
+
+
+class TestControllerApiAccessLifecycle:
+    """Controller credentials stay coroutine-local, roll back, and get reaped."""
+
+    @pytest.mark.asyncio
+    async def test_credential_is_visible_only_inside_the_job_context(
+            self, monkeypatch):
+        manager = _make_controller_manager()
+        token_env_var = constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR
+        monkeypatch.delenv(token_env_var, raising=False)
+        # The controller entrypoint hijacks os.environ; the credential must
+        # reach the SDK through that seam, never the process environment.
+        monkeypatch.setattr(os, 'environ',
+                            context.ContextualEnviron(os.environ))
+        seen: dict[str, str | None] = {}
+
+        @context.contextual_async
+        async def run_job() -> None:
+            with _issuing_controller_credential():
+                assert manager._initialize_controller_api_access(
+                    37) == 'token-id'
+            seen['coroutine'] = (
+                service_account_auth._get_service_account_token())
+            seen['thread'] = await asyncio.to_thread(os.environ.get,
+                                                     token_env_var)
+
+        @context.contextual_async
+        async def run_sibling_job() -> None:
+            seen['sibling'] = os.environ.get(token_env_var)
+
+        # Job loops are scheduled as their own tasks (create_background_task);
+        # that task boundary is what confines the per-job credential.
+        await asyncio.create_task(run_job())
+        await asyncio.create_task(run_sibling_job())
+        seen['process'] = os.environ.get(token_env_var)
+
+        assert seen == {
+            'coroutine': 'sky_job-token',
+            'thread': 'sky_job-token',
+            'sibling': None,
+            'process': None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_run_job_loop_installs_the_credential_before_the_controller(
+            self):
+        manager = _make_controller_manager()
+        manager.starting.add(3)
+        manager._cleanup = AsyncMock()
+        manager._cleanup_api_server_access_token = MagicMock()
+        manager._cleanup_controller_api_access = MagicMock()
+        order: list[str] = []
+        ctx = MagicMock()
+        ctx.override_envs.side_effect = (
+            lambda envs: order.append('credential')
+            if constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR in envs else None)
+        controller = MagicMock()
+        controller.run = AsyncMock(return_value=True)
+
+        def build_controller(*args, **kwargs):
+            del args, kwargs
+            order.append('controller')
+            return controller
+
+        with _issuing_controller_credential(ctx), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'get_job_env_content', return_value=''), \
+                patch('sky.jobs.controller.usage_lib.'
+                      'install_fresh_messages_for_current_context'), \
+                patch('sky.jobs.controller.JobController',
+                      side_effect=build_controller), \
+                patch('sky.jobs.controller.managed_job_state.get_status_async',
+                      new_callable=AsyncMock,
+                      return_value=(
+                          managed_job_state.ManagedJobStatus.SUCCEEDED)), \
+                patch('sky.jobs.controller.scheduler.job_done_async',
+                      new_callable=AsyncMock):
+            await manager.run_job_loop(3, '/dev/null')
+
+        # Every nested launch/status/down call runs under the JobController,
+        # so the credential must exist before it is constructed.
+        assert order == ['credential', 'controller']
+        manager._cleanup_controller_api_access.assert_called_once_with(
+            'token-id', 3)
+        assert not manager._controller_api_token_ids
+
+    def test_install_failure_revokes_the_fresh_token(self):
+        manager = _make_controller_manager()
+        ctx = MagicMock()
+        ctx.override_envs.side_effect = RuntimeError('context is gone')
+
+        with _issuing_controller_credential(ctx), \
+                patch('sky.jobs.controller.global_user_state.'
+                      'delete_service_account_token') as delete:
+            with pytest.raises(RuntimeError, match='context is gone'):
+                manager._initialize_controller_api_access(37)
+
+        delete.assert_called_once_with('token-id')
+        assert not manager._controller_api_token_ids
+
+    @pytest.mark.asyncio
+    async def test_cleanup_only_installs_the_credential_once_and_revokes_it(
+            self):
+        manager = _make_controller_manager()
+        manager.job_tasks[3] = asyncio.current_task()
+        manager._cleanup_only_job_ids.add(3)
+        manager._initialize_job_context = MagicMock(return_value=None)
+        manager._cleanup = AsyncMock(
+            side_effect=[RuntimeError('provider unavailable'), None])
+        manager._cleanup_api_server_access_token = MagicMock()
+        manager._cleanup_controller_api_access = MagicMock()
+        ctx = MagicMock()
+
+        with _issuing_controller_credential(ctx) as create, \
+                patch('sky.jobs.controller.asyncio.sleep',
+                      new_callable=AsyncMock), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'scheduler_set_cleanup_done_async',
+                      new_callable=AsyncMock):
+            await ControllerManager.run_cleanup_loop.__wrapped__(
+                manager, 3, '/tmp/controller.log', None)
+
+        create.assert_called_once_with('job-user-hash', 'controller-3-00000000')
+        ctx.override_envs.assert_called_once_with(
+            {constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR: 'sky_job-token'})
+        manager._cleanup_controller_api_access.assert_called_once_with(
+            'token-id', 3)
+        assert not manager._controller_api_token_ids
+
+    def test_leaked_controller_token_is_reaped_by_the_expiry_sweep(self):
+        manager = ControllerManager('test-uuid', _TEST_CONTROLLER_SLOT_ID,
+                                    str(uuid.uuid4()))
+        token_service = MagicMock()
+        token_service.create_token.return_value = {
+            'token': 'sky_job-token',
+            'token_id': 'token-id',
+            'token_hash': 'token-hash',
+            'expires_at': 12345,
+        }
+
+        with patch('sky.jobs.controller.controller_capability.'
+                   'get_process_local', return_value='capability'), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_managed_job_tasks',
+                      return_value=[{
+                          'user_hash': 'job-user-hash',
+                      }]), \
+                patch.object(managed_job_api_access.token_service_lib,
+                             'token_service', token_service), \
+                patch.object(managed_job_api_access.global_user_state,
+                             'add_service_account_token') as add_token, \
+                patch('sky.jobs.controller.context.get',
+                      return_value=MagicMock()), \
+                patch('sky.jobs.controller.server_common.'
+                      'get_api_server_status_response.cache_clear'):
+            manager._initialize_controller_api_access(37)
+
+        token_name = add_token.call_args.kwargs['token_name']
+        # A controller crash between issuance and release leaks this row. The
+        # expired-token daemon must recognise it by name shape alone.
+        with patch.object(
+                managed_job_utils.global_user_state,
+                'get_expired_service_account_tokens_by_name_prefix',
+                return_value=[{
+                    'token_id': 'token-id',
+                    'token_name': token_name,
+                }]), \
+                patch.object(managed_job_utils.global_user_state,
+                             'delete_service_account_token',
+                             return_value=True) as delete:
+            assert managed_job_utils.cleanup_expired_api_access_tokens() == 1
+
+        delete.assert_called_once_with('token-id')
