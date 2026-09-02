@@ -2,6 +2,7 @@
 
 from io import StringIO
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
@@ -222,7 +223,7 @@ class TestRunWithLogTimeout(unittest.TestCase):
                         deadline_monotonic=time.monotonic() + 0.5,
                         max_output_bytes=1024))
             self.assertLess(time.monotonic() - started_at, 2.5)
-            child_pid = int(open(pid_path, encoding='utf-8').read())
+            child_pid = int(pathlib.Path(pid_path).read_text(encoding='utf-8'))
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline:
                 try:

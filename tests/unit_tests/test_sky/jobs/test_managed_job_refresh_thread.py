@@ -757,11 +757,14 @@ def test_recovery_only_fences_stale_jobs(tmp_path, monkeypatch):
     monkeypatch.setattr(mjrt.managed_job_state,
                         'reset_stale_jobs_for_current_controller',
                         reset_stale_jobs_for_current_controller)
+    monkeypatch.setattr(mjrt.managed_job_utils,
+                        'requeue_terminal_done_jobs_with_live_clusters',
+                        lambda: order.append('requeue-terminal-cleanup') or 1)
     monkeypatch.setattr(mjrt.managed_job_state, 'get_managed_jobs_with_filters',
                         lambda fields: ([], None))
     mjrt.managed_job_utils.ha_recovery_for_consolidation_mode()
 
-    assert order == ['reset-stale']
+    assert order == ['reset-stale', 'requeue-terminal-cleanup']
 
 
 class TestStart:
