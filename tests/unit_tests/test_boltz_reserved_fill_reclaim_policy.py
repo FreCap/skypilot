@@ -565,6 +565,12 @@ def test_two_arbitrary_services_share_one_canonical_claim_path(monkeypatch):
 
 
 def test_zero_capacity_context_does_not_block_positive_claim_peer(monkeypatch):
+    """A claim set decodes an exact zero-node receipt on the production path.
+
+    The durable receipt is served through the repository seam so the claim
+    authorization runs the real ``validate`` callback and context decode; a
+    decoder that still rejects zero matching nodes fails this test.
+    """
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
     identity = policy.policy_identity()
     east_name = 'prod_research_cluster_eks'
@@ -580,19 +586,35 @@ def test_zero_capacity_context_does_not_block_positive_claim_peer(monkeypatch):
         phx_name: _context_proof(phx,
                                  policy._bundle.provider_context(phx_name)),
     }
+    validated: dict[str, bool] = {}
 
-    def read(context_name, expected_identity, gate_generation, _deadline):
-        return proofs[context_name], reclaim.ReclaimProviderProofReference(
-            receipt_nonce=hashlib.sha256(context_name.encode()).hexdigest(),
-            proof_sha256='d' * 64,
-            identity=expected_identity,
-            gate_generation=gate_generation,
-            kubernetes_context=context_name,
-            completed_monotonic=time.monotonic())
+    class _Repository:
+        """Serve durable receipts through the production decode path."""
 
-    receipt_read = mock.Mock(side_effect=read)
-    monkeypatch.setattr(policy, '_read_launch_context', receipt_read)
-    monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
+        @staticmethod
+        def get_fresh(**kwargs):
+            context_name = kwargs['kubernetes_context']
+            proof = proofs[context_name]
+            payload, _ = reclaim_proofs.canonical_proof_payload({
+                'aws': dataclasses.asdict(proof.aws),
+                'kubernetes': dataclasses.asdict(proof.kubernetes),
+            })
+            validated[context_name] = kwargs['validate'](payload)
+            return types.SimpleNamespace(
+                proof_payload=payload,
+                reference=reclaim.ReclaimProviderProofReference(
+                    receipt_nonce=hashlib.sha256(
+                        context_name.encode()).hexdigest(),
+                    proof_sha256='d' * 64,
+                    identity=kwargs['identity'],
+                    gate_generation=kwargs['gate_generation'],
+                    kubernetes_context=context_name,
+                    completed_monotonic=time.monotonic()))
+
+    monkeypatch.setattr(reclaim_proofs, 'ReclaimProviderProofRepository',
+                        _Repository)
+    emit_proof = mock.Mock()
+    monkeypatch.setattr(policy, '_emit_proof', emit_proof)
     scope = reclaim.ReclaimClaimSetScope(
         service_name='mixed-capacity-service',
         service_incarnation='mixed-capacity-incarnation',
@@ -607,8 +629,18 @@ def test_zero_capacity_context_does_not_block_positive_claim_peer(monkeypatch):
         deadline_monotonic=time.monotonic() + 5)
 
     assert authorization.scope == scope
-    assert {call.args[0] for call in receipt_read.call_args_list
-           } == {east_name, phx_name}
+    assert validated == {east_name: True, phx_name: True}
+    payload_by_context = {
+        context['kubernetes_context']: context
+        for context in emit_proof.call_args.args[0]['contexts']
+    }
+    assert {
+        node['non_deleting_node_count']
+        for node in payload_by_context[east_name]['kubernetes']['node_flavors']
+    } == {0}
+    assert all(
+        node['non_deleting_node_count'] > 0
+        for node in payload_by_context[phx_name]['kubernetes']['node_flavors'])
 
 
 def test_claim_ticket_is_minted_after_proof_logging(monkeypatch):
