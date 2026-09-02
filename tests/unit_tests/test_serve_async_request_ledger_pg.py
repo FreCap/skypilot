@@ -240,7 +240,7 @@ def test_migration_058_has_normalized_deferred_attempt_identity(
             sqlalchemy.text(
                 'SELECT version_num FROM alembic_version_serve_state_db')
         ).scalar_one()
-    assert revision == '058'
+    assert revision == migration_utils.SERVE_VERSION
     assert inspector.has_table('serve_async_requests')
     assert inspector.has_table('serve_async_request_attempts')
     attempt_fks = inspector.get_foreign_keys('serve_async_request_attempts')

@@ -12,6 +12,7 @@ import pytest
 
 from sky.provision import common as provision_common
 from sky.serve import constants as serve_constants
+from sky.serve import kubernetes_identity
 from sky.serve import kueue_lane_lineage
 from sky.serve import kueue_lane_observer
 from sky.serve import ordinary_launch_binding
@@ -20,6 +21,8 @@ from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_reclaim_attestation
 
 _INTENT_KEY = 'a' * 64
+_CURRENT_PROJECTION_VERSION = (
+    kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
 _WORKER_PROJECTION_SHA256 = 'b' * 64
 _REPLICA_RECORD_ID = uuid.UUID('11111111-1111-4111-8111-111111111111')
 _READ_STARTED_AT = datetime.datetime(2026,
@@ -463,14 +466,15 @@ def test_identity_or_shape_mismatch_fails_before_durable_state(mutation):
 
 @pytest.mark.parametrize(
     ('admission_mode', 'expects_runtime', 'projection_version', 'error_match'),
-    [(reserved_fill_reclaim_attestation.ReclaimAdmissionMode.KUEUE, True, 9,
-      None),
+    [(reserved_fill_reclaim_attestation.ReclaimAdmissionMode.KUEUE, True,
+      _CURRENT_PROJECTION_VERSION, None),
      (reserved_fill_reclaim_attestation.ReclaimAdmissionMode.
-      KUBERNETES_SCHEDULER, False, 9, None),
-     (reserved_fill_reclaim_attestation.ReclaimAdmissionMode.KUEUE, True, 8,
-      None),
+      KUBERNETES_SCHEDULER, False, _CURRENT_PROJECTION_VERSION, None),
+     (reserved_fill_reclaim_attestation.ReclaimAdmissionMode.KUEUE, True,
+      _CURRENT_PROJECTION_VERSION - 1, None),
      (reserved_fill_reclaim_attestation.ReclaimAdmissionMode.
-      KUBERNETES_SCHEDULER, False, 8, 'no durable Pod identity')])
+      KUBERNETES_SCHEDULER, False, _CURRENT_PROJECTION_VERSION - 1,
+      'no durable Pod identity')])
 def test_runtime_is_derived_only_for_projected_kueue_admission(
         admission_mode, expects_runtime, projection_version, error_match):
     fence = _fence()

@@ -2673,6 +2673,12 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
     monkeypatch.setattr(ordinary_launch_binding,
                         'resolve_non_pool_launch_profile_in_connection',
                         lambda *_args, **_kwargs: profile)
+    # Admission recomputes the profile through the connection-local resolver
+    # (not the public wrapper) since #1685; this test seeds no committed
+    # intent graph, so pin that seam to the same frozen profile.
+    monkeypatch.setattr(ordinary_launch_binding,
+                        '_resolve_non_pool_launch_profile_in_connection',
+                        lambda *_args, **_kwargs: (profile, None))
     monkeypatch.setattr(
         ordinary_launch_binding, '_reserved_fill_cleanup_payload',
         lambda *_args, **_kwargs: {'physical_cluster_uid': 'physical-uid-a'})
@@ -3506,7 +3512,7 @@ def test_gcp_paid_unknown_replacement_absence_uses_frozen_cleanup_graph(
 }])
 def test_paid_unknown_replacement_database_guards_reject_pool_near_misses(
         bound_request_database, monkeypatch, pool_override) -> None:
-    """Fresh pointer and association transitions require exact GCP v2."""
+    """The association pool-scope CHECK rejects every GCP v2 near miss."""
     graph = _prepare_paid_provider_absence_graph(
         bound_request_database,
         monkeypatch,
@@ -3542,36 +3548,25 @@ def test_paid_unknown_replacement_database_guards_reject_pool_near_misses(
                                   sort_keys=True,
                                   separators=(',', ':'))
     associations = ordinary_launch_binding.ordinary_launch_associations_table
-    with graph.engine.begin() as connection:
-        connection.exec_driver_sql(
-            f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
-        try:
+    # Serve067's pool-scope CHECK is a table constraint, not a trigger: a
+    # near-miss key cannot even be planted on the replacement association, so
+    # no pointer or resolution transition can ever observe one.
+    with pytest.raises(sqlalchemy.exc.DBAPIError) as rejected:
+        with graph.engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
             connection.execute(
                 sqlalchemy.update(associations).where(
                     associations.c.association_id ==
                     graph.context.association_id).values(
                         paid_capacity_pool_key=invalid_pool_key))
-        finally:
-            connection.exec_driver_sql(
-                f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
-
-    with pytest.raises(sqlalchemy.exc.DBAPIError):
-        with graph.engine.begin() as connection:
-            connection.execute(
-                sqlalchemy.update(serve_state_schema.replicas_table).where(
-                    serve_state_schema.replicas_table.c.service_name ==
-                    'gc-service',
-                    serve_state_schema.replicas_table.c.replica_id == 3).values(
-                        ordinary_launch_association_id=None))
-    with pytest.raises(sqlalchemy.exc.DBAPIError):
-        with graph.engine.begin() as connection:
-            connection.execute(
-                sqlalchemy.update(associations).where(
-                    associations.c.association_id ==
-                    graph.context.association_id).values(
-                        resolution='PROJECTED',
-                        reconciliation_outcome='PROJECTED',
-                        ambiguity_code=None))
+    assert 'serve059_paid_pool_scope_ck' in str(rejected.value)
+    with graph.engine.connect() as connection:
+        retained_pool_key = connection.execute(
+            sqlalchemy.select(associations.c.paid_capacity_pool_key).where(
+                associations.c.association_id ==
+                graph.context.association_id)).scalar_one()
+    assert retained_pool_key == graph.pool_key
 
 
 def test_gcp_paid_identity_accepts_http_post_normalization_body(
@@ -3645,8 +3640,9 @@ def test_gcp_paid_identity_accepts_http_post_normalization_body(
             user_hash='skyserve'))
 
 
-def test_gcp_paid_provider_identity_uses_frozen_region_for_project(
+def test_gcp_paid_provider_identity_uses_frozen_pool_project(
         bound_request_database, monkeypatch) -> None:
+    """A v2 pool froze its project at admission; config is never consulted."""
     graph = _prepare_paid_provider_absence_graph(
         bound_request_database, monkeypatch, pool_key=_gc_gcp_paid_pool_key())
     original_resolver = (request_postgres.skypilot_config.
@@ -3656,8 +3652,7 @@ def test_gcp_paid_provider_identity_uses_frozen_region_for_project(
     def _regional_project_resolver(config_snapshot, cloud, keys, **kwargs):
         if cloud == 'gcp' and keys == ('project_id',):
             project_reads.append(kwargs)
-            if kwargs.get('region') == 'us-east4':
-                return 'regional-project'
+            return 'regional-project'
         return original_resolver(config_snapshot, cloud, keys, **kwargs)
 
     monkeypatch.setattr(request_postgres.skypilot_config,
@@ -3668,11 +3663,8 @@ def test_gcp_paid_provider_identity_uses_frozen_region_for_project(
         graph.context, graph.authority)
 
     assert identity is not None
-    assert identity['project_id'] == 'regional-project'
-    assert project_reads == [{
-        'region': 'us-east4',
-        'workspace': 'workspace-a',
-    }]
+    assert identity['project_id'] == 'boltz-498512'
+    assert project_reads == []
 
 
 @pytest.mark.parametrize('production_http_normalization', [False, True])

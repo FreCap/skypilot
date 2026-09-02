@@ -635,6 +635,9 @@ def test_all_current_skypilot_exceptions_round_trip_exactly():
         exceptions.ExecutionPausedError:
             lambda: exceptions.ExecutionPausedError('paused', 'waiting', 5,
                                                     {'signal': 'ready'}),
+        exceptions.ProviderCreateAmbiguousError:
+            lambda: exceptions.ProviderCreateAmbiguousError(
+                'ambiguous create', 'replaying the idempotent create', 5),
         exceptions.ReservedFillProviderProofPausedError:
             lambda: exceptions.ReservedFillProviderProofPausedError(
                 'proof paused', 'waiting for renewal', 3),
