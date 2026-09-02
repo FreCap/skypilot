@@ -8502,6 +8502,60 @@ class TestLogicalReplicaSemantics(unittest.TestCase):
         self.assertEqual(target.target_capacity_by_accelerator, (('L4', 1),))
         self.assertTrue(target.is_exact)
 
+    def test_logical_capacity_target_intent_renewal_contract(self):
+        # A launch fence stored under one target may be carried onto a newer
+        # generation only when every other field is identical.
+        shapes = (('L4', 1), ('A100', 8))
+        fence = autoscalers.LogicalCapacityTarget(
+            version=1,
+            generation=4,
+            target_capacity=3,
+            target_capacity_by_accelerator=(('L4', 3),),
+            accelerator_shapes=shapes)
+        renewed = dataclasses.replace(fence, generation=9)
+
+        self.assertTrue(fence.intent_is_preserved_by(fence))
+        self.assertTrue(fence.intent_is_preserved_by(renewed))
+        self.assertFalse(
+            fence.intent_is_preserved_by(
+                dataclasses.replace(fence, generation=3)))
+        self.assertFalse(
+            fence.intent_is_preserved_by(dataclasses.replace(renewed,
+                                                             version=2)))
+        self.assertFalse(
+            fence.intent_is_preserved_by(
+                dataclasses.replace(renewed,
+                                    accelerator_shapes=(('L4', 1), ('A100',
+                                                                    1)))))
+        self.assertFalse(
+            fence.intent_is_preserved_by(
+                dataclasses.replace(renewed,
+                                    target_capacity_by_accelerator=(('A100',
+                                                                     3),))))
+        self.assertFalse(
+            fence.intent_is_preserved_by(
+                autoscalers.LogicalCapacityTarget(version=1,
+                                                  generation=9,
+                                                  target_capacity=3)))
+        self.assertFalse(fence.intent_is_preserved_by(None))
+
+    def test_logical_capacity_target_zero_capacity_keeps_exact_shapes(self):
+        # An exact-card service at target zero still names its catalog, so an
+        # aggregate-only caller cannot act on it.
+        target = autoscalers.LogicalCapacityTarget(
+            version=1,
+            generation=4,
+            target_capacity=0,
+            target_capacity_by_accelerator=(('L4', 0),),
+            accelerator_shapes=(('L4', 1),))
+
+        self.assertEqual(target.target_capacity_by_accelerator, ())
+        self.assertTrue(target.is_exact)
+        self.assertFalse(
+            autoscalers.LogicalCapacityTarget(version=1,
+                                              generation=4,
+                                              target_capacity=0).is_exact)
+
     def test_cost_rebalance_location_capacity_stays_in_gpu_slots(self):
         autoscaler = _make_autoscaler(knob=2, replica_unit='logical')
         location = mock.Mock()
