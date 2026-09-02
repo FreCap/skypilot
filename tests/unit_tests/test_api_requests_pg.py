@@ -873,9 +873,10 @@ def _prepare_paid_provider_absence_graph(
                 ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)),
         auth_user=models.User(id=admission_tenant, name=admission_creator),
         client_api_version=77)
-    monkeypatch.setattr(request_postgres,
-                        '_resolved_request_backend_capability', lambda:
-                        ('postgres-storage', 'postgres-queue', True))
+    monkeypatch.setattr(
+        request_postgres, '_resolved_request_backend_capability', lambda:
+        (request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE,
+         request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE, True))
     monkeypatch.setattr(request_postgres,
                         'non_pool_launch_binding_fleet_capable',
                         lambda **_kwargs: True)
@@ -2137,9 +2138,10 @@ def test_generic_binding_atomically_commits_exact_profile_request_queue_and_pin(
         precondition=preconditions.OrdinaryLaunchBindingPrecondition(
             identity.request_id, str(identity.association_id)),
         client_api_version=77)
-    monkeypatch.setattr(request_postgres,
-                        '_resolved_request_backend_capability', lambda:
-                        ('postgres-storage', 'postgres-queue', True))
+    monkeypatch.setattr(
+        request_postgres, '_resolved_request_backend_capability', lambda:
+        (request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE,
+         request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE, True))
     monkeypatch.setattr(request_postgres,
                         'non_pool_launch_binding_fleet_capable',
                         lambda **_kwargs: True)
@@ -2377,9 +2379,10 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
         lambda *_args, **_kwargs: {'physical_cluster_uid': 'physical-uid-a'})
     identity = _gc_non_pool_binding_identity(profile)
     request = _bound_non_pool_request(identity.request_id)
-    monkeypatch.setattr(request_postgres,
-                        '_resolved_request_backend_capability', lambda:
-                        ('postgres-storage', 'postgres-queue', True))
+    monkeypatch.setattr(
+        request_postgres, '_resolved_request_backend_capability', lambda:
+        (request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE,
+         request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE, True))
     monkeypatch.setattr(request_postgres,
                         'non_pool_launch_binding_fleet_capable',
                         lambda **_kwargs: True)
@@ -2698,9 +2701,10 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
         client_api_version=77)
     identity = built.identity
     request = built.request
-    monkeypatch.setattr(request_postgres,
-                        '_resolved_request_backend_capability', lambda:
-                        ('postgres-storage', 'postgres-queue', True))
+    monkeypatch.setattr(
+        request_postgres, '_resolved_request_backend_capability', lambda:
+        (request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE,
+         request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE, True))
     monkeypatch.setattr(request_postgres,
                         'non_pool_launch_binding_fleet_capable',
                         lambda **_kwargs: True)
@@ -6565,7 +6569,7 @@ def test_non_pool_cohort_promotion_barrier_blocks_heartbeat_phantoms(
 
 
 def test_non_pool_fleet_rejects_recent_previous_cohort_participant(
-        request_database):
+        request_database, monkeypatch):
     engine, _ = request_database
     current_cohort = ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
 
@@ -6615,6 +6619,15 @@ def test_non_pool_fleet_rejects_recent_previous_cohort_participant(
                        ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS +
                        1))))
     assert request_postgres.non_pool_launch_binding_fleet_capable()
+
+    def _unexpected_database_initialization():
+        raise AssertionError('caller-owned read opened a second database')
+
+    with engine.connect() as connection:
+        monkeypatch.setattr(request_postgres, 'initialize_and_get_db',
+                            _unexpected_database_initialization)
+        assert request_postgres.non_pool_launch_binding_fleet_capable(
+            connection=connection)
 
 
 def test_ordered_capacity_fleet_requires_exact_recent_api015_cohort(

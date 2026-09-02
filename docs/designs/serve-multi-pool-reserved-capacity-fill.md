@@ -92,6 +92,15 @@ newly durable paid profile, and invokes the sole
 accepted member before commit. Plan/head, debit, replica, claim, association,
 request, retention pin, queue row, and replica pointer are therefore one atomic
 graph: either all accepted members become executable or none does.
+Handler registration, request-backend capability discovery, and nested lazy
+module resolution are process preflight, never correctness-transaction work.
+The preflight emits one frozen ``NonPoolLaunchBindingRuntime`` token; the
+transaction accepts that token only alongside its locked PostgreSQL fleet,
+cohort, authority, and service/version checks. A fleet-capability read given a
+caller-owned connection uses only that connection and cannot initialize or
+check out a second database handle. The token therefore removes cold-process
+imports and backend construction from the lock interval without replacing any
+durable authorization fact.
 The receipt retains only durable request identity. Its derived log path is
 created and touched after commit as best effort, so filesystem availability is
 not part of the graph's commit condition.

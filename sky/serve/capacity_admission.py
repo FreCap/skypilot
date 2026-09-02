@@ -5489,6 +5489,11 @@ class CapacityAdmissionRepository:
         reserved_fill_planner.FillCapacityUnit  # pylint: disable=pointless-statement
         zero_cost_actuation.replica_capacity_for_unit  # pylint: disable=pointless-statement
         ordinary_launch_binding.ControllerBindingAuthority  # pylint: disable=pointless-statement
+        ordinary_launch_binding.system_oom_recovery.has_v3_system_oom_recovery_context  # pylint: disable=pointless-statement
+        serve_state.replica_managers.ReplicaInfo  # pylint: disable=pointless-statement
+        serve_paid_capacity.replica_info_lib.ReplicaInfo  # pylint: disable=pointless-statement
+        service_spec.SkyServiceSpec  # pylint: disable=pointless-statement
+        kubernetes_identity.validate_worker_placement_projections  # pylint: disable=pointless-statement
         request_postgres.non_pool_launch_binding_fleet_capable  # pylint: disable=pointless-statement
         # Resolve request modules and run the complete canonical reconstruction
         # before correctness locks.  The advisory source facts are compared to
@@ -5498,6 +5503,9 @@ class CapacityAdmissionRepository:
             paid_wave_admission.bind_accepted_in_transaction)
         record_paid_executable_commit = paid_wave_admission.record_fused_commit
         has_prepared_paid_launches = bool(prepared_paid_launch_specs)
+        request_runtime = (
+            request_postgres.prepare_non_pool_launch_binding_runtime()
+            if has_prepared_paid_launches else None)
         paid_preflight = (_prepare_paid_launch_preflight(
             self.engine,
             prepared_paid_launch_specs,
@@ -6229,11 +6237,13 @@ class CapacityAdmissionRepository:
                 accepted=accepted)
             if accepted:
                 assert binding_authority is not None
+                assert request_runtime is not None
                 try:
                     paid_launch_bindings = (bind_paid_executables(
                         connection,
                         service=service,
                         authority=binding_authority,
+                        runtime=request_runtime,
                         accepted=tuple(
                             zip(paid_launch_receipt.members,
                                 (item.launch_spec for item in accepted),

@@ -762,9 +762,10 @@ def capacity_database(empty_postgres, monkeypatch):
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
     monkeypatch.setattr(request_postgres._DB_MANAGER, '_engine', empty_postgres)
-    monkeypatch.setattr(request_postgres,
-                        '_resolved_request_backend_capability', lambda:
-                        ('postgres-storage', 'postgres-queue', True))
+    monkeypatch.setattr(
+        request_postgres, '_resolved_request_backend_capability', lambda:
+        (request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE,
+         request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE, True))
     incarnation = uuid.uuid4()
     controller_config = _paid_controller_config_snapshot()
     with empty_postgres.begin() as connection:
@@ -3499,6 +3500,8 @@ def test_paid_canonical_preflight_and_log_io_are_outside_correctness_locks(
     correctness_open = False
     real_transaction = capacity_admission._capacity_admission_transaction
     real_canonical = capacity_admission._canonical_prepared_paid_launch_specs
+    real_runtime_preflight = (capacity_admission.request_postgres.
+                              prepare_non_pool_launch_binding_runtime)
 
     @contextlib.contextmanager
     def _guarded_transaction(*args, **kwargs):
@@ -3517,6 +3520,10 @@ def test_paid_canonical_preflight_and_log_io_are_outside_correctness_locks(
     def _guarded_secho(*_args, **_kwargs):
         assert not correctness_open
 
+    def _guarded_runtime_preflight():
+        assert not correctness_open
+        return real_runtime_preflight()
+
     def _materialize_log(_request_id):
         assert not correctness_open
         assert _fused_paid_graph_counts(engine) == (1,) * 9
@@ -3527,6 +3534,10 @@ def test_paid_canonical_preflight_and_log_io_are_outside_correctness_locks(
                         '_canonical_prepared_paid_launch_specs',
                         _guarded_canonical)
     monkeypatch.setattr(sdk.click, 'secho', _guarded_secho)
+    runtime_preflight = mock.Mock(side_effect=_guarded_runtime_preflight)
+    monkeypatch.setattr(capacity_admission.request_postgres,
+                        'prepare_non_pool_launch_binding_runtime',
+                        runtime_preflight)
     materialize_log = mock.Mock(side_effect=_materialize_log)
     monkeypatch.setattr(request_lib, 'materialize_request_log_path_for_id',
                         materialize_log)
@@ -3545,6 +3556,7 @@ def test_paid_canonical_preflight_and_log_io_are_outside_correctness_locks(
                                        prepared_paid_launch_specs=(spec,))
 
     assert len(committed.paid_launch_bindings) == 1
+    runtime_preflight.assert_called_once_with()
     materialize_log.assert_called_once()
 
 

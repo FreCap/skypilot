@@ -136,6 +136,7 @@ def bind_accepted_in_transaction(
     *,
     service: Mapping[str, Any],
     authority: ordinary_launch_binding.ControllerBindingAuthority,
+    runtime: request_postgres.NonPoolLaunchBindingRuntime,
     accepted: Sequence[tuple[paid_capacity.PaidLaunchReceiptMember,
                              paid_capacity.PaidLaunchSpec]],
 ) -> tuple[FusedBindingReceiptMember, ...]:
@@ -213,7 +214,9 @@ def bind_accepted_in_transaction(
                 built.request.request_body) != built.identity.input_digest:
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                 'Fused paid request body does not match its canonical digest.')
-        admission = non_pool_admission.bind_in_transaction(connection, built)
+        admission = non_pool_admission.bind_in_transaction(connection,
+                                                           built,
+                                                           runtime=runtime)
         if not admission.created:
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                 'Fresh paid capacity resolved an existing launch request.')
