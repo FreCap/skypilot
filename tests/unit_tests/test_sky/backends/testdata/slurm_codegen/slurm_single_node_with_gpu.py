@@ -1,24 +1,28 @@
+import asyncio
+import copy
+import dataclasses
 import functools
 import getpass
 import hashlib
 import io
+import logging
+import math
+import multiprocessing.pool
 import os
 import pathlib
 import selectors
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from typing import Dict, List, Optional, Tuple, Union
 
 import colorama
-import copy
 import json
-import multiprocessing
-import signal
-import threading
 from sky.backends import backend_utils
 
 from sky.skylet import autostop_lib
@@ -30,6 +34,114 @@ from sky.utils import subprocess_utils
 SKY_REMOTE_WORKDIR = '~/sky_workdir'
 
 CANCELLED_RETURN_CODE = 137
+
+logger = logging.getLogger(__name__)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class BoundedSubprocessCapture:
+    """Finite POSIX capture contract for short control-plane commands."""
+
+    deadline_monotonic: int | float
+    max_output_bytes: int
+
+    def __post_init__(self) -> None:
+        deadline = self.deadline_monotonic
+        if (isinstance(deadline, bool) or
+                not isinstance(deadline,
+                               (int, float)) or not math.isfinite(deadline)):
+            raise ValueError('Capture deadline must be finite.')
+        if (isinstance(self.max_output_bytes, bool) or
+                not isinstance(self.max_output_bytes, int) or
+                self.max_output_bytes < 1):
+            raise ValueError('Capture output limit must be a positive integer.')
+
+class SubprocessOutputLimitExceeded(RuntimeError):
+    """A bounded subprocess emitted more bytes than its capture contract."""
+
+def _kill_and_reap_process_group(proc: subprocess.Popen) -> None:
+    """Immediately retire a start_new_session process and its local children."""
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            logger.error('Failed to reap bounded subprocess %s.', proc.pid)
+
+def _kill_process_group_nonblocking(proc: subprocess.Popen) -> None:
+    """Signal a bounded process group from a cancellation callback."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+def _capture_subprocess_bounded(
+    proc: subprocess.Popen,
+    cmd: list[str] | str,
+    capture: BoundedSubprocessCapture,
+) -> tuple[str, str]:
+    """Capture stdout/stderr with one deadline, byte cap, and no threads."""
+    if os.name != 'posix':
+        _kill_and_reap_process_group(proc)
+        raise RuntimeError('Bounded subprocess capture requires POSIX.')
+    deadline = capture.deadline_monotonic
+    streams = {
+        'stdout': proc.stdout,
+        'stderr': proc.stderr,
+    }
+    buffers: dict[str, list[bytes]] = {'stdout': [], 'stderr': []}
+    captured_bytes = 0
+    selector = selectors.DefaultSelector()
+    try:
+        for name, stream in streams.items():
+            if stream is not None:
+                selector.register(stream, selectors.EVENT_READ, name)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(cmd, max(0, remaining))
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(cmd, max(0, remaining))
+            for key, _ in events:
+                chunk = os.read(key.fd, 64 * 1024)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                captured_bytes += len(chunk)
+                if captured_bytes > capture.max_output_bytes:
+                    raise SubprocessOutputLimitExceeded(
+                        'Subprocess output exceeded '
+                        f'{capture.max_output_bytes} bytes: {cmd}')
+                buffers[key.data].append(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(cmd, max(0, remaining))
+        proc.wait(timeout=remaining)
+    except BaseException:
+        _kill_and_reap_process_group(proc)
+        raise
+    finally:
+        selector.close()
+    stdout = b''.join(buffers['stdout']).decode('utf-8', errors='replace')
+    stderr = b''.join(buffers['stderr']).decode('utf-8', errors='replace')
+    return stdout, stderr
 
 class _ProcessingArgs:
     """Arguments for processing logs."""
