@@ -493,10 +493,12 @@ class RequestWorker:
                            request_element.managed_job_origin)
             capability_fd = None
             if request_element.managed_job_origin is not None:
-                origin = request_element.managed_job_origin
-                if request_element.worker_instance_id != origin[1]:
-                    raise RuntimeError(
-                        'Managed-job nested request claim and origin disagree.')
+                # The request claim and managed-job origin are independent
+                # identities in a split-role deployment.  The former names
+                # the server process executing this disposable request; the
+                # latter names the elected outer controller and exact job
+                # attempt.  PostgreSQL already validated both identities
+                # atomically while claiming the queue row.
                 capability = controller_capability.get_process_local()
                 if capability is None:
                     raise RuntimeError(
