@@ -88,6 +88,23 @@ def test_service_accepts_cli_overrides_for_empty_yaml_secrets():
     serve_utils.validate_service_task(task, pool=False)
 
 
+def test_pool_keeps_empty_secrets_for_job_time_injection():
+    task = sky.Task.from_yaml_config({
+        'pool': {
+            'workers': 1,
+        },
+        'resources': {
+            'cpus': '2+',
+        },
+        'secrets': {
+            'API_KEY': '',
+        },
+        'run': 'sleep infinity',
+    })
+
+    serve_utils.validate_service_task(task, pool=True)
+
+
 @pytest.mark.parametrize(
     ('config', 'expected_min', 'expected_max'),
     [
