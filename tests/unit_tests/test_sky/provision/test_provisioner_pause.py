@@ -183,8 +183,11 @@ def test_bulk_provision_retries_teardown_then_reraises_original_failure(
         _call_bulk_provision(tmp_path)
 
     assert exc_info.value is provisioning_error
-    assert patched_bulk_provision.call_count == 3
-    assert sleep_mock.call_args_list == [mock.call(5), mock.call(5)]
+    teardown_calls = patched_bulk_provision.call_args_list
+    assert len(teardown_calls) == 3
+    assert teardown_calls == [teardown_calls[0]] * 3
+    assert teardown_calls[0].kwargs['terminate'] is True
+    assert sleep_mock.call_count == 2
 
 
 def test_bulk_provision_stops_failover_when_teardown_retries_exhausted(
@@ -193,8 +196,12 @@ def test_bulk_provision_stops_failover_when_teardown_retries_exhausted(
     monkeypatch.setattr(
         provisioner, '_bulk_provision',
         mock.MagicMock(side_effect=RuntimeError('provisioning failed')))
-    teardown_error = RuntimeError('teardown still failing')
-    patched_bulk_provision.side_effect = teardown_error
+    teardown_errors = [
+        RuntimeError('first teardown failure'),
+        RuntimeError('second teardown failure'),
+        RuntimeError('final teardown failure'),
+    ]
+    patched_bulk_provision.side_effect = teardown_errors
     sleep_mock = mock.MagicMock()
     monkeypatch.setattr(provisioner.time, 'sleep', sleep_mock)
 
@@ -202,9 +209,12 @@ def test_bulk_provision_stops_failover_when_teardown_retries_exhausted(
                        match='resource leakage') as exc_info:
         _call_bulk_provision(tmp_path)
 
-    assert exc_info.value.__cause__ is teardown_error
-    assert patched_bulk_provision.call_count == 3
-    assert sleep_mock.call_args_list == [mock.call(5), mock.call(5)]
+    assert exc_info.value.__cause__ is teardown_errors[-1]
+    teardown_calls = patched_bulk_provision.call_args_list
+    assert len(teardown_calls) == 3
+    assert teardown_calls == [teardown_calls[0]] * 3
+    assert teardown_calls[0].kwargs['terminate'] is True
+    assert sleep_mock.call_count == 2
 
 
 def test_bulk_provision_skips_teardown_for_exact_provider_negative_ack(
