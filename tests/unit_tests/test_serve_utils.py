@@ -4693,6 +4693,64 @@ class _FakeReplicaInfo:
         return self.status == serve_state.ReplicaStatus.READY
 
 
+def test_ha_recovery_retires_placeholder_through_liveness_snapshot_identity(
+        _mock_serve_db, tmp_path):
+    """The joined liveness snapshot carries the same ``services.hash`` the
+    raw identity reread used to fetch, so a NULL-yaml placeholder retires
+    through the snapshot with zero raw identity reads.  Only a raw orphan
+    (no version row at all) still needs the fallback read, and a placeholder
+    whose row has no hash is never retired by either path."""
+    with orm.Session(_mock_serve_db) as session:
+        for name, service_hash in (('placeholder', 'placeholder-hash'),
+                                   ('hashless', None)):
+            session.execute(serve_state.services_table.insert().values(
+                name=name,
+                controller_job_id=1,
+                status=serve_state.ServiceStatus.CONTROLLER_INIT.value,
+                requested_resources_str='1x[CPU:1+]',
+                pool=0,
+                controller_pid=None,
+                hash=service_hash,
+                entrypoint='entry'))
+            session.execute(serve_state.version_specs_table.insert().values(
+                service_name=name,
+                version=1,
+                spec=serve_state.pickle.dumps(
+                    types.SimpleNamespace(min_replicas=1)),
+                yaml_content=None))
+        session.commit()
+    _insert_orphan_service_row(_mock_serve_db, 'orphan')
+
+    with mock.patch.object(
+            serve_state,
+            'get_service_mode_and_hashes',
+            wraps=serve_state.get_service_mode_and_hashes) as identities, \
+         mock.patch.object(
+             serve_utils,
+             '_snapshot_in_flight_start_service_incarnations',
+             return_value=set()), \
+         mock.patch.object(
+             serve_utils.skylet_constants,
+             'HA_PERSISTENT_RECOVERY_LOG_PATH',
+             str(tmp_path / 'recovery_{}.log')), \
+         mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner') as runner_cls:
+        serve_utils.ha_recovery_for_consolidation_mode(pool=False)
+
+    identities.assert_called_once_with(['orphan'])
+    runner_cls.return_value.run.assert_not_called()
+    with orm.Session(_mock_serve_db) as session:
+        statuses = dict(
+            session.execute(
+                sqlalchemy.select(serve_state.services_table.c.name,
+                                  serve_state.services_table.c.status)).all())
+    assert statuses == {
+        'placeholder': serve_state.ServiceStatus.FAILED_CLEANUP.value,
+        'orphan': serve_state.ServiceStatus.FAILED_CLEANUP.value,
+        'hashless': serve_state.ServiceStatus.CONTROLLER_INIT.value,
+    }
+
+
 @pytest.mark.parametrize(
     'replica_statuses,expected_service_status',
     [
