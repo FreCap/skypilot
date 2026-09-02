@@ -152,7 +152,7 @@ def _provider_proof(
         namespace_uid=provider['namespace_uid'],
         kueue_managed=True,
         local_queue_name=admission['local_queue_name'],
-        cluster_queue_name=admission['queues']['inference_cluster_queue'],
+        cluster_queue_name=admission['cluster_queue_name'],
         pod_identity_irsa_annotation_absent=True,
         assign_queue_labels_for_pods=True,
         topology_aware_scheduling=True,
