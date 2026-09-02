@@ -5869,6 +5869,117 @@ def test_controller_installs_finalized_partial_paid_wave_and_successor(
     assert installed == [first.candidate, successor.candidate]
 
 
+def test_controller_suppresses_actuation_on_committed_candidate_drift(
+        capacity_database, monkeypatch):
+    """Only the finalized policy state may differ from the local candidate.
+
+    #1823 rebinds ``next_policy_state`` before comparing the committed
+    candidate with the local plan.  Any other committed field drifting from
+    the local projection must still suppress local actuation and install
+    nothing, otherwise a divergent repository plan would be actuated locally.
+    ``source_generation`` is the drift probe: it carries no planner
+    invariant, so the tampered candidate reaches the comparison itself.
+    """
+    drift = 'source_generation'
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           max_replicas=120,
+                           replica_unit='logical',
+                           max_live_paid_gpu_units=120,
+                           max_scale_up_rate_percentage=100,
+                           scale_up_rate_min_replicas=8,
+                           scale_up_rate_period_seconds=60)
+    route_response = _route_response()
+    route_response.update(replica_info={}, num_ready_replicas=0)
+    route_response['capacity_hint']['replica_unit'] = 'logical'
+    route = _publish_route_snapshot(engine, incarnation, route_response, {},
+                                    set())
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_snapshots_table).where(
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    service_name == 'svc').values(producer_protocol_version=2))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_projection_protocol_version=2,
+                    route_projection_controller_incarnation=incarnation))
+    report = _demand_report(time.time(), route, sequence=2, request_count=0)
+    report.update(http_in_flight={},
+                  async_occupancy={},
+                  occupancy_sample_generation={},
+                  occupancy_sample_age_seconds={},
+                  occupancy_sampled_urls=[],
+                  total_slots_by_url={},
+                  routing_urls=[],
+                  queue_depth=100,
+                  queue_depth_by_priority={'50': 100},
+                  queued_requests_by_compatibility=[{
+                      'priority': 50,
+                      'compatible_accelerators': ['L4'],
+                      'count': 100,
+                  }],
+                  queued_request_deadline_buckets=[{
+                      'priority': 50,
+                      'compatible_accelerators': ['L4'],
+                      'remaining_seconds': 600,
+                      'count': 100,
+                  }],
+                  configured_accelerators=['L4'])
+    demand_state.ingest_report('svc', 'svc-hash', report)
+    spec = serve_state.get_spec('svc', 1)
+    assert spec is not None
+    autoscaler = autoscalers.Autoscaler.from_spec('svc', spec, version=1)
+    assert isinstance(autoscaler, autoscalers.ConcurrencyAutoscaler)
+    autoscaler.set_configured_accelerator_shapes({'L4': 1})
+    manager = types.SimpleNamespace(
+        max_live_paid_gpu_units=120,
+        workspace='workspace-a',
+        spot_placer=None,
+        prepare_paid_launch_specs=mock.Mock(
+            return_value=(_paid_launch_spec(engine, 0, 101),)))
+    ctrl = _current_capacity_controller(incarnation, autoscaler, manager)
+    installed = []
+    autoscaler.install_committed_capacity_projection = (
+        lambda *, committed_candidate: installed.append(committed_candidate))
+
+    real_plan_and_admit = (
+        capacity_admission.CapacityAdmissionRepository.plan_and_admit_current)
+    repository_calls = []
+
+    def _drifted_plan_and_admit(self, **kwargs):
+        committed = real_plan_and_admit(self, **kwargs)
+        repository_calls.append(committed)
+        drifted = dataclasses.replace(
+            committed.candidate,
+            **{drift: getattr(committed.candidate, drift) + 1})
+        return dataclasses.replace(committed, candidate=drifted)
+
+    monkeypatch.setattr(capacity_admission.CapacityAdmissionRepository,
+                        'plan_and_admit_current', _drifted_plan_and_admit)
+    planning_fingerprint = serve_state.get_scale_planning_state_fingerprint(
+        'svc', require_version=True)
+    assert planning_fingerprint is not None
+    prepared_inputs = autoscalers.prepare_controller_scaling_decision_inputs(
+        autoscaler, [])
+    result = ctrl._plan_and_admit_current_capacity(
+        autoscaler,
+        1,
+        0,
+        0,
+        planning_fingerprint,
+        prepared_inputs,
+        sequenced_reserved_fill=False,
+        prepared_paid_launch_specs=manager.prepare_paid_launch_specs())
+
+    assert len(repository_calls) == 1
+    assert result is None
+    assert installed == []
+
+
 def test_fresh_zero_multi_pool_admission_accepts_yaml_card_casing(
         capacity_database, monkeypatch):
     """Repository genesis and the production autoscaler share one card domain."""
