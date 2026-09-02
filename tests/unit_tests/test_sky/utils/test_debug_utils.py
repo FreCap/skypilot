@@ -2083,6 +2083,7 @@ class TestRequestBodyAllowlistCoverage:
         'sky.pool-status-refresh',
         'sky.server-heartbeat',
         'sky.expired-token-cleanup',
+        'sky.reserved-fill-reclaim-proof-renewal',
     }
 
     def test_all_request_names_covered(self):
