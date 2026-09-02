@@ -158,6 +158,17 @@ def encode_jobs_queue(jobs: list[dict],) -> list[dict[str, Any]]:
     return jobs
 
 
+@register_encoder('jobs.events')
+def encode_jobs_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    response = []
+    for event in events:
+        encoded_event = dict(event)
+        encoded_event['new_status'] = event['new_status'].value
+        encoded_event['timestamp'] = event['timestamp'].isoformat()
+        response.append(encoded_event)
+    return response
+
+
 @register_encoder('jobs.queue_v2')
 def encode_jobs_queue_v2(
         jobs_or_tuple) -> list[dict[str, Any]] | dict[str, Any]:

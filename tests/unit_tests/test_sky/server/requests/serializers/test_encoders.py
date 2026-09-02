@@ -1,5 +1,7 @@
 """Unit tests for sky.server.requests.serializers.encoders module."""
 import base64
+import datetime
+import json
 import pickle
 
 from sky import resources as resources_lib
@@ -184,3 +186,44 @@ class TestEncodeJobsQueue:
         assert len(result['jobs']) == 1
         assert result['jobs'][0]['internal_external_ips'] == [('10.0.0.1',
                                                                '35.1.2.3')]
+
+
+class TestEncodeJobsEvents:
+    """Test the managed-job event response encoder."""
+
+    def test_encode_jobs_events_for_json_transport(self):
+        """Reject enum/datetime values that the JSONB backend cannot store."""
+        from sky.jobs import state as managed_jobs
+
+        timestamp = datetime.datetime(2026,
+                                      9,
+                                      2,
+                                      18,
+                                      30,
+                                      tzinfo=datetime.timezone.utc)
+        event = {
+            'spot_job_id': 6339,
+            'task_id': 0,
+            'new_status': managed_jobs.ManagedJobStatus.FAILED,
+            'code': 'USER_FAILURE',
+            'reason': 'task exited',
+            'timestamp': timestamp,
+        }
+
+        encoder = encoders.get_encoder('sky.jobs.events')
+        result = encoder([event])
+
+        assert encoder is encoders.encode_jobs_events
+        assert result == [{
+            'spot_job_id': 6339,
+            'task_id': 0,
+            'new_status': managed_jobs.ManagedJobStatus.FAILED.value,
+            'code': 'USER_FAILURE',
+            'reason': 'task exited',
+            'timestamp': timestamp.isoformat(),
+        }]
+        json.dumps(result, allow_nan=False)
+        # Encoding must not change the domain-typed result returned by the
+        # managed-jobs state layer.
+        assert event['new_status'] is managed_jobs.ManagedJobStatus.FAILED
+        assert event['timestamp'] is timestamp

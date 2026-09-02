@@ -10537,6 +10537,59 @@ def test_terminal_event_commits_with_request_and_queue_exactly_once(
     assert queue_count == 0
 
 
+def test_jobs_events_result_is_jsonb_safe(request_database):
+    """A non-empty jobs.events result must not terminalize as FAILED."""
+    engine, backend = request_database
+    request = requests.Request(
+        request_id='jobs-events-jsonb',
+        name='sky.jobs.events',
+        entrypoint=managed_jobs_core.get_job_events,
+        request_body=payloads.GetJobEventsBody(job_id=6339),
+        status=requests.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='user',
+        schedule_type=requests.ScheduleType.SHORT,
+        should_enqueue=True,
+    )
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+    timestamp = datetime.datetime(2026,
+                                  9,
+                                  2,
+                                  18,
+                                  30,
+                                  tzinfo=datetime.timezone.utc)
+    result = [{
+        'spot_job_id': 6339,
+        'task_id': 0,
+        'new_status': managed_job_state.ManagedJobStatus.FAILED,
+        'code': 'USER_FAILURE',
+        'reason': 'task exited',
+        'timestamp': timestamp,
+    }]
+
+    assert backend.transition_request_terminal(
+        request.request_id,
+        requests.RequestStatus.SUCCEEDED,
+        event_api_models.EventCause.HANDLER_SUCCEEDED.value,
+        result=result)
+
+    with engine.connect() as connection:
+        stored = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS.c.status,
+                              request_postgres.REQUESTS.c.return_value).where(
+                                  request_postgres.REQUESTS.c.request_id ==
+                                  request.request_id)).mappings().one()
+    assert stored['status'] == requests.RequestStatus.SUCCEEDED.value
+    assert stored['return_value'] == [{
+        'spot_job_id': 6339,
+        'task_id': 0,
+        'new_status': managed_job_state.ManagedJobStatus.FAILED.value,
+        'code': 'USER_FAILURE',
+        'reason': 'task exited',
+        'timestamp': timestamp.isoformat(),
+    }]
+
+
 def test_event_insert_failure_rolls_back_terminal_transition_and_delivery(
         request_database, monkeypatch):
     engine, backend = request_database
