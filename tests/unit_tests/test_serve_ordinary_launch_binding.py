@@ -123,7 +123,7 @@ def test_non_pool_profile_envelope_is_closed_and_canonical() -> None:
 
 def test_supported_non_pool_profile_set_digest_is_stable_and_complete() -> None:
     digest = binding.supported_non_pool_profile_set_digest()
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 14
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 15
     assert len(digest) == 64
     assert digest == binding.supported_non_pool_profile_set_digest()
     assert set(binding._PROFILE_AUTHORIZATION_KIND) == set(  # pylint: disable=protected-access
@@ -349,6 +349,48 @@ def test_paid_aws_replacement_has_stable_token_and_account_scope() -> None:
     with pytest.raises(binding.OrdinaryLaunchBindingConflict,
                        match='no immutable account authority'):
         binding.ordinary_paid_aws_account_id(legacy)
+
+
+def test_paid_gcp_replacement_has_exact_current_project_scope() -> None:
+    profile = binding.NonPoolLaunchProfile.create(
+        binding.NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT,
+        authorization_reference=(
+            'unknown-capacity:44444444-4444-4444-8444-444444444444:9:'
+            'gcp-project:boltz-spot-project'),
+        authorization_generation=9,
+        authorization_payload={'replacement': 'exact'})
+    context = binding.BoundNonPoolLaunchContext(
+        association_id=_SUBMISSION_ID,
+        request_id='request-1',
+        service_name='svc',
+        replica_id=3,
+        replica_record_id=_RECORD_ID,
+        launch_generation=1,
+        input_digest='a' * 64,
+        profile=profile,
+        capability_cohort_epoch=binding.NON_POOL_CAPABILITY_COHORT_EPOCH,
+        capability_profile_set_digest=(
+            binding.supported_non_pool_profile_set_digest()),
+        receipt_protocol_version=binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)
+
+    assert binding.ordinary_paid_gcp_project_id(context) == 'boltz-spot-project'
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='current paid GCP project authority'):
+        binding.ordinary_paid_gcp_project_id(
+            dataclasses.replace(
+                context,
+                capability_cohort_epoch=(
+                    binding.NON_POOL_CAPABILITY_COHORT_EPOCH - 1)))
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='no immutable project authority'):
+        binding.ordinary_paid_gcp_project_id(
+            dataclasses.replace(
+                context,
+                profile=dataclasses.replace(
+                    profile,
+                    authorization_reference=(
+                        'unknown-capacity:'
+                        '44444444-4444-4444-8444-444444444444:9'))))
     with pytest.raises(binding.OrdinaryLaunchBindingConflict,
                        match='unsupported'):
         binding._non_pool_capability_from_service({
@@ -961,7 +1003,7 @@ def test_non_pool_identity_and_context_are_structurally_distinct() -> None:
     binding.install_bound_non_pool_context(body, identity, 7)
     context = body.extra_launch_context
     assert context[binding.PROFILE_KIND_KEY] == 'ORDINARY_PAID'
-    assert context[binding.CAPABILITY_COHORT_EPOCH_KEY] == 14
+    assert context[binding.CAPABILITY_COHORT_EPOCH_KEY] == 15
     parsed = binding.parse_bound_non_pool_launch_context(context)
     assert isinstance(parsed, binding.BoundNonPoolLaunchContext)
     assert parsed.profile == identity.profile
@@ -1281,7 +1323,7 @@ def test_api014_serve051_lineage_and_sqlite_stays_at_serve037(
     assert api_scripts.get_revision('013').down_revision == '012'
     assert api_scripts.get_revision('012').down_revision == '011'
     assert api_scripts.get_revision('011').down_revision == '010'
-    assert serve_scripts.get_heads() == ['066']
+    assert serve_scripts.get_heads() == ['067']
     assert serve_scripts.get_revision('055').down_revision == '054'
     assert serve_scripts.get_revision('053').down_revision == '052'
     assert serve_scripts.get_revision('052').down_revision == '051'

@@ -69,6 +69,9 @@ jobs:
             runner: namespace-profile-skypilot-ci-4x8
     runs-on: ${{ matrix.runner }}
     name: "Python Tests - ${{ matrix.test-name }}"
+    # The last completed Unit Tests shard took 33 min; a hung test must fail
+    # the job instead of holding a runner for GitHub's 360-min default.
+    timeout-minutes: 90
     steps:
       - name: Checkout repository
         uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
@@ -154,7 +157,9 @@ jobs:
   failover-test:
     # Test failover functionality
     runs-on: namespace-profile-skypilot-ci-2x4
+    timeout-minutes: 60
     strategy:
+      fail-fast: false
       matrix:
         # Keep failover coverage on the production interpreter.
         python-version: ["3.14"]

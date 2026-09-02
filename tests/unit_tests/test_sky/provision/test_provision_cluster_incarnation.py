@@ -98,7 +98,8 @@ def test_provision_config_retains_old_constructor_and_subclass_contract():
     parameters = list(
         inspect.signature(common.ProvisionConfig).parameters.values())
     runtime_names = [
-        'cluster_incarnation', 'provider_effect_guard_factory',
+        'cluster_incarnation', 'provider_create_idempotency_token',
+        'provider_create_account_id', 'provider_effect_guard_factory',
         'kueue_admission_runtime'
     ]
 

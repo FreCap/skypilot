@@ -57,6 +57,7 @@ run: |
       raise RuntimeError('SKYPILOT_NUM_GPUS_PER_NODE must be positive')
   _lock = threading.Lock()
   _running = 0
+  _MAX_SYNTHETIC_DURATION_SECONDS = 360
 
   class Handler(http.server.BaseHTTPRequestHandler):
       server_version = 'SkyServePaidCapacityTest/1'
@@ -122,7 +123,8 @@ run: |
               if (set(payload) != {'action', 'payload', 'request_id'} or
                       set(work or {}) != {'duration_seconds'} or
                       not isinstance(duration, (int, float)) or
-                      isinstance(duration, bool) or not 0 <= duration <= 120 or
+                      isinstance(duration, bool) or
+                      not 0 <= duration <= _MAX_SYNTHETIC_DURATION_SECONDS or
                       not isinstance(request_id, str) or not request_id or
                       self.headers.get('X-SkyServe-Async-Ledger-Protocol') != '1' or
                       not self.headers.get('X-SkyServe-Service-Incarnation') or
@@ -155,7 +157,8 @@ run: |
           duration = payload.get('duration_seconds', 0)
           request_id = payload.get('request_id')
           if (not isinstance(duration, (int, float)) or
-                  isinstance(duration, bool) or not 0 <= duration <= 120 or
+                  isinstance(duration, bool) or
+                  not 0 <= duration <= _MAX_SYNTHETIC_DURATION_SECONDS or
                   not isinstance(request_id, str) or not request_id):
               self.write_json(400, {'error': 'invalid request'})
               return

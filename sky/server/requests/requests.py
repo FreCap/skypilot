@@ -57,6 +57,23 @@ managed_job_state = adaptors_common.LazyImport('sky.jobs.state')
 _ErrorT = TypeVar('_ErrorT', bound=BaseException)
 
 
+def request_log_path_for_id(request_id: str) -> pathlib.Path:
+    """Return one request's canonical log path without filesystem I/O."""
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError('request_id must be a non-empty string.')
+    log_path_prefix = pathlib.Path(
+        server_constants.REQUEST_LOG_PATH_PREFIX).expanduser().absolute()
+    return (log_path_prefix / request_id).with_suffix('.log')
+
+
+def materialize_request_log_path_for_id(request_id: str) -> pathlib.Path:
+    """Create one request's log path; callers choose the I/O boundary."""
+    log_path = request_log_path_for_id(request_id)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.touch()
+    return log_path
+
+
 def _unresolved_entrypoint(*args: Any, **kwargs: Any) -> NoReturn:
     """Placeholder for a request entrypoint that could not be unpickled.
 
@@ -521,10 +538,8 @@ class Request:
 
     @property
     def log_path(self) -> pathlib.Path:
-        log_path_prefix = pathlib.Path(
-            server_constants.REQUEST_LOG_PATH_PREFIX).expanduser().absolute()
-        log_path_prefix.mkdir(parents=True, exist_ok=True)
-        log_path = (log_path_prefix / self.request_id).with_suffix('.log')
+        log_path = request_log_path_for_id(self.request_id)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         return log_path
 
     def set_error(self, error: BaseException) -> None:

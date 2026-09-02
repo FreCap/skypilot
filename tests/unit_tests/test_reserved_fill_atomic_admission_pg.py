@@ -59,6 +59,7 @@ from sky.serve import zero_cost_actuation
 from sky.serve import zero_cost_actuation_schema
 from sky.server import constants as server_constants
 from sky.server.requests import executor
+from sky.server.requests import non_pool_launch as non_pool_launch_request
 from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import requests as api_requests
@@ -75,6 +76,11 @@ _CONTROLLER_PORT = 8123
 _CONTROLLER_INCARNATION = uuid.UUID('11111111-1111-4111-8111-111111111111')
 _CONTROLLER_OWNER_EPOCH = 2
 _BINDING_EPOCH = 1
+_REQUEST_RUNTIME = request_postgres.NonPoolLaunchBindingRuntime(
+    handler_name=non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME,
+    storage_backend_type=(
+        request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE),
+    queue_backend_type=request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE)
 
 
 class _InjectedAdmissionFault(BaseException):
@@ -94,9 +100,10 @@ def atomic_database(allocation_engine, monkeypatch):
                         allocation_engine)
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         allocation_engine)
-    monkeypatch.setattr(request_postgres,
-                        '_resolved_request_backend_capability', lambda:
-                        ('postgres', 'postgres', True))
+    monkeypatch.setattr(
+        request_postgres, '_resolved_request_backend_capability', lambda:
+        (request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE,
+         request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE, True))
     profile_digest = ordinary_launch_binding.supported_non_pool_profile_set_digest(
     )
     with allocation_engine.begin() as connection:
@@ -577,6 +584,14 @@ def _install_failed_teardown_provider_observation(monkeypatch, engine, info,
     return provider_reads
 
 
+def _post_teardown_absence_receipt(info):
+    """Build the exact receipt a fenced protocol-v2 down returns (#1685)."""
+    fence = reserved_capacity.parse_protocol_v2_cleanup_fence(info)
+    assert fence is not None
+    return reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
+        cleanup_fence=fence, cluster_name=info.cluster_name)
+
+
 def test_failed_teardown_present_ambiguity_authorizes_cleanup_marker(
         atomic_database, monkeypatch) -> None:
     context, info, authority = _failed_teardown_reserved_fill_ambiguity(
@@ -627,9 +642,10 @@ def test_failed_teardown_present_ambiguity_authorizes_cleanup_marker(
     assert pin_count == 1
 
     # The cleanup owner must use the existing exact PRESENT path, not generic
-    # cancellation or a name-only down. That path performs the fenced down and
-    # then forces a new provider observation before releasing the association
-    # and retention pin.
+    # cancellation or a name-only down. Since #1685 the fenced down itself
+    # yields the exact post-teardown ABSENT receipt, and the projection reuses
+    # that receipt without a second provider read before releasing the
+    # association and retention pin.
     cleanup_reads = _install_failed_teardown_provider_observation(
         monkeypatch, atomic_database, persisted,
         ordinary_launch_binding.ProviderEvidence.ABSENT)
@@ -637,6 +653,7 @@ def test_failed_teardown_present_ambiguity_authorizes_cleanup_marker(
 
     def _terminate(*args, **kwargs):
         terminated.append((args, kwargs))
+        return _post_teardown_absence_receipt(persisted)
 
     monkeypatch.setattr(replica_managers, 'terminate_cluster', _terminate)
     replica_managers.terminate_bound_non_pool_provider_present_cluster(
@@ -645,8 +662,8 @@ def test_failed_teardown_present_ambiguity_authorizes_cleanup_marker(
                           authority), persisted.cluster_name)
 
     assert len(terminated) == 1
-    assert terminated[0][0] == (persisted.cluster_name,)
-    assert cleanup_reads == ['physical-cluster-uid', 'replica-presence']
+    assert terminated[0][0] == (persisted.cluster_name, 0)
+    assert cleanup_reads == []
     with atomic_database.connect() as connection:
         association = connection.execute(
             sqlalchemy.select(
@@ -792,8 +809,10 @@ def test_failed_teardown_absent_ambiguity_projects_exact_result(
         ordinary_launch_binding.ProviderEvidence.ABSENT.value)
     assert association['cancel_reason'] is None
     assert replica['ordinary_launch_association_id'] is None
+    # Exact post-quiescence reserved ABSENT evidence normalizes the replica to
+    # the immediate-cleanup INTERRUPTED marker (#1748), not FAILED.
     assert persisted.status_property.sky_launch_status == (
-        common_utils.ProcessStatus.FAILED)
+        common_utils.ProcessStatus.INTERRUPTED)
     assert pin_count == 0
 
 
@@ -857,6 +876,9 @@ def test_failed_teardown_uncertain_provider_ambiguity_stays_fail_closed(
 def _use_real_broker(monkeypatch, engine):
     monkeypatch.setattr(request_postgres,
                         'non_pool_launch_binding_fleet_capable', lambda: True)
+    monkeypatch.setattr(request_postgres,
+                        'prepare_non_pool_launch_binding_runtime',
+                        lambda: _REQUEST_RUNTIME)
 
     def get_postgres_lock(lock_id,
                           timeout=None,
@@ -882,13 +904,13 @@ def test_serve059_lineage_and_sqlite_ceiling() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['066']
+    assert scripts.get_heads() == ['067']
     assert scripts.get_revision('060').down_revision == '059'
     assert scripts.get_revision('059').down_revision == '058'
     assert scripts.get_revision('058').down_revision == '057'
     assert scripts.get_revision('056').down_revision == '055'
     assert scripts.get_revision('055').down_revision == '054'
-    assert migration_utils.SERVE_VERSION == '066'
+    assert migration_utils.SERVE_VERSION == '067'
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
         alembic_command.upgrade(config, '056')
@@ -1048,9 +1070,10 @@ def test_serve059_exposes_only_owner_attestation_symbol(
         atomic_database) -> None:
     del atomic_database
     assert hasattr(serve_state, 'attest_service_owner_user_id')
-    assert not hasattr(serve_state,
-                       'service_owner_attestation_transition_active')
     assert not hasattr(serve_state, 'verify_service_owner_user_id')
+    # The Serve055 transition predicate is not an owner-transition leftover:
+    # sky/users/server.py consumes it as the fail-closed user-deletion gate.
+    assert hasattr(serve_state, 'service_owner_attestation_transition_active')
 
 
 def test_service_owner_attestation_is_idempotent_and_restart_safe(
@@ -1255,6 +1278,7 @@ def test_rejected_savepoint_leaves_outer_transaction_usable_and_empty(
             reserved_fill_admission._stage_and_bind(connection,
                                                     spec,
                                                     lease_token,
+                                                    runtime=_REQUEST_RUNTIME,
                                                     require_existing=False)
         assert connection.execute(sqlalchemy.select(1)).scalar_one() == 1
         assert _suffix_counts(connection) == (0, 0, 0, 0, 0)
@@ -1286,6 +1310,7 @@ def test_atomic_fill_rejects_caller_assigned_event_sequence(
             reserved_fill_admission._stage_and_bind(connection,
                                                     spec,
                                                     7,
+                                                    runtime=_REQUEST_RUNTIME,
                                                     require_existing=False)
         assert connection.execute(sqlalchemy.select(1)).scalar_one() == 1
         assert _suffix_counts(connection) == (0, 0, 0, 0, 0)
@@ -1395,7 +1420,11 @@ def test_inner_commit_is_savepoint_and_outer_rollback_removes_full_suffix(
     with atomic_database.connect() as connection:
         outer = connection.begin()
         staged, receipt = reserved_fill_admission._stage_and_bind(
-            connection, spec, 7, require_existing=False)
+            connection,
+            spec,
+            7,
+            runtime=_REQUEST_RUNTIME,
+            require_existing=False)
         assert not staged.already_committed
         assert receipt.replica_id == 1
         assert isinstance(receipt.context,
@@ -1454,10 +1483,12 @@ def test_every_suffix_insert_fault_rolls_back_to_usable_savepoint(
         with atomic_database.connect() as connection:
             outer = connection.begin()
             with pytest.raises(_InjectedSuffixFault):
-                reserved_fill_admission._stage_and_bind(connection,
-                                                        spec,
-                                                        7,
-                                                        require_existing=False)
+                reserved_fill_admission._stage_and_bind(
+                    connection,
+                    spec,
+                    7,
+                    runtime=_REQUEST_RUNTIME,
+                    require_existing=False)
             assert injected
             assert connection.execute(sqlalchemy.select(1)).scalar_one() == 1
             assert _suffix_counts(connection) == (0, 0, 0, 0, 0)
@@ -1500,6 +1531,7 @@ def test_savepoint_rollback_interrupt_preserves_original_operator_signal(
             reserved_fill_admission._stage_and_bind(connection,
                                                     spec,
                                                     7,
+                                                    runtime=_REQUEST_RUNTIME,
                                                     require_existing=False)
         assert raised.value is original_interrupt
         assert raised.value.__cause__ is rollback_interrupt
@@ -1605,6 +1637,7 @@ def test_atomic_suffix_uses_canonical_lock_order(atomic_database) -> None:
             reserved_fill_admission._stage_and_bind(connection,
                                                     spec,
                                                     7,
+                                                    runtime=_REQUEST_RUNTIME,
                                                     require_existing=False)
             outer.rollback()
     finally:
@@ -1972,8 +2005,9 @@ def test_remove_service_completely_removes_intent_linked_replica_graph(
     _install_failed_teardown_provider_observation(
         monkeypatch, atomic_database, persisted,
         ordinary_launch_binding.ProviderEvidence.ABSENT)
-    monkeypatch.setattr(replica_managers, 'terminate_cluster',
-                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        replica_managers, 'terminate_cluster',
+        lambda *_args, **_kwargs: _post_teardown_absence_receipt(persisted))
     replica_managers.terminate_bound_non_pool_provider_present_cluster(
         context, persisted, authority,
         functools.partial(service._project_bound_ordinary_launch_for_teardown,

@@ -5,6 +5,7 @@ import concurrent.futures
 import dataclasses
 import json
 import os
+import pickle
 import subprocess
 import threading
 import types
@@ -23,12 +24,14 @@ from sky import exceptions
 from sky import global_user_state_schema
 from sky.serve import kubernetes_identity
 from sky.serve import ordinary_launch_binding
+from sky.serve import paid_capacity
 from sky.serve import pool_capacity_observation as observation
 from sky.serve import pool_capacity_observation_schema as observation_schema
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_reclaim_attestation as reclaim_attestation
 from sky.serve import serve_state
+from sky.serve import service_spec
 from sky.serve import spot_placer
 from sky.serve import zero_cost_actuation
 from sky.utils import common_utils
@@ -76,6 +79,36 @@ def _pool_key(*names: str) -> str:
     encoded_names: str | list[str] = (names[0]
                                       if len(names) == 1 else list(names))
     return json.dumps(['v2', 'physical-uid', encoded_names])
+
+
+def _paid_pool_key() -> str:
+    """Exact provider pool identity accepted by paid GPU attribution.
+
+    The accelerator shape matches ``_zero_cost_replica`` so the persisted
+    location cross-check agrees with the pool.
+    """
+    location = spot_placer.Location(cloud=clouds.AWS(),
+                                    region='us-east-1',
+                                    zone='us-east-1a',
+                                    accelerators={'A100-80GB': 1},
+                                    use_spot=True,
+                                    instance_type='p4d.24xlarge')
+    return paid_capacity.pool_key(location,
+                                  workspace='default',
+                                  num_nodes=1,
+                                  aws_account_id='123456789012')
+
+
+def _seed_readable_version_spec(engine: sqlalchemy.engine.Engine,
+                                service_name: str) -> None:
+    """Paid admission reads the elected version spec for its paid GPU cap."""
+    spec = service_spec.SkyServiceSpec.from_yaml_config({'replicas': 1})
+    with engine.begin() as connection:
+        connection.execute(serve_state.version_specs_table.insert().values(
+            service_name=service_name,
+            version=1,
+            spec=pickle.dumps(spec, protocol=4),
+            yaml_content='service: {}'))
 
 
 def _isolated_engine(request, prefix: str) -> sqlalchemy.engine.Engine:
@@ -1339,6 +1372,7 @@ def test_paid_claim_failure_does_not_publish_pool_key(observation_engine,
         connection.execute(
             sqlalchemy.insert(serve_state.services_table).values(
                 name='paid', hash='paid-hash', status='READY'))
+    _seed_readable_version_spec(observation_engine, 'paid')
     info = _zero_cost_replica(1)
     info.is_zero_cost = False
     original_row_values = serve_state._replica_row_values
@@ -1354,7 +1388,7 @@ def test_paid_claim_failure_does_not_publish_pool_key(observation_engine,
             'paid-hash',
             1,
             info,
-            pool_key='paid-pool',
+            pool_key=_paid_pool_key(),
             priority=10,
             base_limit=1,
             max_limit=1,
@@ -1377,6 +1411,12 @@ def test_paid_claim_failure_does_not_publish_pool_key(observation_engine,
 
 def test_paid_claim_adoption_rejects_persisted_zero_cost_authority(
         observation_engine, monkeypatch) -> None:
+    # Adoption selects the full paid-claim row, whose planner columns arrive
+    # after Serve046; advance this isolated database through the additive
+    # tail like the paid-claim failure test above.
+    config = migration_utils.get_alembic_config(observation_engine,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, migration_utils.SERVE_VERSION)
     repository = _repository(observation_engine)
     _activate(repository)
     monkeypatch.setattr(serve_state._db_manager, '_engine', observation_engine)

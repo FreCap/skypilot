@@ -1602,6 +1602,86 @@ def test_dispatch_resolves_only_newly_granted_waiters_at_scale():
     asyncio.run(_run())
 
 
+def test_zero_capacity_dispatch_never_traverses_ten_thousand_waiters():
+
+    class _ColdQueueBucket(dict):
+
+        def values(self):
+            raise AssertionError('cold dispatch traversed the resident queue')
+
+    lb = _make_lb(min_size=10000,
+                  size_per_replica=0,
+                  max_size=10000,
+                  max_concurrency=128)
+    resident = object()
+    lb._request_queue_waiters = {
+        50: _ColdQueueBucket({index: resident for index in range(10000)})
+    }
+    lb._waiting_request_count = 10000
+
+    # Model one disconnect poll from every resident waiter. This is a
+    # structural complexity assertion, not a wall-clock benchmark: a cold
+    # dispatch has no work to grant and must never inspect the backlog.
+    for _ in range(10000):
+        lb._dispatch_request_queue_locked()
+
+    assert lb._waiting_request_count == 10000
+
+
+def test_abandoned_waiter_does_not_consume_a_new_exact_card_slot():
+
+    async def _run():
+        lb = _make_lb(max_concurrency=1)
+        lb._apply_routing_spec({
+            'request_queue': _queue_config(max_concurrency=1),
+            'request_accelerator_compatibility_version': 1,
+            'configured_accelerators': ['L4'],
+        })
+        url = 'http://worker:8000'
+        lb._replica_info_by_url = {
+            url: {
+                'gpu_type': 'L4',
+                'is_zero_cost': 'false',
+            },
+        }
+        lb._load_balancing_policy.set_ready_replicas([url])
+        loop = asyncio.get_running_loop()
+        abandoned_request = _request()
+        live_request = _request()
+        for request in (abandoned_request, live_request):
+            setattr(request, '_skyserve_compatible_accelerators', ('L4',))
+        abandoned = load_balancer._RequestQueueWaiter(
+            request=abandoned_request,
+            priority=50,
+            sequence=0,
+            future=loop.create_future(),
+            abandoned=True)
+        live = load_balancer._RequestQueueWaiter(request=live_request,
+                                                 priority=50,
+                                                 sequence=1,
+                                                 future=loop.create_future())
+        lb._request_queue_waiters = {50: {0: abandoned, 1: live}}
+        lb._waiting_request_count = 2
+
+        async with lb._request_queue_condition:
+            lb._dispatch_request_queue_locked()
+
+        assert not abandoned.granted
+        assert not abandoned.future.done()
+        assert live.granted
+        assert live.future.done()
+        assert lb._waiting_request_count == 1
+
+        # Cancellation owns its exact waiter cleanup. It does not need a
+        # dispatcher-wide sweep, and the live peer retained the only slot.
+        await lb._cleanup_request_queue_waiter(abandoned)
+        assert abandoned.future.done()
+        assert lb._waiting_request_count == 0
+        await lb._release_request_slot(live_request)
+
+    asyncio.run(_run())
+
+
 def test_full_queue_rejects_without_growing_waiter_count():
 
     async def _run():
@@ -1752,6 +1832,57 @@ def test_full_queue_classifies_the_terminal_rejection():
             'classified_request_count': 1,
             'counted_rejected_count': 1,
         }
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize('fence', ['draining', 'inactive_role'])
+def test_post_admission_role_fence_exit_is_classified_as_rejected(fence):
+    """A drain/role 503 after admission is a rejection, not served work.
+
+    The request already counts as an attempt, so leaving it to the final
+    non-rejected guard would inflate the spend dashboard's non-rejected
+    denominator with a request that never reached a replica.  It stays out of
+    the autoscaling pressure gauges exactly like pre-admission drain exits.
+    """
+
+    async def _run():
+        lb = _make_lb(min_size=1, max_size=1)
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+        lb._request_body = mock.AsyncMock(return_value=b'payload')
+        request = _request()
+        mark_eligible = lb._mark_request_classification_eligible
+
+        def _mark_then_fence(eligible_request):
+            # The final pre-eligibility fence has passed; the process starts
+            # draining (or loses its slot) before the retry loop's per-attempt
+            # fence selects a replica.
+            mark_eligible(eligible_request)
+            if fence == 'draining':
+                lb._draining = True
+            else:
+                lb._lb_role = lb_ha.LbRole.STANDBY
+
+        with mock.patch.object(lb,
+                               '_mark_request_classification_eligible',
+                               side_effect=_mark_then_fence):
+            with pytest.raises(fastapi.HTTPException) as exc:
+                await lb._proxy_with_retries(request)
+
+        assert exc.value.status_code == 503
+        history = lb._request_aggregator.request_history_snapshot()
+        assert history is not None
+        assert history['buckets'][0]['request_count'] == 1
+        assert history['buckets'][0]['rejected_count'] == 0
+        assert lb._request_aggregator.request_classification_history_snapshot(
+        )['buckets'][0] == {
+            'bucket_start': history['buckets'][0]['bucket_start'],
+            'classified_request_count': 1,
+            'counted_rejected_count': 1,
+        }
+        assert lb._rejected_in_window() == 0
+        assert lb._active_request_count == 0
+        assert lb._queue_depth == 0
 
     asyncio.run(_run())
 

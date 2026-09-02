@@ -100,18 +100,19 @@ def get_service_time_estimates(
                                    _ATTEMPTS.c.dispatch_binding.is_not(None),
                                    selected_version == service_version,
                                    projected_card.is_not(None)).subquery()
-            duration_p75 = sqlalchemy.func.percentile_disc(
+            duration_p75 = sqlalchemy.func.percentile_disc(  # pylint: disable=not-callable
                 constants.AUTOSCALER_CARD_DURATION_QUANTILE).within_group(
                     recent_samples.c.processing_time_us).label('duration_us')
             estimate_query = sqlalchemy.select(
-                recent_samples.c.projected_accelerator, duration_p75,
-                sqlalchemy.func.count().label('samples'),
+                recent_samples.c.projected_accelerator,
+                duration_p75,
+                sqlalchemy.func.count().label('samples'),  # pylint: disable=not-callable
                 sqlalchemy.func.max(
                     recent_samples.c.terminal_at).label('observed_at')).where(
                         recent_samples.c.sample_rank <= sample_cap)
             estimate_query = estimate_query.group_by(
                 recent_samples.c.projected_accelerator).having(
-                    sqlalchemy.func.count() >= min_samples)
+                    sqlalchemy.func.count() >= min_samples)  # pylint: disable=not-callable
             rows = connection.execute(estimate_query).mappings().all()
     except (AsyncRequestLedgerUnavailable, RuntimeError,
             sqlalchemy.exc.SQLAlchemyError, ValueError):
@@ -508,8 +509,7 @@ def _worker_admission(connection: sqlalchemy.engine.Connection,
 def _advisory_lock(connection: sqlalchemy.engine.Connection, service_name: str,
                    service_hash: str, request_key: str) -> None:
     lock_key = hashlib.sha256(
-        f'{service_name}\0{service_hash}\0{request_key}'.encode(
-            'utf-8')).hexdigest()
+        f'{service_name}\0{service_hash}\0{request_key}'.encode()).hexdigest()
     connection.execute(
         sqlalchemy.text(
             'SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))'),
