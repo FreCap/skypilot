@@ -6938,11 +6938,20 @@ class SkyServeController:
         # checked here before the transaction and again before every provider
         # effect in _reconcile_scale_once().
         with self._routing_state_lock:
-            if (not self._scale_actuation_is_current(
-                    actuation_generation, decision_autoscaler, decision_version)
-                    or self._scale_reconcile_coordinator.generation
-                    != notification_generation):
+            if not self._scale_actuation_is_current(actuation_generation,
+                                                    decision_autoscaler,
+                                                    decision_version):
                 return None
+            # Paid-spec preparation may take long enough for another demand
+            # or replica notification to arrive.  The PostgreSQL repository
+            # locks and plans from the newest durable demand/supply graph, so
+            # treating that notification as an optimistic precondition can
+            # starve every successor wave under continuous traffic.  Adopt
+            # the current notification generation at the linearization
+            # boundary; a still-later notification will fence only the local
+            # projection and schedule another reconciliation.
+            notification_generation = (
+                self._scale_reconcile_coordinator.generation)
             try:
                 committed = (capacity_admission.CapacityAdmissionRepository(
                 ).plan_and_admit_current(
