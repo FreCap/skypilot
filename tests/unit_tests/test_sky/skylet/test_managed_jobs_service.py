@@ -821,6 +821,36 @@ class TestCancelJobs:
         assert 'graceful' not in forwarded
         assert 'graceful_timeout' not in forwarded
 
+    def test_in_process_dispatch_is_the_servicer_dispatch(self):
+        """Consolidation mode calls ``cancel_jobs_from_request`` directly.
+
+        It must be the same dispatch the servicer runs: same result on the
+        same seeded DB, and the same criteria validation, raised as
+        ``ManagedJobCancelCriteriaError`` so the servicer can map it to
+        INVALID_ARGUMENT.
+        """
+        job_id = self.job_ids['job_id1']
+        request = managed_jobsv1_pb2.CancelJobsRequest(
+            job_ids=managed_jobsv1_pb2.JobIds(ids=[job_id]),
+            current_workspace='ws1',
+        )
+
+        message = services.managed_job_utils.cancel_jobs_from_request(request)
+
+        assert message.lower() == (
+            f'job with id {job_id} is scheduled to be cancelled.')
+        with pytest.raises(
+                services.managed_job_utils.ManagedJobCancelCriteriaError,
+                match='exactly one cancellation criteria'):
+            services.managed_job_utils.cancel_jobs_from_request(
+                managed_jobsv1_pb2.CancelJobsRequest(current_workspace='ws1'))
+        with pytest.raises(
+                services.managed_job_utils.ManagedJobCancelCriteriaError,
+                match='user_hash is required'):
+            services.managed_job_utils.cancel_jobs_from_request(
+                managed_jobsv1_pb2.CancelJobsRequest(all_users=False,
+                                                     current_workspace='ws1'))
+
     def test_cancel_jobs_all_users_validation_error(self):
         """Test validation error when all_users=True but user_hash is provided (removed overly strict validation)."""
         # This test is now obsolete since we allow user_hash with all_users=True
