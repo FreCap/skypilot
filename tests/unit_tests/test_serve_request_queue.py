@@ -1602,6 +1602,86 @@ def test_dispatch_resolves_only_newly_granted_waiters_at_scale():
     asyncio.run(_run())
 
 
+def test_zero_capacity_dispatch_never_traverses_ten_thousand_waiters():
+
+    class _ColdQueueBucket(dict):
+
+        def values(self):
+            raise AssertionError('cold dispatch traversed the resident queue')
+
+    lb = _make_lb(min_size=10000,
+                  size_per_replica=0,
+                  max_size=10000,
+                  max_concurrency=128)
+    resident = object()
+    lb._request_queue_waiters = {
+        50: _ColdQueueBucket({index: resident for index in range(10000)})
+    }
+    lb._waiting_request_count = 10000
+
+    # Model one disconnect poll from every resident waiter. This is a
+    # structural complexity assertion, not a wall-clock benchmark: a cold
+    # dispatch has no work to grant and must never inspect the backlog.
+    for _ in range(10000):
+        lb._dispatch_request_queue_locked()
+
+    assert lb._waiting_request_count == 10000
+
+
+def test_abandoned_waiter_does_not_consume_a_new_exact_card_slot():
+
+    async def _run():
+        lb = _make_lb(max_concurrency=1)
+        lb._apply_routing_spec({
+            'request_queue': _queue_config(max_concurrency=1),
+            'request_accelerator_compatibility_version': 1,
+            'configured_accelerators': ['L4'],
+        })
+        url = 'http://worker:8000'
+        lb._replica_info_by_url = {
+            url: {
+                'gpu_type': 'L4',
+                'is_zero_cost': 'false',
+            },
+        }
+        lb._load_balancing_policy.set_ready_replicas([url])
+        loop = asyncio.get_running_loop()
+        abandoned_request = _request()
+        live_request = _request()
+        for request in (abandoned_request, live_request):
+            setattr(request, '_skyserve_compatible_accelerators', ('L4',))
+        abandoned = load_balancer._RequestQueueWaiter(
+            request=abandoned_request,
+            priority=50,
+            sequence=0,
+            future=loop.create_future(),
+            abandoned=True)
+        live = load_balancer._RequestQueueWaiter(request=live_request,
+                                                 priority=50,
+                                                 sequence=1,
+                                                 future=loop.create_future())
+        lb._request_queue_waiters = {50: {0: abandoned, 1: live}}
+        lb._waiting_request_count = 2
+
+        async with lb._request_queue_condition:
+            lb._dispatch_request_queue_locked()
+
+        assert not abandoned.granted
+        assert not abandoned.future.done()
+        assert live.granted
+        assert live.future.done()
+        assert lb._waiting_request_count == 1
+
+        # Cancellation owns its exact waiter cleanup. It does not need a
+        # dispatcher-wide sweep, and the live peer retained the only slot.
+        await lb._cleanup_request_queue_waiter(abandoned)
+        assert abandoned.future.done()
+        assert lb._waiting_request_count == 0
+        await lb._release_request_slot(live_request)
+
+    asyncio.run(_run())
+
+
 def test_full_queue_rejects_without_growing_waiter_count():
 
     async def _run():

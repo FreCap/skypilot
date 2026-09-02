@@ -29,7 +29,10 @@ that the exact cold-start scale contract authorizes 800 logical L4 units. The re
 exact one-L4 backend shape therefore authorizes 800 physical backends and
 exceeds the 100-worker provider gate. The final current-writer AWS/GCP
 scale/traffic/drain receipt, and clean `boltz-l4-fleet` recreation remain
-open.** One
+open. The `spot-e2e-0902a` attempt committed its first 100-member paid wave but
+exposed a load-balancer cold-queue liveness defect before the traffic receipt;
+that defect is source-corrected and unpaid-interface-qualified in this
+checkpoint; homogeneous deployment and billable requalification remain.** One
 PostgreSQL-authoritative planner
 is the canonical source path for reservation-aware actuation and paid Spot
 residual. Historical production runs proved complete East occupancy,
@@ -219,6 +222,38 @@ each transaction stays inside the unchanged authority lease. The existing
 optional best-effort history projection may use a second transaction on the
 same checkout. These are qualification inputs, not a scheduler-policy change
 or authorization to raise the long-lived production paid cap.
+
+The ``spot-e2e-0902a`` current-writer attempt committed all 100 members of its
+first atomic paid wave at 05:11:12.596 UTC, about 15.6 seconds after traffic
+began. The active load balancer recorded all 10,000 unique identities, but its
+single event loop then stopped answering Kubernetes probes. The dispatcher
+scanned the complete waiter registry on every enqueue and on every waiter's
+one-second disconnect poll. With 10,000 resident waiters this multiplied one
+bounded queue into continuous O(N²) event-loop work; kubelet recorded repeated
+readiness/liveness timeouts, drained the active slot, and eventually
+force-killed it. The 60-second qualifier gate correctly failed: paid planning
+and admission had progressed, but no healthy routed data plane remained to
+prove traffic or the terminal ledger.
+
+The steady-state correction deletes that eager scan. A cancelled request owns
+removal of its exact waiter through the existing shielded cleanup path;
+capacity-bearing selection already skips abandoned waiters. There is no new
+timeout, retry, registry, background sweeper, or resource increase. A
+structural unit test proves 10,000 zero-capacity dispatch polls never traverse
+the resident queue, and cancellation tests prove an abandoned waiter cannot
+consume a newly available exact-card slot. The serial, resource-heavy unpaid
+production-interface test in
+``tests/integration_tests/test_lb_cold_queue_e2e.py`` starts the real
+load-balancer process, queues 10,000 HTTP requests against zero ready replicas,
+waits through the disconnect-poll interval, probes the public liveness and
+capacity endpoints, observes the production demand-report contract at the fake
+controller, and cancels the requests through their client sockets. The current
+fixed-source run passed with 0.015-second worst liveness latency,
+0.026-second 10,000-waiter capacity latency, an exact 10,000-unit demand report,
+and public queue depth returning to zero. The same test against pre-fix commit
+``667df08845665eb7c37ea2e60995ab52b97da0c5`` failed because the queue could
+not reach 10,000 within 45 seconds while the event loop starved. Homogeneous
+Helm deployment and repetition of the billable qualification remain required.
 
 Provider availability and runtime/service readiness are separate facts. The
 write-once provider-allocation marker commits normal pool-success feedback
@@ -1857,6 +1892,7 @@ it has merged or been deployed.
 | PHX access | The controller identity can exact-read the required namespace/queue and manage only worker Pod/Service lifecycle; it cannot list or patch ClusterQueues. The worker ServiceAccount is tokenless and cannot read Pods, queues, or secrets. A historical audit-only group still has an unused broad Kueue LIST grant from platform PR #8800; it is read-only, has no scheduling effect, and is not used or expanded by this rollout. |
 | Paid state at idle | **Production-proven on the final writer through +30 and the configured stale/quiescence horizon.** Lifecycle 141 normal demand-driven down removed the paid claim and replica, terminated the exact AWS Spot instance, closed its one-time Spot request, deleted its root disk, and returned PostgreSQL and the provider to exact zero. At 04:24:37 UTC, more than 30 minutes after the Spot request closed and more than 22 minutes after the retained +10 exact-zero sample, PostgreSQL still had zero replicas, paid claims, paid waiters, and zero-cost intents; the fresh plan targeted zero on every card, both authoritative HA reporters were complete/fresh/idle, the instance remained terminated, the Spot request closed, and the root volume absent. That interval exceeds the configured 20-second instance-stale, 70-second controller-quiescence, and 180-second reserved-observation horizons. No on-demand or wrong-shape capacity appeared. |
 | Routing and queue | Lifecycle 119's low-priority run produced a small deadline-weighted target; the high-priority run increased the target through 49, 64, 128, and 178 before the paid cap clipped it at 100. The bounded stimulus recorded 2,248 submission starts, 289 accepted requests, 252 completion markers, and definitive queue-full rejections/retries; it is not the separate 10,000-terminal-request ledger proof. PR #1765's deployed capacity-time planner uses deadline buckets, exact compatibility, per-card service-time estimates, finite supply availability, and paid cold lead. A fresh current-schema nonzero queued/processing/in-flight/completed UI and heterogeneous capacity-time proof remains open. |
+| 10,000-request cold-queue liveness | **Source-corrected and unpaid production-interface-qualified; production deployment and billable requalification remain.** `spot-e2e-0902a` committed the first 100-member paid wave and the active LB tracked all 10,000 identities, but an eager whole-waiter-registry scan on every enqueue and one-second disconnect poll starved the single event loop until kubelet killed the active LB. The correction deletes only that scan; exact request cancellation remains the cleanup owner and capacity-bearing selection already skips abandoned waiters. Structural 10,000-waiter non-traversal and cancellation tests pass. The serial real-uvicorn gate enters through HTTP with zero replicas, keeps exact public queue depth and the production demand report at 10,000, measures worst liveness at 0.015 seconds and capacity at 0.026 seconds across two polling intervals, then cancels through client sockets and observes public depth zero. Pre-fix commit `667df08845665eb7c37ea2e60995ab52b97da0c5` fails the same gate before reaching 10,000. |
 | Partial mixed proof | Provider/DB censuses at 2026-08-25 19:45:47.538 and 19:45:56.281 UTC bracketed a 72-request completion wave and both had 44 reserved plus 28 paid replicas all `READY`, the same 28 AWS Spot instances—27 `g6.2xlarge` and one `g6.4xlarge`—and zero on-demand. The wave completed from 19:45:48.956 through 19:45:51.187; every request performed 9.533–12.451 seconds of concurrency-one GPU work, so at least 28 necessarily executed on Spot beside the 44 reserved workers. The Spot instances later fully drained at the provider. |
 | GCP Spot lifecycle proof | **Count, no-spill, warm-request, and teardown are complete.** Lifecycle 137 on `1.1.1554` reached exactly 100 concurrently provider-`RUNNING` one-L4 GCP Spot VMs with zero ordinary on-demand/wrong-shape capacity, served 10,000/10,000 authenticated warm requests with first-attempt HTTP 200, and completed normal exact-zero teardown. Earlier clean-frontier evidence reached 100 in 3 minutes 41.9 seconds and peaked at 117; lifecycle 137's roughly 9.5-minute run correctly retained recent-failure cooldowns. |
 | Final load proof | **The constituent exact-card placement and warm-transport proofs are complete; final-writer mixed convergence remains open.** Lifecycle 137 completed 10,000/10,000 authenticated warm requests, the historical mixed campaign proved 44 reserved plus 28 Spot workers serving concurrently with zero on-demand, lifecycle 139 proved exact compatible reservation admission, and lifecycle 141 proved a final-writer statically disjoint Spot request and teardown. Lifecycle 152 peaked at 87 real provider-`RUNNING` Spot VMs and then froze on restart recovery/cleanup; release `1.1.1583` safely returned its real AWS provider resources to zero but does not supersede lifecycle 137's scale receipt. A current-schema PR-#1854 AWS/GCP multi-wave campaign with exact async-ledger coverage, HA takeover, and provider-native teardown remains required. |
@@ -3959,9 +3995,12 @@ these remaining current-writer acceptance gates:
    PostgreSQL remains the sole central store, Helm storage remains disabled,
    and both prepared physical launch limits remain 420. No scheduler,
    infrastructure, platform, EFS/PVC, or provider configuration changed.
-8. Run the provider-native scale profile against that exact image. Drive the
-   800-logical-slot bounded Spot target to at least 100 provider-``RUNNING`` L4
-   Spot VMs in aggregate within five minutes; do not require both providers to
+8. Homogeneously deploy the cold-queue liveness correction, then run its serial
+   unpaid 10,000-request interface gate against the release image.
+   Only after that passes, run the provider-native scale profile against that
+   exact image. Drive the 800-logical-slot bounded Spot target to at least 100
+   provider-``RUNNING`` L4 Spot VMs in aggregate within five minutes; do not
+   require both providers to
    win the economic selection. Keep the shared 420-physical-launch Helm
    throttle unchanged and record physical VMs and logical L4 slots separately.
    Use exactly 10,000 authenticated async identities as the only scale

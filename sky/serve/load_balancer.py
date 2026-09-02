@@ -1802,14 +1802,6 @@ class SkyServeLoadBalancer:
         """Grant available slots by strict priority and FIFO within a tie."""
         if self._waiting_request_count <= 0:
             return
-        for bucket in list(self._request_queue_waiters_for_instance().values()):
-            for waiter in list(bucket.values()):
-                if not waiter.abandoned:
-                    continue
-                self._remove_request_queue_waiter_locked(waiter)
-                self._resolve_request_queue_waiter_locked(waiter)
-        if self._waiting_request_count <= 0:
-            return
         if self._draining or not self._accepts_new_requests():
             while True:
                 queued_waiter = self._pop_request_queue_waiter_locked()
