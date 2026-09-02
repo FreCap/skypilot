@@ -3006,7 +3006,8 @@ async def scheduler_set_cleanup_done_async(job_id: int) -> None:
     has_nonterminal_task = sqlalchemy.exists(
         sqlalchemy.select(spot_table.c.task_id).where(
             spot_table.c.spot_job_id == job_info_table.c.spot_job_id,
-            spot_table.c.status.not_in(terminal_status_values)))
+            sqlalchemy.or_(spot_table.c.status.is_(None),
+                           spot_table.c.status.not_in(terminal_status_values))))
 
     async def _op(session: sql_async.AsyncSession) -> int:
         await controller_fencing.lock_current_job_attempt_async(
@@ -3090,6 +3091,62 @@ def reset_stale_jobs_for_current_controller() -> int:
                 }))
         session.commit()
         return result.rowcount
+
+
+@db_retries.retry
+def requeue_terminal_done_jobs_for_cleanup(job_ids: list[int]) -> int:
+    """Move exact terminal DONE jobs back to cleanup-only admission.
+
+    The caller has already associated these job IDs with current dedicated
+    managed-job cluster rows. This compare-and-set repeats the authoritative
+    task-state checks in the write transaction so a stale inventory snapshot
+    cannot requeue workload execution. ``get_waiting_job_async`` classifies
+    the resulting all-terminal WAITING rows as cleanup-only work.
+    """
+    unique_job_ids = list(dict.fromkeys(job_ids))
+    if not unique_job_ids:
+        return 0
+
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    has_task = sqlalchemy.exists(
+        sqlalchemy.select(spot_table.c.task_id).where(
+            spot_table.c.spot_job_id == job_info_table.c.spot_job_id))
+    has_nonterminal_task = sqlalchemy.exists(
+        sqlalchemy.select(spot_table.c.task_id).where(
+            spot_table.c.spot_job_id == job_info_table.c.spot_job_id,
+            sqlalchemy.or_(spot_table.c.status.is_(None),
+                           spot_table.c.status.not_in(terminal_status_values))))
+
+    updated_count = 0
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        for offset in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+            chunk = unique_job_ids[offset:offset + _STATUS_CHECK_JOB_ID_CHUNK]
+            result = session.execute(
+                sqlalchemy.update(job_info_table).where(
+                    sqlalchemy.and_(
+                        job_info_table.c.spot_job_id.in_(chunk),
+                        job_info_table.c.schedule_state ==
+                        ManagedJobScheduleState.DONE.value,
+                        job_info_table.c.pool.is_(None),
+                        has_task,
+                        ~has_nonterminal_task,
+                    )).values({
+                        job_info_table.c.controller_pid: None,
+                        job_info_table.c.controller_pid_started_at: None,
+                        job_info_table.c.controller_instance_id: None,
+                        job_info_table.c.controller_generation: None,
+                        job_info_table.c.controller_slot_id: None,
+                        job_info_table.c.controller_slot_attempt: None,
+                        job_info_table.c.controller_slot_quiescing: False,
+                        job_info_table.c.schedule_state:
+                            ManagedJobScheduleState.WAITING.value,
+                    }))
+            updated_count += result.rowcount
+        session.commit()
+    return updated_count
 
 
 def reset_job_for_recovery_if_stale(job_id: int, owner: tuple[str,

@@ -93,6 +93,90 @@ def test_global_sweep_does_not_discover_done_cluster_rows(monkeypatch):
     utils.update_managed_jobs_statuses()
 
 
+def test_recovery_requeues_only_exact_terminal_done_cluster_owners(monkeypatch):
+    """Recovery nominates orphans; the scheduler still owns cleanup."""
+    cluster_candidates = {
+        'job-6036': '6036',
+        'legacy-task-7': None,
+        'wrong-name-8': '8',
+        'nonterminal-9': '9',
+        'pool-task-10': '10',
+        'never-launched-11': '11',
+        'malformed': 'not-a-job-id',
+    }
+    monkeypatch.setattr(utils.global_user_state,
+                        'get_managed_job_cluster_cleanup_candidates',
+                        lambda: cluster_candidates)
+
+    def _task(task_name, status, launched=True):
+        return {
+            'task_id': 0,
+            'task_name': task_name,
+            'status': status,
+            'submitted_at': 100.0 if launched else None,
+            'start_at': None,
+            'last_recovered_at': None,
+        }
+
+    snapshots = {
+        6036: {
+            'schedule_state': managed_job_state.ManagedJobScheduleState.DONE,
+            'pool': None,
+            'tasks': [
+                _task('job', managed_job_state.ManagedJobStatus.SUCCEEDED)
+            ],
+        },
+        7: {
+            'schedule_state': managed_job_state.ManagedJobScheduleState.DONE,
+            'pool': None,
+            'tasks': [
+                _task('legacy-task', managed_job_state.ManagedJobStatus.FAILED)
+            ],
+        },
+        8: {
+            'schedule_state': managed_job_state.ManagedJobScheduleState.DONE,
+            'pool': None,
+            'tasks': [
+                _task('expected-name',
+                      managed_job_state.ManagedJobStatus.FAILED)
+            ],
+        },
+        9: {
+            'schedule_state': managed_job_state.ManagedJobScheduleState.DONE,
+            'pool': None,
+            'tasks': [
+                _task('nonterminal', managed_job_state.ManagedJobStatus.RUNNING)
+            ],
+        },
+        10: {
+            'schedule_state': managed_job_state.ManagedJobScheduleState.DONE,
+            'pool': 'shared-pool',
+            'tasks': [
+                _task('pool-task', managed_job_state.ManagedJobStatus.SUCCEEDED)
+            ],
+        },
+        11: {
+            'schedule_state': managed_job_state.ManagedJobScheduleState.DONE,
+            'pool': None,
+            'tasks': [
+                _task('never-launched',
+                      managed_job_state.ManagedJobStatus.CANCELLED,
+                      launched=False)
+            ],
+        },
+    }
+    monkeypatch.setattr(
+        managed_job_state, 'get_jobs_status_check_info', lambda job_ids:
+        {job_id: snapshots[job_id] for job_id in job_ids if job_id in snapshots})
+    requeued = []
+    monkeypatch.setattr(
+        managed_job_state, 'requeue_terminal_done_jobs_for_cleanup',
+        lambda job_ids: requeued.extend(job_ids) or len(job_ids))
+
+    assert utils.requeue_terminal_done_jobs_with_live_clusters() == 2
+    assert requeued == [6036, 7]
+
+
 @pytest.mark.parametrize(('recorded_owner', 'terminal'), [
     (('current-instance', 7), False),
     (('stale-instance', 6), True),
