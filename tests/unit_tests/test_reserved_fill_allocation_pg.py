@@ -2449,6 +2449,89 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
     assert tuple(cleared) == (0, None, None, None)
 
 
+def test_clock_only_claim_heartbeat_preserves_gated_publication(
+        allocation_engine, monkeypatch) -> None:
+    """Advancing only the governor clocks must not churn the published map.
+
+    Schema 6 (PR #1773) authenticates the demand witness (need, boot state,
+    ceiling) of the claim set, not its release-governor clocks.  A poll-
+    interval heartbeat that keeps the witness and moves ``hot_until`` and
+    ``stepped_at`` must leave the current map readable and republication a
+    no-op; otherwise every heartbeat would invalidate paid planning.
+    """
+    monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)
+    _, snapshot = _commit_evidence(allocation_engine)
+    repository = _repository(allocation_engine)
+    edge = _claim_set_edge()
+    authorizer = _claim_policy_authorizer('semantic-a')
+
+    def _heartbeat(stepped_at: float, heartbeat_ts: int) -> int | None:
+        return serve_state.replace_reserved_fill_claim_set(
+            _SERVICE,
+            semantic_hash='semantic-a',
+            global_headroom=8,
+            utilization_ceiling=4,
+            utilization_state=_utilization_state(cap=4,
+                                                 demonstrated_need=3,
+                                                 stepped_at=stepped_at),
+            edges=(edge,),
+            heartbeat_ts=heartbeat_ts,
+            expected_service_hash=_SERVICE_HASH,
+            service_version=1,
+            expected_controller_owner=_OWNER,
+            reclaim_claim_authorizer=authorizer)
+
+    assert _heartbeat(3.0, 3) == 11
+    published = repository.publish(_SERVICE,
+                                   expected_service_hash=_SERVICE_HASH,
+                                   expected_controller_owner=_OWNER,
+                                   expected_claim_generation=11,
+                                   expected_gate_generation=1,
+                                   pool_snapshots=(snapshot,))
+    assert published is not None
+    assert published.utilization_gate_armed
+    assert published.utilization_demonstrated_need == 3
+    assert published.utilization_ceiling == 4
+    assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) == published
+
+    # Same need, boot state, cap, ceiling, headroom and edges; only the
+    # release-governor clocks advanced by one heartbeat.
+    assert _heartbeat(9.0, 9) == 11
+    assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) == published
+    assert repository.publish(_SERVICE,
+                              expected_service_hash=_SERVICE_HASH,
+                              expected_controller_owner=_OWNER,
+                              expected_claim_generation=11,
+                              expected_gate_generation=1,
+                              pool_snapshots=(snapshot,)) == published
+    with allocation_engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.text("""
+                SELECT allocation_generation
+                FROM reserved_fill_service_claim_sets
+                WHERE service_name = :name
+            """), {
+                'name': _SERVICE
+            }).scalar_one() == published.allocation_generation
+
+    # A changed demand witness at the same clocks is new authority.
+    assert serve_state.replace_reserved_fill_claim_set(
+        _SERVICE,
+        semantic_hash='semantic-a',
+        global_headroom=8,
+        utilization_ceiling=4,
+        utilization_state=_utilization_state(cap=4,
+                                             demonstrated_need=4,
+                                             stepped_at=9.0),
+        edges=(edge,),
+        heartbeat_ts=10,
+        expected_service_hash=_SERVICE_HASH,
+        service_version=1,
+        expected_controller_owner=_OWNER,
+        reclaim_claim_authorizer=authorizer) == 11
+    assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) is None
+
+
 def test_publication_records_unsettled_upward_grant(allocation_engine,
                                                     monkeypatch) -> None:
     monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)

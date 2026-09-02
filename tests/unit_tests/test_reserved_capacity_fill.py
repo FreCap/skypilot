@@ -6850,6 +6850,107 @@ class TestQueryFreeSlots(unittest.TestCase):
                 'utilization_state': json.dumps(state),
             })
 
+    def test_claim_utilization_witness_rejects_each_malformed_shape(self):
+        """Every schema-6 witness conjunct fails closed on its own.
+
+        PR #1773 bound the allocation map to the claim-set utilization
+        witness but only exercised the happy path; each rejection branch of
+        the decoder is a separate conjunct of one guard, so each needs its
+        own falsifying row.
+        """
+        allocation_module = reserved_capacity.reserved_fill_allocation
+
+        def _state(**overrides):
+            state = {
+                'cap': 4,
+                'hot_until': 63.0,
+                'stepped_at': 3.0,
+                'blind_since': None,
+                'demonstrated_need': 3,
+                'demand_witness_sha256': None,
+                'reservation_acquisition_classes': None,
+                'reservation_acquisition_binding_sha256': None,
+                'boot_hold': False,
+                'blind': False,
+            }
+            state.update(overrides)
+            return state
+
+        def _row(state, *, ceiling=4, headroom=8):
+            return {
+                'utilization_ceiling': ceiling,
+                'global_headroom': headroom,
+                'utilization_state': None
+                                     if state is None else json.dumps(state),
+            }
+
+        decode = allocation_module._claim_utilization_authority
+        self.assertEqual(decode(_row(_state())),
+                         (True, 3, None, False, 4, None))
+        self.assertEqual(decode(_row(None, ceiling=8, headroom=8)),
+                         (False, None, None, False, 8, None))
+        self.assertEqual(
+            decode(_row(_state(demonstrated_need=None, blind=True))),
+            (True, None, None, False, 4, None))
+
+        legacy_state = {
+            'cap': 4,
+            'hot_until': 63.0,
+            'stepped_at': 3.0,
+            'blind_since': None,
+        }
+        cases = [
+            ('ungated reduced ceiling', _row(None, ceiling=4, headroom=8),
+             'ungated reserved-fill claim'),
+            ('ceiling above headroom', _row(_state(), ceiling=9, headroom=8),
+             'ceiling is malformed'),
+            ('negative ceiling', _row(_state(), ceiling=-1,
+                                      headroom=8), 'ceiling is malformed'),
+            ('boolean headroom', _row(_state(), ceiling=4,
+                                      headroom=True), 'ceiling is malformed'),
+            ('legacy four-key state', _row(legacy_state), 'unsupported shape'),
+            ('ceiling not min of headroom and cap',
+             _row(_state(cap=6), ceiling=4,
+                  headroom=8), 'witness is malformed'),
+            ('boolean cap', _row(_state(cap=True),
+                                 ceiling=1), 'witness is malformed'),
+            ('negative cap', _row(_state(cap=-1),
+                                  ceiling=0), 'witness is malformed'),
+            ('float need', _row(_state(demonstrated_need=3.0)),
+             'witness is malformed'),
+            ('boolean need', _row(_state(demonstrated_need=True)),
+             'witness is malformed'),
+            ('negative need', _row(_state(demonstrated_need=-1)),
+             'witness is malformed'),
+            ('blind sample with need', _row(_state(blind=True)),
+             'witness is malformed'),
+            ('blind sample with boot hold',
+             _row(_state(blind=True, demonstrated_need=None,
+                         boot_hold=True)), 'witness is malformed'),
+            ('sighted sample without need',
+             _row(_state(demonstrated_need=None)), 'witness is malformed'),
+            ('integer boot hold', _row(_state(boot_hold=1)),
+             'witness is malformed'),
+            ('integer blind flag', _row(_state(blind=0)),
+             'witness is malformed'),
+            ('boolean clock', _row(_state(hot_until=True)),
+             'witness is malformed'),
+            ('negative clock', _row(_state(stepped_at=-1.0)),
+             'witness is malformed'),
+            ('non-finite clock', _row(_state(hot_until=float('inf'))),
+             'witness is malformed'),
+            ('boolean blind_since', _row(_state(blind_since=False)),
+             'witness is malformed'),
+            ('negative blind_since', _row(_state(blind_since=-5.0)),
+             'witness is malformed'),
+        ]
+        for name, row, message in cases:
+            with self.subTest(name):
+                with self.assertRaisesRegex(
+                        allocation_module.ReservedFillAllocationCorruptionError,
+                        message):
+                    decode(row)
+
     def _exact_pool_snapshot(
         self,
         edge_cap: int,
