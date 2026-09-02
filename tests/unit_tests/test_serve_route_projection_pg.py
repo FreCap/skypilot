@@ -415,9 +415,66 @@ def test_material_batch_has_fixed_statement_count_and_joined_target_read(
     # The material transaction is owner, replicas, histories, sibling revoke,
     # bulk upsert, and ranked history prune regardless of fleet batch size.
     assert material_statement_count == 6
-    # Probe targets are one owner fence and one lease/current-replica join.
-    assert target_statement_count == 2
+    # Probe targets install two transaction deadlines, then read one owner
+    # fence and one lease/current-replica join.
+    assert target_statement_count == 4
     assert [target.replica_id for target in targets] == [1, 2, 3]
+
+
+def test_incremental_worker_transactions_install_local_deadlines(
+        route_database):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    identity = _identity(incarnation)
+    record_id = str(uuid.uuid4())
+    _insert_replica(engine, record_id)
+    info = types.SimpleNamespace(replica_id=1,
+                                 replica_record_id=record_id,
+                                 version=1)
+    repository.upsert_replica_material(identity, info, _material())
+    target = repository.list_probe_targets(identity)[0]
+    statements = []
+
+    def _record_statement(_connection, _cursor, statement, *_args):
+        statements.append(' '.join(statement.split()))
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _record_statement)
+    try:
+        repository.list_probe_targets(identity)
+        target_statements = list(statements)
+        statements.clear()
+
+        repository.record_probe_results(
+            [route_projection.RouteLeaseProbeResult(target, True)],
+            ttl_seconds=60)
+        receipt_statements = list(statements)
+        statements.clear()
+
+        repository.compose_incremental_snapshot(
+            identity,
+            1, {'load_balancing_policy_name': 'round_robin'},
+            lambda _version, state: types.SimpleNamespace(
+                replica_id=1,
+                replica_record_id=state['replica_record_id'],
+                version=1),
+            lambda _infos, _translation, _logical_versions:
+            {'replica_unit': 'physical_backend'},
+            ttl_seconds=60)
+        compose_statements = list(statements)
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute',
+                                _record_statement)
+
+    expected_lock = (
+        "SET LOCAL lock_timeout = "
+        f"'{route_projection._INCREMENTAL_WORKER_LOCK_TIMEOUT_MS}ms'")
+    expected_statement = (
+        "SET LOCAL statement_timeout = "
+        f"'{route_projection._INCREMENTAL_WORKER_STATEMENT_TIMEOUT_MS}ms'")
+    assert target_statements[:2] == [expected_lock, expected_statement]
+    assert receipt_statements[:2] == [expected_lock, expected_statement]
+    assert compose_statements.count(expected_lock) == 2
+    assert compose_statements.count(expected_statement) == 2
 
 
 def test_material_batch_isolates_revoked_and_stale_siblings(route_database):
