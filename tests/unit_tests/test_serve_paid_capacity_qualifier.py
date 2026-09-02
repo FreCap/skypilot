@@ -235,7 +235,7 @@ def _database_state(**overrides):
             incarnation='12345678-1234-5678-9234-567812345678'),
         'paid_debit_units': 0,
         'claimed_units': 0,
-        'claim_priorities': (),
+        'claim_priority_units': (),
         'waiter_count': 0,
         'demand_units': 0,
         'gcp_provider_identities': tuple(
@@ -2259,13 +2259,31 @@ def test_paid_claim_requires_exact_offered_priority_and_plan():
     }
     census = qualifier.paid_claim_census([claim, dict(claim)])
     assert census.gpu_units == 2
-    assert census.priorities == (50, 50)
+    assert census.priority_units == (qualifier.PaidClaimPriorityUnits(
+        priority=50, gpu_units=2),)
 
     for invalid_priority in (49, 51, True, None):
         with pytest.raises(qualifier.GuardViolation, match='not priority 50'):
             qualifier.paid_claim_census([{
                 **claim, 'priority': invalid_priority
             }])
+
+
+def test_paid_claim_census_aggregates_multi_gpu_claim_units_by_priority():
+    claims = [{
+        'priority': 50,
+        'capacity_plan_generation': 9,
+        'capacity_plan_sha256': 'a' * 64,
+        'persisted_plan_sha256': 'a' * 64,
+        'capacity_plan_accelerator': 'L4',
+        'capacity_plan_units': width,
+    } for width in (4, 8)]
+
+    census = qualifier.paid_claim_census(claims)
+
+    assert census.gpu_units == 12
+    assert census.priority_units == (qualifier.PaidClaimPriorityUnits(
+        priority=50, gpu_units=12),)
 
 
 def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
@@ -2278,7 +2296,10 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
     }
     controller = qualifier.controller_identity_from_authority(authority)
     observation = _observation(database=_database_state(
-        controller=controller, claimed_units=1, claim_priorities=(50,)))
+        controller=controller,
+        claimed_units=1,
+        claim_priority_units=(
+            qualifier.PaidClaimPriorityUnits(priority=50, gpu_units=1),)))
     receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
                                 service_name='paid-e2e',
                                 profile=qualifier.PROFILES['small'])
@@ -2294,7 +2315,10 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
     assert sample['controller_pid'] == 321
     assert sample['controller_owner_epoch'] == 12
     assert sample['claimed_units'] == 1
-    assert sample['paid_claim_priorities'] == [50]
+    assert sample['paid_claim_priority_units'] == [{
+        'priority': 50,
+        'gpu_units': 1,
+    }]
     assert sample['provider_instances'] == 0
     assert sample['provider_gpu_units'] == 0
     assert sample['provider_running_gpu_units'] == 0
@@ -2764,7 +2788,8 @@ def test_exact_provider_free_unbound_paid_debit_remains_visible_during_scale(
     phase_a = _observation(database=_database_state(
         paid_debit_units=1,
         claimed_units=1,
-        claim_priorities=(50,),
+        claim_priority_units=(qualifier.PaidClaimPriorityUnits(priority=50,
+                                                               gpu_units=1),),
         demand_units=4,
         provider_free_unbound_replica_ids=(7,)),
                            load_balancer=_load_balancer_state(demand_units=4))
@@ -2801,11 +2826,13 @@ def test_exact_provider_free_unbound_paid_debit_remains_visible_during_scale(
 
 def test_phase_a_observation_cannot_hide_a_provider_effect(tmp_path):
     phase_a_with_effect = _observation(
-        database=_database_state(paid_debit_units=1,
-                                 claimed_units=1,
-                                 claim_priorities=(50,),
-                                 demand_units=4,
-                                 provider_free_unbound_replica_ids=(7,)),
+        database=_database_state(
+            paid_debit_units=1,
+            claimed_units=1,
+            claim_priority_units=(qualifier.PaidClaimPriorityUnits(
+                priority=50, gpu_units=1),),
+            demand_units=4,
+            provider_free_unbound_replica_ids=(7,)),
         provider=_provider_state(instance_count=1,
                                  cluster_names=frozenset({'paid-e2e-7'})),
         load_balancer=_load_balancer_state(demand_units=4))
@@ -3294,11 +3321,20 @@ def test_generated_concurrent_receipt_passes_aggregate_gate(tmp_path):
                                     providers=('aws', 'gcp'))))
     gcp_names = _provider_cluster_names('gcp', 50)
     aws_names = _provider_cluster_names('aws', 50)
+    claims = [{
+        'priority': qualifier._REQUEST_PRIORITY,
+        'capacity_plan_generation': 9,
+        'capacity_plan_sha256': 'f' * 64,
+        'persisted_plan_sha256': 'f' * 64,
+        'capacity_plan_accelerator': 'L4',
+        'capacity_plan_units': width,
+    } for width in (4, 8)]
+    claim_census = qualifier.paid_claim_census(claims)
     paid_database = _database_state(
         service_hash=scope.service_hash,
         paid_debit_units=100,
-        claimed_units=100,
-        claim_priorities=(qualifier._REQUEST_PRIORITY,) * 100,
+        claimed_units=claim_census.gpu_units,
+        claim_priority_units=claim_census.priority_units,
         demand_units=canonical_profile.max_units,
         bound_cluster_zones=tuple(
             (name, 'us-central1-a') for name in gcp_names),
@@ -4239,7 +4275,7 @@ def _zero_qualification_sample(observed_at,
             field: 0 for field in qualifier._ZERO_OBSERVATION_FIELDS
         },
         'provider_by_cloud': _qualification_provider_projection({}),
-        'paid_claim_priorities': [],
+        'paid_claim_priority_units': [],
         'lb_offered_arrival_tracking_saturated': False,
     }
     if phase == 'baseline':
@@ -4283,7 +4319,7 @@ def _write_aggregate_qualification(path,
         'provider_disks': sum(peaks.values()),
         'provider_inflight_operations': 0,
         'provider_by_cloud': provider_projection,
-        'paid_claim_priorities': [],
+        'paid_claim_priority_units': [],
         'postgres_demand_units': stimulus,
         'lb_demand_units': stimulus,
         'lb_unique_job_arrivals_60s': stimulus,
@@ -4729,25 +4765,85 @@ def test_qualification_receipt_binds_exact_request_priority(
 
 
 @pytest.mark.parametrize(
-    ('claimed_units', 'priorities'),
-    [(1, [49]), (2, [50]), (1, ['50']), (0, None)],
+    ('claimed_units', 'priority_units'),
+    [(1, [{
+        'priority': 49,
+        'gpu_units': 1
+    }]), (2, [{
+        'priority': 50,
+        'gpu_units': 1
+    }]), (1, [{
+        'priority': '50',
+        'gpu_units': 1
+    }]), (1, [{
+        'priority': True,
+        'gpu_units': 1
+    }]), (1, [{
+        'priority': 50,
+        'gpu_units': True
+    }]), (1, [{
+        'priority': 50,
+        'gpu_units': 0
+    }]),
+     (2, [{
+         'priority': 50,
+         'gpu_units': 1
+     }, {
+         'priority': 50,
+         'gpu_units': 1
+     }]),
+     (2, [{
+         'priority': 51,
+         'gpu_units': 1
+     }, {
+         'priority': 50,
+         'gpu_units': 1
+     }]), (1, [{
+         'priority': 50,
+         'gpu_units': 1,
+         'unexpected': 0
+     }]), (0, [{
+         'priority': 50,
+         'gpu_units': 1
+     }]), (801, [{
+         'priority': 50,
+         'gpu_units': 801
+     }]), (1, [{
+         'priority': 50
+     }]), (1, ['not-an-entry']), (0, None)],
 )
-def test_qualification_receipt_binds_recorded_paid_claim_priorities(
-        tmp_path, claimed_units, priorities):
+def test_qualification_receipt_rejects_tampered_paid_claim_priority_units(
+        tmp_path, claimed_units, priority_units):
     args = _aggregate_args(tmp_path)
     receipt = pathlib.Path(args.economic_receipt)
     payload = json.loads(receipt.read_text(encoding='utf-8'))
     scale = next(
         sample for sample in payload['samples'] if sample['phase'] == 'scale')
     scale['claimed_units'] = claimed_units
-    if priorities is None:
-        del scale['paid_claim_priorities']
+    if priority_units is None:
+        del scale['paid_claim_priority_units']
     else:
-        scale['paid_claim_priorities'] = priorities
+        scale['paid_claim_priority_units'] = priority_units
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
     with pytest.raises(qualifier.QualificationError,
                        match='paid claim priorit'):
+        qualifier._read_qualification_evidence(
+            receipt, qualifier.ExpectationKind.ECONOMIC)
+
+
+def test_qualification_receipt_rejects_legacy_paid_claim_priority_field(
+        tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    scale = next(
+        sample for sample in payload['samples'] if sample['phase'] == 'scale')
+    scale['paid_claim_priorities'] = []
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='paid claim priority-unit'):
         qualifier._read_qualification_evidence(
             receipt, qualifier.ExpectationKind.ECONOMIC)
 

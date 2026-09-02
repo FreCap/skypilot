@@ -2502,6 +2502,14 @@ def controller_identity_from_authority(
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class PaidClaimPriorityUnits:
+    """Logical GPU units held by live claims at one exact priority."""
+
+    priority: int
+    gpu_units: int
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class DatabaseState:
     """One consistent PostgreSQL authority and telemetry snapshot."""
 
@@ -2509,7 +2517,7 @@ class DatabaseState:
     controller: ControllerIdentity
     paid_debit_units: int
     claimed_units: int
-    claim_priorities: tuple[int, ...]
+    claim_priority_units: tuple[PaidClaimPriorityUnits, ...]
     waiter_count: int
     demand_units: int
     gcp_provider_identities: tuple[GcpProviderIdentity, ...]
@@ -2530,7 +2538,7 @@ class PaidClaimCensus:
     """Exact priority and immutable-plan attribution of live paid claims."""
 
     gpu_units: int
-    priorities: tuple[int, ...]
+    priority_units: tuple[PaidClaimPriorityUnits, ...]
 
 
 def paid_debit_census(
@@ -2566,7 +2574,7 @@ def paid_claim_census(
 ) -> PaidClaimCensus:
     """Require every live claim to retain the offered priority and plan."""
     claimed_units = 0
-    priorities: list[int] = []
+    units_by_priority: dict[int, int] = {}
     try:
         for claim in claims:
             priority = claim['priority']
@@ -2583,13 +2591,17 @@ def paid_claim_census(
                     f'Paid claim is not priority {_REQUEST_PRIORITY} and '
                     'linked to one immutable whole-L4 plan.')
             claimed_units += claim['capacity_plan_units']
-            priorities.append(priority)
+            units_by_priority[priority] = (units_by_priority.get(priority, 0) +
+                                           claim['capacity_plan_units'])
     except (KeyError, TypeError) as error:
         raise GuardViolation(
             'Paid claim has incomplete priority or plan attribution.') \
             from error
-    return PaidClaimCensus(gpu_units=claimed_units,
-                           priorities=tuple(priorities))
+    return PaidClaimCensus(
+        gpu_units=claimed_units,
+        priority_units=tuple(
+            PaidClaimPriorityUnits(priority=priority, gpu_units=gpu_units)
+            for priority, gpu_units in sorted(units_by_priority.items())))
 
 
 _BOUND_REQUEST_PROFILE_FIELDS = (
@@ -3370,7 +3382,7 @@ class PostgresObserver:
             controller=controller_identity,
             paid_debit_units=debits.gpu_units,
             claimed_units=claim_census.gpu_units,
-            claim_priorities=claim_census.priorities,
+            claim_priority_units=claim_census.priority_units,
             waiter_count=int(waiter_count),
             demand_units=demand_units(demand_report['payload']),
             gcp_provider_identities=tuple(
@@ -3831,7 +3843,10 @@ def observation_summary(observation: Observation) -> dict[str, Any]:
         'controller_incarnation': observation.database.controller.incarnation,
         'paid_debit_units': observation.database.paid_debit_units,
         'claimed_units': observation.database.claimed_units,
-        'paid_claim_priorities': list(observation.database.claim_priorities),
+        'paid_claim_priority_units': [
+            dataclasses.asdict(item)
+            for item in observation.database.claim_priority_units
+        ],
         'waiters': observation.database.waiter_count,
         # Phase-A launch intents are expected while a wave is being bound.
         # Keep them visible in the receipt without mistaking them for an
@@ -5402,18 +5417,34 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
         final_observed_at=final_observed_at)
 
 
-def _validate_paid_claim_priority_evidence(
-        sample: collections.abc.Mapping[str, Any]) -> None:
-    """Bind each recorded one-L4 live claim to the offered priority."""
+def _validate_paid_claim_priority_units_evidence(
+        sample: collections.abc.Mapping[str, Any], *, max_units: int) -> None:
+    """Bind compact live-claim logical GPU units to the offered priority."""
     claimed_units = sample.get('claimed_units')
-    priorities = sample.get('paid_claim_priorities')
-    if (type(claimed_units) is not int or claimed_units < 0 or
-            not isinstance(priorities, list) or
-            len(priorities) != claimed_units or any(
-                type(priority) is not int or priority != _REQUEST_PRIORITY
-                for priority in priorities)):
+    priority_units = sample.get('paid_claim_priority_units')
+    if (type(claimed_units) is not int or not 0 <= claimed_units <= max_units or
+            not isinstance(priority_units, list) or
+            'paid_claim_priorities' in sample):
         raise QualificationError(
-            'Qualification receipt has invalid paid claim priority evidence.')
+            'Qualification receipt has invalid paid claim priority-unit '
+            'evidence.')
+    entries: list[tuple[int, int]] = []
+    for entry in priority_units:
+        if (not isinstance(entry, dict) or
+                set(entry) != {'priority', 'gpu_units'} or
+                type(entry['priority']) is not int or
+                type(entry['gpu_units']) is not int or entry['gpu_units'] <= 0):
+            raise QualificationError(
+                'Qualification receipt has invalid paid claim priority-unit '
+                'evidence.')
+        entries.append((entry['priority'], entry['gpu_units']))
+    priorities = [priority for priority, _ in entries]
+    if (priorities != sorted(set(priorities)) or
+            sum(gpu_units for _, gpu_units in entries) != claimed_units or
+            any(priority != _REQUEST_PRIORITY for priority in priorities)):
+        raise QualificationError(
+            'Qualification receipt has invalid paid claim priority-unit '
+            'evidence.')
 
 
 def _complete_provider_sample(
@@ -5581,7 +5612,8 @@ def _validate_provider_scale_samples(
                 raise QualificationError(
                     'Qualification receipt has a malformed provider sample.')
             continue
-        _validate_paid_claim_priority_evidence(sample)
+        _validate_paid_claim_priority_units_evidence(
+            sample, max_units=profile.max_units)
         totals, by_cloud = _complete_provider_sample(
             sample,
             max_units=profile.max_units,
