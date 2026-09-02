@@ -35,6 +35,8 @@ from sky import global_user_state_schema
 from sky import models
 from sky import skypilot_config
 from sky.events import api_models as event_api_models
+from sky.jobs import controller_fencing as managed_job_controller_fencing
+from sky.jobs import state as managed_job_state
 from sky.jobs import state_schema as managed_job_state_schema
 from sky.jobs.server import core as managed_jobs_core
 from sky.provision import common as provision_common
@@ -8892,6 +8894,103 @@ def test_managed_job_first_slot_rollout_quiesces_correlated_request(
         assert restored.execution_quiesced_at is not None
     finally:
         leader.release()
+
+
+def test_managed_job_recovery_retains_tombstone_across_two_successors(
+        request_database, monkeypatch):
+    """Two production recovery passes adopt a retained exact tombstone."""
+    engine, backend = request_database
+    monkeypatch.setattr(storage, '_storage_backend', backend)
+    monkeypatch.setattr(managed_job_state._db_manager, '_engine', engine)
+
+    job_id = 51
+    old_instance_id = str(uuid.uuid4())
+    old_attempt = uuid.uuid4()
+    execution_generation = 7
+    now = time.time()
+    _seed_legacy_managed_job(engine, job_id=job_id, schedule_state='WAITING')
+    tombstone = _request('retained-managed-job-tombstone', should_enqueue=False)
+    tombstone.status = requests.RequestStatus.FAILED
+    tombstone.terminal_cause = (
+        event_api_models.EventCause.HANDLER_FAILED.value)
+    tombstone.finished_at = now
+    tombstone.execution_generation = execution_generation
+    tombstone.claim_token = str(uuid.uuid4())
+    tombstone.worker_instance_id = str(uuid.uuid4())
+    tombstone.pid = 1234
+    tombstone.execution_process_start_time_ticks = 424242
+    tombstone.lease_expires_at = now
+    tombstone.heartbeat_at = now
+    tombstone.execution_quiescence_required = True
+    tombstone.execution_quiesced_generation = execution_generation
+    tombstone.execution_quiesced_at = now
+    tombstone.managed_job_id = job_id
+    tombstone.managed_job_controller_instance_id = old_instance_id
+    tombstone.managed_job_controller_generation = 11
+    tombstone.managed_job_controller_slot_id = 0
+    tombstone.managed_job_controller_slot_attempt = str(old_attempt)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(request_postgres.REQUESTS).values(
+                **request_postgres._request_values_for_db(tombstone)))
+
+    original_tombstone = backend.get_request(tombstone.request_id)
+    assert original_tombstone is not None
+    successor_generations: list[int] = []
+    for _ in range(2):
+        leader = _controller_leader(engine, monkeypatch, str(uuid.uuid4()))
+        try:
+            assert leader.generation is not None
+            successor_generations.append(leader.generation)
+            managed_job_controller_fencing.publish_owner(
+                (leader.instance_id, leader.generation),
+                mode=managed_job_controller_fencing.POSTGRES_OWNER_MODE)
+
+            # Exercise the production startup seam, including both request
+            # quiescence and the managed-job reset transaction.
+            assert managed_job_state.reset_stale_jobs_for_current_controller(
+            ) == 1
+            retained = backend.get_request(tombstone.request_id)
+            assert retained is not None
+            assert retained.status is requests.RequestStatus.FAILED
+            assert retained.terminal_cause == tombstone.terminal_cause
+            assert retained.execution_generation == execution_generation
+            assert retained.claim_token == original_tombstone.claim_token
+            assert (retained.worker_instance_id ==
+                    original_tombstone.worker_instance_id)
+            assert retained.execution_quiescence_required
+            assert retained.execution_quiesced_generation == execution_generation
+            assert (retained.execution_quiesced_at ==
+                    original_tombstone.execution_quiesced_at)
+            assert (retained.managed_job_controller_instance_id,
+                    retained.managed_job_controller_generation,
+                    retained.managed_job_controller_slot_id,
+                    retained.managed_job_controller_slot_attempt) == (
+                        old_instance_id, 11, 0, str(old_attempt))
+            with engine.connect() as connection:
+                recovered_job = connection.execute(
+                    sqlalchemy.select(
+                        managed_job_state_schema.job_info_table.c.
+                        schedule_state,
+                        managed_job_state_schema.job_info_table.c.
+                        controller_instance_id,
+                        managed_job_state_schema.job_info_table.c.
+                        controller_generation,
+                        managed_job_state_schema.job_info_table.c.
+                        controller_slot_id,
+                        managed_job_state_schema.job_info_table.c.
+                        controller_slot_attempt,
+                        managed_job_state_schema.job_info_table.c.
+                        controller_slot_quiescing,
+                    ).where(managed_job_state_schema.job_info_table.c.
+                            spot_job_id == job_id)).one()
+            assert tuple(recovered_job) == ('WAITING', None, None, None, None,
+                                            False)
+        finally:
+            managed_job_controller_fencing.clear_owner()
+            leader.release()
+
+    assert successor_generations == [1, 2]
 
 
 def test_managed_job_first_slot_rollout_requires_fresh_outer_generation(
