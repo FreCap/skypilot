@@ -6707,10 +6707,28 @@ def test_added_supply_keeps_retained_demand_and_paid_admission(
 
 def test_added_supply_retained_zero_revokes_spend_without_retirement_authority(
         capacity_database):
+    """Additive fresh zero rejects new paid spend inside fused admission.
+
+    Format-6 paid claims exist only through ``plan_and_admit_current``, so the
+    revocation must be proven at the fused boundary: a protocol-2 route owner
+    whose fresh reports prove aggregate zero must not commit a positive paid
+    target even though the added, unsampled replica leaves it without
+    retirement authority.
+    """
     engine, incarnation, reported_route = capacity_database
+    _plan_and_admit_target(engine, 2)
     _publish_added_supply_route(engine, incarnation, advertised=True)
-    repository = capacity_admission.CapacityAdmissionRepository(engine)
-    authority = _seed_committed_plan_for_consumer(engine, _plan(2))
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_snapshots_table).where(
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    service_name == 'svc').values(producer_protocol_version=2))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_projection_protocol_version=2,
+                    route_projection_controller_incarnation=incarnation))
 
     demand_state.ingest_report(
         'svc', 'svc-hash',
@@ -6719,9 +6737,19 @@ def test_added_supply_retained_zero_revokes_spend_without_retirement_authority(
 
     snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
     assert snapshot is not None
+    assert snapshot.fresh_aggregate_zero
     assert snapshot.reconcile_authority.deadline_monotonic <= time.monotonic()
-    with pytest.raises(capacity_admission.CapacityAdmissionConflict):
-        _insert_claim(engine, authority, 10)
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='Fresh aggregate zero'):
+        _plan_and_admit_target(engine, 2)
+    with engine.connect() as connection:
+        head = connection.execute(
+            sqlalchemy.select(
+                capacity_admission_schema.serve_capacity_plan_heads_table.c.
+                generation).where(
+                    capacity_admission_schema.serve_capacity_plan_heads_table.c.
+                    service_name == 'svc')).scalar_one()
+    assert head == 1
 
 
 def test_promotion_requires_exact_route_not_additive_compatibility(
@@ -7235,8 +7263,14 @@ def test_allocation_bound_claim_survives_unbound_zero_successor(
                          ids=['pod-waiting', 'quota-assigned'])
 def test_only_quota_assigned_kueue_capacity_is_reserved_supply(
         capacity_database, admitted, expected_paid):
-    engine, _, _ = capacity_database
+    engine, _, route_receipt = capacity_database
+    # Format-6 genesis is legal only beside an empty authority graph, so the
+    # policy head must exist before the retained Kueue graph is installed.
+    _plan_and_admit_target(engine, 0)
     _install_waiting_kueue_capacity(engine, admitted=admitted)
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=1))
 
     authority = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
@@ -7260,9 +7294,13 @@ def test_only_quota_assigned_kueue_capacity_is_reserved_supply(
 
 def test_missing_kueue_admission_does_not_revoke_committed_provider_effect(
         capacity_database):
-    engine, incarnation, _ = capacity_database
+    engine, incarnation, route_receipt = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    _plan_and_admit_target(engine, 0)
     key = _install_waiting_kueue_capacity(engine)
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=1))
     committed = capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(**_current_owner_kwargs(engine),
                                        service_name='svc',
@@ -7327,11 +7365,40 @@ def test_copied_kueue_identity_does_not_revoke_committed_provider_effect(
 
 def test_cross_card_reserved_capacity_satisfies_supply_aware_target(
         capacity_database):
-    engine, _, _ = capacity_database
+    engine, _, route_receipt = capacity_database
+    # Establish the two-card policy head before the retained reserved replica
+    # exists; genesis beside a provider-possible replica fails closed.
+    capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={
+                'l4': 1,
+                'a100': 1,
+            },
+            backend_num_nodes=1,
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot,
+                supply,
+                0,
+                target_by_accelerator={
+                    'l4': 0,
+                    'a100': 0,
+                },
+                compatible_accelerators=('l4', 'a100'),
+                cold_accelerator_order=('l4', 'a100'),
+                prospective_paid_accelerators=('l4', 'a100')))
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.insert(serve_state_schema.replicas_table).values(
                 **_replica_values(22, zero_cost=True, accelerator='A100')))
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=1))
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
             **_current_owner_kwargs(engine),
