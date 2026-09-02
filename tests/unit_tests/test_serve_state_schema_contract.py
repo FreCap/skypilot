@@ -259,6 +259,7 @@ def test_resource_action_existing_table_columns_are_dialect_portable():
     assert serve_state._ACTION_OWNED_REPLICA_COLUMNS == uuid_columns | {
         'desired_generation',
         'non_pool_launch_authorization',
+        'reserved_fill_intent_idempotency_key',
         'resource_action_spec_identity_sha256',
     }
     assert set(serve_state._REPLICA_ROW_COLUMNS).isdisjoint(

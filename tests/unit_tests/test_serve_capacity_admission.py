@@ -2,6 +2,8 @@
 
 import copy
 import dataclasses
+import threading
+import time
 
 import pytest
 import sqlalchemy
@@ -867,3 +869,64 @@ def test_paid_launch_authority_debits_exact_or_aggregate_units():
             capacity_admission.ReservedFillPlanAuthority.not_applicable()))
     assert aggregate.claim_values('A100',
                                   units=1)['capacity_plan_accelerator'] == '*'
+
+
+def _witness_wake_state(monkeypatch):
+    monkeypatch.setattr(capacity_admission, '_FILL_DEMAND_WITNESS_WAKE',
+                        threading.Condition())
+    monkeypatch.setattr(capacity_admission,
+                        '_FILL_DEMAND_WITNESS_WAKE_SEQUENCE', {})
+    monkeypatch.setattr(capacity_admission, '_FILL_DEMAND_WITNESS_WAKE_DIGEST',
+                        {})
+
+
+def test_wait_for_fill_demand_witness_returns_at_its_deadline(monkeypatch):
+    _witness_wake_state(monkeypatch)
+    started = time.monotonic()
+    sequence, changed = capacity_admission.wait_for_fill_demand_witness(
+        'svc', 0, 0.05)
+    elapsed = time.monotonic() - started
+    assert (sequence, changed) == (0, False)
+    assert elapsed < 5.0
+
+
+def test_wait_for_fill_demand_witness_honors_a_set_stop_event(monkeypatch):
+    _witness_wake_state(monkeypatch)
+    stop_event = threading.Event()
+    stop_event.set()
+    started = time.monotonic()
+    sequence, changed = capacity_admission.wait_for_fill_demand_witness(
+        'svc', 0, 3600.0, stop_event=stop_event)
+    assert (sequence, changed) == (0, False)
+    assert time.monotonic() - started < 5.0
+
+
+def test_wait_for_fill_demand_witness_wakes_on_publication(monkeypatch):
+    _witness_wake_state(monkeypatch)
+    after = capacity_admission.fill_demand_witness_wake_sequence('svc')
+    publisher = threading.Timer(0.05,
+                                capacity_admission._notify_fill_demand_witness,
+                                ('svc', 'a' * 64))
+    publisher.start()
+    try:
+        sequence, changed = capacity_admission.wait_for_fill_demand_witness(
+            'svc', after, 30.0)
+    finally:
+        publisher.join(5.0)
+    assert changed is True
+    assert sequence == after + 1
+    # A repeated digest is not a new publication.
+    capacity_admission._notify_fill_demand_witness('svc', 'a' * 64)
+    assert capacity_admission.fill_demand_witness_wake_sequence(
+        'svc') == after + 1
+
+
+def test_wait_for_fill_demand_witness_rejects_malformed_arguments():
+    with pytest.raises(ValueError):
+        capacity_admission.wait_for_fill_demand_witness('', 0, 1.0)
+    with pytest.raises(ValueError):
+        capacity_admission.wait_for_fill_demand_witness('svc', -1, 1.0)
+    with pytest.raises(ValueError):
+        capacity_admission.wait_for_fill_demand_witness('svc', 0, -1.0)
+    with pytest.raises(ValueError):
+        capacity_admission.wait_for_fill_demand_witness('svc', True, 1.0)

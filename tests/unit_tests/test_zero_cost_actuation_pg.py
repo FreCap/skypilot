@@ -168,18 +168,28 @@ def _plan(
         capacity_unit=capacity_unit)
 
 
+_PHX_EAST_LANES = (('phx', 'uid-phx', True), ('east', 'uid-east', False))
+_EAST_WEST_LANES = (('east', 'uid-east', False), ('west', 'uid-west', False))
+
+
 def _multi_pool_plan(
     *,
     free_slots: int,
     reconcile_generation: int = 3,
     allocation_generation: int = 5,
     valid_until: float | None = None,
+    pools: tuple[tuple[str, str, bool], ...] = _PHX_EAST_LANES,
 ) -> reserved_fill_planner.FillPlan:
+    """Plan one authenticated allocation spanning every ``pools`` lane.
+
+    Grant admission terminalizes the unleased provider-free rows of any other
+    allocation (``allocation_superseded``), so pools of one service that must
+    coexist have to share a single allocation map.
+    """
     if valid_until is None:
         valid_until = time.time() + 60
     snapshots = []
-    for context, physical_uid, kueue in (('phx', 'uid-phx', True),
-                                         ('east', 'uid-east', False)):
+    for context, physical_uid, kueue in pools:
         projection = _worker_projection(context, 1, kueue=kueue)
         location = spot_placer.Location(cloud=clouds.Kubernetes(),
                                         region=context,
@@ -232,9 +242,15 @@ def _multi_pool_plan(
         service_incarnation=_SERVICE_HASH,
         service_version=19,
         controller_owner=_OWNER,
-        max_replicas=2 * free_slots,
+        max_replicas=len(pools) * free_slots,
         planned_replicas=0,
         capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+
+
+def _pool_intent(plan: reserved_fill_planner.FillPlan,
+                 context: str) -> reserved_fill_planner.FillIntent:
+    return next(intent for intent in plan.intents
+                if intent.allowed_locations[0].region == context)
 
 
 @pytest.mark.parametrize(('context', 'kueue'), [('phx', True), ('east', False)])
@@ -1117,15 +1133,29 @@ def test_short_authority_lease_cannot_commit_after_grant_expiry(
         with actuation_database.begin() as connection:
             _commit_and_insert_replica(connection, lease, info)
 
+    # The expired grant offers no actionable work, but its live execution
+    # lease is retained for its owner instead of being retired underneath it.
     assert not repository.actionable_pool_keys(service_name='svc')
     intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    with actuation_database.connect() as connection:
+        row = connection.execute(sqlalchemy.select(intents)).mappings().one()
+    assert row['state'] == zero_cost_actuation.IntentState.ACTUATING.value
+    assert row['lease_owner'] == lease.owner
+    assert row['lease_generation'] == lease.generation
+    assert row['terminal_at'] is None
+
+    # The owner settles the refused commit as the executor does; the expired
+    # authority cannot return to RETRYABLE.
+    assert repository.release_retryable(lease, 'ZeroCostActuationConflict')
+    assert not repository.actionable_pool_keys(service_name='svc')
     with actuation_database.connect() as connection:
         row = connection.execute(sqlalchemy.select(intents)).mappings().one()
         replica_count = connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
                 serve_state_schema.replicas_table)).scalar_one()
     assert row['state'] == zero_cost_actuation.IntentState.TERMINAL.value
-    assert row['last_error'] == 'grant_expired'
+    assert row['last_error'] == 'ZeroCostActuationConflict'
+    assert row['terminal_at'] is not None
     assert replica_count == 0
 
 
@@ -1261,23 +1291,22 @@ def test_kueue_replacement_surge_is_service_wide_and_cannot_chain(
     alembic_command.upgrade(config, '057')
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
-    first = _plan(free_slots=1,
-                  context='phx',
-                  physical_uid='uid-phx-a',
-                  kueue=True)
-    second = _plan(free_slots=1,
-                   context='phx',
-                   physical_uid='uid-phx-b',
-                   kueue=True)
-    _insert_paid_replica_for_shape(actuation_database, first.intents[0])
-    assert len(_grant_plan(repository, first, max_capacity=1).accepted) == 1
+    # Both PHX physical pools belong to one allocation: a second single-pool
+    # allocation would supersede the first pool's provider-free grant instead
+    # of contending with it for the service-wide surge token.
+    plan = _multi_pool_plan(free_slots=1,
+                            pools=(('phx', 'uid-phx-a', True),
+                                   ('phx', 'uid-phx-b', True)))
+    _insert_paid_replica_for_shape(actuation_database, plan.intents[0])
 
-    receipt = _grant_plan(repository, second, max_capacity=1)
+    receipt = _grant_plan(repository, plan, max_capacity=1)
 
-    assert not receipt.accepted
+    assert len(receipt.accepted) == 1
     assert len(receipt.deferred) == 1
     assert receipt.deferred[0].reason is (
         reserved_fill_planner.DeferredFillReason.MAX_REPLICAS_EXHAUSTED)
+    # The granted surge holds the token, so a replay cannot chain a second.
+    assert _grant_plan(repository, plan, max_capacity=1) == receipt
 
 
 def test_kueue_replacement_surge_releases_only_after_provider_clean_evidence(
@@ -2073,32 +2102,33 @@ def test_idle_gate_controls_width_adjusted_durable_intents_without_paid_spill(
 def test_pool_leases_are_independent_and_retryable(actuation_database) -> None:
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
-    east = _plan(free_slots=1, context='east', physical_uid='uid-east')
-    west = _plan(free_slots=1, context='west', physical_uid='uid-west')
-    _grant_plan(repository, east, max_capacity=2)
-    _grant_plan(repository, west, max_capacity=2)
-    _install_fresh_provider_proofs(actuation_database,
-                                   east.intents + west.intents)
+    # Both lanes share one allocation; a second single-pool allocation would
+    # supersede the first pool's provider-free grant.
+    plan = _multi_pool_plan(free_slots=1, pools=_EAST_WEST_LANES)
+    assert len(_grant_plan(repository, plan, max_capacity=2).accepted) == 2
+    _install_fresh_provider_proofs(actuation_database, plan.intents)
+    east = _pool_intent(plan, 'east')
+    west = _pool_intent(plan, 'west')
     owner = uuid.uuid4()
 
     east_lease = repository.lease_next(service_name='svc',
-                                       pool_key=east.intents[0].pool_key,
+                                       pool_key=east.pool_key,
                                        owner=owner,
                                        lease_seconds=30)
     west_lease = repository.lease_next(service_name='svc',
-                                       pool_key=west.intents[0].pool_key,
+                                       pool_key=west.pool_key,
                                        owner=owner,
                                        lease_seconds=30)
 
     assert east_lease is not None
     assert west_lease is not None
     assert repository.lease_next(service_name='svc',
-                                 pool_key=east.intents[0].pool_key,
+                                 pool_key=east.pool_key,
                                  owner=owner,
                                  lease_seconds=30) is None
     assert repository.release_retryable(east_lease, 'provider_busy')
     retried = repository.lease_next(service_name='svc',
-                                    pool_key=east.intents[0].pool_key,
+                                    pool_key=east.pool_key,
                                     owner=owner,
                                     lease_seconds=30)
     assert retried is not None
@@ -2109,12 +2139,11 @@ def test_proof_blackout_parks_only_its_exact_pool_and_resumes(
         actuation_database) -> None:
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
-    east = _plan(free_slots=1, context='east', physical_uid='uid-east')
-    west = _plan(free_slots=1, context='west', physical_uid='uid-west')
-    _grant_plan(repository, east, max_capacity=2)
-    _grant_plan(repository, west, max_capacity=2)
-    _install_fresh_provider_proofs(actuation_database,
-                                   east.intents + west.intents)
+    plan = _multi_pool_plan(free_slots=1, pools=_EAST_WEST_LANES)
+    assert len(_grant_plan(repository, plan, max_capacity=2).accepted) == 2
+    _install_fresh_provider_proofs(actuation_database, plan.intents)
+    east = _pool_intent(plan, 'east')
+    west = _pool_intent(plan, 'west')
     proof_table = (reserved_fill_reclaim_proof_schema.
                    serve_reserved_fill_reclaim_provider_proofs_table)
     with actuation_database.begin() as connection:
@@ -2125,9 +2154,9 @@ def test_proof_blackout_parks_only_its_exact_pool_and_resumes(
                                   datetime.timedelta(seconds=11))))
 
     assert repository.actionable_pool_keys(
-        service_name='svc') == (east.intents[0].pool_key,)
+        service_name='svc') == (east.pool_key,)
     assert repository.lease_next(service_name='svc',
-                                 pool_key=west.intents[0].pool_key,
+                                 pool_key=west.pool_key,
                                  owner=uuid.uuid4(),
                                  lease_seconds=30) is None
     with actuation_database.connect() as connection:
@@ -2141,12 +2170,12 @@ def test_proof_blackout_parks_only_its_exact_pool_and_resumes(
     assert west_row['state'] == 'GRANTED'
     assert west_row['lease_generation'] == 0
 
-    _install_fresh_provider_proofs(actuation_database, west.intents)
+    _install_fresh_provider_proofs(actuation_database, (west,))
     assert set(repository.actionable_pool_keys(service_name='svc')) == {
-        east.intents[0].pool_key, west.intents[0].pool_key
+        east.pool_key, west.pool_key
     }
     west_lease = repository.lease_next(service_name='svc',
-                                       pool_key=west.intents[0].pool_key,
+                                       pool_key=west.pool_key,
                                        owner=uuid.uuid4(),
                                        lease_seconds=30)
     assert west_lease is not None

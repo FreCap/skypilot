@@ -29,7 +29,11 @@ class _Manager:
         self.removed = []
         self.persisted = []
 
-    def _remove_replica(self, replica_id, record_id):
+    def _remove_replica(self,
+                        replica_id,
+                        record_id,
+                        allow_active_provider_free_pre_job=False):
+        del record_id, allow_active_provider_free_pre_job
         self.removed.append(replica_id)
 
     def _persist_replica(self, replica_id, info):
@@ -59,6 +63,11 @@ def _info(status,
         version=version,
         status=status,
         status_property=status_property,
+        # The down-result projection reads the provider-free reserved-fill
+        # markers before it looks at the status property (#1720).
+        reserved_fill=False,
+        zero_cost_materialization_sequence=None,
+        service_job_id=None,
     )
 
 

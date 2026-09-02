@@ -1006,7 +1006,7 @@ run: echo hi
         assert ranked == repeated_selection_order
         assert ranked == [cheapest, first_tie, second_tie]
 
-    def test_ranked_active_locations_evaluates_each_cost_key_once(self):
+    def test_ranked_active_locations_reads_construction_order_only(self):
         locations = [
             make_location(f'region-{index}',
                           accelerators={'L4': 1},
@@ -1029,7 +1029,9 @@ run: echo hi
                 ranked = placer.ranked_active_locations()
 
         assert ranked == list(reversed(locations))
-        assert normalized_cost.call_count == len(locations)
+        # The selector order is fixed at construction; ranking a 64-row
+        # catalog must not re-evaluate any cost key.
+        assert normalized_cost.call_count == 0
 
     def test_fractional_gpu_shape_uses_exact_configured_count(self):
         half_gpu = make_location('half', accelerators={'L4': 0.5})
