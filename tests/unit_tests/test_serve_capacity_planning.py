@@ -180,6 +180,22 @@ def test_demand_observation_reconciliation_keeps_disjoint_arrival() -> None:
     assert _profile_work(result) == {(50, ('L4',)): 1}
 
 
+def test_demand_observation_reconciliation_shelters_only_ambiguous_cards(
+) -> None:
+    result = capacity_planning.reconcile_demand_observations(
+        primary_profiles=(),
+        fixed_work=_work(L4=1),
+        arrival_profiles=(
+            _demand(50, ('L4',), 1),
+            _demand(50, ('A100',), 1, sequence=1),
+        ))
+
+    assert result.incremental_arrival_work == pytest.approx(1)
+    assert result.ambiguous_fixed_arrival_work == pytest.approx(1)
+    assert result.ambiguous_fixed_shelter_accelerators == ('L4',)
+    assert _profile_work(result) == {(50, ('A100',)): 1}
+
+
 def test_demand_observation_reconciliation_does_not_guess_flexible_identity(
 ) -> None:
     result = capacity_planning.reconcile_demand_observations(
