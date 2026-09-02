@@ -282,7 +282,7 @@ def cleanup_expired_api_access_tokens() -> int:
     Scans the service_account_tokens table for any token whose name starts
     with the managed-job prefix and whose expires_at is in the past, then
     requires the name to also end with the 8-hex-char dag_uuid suffix
-    produced by _create_job_api_token. Matching tokens are deleted.
+    produced by create_job_api_token. Matching tokens are deleted.
 
     Driving the sweep off the name shape means tokens that leaked due to
     a controller crash mid-cleanup, or that were issued by older code

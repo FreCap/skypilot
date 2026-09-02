@@ -4019,6 +4019,58 @@ class TestTerminalCleanupAdoption:
             pathlib.Path('/tmp/controller.log'))
         usage.assert_called_once_with()
 
+    def test_controller_api_access_uses_original_job_user(self):
+        manager = _make_controller_manager()
+        ctx = MagicMock()
+        token_env_var = constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR
+
+        with patch('sky.jobs.controller.controller_capability.'
+                   'get_process_local', return_value='capability'), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_managed_job_tasks', return_value=[{
+                          'user_hash': 'nima-user-hash',
+                      }]), \
+                patch('sky.jobs.controller.managed_job_api_access.'
+                      'create_job_api_token',
+                      return_value=('sky_raw-token', 'token-id')) as create, \
+                patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.server_common.'
+                      'get_api_server_status_response.cache_clear') as clear:
+            token_id = manager._initialize_controller_api_access(37)
+
+        assert token_id == 'token-id'
+        create.assert_called_once_with(
+            'nima-user-hash',
+            'controller-37-00000000',
+        )
+        ctx.override_envs.assert_called_once_with(
+            {token_env_var: 'sky_raw-token'})
+        clear.assert_called_once_with()
+        assert manager._controller_api_token_ids == {37: 'token-id'}
+
+    def test_controller_api_access_is_not_needed_without_capability(self):
+        manager = _make_controller_manager()
+
+        with patch('sky.jobs.controller.controller_capability.'
+                   'get_process_local', return_value=None), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_managed_job_tasks') as get_tasks:
+            assert manager._initialize_controller_api_access(37) is None
+
+        get_tasks.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_releasing_job_revokes_only_controller_token(self):
+        manager = _make_controller_manager()
+        manager._controller_api_token_ids[37] = 'controller-token-id'
+        manager._cleanup_controller_api_access = MagicMock()
+
+        await manager._release_job_loop_ownership(37)
+
+        manager._cleanup_controller_api_access.assert_called_once_with(
+            'controller-token-id', 37)
+        assert not manager._controller_api_token_ids
+
     def test_cleanup_context_overrides_persisted_job_origin_last(self):
         manager = _make_controller_manager()
         ctx = MagicMock()
