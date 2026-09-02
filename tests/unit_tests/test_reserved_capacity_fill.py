@@ -2810,6 +2810,88 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
         self.assertEqual(set(autoscaler.info()['fill_by_pool']),
                          {edges[0]['pool_key'], edges[1]['pool_key']})
 
+    def test_durable_feed_headroom_is_the_service_maximum(self):
+        """Gate-on durable fill budgets against ``max_replicas``, not ``max -
+        target``.
+
+        PR #1774 made the paid guard require the utilization ceiling to cover
+        the SLA target, while the broker still budgeted the ceiling as
+        ``max_replicas - target``; a target above half of ``max_replicas``
+        could then never be covered (audit red: max 10, target 8, ceiling 2).
+        PR #1777 moved durable-feed services to the immutable service maximum.
+        Pin both formulas so the guard stays satisfiable on the durable path
+        and the retained legacy overlay keeps its documented shape.
+        """
+        east = spot_placer.Location.from_pickleable(
+            dict(_K8S_KEY, region='east-context'))
+        placer = mock.Mock()
+        placer.active_locations.return_value = [east]
+
+        def _cycle(*, durable: bool) -> dict:
+            # target_qps None: the demand target is the constant min_replicas,
+            # so the SLA target (8) sits above half of max_replicas (10).
+            autoscaler = _make_autoscaler(min_replicas=8, max_replicas=10)
+            autoscaler.reserved_fill_utilization_gate = True
+            self.assertEqual(autoscaler.get_final_target_num_replicas(), 8)
+            sample = mock.Mock()
+            sample.demonstrated_need.return_value = 8
+            sample.boot_hold.return_value = False
+            autoscaler.fill_demand_sample = mock.Mock(return_value=sample)
+            gate = types.SimpleNamespace(sequenced_active=durable,
+                                         generation=1,
+                                         reclaim_policy_identity=None)
+            observation_repository = mock.Mock()
+            observation_repository.read_reconciliation_gate.return_value = gate
+            observation_repository.read_latest_authoritative.return_value = (
+                None)
+            with mock.patch.object(reserved_capacity,
+                                   'get_kubernetes_physical_cluster_uid',
+                                   return_value='east-uid'), \
+                 mock.patch.object(
+                     reserved_capacity, 'sequenced_fill_pool_specs',
+                     side_effect=lambda zero_cost, **_kwargs: reserved_capacity.
+                     discover_fill_pool_specs(zero_cost)), \
+                 mock.patch.object(reserved_capacity.serve_state,
+                                   'get_replica_infos', return_value=[]), \
+                 mock.patch.object(reserved_capacity.serve_state,
+                                   'get_reserved_fill_service_claim_set',
+                                   return_value=None), \
+                 mock.patch.object(reserved_capacity.serve_state,
+                                   'get_reserved_fill_round',
+                                   return_value=None), \
+                 mock.patch.object(reserved_capacity_broker,
+                                   'replace_claim_set',
+                                   return_value=1) as replace, \
+                 mock.patch.object(reserved_capacity_broker,
+                                   'run_round_from_committed_observation',
+                                   return_value=None), \
+                 mock.patch.object(reserved_capacity_broker,
+                                   'run_round_if_stale', return_value=None), \
+                 mock.patch.object(
+                     reserved_capacity.provider_phase, 'provider_phase',
+                     side_effect=lambda _mode: contextlib.nullcontext()), \
+                 mock.patch.object(reserved_capacity,
+                                   '_record_allocation_observation'), \
+                 mock.patch.object(
+                     reserved_capacity.capacity_admission,
+                     'get_service_source_mode',
+                     return_value=(reserved_capacity.capacity_admission.
+                                   DemandSourceMode.DURABLE_FEED, None)):
+                reserved_capacity._broker_cycle_v2(
+                    autoscaler,
+                    placer,
+                    'svc', [east],
+                    'service-hash', (123, 'controller-ip'),
+                    observation_repository=observation_repository,
+                    allocation_repository=mock.Mock())
+            return replace.call_args.kwargs
+
+        durable = _cycle(durable=True)
+        self.assertEqual(durable['global_headroom'], 10)
+        legacy = _cycle(durable=False)
+        self.assertEqual(legacy['global_headroom'], 2)
+        self.assertLessEqual(legacy['utilization_ceiling'], 2)
+
     def _assert_one_pool_round_failure_isolated(self,
                                                 *,
                                                 lock_timeout: bool,
