@@ -36,7 +36,27 @@ explains the valid target-800/request-history-zero observation made after the
 held prefix was cancelled. No schema or historical-series migration is added.
 
 The final current-writer AWS/GCP scale/traffic/drain receipt and clean
-`boltz-l4-fleet` recreation remain open.** One PostgreSQL-authoritative planner
+`boltz-l4-fleet` recreation remain open. The first clean release-1.1.1631
+attempt, ``paid-e2e-1632a``, established three joined exact-zero baseline
+samples, made its exact 800-request scale cohort resident, committed 100 paid
+claims/replicas, and reached 31 provider-``RUNNING`` AWS Spot VMs before the
+qualification harness stopped at its obsolete 60-second full-campaign gate.
+It then completed normal teardown. This is a harness failure, not evidence of
+provider or product scale failure: the old gate required 9,200 additional
+HTTP/1.1 requests to remain open simultaneously so all 10,000 requests could
+be resident at once. That couples a logical request-count proof to roughly
+10,000 client and load-balancer sockets and is not the production workload
+contract.
+
+The schema-8 qualifier replaces that condition with one bounded exact
+800-request scale stimulus, retained by an explicit completion gate until the
+provider scale observation. After the at-least-100/five-minute gate, the
+remaining 9,200 identities run in sequential batches of 400 with at most 128
+HTTP connections. Every identity must still finish as an exact PostgreSQL
+``SUCCEEDED`` ledger transition; the required final delta remains exactly
+10,000, followed by natural and provider-native exact-zero proof. Source and
+loopback HTTP tests are complete; merge, deployment, and billable
+requalification remain open.** One PostgreSQL-authoritative planner
 is the canonical source path for reservation-aware actuation and paid Spot
 residual. Historical production runs proved complete East occupancy,
 Kueue-bounded PHX occupancy under the unchanged research policy, reclaim,
@@ -45,10 +65,10 @@ authenticated warm requests, and exact provider teardown. Full idle research
 occupancy is no longer a steady-state goal: `utilization_gate: true` permits
 only demand-backed fill and returns it to the unchanged scheduler when idle.
 
-The current production control plane is release ``1.1.1628`` from merge commit
-``d4e433747`` at Helm revision 743 on 2026-09-02. API, controller, and executor
+The current production control plane is release ``1.1.1631`` at Helm revision
+748 on 2026-09-02. API, controller, and executor
 containers resolve to image digest
-``sha256:dafbb0ccae69fc2077960b0bb1904c3b21daa5516f7f5ccac6c653cb559928c4``.
+``sha256:e93dffb0fa9d4b206b512af1afaf13787ee31211017b686e08d69617202eabac``.
 Two API, two controller, and seven executor Pods are Ready. PostgreSQL is the
 central store and Helm storage is disabled. The source checkpoint also includes
 merged Managed Jobs authentication/claim-ownership PRs #1877 and #1878; they
@@ -281,34 +301,43 @@ The next billable qualification is bounded at 800 logical L4 slots and requires
 at least 100 physical provider-``RUNNING`` workers. The rendered task uses an
 exact one-L4 backend shape without pinning an instance type, so its 800-slot
 target authorizes 800 physical backends and comfortably exceeds the provider
-gate. The campaign first submits 800 immutable async
-identities and proves that exact held prefix is resident before it submits the
-remaining 9,200 zero-duration identities. This removes client/network ordering
-from the load balancer's strict FIFO contract: the first 800 remain active for
-340 seconds while the tail stays queued behind them. Within the original
-60-second offered-arrival window, the qualifier joins a fresh PostgreSQL
-request reduction showing exactly 10,000 queued plus in-flight identities to
-the routed ACTIVE load balancer's exact 10,000 unique-job arrival counters.
-Queued identities do not yet have ledger rows; dispatched in-flight identities
-must exactly equal active ledger rows, and the terminal 10,000-row delta later
-proves that the whole queue was processed. The worker accepts at most 360
-seconds of synthetic work and the queue expires at 600 seconds, so demand
-survives the five-minute scale SLO without depending on timeout. The controller
+gate. The campaign first submits 800 immutable async identities and proves that
+exact bounded cohort is resident. An explicit completion gate retains every
+dispatched identity through the provider scale observation without turning its
+synthetic worker duration into a five-minute GPU reservation. Every scale
+sample requires exactly those 800 queued plus in-flight identities, active
+ledger rows equal to dispatched in-flight identities, exactly 800 stable-job
+arrivals in the 300-second scale window, and zero headerless or saturated
+arrival tracking. The provider must reach at least 100 physical
+provider-``RUNNING`` Spot VMs within five minutes of the pre-request scale
+clock.
+
+Only after that scale gate passes does the qualifier release the cohort and
+send the remaining 9,200 identities in 23 sequential batches of 400, each with
+at most 128 HTTP connections. A batch may queue normally and must complete
+before the next batch. The final PostgreSQL reduction must still show exactly
+10,000 new request rows and exactly 10,000 new ``SUCCEEDED`` rows, so batching
+does not weaken the logical workload proof. It removes the non-production
+requirement that one HTTP/1.1 client keep roughly 10,000 simultaneous sockets
+open. The worker accepts at most 360 seconds of synthetic work and the queue
+expires at 600 seconds. The controller
 Helm throttle remains 420 prepared physical launches; neither that shared
 throttle nor `boltz-l4-fleet`'s paid cap changes. The real-cloud gate remains at
 least 100 provider-running workers within five minutes, exact request-ledger
 completion, fresh attributed demand telemetry, and natural exact-zero drain.
 The hermetic qualification gate enters through the production durable planner
-adapter with this exact cold-start contract: 10,000 priority-50 L4 requests,
+adapter with this exact cold-start contract: an 800-request priority-50 L4
+scale stimulus followed by an exact 9,200-request bounded tail,
 the 600-second default queue deadline, a ten-second configured service time,
 the 600-second automatic cold-lead seed, an 800-logical-slot service/paid
 ceiling, and the rendered task's exact one-L4 backend shape. The canonical
 planner returns an 800-slot deadline, raw, supply-aware, wave-limited,
 paid-residual, and paid-launch target, which authorizes 800 physical backends
-and therefore exceeds the 100-worker provider gate. It also publishes all
-10,000 requests as infeasible against the cold-start SLA; the 800 target is
-therefore explicitly bounded backlog recovery and not a claim that capacity
-arriving after the deadline can satisfy that deadline.
+and therefore exceeds the 100-worker provider gate. The separate pure-planner
+saturation test may still submit all 10,000 logical requests and proves that
+the 800 target is bounded backlog recovery, not a claim that capacity arriving
+after the deadline can satisfy every request deadline. That planner test does
+not require 10,000 live HTTP waiters.
 The 100-member atomic PostgreSQL wave bound is independent from the logical
 service target, physical-launch throttle, per-location window, and provider
 concurrency. Successive fresh generations must converge to the target while
@@ -3903,14 +3932,17 @@ reachability. One generic AWS/GCP economic service lets the production
 cheapest-first selector choose either cloud; its scale gate is at least 100
 physical provider-``RUNNING`` VMs in aggregate within five minutes, never a
 synthetic requirement that both clouds win. Exactly 10,000 stable async-ledger
-identities are the sole demand stimulus for that run. A joined exact-zero
+identities are the sole logical workload for that run. A joined exact-zero
 request/provider baseline immediately precedes traffic. The staged campaign
-then proves exactly 10,000 resident and deduplicated offered arrivals within 60
-seconds; every provider scale sample must itself retain positive PostgreSQL and
-load-balancer demand, and its dispatched in-flight gauge must equal active
-exact-ledger rows. Its exact one-L4 task shape, 800 logical-slot cap, and 800
-held identities authorize 800 physical backends and therefore permit the
-at-least-100 physical gate. If its
+first proves exactly 800 resident scale-stimulus identities, with no
+unattributed/headerless arrivals; every provider scale sample must itself
+retain those 800 queued plus in-flight identities, positive PostgreSQL and
+load-balancer demand, and an in-flight gauge equal to active exact-ledger rows.
+Its exact one-L4 task shape and 800 logical-slot cap therefore permit the
+at-least-100 physical gate. After that gate, the remaining 9,200 identities run
+in sequential 400-request batches with bounded 128-request HTTP concurrency;
+the exact 10,000-row terminal ``SUCCEEDED`` delta proves the complete logical
+campaign. If its
 completed receipt has no positive ``RUNNING`` evidence for one provider, that
 receipt may authorize exactly one provider-pinned canary rendered from the same
 source YAML. Rendering fails before ``sky serve up`` unless the requested cloud
@@ -3928,7 +3960,7 @@ economic receipt that authorized it. It also joins every
 qualification receipt to its matching immutable service identity and cleanup
 receipt. It accepts only real provider scale samples, the exact AWS/GCP
 positive-provider union, positive attributed economic telemetry, the 10,000
-request terminal-ledger delta, and strict baseline-before-campaign-before-
+request terminal-ledger delta, and strict baseline-before-scale-stimulus-before-
 provider-scale-before-terminal-ledger-before-drain timing. Provider shapes and
 totals are reduced from complete raw samples, not trusted receipt scalars. The
 gate also requires the physical scale SLO, three distinct
@@ -4166,13 +4198,16 @@ these remaining current-writer acceptance gates:
    Spot VMs in aggregate within five minutes; do not require both providers to
    win the economic selection. Keep the shared 420-physical-launch Helm
    throttle unchanged and record physical VMs and logical L4 slots separately.
-   Use exactly 10,000 authenticated async identities as the only scale
-   stimulus. Submit and observe the 800 held identities first, then submit the
-   9,200 zero-duration tail; within 60 seconds prove all 10,000 are resident
-   and appear in the ACTIVE load balancer's exact deduplicated offered-arrival
-   counters. Hold the prefix for 340 seconds, capture positive queued,
-   processing, in-flight, exact attribution, and exact terminal-ledger/UI
-   evidence, and require zero ordinary on-demand or wrong-shape capacity. Only
+   Use exactly 10,000 authenticated async identities as the complete logical
+   workload. Submit and observe an exact 800-identity scale stimulus first;
+   retain it through an explicit completion gate while proving positive queued,
+   processing and in-flight telemetry, zero unattributed/headerless arrivals,
+   and at least 100 physical Spot VMs within five minutes. Release that gate,
+   then send the 9,200-identity tail in 23 sequential batches of 400 with at
+   most 128 HTTP connections. Require every batch to complete and require the
+   final immutable ledger delta to be exactly 10,000 requests and 10,000
+   ``SUCCEEDED`` transitions. Also require zero ordinary on-demand or
+   wrong-shape capacity. Only
    after the economic receipt proves a missing provider, run its one
    provider-pinned, one-request canary projected from the same immutable source
    task. Then stop demand, retain three natural exact-zero PostgreSQL, VM, disk,
