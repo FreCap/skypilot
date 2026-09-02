@@ -7577,10 +7577,23 @@ def test_role_scoped_queues_isolate_normal_and_controller_claims(
     try:
         normal_request = _request('normal-class')
         controller_request = _controller_request('controller-class')
+        slot_attempt = uuid.uuid4()
+        _seed_managed_job_attempt(engine,
+                                  leader,
+                                  job_id=42,
+                                  slot_id=3,
+                                  slot_attempt=slot_attempt)
+        nested_request = _managed_job_request('nested-normal-class',
+                                              leader,
+                                              job_id=42,
+                                              slot_id=3,
+                                              slot_attempt=slot_attempt)
         assert asyncio.run(
             fixture_backend.create_if_not_exists_async(normal_request))
         assert asyncio.run(
             fixture_backend.create_if_not_exists_async(controller_request))
+        assert asyncio.run(
+            fixture_backend.create_if_not_exists_async(nested_request))
 
         normal_queue = request_postgres.PostgresQueueBackend(
             'short',
@@ -7592,6 +7605,8 @@ def test_role_scoped_queues_isolate_normal_and_controller_claims(
         normal_item = normal_queue.get()
         assert normal_item is not None
         assert normal_item.request_id == 'normal-class'
+        # A general executor must not consume nested managed-job work even
+        # though it supports the underlying normal handler.
         assert normal_queue.get() is None
 
         controller_queue = request_postgres.PostgresQueueBackend(
@@ -7623,6 +7638,15 @@ def test_role_scoped_queues_isolate_normal_and_controller_claims(
         assert reservation['state'] == 'running'
         assert reservation['controller_generation'] == leader.generation
         assert str(reservation['controller_instance_id']) == instance_id
+
+        # The controller-authorized queue owns nested work independently of
+        # the handler's normal execution class.
+        nested_item = controller_queue.get()
+        assert nested_item is not None
+        assert nested_item.request_id == nested_request.request_id
+        assert nested_item.managed_job_origin == (42, leader.instance_id,
+                                                  leader.generation, 3,
+                                                  str(slot_attempt))
     finally:
         leader.release()
 
@@ -8509,7 +8533,8 @@ def test_managed_job_claim_terminalizes_stale_pre_effect_request(
         # share this process in compatibility mode while the leader's dedicated
         # PostgreSQL lock session continues to prove outer authority.
         monkeypatch.setenv(request_postgres.SERVER_ROLE_ENV_VAR, 'all')
-        assert request_postgres.PostgresQueueBackend('short').get() is None
+        assert request_postgres.PostgresQueueBackend(
+            'short', controller_generation=leader.generation).get() is None
         restored = backend.get_request(request_id)
         assert restored is not None
         assert restored.status is requests.RequestStatus.CANCELLED
@@ -8540,7 +8565,8 @@ def test_managed_job_running_admission_revalidates_exact_attempt(
                                        slot_attempt=slot_attempt)
         assert asyncio.run(backend.create_if_not_exists_async(request))
         monkeypatch.setenv(request_postgres.SERVER_ROLE_ENV_VAR, 'all')
-        item = request_postgres.PostgresQueueBackend('short').get()
+        item = request_postgres.PostgresQueueBackend(
+            'short', controller_generation=leader.generation).get()
         assert item is not None
         assert item.claim_token is not None
         with engine.begin() as connection:

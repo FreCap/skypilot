@@ -8140,12 +8140,33 @@ class PostgresQueueBackend(queue_base.QueueBackend):
         # Handler filtering is repeated in candidate selection, locked claim,
         # and the guarded request UPDATE because observing a queue row never
         # grants execution authority by itself.
-        predicates: list[sqlalchemy.ColumnElement[bool]] = [
-            REQUESTS.c.handler_name.in_(self._supported_handler_names)
-        ]
-        if self._execution_classes is not None:
+        managed_job_request = REQUESTS.c.managed_job_id.is_not(None)
+        handler_is_supported = REQUESTS.c.handler_name.in_(
+            self._supported_handler_names)
+        predicates: list[sqlalchemy.ColumnElement[bool]] = []
+        if self._controller_generation is None:
+            # Nested managed-job work must run in the controller-authorized
+            # process that owns the matching outer generation.  A normal
+            # executor may understand the underlying handler, but it cannot
+            # transport controller authority into the disposable child.
+            predicates.extend(
+                [handler_is_supported,
+                 sqlalchemy.not_(managed_job_request)])
+        else:
+            # A verified managed-job origin routes through the authoritative
+            # controller worker even when its underlying API handler is
+            # normally executor-scoped (for example, launch or down).
             predicates.append(
-                REQUESTS.c.execution_class.in_(self._execution_classes))
+                sqlalchemy.or_(handler_is_supported, managed_job_request))
+        if self._execution_classes is not None:
+            execution_class_is_supported = REQUESTS.c.execution_class.in_(
+                self._execution_classes)
+            if self._controller_generation is None:
+                predicates.append(execution_class_is_supported)
+            else:
+                predicates.append(
+                    sqlalchemy.or_(execution_class_is_supported,
+                                   managed_job_request))
         controller_class = request_registry.ExecutionClass.CONTROLLER.value
         if self._controller_generation is None:
             # An unscoped queue without outer authority remains usable for
