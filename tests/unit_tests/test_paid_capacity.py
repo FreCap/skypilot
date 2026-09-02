@@ -433,6 +433,54 @@ def test_gcp_pool_v2_freezes_exact_project_identity():
         json.dumps(malformed, sort_keys=True, separators=(',', ':'))) is None
 
 
+def test_gcp_project_resolution_omits_only_invalid_locations(
+        monkeypatch, caplog):
+    aws = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    valid_gcp = make_location('us-central1', {'L4': 1}, cloud_name='GCP')
+    invalid_gcp = make_location('us-west1', {'L4': 1}, cloud_name='GCP')
+
+    def _resolve(_config, cloud, keys, *, region, workspace):
+        assert cloud == 'gcp'
+        assert keys == ('project_id',)
+        assert workspace == 'w'
+        return ('valid-project'
+                if region == valid_gcp.region else 'INVALID_PROJECT')
+
+    monkeypatch.setattr(paid_capacity.skypilot_config,
+                        'get_effective_workspace_region_config_from_snapshot',
+                        _resolve)
+
+    with caplog.at_level('WARNING'):
+        projects = paid_capacity.resolve_gcp_project_ids_for_locations(
+            (aws, invalid_gcp, valid_gcp),
+            workspace='w',
+            frozen_controller_config={})
+
+    assert projects == {valid_gcp: 'valid-project'}
+    assert 'Omitting GCP paid candidate' in caplog.text
+    assert invalid_gcp.region in caplog.text
+    assert aws.region not in caplog.text
+
+
+def test_gcp_project_resolution_preserves_global_validation(monkeypatch):
+    location = make_location('us-central1', {'L4': 1}, cloud_name='GCP')
+
+    with pytest.raises(ValueError, match='workspace must be nonempty'):
+        paid_capacity.resolve_gcp_project_ids_for_locations(
+            (location,), workspace='', frozen_controller_config={})
+    with pytest.raises(ValueError, match='must be a mapping'):
+        paid_capacity.resolve_gcp_project_ids_for_locations(
+            (location,), workspace='w', frozen_controller_config=[])
+
+    monkeypatch.setattr(
+        paid_capacity.skypilot_config,
+        'get_effective_workspace_region_config_from_snapshot',
+        mock.Mock(side_effect=ValueError('malformed config snapshot')))
+    with pytest.raises(ValueError, match='malformed config snapshot'):
+        paid_capacity.resolve_gcp_project_ids_for_locations(
+            (location,), workspace='w', frozen_controller_config={})
+
+
 def test_pool_key_normalizes_equivalent_accelerator_counts():
     integral = make_location('us-east-1', {'A100': 1}, cloud_name='AWS')
     floating = make_location('us-east-1', {'a100': 1.0}, cloud_name='AWS')
@@ -1036,6 +1084,43 @@ def test_authoritative_budget_omits_gcp_without_locked_project_mapping():
         now=None,
         success_ttl_seconds=(paid_capacity.success_ttl_seconds()),
         failure_cooldown_seconds=(paid_capacity.failure_cooldown_seconds()))
+
+
+def test_prospective_budget_keeps_aws_when_gcp_project_mapping_is_missing():
+    aws = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    aws.instance_type = 'g6.xlarge'
+    gcp = make_location('us-central1', {'L4': 1}, cloud_name='GCP')
+    gcp.instance_type = 'g2-standard-4'
+    placer = make_placer({gcp: 0.10, aws: 0.20})
+    aws_key = paid_capacity.pool_key(aws, workspace='w', num_nodes=1)
+
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'get_paid_capacity_pool_states',
+                               return_value={
+                                   aws_key: {
+                                       'remaining': 1,
+                                       'admission_state': 'active',
+                                       'admission_limit': 1,
+                                       'last_success_at': None,
+                                   }
+                               }):
+        budget = paid_capacity.build_launch_budget(
+            placer,
+            workspace='w',
+            service_name='svc',
+            service_hash='hash',
+            existing_replica_infos=[],
+            globally_managed=True,
+            gcp_project_id_by_location={},
+            prospective_backend_claims_by_accelerator={'l4': 1})
+
+    assert budget.remaining_by_location == {aws: 1}
+    assert budget.pool_key_by_location == {aws: aws_key}
+    assert budget.service_remaining == 1
+    assert paid_capacity.pool_key_payload(aws_key)['cloud'] == 'aws'
 
 
 def test_prospective_budget_rejects_committed_authority_and_nonstring_cards():

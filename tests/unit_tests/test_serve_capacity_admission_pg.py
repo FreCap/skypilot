@@ -240,7 +240,7 @@ def _fused_paid_graph_counts(
 
 @contextlib.contextmanager
 def _observe_engine_transactions(engine: sqlalchemy.engine.Engine):
-    """Record one call's checkout and transaction outcomes."""
+    """Record one paid call's advisory and correctness transactions."""
     state = {
         'active': 0,
         'maximum': 0,
@@ -276,7 +276,7 @@ def _observe_engine_transactions(engine: sqlalchemy.engine.Engine):
         sqlalchemy.event.remove(engine, 'rollback', _rollback)
         assert state['active'] == 0
         assert state['maximum'] == 1
-        assert state['checkouts'] == 1
+        assert state['checkouts'] == 2
 
 
 def _fused_paid_graph_identities(
@@ -1557,7 +1557,8 @@ def _validate_prepared_paid_specs(
         service_version=1,
         accounting_cards=accounting_cards,
         backend_num_nodes=1,
-        locked_version=locked_version)
+        locked_version=locked_version,
+        launch_runtime=paid_launch_request.capture_replica_launch_runtime())
 
 
 def _replica_values(replica_id: int,
@@ -3438,8 +3439,18 @@ def test_paid_atomic_commit_precedes_best_effort_history_transaction(
         side_effect=AssertionError('admission must not submit provider work'))
     monkeypatch.setattr(sdk, 'submit_prepared_non_pool_launch_request',
                         provider_io)
-    touch = mock.Mock()
-    monkeypatch.setattr(pathlib.Path, 'touch', touch)
+    correctness_committed = False
+
+    def _record_commit(_connection):
+        nonlocal correctness_committed
+        correctness_committed = True
+
+    def _materialize_log(_request_id):
+        assert correctness_committed
+
+    materialize_log = mock.Mock(side_effect=_materialize_log)
+    monkeypatch.setattr(request_lib, 'materialize_request_log_path_for_id',
+                        materialize_log)
     history_error = RuntimeError('injected best-effort history failure')
     history_writer = mock.Mock(
         side_effect=history_error if history_fails else None, return_value=1)
@@ -3462,17 +3473,134 @@ def test_paid_atomic_commit_precedes_best_effort_history_transaction(
         'prepared_paid_launch_specs': (spec,),
     }
 
-    with _observe_engine_transactions(engine) as outcomes:
-        committed = capacity_admission.CapacityAdmissionRepository(
-            engine).plan_and_admit_current(**call_kwargs)
+    sqlalchemy.event.listen(engine, 'commit', _record_commit)
+    try:
+        with _observe_engine_transactions(engine) as outcomes:
+            committed = capacity_admission.CapacityAdmissionRepository(
+                engine).plan_and_admit_current(**call_kwargs)
+    finally:
+        sqlalchemy.event.remove(engine, 'commit', _record_commit)
 
     assert outcomes['commits'] == (1 if history_fails else 2)
-    assert outcomes['rollbacks'] == (1 if history_fails else 0)
+    assert outcomes['rollbacks'] == (2 if history_fails else 1)
     assert len(committed.paid_launch_bindings) == 1
     assert _fused_paid_graph_counts(engine) == (1,) * 9
     history_writer.assert_called_once()
     provider_io.assert_not_called()
-    touch.assert_called_once()
+    materialize_log.assert_called_once()
+
+
+def test_paid_canonical_preflight_and_log_io_are_outside_correctness_locks(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    ranks = _install_paid_wave_catalog(engine, pool_count=1)
+    spec = _paid_launch_spec(engine, 0, 1950, pool_rank=ranks[0])
+    correctness_open = False
+    real_transaction = capacity_admission._capacity_admission_transaction
+    real_canonical = capacity_admission._canonical_prepared_paid_launch_specs
+
+    @contextlib.contextmanager
+    def _guarded_transaction(*args, **kwargs):
+        nonlocal correctness_open
+        with real_transaction(*args, **kwargs) as transaction:
+            correctness_open = True
+            try:
+                yield transaction
+            finally:
+                correctness_open = False
+
+    def _guarded_canonical(*args, **kwargs):
+        assert not correctness_open
+        return real_canonical(*args, **kwargs)
+
+    def _guarded_secho(*_args, **_kwargs):
+        assert not correctness_open
+
+    def _materialize_log(_request_id):
+        assert not correctness_open
+        assert _fused_paid_graph_counts(engine) == (1,) * 9
+
+    monkeypatch.setattr(capacity_admission, '_capacity_admission_transaction',
+                        _guarded_transaction)
+    monkeypatch.setattr(capacity_admission,
+                        '_canonical_prepared_paid_launch_specs',
+                        _guarded_canonical)
+    monkeypatch.setattr(sdk.click, 'secho', _guarded_secho)
+    materialize_log = mock.Mock(side_effect=_materialize_log)
+    monkeypatch.setattr(request_lib, 'materialize_request_log_path_for_id',
+                        materialize_log)
+
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
+                                       service_hash='svc-hash',
+                                       service_lifecycle_epoch=3,
+                                       service_version=1,
+                                       accounting_cards={'l4': 1},
+                                       backend_num_nodes=1,
+                                       sequenced_reserved_fill=False,
+                                       planner=lambda snapshot, supply:
+                                       _current_decision(snapshot, supply, 1),
+                                       prepared_paid_launch_specs=(spec,))
+
+    assert len(committed.paid_launch_bindings) == 1
+    materialize_log.assert_called_once()
+
+
+@pytest.mark.parametrize('mutation', ('binding_epoch', 'launch_yaml'))
+def test_paid_preflight_rejects_locked_source_race(capacity_database,
+                                                   monkeypatch, mutation):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    ranks = _install_paid_wave_catalog(engine, pool_count=1)
+    spec = _paid_launch_spec(engine, 0, 1960, pool_rank=ranks[0])
+    real_transaction = capacity_admission._capacity_admission_transaction
+
+    @contextlib.contextmanager
+    def _mutating_transaction(*args, **kwargs):
+        with engine.begin() as connection:
+            if mutation == 'binding_epoch':
+                connection.execute(
+                    sqlalchemy.update(serve_state_schema.services_table).where(
+                        serve_state_schema.services_table.c.name ==
+                        'svc').values(ordinary_launch_binding_mode='legacy',
+                                      ordinary_launch_binding_epoch=(
+                                          serve_state_schema.services_table.c.
+                                          ordinary_launch_binding_epoch + 1)))
+            else:
+                connection.execute(
+                    sqlalchemy.update(
+                        serve_state_schema.version_specs_table).where(
+                            serve_state_schema.version_specs_table.c.
+                            service_name == 'svc',
+                            serve_state_schema.version_specs_table.c.version ==
+                            1).values(yaml_content=_PAID_LAUNCH_YAML +
+                                      '# changed\n'))
+        with real_transaction(*args, **kwargs) as transaction:
+            yield transaction
+
+    monkeypatch.setattr(capacity_admission, '_capacity_admission_transaction',
+                        _mutating_transaction)
+    planner = mock.Mock(
+        side_effect=AssertionError('stale preflight must not reach planner'))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='source changed after canonical preflight'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner,
+                                           prepared_paid_launch_specs=(spec,))
+
+    planner.assert_not_called()
+    assert _fused_paid_graph_counts(engine) == (0,) * 9
 
 
 def test_paid_maximum_atomic_wave_survives_lost_ack_and_is_claimable(
@@ -3542,7 +3670,7 @@ def test_paid_maximum_atomic_wave_survives_lost_ack_and_is_claimable(
                            match='injected after final fused member'):
             repository.plan_and_admit_current(**call_kwargs)
     assert rolled_back['commits'] == 0
-    assert rolled_back['rollbacks'] == 1
+    assert rolled_back['rollbacks'] == 2
     assert _fused_paid_graph_counts(engine) == (0,) * 9
     provider_io.assert_not_called()
     touch.assert_not_called()
@@ -4081,7 +4209,6 @@ def test_paid_launch_validator_rejects_inexact_interleaved_rank_occurrence(
     for index in range(2):
         location = _paid_location(1)
         location.region = f'us-central1-{chr(ord("a") + index)}'
-        location.instance_type = f'test-l4-occurrence-pool-{index}'
         locations.append((location, 0.424))
     catalog = spot_placer.PlacementCatalog(tuple(locations), num_nodes=1)
     with engine.begin() as connection:
@@ -4121,10 +4248,9 @@ def _install_equal_cost_shape_catalog(
     """Install two same-cost Spot tiers and return their global ranks."""
     l4 = _paid_location(1)
     l4.region = 'us-central1-a'
-    l4.instance_type = 'test-l4-exact-tier'
     a100 = make_location('us-central1-b', {'A100': 1},
                          cloud_name='GCP',
-                         instance_type='test-a100-exact-tier')
+                         instance_type='a2-highgpu-1g')
     a100.image_id = {None: 'skypilot:test-regionless-image'}
     entries = [(l4, 0.424), (a100, 0.424)]
     entries.sort(key=lambda item: item[0].sort_key())

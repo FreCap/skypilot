@@ -1302,7 +1302,7 @@ def resolve_gcp_project_ids_for_locations(
         raise ValueError('workspace must be nonempty.')
     if not isinstance(frozen_controller_config, Mapping):
         raise ValueError('frozen_controller_config must be a mapping.')
-    projects = {}
+    projects: dict[spot_placer.Location, str] = {}
     for location in locations:
         if str(location.cloud).casefold() != 'gcp':
             continue
@@ -1314,8 +1314,13 @@ def resolve_gcp_project_ids_for_locations(
                 workspace=workspace))
         if (not isinstance(project_id, str) or
                 _GCP_PROJECT_ID_RE.fullmatch(project_id) is None):
-            raise ValueError(
-                f'GCP paid pool {location!r} has no exact project ID.')
+            # Project identity is a hard correctness scope for this location,
+            # but one invalid GCP catalog entry must not suppress healthy GCP
+            # siblings or other providers in the heterogeneous service.
+            logger.warning(
+                'Omitting GCP paid candidate %r because its exact workspace '
+                'project ID is unavailable or invalid.', location)
+            continue
         projects[location] = project_id
     return projects
 

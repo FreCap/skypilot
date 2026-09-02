@@ -16,7 +16,13 @@ authority lease remains fail-closed. The canonical implementation extends the
 existing fused PostgreSQL capacity-admission transaction through
 executable-request binding and makes the durable request queue, not a
 process-local handoff, the recovery source. The principal unpaid PostgreSQL
-and adversarial source gates pass; merge, production-like wave-latency
+and adversarial source gates pass. Canonical request reconstruction now runs
+before correctness locks against one advisory source read; the transaction
+accepts it only when an exact immutable service/version fingerprint still
+matches. Request-log directory creation is post-commit best effort, so no
+filesystem or EFS path can roll back paid admission. One invalid GCP project
+entry is omitted without suppressing healthy AWS or GCP siblings. Merge,
+production-like wave-latency
 qualification, deployment, the final current-writer AWS/GCP
 scale/traffic/drain receipt, and clean `boltz-l4-fleet` recreation remain
 open.** One
@@ -68,12 +74,17 @@ same 420-member queue and consume more central-database capacity.
 
 The existing ``CapacityAdmissionRepository.plan_and_admit_current()``
 transaction is the sole paid request-materialization unit. Before it begins,
-the controller performs advisory PostgreSQL reads of immutable version
-authority and paid-pool budget, then constructs an immutable, canonically
-ordered candidate tuple containing every ``PaidLaunchSpec`` and its exact
-server-local prepared launch bytes. Manager-side construction and serialization
-are provider-, HTTP-, filesystem-, and database-free. The repository revalidates
-all authority under its locks and takes the protocol/lifecycle/service prefix
+the controller constructs an immutable, canonically ordered candidate tuple
+containing every ``PaidLaunchSpec`` and its exact server-local prepared launch
+bytes. The repository then performs one non-authoritative PostgreSQL read,
+closes that checkout, fully reconstructs and validates those bytes, and freezes
+the complete binding authority, resource scope, replica port, and a canonical
+fingerprint of the service spec, launch YAML, placement catalog and contract,
+and controller configuration. Manager-side candidate construction remains
+provider-, HTTP-, filesystem-, and database-free; advisory validation may use
+local validation and console paths but holds no correctness lock. The
+repository revalidates the complete preflight fingerprint under its locks and
+takes the protocol/lifecycle/service prefix
 once, arbitrates the sparse accepted subset, writes the plan, capacity debit,
 replica, and claim, derives every retry-stable submission UUID, resolves the
 newly durable paid profile, and invokes the sole
@@ -81,6 +92,9 @@ newly durable paid profile, and invokes the sole
 accepted member before commit. Plan/head, debit, replica, claim, association,
 request, retention pin, queue row, and replica pointer are therefore one atomic
 graph: either all accepted members become executable or none does.
+The receipt retains only durable request identity. Its derived log path is
+created and touched after commit as best effort, so filesystem availability is
+not part of the graph's commit condition.
 
 Queue visibility at commit is the durable handoff. The generic executor may
 claim work immediately; controller workers published afterward are optional
@@ -107,7 +121,11 @@ proves in the same transaction the exact ordered plan/debit/replica/claim/
 association/request/queue/pin/pointer cardinality. A changed executable member
 must roll back that complete wave. A real post-COMMIT acknowledgement loss must
 leave every committed request executable and exactly adoptable, with no
-singleton HTTP call and no second database checkout for materialization.
+singleton HTTP call and no second correctness checkout for materialization.
+Paid admission uses two sequential, never concurrent checkouts: one advisory
+source read that closes before canonical reconstruction and one atomic
+correctness checkout (whose optional history projection may use a later
+transaction on that same connection).
 Provider adapters remain fail traps throughout, so this gate costs no cloud
 resources. The correctness graph commits atomically first; the existing
 minute-history projection may then commit or roll back best-effort on the same
@@ -193,6 +211,11 @@ an ordinary-paid or ``UNKNOWN_CAPACITY_REPLACEMENT`` effect against a v2 GCP
 pool. Cohort 14 cannot begin or replay that provider I/O, so successor
 activation requires one homogeneous cohort-15 API/controller/executor fleet
 before planning, admission, or any provider call.
+Project resolution is fault-isolated per catalog location: a missing or invalid
+exact project omits that GCP location and emits an operator warning, while
+malformed global workspace/config input still fails closed. The omission never
+removes a healthy AWS pool or a separately valid GCP project from the same
+bounded wave.
 
 The provider-allocation checkpoint was a forward-only additive PostgreSQL
 schema change. Its activation requires

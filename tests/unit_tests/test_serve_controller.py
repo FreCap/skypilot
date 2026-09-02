@@ -25,6 +25,7 @@ from unittest import mock
 from fastapi import testclient as fastapi_testclient
 import pytest
 
+from sky import clouds
 from sky import exceptions
 from sky import skypilot_config
 from sky.serve import autoscalers
@@ -40,6 +41,7 @@ from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import spot_placer
 from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
 from sky.utils import yaml_utils
@@ -5142,6 +5144,61 @@ class TestAutoscalerRuntimeSnapshot:
             accelerator_shapes={'l4': 1},
             max_gpu_units_by_accelerator={'l4': 100},
             max_candidates=100,
+            occupied_replica_ids=mock.ANY,
+            version_authority=authority,
+            paid_location_launch_budget=mock.sentinel.paid_budget)
+
+    def test_paid_spec_preparation_keeps_aws_when_gcp_project_is_invalid(
+            self, caplog):
+        ctrl = _make_controller()
+        authority = _paid_launch_version_authority()
+        aws = spot_placer.Location(cloud=clouds.AWS(),
+                                   region='us-east-1',
+                                   zone=None,
+                                   accelerators={'L4': 1},
+                                   instance_type='g6.xlarge')
+        gcp = spot_placer.Location(cloud=clouds.GCP(),
+                                   region='us-central1',
+                                   zone=None,
+                                   accelerators={'L4': 1},
+                                   instance_type='g2-standard-4')
+        manager = mock.Mock()
+        manager.spot_placer.ranked_active_locations.return_value = [gcp, aws]
+        manager.workspace = 'default'
+        manager.prepare_paid_launch_specs.return_value = ()
+        ctrl._replica_manager = manager  # pylint: disable=protected-access
+        scaler = types.SimpleNamespace(max_replicas=1,
+                                       backend_num_nodes=1,
+                                       configured_accelerator_shapes={'L4': 1})
+
+        def _build_budget(*args, **kwargs):
+            assert args == (manager.spot_placer,)
+            assert kwargs['gcp_project_id_by_location'] == {}
+            return mock.sentinel.paid_budget
+
+        with mock.patch.object(
+                controller.serve_state,
+                'get_paid_launch_version_authority',
+                return_value=authority), mock.patch.object(
+                    controller.serve_utils,
+                    'parse_and_validate_version_controller_config',
+                    return_value={}), mock.patch.object(
+                        controller.paid_capacity,
+                        'active_paid_spot_accelerator_shapes',
+                        return_value=frozenset({('l4', 1)})), mock.patch.object(
+                            controller.paid_capacity,
+                            'build_launch_budget',
+                            side_effect=_build_budget), caplog.at_level(
+                                'WARNING'):
+            prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
+                scaler, 1, [], None)
+
+        assert prepared == ()
+        assert 'Omitting GCP paid candidate' in caplog.text
+        manager.prepare_paid_launch_specs.assert_called_once_with(
+            accelerator_shapes={'l4': 1},
+            max_gpu_units_by_accelerator={'l4': 1},
+            max_candidates=1,
             occupied_replica_ids=mock.ANY,
             version_authority=authority,
             paid_location_launch_budget=mock.sentinel.paid_budget)

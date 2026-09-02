@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from collections.abc import Sequence
 import dataclasses
-import pathlib
 from typing import Any
 import uuid
 
@@ -39,7 +38,6 @@ class FusedBindingReceiptMember:
     request_id: str
     launch_generation: int
     context: ordinary_launch_binding.BoundNonPoolLaunchContext
-    request_log_path: pathlib.Path
 
 
 def record_singleton_paid_compatibility_use() -> None:
@@ -229,6 +227,5 @@ def bind_accepted_in_transaction(
                 association_id=admission.association_id,
                 request_id=admission.request_id,
                 launch_generation=admission.launch_generation,
-                context=context,
-                request_log_path=built.request.log_path))
+                context=context))
     return tuple(receipts)

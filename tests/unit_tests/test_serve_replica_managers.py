@@ -27,7 +27,6 @@ import json
 import logging
 import math
 import os
-import pathlib
 import pickle
 import queue
 import threading
@@ -2454,8 +2453,7 @@ def _fused_paid_binding(
         association_id=str(association_id),
         request_id=request_id,
         launch_generation=1,
-        context=context,
-        request_log_path=pathlib.Path(f'/tmp/{request_id}.log'))
+        context=context)
 
 
 def test_materialize_paid_launch_receipt_builds_only_sparse_members():
