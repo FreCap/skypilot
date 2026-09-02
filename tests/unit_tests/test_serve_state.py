@@ -37,6 +37,7 @@ from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import service as service_lib
 from sky.serve import service_spec as service_spec_lib
+from sky.serve import spot_placer
 from sky.serve import system_oom_recovery
 from sky.serve import system_recovery_state as recovery_state
 from sky.skylet import constants as skylet_constants
@@ -56,6 +57,20 @@ def _replica(replica_id: int,
         version=version,
         resources_override=None,
     )
+
+
+def _paid_pool_key(accelerator: str = 'A100-80GB') -> str:
+    """Exact provider pool identity accepted by paid GPU attribution."""
+    location = spot_placer.Location(cloud=clouds.AWS(),
+                                    region='us-east-1',
+                                    zone='us-east-1a',
+                                    accelerators={accelerator: 1},
+                                    use_spot=True,
+                                    instance_type='p4d.24xlarge')
+    return paid_capacity.pool_key(location,
+                                  workspace='default',
+                                  num_nodes=1,
+                                  aws_account_id='123456789012')
 
 
 class _TestServiceSpec(service_spec_lib.SkyServiceSpec):
@@ -1226,9 +1241,14 @@ def test_replica_updates_and_insert_conflicts_preserve_action_owned_columns(
     _add_minimal_service('svc', service_hash=service_hash)
     expected_by_replica = {}
 
+    # Fresh paid admission fails closed on any cleanup-unproven row whose
+    # relational pool key and zero-cost copy disagree, so the pre-existing
+    # rows carry the same exact paid pool the admission below targets.
+    pool_key = _paid_pool_key()
     for replica_id in range(1, 5):
-        assert serve_state.add_or_update_replica('svc', replica_id,
-                                                 _replica(replica_id))
+        existing = _replica(replica_id)
+        existing.paid_capacity_pool_key = pool_key
+        assert serve_state.add_or_update_replica('svc', replica_id, existing)
         launch_shadow_coverage_id = (None if replica_id %
                                      2 else uuid.UUID(int=replica_id * 100 + 5))
         down_shadow_coverage_id = (None if replica_id %
@@ -1282,7 +1302,7 @@ def test_replica_updates_and_insert_conflicts_preserve_action_owned_columns(
             service_hash,
             3,
             _replica(3, version=2),
-            pool_key='test-paid-pool',
+            pool_key=pool_key,
             priority=1,
             base_limit=1,
             max_limit=2,
