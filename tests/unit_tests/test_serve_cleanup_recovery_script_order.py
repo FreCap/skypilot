@@ -712,6 +712,110 @@ def test_finalize_marks_failed_cleanup_when_teardown_fails(monkeypatch):
     assert ('remove_script', 'svc') in calls
 
 
+def test_late_exact_provider_worker_failure_recovers_after_absence(monkeypatch):
+    """A timed-out exact worker retains recovery, then drains durable state."""
+    binding = service.ordinary_launch_binding
+    reconciliation = service.non_pool_launch_reconciliation
+    info = _replica(1)
+    info.is_spot = True
+    info.is_zero_cost = False
+    info.reserved_fill = False
+    info.paid_capacity_pool_key = (
+        '{"accelerators":[["l4",1]],"cloud":"aws",'
+        '"instance_type":"g6.2xlarge","num_nodes":1,'
+        '"region":"eu-south-2","use_spot":true,"version":1,'
+        '"workspace":"w","zone":"eu-south-2a"}')
+    reconciliation.apply_immediate_provider_cleanup_replica_marker(info)
+    profile = binding.NonPoolLaunchProfile.create(
+        binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+        authorization_reference='paid-capacity:test',
+        authorization_generation=7,
+        authorization_payload={'pool_key': info.paid_capacity_pool_key})
+    context = binding.BoundNonPoolLaunchContext(
+        association_id=uuid.UUID('11111111-1111-4111-8111-111111111111'),
+        request_id='request-1',
+        service_name='svc',
+        replica_id=info.replica_id,
+        replica_record_id=uuid.UUID(info.replica_record_id),
+        launch_generation=1,
+        input_digest='a' * 64,
+        profile=profile,
+        capability_cohort_epoch=binding.NON_POOL_CAPABILITY_COHORT_EPOCH,
+        capability_profile_set_digest=(
+            binding.supported_non_pool_profile_set_digest()),
+        receipt_protocol_version=binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)
+    authority = types.SimpleNamespace(capable=True,
+                                      binding_mode=binding.BindingMode.BOUND,
+                                      service_name='svc',
+                                      service_hash='incarnation-a')
+    replicas = [info]
+    calls = []
+    provider_attempts = 0
+
+    def _exact_provider_cleanup(actual_context, _info, actual_authority,
+                                _projector, *, continue_guard):
+        nonlocal provider_attempts
+        assert actual_context is context
+        assert actual_authority is authority
+        assert continue_guard()
+        provider_attempts += 1
+        calls.append(('provider_cleanup', provider_attempts))
+        if provider_attempts == 1:
+            raise binding.OrdinaryLaunchBindingConflict(
+                'provider remained PRESENT through the cleanup deadline')
+        return reconciliation.ProviderObservation(
+            binding.ProviderEvidence.ABSENT, {'instances': []})
+
+    _patch_finalize(monkeypatch, calls)
+    _patch_common(monkeypatch, calls, replicas)
+    monkeypatch.setattr(serve_state, 'get_service_controller_owner',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, 'cleanup_storage_intents',
+                        lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        service.request_postgres,
+        'bound_non_pool_provider_present_cleanup_is_authorized',
+        lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(reconciliation,
+                        'terminate_aws_paid_provider_allocation',
+                        _exact_provider_cleanup)
+
+    def _remove_replica(_service_name, replica_id, **_kwargs):
+        assert replica_id == info.replica_id
+        replicas.clear()
+        calls.append(('row_removed', replica_id))
+        return True
+
+    monkeypatch.setattr(serve_state, 'remove_replica', _remove_replica)
+
+    lifecycle_lock = types.SimpleNamespace(epoch=31)
+    finalize_args = ('svc', types.SimpleNamespace(pool=True), '/tmp/svc', 1,
+                     'incarnation-a', 123, None, lifecycle_lock)
+    cleanup_contexts = {(info.replica_id, info.replica_record_id): context}
+
+    service._run_cleanup_and_finalize_locked(
+        *finalize_args,
+        binding_authority=authority,
+        provider_present_cleanup_contexts=cleanup_contexts)
+
+    assert replicas == [info]
+    assert info.status_property.sky_down_status == common_utils.ProcessStatus.FAILED
+    assert ('status', serve_state.ServiceStatus.FAILED_CLEANUP) in calls
+    assert ('remove_script', 'svc') not in calls
+
+    # A fresh HA owner later receives exact provider-ABSENT evidence.
+    service._run_cleanup_and_finalize_locked(
+        *finalize_args,
+        binding_authority=authority,
+        provider_present_cleanup_contexts=cleanup_contexts)
+
+    assert not replicas
+    assert provider_attempts == 2
+    assert ('row_removed', info.replica_id) in calls
+    assert calls.count(('removed', 'svc')) == 1
+    assert ('remove_script', 'svc') not in calls
+
+
 def test_provider_uncertainty_retains_recovery_script_for_exact_retry(
         monkeypatch):
     calls = []

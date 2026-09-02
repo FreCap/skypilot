@@ -29,7 +29,20 @@ executor now uses `limits.memory` when configured and retains the existing
 fresh authoritative row read finds a closed exact-provider cleanup marker (or
 the read itself fails closed); unrelated persistent cleanup failures keep the
 existing no-hot-loop behavior. Both corrections have red/green tests and
-independent review. They are not yet merged, deployed, or production-proven.
+independent review. PR #1900 merged them at
+`326f33d406dd3d61f4e9b62328711d09a52596cb`; immutable chart and image release
+`1.1.1643` is deployed at Helm revision 755. The live executor projection uses
+`limits.memory`, and all seven registered executor replicas report 64 long
+workers. Current-writer scale and automatic-cleanup requalification remain
+open, so deployment is not yet production proof of either correction.
+Test-only checkpoint `51475d975` drives the real cleanup finalizer, real
+``_cleanup`` implementation, bounded worker admission, and exact AWS cleanup
+dispatch through two generations while replacing only provider I/O. It is red
+on pre-fix `26bdbc6e6`: the first late provider failure publishes
+``FAILED_CLEANUP`` and incorrectly deletes HA recovery. It is green on the
+current source: the script remains, the next owner observes ``ABSENT``, removes
+the retained replica, and finalizes the service. This deterministic unpaid gate
+must pass before the next billable run.
 The immutable failed-run bundle is keyed by scope SHA-256
 `232ed4c525d648c13756c173085fbb1fb1177cab8dcc1b4bdb7f5af5134310ad`;
 qualifier, cleanup, and lifecycle receipts are respectively
@@ -110,14 +123,28 @@ authenticated warm requests, and exact provider teardown. Full idle research
 occupancy is no longer a steady-state goal: `utilization_gate: true` permits
 only demand-backed fill and returns it to the unchanged scheduler when idle.
 
-The current production control plane is release ``1.1.1638`` from source
-``1cad3f6d0442926f30ee26b2b8a294cceeceb245`` at Helm revision 753 on
+The current production control plane is release ``1.1.1643`` from source
+``326f33d406dd3d61f4e9b62328711d09a52596cb`` at Helm revision 755 on
 2026-09-02. API, controller, and executor containers resolve to image digest
-``sha256:5de0e97ab88b66bf0496a84059cfb96b3d97cde7174948a7cdfeddddd15b41a2``.
-Two API, two controller, and seven executor Pods are Ready. PostgreSQL is the
-central store and Helm storage is disabled. No scheduler, platform,
-infrastructure, EFS/PVC, or provider-policy configuration changed in the
-rollout.
+``sha256:c00b764ed518d54312843afb0f044f91f0fdbc98e63dfa5607c944fe8429ebbd``.
+Two API, two controller, and seven executor Pods are Ready with zero restarts.
+The rollout preserved the API's ``maxSurge: 1`` / ``maxUnavailable: 0`` HA
+contract: after proving zero active API requests, one idle executor was drained
+temporarily to make the surge Pod's 16-CPU/56-GiB request schedulable, then the
+seventh executor was restored. PostgreSQL is the central store and Helm storage
+is disabled. No scheduler, platform, infrastructure, EFS/PVC, or
+provider-policy configuration changed in the rollout.
+
+The retained ``paid-e2e-1638a`` failure was then reclaimed through the normal
+evidence-fenced ``sky serve down --purge`` path, never by manual row deletion.
+The service and its 13 replica rows disappeared. Three subsequent authoritative
+samples observed exact zero AWS and GCP instances, disks, and in-flight
+operations, plus zero PostgreSQL paid claims, debit units, and waiters. This
+receipt has SHA-256
+``949a1369fc959b369eabcb806183de49222eca7b7e30a9211043492b12807897``.
+It proves the historical graph is clean; it does not substitute for a fresh
+run proving that ordinary teardown and HA recovery converge without operator
+purge.
 
 The first 100-member qualification on this writer exposed a controller-memory
 gate after atomic admission, not an atomic-payload or provider-capacity gate.
