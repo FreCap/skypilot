@@ -1,4 +1,11 @@
-"""Process-integration coverage for Serve remote-I/O scheduling."""
+"""Process/component regression for Serve remote-I/O scheduling.
+
+This rejects the pre-fix design in which readiness and job-status producers
+could create independently bounded pools whose aggregate fan-out exhausted the
+controller. Exact worker/queue limits, opposite-phase progress, terminal
+shutdown, and OS-observed memory are the negative controls; merely completing
+the fake calls is not sufficient.
+"""
 
 # pylint: disable=protected-access
 import multiprocessing
@@ -6,8 +13,12 @@ import threading
 import time
 import traceback
 
+import pytest
+
 from sky.serve import provider_phase
 from sky.serve import replica_managers
+
+pytestmark = pytest.mark.component
 
 
 def _linux_process_memory_kib(field: str) -> int:
@@ -29,7 +40,20 @@ def _run_remote_io_budget_probe(result_connection) -> None:
     max_workers = manager._REMOTE_IO_MAX_PARALLELISM
     probe_workers = manager._REMOTE_PROBE_PARALLELISM
     status_workers = manager._REMOTE_STATUS_PARALLELISM
-    configured_max_replicas = 800
+    work_items_by_lane = {
+        replica_managers._ReplicaRemoteIOLane.PROBE:
+            probe_workers + manager._REMOTE_PROBE_QUEUE_CAPACITY,
+        replica_managers._ReplicaRemoteIOLane.STATUS:
+            status_workers + manager._REMOTE_STATUS_QUEUE_CAPACITY,
+    }
+    if sum(work_items_by_lane.values()) != manager._REMOTE_IO_MAX_OUTSTANDING:
+        raise RuntimeError('Remote-I/O lane budgets do not sum to the owner.')
+    if (work_items_by_lane[replica_managers._ReplicaRemoteIOLane.PROBE] <=
+            probe_workers or
+            work_items_by_lane[replica_managers._ReplicaRemoteIOLane.STATUS] <=
+            status_workers):
+        raise RuntimeError('Remote-I/O component gate must exercise multiple '
+                           'production-sized waves in every lane.')
     manager._get_remote_io_executor()
     baseline_rss_kib = _linux_process_memory_kib('VmRSS')
     baseline_hwm_kib = _linux_process_memory_kib('VmHWM')
@@ -113,15 +137,15 @@ def _run_remote_io_budget_probe(result_connection) -> None:
             batch_size = (probe_workers
                           if lane is replica_managers._ReplicaRemoteIOLane.PROBE
                           else status_workers)
-            for offset in range(0, configured_max_replicas, batch_size):
+            work_items = work_items_by_lane[lane]
+            for offset in range(0, work_items, batch_size):
                 submitted = [
                     manager._submit_remote_io(_fake_remote_io,
                                               kind,
                                               index,
                                               lane=lane)
-                    for index in range(
-                        offset, min(offset +
-                                    batch_size, configured_max_replicas))
+                    for index in range(offset,
+                                       min(offset + batch_size, work_items))
                 ]
                 with futures_lock:
                     futures.extend(submitted)
@@ -201,8 +225,10 @@ def test_remote_io_budget_is_aggregate_memory_bounded_and_phase_safe():
     assert 'error' not in result, result.get('error')
     assert result['peak_active'] == 72
     assert result['worker_threads_at_peak'] == 72
-    assert result['completed'] == 1600
-    assert result['result_count'] == 1600
+    expected_work_items = (
+        replica_managers.SkyPilotReplicaManager._REMOTE_IO_MAX_OUTSTANDING)
+    assert result['completed'] == expected_work_items
+    assert result['result_count'] == expected_work_items
     assert result['remaining_worker_threads'] == []
     # Seventy-two retained 512-KiB calls, fixed-size producer waves, and
     # Python/thread overhead stay below these OS-observed ceilings.

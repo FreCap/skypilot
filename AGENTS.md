@@ -68,7 +68,7 @@ skypilot/
 ├── tests/                  # Test suite
 │   ├── unit_tests/         # Unit tests with subdirectories per module
 │   ├── smoke_tests/        # Quick validation tests
-│   ├── integration_tests/  # End-to-end tests
+│   ├── integration_tests/  # Component/process and end-to-end tests
 │   ├── kubernetes/         # K8s-specific tests
 │   └── conftest.py         # Pytest fixtures
 ├── examples/               # 50+ usage examples
@@ -195,6 +195,12 @@ completing the narrow boundary explicit follow-up work. A paid test validates
 the real adapter and environment after unpaid gates pass; it is not a substitute
 for a deterministic unpaid regression.
 
+An incident regression must say which pre-fix behavior it rejects and include
+a negative or structural control that would fail if the affected production
+path were bypassed. A test that merely executes nearby code, asserts only a
+successful result, or replaces the defective owner itself is coverage, not a
+regression proof.
+
 Each non-unit test must state its layer in the module docstring and enter
 through the exact public or production scheduling boundary named there. An
 unpaid provider E2E must use PostgreSQL plus the real API server, controller,
@@ -204,6 +210,20 @@ acknowledgements, partial waves, delayed visibility, preemption, and deletion
 lag without patching controller or database internals. Include a negative
 control that fails if production bypasses the facet or if the scenario no
 longer traverses the claimed entry point.
+
+Keep the filesystem taxonomy honest as well: unit tests live under
+``tests/unit_tests``; process/component and end-to-end tests live under
+``tests/integration_tests`` (or the established paid smoke-test location) and
+carry exactly one of ``component``, ``unpaid_e2e``, or ``paid_e2e``. Do not
+leave a component test in the unit tree or use ``e2e`` in a filename for a
+test that replaces the controller, database, planner, or another internal
+orchestration layer.
+
+``operator_fixture`` is an orthogonal execution-requirement marker, not a test
+layer. Apply it together with ``component`` when a test needs an existing
+operator-supplied cluster or comparable external fixture. Such tests must skip
+cleanly when their explicit fixture option is absent; hermetic component CI
+excludes this marker.
 
 ### CI Tests via PR Comments
 
@@ -314,8 +334,8 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
   and retries when calculating their complexity.
 - Do not put a whole-registry scan inside each item's retry, reconciliation,
   enqueue/dequeue operation, or periodic poll. One O(N) aggregate pass per
-  bounded tick is valid only with a numeric maximum cardinality and latency
-  budget.
+  bounded tick is valid only with a numeric maximum resident/window
+  cardinality and latency budget.
 - O(N²) work is forbidden on critical paths unless N is hard-enforced as small
   in the same owning component and a max-bound benchmark plus a structural
   complexity test proves the budget. Configuration convention or today's
@@ -326,16 +346,24 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
   operation cannot delay request handling, reconciliation, teardown, or
   provider cleanup. A helper inherits critical-path status from any production
   caller; moving the loop into a helper does not make it offline.
-- Scale tests must enter through the production interface at the maximum
-  configured cardinality and prove health/control-plane responsiveness, not
-  only call helpers against pre-populated internal state.
+- A total stream may be unbounded only when work is O(1) per item, the owning
+  component hard-bounds every resident, queued, and in-flight window, and its
+  completion formula is explicit in total N (for example,
+  ``ceil(N / window) * per_window_deadline``). An unbounded stream does not
+  have a fixed convergence deadline.
+- Scale tests must enter through the production interface, fill the maximum
+  configured resident/window cardinality, exercise multiple windows, and
+  prove health/control-plane responsiveness. If total N is bounded, exercise
+  that bound too; do not only call helpers against pre-populated internal
+  state.
 - Every critical-path owner must keep one adjacent, reviewable budget naming:
-  the hard maximum N and where it is enforced; work per item and per tick;
-  worker, subprocess, file-descriptor, connection, queued-item, queued-byte,
-  output-byte, and resident-memory bounds; the per-operation deadline; and the
-  resulting worst-case round formula. Tests must derive their max-cardinality
-  assertions from the same production constants. A timeout without the
-  cardinality/parallelism formula is not a convergence bound.
+  the hard maximum resident/window N and where it is enforced; total N when it
+  is bounded; work per item and per tick; worker, subprocess, file-descriptor,
+  connection, queued-item, queued-byte, output-byte, and resident-memory
+  bounds; the per-operation deadline; and the resulting worst-case round or
+  stream formula. Tests must derive their max-cardinality assertions from the
+  same production constants. A timeout without the cardinality/parallelism
+  formula is not a convergence bound.
 - An exceptional critical-path O(N²) implementation must name its owner,
   rationale, enforced N, measured max-bound result, and removal/re-evaluation
   gate in code. Its test must fail if the bound is increased without updating
@@ -360,6 +388,53 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
   controller is terminal, racing submissions must fail and no caller may
   recreate workers. Tests must cover submit-versus-shutdown races and assert
   that queued futures are cancelled and all workers/processes are reaped.
+
+### Async Poller and Freshness Safety
+
+- Never run synchronous database, provider, filesystem, subprocess, or DNS I/O
+  on an event loop that owns request liveness, leases, deadlines, cancellation,
+  or safety heartbeats. Move it behind one bounded single-flight interface and
+  prove a blocked dependency cannot prevent unrelated timers or probes from
+  progressing.
+- Cancellation, owner loss, and interrupted observation mean ``UNKNOWN``; they
+  are not negative provider or health evidence. A canceled operation must not
+  increment failure counters, revoke capacity, or publish a failed receipt.
+- Isolate work-item failures. One malformed target or unexpected exception may
+  fail that exact item closed, but must not cancel siblings or kill a persistent
+  polling loop.
+- A persistent poller constructs its TLS context, HTTP session, connector, and
+  worker pools once per lifecycle. Per-item recreation defeats pooling and can
+  turn bounded concurrency into unbounded retained sockets or contexts.
+- Safety freshness must remain live during an indefinite optional persistence,
+  telemetry, or composition stall. Bound active, queued, and retained tasks,
+  sockets, results, and database batches across target churn—not only connector
+  acquisitions for the current snapshot.
+
+### Durable Concurrency and Ownership Fences
+
+- Treat an in-process lock, a PostgreSQL transaction, and any optimistic
+  compare-and-set as one concurrency protocol. Never read a whole durable
+  record, drop the owning lock, and later write that stale record after another
+  writer may have committed. A database row lock during only the second write
+  does not prevent that lost update.
+- Keep provider and other unbounded remote I/O outside the manager lock. For
+  the bounded persistence phase, either reacquire the shared owning lock for
+  one deadline-bounded transaction or use field-scoped patches with an exact
+  revision predicate. State which mechanism serializes every competing writer
+  and test it with the real production writers, not surrogate SQL updates.
+- A durable owner fence must include stable lifecycle/configuration identity
+  plus a controller incarnation and monotonically changing owner epoch. PID,
+  host/IP, thread identity, or lease freshness alone are not identity: they can
+  be reused after restart. Tests must rotate incarnation/epoch while preserving
+  PID and IP and prove the stale writer is rejected.
+- Persist safety-coupled state atomically. If a row becoming ineligible also
+  invalidates a route, claim, lease, debit, or association, change both in the
+  same transaction. Post-commit effects may refresh process-local caches or
+  wake workers, but correctness must survive process death before those effects.
+- Do not reuse a policy-specific persistence fence as a generic health or
+  observation fence. The database predicate must distinguish universal owner
+  identity from per-row policy eligibility; exercise pools and every supported
+  action mode against real PostgreSQL.
 
 ### Typed Internal State and Compatibility Boundaries
 

@@ -23,7 +23,7 @@ from sky.utils import env_options
 
 logger = sky_logging.init_logger(__name__)
 
-pytestmark = pytest.mark.component
+pytestmark = [pytest.mark.component, pytest.mark.operator_fixture]
 
 
 @pytest.fixture(scope="session")
@@ -31,7 +31,7 @@ def test_cluster(request):
     """Session-scoped fixture to set up and tear down test cluster."""
     cluster_name = request.config.getoption('--backend-test-cluster')
     if not cluster_name:
-        pytest.fail("cluster name is not provided")
+        pytest.skip('requires an existing --backend-test-cluster fixture')
     yield cluster_name
 
 

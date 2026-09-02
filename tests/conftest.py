@@ -439,24 +439,42 @@ def pytest_collection_modifyitems(config, items):
     # below: adding an unclassified or multiply classified integration test is
     # an authoring error in every environment.
     test_layers = frozenset({'component', 'unpaid_e2e', 'paid_e2e'})
-    invalid_integration_layers = []
+    invalid_test_layers = []
     for item in items:
         path_parts = pathlib.PurePath(item.location[0]).parts
+        filename = pathlib.PurePath(item.location[0]).name
         marks = {mark.name for mark in item.iter_markers()}
         layers = sorted(test_layers & marks)
         if 'integration_tests' in path_parts and len(layers) != 1:
-            invalid_integration_layers.append(
+            invalid_test_layers.append(
                 f'{item.nodeid}: expected exactly one of '
                 f'{sorted(test_layers)!r}, found {layers!r}')
+        if 'unit_tests' in path_parts and layers:
+            invalid_test_layers.append(
+                f'{item.nodeid}: unit-tree test cannot claim non-unit layer '
+                f'{layers!r}')
+        if ('integration_tests' in path_parts and '_e2e' in filename and
+                layers == ['component']):
+            invalid_test_layers.append(
+                f'{item.nodeid}: component test filename must not claim E2E')
+        if ('operator_fixture' in marks and
+            ('integration_tests' not in path_parts or layers != ['component'])):
+            invalid_test_layers.append(
+                f'{item.nodeid}: operator_fixture requires exactly the '
+                'component layer under tests/integration_tests')
+        if ('serve_lb_10k_interface' in marks and
+            ('integration_tests' not in path_parts or layers != ['component'])):
+            invalid_test_layers.append(
+                f'{item.nodeid}: serve_lb_10k_interface requires exactly the '
+                'component layer under tests/integration_tests')
         if 'unpaid_e2e' in marks and not config.getoption('--postgres'):
             item.add_marker(skip_marks['unpaid_e2e_postgres'])
         if ('paid_e2e' in marks and
                 config.getoption('--serve-paid-provider-e2e') is None):
             item.add_marker(skip_marks['paid_e2e_gate'])
-    if invalid_integration_layers:
-        raise pytest.UsageError(
-            'Integration test-layer classification failed:\n' +
-            '\n'.join(invalid_integration_layers))
+    if invalid_test_layers:
+        raise pytest.UsageError('Test-layer classification failed:\n' +
+                                '\n'.join(invalid_test_layers))
 
     cloud_to_run = _get_cloud_to_run(config)
     generic_cloud = _generic_cloud(config)

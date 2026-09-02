@@ -1,4 +1,4 @@
-"""[boltz fork] Local end-to-end smoke for LB async-occupancy probing.
+"""[boltz fork] Local process/component smoke for LB occupancy probing.
 
 Deploys the REAL load balancer (run_load_balancer, its own process) against
 a fake controller and fake replicas that mimic the async wrapper's contract
@@ -16,7 +16,7 @@ lifecycle through the LB's public surface:
 
 Run manually (not collected by pytest — this spawns servers):
 
-    PYTHONPATH=. python tests/lb_local_e2e.py
+    PYTHONPATH=. python tests/lb_local_component.py
 """
 import json
 import multiprocessing

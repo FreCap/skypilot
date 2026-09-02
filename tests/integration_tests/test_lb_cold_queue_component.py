@@ -13,7 +13,7 @@ public demand accounting at maximum tested queue cardinality.
 Run as the dedicated resource-heavy regression (it opens 10,000 local
 sockets, so do not run it under xdist):
 
-    pytest -n0 tests/integration_tests/test_lb_cold_queue_e2e.py
+    pytest -n0 tests/integration_tests/test_lb_cold_queue_component.py
 """
 import asyncio
 import json
