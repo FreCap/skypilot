@@ -1377,6 +1377,17 @@ def autoscaler_history_snapshot_from_committed_plan(
         observed_at=observed_at)
 
 
+def _resolve_lazy_transaction_dependencies(*resolved: object) -> None:
+    """Force lazy module resolution before a correctness transaction opens.
+
+    Evaluating each argument at the call site imports its lazily bound module
+    (including nested lazy modules), so cold import order cannot lengthen
+    correctness locks or introduce import-time I/O inside the transaction.
+    The resolved attributes themselves are intentionally unused.
+    """
+    del resolved
+
+
 @contextlib.contextmanager
 def _capacity_admission_transaction(
     engine: sqlalchemy.engine.Engine,
@@ -5484,21 +5495,24 @@ class CapacityAdmissionRepository:
         # module-level APIs.  Resolve every lazy module they may enter before
         # opening the correctness transaction so cold import order cannot
         # lengthen locks or introduce import-time I/O.
-        serve_state.lock_zero_cost_protocol_for_bound_launch_observation  # pylint: disable=pointless-statement
-        reserved_fill_allocation.ReservedFillAllocationRepository  # pylint: disable=pointless-statement
-        reserved_fill_planner.FillCapacityUnit  # pylint: disable=pointless-statement
-        zero_cost_actuation.replica_capacity_for_unit  # pylint: disable=pointless-statement
-        ordinary_launch_binding.ControllerBindingAuthority  # pylint: disable=pointless-statement
-        ordinary_launch_binding.system_oom_recovery.has_v3_system_oom_recovery_context  # pylint: disable=pointless-statement
-        serve_state.replica_managers.ReplicaInfo  # pylint: disable=pointless-statement
-        serve_paid_capacity.replica_info_lib.ReplicaInfo  # pylint: disable=pointless-statement
-        service_spec.SkyServiceSpec  # pylint: disable=pointless-statement
-        kubernetes_identity.validate_worker_placement_projections  # pylint: disable=pointless-statement
-        request_postgres.non_pool_launch_binding_fleet_capable  # pylint: disable=pointless-statement
-        # Resolve request modules and run the complete canonical reconstruction
-        # before correctness locks.  The advisory source facts are compared to
-        # the locked service/version rows below; they never authorize a launch.
-        paid_launch_request.prepare_paid_launch_request  # pylint: disable=pointless-statement
+        _resolve_lazy_transaction_dependencies(
+            serve_state.lock_zero_cost_protocol_for_bound_launch_observation,
+            reserved_fill_allocation.ReservedFillAllocationRepository,
+            reserved_fill_planner.FillCapacityUnit,
+            zero_cost_actuation.replica_capacity_for_unit,
+            ordinary_launch_binding.ControllerBindingAuthority,
+            ordinary_launch_binding.system_oom_recovery.
+            has_v3_system_oom_recovery_context,
+            serve_state.replica_managers.ReplicaInfo,
+            serve_paid_capacity.replica_info_lib.ReplicaInfo,
+            service_spec.SkyServiceSpec,
+            kubernetes_identity.validate_worker_placement_projections,
+            request_postgres.non_pool_launch_binding_fleet_capable,
+            # Resolve request modules and run the complete canonical
+            # reconstruction before correctness locks.  The advisory source
+            # facts are compared to the locked service/version rows below;
+            # they never authorize a launch.
+            paid_launch_request.prepare_paid_launch_request)
         bind_paid_executables = (
             paid_wave_admission.bind_accepted_in_transaction)
         record_paid_executable_commit = paid_wave_admission.record_fused_commit
