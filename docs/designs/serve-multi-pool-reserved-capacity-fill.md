@@ -362,7 +362,7 @@ compatibility profiles, updated at the two registry mutation points and
 rebuilt once when a service update re-indexes queued requests, and skips the
 traversal when no free card is acceptable to any resident waiter. A structural
 test pins 10,000 mismatched-fleet dispatches to zero traversals, and the serial
-10,000-request interface gate runs as the dedicated ``Serve LB 10k Interface``
+10,000-request interface gate runs as the dedicated ``Serve LB 10k Component``
 CI job rather than only by hand.
 
 Provider availability and runtime/service readiness are separate facts. The
