@@ -2100,6 +2100,55 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             autoscalers.bind_locked_kueue_capacity_snapshot(
                 prepared, [first, second], locked)
 
+    def test_locked_kueue_snapshot_rejects_one_sided_replica_difference(self):
+        first = _replica(1)
+        second = _replica(2)
+        third = _replica(3)
+        locked = kueue_lane_capacity.KueueReplicaCapacitySnapshot({})
+        cases = (
+            (_durable_inputs((first, second)), [first, second, third]),
+            (_durable_inputs((first, second, third)), [first, second]),
+        )
+        for prepared, replica_infos in cases:
+            with self.subTest(prepared=prepared.replica_ids):
+                with self.assertRaises(ValueError):
+                    autoscalers.bind_locked_kueue_capacity_snapshot(
+                        prepared, replica_infos, locked)
+
+    def test_locked_kueue_snapshot_rejects_duplicate_replica_ids(self):
+        first = _replica(1)
+        second = _replica(2)
+        locked = kueue_lane_capacity.KueueReplicaCapacitySnapshot({})
+        cases = (
+            (_durable_inputs((first, second, second)), [first, second]),
+            (_durable_inputs((first, second)), [first, second, second]),
+        )
+        for prepared, replica_infos in cases:
+            with self.subTest(
+                    prepared=prepared.replica_ids,
+                    locked=[info.replica_id for info in replica_infos]):
+                with self.assertRaises(ValueError):
+                    autoscalers.bind_locked_kueue_capacity_snapshot(
+                        prepared, replica_infos, locked)
+
+    def test_locked_kueue_snapshot_rejects_malformed_replica_ids(self):
+        first = _replica(1)
+        second = _replica(2)
+        zero = _replica(0)
+        missing = _replica(None)
+        locked = kueue_lane_capacity.KueueReplicaCapacitySnapshot({})
+        cases = (
+            (dataclasses.replace(_durable_inputs((first, second)),
+                                 replica_ids=[1, 2]), [first, second]),
+            (_durable_inputs((zero, first)), [zero, first]),
+            (_durable_inputs((first, missing)), [first, missing]),
+        )
+        for prepared, replica_infos in cases:
+            with self.subTest(prepared=prepared.replica_ids):
+                with self.assertRaises(ValueError):
+                    autoscalers.bind_locked_kueue_capacity_snapshot(
+                        prepared, replica_infos, locked)
+
     def test_bounded_kueue_unknown_is_committed_on_its_exact_card(self):
         unknown = _replica(1, reserved_fill=True)
         unknown.is_zero_cost = True
