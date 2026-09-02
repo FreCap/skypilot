@@ -1241,7 +1241,6 @@ def _active_aws_account_id_for_workspace(workspace: str,
 def _provider_identity_for_location(
     location: spot_placer.Location,
     *,
-    workspace: str,
     aws_account_id: str | None = None,
     gcp_project_id: str | None = None,
 ) -> dict[str, str] | None:
@@ -1354,7 +1353,6 @@ def pool_key(location: spot_placer.Location,
     if scoped_provider:
         payload['provider_identity'] = _provider_identity_for_location(
             location,
-            workspace=workspace,
             aws_account_id=aws_account_id,
             gcp_project_id=gcp_project_id)
     return json.dumps(payload, sort_keys=True, separators=(',', ':'))

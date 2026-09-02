@@ -50,6 +50,17 @@ def test_service_account_route_characterization():
 
 
 class TestServiceAccountDeletionProtection:
+
+    @pytest.fixture(autouse=True)
+    def _serve_owner_attestation_complete(self, monkeypatch):
+        # Unit tests run on SQLite, where the Serve055 owner-attestation
+        # transition predicate fails closed (409) before the resource checks
+        # under test run; production PostgreSQL has completed the transition.
+        monkeypatch.setattr(users_server.serve_state,
+                            'service_owner_attestation_transition_active',
+                            lambda: False,
+                            raising=False)
+
     """Test cases for service account deletion protection."""
 
     @pytest.fixture

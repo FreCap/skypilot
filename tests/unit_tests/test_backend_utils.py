@@ -728,7 +728,7 @@ def test_projected_worker_persists_authenticated_bootstrap_through_finalizer(
     assert contract.matches
 
 
-def test_projected_v7_worker_is_rejected_before_v8_renderer(
+def test_projected_v7_worker_is_rejected_before_rendering(
         monkeypatch, tmp_path):
     writer_kwargs, output_path = _builtin_kubernetes_writer_kwargs(
         monkeypatch, tmp_path, 'projected-v6-decode-only')
@@ -738,7 +738,10 @@ def test_projected_v7_worker_is_rejected_before_v8_renderer(
         _projected_h200_worker_memory(7)
     ]
 
-    with pytest.raises(ValueError, match='does not satisfy required version 8'):
+    # Historical v7 projections decode but have no byte-exact renderer, so
+    # placement is refused before any cluster YAML is rendered.
+    with pytest.raises(exceptions.InvalidCloudConfigs,
+                       match='byte-exact renderer for projection protocol 7'):
         backend_utils.write_cluster_config(**writer_kwargs)
 
     assert not pathlib.Path(f'{output_path}.tmp').exists()

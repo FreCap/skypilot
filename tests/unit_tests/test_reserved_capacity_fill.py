@@ -1727,6 +1727,74 @@ class TestPollerFlagOff(unittest.TestCase):
         self.assertLessEqual(autoscaler._fill_snapshot_time, pre_query_time)
 
 
+class TestPollerWitnessWait(unittest.TestCase):
+    """A named poller paces itself on the fill-demand witness, not sleep.
+
+    TestPollerClaimLifecycle stops the loop from a mocked ``time.sleep``;
+    this pins the production contract that class relies on so a future
+    change to the pacing path fails here instead of hanging the shard.
+    """
+
+    class _Stop(Exception):
+        pass
+
+    def test_named_poller_waits_on_witness_and_never_sleeps(self):
+        autoscaler = _make_autoscaler(fill=False)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = []
+        waits = []
+
+        def _record_wait(service_name,
+                         after_sequence,
+                         timeout_seconds,
+                         stop_event=None):
+            waits.append(
+                (service_name, after_sequence, timeout_seconds, stop_event))
+            raise self._Stop()
+
+        with mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'get_protocol_version',
+                               return_value=1), \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'remove_claim'), \
+             mock.patch.object(reserved_capacity.capacity_admission,
+                               'wait_for_fill_demand_witness',
+                               side_effect=_record_wait) as witness_wait, \
+             mock.patch.object(reserved_capacity.time, 'sleep') as sleep:
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(lambda: autoscaler,
+                                              lambda: placer,
+                                              service_name='svc')
+        witness_wait.assert_called_once()
+        sleep.assert_not_called()
+        service_name, after_sequence, timeout_seconds, stop_event = waits[0]
+        self.assertEqual(service_name, 'svc')
+        self.assertEqual(after_sequence, 0)
+        self.assertIsInstance(timeout_seconds, float)
+        self.assertGreaterEqual(timeout_seconds, 0.0)
+        self.assertLessEqual(timeout_seconds,
+                             reserved_capacity.poll_interval_seconds())
+        self.assertIsNone(stop_event)
+
+    def test_unnamed_poller_keeps_sleeping(self):
+        autoscaler = _make_autoscaler(fill=False)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = []
+        with mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'get_protocol_version',
+                               return_value=1), \
+             mock.patch.object(reserved_capacity.capacity_admission,
+                               'wait_for_fill_demand_witness') as witness_wait, \
+             mock.patch.object(reserved_capacity.time,
+                               'sleep',
+                               side_effect=self._Stop) as sleep:
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(lambda: autoscaler,
+                                              lambda: placer)
+        sleep.assert_called_once()
+        witness_wait.assert_not_called()
+
+
 class TestPollerClaimLifecycle(unittest.TestCase):
     """Disabling fill (or losing the placer) withdraws the broker claim
     immediately -- a disabled service must not keep absorbing entitlement
@@ -1734,6 +1802,27 @@ class TestPollerClaimLifecycle(unittest.TestCase):
 
     class _Stop(Exception):
         pass
+
+    def setUp(self):
+        # Every test here drives poller_loop with a service name and stops it
+        # from a mocked ``time.sleep`` side effect. Since #1777 the named
+        # poller waits on the fill-demand witness condition instead of
+        # sleeping, so the mocked sleep was never reached and the loop ran
+        # forever (the CI Unit Tests shard hung for hours). Route that wait
+        # back through ``time.sleep`` so each test's cadence contract holds.
+        def _wait_via_sleep(service_name,
+                            after_sequence,
+                            timeout_seconds,
+                            stop_event=None):
+            del service_name, stop_event
+            reserved_capacity.time.sleep(timeout_seconds)
+            return after_sequence, False
+
+        witness_wait = mock.patch.object(reserved_capacity.capacity_admission,
+                                         'wait_for_fill_demand_witness',
+                                         side_effect=_wait_via_sleep)
+        witness_wait.start()
+        self.addCleanup(witness_wait.stop)
 
     @staticmethod
     def _policy_identity():
