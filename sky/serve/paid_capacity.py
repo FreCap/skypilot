@@ -73,10 +73,16 @@ _ADMISSION_SUMMARY_LOG_INTERVAL_SECONDS = 5 * 60
 _LEGACY_POOL_KEY_VERSION = 1
 _POOL_KEY_VERSION = 2
 _AWS_ACCOUNT_ID_RE = re.compile(r'[0-9]{12}')
+_GCP_PROJECT_ID_RE = re.compile(r'[a-z][a-z0-9-]{4,28}[a-z0-9]')
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
 _MAX_EXACT_SHAPE_INTEGER = (1 << 63) - 1
 PAID_PROVIDER_ALLOCATION_CONTRACT = 'in-tree-full-fresh-running-v1'
-MAX_PREPARED_LAUNCH_SPECS = 512
+# One fused admission transaction must stay comfortably inside the unchanged
+# demand/plan authority lease.  This is a database transaction bound, not a
+# service target, paid-cap, provider-pool window, or launch-concurrency bound.
+# A positive residual larger than this limit is committed by deterministic
+# successor reconciles from the newly durable replica/claim graph.
+MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS = 100
 _UNRESOLVED_STATUS_VALUES = frozenset({'PENDING', 'PROVISIONING'})
 _admission_summary_log_lock = threading.Lock()
 _admission_summary_log_signature: tuple[Any, ...] | None = None
@@ -144,8 +150,7 @@ class EqualCostBalancingTier:
         if (not isinstance(self.normalized_cost, (int, float)) or
                 isinstance(self.normalized_cost, bool) or
                 not math.isfinite(float(self.normalized_cost)) or
-                self.normalized_cost <= 0 or
-                type(self.use_spot) is not bool or  # pylint: disable=unidiomatic-typecheck
+                self.normalized_cost <= 0 or type(self.use_spot) is not bool or  # pylint: disable=unidiomatic-typecheck
                 not isinstance(self.physical_backend_shape,
                                PhysicalBackendShape)):
             raise PaidGPUAttributionError(
@@ -266,7 +271,9 @@ class PaidLaunchSpec:
     replica_record_id: str
     cluster_name_seed: str
     worker_construction: bytes
+    prepared_launch_request: bytes
     provider_account: str | None
+    provider_project_id: str | None
     cloud: str
     workspace: str
     region: str
@@ -321,6 +328,10 @@ class PaidLaunchSpec:
             (type(self.provider_account) is not str or
              not self.provider_account)):
             raise ValueError('Paid launch provider account is malformed.')
+        if (self.provider_project_id is not None and
+            (type(self.provider_project_id) is not str or
+             _GCP_PROJECT_ID_RE.fullmatch(self.provider_project_id) is None)):
+            raise ValueError('Paid launch provider project is malformed.')
         if (self.cloud != self.cloud.casefold() or
                 self.accelerator != self.accelerator.casefold()):
             raise ValueError('Paid launch cloud/card names must be folded.')
@@ -329,6 +340,9 @@ class PaidLaunchSpec:
                 for card in self.frontier_key) or
                 self.frontier_key != tuple(sorted(set(self.frontier_key)))):
             raise ValueError('Paid launch frontier identity is noncanonical.')
+        if (type(self.prepared_launch_request) is not bytes or
+                not self.prepared_launch_request):
+            raise ValueError('Paid launch executable payload is malformed.')
         for payload in (self.worker_construction, self.resources_override):
             thaw_paid_launch_payload(payload)
         if not isinstance(self.catalog_evidence, PaidLaunchCatalogEvidence):
@@ -350,8 +364,12 @@ class PaidLaunchSpec:
         provider_identity = pool.get('provider_identity')
         pool_account = (provider_identity.get('aws_account_id') if isinstance(
             provider_identity, dict) else None)
+        pool_project_id = (provider_identity.get('gcp_project_id')
+                           if isinstance(provider_identity, dict) else None)
         if pool_account != self.provider_account:
             raise ValueError('Paid launch pool and provider account disagree.')
+        if pool_project_id != self.provider_project_id:
+            raise ValueError('Paid launch pool and provider project disagree.')
 
     @property
     def physical_gpu_units(self) -> int:
@@ -617,11 +635,19 @@ class PaidProviderAllocationReceipt:
             raise ValueError(
                 'Paid provider allocation pool key is noncanonical.')
         provider_identity = pool.get('provider_identity')
-        pool_provider_identity = (provider_identity.get('aws_account_id') if
-                                  isinstance(provider_identity, dict) else None)
-        provider_identity_disagrees = (
-            pool_provider_identity != self.provider_identity
-            if self.provider == 'aws' else pool_provider_identity is not None)
+        pool_account_id = (provider_identity.get('aws_account_id')
+                           if isinstance(provider_identity, dict) else None)
+        pool_project_id = (provider_identity.get('gcp_project_id')
+                           if isinstance(provider_identity, dict) else None)
+        if self.provider == 'aws':
+            provider_identity_disagrees = (pool_account_id
+                                           != self.provider_identity or
+                                           pool_project_id is not None)
+        else:
+            provider_identity_disagrees = (
+                pool_account_id is not None or
+                (pool.get('version') == _POOL_KEY_VERSION and
+                 pool_project_id != self.provider_project_id))
         if (pool.get('cloud') != self.provider or
                 pool.get('workspace') != self.workspace or
                 pool.get('region') != self.region or
@@ -1217,14 +1243,21 @@ def _provider_identity_for_location(
     *,
     workspace: str,
     aws_account_id: str | None = None,
+    gcp_project_id: str | None = None,
 ) -> dict[str, str] | None:
-    if not isinstance(location.cloud, clouds.AWS):
-        return None
-    account_id = aws_account_id
-    if (not isinstance(account_id, str) or
-            _AWS_ACCOUNT_ID_RE.fullmatch(account_id) is None):
-        raise ValueError('AWS paid pool requires one exact account ID.')
-    return {'aws_account_id': account_id}
+    cloud = str(location.cloud).casefold()
+    if cloud == 'aws':
+        account_id = aws_account_id
+        if (not isinstance(account_id, str) or
+                _AWS_ACCOUNT_ID_RE.fullmatch(account_id) is None):
+            raise ValueError('AWS paid pool requires one exact account ID.')
+        return {'aws_account_id': account_id}
+    if cloud == 'gcp':
+        if (not isinstance(gcp_project_id, str) or
+                _GCP_PROJECT_ID_RE.fullmatch(gcp_project_id) is None):
+            raise ValueError('GCP paid pool requires one exact project ID.')
+        return {'gcp_project_id': gcp_project_id}
+    return None
 
 
 def _active_aws_account_id_for_locations(
@@ -1253,20 +1286,59 @@ def resolve_aws_account_id_for_locations(
     return _active_aws_account_id_for_locations(locations, workspace=workspace)
 
 
+def resolve_gcp_project_ids_for_locations(
+    locations: Iterable[spot_placer.Location],
+    *,
+    workspace: str,
+    frozen_controller_config: Mapping[str, Any],
+) -> dict[spot_placer.Location, str]:
+    """Resolve exact GCP projects from one locked controller snapshot.
+
+    Unlike AWS account discovery this is provider-free.  Region precedence is
+    applied independently for every catalog location so a heterogeneous
+    catalog cannot silently collapse distinct projects into one pool scope.
+    """
+    if not isinstance(workspace, str) or not workspace:
+        raise ValueError('workspace must be nonempty.')
+    if not isinstance(frozen_controller_config, Mapping):
+        raise ValueError('frozen_controller_config must be a mapping.')
+    projects = {}
+    for location in locations:
+        if str(location.cloud).casefold() != 'gcp':
+            continue
+        project_id = (
+            skypilot_config.get_effective_workspace_region_config_from_snapshot(
+                frozen_controller_config,
+                'gcp', ('project_id',),
+                region=location.region,
+                workspace=workspace))
+        if (not isinstance(project_id, str) or
+                _GCP_PROJECT_ID_RE.fullmatch(project_id) is None):
+            raise ValueError(
+                f'GCP paid pool {location!r} has no exact project ID.')
+        projects[location] = project_id
+    return projects
+
+
 def pool_key(location: spot_placer.Location,
              *,
              workspace: str,
              num_nodes: int,
-             aws_account_id: str | None = None) -> str:
+             aws_account_id: str | None = None,
+             gcp_project_id: str | None = None) -> str:
     """Build a stable identity for one exact provider capacity pool."""
+    cloud = str(location.cloud).casefold()
+    scoped_provider = (cloud == 'aws' or
+                       (cloud == 'gcp' and gcp_project_id is not None))
     payload = {
-        # Account scope is an AWS provider requirement.  Keep every other
-        # provider on the existing v1 identity so this AWS-only safety change
-        # neither resets its admission history nor widens its rollout surface.
-        'version': (_POOL_KEY_VERSION if isinstance(location.cloud, clouds.AWS)
-                    else _LEGACY_POOL_KEY_VERSION),
+        # Fresh AWS and GCP paid effects require their immutable provider
+        # account/project scope.  A GCP v1 key is retained only for settlement
+        # of historical rows; new fused admission supplies ``gcp_project_id``.
+        'version':
+            (_POOL_KEY_VERSION if scoped_provider else _LEGACY_POOL_KEY_VERSION
+            ),
         'workspace': workspace,
-        'cloud': str(location.cloud).casefold(),
+        'cloud': cloud,
         'region': location.region,
         'zone': location.zone,
         'instance_type': location.instance_type,
@@ -1274,9 +1346,12 @@ def pool_key(location: spot_placer.Location,
         'use_spot': location.use_spot,
         'num_nodes': num_nodes,
     }
-    if isinstance(location.cloud, clouds.AWS):
+    if scoped_provider:
         payload['provider_identity'] = _provider_identity_for_location(
-            location, workspace=workspace, aws_account_id=aws_account_id)
+            location,
+            workspace=workspace,
+            aws_account_id=aws_account_id,
+            gcp_project_id=gcp_project_id)
     return json.dumps(payload, sort_keys=True, separators=(',', ':'))
 
 
@@ -1350,12 +1425,21 @@ def _pool_key_payload(key: str) -> dict[str, Any] | None:
         return None
     if payload['version'] == _POOL_KEY_VERSION:
         provider_identity = payload['provider_identity']
-        if (payload['cloud'] != 'aws' or
-                not isinstance(provider_identity, dict) or
-                set(provider_identity) != {'aws_account_id'} or
-                not isinstance(provider_identity['aws_account_id'], str) or
-                _AWS_ACCOUNT_ID_RE.fullmatch(
-                    provider_identity['aws_account_id']) is None):
+        aws_identity = bool(
+            payload['cloud'] == 'aws' and
+            isinstance(provider_identity, dict) and
+            set(provider_identity) == {'aws_account_id'} and
+            isinstance(provider_identity['aws_account_id'], str) and
+            _AWS_ACCOUNT_ID_RE.fullmatch(
+                provider_identity['aws_account_id']) is not None)
+        gcp_identity = bool(
+            payload['cloud'] == 'gcp' and
+            isinstance(provider_identity, dict) and
+            set(provider_identity) == {'gcp_project_id'} and
+            isinstance(provider_identity['gcp_project_id'], str) and
+            _GCP_PROJECT_ID_RE.fullmatch(
+                provider_identity['gcp_project_id']) is not None)
+        if not (aws_identity or gcp_identity):
             return None
     names = []
     for accelerator in payload['accelerators']:
@@ -1527,6 +1611,42 @@ def _exact_whole_gpu_shape(
     return card.casefold(), int(count)
 
 
+def active_paid_spot_accelerator_shapes(
+    placer: spot_placer.SpotPlacer,) -> frozenset[tuple[str, int]]:
+    """Project exact GPU shapes that can consume a paid preparation wave.
+
+    This is deliberately provider- and database-free.  It reads only the
+    placer's already-materialized catalog and active-location state, using the
+    same hard eligibility facts required by paid request serialization.  The
+    result sizes a speculative transaction wave; the fused PostgreSQL
+    admission remains the authority for every actual purchase.
+    """
+    if not isinstance(placer, spot_placer.SpotPlacer):
+        raise ValueError('Paid accelerator projection requires a SpotPlacer.')
+    active = set(placer.active_locations())
+    shapes = set()
+    for entry in placer.ranked_catalog_entries:
+        location = entry.location
+        cloud = str(location.cloud).casefold()
+        if (location not in active or location.use_spot is not True or
+                cloud not in ('aws', 'gcp') or
+                type(location.instance_type) is not str or  # pylint: disable=unidiomatic-typecheck
+                not location.instance_type
+                or not math.isfinite(entry.hourly_cost)
+                or entry.hourly_cost <= 0
+                or not math.isfinite(entry.normalized_hourly_cost)
+                or entry.normalized_hourly_cost <= 0):
+            continue
+        try:
+            shapes.add(
+                _exact_whole_gpu_shape(
+                    location.accelerators,
+                    field='active paid Spot catalog location'))
+        except PaidGPUAttributionError:
+            continue
+    return frozenset(shapes)
+
+
 def equal_cost_balancing_tier(
     location: spot_placer.Location,
     *,
@@ -1540,15 +1660,14 @@ def equal_cost_balancing_tier(
     if type(location.use_spot) is not bool:  # pylint: disable=unidiomatic-typecheck
         raise PaidGPUAttributionError(
             'Equal-cost balancing requires an exact purchase market.')
-    card, width = _exact_whole_gpu_shape(
-        location.accelerators, field='equal-cost balancing location')
-    return EqualCostBalancingTier(
-        normalized_cost=normalized_cost,
-        use_spot=location.use_spot,
-        physical_backend_shape=PhysicalBackendShape(
-            accelerator=card,
-            gpu_units_per_node=width,
-            num_nodes=num_nodes))
+    card, width = _exact_whole_gpu_shape(location.accelerators,
+                                         field='equal-cost balancing location')
+    return EqualCostBalancingTier(normalized_cost=normalized_cost,
+                                  use_spot=location.use_spot,
+                                  physical_backend_shape=PhysicalBackendShape(
+                                      accelerator=card,
+                                      gpu_units_per_node=width,
+                                      num_nodes=num_nodes))
 
 
 def _paid_pool_gpu_shape(pool_key_value: Any) -> PhysicalBackendShape:
@@ -1967,6 +2086,8 @@ def build_launch_budget(
     requested_frontier_keys: set[FrontierKey] | None = None,
     max_live_paid_gpu_units: int | None = None,
     allow_provider_identity_lookup: bool = True,
+    gcp_project_id_by_location: Mapping[spot_placer.Location, str] |
+    None = None,
     paid_launch_authority:
     'capacity_admission.PaidLaunchAuthority | None' = None,
     prospective_backend_claims_by_accelerator: Mapping[str, int] | None = None,
@@ -2108,12 +2229,25 @@ def build_launch_budget(
                 location for location in paid_locations
                 if not isinstance(location.cloud, clouds.AWS)
             ]
+    if paid_launch_authority is not None or prospective_claims is not None:
+        # An authoritative fresh GCP candidate must be v2.  Missing locked
+        # project input omits that location; it must never manufacture a v1
+        # pool and defer the correctness failure to request admission.
+        paid_locations = [
+            location for location in paid_locations
+            if str(location.cloud).casefold() != 'gcp' or
+            (gcp_project_id_by_location is not None and
+             location in gcp_project_id_by_location)
+        ]
     keys = {
         location: pool_key(
             location,
             workspace=workspace,
             num_nodes=placer.num_nodes,
-            aws_account_id=aws_account_id) for location in paid_locations
+            aws_account_id=aws_account_id,
+            gcp_project_id=(None if gcp_project_id_by_location is None else
+                            gcp_project_id_by_location.get(location)))
+        for location in paid_locations
     }
 
     states = serve_state.get_paid_capacity_pool_states(
@@ -2428,8 +2562,8 @@ def _balanced_equal_cost_location(
             selected,
             normalized_cost=selected_entry.normalized_hourly_cost,
             num_nodes=placer.num_nodes)
-        if (paid_pool_gpu_shape(selected_pool) !=
-                selected_tier.physical_backend_shape):
+        if (paid_pool_gpu_shape(selected_pool)
+                != selected_tier.physical_backend_shape):
             return selected
     except PaidGPUAttributionError:
         return selected
@@ -2444,9 +2578,8 @@ def _balanced_equal_cost_location(
                 location,
                 normalized_cost=entry.normalized_hourly_cost,
                 num_nodes=placer.num_nodes)
-            if (candidate_tier != selected_tier or
-                    paid_pool_gpu_shape(pool) !=
-                    candidate_tier.physical_backend_shape):
+            if (candidate_tier != selected_tier or paid_pool_gpu_shape(pool)
+                    != candidate_tier.physical_backend_shape):
                 continue
         except PaidGPUAttributionError:
             continue
@@ -2461,8 +2594,8 @@ def _balanced_equal_cost_location(
         current = budget.remaining_by_location.get(location)
         state = budget.states_by_pool_key.get(pool)
         initial = state.get('remaining') if isinstance(state, Mapping) else None
-        if (pool in seen_pool_keys or
-                type(current) is not int or current <= 0 or  # pylint: disable=unidiomatic-typecheck
+        if (pool in seen_pool_keys or type(current) is not int or
+                current <= 0 or  # pylint: disable=unidiomatic-typecheck
                 type(initial) is not int or initial < current or  # pylint: disable=unidiomatic-typecheck
                 initial <= 0):
             # Partial or contradictory evidence must not invent a new

@@ -3202,12 +3202,18 @@ def _bound_association_for_replica(
     return typing.cast(Mapping[str, Any] | None, association)
 
 
-def stable_bound_ordinary_launch_submission_id(
+def stable_bound_ordinary_launch_submission_id_in_connection(
+    connection: sqlalchemy.engine.Connection,
     service_name: str,
     replica_id: int,
     replica_record_id: str,
 ) -> str:
-    """Derive a retry-stable submission UUID from durable generation state."""
+    """Derive a retry-stable submission UUID on a caller-owned transaction."""
+    if (connection.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value
+            or not connection.in_transaction()):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Stable bound-launch submission IDs require an active PostgreSQL '
+            'transaction.')
     try:
         record_uuid = uuid.UUID(replica_record_id)
     except (AttributeError, TypeError, ValueError) as error:
@@ -3218,25 +3224,22 @@ def stable_bound_ordinary_launch_submission_id(
     if isinstance(replica_id,
                   bool) or not isinstance(replica_id, int) or replica_id < 1:
         raise ValueError('replica_id must be a positive integer.')
-    engine = initialize_and_get_db()
-    with engine.connect() as connection:
-        latest = connection.execute(
-            sqlalchemy.select(
+    latest = connection.execute(
+        sqlalchemy.select(
+            ordinary_launch_binding.ordinary_launch_associations_table.c.
+            submission_id, ordinary_launch_binding.
+            ordinary_launch_associations_table.c.launch_generation,
+            ordinary_launch_binding.ordinary_launch_associations_table.c.
+            resolution, ordinary_launch_binding.
+            ordinary_launch_associations_table.c.cancel_reason).where(
                 ordinary_launch_binding.ordinary_launch_associations_table.c.
-                submission_id, ordinary_launch_binding.
-                ordinary_launch_associations_table.c.launch_generation,
+                service_name == service_name, ordinary_launch_binding.
+                ordinary_launch_associations_table.c.replica_id == replica_id,
                 ordinary_launch_binding.ordinary_launch_associations_table.c.
-                resolution, ordinary_launch_binding.
-                ordinary_launch_associations_table.c.cancel_reason).where(
+                replica_record_id == record_uuid).order_by(
                     ordinary_launch_binding.ordinary_launch_associations_table.
-                    c.service_name == service_name,
-                    ordinary_launch_binding.ordinary_launch_associations_table.
-                    c.replica_id == replica_id,
-                    ordinary_launch_binding.ordinary_launch_associations_table.
-                    c.replica_record_id == record_uuid).
-            order_by(
-                ordinary_launch_binding.ordinary_launch_associations_table.c.
-                launch_generation.desc()).limit(1)).mappings().one_or_none()
+                    c.launch_generation.desc()).limit(
+                        1)).mappings().one_or_none()
     if latest is None:
         generation = 1
     else:
@@ -3255,6 +3258,18 @@ def stable_bound_ordinary_launch_submission_id(
         generation = int(latest['launch_generation']) + 1
     material = f'{service_name}\0{replica_id}\0{record_uuid}\0{generation}'
     return str(uuid.uuid5(_ORDINARY_LAUNCH_SUBMISSION_NAMESPACE, material))
+
+
+def stable_bound_ordinary_launch_submission_id(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> str:
+    """Derive a retry-stable submission UUID from durable generation state."""
+    engine = initialize_and_get_db()
+    with engine.begin() as connection:
+        return stable_bound_ordinary_launch_submission_id_in_connection(
+            connection, service_name, replica_id, replica_record_id)
 
 
 def inspect_bound_ordinary_launch(
@@ -4475,12 +4490,14 @@ def _ordinary_paid_gcp_provider_identity_from_locked_request(
                 workspace=workspace))
         if managed_instance_group is not None:
             return None
-        project_id = (
-            skypilot_config.get_effective_workspace_region_config_from_snapshot(
-                config_snapshot,
-                'gcp', ('project_id',),
-                region=pool_identity['region'],
-                workspace=workspace))
+        project_id = None
+        if pool_identity.get('version') == 1:
+            project_id = (skypilot_config.
+                          get_effective_workspace_region_config_from_snapshot(
+                              config_snapshot,
+                              'gcp', ('project_id',),
+                              region=pool_identity['region'],
+                              workspace=workspace))
         return ordinary_launch_binding.ordinary_paid_gcp_provider_identity(
             association, project_id=project_id)
     except Exception:  # pylint: disable=broad-except
@@ -5096,12 +5113,14 @@ def _paid_provider_allocation_identity_from_locked_request(
                         association, credential_profile=credential_profile))
         if cloud != 'gcp':
             return None
-        project_id = (
-            skypilot_config.get_effective_workspace_region_config_from_snapshot(
-                config_snapshot,
-                'gcp', ('project_id',),
-                region=region,
-                workspace=workspace))
+        project_id = None
+        if pool_identity.get('version') == 1:
+            project_id = (skypilot_config.
+                          get_effective_workspace_region_config_from_snapshot(
+                              config_snapshot,
+                              'gcp', ('project_id',),
+                              region=region,
+                              workspace=workspace))
         return ('gcp',
                 ordinary_launch_binding.ordinary_paid_gcp_provider_identity(
                     association, project_id=project_id))

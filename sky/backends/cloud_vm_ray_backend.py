@@ -2072,6 +2072,31 @@ class RetryingVmProvisioner:
                                 bulk_provision_kwargs[
                                     'kueue_admission_runtime'] = (
                                         self._kueue_admission_runtime)
+                        if (isinstance(to_provision.cloud, clouds.GCP) and
+                                ordinary_launch_binding.
+                                has_bound_launch_context(
+                                    self._extra_launch_context) and
+                                ordinary_launch_binding.
+                                BINDING_PROTOCOL_VERSION_KEY
+                                in self._extra_launch_context):
+                            paid_gcp_context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+                                self._extra_launch_context)
+                            if paid_gcp_context.profile.kind in (
+                                    ordinary_launch_binding.
+                                    NonPoolLaunchProfileKind.ORDINARY_PAID,
+                                    ordinary_launch_binding.
+                                    NonPoolLaunchProfileKind.
+                                    UNKNOWN_CAPACITY_REPLACEMENT):
+                                expected_project_id = (
+                                    ordinary_launch_binding.
+                                    ordinary_paid_gcp_project_id(
+                                        paid_gcp_context))
+                                active_project_id = (
+                                    to_provision.cloud.get_project_id())
+                                if active_project_id != expected_project_id:
+                                    raise exceptions.ServeReplicaLaunchFenceError(
+                                        'Ordinary-paid GCP project changed '
+                                        'after atomic capacity admission.')
                         # Recheck at the terminal provider boundary as well as
                         # at each outer retry iteration. This protects against
                         # future in-attempt planning changes being inserted
@@ -2205,6 +2230,11 @@ class RetryingVmProvisioner:
                         # A durable launch fence is terminal. Never reinterpret
                         # it as provider capacity loss or clean up/fail over
                         # through a target that may have changed.
+                        raise
+                    except exceptions.ServeReplicaLaunchFenceError:
+                        # Identity/cohort drift is also a terminal correctness
+                        # fence.  It precedes bulk provisioning and must never
+                        # be reclassified as capacity loss or trigger cleanup.
                         raise
                     except provision_common.StopFailoverError as error:
                         if reserved_fill_pod_materialized:

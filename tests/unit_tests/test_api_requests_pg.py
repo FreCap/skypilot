@@ -165,9 +165,12 @@ def _gc_gcp_paid_pool_key(*,
             'num_nodes': 1,
             'region': region,
             'use_spot': True,
-            'version': 1,
+            'version': 2,
             'workspace': 'workspace-a',
             'zone': zone,
+            'provider_identity': {
+                'gcp_project_id': 'boltz-498512',
+            },
         },
         sort_keys=True,
         separators=(',', ':'))
@@ -2303,6 +2306,19 @@ def test_generic_binding_atomically_commits_exact_profile_request_queue_and_pin(
             })
 
 
+def test_stable_bound_submission_public_wrapper_opens_transaction(
+        bound_request_database) -> None:
+    engine, _ = bound_request_database
+    replica_record_id = str(uuid.uuid4())
+    with engine.begin() as connection:
+        expected = (request_postgres.
+                    stable_bound_ordinary_launch_submission_id_in_connection(
+                        connection, 'gc-service', 41, replica_record_id))
+
+    assert request_postgres.stable_bound_ordinary_launch_submission_id(
+        'gc-service', 41, replica_record_id) == expected
+
+
 @pytest.mark.parametrize('effect_phase', [
     ordinary_launch_binding.EffectPhase.NOT_STARTED,
     ordinary_launch_binding.EffectPhase.PROVIDER_IO
@@ -3482,11 +3498,11 @@ def test_gcp_paid_unknown_replacement_absence_uses_frozen_cleanup_graph(
 }, {
     'use_spot': False
 }, {
-    'version': 2
+    'provider_identity': {}
 }])
 def test_paid_unknown_replacement_database_guards_reject_pool_near_misses(
         bound_request_database, monkeypatch, pool_override) -> None:
-    """Pointer and association transitions require exact GCP v1 Spot."""
+    """Fresh pointer and association transitions require exact GCP v2."""
     graph = _prepare_paid_provider_absence_graph(
         bound_request_database,
         monkeypatch,
@@ -3712,15 +3728,21 @@ def test_gcp_paid_exact_presence_authorizes_only_immediate_cleanup(
         graph.context, graph.authority)
 
 
-def test_cancelled_gcp_paid_present_cleanup_then_absence_retires_atomically(
+def test_cancelled_gcp_v2_paid_present_cleanup_then_absence_retires_atomically(
         bound_request_database, monkeypatch) -> None:
-    """Explicit teardown keeps debits until exact GCP cleanup is absent."""
+    """Cohort-15 teardown keeps debits until exact GCP-v2 cleanup is absent."""
     graph = _prepare_paid_provider_absence_graph(
         bound_request_database,
         monkeypatch,
         pool_key=_gc_gcp_paid_pool_key(),
         production_http_normalization=True,
         explicit_cancel=True)
+    assert graph.context.capability_cohort_epoch == 15
+    pool_identity = json.loads(graph.pool_key)
+    assert pool_identity['version'] == 2
+    assert pool_identity['provider_identity'] == {
+        'gcp_project_id': 'boltz-498512'
+    }
     identity = request_postgres.bound_non_pool_gcp_provider_identity(
         graph.context, graph.authority)
     assert identity is not None
