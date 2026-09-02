@@ -16,6 +16,7 @@ failures publish ``FAILED_CLEANUP`` and remove the script; typed provider
 uncertainty retains it so a later exact census can finish automatically.
 """
 # pylint: disable=protected-access
+import json
 import types
 from unittest import mock
 import uuid
@@ -23,6 +24,7 @@ import uuid
 import pytest
 
 from sky import exceptions
+from sky.serve import non_pool_launch_reconciliation
 from sky.serve import ordinary_launch_binding
 from sky.serve import replica_managers
 from sky.serve import serve_state
@@ -39,6 +41,35 @@ def _replica(replica_id: int) -> replica_managers.ReplicaInfo:
                                         location=None,
                                         version=1,
                                         resources_override=None)
+
+
+def _failed_paid_provider_cleanup_replica(
+        replica_id: int) -> replica_managers.ReplicaInfo:
+    """Build the durable row left by a timed-out exact provider cleanup."""
+    info = _replica(replica_id)
+    info.is_spot = True
+    info.is_zero_cost = False
+    info.reserved_fill = False
+    info.paid_capacity_pool_key = json.dumps(
+        {
+            'accelerators': [['l4', 1]],
+            'cloud': 'aws',
+            'instance_type': 'g6.2xlarge',
+            'num_nodes': 1,
+            'region': 'eu-south-2',
+            'use_spot': True,
+            'version': 1,
+            'workspace': 'w',
+            'zone': 'eu-south-2a',
+        },
+        sort_keys=True,
+        separators=(',', ':'))
+    non_pool_launch_reconciliation.apply_immediate_provider_cleanup_replica_marker(
+        info)
+    info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+    assert ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+        info)
+    return info
 
 
 def _patch_common(monkeypatch, events, replicas):
@@ -67,7 +98,7 @@ def _patch_common(monkeypatch, events, replicas):
     def _reserve(_service_name, candidates, **_kwargs):
         replicas_by_id = {replica.replica_id: replica for replica in replicas}
         admitted = {}
-        for replica_id, _replica_record_id in candidates:
+        for replica_id, _ in candidates:
             replica = replicas_by_id[replica_id]
             replica.status_property.sky_down_status = (
                 common_utils.ProcessStatus.RUNNING)
@@ -718,6 +749,47 @@ def test_provider_uncertainty_retains_recovery_script_for_exact_retry(
                                       '/tmp/svc', 1, 'incarnation-a', 123, None)
 
     assert ('status', serve_state.ServiceStatus.FAILED_CLEANUP) in calls
+    assert ('remove_script', 'svc') not in calls
+
+
+def test_late_provider_cleanup_failure_retains_recovery_script(monkeypatch):
+    """A late provider timeout leaves durable work for the next owner."""
+    calls = []
+    info = _failed_paid_provider_cleanup_replica(1)
+    cleanup_finished = False
+    cleanup_results = iter((True, False))
+
+    def _replica_infos(_service_name):
+        # The initial teardown inventory is empty in this focused finalizer
+        # test. The exact retry marker becomes visible only after _cleanup's
+        # provider worker has failed, reproducing a late failure that is absent
+        # from the earlier provider_reconciliation_failures input.
+        return [info] if cleanup_finished else []
+
+    def _cleanup(*_args, **kwargs):
+        nonlocal cleanup_finished
+        assert not kwargs['provider_reconciliation_failures']
+        failed = next(cleanup_results)
+        # Make the durable retry row disappear before allowing the next
+        # finalizer pass to complete. Provider census behavior is tested at
+        # the provider-reconciliation boundary, not mocked by this test.
+        cleanup_finished = failed
+        return failed
+
+    _patch_finalize(monkeypatch, calls)
+    monkeypatch.setattr(serve_state, 'get_replica_infos', _replica_infos)
+    monkeypatch.setattr(service, '_cleanup', _cleanup)
+
+    service._run_cleanup_and_finalize('svc', types.SimpleNamespace(pool=False),
+                                      '/tmp/svc', 1, 'incarnation-a', 123, None)
+
+    assert ('status', serve_state.ServiceStatus.FAILED_CLEANUP) in calls
+    assert ('remove_script', 'svc') not in calls
+
+    service._run_cleanup_and_finalize('svc', types.SimpleNamespace(pool=False),
+                                      '/tmp/svc', 1, 'incarnation-a', 123, None)
+
+    assert calls.count(('removed', 'svc')) == 1
     assert ('remove_script', 'svc') not in calls
 
 
