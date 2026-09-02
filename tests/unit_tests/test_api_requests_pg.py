@@ -8622,7 +8622,7 @@ def test_managed_job_first_slot_rollout_marks_request_free_legacy_jobs(
         leader.release()
 
 
-def test_managed_job_first_slot_rollout_rejects_correlated_request(
+def test_managed_job_first_slot_rollout_quiesces_correlated_request(
         request_database, monkeypatch):
     engine, backend = request_database
     leader = _controller_leader(engine, monkeypatch, backend.instance_id)
@@ -8645,10 +8645,8 @@ def test_managed_job_first_slot_rollout_rejects_correlated_request(
                     **request_postgres._request_values_for_db(correlated)))
 
         assert leader.generation is not None
-        with pytest.raises(storage.ManagedJobRequestQuiescenceError,
-                           match='pre-slot managed jobs'):
-            backend.quiesce_stale_managed_job_requests(
-                (leader.instance_id, leader.generation), timeout_seconds=0)
+        assert backend.quiesce_stale_managed_job_requests(
+            (leader.instance_id, leader.generation), timeout_seconds=0) == 1
         with engine.connect() as connection:
             quiescing = connection.execute(
                 sqlalchemy.select(
@@ -8656,7 +8654,12 @@ def test_managed_job_first_slot_rollout_rejects_correlated_request(
                     controller_slot_quiescing).where(
                         managed_job_state_schema.job_info_table.c.spot_job_id ==
                         49)).scalar_one()
-        assert not quiescing
+        assert quiescing
+        restored = backend.get_request(correlated.request_id)
+        assert restored is not None
+        assert restored.status is requests.RequestStatus.CANCELLED
+        assert restored.execution_quiesced_generation == 0
+        assert restored.execution_quiesced_at is not None
     finally:
         leader.release()
 
