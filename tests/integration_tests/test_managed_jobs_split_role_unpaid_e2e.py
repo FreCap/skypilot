@@ -271,6 +271,16 @@ def _nested_requests(engine: sqlalchemy.Engine,
         'ORDER BY created_at, request_id', {'job_id': job_id})
 
 
+def _request_row(engine: sqlalchemy.Engine,
+                 request_id: str) -> dict[str, typing.Any] | None:
+    rows = _rows(
+        engine, 'SELECT status, return_value, error, '
+        'worker_instance_id::text AS worker_instance_id '
+        'FROM api_requests WHERE request_id = :request_id',
+        {'request_id': request_id})
+    return rows[0] if rows else None
+
+
 def _bootstrap_database(env: dict[str, str], root: pathlib.Path) -> None:
     migration_env = env.copy()
     migration_home = root / 'home-migrations'
@@ -545,6 +555,42 @@ def test_managed_job_nested_requests_survive_two_controller_successors(
                     done_job['controller_slot_id'])
             assert (row['managed_job_controller_slot_attempt'] ==
                     done_job['controller_slot_attempt'])
+
+        # Query through the real route and split-role request executor.  A
+        # non-empty result is essential: an empty list is already JSON-native
+        # and cannot detect missing enum/datetime wire encoding.
+        for include_cluster_events in (False, True):
+            events_response = requests.post(
+                f'{api_url}/jobs/events',
+                headers={
+                    server_constants.API_VERSION_HEADER: str(
+                        server_constants.API_VERSION)
+                },
+                json={
+                    'job_id': job_id,
+                    'task_id': 0,
+                    'limit': 100,
+                    'include_cluster_events': include_cluster_events,
+                },
+                timeout=10)
+            events_response.raise_for_status()
+            events_request_id = events_response.headers.get(
+                'X-Skypilot-Request-ID')
+            assert events_request_id is not None
+
+            events_request = _wait_for(
+                lambda request_id=events_request_id:
+                (row if (row := _request_row(engine, request_id)) is not None
+                 and row['status'] in _TERMINAL_REQUEST_STATUSES else None),
+                'managed job events request completion')
+            assert events_request['status'] == 'SUCCEEDED', events_request[
+                'error']
+            assert events_request['worker_instance_id'] == _C3_ID
+            events = events_request['return_value']
+            assert events
+            assert all(isinstance(event['new_status'], str) for event in events)
+            assert all(isinstance(event['timestamp'], str) for event in events)
+
         token_owners = _rows(
             engine, 'SELECT token_id FROM api_access_tokens '
             'WHERE job_id = :job_id', {'job_id': job_id})
