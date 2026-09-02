@@ -10,6 +10,7 @@ deletion is never automatic; a failed exact cleanup is an operator escalation.
 import argparse
 import asyncio
 import dataclasses
+import enum
 import hashlib
 import json
 import math
@@ -21,6 +22,9 @@ from typing import Awaitable, Callable, Protocol, TypeVar
 import urllib.parse
 
 import qualify
+
+from sky.serve import constants as serve_constants
+from sky.serve import lb_k8s
 
 _T = TypeVar('_T')
 
@@ -48,6 +52,24 @@ class CommandResult:
     stdout: str
 
 
+class EndpointMode(str, enum.Enum):
+    """Network path used only by the qualification request client."""
+
+    PUBLISHED = 'published'
+    IN_CLUSTER = 'in-cluster'
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class EndpointResolutionRequest:
+    """Durable authority needed to resolve one qualification endpoint."""
+
+    service_name: str
+    provider_scope: pathlib.Path
+
+
 class ServiceLifecycle(Protocol):
     """Narrow swappable boundary around SkyServe lifecycle operations."""
 
@@ -62,6 +84,54 @@ class ServiceLifecycle(Protocol):
 
     async def down(self, service_name: str) -> None:
         ...
+
+
+class ServiceEndpointResolver(Protocol):
+    """Swappable endpoint projection with no service lifecycle authority."""
+
+    async def resolve(self, request: EndpointResolutionRequest) -> str:
+        ...
+
+
+class PublishedEndpointResolver:
+    """Resolve the normal provider-published SkyServe endpoint."""
+
+    def __init__(self, lifecycle: ServiceLifecycle) -> None:
+        self._lifecycle = lifecycle
+
+    async def resolve(self, request: EndpointResolutionRequest) -> str:
+        return await self._lifecycle.endpoint(request.service_name)
+
+
+class InClusterEndpointResolver:
+    """Resolve the incarnation-scoped LB Service through cluster DNS."""
+
+    def __init__(self, *, namespace: str | None = None) -> None:
+        if namespace is not None and (not isinstance(namespace, str) or
+                                      not namespace):
+            raise ValueError('LB namespace must be a non-empty string.')
+        self._namespace = namespace
+
+    async def resolve(self, request: EndpointResolutionRequest) -> str:
+        # The frozen provider receipt is written from the current committed
+        # service row before qualification traffic, so no mutable lookup can
+        # redirect this client to another same-name service incarnation.
+        scope = qualify.read_provider_scope(request.provider_scope,
+                                            request.service_name)
+        namespace = self._namespace or lb_k8s.get_lb_namespace()
+        service_name = lb_k8s.lb_service_name(request.service_name,
+                                              scope.resource_scope)
+        return (f'http://{service_name}.{namespace}:'
+                f'{serve_constants.LOAD_BALANCER_PORT_START}')
+
+
+def _endpoint_resolver(mode: EndpointMode,
+                       lifecycle: ServiceLifecycle) -> ServiceEndpointResolver:
+    if mode is EndpointMode.PUBLISHED:
+        return PublishedEndpointResolver(lifecycle)
+    if mode is EndpointMode.IN_CLUSTER:
+        return InClusterEndpointResolver()
+    raise ValueError(f'Unsupported endpoint mode: {mode!r}.')
 
 
 class SkyCliLifecycle:
@@ -289,6 +359,11 @@ async def run_lifecycle(args: argparse.Namespace,
     if (args.workspace is not None and
         (not isinstance(args.workspace, str) or not args.workspace)):
         raise LifecycleError('Workspace must be a non-empty string.')
+    try:
+        endpoint_mode = EndpointMode(args.endpoint_mode)
+    except (TypeError, ValueError) as error:
+        raise LifecycleError('Qualification endpoint mode is invalid.') \
+            from error
     artifacts = LifecycleArtifacts.create(pathlib.Path(args.artifacts_dir),
                                           args.service_name)
     existing = [
@@ -307,6 +382,7 @@ async def run_lifecycle(args: argparse.Namespace,
         down_timeout_seconds=args.down_timeout_seconds,
         poll_seconds=args.poll_seconds,
         workspace=args.workspace)
+    endpoint_resolver = _endpoint_resolver(endpoint_mode, lifecycle)
     primary_error: BaseException | None = None
     scope_recovery_error: BaseException | None = None
     serve_down_error: BaseException | None = None
@@ -338,8 +414,12 @@ async def run_lifecycle(args: argparse.Namespace,
             receipt, 'freeze-scope',
             lambda: asyncio.to_thread(qualify.freeze_provider_scope, scope_args)
         )
+        endpoint_request = EndpointResolutionRequest(
+            service_name=args.service_name,
+            provider_scope=artifacts.provider_scope)
         endpoint = await _record_stage(
-            receipt, 'endpoint', lambda: lifecycle.endpoint(args.service_name))
+            receipt, 'endpoint',
+            lambda: endpoint_resolver.resolve(endpoint_request))
         await _record_stage(
             receipt, 'qualify', lambda: qualify.qualify(
                 argparse.Namespace(profile=args.profile,
@@ -445,6 +525,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--endpoint-timeout-seconds',
                         type=float,
                         default=15 * 60)
+    parser.add_argument('--endpoint-mode',
+                        type=EndpointMode,
+                        choices=tuple(EndpointMode),
+                        default=EndpointMode.PUBLISHED,
+                        help=('Endpoint path for qualification traffic. '
+                              'Published is the default; in-cluster resolves '
+                              'the incarnation-scoped LB Service DNS.'))
     parser.add_argument('--scope-timeout-seconds', type=float, default=5 * 60)
     parser.add_argument('--down-timeout-seconds', type=float, default=5 * 60)
     parser.add_argument('--cleanup-timeout-seconds',
