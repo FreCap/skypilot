@@ -76,8 +76,8 @@ def _frozen_identity(
                               zero_cost_actuation.IntentLease) or
             type(spec.launch_limit) is not int or spec.launch_limit < 1):
         raise ValueError('Reserved-fill admission input is malformed.')
-    if (spec.replica_info.status_property.sky_launch_status !=
-            common_utils.ProcessStatus.RUNNING or
+    if (spec.replica_info.status_property.sky_launch_status
+            != common_utils.ProcessStatus.RUNNING or
             spec.replica_info.status_property.sky_down_status is not None):
         raise ValueError('Reserved-fill admission must reserve a RUNNING '
                          'launch without teardown intent.')
@@ -108,8 +108,8 @@ def _frozen_identity(
             intent.controller_pid != authority.controller_pid or
             intent.controller_ip != authority.controller_ip or
             intent.replica_id != spec.replica_info.replica_id or
-            str(intent.replica_record_id) !=
-            spec.replica_info.replica_record_id):
+            str(intent.replica_record_id)
+            != spec.replica_info.replica_record_id):
         raise ValueError('Frozen launch does not match controller authority.')
     return body, intent
 
@@ -119,6 +119,7 @@ def _stage_and_bind_in_savepoint(
     spec: AdmissionSpec,
     lease_token: int | None,
     *,
+    runtime: request_postgres.NonPoolLaunchBindingRuntime,
     require_existing: bool,
 ) -> tuple[serve_state.StagedReservedFillReplica, AdmissionReceipt]:
     staged = (
@@ -255,7 +256,9 @@ def _stage_and_bind_in_savepoint(
             built.request.request_body) != built.identity.input_digest):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Atomic fill request body does not match its canonical digest.')
-    admission = non_pool_admission.bind_in_transaction(connection, built)
+    admission = non_pool_admission.bind_in_transaction(connection,
+                                                       built,
+                                                       runtime=runtime)
     if require_existing and admission.created:
         raise AdmissionAmbiguousError(
             'Lost-ACK hydration found no existing request.')
@@ -302,6 +305,7 @@ def _stage_and_bind(
     spec: AdmissionSpec,
     lease_token: int | None,
     *,
+    runtime: request_postgres.NonPoolLaunchBindingRuntime,
     require_existing: bool,
 ) -> tuple[serve_state.StagedReservedFillReplica, AdmissionReceipt]:
     """Stage the complete tuple behind one caller-usable savepoint."""
@@ -310,6 +314,7 @@ def _stage_and_bind(
         result = _stage_and_bind_in_savepoint(connection,
                                               spec,
                                               lease_token,
+                                              runtime=runtime,
                                               require_existing=require_existing)
     except BaseException as error:
         try:
@@ -335,8 +340,14 @@ def _stage_and_bind(
 
 
 def _transaction(
-    spec: AdmissionSpec, lease_token: int | None, *, require_existing: bool
+    spec: AdmissionSpec,
+    lease_token: int | None,
+    *,
+    runtime: request_postgres.NonPoolLaunchBindingRuntime | None = None,
+    require_existing: bool,
 ) -> tuple[serve_state.StagedReservedFillReplica, AdmissionReceipt]:
+    if runtime is None:
+        runtime = request_postgres.prepare_non_pool_launch_binding_runtime()
     engine = request_postgres.initialize_and_get_db()
     connection = engine.connect()
     transaction_error: BaseException | None = None
@@ -366,6 +377,7 @@ def _transaction(
             staged_receipt = _stage_and_bind(connection,
                                              spec,
                                              lease_token,
+                                             runtime=runtime,
                                              require_existing=require_existing)
         except BaseException as error:
             try:
@@ -413,6 +425,7 @@ def admit(spec: AdmissionSpec) -> AdmissionResult:
     """Commit one complete tuple, returning a closed three-way result."""
     try:
         _frozen_identity(spec)
+        runtime = request_postgres.prepare_non_pool_launch_binding_runtime()
         if not request_postgres.non_pool_launch_binding_fleet_capable():
             raise _Rejected('The generic request fleet is not yet capable.')
     except BaseException as error:  # pylint: disable=broad-exception-caught
@@ -423,7 +436,8 @@ def admit(spec: AdmissionSpec) -> AdmissionResult:
     deferred_interrupt: BaseException | None = None
     try:
         staged, receipt = reserved_capacity_broker.run_fill_persist_transaction(
-            lambda token: _transaction(spec, token, require_existing=False))
+            lambda token: _transaction(
+                spec, token, runtime=runtime, require_existing=False))
     except (_Rejected,
             reserved_capacity_broker.ReservedFillPersistRejected) as error:
         return AdmissionResult(AdmissionDisposition.REJECTED, detail=str(error))
@@ -434,7 +448,7 @@ def admit(spec: AdmissionSpec) -> AdmissionResult:
             staged, receipt = (
                 reserved_capacity_broker.run_fill_persist_transaction(
                     lambda token: _transaction(
-                        spec, token, require_existing=True)))
+                        spec, token, runtime=runtime, require_existing=True)))
         except BaseException as read_error:  # pylint: disable=broad-except
             if deferred_interrupt is not None:
                 # Once an operator interrupt crosses an uncertain commit

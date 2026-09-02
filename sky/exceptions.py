@@ -82,8 +82,8 @@ def is_safe_exception(exc: BaseException) -> bool:
     # registry: a class merely living below ``sky.*`` is not reconstructible
     # by an older client and must use the client-safe CloudError envelope.
     exception_class = type(exc)
-    return (_deserializable_exception_class(exception_class.__name__) is
-            exception_class)
+    return (_deserializable_exception_class(exception_class.__name__)
+            is exception_class)
 
 
 def wrap_exception(exc: BaseException) -> BaseException:

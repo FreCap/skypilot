@@ -94,6 +94,9 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/internal/serve/non-pool-launch', 'POST'),
     ('/internal/resource-actions/v1/launch-identity/canonicalize', 'POST'),
     ('/api/internal/serve/{service_name}/demand', 'POST'),
+    # Authenticated LB-to-controller async request ledger submission; a write
+    # path that is never a viewer API.
+    ('/api/internal/serve/{service_name}/async-request-ledger', 'POST'),
     # --- Managed container image writes ---
     ('/images/publications', 'POST'),
     ('/images/artifacts/{image_id}/prepare', 'POST'),

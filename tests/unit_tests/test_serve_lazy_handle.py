@@ -491,9 +491,9 @@ class TestControllerHttpRetryTightened:
 class TestGetServiceStatusPickledParallel:
     """`get_service_status_pickled` fans out across services. The change
     must preserve four contracts: (a) returned list sorted by 'name'; (b)
-    None statuses filtered out; (c) first failure aborts the whole call
-    (matching legacy serial behavior); (d) contextvars propagate into
-    workers so request-scoped log redirection keeps working."""
+    None statuses filtered out; (c) one service's failed snapshot is
+    omitted without aborting its healthy peers; (d) contextvars propagate
+    into workers so request-scoped log redirection keeps working."""
 
     def _fake_status(self, name):
         return {
@@ -547,10 +547,10 @@ class TestGetServiceStatusPickledParallel:
                 ['svc-a', 'svc-gone', 'svc-b'], pool=False)
         assert len(out) == 2
 
-    def test_first_failure_raises_like_serial(self):
-        """ex.map() yields in input order and re-raises the first
-        exception it encounters. Matches the legacy for-loop contract:
-        any failure surfaces immediately."""
+    def test_failed_service_is_omitted_without_aborting_peers(self):
+        """A malformed snapshot is not evidence about any peer service:
+        the failing service is dropped from this poll and every healthy
+        peer is still returned instead of the whole batch failing."""
 
         class Boom(Exception):
             pass
@@ -565,9 +565,13 @@ class TestGetServiceStatusPickledParallel:
 
         with mock.patch('sky.serve.serve_utils._prepare_service_status',
                         side_effect=side):
-            with pytest.raises(Boom):
-                serve_utils.get_service_status_pickled(
-                    ['svc-a', 'svc-boom', 'svc-b'], pool=False)
+            out = serve_utils.get_service_status_pickled(
+                ['svc-a', 'svc-boom', 'svc-b'], pool=False)
+        decoded_names = [
+            pickle.loads(base64.b64decode(s['name'].encode('utf-8')))
+            for s in out
+        ]
+        assert decoded_names == ['svc-a', 'svc-b']
 
     def test_empty_input_short_circuits(self):
         """Empty `service_names` must NOT spawn an executor (cheap path

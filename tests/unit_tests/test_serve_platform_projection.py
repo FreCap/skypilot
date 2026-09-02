@@ -140,6 +140,49 @@ def _current_bootstrap_pod_environment() -> list[dict[str, str]]:
         kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT.items())]
 
 
+# The bootstrap script only accepts root-owned (uid 0, gid 0) host
+# directories, and the suite runs unprivileged.  Present the invoking user's
+# own files to the bootstrap subprocess as root-owned so the mode, sticky-bit,
+# symlink and leaf-normalization contracts execute byte-for-byte; files owned
+# by anyone else keep their real identity and remain rejected.
+_FAKE_ROOT_SITECUSTOMIZE = """\
+import os
+
+_EUID = os.geteuid()
+_EGID = os.getegid()
+_REAL_FSTAT = os.fstat
+
+
+def _as_root(metadata):
+    values = list(metadata)
+    if metadata.st_uid == _EUID:
+        values[4] = 0
+    if metadata.st_gid == _EGID:
+        values[5] = 0
+    return os.stat_result(tuple(values))
+
+
+os.fstat = lambda file_descriptor: _as_root(_REAL_FSTAT(file_descriptor))
+"""
+
+
+def _install_fake_root_ownership(fake_bin: pathlib.Path,
+                                 environment: dict) -> None:
+    if os.geteuid() == 0:
+        return
+    (fake_bin / 'sitecustomize.py').write_text(_FAKE_ROOT_SITECUSTOMIZE,
+                                               encoding='utf-8')
+    environment['PYTHONPATH'] = os.pathsep.join(
+        path for path in (str(fake_bin), environment.get('PYTHONPATH')) if path)
+
+
+def _expected_cache_owner() -> tuple[int, int]:
+    """Owner the bootstrap leaves behind: root, or the fake-root test user."""
+    if os.geteuid() == 0:
+        return (0, 0)
+    return (os.geteuid(), os.getegid())
+
+
 def _run_cache_bootstrap(tmp_path: pathlib.Path,
                          cache=None,
                          *,
@@ -181,6 +224,7 @@ def _run_cache_bootstrap(tmp_path: pathlib.Path,
         'FAKE_FINDMNT_TARGET': str(parent) if target is None else target,
         'PATH': f'{fake_bin}:{environment["PATH"]}',
     })
+    _install_fake_root_ownership(fake_bin, environment)
     result = subprocess.run([
         *kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_COMMAND,
         kubernetes_pod_spec.serve_worker_cache_bootstrap_script(
@@ -210,7 +254,7 @@ def test_cache_bootstrap_creates_leaf_idempotently_with_live_parent_shape(
     for path in (leaf_parent, leaf):
         metadata = path.stat()
         assert (metadata.st_uid, metadata.st_gid,
-                metadata.st_mode & 0o7777) == (0, 0, 0o755)
+                metadata.st_mode & 0o7777) == (*_expected_cache_owner(), 0o755)
 
 
 @pytest.mark.parametrize('retained_mode', [0o757, 0o775, 0o777])
@@ -226,7 +270,7 @@ def test_cache_bootstrap_tightens_root_owned_final_leaf(tmp_path,
     assert normalized.returncode == 0, normalized.stderr
     metadata = leaf.stat()
     assert (metadata.st_uid, metadata.st_gid,
-            metadata.st_mode & 0o7777) == (0, 0, 0o755)
+            metadata.st_mode & 0o7777) == (*_expected_cache_owner(), 0o755)
 
 
 def test_protocol_v8_cache_bootstrap_does_not_normalize_released_leaf(tmp_path):
@@ -461,6 +505,7 @@ def test_cache_bootstrap_is_concurrent_mkdir_safe(tmp_path):
         'FAKE_FINDMNT_TARGET': str(parent),
         'PATH': f'{fake_bin}:{environment["PATH"]}',
     })
+    _install_fake_root_ownership(fake_bin, environment)
     command = [
         *kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_COMMAND,
         kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT_V9,

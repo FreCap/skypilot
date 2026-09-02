@@ -43,7 +43,7 @@ _CALLABLE_CONTRACT = {
     '_headers_without_request_priority': (
         staticmethod,
         '(request: starlette.requests.Request) -> Any',
-        'f101768fccc16883bca71e1414e362d47dc23914ad0d2a494719d575cbe8a165',
+        '7af76f48739fd6cff3825738cfbba423675d218398cf500b024155f5bb88132e',
     ),
 }
 
