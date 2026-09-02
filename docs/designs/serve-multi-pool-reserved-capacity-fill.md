@@ -64,25 +64,34 @@ proved all 800 stimulus identities queued at 18:27:32.844. No replica was
 positive-processing deadline, so the qualifier cancelled demand at 18:29:36
 while provisioning was making progress. Provider census subsequently observed
 33 running AWS Spot VMs out of 36 instances at 18:30:09, and PostgreSQL had
-committed 100 exact claims. A queued request has no async ledger row before
-dispatch, so requiring positive in-flight/processing evidence before observing
-physical provider scale made ordinary cold-start progress indistinguishable
-from failure.
+committed 100 exact claims. The failed run eventually peaked at 53 physical
+provider-``RUNNING`` VMs. Revision 749 then terminated the service before its
+lifecycle receipt could complete, but an independent cleanup observer retained
+three consecutive exact-zero AWS, GCP, and PostgreSQL samples. A queued request
+has no async ledger row before dispatch, so requiring positive
+in-flight/processing evidence before observing physical provider scale made
+ordinary cold-start progress indistinguishable from failure.
 
-Receipt schema 9 orders the independent facts correctly. Exactly 800 queued
-and attributable identities—with zero in-flight requests and zero active
-ledger rows allowed—first drive and accompany the at-least-100 physical
-provider-``RUNNING`` proof. The qualifier then requires a fresh sample with
-positive queue, in-flight, processing, confirmed occupancy, and exact active
-ledger attribution before it opens the completion gate. That post-scale sample
-must arrive within the immutable queue/runtime budget: from the pre-demand
-clock, the 600-second queue timeout minus eight worst-case 20-second stimulus
-waves at the 100-machine threshold and one 10-second observation interval, or
-430 seconds. Only then does the exact tail run as 23 sequential 400-request
-batches at concurrency 128. The 10,000 requests are deliberately not required
-to be simultaneous; every one must still succeed and the final PostgreSQL
-delta must remain exactly 10,000 ``SUCCEEDED`` rows. Source tests are complete;
-merge, deployment, and the next billable run remain open.** One
+Receipt schema 9 keeps the two independent facts independent. Exactly 800
+queued and attributable identities—with zero in-flight requests and zero active
+ledger rows allowed—first establish the scale stimulus. The qualifier then
+runs the at-least-100 physical provider-``RUNNING`` proof and the positive
+request-telemetry proof concurrently against that same held cohort. Positive
+telemetry may precede or follow physical qualification; it requires positive
+in-flight, processing, confirmed occupancy, exact active-ledger attribution,
+and exactly 800 queued plus in-flight identities, but queue depth may already
+be zero after full dispatch. The completion gate opens only after both tasks
+succeed; either failure cancels and awaits its sibling while leaving the gate
+closed. The positive sample's absolute deadline is the frozen 600-second queue
+timeout minus one 10-second observation margin, or 590 seconds from the
+pre-demand clock. The physical proof retains its independent 300-second SLO
+and stops starting observations once that absolute deadline passes. Only then
+does the exact tail run as 23 sequential 400-request batches at concurrency
+128. The 10,000 requests are deliberately not required to be simultaneous;
+every one must still succeed and the final PostgreSQL delta must remain exactly
+10,000 ``SUCCEEDED`` rows. Source tests are complete; merge, staging, and the
+next billable run remain open. This qualifier-only change does not require a
+Helm deployment.** One
 PostgreSQL-authoritative planner
 is the canonical source path for reservation-aware actuation and paid Spot
 residual. Historical production runs proved complete East occupancy,
@@ -330,7 +339,7 @@ exact one-L4 backend shape without pinning an instance type, so its 800-slot
 target authorizes 800 physical backends and comfortably exceeds the provider
 gate. The campaign first submits 800 immutable async identities and proves that
 exact bounded cohort is resident. An explicit completion gate retains every
-dispatched identity through the provider scale observation without turning its
+dispatched identity through both independent proofs without turning its
 synthetic worker duration into a five-minute GPU reservation. Every scale
 sample requires exactly those 800 queued plus in-flight identities, active
 ledger rows equal to dispatched in-flight identities (including the valid
@@ -338,17 +347,19 @@ queued-only value zero), exactly 800 stable-job
 arrivals in the 300-second scale window, and zero headerless or saturated
 arrival tracking. The provider must reach at least 100 physical
 provider-``RUNNING`` Spot VMs within five minutes of the pre-request scale
-clock.
+clock and stops starting new censuses after that absolute SLO.
 
-After that physical scale gate, and before releasing the cohort, the qualifier
-must observe positive queued, in-flight, processing, confirmed-occupancy, and
-active-ledger evidence for the same exact stimulus. Its absolute deadline is
-derived from the frozen contract rather than a standalone timer: queue timeout
-minus enough worker runtime to drain ``ceil(800 / 100)`` stimulus waves at the
-minimum physical threshold, minus one observation interval. For the current
-600-second queue, 20-second synthetic request, and 10-second polling contracts,
-that is 430 seconds from the pre-demand clock. Only then does it release the
-cohort and send the remaining 9,200 identities in 23 sequential batches of 400,
+After the resident-stimulus proof, the physical scale gate and request
+telemetry gate run concurrently. The request gate must observe positive
+in-flight, processing, confirmed-occupancy, and active-ledger evidence for the
+same exact stimulus. Queue depth may be zero once all 800 identities dispatch,
+but queued plus in-flight must remain exactly 800. Its absolute deadline is
+derived directly from the frozen contract rather than provider readiness:
+queue timeout minus one observation interval. For the current 600-second queue
+and 10-second polling contracts, that is 590 seconds from the pre-demand clock.
+The completion gate opens only after both proofs succeed. Either proof failure
+cancels and awaits the other without opening the gate. The qualifier then sends
+the remaining 9,200 identities in 23 sequential batches of 400,
 each with at most 128 HTTP connections. A batch may queue normally and every
 request in it must succeed before the next batch. The 10,000 requests are not
 simultaneous. The final PostgreSQL reduction must still show exactly 10,000 new
@@ -470,7 +481,8 @@ that blocks runtime setup after provider return while proving the next paid
 wave is admitted from the marker within one controller reconciliation. The
 production gate remains cold at-least-100 provider-``RUNNING`` Spot VMs within
 five minutes, 10,000 exact async ``SUCCEEDED`` ledger completions with fresh
-positive queued/in-flight/processing telemetry, and natural exact-zero drain.
+positive in-flight/processing telemetry (queue may be zero after full
+dispatch), and natural exact-zero drain.
 The current atomic request-binding and GCP-v2 correction requires the
 forward-only Serve067 additive control-plane migration. It replaces the exact
 existing paid-pool constraints and guard-function fragments; it creates no
@@ -2036,7 +2048,7 @@ it has merged or been deployed.
 | Fixed paid pacing | **Deployed since `1.1.1578`; final fast-scale qualification remains.** Durable logical services use one configured fixed wave and PostgreSQL owns the accepted paid-window cursor across takeover. Campaign `spot-e2e-0901k` proved that the bounded 120-unit service window no longer truncates the target; its delayed second wave identified terminal-only provider feedback as the remaining latency source. |
 | Atomic plan and paid admission | **Atomic executable-request binding is deployed homogeneously in `1.1.1618`; live provider qualification remains open.** The current writer invokes the one planner and inserts the accepted wave plus association/request/queue/pin/pointer before releasing the service-row lock. No freshness comparator or TTL is relaxed. There is no second request-admission transaction, singleton fanout, batch-to-singleton fallback, or process-local recovery handoff. Release `1.1.1583` separately closed restart-adoption mutation by making existing-claim replay validation-only. |
 | Paid restart replay and frozen cleanup | **The replay correction, historical repair, and final row settlement are production-complete; the temporary repair is ready for removal.** Recovery supplied priority 0 to an adoption UPSERT that rewrote nine existing priority-20 claims after their profiles were frozen. Release `1.1.1583` made existing claim replay/adoption validation-only and deployed a cleanup-only transition accepting solely a current priority of 0 whose historical-priority reconstruction exactly matches the frozen profile. Production released all nine claims. Release `1.1.1584` then consumed each exact same-record irreversible `COMMITTED` receipt atomically with its replica; supported cleanup also settled the two older `ACTIVE` rows. The affected PostgreSQL graph reached exact zero and stayed provider/cleanup-clean for 372 seconds, satisfying the strict-removal gate. |
-| Provider-native paid E2E | **Count and cleanup pass on the historical writer; the five-minute and exact-ledger gates remain open.** `spot-e2e-0901k` reached 113 concurrent provider-`RUNNING` GCP Spot L4 VMs and first crossed 100 at 343.5 seconds, with zero ordinary on-demand/wrong-shape capacity. Normal cleanup returned claims, debits, VMs, disks, operations, and the service to three exact-zero samples. A homogeneous cohort-15 successor must repeat the run within five minutes, complete 10,000 authenticated async requests, and capture fresh positive queued/in-flight/processing plus exact terminal-ledger evidence before natural exact-zero drain. |
+| Provider-native paid E2E | **Count and cleanup pass on the historical writer; the five-minute and exact-ledger gates remain open.** `spot-e2e-0901k` reached 113 concurrent provider-`RUNNING` GCP Spot L4 VMs and first crossed 100 at 343.5 seconds, with zero ordinary on-demand/wrong-shape capacity. Normal cleanup returned claims, debits, VMs, disks, operations, and the service to three exact-zero samples. A homogeneous cohort-15 successor must repeat the run within five minutes, complete 10,000 authenticated async requests, and capture fresh positive in-flight/processing plus exact terminal-ledger evidence before natural exact-zero drain; queue depth may be zero after full dispatch. |
 | Format-4 activation | **Superseded cleanly.** No older capacity plan, claim, or provider effect crossed the strict-current decoder boundary before format 6 activation. There was no row rewrite, compatibility decoder, storage migration, or infrastructure change. |
 | Format-6 activation | **Complete from an exact-zero service recreation and current through `1.1.1598`.** Current writers strictly reject formats 1--5; lifecycle 152 and later campaigns committed schema-6 heads and paid waves. The service is now absent, so the next clean fleet creation requires no retained service-version migration. |
 | Lifecycle-137 evidence | Release `1.1.1554` reached exactly 100 provider-`RUNNING` GCP Spot one-L4 workers with zero ordinary on-demand and zero wrong-shape capacity. All 10,000 authenticated warm requests returned first-attempt HTTP 200. Normal down converged service, replica, claim, waiter, VM, and disk state to exact zero before the schema-3 cutover. |
@@ -3975,11 +3987,14 @@ unattributed/headerless arrivals; every provider scale sample must itself
 retain those 800 queued plus in-flight identities, positive PostgreSQL and
 load-balancer demand, and an in-flight gauge equal to active exact-ledger rows.
 Before any replica is ready, both exact values may be zero while all 800
-identities remain queued; that state is valid physical-scale evidence. Once the
-physical gate passes, a separate fresh sample must prove positive queue,
-in-flight, processing, confirmed occupancy, and active-ledger attribution
-within the queue/runtime-derived 430-second deadline before the completion gate
-opens.
+identities remain queued; that state is valid physical-scale evidence. The
+physical proof and a separate fresh request proof run concurrently after the
+stimulus is established. The request proof requires positive in-flight,
+processing, confirmed occupancy, and active-ledger attribution; queue depth may
+be zero after full dispatch, while queued plus in-flight remains exactly 800.
+It may complete before or after physical qualification and must complete by the
+queue-derived 590-second deadline. The completion gate opens only when both
+proofs pass.
 Its exact one-L4 task shape and 800 logical-slot cap therefore permit the
 at-least-100 physical gate. After that gate, the remaining 9,200 identities run
 in sequential 400-request batches with bounded 128-request HTTP concurrency;
@@ -4247,9 +4262,13 @@ these remaining current-writer acceptance gates:
    retain it through an explicit completion gate while proving zero
    unattributed/headerless arrivals and at least 100 physical Spot VMs within
    five minutes. Queued-only demand with zero in-flight/active rows is valid
-   until a replica becomes ready. After physical scale, prove positive queued,
-   processing, in-flight, confirmed-occupancy and active-ledger telemetry by
-   the queue/runtime-derived deadline; only then release the gate. Send the
+   until a replica becomes ready. Run that physical proof concurrently with a
+   positive processing, in-flight, confirmed-occupancy and active-ledger proof
+   against the same held cohort. Positive telemetry may have zero queue depth
+   after full dispatch, but queued plus in-flight must remain exactly 800.
+   Require both proofs before releasing the gate; either failure cancels its
+   sibling and leaves the gate closed. Keep the independent five-minute
+   physical SLO and the queue-derived 590-second request deadline. Send the
    9,200-identity tail in 23 sequential batches of 400 with at most 128 HTTP
    connections. The 10,000 requests are not simultaneous. Require every
    request in every batch to succeed and require the final immutable ledger

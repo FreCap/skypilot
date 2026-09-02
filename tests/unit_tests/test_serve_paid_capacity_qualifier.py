@@ -577,16 +577,16 @@ def test_scale_profile_exceeds_physical_gate_for_rendered_shape():
     assert profile.scale_up_min_replicas == profile.max_units
 
 
-def test_positive_telemetry_deadline_reserves_queue_processing_headroom():
+def test_positive_telemetry_deadline_uses_frozen_queue_timeout_margin():
     profile = qualifier.PROFILES['scale']
 
     assert profile.request_queue_timeout_seconds == 600
     assert qualifier.positive_telemetry_deadline_monotonic(
-        profile, scale_started_monotonic=100.0) == 530.0
+        profile, scale_started_monotonic=100.0) == 690.0
 
-    with pytest.raises(ValueError, match='cannot preserve'):
+    with pytest.raises(ValueError, match='polling margin'):
         qualifier.positive_telemetry_window_seconds(
-            dataclasses.replace(profile, request_queue_timeout_seconds=470))
+            dataclasses.replace(profile, request_queue_timeout_seconds=10))
 
 
 def test_scale_queue_only_admits_one_stimulus_plus_one_tail_batch():
@@ -3175,6 +3175,188 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
            ] == [None, 'QualificationError', None]
 
 
+def test_scale_and_positive_gates_accept_fully_dispatched_cohort_concurrently(
+        tmp_path):
+    """Positive telemetry must not wait for the physical provider gate."""
+    profile = dataclasses.replace(qualifier.PROFILES['scale'], poll_seconds=0)
+    gcp_names = _provider_cluster_names('gcp', 50)
+    aws_names = _provider_cluster_names('aws', 50)
+    database = _database_state(
+        paid_debit_units=100,
+        demand_units=800,
+        bound_cluster_zones=tuple(
+            (name, 'us-central1-a') for name in gcp_names),
+        aws_provider_identities=tuple(
+            _aws_identity(client_token=f'token-aws-{index}', cluster_name=name)
+            for index, name in enumerate(aws_names)))
+    started_monotonic = time.monotonic()
+    started_at = time.time()
+    gate = qualifier.ExactRequestCompletionGate()
+
+    class Observer:
+        """Dispatch the whole cohort while provider scale is still at 99."""
+
+        def __init__(self):
+            self.provider_reads = 0
+
+        @staticmethod
+        async def request_telemetry():
+            return _request_telemetry(queue_depth=0,
+                                      in_flight=800,
+                                      processing=100,
+                                      state_counts={'ACCEPTED': 800})
+
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
+            self.provider_reads += 1
+            running = 99 if self.provider_reads == 1 else 100
+            gcp_running = running - 50
+            observation = _observation(
+                observed_at=started_at + self.provider_reads,
+                observed_monotonic=started_monotonic + self.provider_reads,
+                database=database,
+                provider=_cross_cloud_provider_state(
+                    gcp_running_count=gcp_running, aws_running_count=50),
+                load_balancer=_load_balancer_state(
+                    demand_units=800,
+                    unique_job_arrivals_60s=800,
+                    unique_job_arrivals_300s=800))
+            if running == 99:
+                await asyncio.sleep(0)
+                assert not gate.released
+            return observation
+
+    async def exercise():
+        observer = Observer()
+        progress = qualifier.Progress(scale_started_monotonic=started_monotonic,
+                                      scale_started_at=started_at)
+        receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                    service_name='paid-e2e',
+                                    profile=profile)
+        receipt.request_telemetry('scale-stimulus',
+                                  _request_telemetry(queue_depth=800))
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            await qualifier._wait_for_scale_and_positive_request_telemetry(
+                observer=observer,
+                profile=profile,
+                progress=progress,
+                receipt=receipt,
+                traffic=traffic,
+                completion_gate=gate,
+                baseline=_request_telemetry(),
+                expectation=qualifier.provider_expectation(profile, None),
+                positive_deadline_monotonic=started_monotonic + 590)
+            return observer, progress, receipt
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+
+    observer, progress, receipt = asyncio.run(exercise())
+    assert observer.provider_reads == 2
+    assert progress.scale_reached_monotonic == started_monotonic + 2
+    assert gate.released
+    phases = [
+        sample['phase']
+        for sample in receipt._payload['request_telemetry_samples']
+    ]
+    assert phases == ['scale-stimulus', 'scale', 'positive', 'scale']
+    positive = next(
+        sample for sample in receipt._payload['request_telemetry_samples']
+        if sample['phase'] == 'positive')
+    assert positive['queue_depth'] == 0
+    assert positive['in_flight_requests'] == 800
+    assert positive['processing_requests'] == 100
+
+
+def test_scale_and_positive_gate_failure_cancels_sibling_without_release(
+        tmp_path, monkeypatch):
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+    gate = qualifier.ExactRequestCompletionGate()
+
+    async def fail_scale(**_kwargs):
+        await sibling_started.wait()
+        raise qualifier.QualificationError('physical gate failed')
+
+    async def wait_positive(**_kwargs):
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_cancelled.set()
+
+    monkeypatch.setattr(qualifier, '_wait_for_scale', fail_scale)
+    monkeypatch.setattr(qualifier, '_wait_for_positive_request_telemetry',
+                        wait_positive)
+
+    async def exercise():
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='physical gate failed'):
+                await qualifier._wait_for_scale_and_positive_request_telemetry(
+                    observer=object(),
+                    profile=qualifier.PROFILES['scale'],
+                    progress=qualifier.Progress(),
+                    receipt=qualifier.Receipt(
+                        path=tmp_path / 'receipt.json',
+                        service_name='paid-e2e',
+                        profile=qualifier.PROFILES['scale']),
+                    traffic=traffic,
+                    completion_gate=gate,
+                    baseline=_request_telemetry(),
+                    expectation=qualifier.provider_expectation(
+                        qualifier.PROFILES['scale'], None),
+                    positive_deadline_monotonic=time.monotonic() + 1)
+            assert sibling_cancelled.is_set()
+            assert not gate.released
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+def test_scale_wait_stops_at_absolute_physical_slo(tmp_path):
+    profile = dataclasses.replace(qualifier.PROFILES['small'],
+                                  poll_seconds=1,
+                                  scale_slo_seconds=300,
+                                  scale_timeout_seconds=900)
+
+    class Observer:
+
+        def __init__(self):
+            self.telemetry_reads = 0
+
+        async def request_telemetry(self):
+            self.telemetry_reads += 1
+            raise AssertionError('polled after the physical scale SLO')
+
+    async def exercise():
+        observer = Observer()
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='Provider did not reach'):
+                await qualifier._wait_for_scale(
+                    observer=observer,
+                    profile=profile,
+                    progress=qualifier.Progress(
+                        scale_started_monotonic=time.monotonic() - 301),
+                    receipt=qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                              service_name='paid-e2e',
+                                              profile=profile),
+                    traffic=traffic,
+                    baseline=_request_telemetry())
+            assert observer.telemetry_reads == 0
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
 def test_aggregate_accepts_queued_only_physical_scale_before_positive(tmp_path):
     args = _aggregate_args(tmp_path)
     receipt = pathlib.Path(args.economic_receipt)
@@ -3197,7 +3379,7 @@ def test_aggregate_accepts_queued_only_physical_scale_before_positive(tmp_path):
     qualifier.aggregate_evidence(args)
 
 
-@pytest.mark.parametrize('positive_observed_at', [248.0, 435.0])
+@pytest.mark.parametrize('positive_observed_at', [4.5, 595.0])
 def test_aggregate_rejects_positive_outside_post_scale_queue_window(
         tmp_path, positive_observed_at):
     args = _aggregate_args(tmp_path)

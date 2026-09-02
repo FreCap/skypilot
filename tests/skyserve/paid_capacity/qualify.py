@@ -165,18 +165,12 @@ def scale_stimulus_count(profile: Profile) -> int:
 
 
 def positive_telemetry_window_seconds(profile: Profile) -> float:
-    """Return the queue-bounded window for observing the first dispatch."""
-    minimum_waves = math.ceil(
-        scale_stimulus_count(profile) / profile.minimum_running)
-    drain_budget = minimum_waves * request_processing_seconds(profile)
-    observation_budget = max(1.0, profile.poll_seconds)
-    usable_queue_window = (profile.request_queue_timeout_seconds -
-                           drain_budget - observation_budget)
-    window = min(profile.scale_timeout_seconds, usable_queue_window)
-    if not math.isfinite(window) or window <= profile.scale_slo_seconds:
+    """Return the frozen queue lifetime minus one observation margin."""
+    observation_margin = max(1.0, profile.poll_seconds)
+    window = profile.request_queue_timeout_seconds - observation_margin
+    if not math.isfinite(window) or window <= 0:
         raise ValueError(
-            'Request queue cannot preserve the scale stimulus through '
-            'positive telemetry.')
+            'Request queue timeout has no positive telemetry polling margin.')
     return window
 
 
@@ -4595,7 +4589,7 @@ async def _wait_for_positive_request_telemetry(
             continue
         if (_has_exact_campaign_demand(telemetry, baseline) and
                 telemetry.queue_depth is not None and
-                telemetry.queue_depth > 0 and
+            (profile.name == 'scale' or telemetry.queue_depth > 0) and
                 telemetry.in_flight_requests is not None and
                 telemetry.in_flight_requests > 0 and
                 telemetry.processing_requests is not None and
@@ -4612,8 +4606,8 @@ async def _wait_for_positive_request_telemetry(
             return telemetry
         await asyncio.sleep(profile.poll_seconds)
     raise QualificationError(
-        'No fresh positive processing, queued, and in-flight sample was '
-        'observed for exact traffic.')
+        'No fresh positive processing and in-flight sample was observed for '
+        'exact traffic.')
 
 
 async def _wait_for_final_request_telemetry(
@@ -4681,7 +4675,12 @@ async def _wait_for_scale(
         expectation: ProviderExpectation | None = None) -> None:
     if expectation is None:
         expectation = provider_expectation(profile, None)
-    deadline = time.monotonic() + profile.scale_timeout_seconds
+    if progress.scale_started_monotonic is None:
+        raise QualificationError('Provider scale has no absolute start time.')
+    # Do not spend the profile's broader lifecycle timeout after the physical
+    # scale SLO has already failed.  A census started before this deadline may
+    # finish, and Progress.observe() still rejects a late qualifying sample.
+    deadline = (progress.scale_started_monotonic + profile.scale_slo_seconds)
     scale_iteration_id = 0
     while time.monotonic() < deadline:
         if traffic.done():
@@ -4751,6 +4750,46 @@ async def _wait_for_scale(
         f'Provider did not reach {expectation.minimum_physical_running} '
         f'physical RUNNING L4 Spot VMs for {expectation.kind.value} '
         f'providers {expectation.providers}.')
+
+
+async def _wait_for_scale_and_positive_request_telemetry(
+    *,
+    observer: Observer,
+    profile: Profile,
+    progress: Progress,
+    receipt: Receipt,
+    traffic: asyncio.Task[int],
+    completion_gate: ExactRequestCompletionGate,
+    baseline: RequestTelemetry,
+    expectation: ProviderExpectation,
+    positive_deadline_monotonic: float,
+) -> None:
+    """Join independent physical and request proofs before releasing work."""
+    scale_task = asyncio.create_task(
+        _wait_for_scale(observer=observer,
+                        profile=profile,
+                        progress=progress,
+                        receipt=receipt,
+                        traffic=traffic,
+                        baseline=baseline,
+                        expectation=expectation))
+    positive_task = asyncio.create_task(
+        _wait_for_positive_request_telemetry(
+            observer=observer,
+            profile=profile,
+            receipt=receipt,
+            traffic=traffic,
+            baseline=baseline,
+            deadline_monotonic=positive_deadline_monotonic))
+    proof_tasks = (scale_task, positive_task)
+    try:
+        await asyncio.gather(*proof_tasks)
+    except BaseException:
+        for task in proof_tasks:
+            task.cancel()
+        await asyncio.gather(*proof_tasks, return_exceptions=True)
+        raise
+    completion_gate.release()
 
 
 async def _wait_for_drain(
@@ -5985,32 +6024,18 @@ async def qualify(args: argparse.Namespace) -> None:
             campaign_tasks.append(traffic)
         try:
             assert ledger_baseline is not None
-            if (expectation.requires_full_request_telemetry and
-                    profile.name != 'scale'):
-                await _wait_for_positive_request_telemetry(
-                    observer=observer,
-                    profile=profile,
-                    receipt=receipt,
-                    traffic=traffic,
-                    baseline=ledger_baseline,
-                    deadline_monotonic=positive_deadline)
-            await _wait_for_scale(observer=observer,
-                                  profile=profile,
-                                  progress=progress,
-                                  receipt=receipt,
-                                  traffic=traffic,
-                                  baseline=ledger_baseline,
-                                  expectation=expectation)
             if profile.name == 'scale':
-                await _wait_for_positive_request_telemetry(
+                assert completion_gate is not None
+                await _wait_for_scale_and_positive_request_telemetry(
                     observer=observer,
                     profile=profile,
+                    progress=progress,
                     receipt=receipt,
                     traffic=traffic,
+                    completion_gate=completion_gate,
                     baseline=ledger_baseline,
-                    deadline_monotonic=positive_deadline)
-                assert completion_gate is not None
-                completion_gate.release()
+                    expectation=expectation,
+                    positive_deadline_monotonic=positive_deadline)
                 tail_count = (expectation.exact_request_count -
                               scale_stimulus_count(profile))
                 tail_traffic = asyncio.create_task(
@@ -6027,10 +6052,24 @@ async def qualify(args: argparse.Namespace) -> None:
                 campaign_tasks.append(tail_traffic)
                 traffic = asyncio.create_task(
                     _sum_exact_request_tasks(campaign_tasks))
+            else:
+                if expectation.requires_full_request_telemetry:
+                    await _wait_for_positive_request_telemetry(
+                        observer=observer,
+                        profile=profile,
+                        receipt=receipt,
+                        traffic=traffic,
+                        baseline=ledger_baseline,
+                        deadline_monotonic=positive_deadline)
+                await _wait_for_scale(observer=observer,
+                                      profile=profile,
+                                      progress=progress,
+                                      receipt=receipt,
+                                      traffic=traffic,
+                                      baseline=ledger_baseline,
+                                      expectation=expectation)
             exact_request_successes = await traffic
         except BaseException:
-            if completion_gate is not None:
-                completion_gate.release()
             traffic.cancel()
             await asyncio.gather(traffic, return_exceptions=True)
             raise
@@ -6049,8 +6088,6 @@ async def qualify(args: argparse.Namespace) -> None:
                               receipt=receipt,
                               expectation=expectation)
     except BaseException as error:
-        if completion_gate is not None:
-            completion_gate.release()
         for task in campaign_tasks:
             task.cancel()
         await asyncio.gather(*campaign_tasks, return_exceptions=True)
@@ -6064,8 +6101,6 @@ async def qualify(args: argparse.Namespace) -> None:
             ledger_baseline=ledger_baseline,
             ledger_final=ledger_final,
             error=failure)
-        if completion_gate is not None:
-            completion_gate.release()
         postgres.close()
     print(
         json.dumps(
