@@ -1298,7 +1298,17 @@ def test_tail_hook_logs_minimal_api_version_required(monkeypatch):
     """
     from sky import exceptions
     from sky.client import sdk
+    from sky.server import common as server_common
     from sky.server import versions
+
+    # The outer ``check_server_healthy_or_start`` decorator runs before the
+    # version gate. Without a reachable API server it either starts one or
+    # raises ``ApiServerConnectionError`` depending on state earlier tests in
+    # the same xdist worker leave behind (the server env marker, the endpoint
+    # locality, the health cache). This test is about the version gate only,
+    # so make the health step a no-op and keep the outcome deterministic.
+    monkeypatch.setattr(server_common, 'check_server_healthy_or_start_fn',
+                        lambda *_args, **_kwargs: None)
 
     # `tail_hook_logs` requires API_VERSION >= 52 (see the
     # `@versions.minimal_api_version(52)` decorator on it). Pin the

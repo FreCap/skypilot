@@ -2,6 +2,7 @@
 # pylint: disable=not-callable,protected-access,redefined-outer-name,unused-import
 
 import datetime
+import time
 
 import pytest
 import sqlalchemy
@@ -301,3 +302,61 @@ def test_history_only_exposes_projection_matching_current_plan_head(
         'capacity_plan_generation'] == retried.authority.generation
     assert current['window_end'] <= datetime.datetime.now(
         datetime.timezone.utc).timestamp()
+
+
+def _latest_history_row(engine: sqlalchemy.engine.Engine):
+    table = serve_history.serve_autoscaler_history_table
+    with engine.connect() as connection:
+        return connection.execute(
+            sqlalchemy.select(table).order_by(
+                table.c.bucket_start.desc())).mappings().first()
+
+
+def test_history_projection_lock_wait_is_bounded_and_never_blocks_plan(
+        capacity_database):
+    """A locked minute row cannot hold the plan commit past the lock timeout.
+
+    The history transaction runs after the authority commit with a local
+    ``lock_timeout``; a concurrent holder of the minute row must therefore
+    cost at most that bound, leave the committed plan usable, and lose the
+    projection only until the next reconciliation.
+    """
+    engine, _, _ = capacity_database
+    first = _commit(engine, 3)
+    assert _latest_history_row(engine)['accelerator_breakdown'][
+        'capacity_plan_generation'] == first.authority.generation
+
+    table = serve_history.serve_autoscaler_history_table
+    blocker = engine.connect()
+    blocking_transaction = blocker.begin()
+    try:
+        assert len(
+            blocker.execute(sqlalchemy.select(
+                table).with_for_update()).mappings().all()) == 1
+        started = time.monotonic()
+        second = _commit(engine, 3)
+        elapsed = time.monotonic() - started
+    finally:
+        blocking_transaction.rollback()
+        blocker.close()
+
+    # Plan/head advanced while the projection was locked out within the
+    # 250 ms lock timeout (allow generous CI headroom, far below the 1 s
+    # statement timeout plus any pool wait).
+    assert second.authority.generation > first.authority.generation
+    assert elapsed < 5.0
+    locked_out = _latest_history_row(engine)
+    assert locked_out['accelerator_breakdown'][
+        'capacity_plan_generation'] == first.authority.generation
+    stale = serve_history.get_status_history('svc', sections={'autoscaler'})
+    assert 'capacity_plan_generation' not in stale['autoscaler_samples'][-1][
+        'accelerator_breakdown']
+
+    third = _commit(engine, 3)
+    assert third.authority.generation > second.authority.generation
+    projected = _latest_history_row(engine)
+    assert projected['accelerator_breakdown'][
+        'capacity_plan_generation'] == third.authority.generation
+    current = serve_history.get_status_history('svc', sections={'autoscaler'})
+    assert current['autoscaler_samples'][-1]['accelerator_breakdown'][
+        'capacity_plan_generation'] == third.authority.generation

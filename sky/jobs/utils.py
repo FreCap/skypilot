@@ -48,6 +48,9 @@ from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 
 if typing.TYPE_CHECKING:
+    from sky.schemas.generated import managed_jobsv1_pb2
+
+if typing.TYPE_CHECKING:
     from google.protobuf import descriptor
     from google.protobuf import json_format
     import grpc
@@ -1165,6 +1168,55 @@ def cancel_jobs_by_pool(pool_name: str,
     if not job_ids:
         return f'No running job found in pool {pool_name!r}.'
     return cancel_jobs_by_id(job_ids, current_workspace=current_workspace)
+
+
+class ManagedJobCancelCriteriaError(ValueError):
+    """A cancel request that does not name exactly one valid selector."""
+
+
+def cancel_jobs_from_request(
+        request: 'managed_jobsv1_pb2.CancelJobsRequest') -> str:
+    """Dispatch one managed-job cancel request to its selector variant.
+
+    This is the single cancel dispatch. The skylet ``CancelJobs`` servicer
+    calls it for gRPC-enabled controllers, and the API server calls it
+    in-process in consolidation mode, where the jobs controller runs inside
+    the server deployment and no skylet gRPC server exists.
+    """
+    criteria = request.WhichOneof('cancellation_criteria')
+    if criteria is None:
+        raise ManagedJobCancelCriteriaError(
+            'exactly one cancellation criteria must be specified.')
+    graceful = request.graceful if request.HasField('graceful') else False
+    graceful_timeout = (request.graceful_timeout
+                        if request.HasField('graceful_timeout') else None)
+    if criteria == 'all_users':
+        user_hash = (request.user_hash
+                     if request.HasField('user_hash') else None)
+        if not request.all_users and user_hash is None:
+            raise ManagedJobCancelCriteriaError(
+                'user_hash is required when all_users is False')
+        return cancel_jobs_by_id(job_ids=None,
+                                 all_users=request.all_users,
+                                 current_workspace=request.current_workspace,
+                                 user_hash=user_hash,
+                                 graceful=graceful,
+                                 graceful_timeout=graceful_timeout)
+    if criteria == 'job_ids':
+        return cancel_jobs_by_id(job_ids=list(request.job_ids.ids),
+                                 current_workspace=request.current_workspace,
+                                 graceful=graceful,
+                                 graceful_timeout=graceful_timeout)
+    if criteria == 'job_name':
+        return cancel_job_by_name(job_name=request.job_name,
+                                  current_workspace=request.current_workspace,
+                                  graceful=graceful,
+                                  graceful_timeout=graceful_timeout)
+    if criteria == 'pool_name':
+        return cancel_jobs_by_pool(pool_name=request.pool_name,
+                                   current_workspace=request.current_workspace)
+    raise ManagedJobCancelCriteriaError(
+        f'invalid cancellation criteria: {criteria}')
 
 
 def _sync_log_streaming_facade() -> None:

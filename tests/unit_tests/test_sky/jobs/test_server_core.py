@@ -175,6 +175,62 @@ def test_cancel_rejects_non_grpc_before_transport_setup(cancellation_gateway,
     gateway.skylet_client.assert_not_called()
 
 
+@pytest.mark.parametrize(('graceful', 'graceful_timeout'), [
+    (False, None),
+    (True, 17),
+])
+def test_cancel_consolidated_controller_dispatches_in_process(
+        cancellation_gateway, graceful, graceful_timeout):
+    """Consolidation mode has no skylet gRPC server: the jobs controller runs
+    inside the API server deployment behind a ``LocalResourcesHandle`` whose
+    gRPC flag is always off, so cancel must run the servicer's single
+    dispatch in-process instead of refusing every request."""
+    gateway = cancellation_gateway
+    local_handle = mock.MagicMock(
+        spec=jobs_cancellation.cloud_vm_ray_backend.LocalResourcesHandle)
+    local_handle.is_grpc_enabled_with_flag = False
+    gateway.accessible.return_value = local_handle
+
+    with mock.patch.object(
+            jobs_core.managed_job_utils,
+            'cancel_jobs_by_id',
+            return_value='Job with ID 7 is scheduled to be cancelled.'
+    ) as cancel_by_id:
+        jobs_core.cancel(job_ids=[7],
+                         graceful=graceful,
+                         graceful_timeout=graceful_timeout)
+
+    cancel_by_id.assert_called_once_with(job_ids=[7],
+                                         current_workspace='workspace-a',
+                                         graceful=graceful,
+                                         graceful_timeout=graceful_timeout)
+    gateway.client.cancel_managed_jobs.assert_not_called()
+    gateway.invoke.assert_not_called()
+    local_handle.get_grpc_channel.assert_not_called()
+
+
+def test_cancel_consolidated_controller_ignores_grpc_flag(cancellation_gateway):
+    """The local handle is dispatched in-process even if the server flag is
+    set: there is no skylet gRPC endpoint to reach in consolidation mode."""
+    gateway = cancellation_gateway
+    local_handle = mock.MagicMock(
+        spec=jobs_cancellation.cloud_vm_ray_backend.LocalResourcesHandle)
+    local_handle.is_grpc_enabled_with_flag = True
+    gateway.accessible.return_value = local_handle
+
+    with mock.patch.object(jobs_core.managed_job_utils,
+                           'cancel_job_by_name',
+                           return_value='cancelled') as cancel_by_name:
+        jobs_core.cancel(name='train')
+
+    cancel_by_name.assert_called_once_with(job_name='train',
+                                           current_workspace='workspace-a',
+                                           graceful=False,
+                                           graceful_timeout=None)
+    gateway.client.cancel_managed_jobs.assert_not_called()
+    local_handle.get_grpc_channel.assert_not_called()
+
+
 def test_cancel_rejects_missing_grpc_output(cancellation_gateway):
     gateway = cancellation_gateway
     gateway.client.cancel_managed_jobs.return_value = SimpleNamespace(

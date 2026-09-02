@@ -708,8 +708,12 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
 
         self.assertIsNone(self._plan(autoscaler))
 
-    def test_fresh_zero_accepts_repository_canonical_card_casing(self):
-        """PostgreSQL card keys and YAML display names share one domain."""
+    def _plan_display_case_fresh_zero(
+            self,
+            *,
+            genesis_shapes: dict[str, int],
+            allocation_demand_witness_sha256: str = _AUTO_GATE_WITNESS):
+        """Plan fresh zero with YAML display cards over folded genesis."""
         autoscaler = _durable_autoscaler(max_replicas=1000)
         autoscaler.set_configured_accelerator_shapes({
             'L4': 1,
@@ -728,12 +732,8 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
             maximum_capacity=autoscaler.max_replicas,
             physical_gpu_width_by_accelerator=(
-                capacity_planning.AcceleratorCapacity.from_mapping({
-                    'l4': 1,
-                    'a100': 1,
-                    'a100-80gb': 1,
-                    'h200': 1,
-                })))
+                capacity_planning.AcceleratorCapacity.from_mapping(
+                    genesis_shapes)))
         zero_inventory = (capacity_planning.AcceleratorCapacity.from_mapping({
             'l4': 0,
             'a100': 0,
@@ -760,7 +760,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             existing_paid_capacity=zero_inventory,
             charged_paid_gpu_units=0,
             evidence_fingerprint='e' * 64,
-            allocation_demand_witness_sha256=_AUTO_GATE_WITNESS,
+            allocation_demand_witness_sha256=allocation_demand_witness_sha256,
             allocation_demonstrated_need=55,
             allocation_ceiling=55)
         decision_inputs = dataclasses.replace(
@@ -787,10 +787,19 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             'h200': 1,
         })
         canonical_result = self._plan(canonical_autoscaler, **plan_kwargs)
+        return canonical_result, self._plan(autoscaler, **plan_kwargs)
+
+    def test_fresh_zero_accepts_repository_canonical_card_casing(self):
+        """PostgreSQL card keys and YAML display names share one domain."""
+        canonical_result, result = self._plan_display_case_fresh_zero(
+            genesis_shapes={
+                'l4': 1,
+                'a100': 1,
+                'a100-80gb': 1,
+                'h200': 1,
+            })
+
         self.assertIsNotNone(canonical_result)
-
-        result = self._plan(autoscaler, **plan_kwargs)
-
         self.assertIsNotNone(result)
         assert result is not None
         candidate = result.envelope.candidate
@@ -800,6 +809,22 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         self.assertEqual(candidate.wave_limited_actuation_target.as_dict(), {})
         self.assertEqual(candidate.paid_launch_target.as_dict(), {})
         self.assertEqual(candidate.reserved_launch_target.as_dict(), {})
+
+    def test_fresh_zero_declines_prior_width_drift_behind_case_change(self):
+        """A case-only respelling never launders a physical-width change."""
+        # A settled witness skips the helper's gate-acquisition pre-plan, so
+        # the adapter's own identity check is what answers here.
+        canonical_result, result = self._plan_display_case_fresh_zero(
+            genesis_shapes={
+                'l4': 1,
+                'a100': 8,
+                'a100-80gb': 1,
+                'h200': 1,
+            },
+            allocation_demand_witness_sha256='b' * 64)
+
+        self.assertIsNone(canonical_result)
+        self.assertIsNone(result)
 
     def test_durable_planner_never_borrows_process_local_kueue_tick_state(self):
         autoscaler = _durable_autoscaler()
@@ -3585,6 +3610,32 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
 
         self.assertEqual(autoscaler._rejected_compatibility_work(),
                          [(50, ('A100',), 5.0)])
+
+    def test_rejected_profile_count_pair_guards(self):
+        for count, recent_count, kept in ((5, 6, False), (0, 0, False), (5, 0,
+                                                                         True)):
+            autoscaler = _make_autoscaler()
+            autoscaler.set_configured_accelerator_shapes({'A100': 1})
+            _report(autoscaler,
+                    in_flight={},
+                    rejected=count,
+                    recent_rejected=recent_count,
+                    rejected_profiles=[{
+                        'priority': 50,
+                        'compatible_accelerators': ['A100'],
+                        'count': count,
+                        'recent_count': recent_count,
+                    }],
+                    compatibility_complete=True)
+
+            profiles = autoscaler.rejected_compatibility_profiles
+            with self.subTest(count=count, recent_count=recent_count):
+                if kept:
+                    self.assertEqual(
+                        [(p['count'], p['recent_count']) for p in profiles],
+                        [(count, recent_count)])
+                else:
+                    self.assertEqual(profiles, [])
 
     def test_logical_exact_card_preserves_production_arrival_floor(self):
         autoscaler = _make_autoscaler(

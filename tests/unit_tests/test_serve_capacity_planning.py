@@ -651,6 +651,94 @@ def test_policy_history_reprojection_rejects_card_domain_changes(
             state, candidate, configured_accelerators=configured_accelerators)
 
 
+def _folded_genesis_history() -> tuple[capacity_planning.CapacityPolicyState,
+                                       capacity_planning.CapacityPlanCandidate]:
+    """Repository genesis in the folded PostgreSQL accounting-card domain."""
+    return capacity_planning.genesis_capacity_policy(
+        service_name='svc',
+        service_version=3,
+        last_reduced_demand_generation=6,
+        capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+        maximum_capacity=20,
+        physical_gpu_width_by_accelerator=_capacity(l4=1, a100=8))
+
+
+def test_policy_history_reprojection_rejects_same_size_card_swap() -> None:
+    state, candidate = _folded_genesis_history()
+
+    # Same cardinality as the history, one card replaced: only the folded
+    # set comparison distinguishes this from a case-only respelling.
+    with pytest.raises(ValueError, match='accelerator domain'):
+        capacity_planning.reproject_capacity_policy_history(
+            state, candidate, configured_accelerators=('L4', 'H200'))
+
+
+def test_policy_history_reprojection_rejects_detached_policy_state() -> None:
+    state, candidate = _folded_genesis_history()
+    detached = dataclasses.replace(state, upscale_observations=1)
+
+    with pytest.raises(ValueError, match='identity'):
+        capacity_planning.reproject_capacity_policy_history(
+            detached, candidate, configured_accelerators=('L4', 'A100'))
+
+
+def test_policy_history_reprojection_rejects_unknown_ceiling_card() -> None:
+    state, candidate = _folded_genesis_history()
+    ceiling_state = dataclasses.replace(
+        state,
+        paid_window_started_db_epoch=90.0,
+        paid_window_ceiling_by_accelerator=_capacity(h200=2))
+    ceiling_candidate = dataclasses.replace(candidate,
+                                            next_policy_state=ceiling_state)
+
+    # The physical domain matches; the paid-window ceiling names a card the
+    # current catalog does not configure.
+    with pytest.raises(ValueError, match='unknown accelerator'):
+        capacity_planning.reproject_capacity_policy_history(
+            ceiling_state,
+            ceiling_candidate,
+            configured_accelerators=('L4', 'A100'))
+
+
+def test_policy_history_reprojection_preserves_counts_across_domains() -> None:
+    state, candidate = _folded_genesis_history()
+    ceiling_state = dataclasses.replace(
+        state,
+        paid_window_started_db_epoch=90.0,
+        paid_window_ceiling_by_accelerator=_capacity(l4=3, a100=2))
+    ceiling_candidate = dataclasses.replace(candidate,
+                                            next_policy_state=ceiling_state)
+    configured = ('L4', 'A100')
+
+    new_state, new_candidate = (
+        capacity_planning.reproject_capacity_policy_history(
+            ceiling_state,
+            ceiling_candidate,
+            configured_accelerators=configured))
+
+    assert new_state.paid_window_ceiling_by_accelerator.as_dict() == {
+        'A100': 2,
+        'L4': 3,
+    }
+    assert new_candidate.physical_gpu_width_by_accelerator.as_dict() == {
+        'A100': 8,
+        'L4': 1,
+    }
+    assert new_candidate.next_policy_state == new_state
+    for field in capacity_planning._CANDIDATE_CAPACITY_FIELDS:  # pylint: disable=protected-access
+        before = getattr(ceiling_candidate, field).as_dict()
+        after = getattr(new_candidate, field).as_dict()
+        assert after == {card.upper(): count for card, count in before.items()}
+    assert dataclasses.replace(
+        new_state,
+        paid_window_ceiling_by_accelerator=(
+            ceiling_state.paid_window_ceiling_by_accelerator)) == ceiling_state
+    # Reprojecting display-domain history into the same catalog is a fixpoint.
+    assert capacity_planning.reproject_capacity_policy_history(
+        new_state, new_candidate,
+        configured_accelerators=configured) == (new_state, new_candidate)
+
+
 def test_fixed_paid_wave_uses_db_epoch_and_prior_committed_candidate() -> None:
     demand = (_demand(50, ('L4',), 5),)
     state = _policy_state(paid_window_started_db_epoch=95.0,
@@ -1533,6 +1621,70 @@ def test_gate_witness_changes_with_request_class_target_or_card() -> None:
         demand_attribution=_capacity(L4=1),
         reservation_acquisition_classes=(_acquisition(50, ('L4',),
                                                       1),)) != baseline
+
+
+def test_gate_witness_binds_scope_and_ignores_volatile_inputs() -> None:
+    demand = (_demand(50, ('A100',), 1),)
+    snapshot = _snapshot(
+        demand_profiles=demand,
+        explicit_demand_profiles=demand,
+        paid_demand_profiles=demand,
+        deadline=_deadline(remaining_seconds=3600),
+        reservation=_reservation(
+            gate_policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence_state=(capacity_planning.ReservationEvidenceState.
+                            AUTHENTICATED_UNSETTLED),
+            authenticated=_capacity(A100=2)))
+    classes = (_acquisition(50, ('A100',), 1),)
+
+    def witness(candidate: capacity_planning.CapacityPlanningSnapshot) -> str:
+        return capacity_planning.demand_witness_semantic_sha256(
+            candidate,
+            aggregate_demand_target=1,
+            demand_attribution=_capacity(A100=1),
+            reservation_acquisition_classes=classes)
+
+    baseline = witness(snapshot)
+
+    # Inputs whose capacity consequence is already carried by the reduced
+    # target, attribution, and acquisition classes must not move the witness:
+    # an equivalent heartbeat would otherwise revoke the grant it authorized.
+    refreshed_demand = (_demand(50, ('A100',), 0.25),)
+    volatile = dataclasses.replace(snapshot,
+                                   service_version=snapshot.service_version + 1,
+                                   maximum_capacity=5,
+                                   minimum_capacity=1,
+                                   actuation_minimum_capacity=1,
+                                   floors=_capacity(A100=1),
+                                   capacity_per_accelerator=_work(L4=2, A100=2),
+                                   demand_profiles=refreshed_demand,
+                                   explicit_demand_profiles=refreshed_demand,
+                                   paid_demand_profiles=refreshed_demand,
+                                   deadline=dataclasses.replace(
+                                       _deadline(remaining_seconds=1),
+                                       utilization=0.5,
+                                       paid_cold_lead_seconds=0.0),
+                                   cold_accelerator_order=('A100', 'L4'))
+    assert witness(volatile) == baseline
+
+    # Every configured-scope field the reservation grant was sized against
+    # must move it.
+    assert witness(
+        dataclasses.replace(
+            snapshot,
+            configured_reservation_accelerators=('L4', 'A100'))) != baseline
+    assert witness(
+        dataclasses.replace(snapshot,
+                            physical_gpu_width_by_accelerator=_capacity(
+                                L4=1, A100=8))) != baseline
+    physical = dataclasses.replace(
+        snapshot, capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND)
+    multi_node = dataclasses.replace(physical, backend_num_nodes=2)
+    assert witness(physical) != baseline
+    assert witness(multi_node) != witness(physical)
+    assert witness(
+        dataclasses.replace(snapshot,
+                            demand_witness_scope_sha256='b' * 64)) != baseline
 
 
 def test_gate_witness_binds_reduced_acquisition_classes() -> None:

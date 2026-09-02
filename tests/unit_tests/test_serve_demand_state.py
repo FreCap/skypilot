@@ -262,6 +262,29 @@ def test_current_lb_authority_excludes_non_authoritative_report(
     assert demand_state.current_demand_report_rows(rows, service) == rows[:1]
 
 
+@pytest.mark.parametrize('stale_role', ['ACTIVE', 'DRAINING'])
+def test_current_lb_authority_fails_closed_on_stale_generation_report(
+        stale_role):
+    active = _report()
+    stale = copy.deepcopy(active)
+    stale['applied_role'] = stale_role
+    stale['applied_generation'] = 1
+    rows = [{
+        'lb_slot': 'a',
+        'payload': active,
+    }, {
+        'lb_slot': 'b',
+        'payload': stale,
+    }]
+    service = {
+        'lb_ha_enabled': 1,
+        'lb_active_slot': 'a',
+        'lb_cutover_generation': 2,
+    }
+
+    assert demand_state.current_demand_report_rows(rows, service) is None
+
+
 def test_fresh_aggregate_zero_requires_full_quiet_window_coverage():
     report = copy.deepcopy(_report())
     report['demand_window'].update(

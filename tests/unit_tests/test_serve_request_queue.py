@@ -1682,6 +1682,130 @@ def test_abandoned_waiter_does_not_consume_a_new_exact_card_slot():
     asyncio.run(_run())
 
 
+def test_incompatible_free_slot_dispatch_never_traverses_ten_thousand_waiters():
+
+    class _ResidentQueueBucket(dict):
+
+        def values(self):
+            raise AssertionError(
+                'mismatched dispatch traversed the resident queue')
+
+    queue = dict(min_size=10000,
+                 size_per_replica=0,
+                 max_size=10000,
+                 max_concurrency=128)
+    lb = _make_lb(**queue)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(**queue),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100'],
+    })
+    url = 'http://worker:8000'
+    lb._replica_info_by_url = {
+        url: {
+            'gpu_type': 'L4',
+            'is_zero_cost': 'false',
+        },
+    }
+    lb._load_balancing_policy.set_ready_replicas([url])
+    resident = object()
+    lb._request_queue_waiters = {
+        50: _ResidentQueueBucket({index: resident for index in range(10000)})
+    }
+    lb._waiting_request_count = 10000
+    lb._request_queue_profile_census = {('A100',): 10000}
+
+    # One free L4 slot is dispatchable, so the exact-card planner runs on
+    # every enqueue and on every waiter's disconnect poll. No resident waiter
+    # accepts an L4: the planner must answer from the profile census alone.
+    for _ in range(10000):
+        lb._dispatch_request_queue_locked()
+
+    assert lb._waiting_request_count == 10000
+
+
+def test_profile_census_follows_real_enqueue_grant_and_cancel():
+
+    async def _run():
+        lb = _make_lb(max_concurrency=1, timeout_seconds=5)
+        lb._apply_routing_spec({
+            'request_queue': _queue_config(max_concurrency=1,
+                                           timeout_seconds=5),
+            'request_accelerator_compatibility_version': 1,
+            'configured_accelerators': ['L4', 'A100'],
+        })
+        url = 'http://worker:8000'
+        lb._replica_info_by_url = {
+            url: {
+                'gpu_type': 'L4',
+                'is_zero_cost': 'false',
+            },
+        }
+        lb._load_balancing_policy.set_ready_replicas([url])
+        a100_request = _request()
+        setattr(a100_request, '_skyserve_compatible_accelerators', ('A100',))
+        l4_request = _request()
+        setattr(l4_request, '_skyserve_compatible_accelerators', ('L4',))
+
+        # The only free slot is an L4, so the A100 request queues without a
+        # grant and the census records its exact profile.
+        a100 = asyncio.create_task(lb._acquire_request_slot(a100_request, 50))
+        await _wait_until(lambda: lb._waiting_request_count == 1)
+        assert lb._request_queue_profile_census == {('A100',): 1}
+        assert not a100.done()
+
+        # A compatible arrival behind it is still admitted: the census reports
+        # an acceptable profile, so the planner runs and grants it.
+        assert await lb._acquire_request_slot(l4_request, 50) is True
+        assert lb._request_queue_profile_census == {('A100',): 1}
+        assert lb._waiting_request_count == 1
+        assert not a100.done()
+
+        a100.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await a100
+        await _wait_until(lambda: lb._waiting_request_count == 0)
+        assert not lb._request_queue_profile_census
+        await lb._release_request_slot(l4_request)
+
+    asyncio.run(_run())
+
+
+def test_profile_census_is_rebuilt_when_a_service_update_reindexes_waiters():
+
+    def _spec(*configured: str) -> dict[str, Any]:
+        return {
+            'request_queue': _queue_config(max_concurrency=1,
+                                           timeout_seconds=5),
+            'request_accelerator_compatibility_version': 1,
+            'configured_accelerators': list(configured),
+        }
+
+    async def _run():
+        lb = _make_lb(max_concurrency=1, timeout_seconds=5)
+        lb._apply_routing_spec(_spec('L4', 'A100'))
+        request = _request()
+        setattr(request, '_skyserve_compatible_accelerators', ('L4', 'A100'))
+        # No ready replica: the request queues cold.
+        waiting = asyncio.create_task(lb._acquire_request_slot(request, 50))
+        await _wait_until(lambda: lb._waiting_request_count == 1)
+        assert lb._request_queue_profile_census == {('L4', 'A100'): 1}
+
+        # Dropping L4 re-indexes the survivor in place under a new key.
+        lb._apply_routing_spec(_spec('A100'))
+        assert lb._request_queue_profile_census == {('A100',): 1}
+
+        # Dropping A100 too terminates it, which must empty the census.
+        lb._apply_routing_spec(_spec('H100'))
+        with pytest.raises(fastapi.HTTPException) as exc:
+            await waiting
+        assert exc.value.status_code == 503
+        assert not lb._request_queue_profile_census
+        assert lb._waiting_request_count == 0
+
+    asyncio.run(_run())
+
+
 def test_full_queue_rejects_without_growing_waiter_count():
 
     async def _run():

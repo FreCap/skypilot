@@ -10373,6 +10373,258 @@ class TestLaunchOwnershipFence:
         notify.assert_called_once_with()
         assert not mgr._paid_phase_a_recoveries
 
+    def _finished_bound_paid_worker(self,
+                                    target,
+                                    *,
+                                    replica_id=1,
+                                    replica_record_id=None,
+                                    receipt='exact'):
+        """Build one finished bound worker whose Phase-A paid claim is exact.
+
+        ``receipt`` selects the paid-claim receipt shape: ``'exact'`` matches
+        the worker and replica identity and ``None`` omits the receipt.
+        """
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._spot_placer = None
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=2,
+            generic=True)
+        mgr._ordinary_launch_binding_authority = authority
+        info = _fake_replica_info(
+            replica_id, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        if replica_record_id is not None:
+            info.replica_record_id = replica_record_id
+        info.paid_capacity_pool_key = _canonical_paid_pool_key()
+        paid_receipt = None
+        if receipt is not None:
+            paid_receipt = paid_capacity.PaidLaunchReceiptMember(
+                replica_id=info.replica_id,
+                replica_record_id=info.replica_record_id,
+                pool_key=info.paid_capacity_pool_key,
+                priority=50,
+                accelerator='l4',
+                plan_units=1,
+                physical_gpu_units=1)
+        worker = replica_managers._ReplicaLaunchThread(
+            target=target,
+            replica_id=info.replica_id,
+            replica_record_id=info.replica_record_id,
+            service_hash=mgr._service_hash,
+            controller_owner=mgr._controller_owner,
+            teardown_requested=threading.Event(),
+            completion_queue=queue.SimpleQueue(),
+            completion_event=threading.Event(),
+            bound_ordinary_launch=True,
+            paid_claim_commit_receipt=paid_receipt)
+        runtime = mgr._legacy_mutation_runtime_state()
+        runtime.launch_thread_pool[info.replica_id] = worker
+        worker.start()
+        worker.join()
+        assert not worker.is_alive()
+        return mgr, info, worker
+
+    def test_failed_paid_worker_with_durable_association_adopts_not_retires(
+            self):
+        """A durable association proves a request escaped: never Phase-A."""
+        context = _bound_non_pool_context()
+
+        def _fail_after_admission():
+            raise ValueError('reduction decode failed after admission')
+
+        mgr, info, worker = self._finished_bound_paid_worker(
+            _fail_after_admission,
+            replica_id=context.replica_id,
+            replica_record_id=str(context.replica_record_id))
+        assert isinstance(worker.exception, ValueError)
+        assert replica_managers._bound_ordinary_paid_claim_owns_provider_effect(
+            info, launch_thread=worker)
+        remaining = types.SimpleNamespace(context=context,
+                                          disposition='ADOPT_ACTIVE')
+        successor = mock.Mock(name='exact-durable-adopter')
+
+        def _install(adopter_info, adopter_context, *, start):
+            assert adopter_info is info
+            assert adopter_context is context
+            assert start is True
+            mgr._launch_thread_pool[info.replica_id] = successor
+            mgr._replica_to_request_id[info.replica_id] = context.request_id
+            return True
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value={info.replica_id: info}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=remaining), \
+             mock.patch.object(
+                 ordinary_launch_binding,
+                 'retire_pre_admission_non_pool_launch_intent') as retire, \
+             mock.patch.object(
+                 mgr, '_install_bound_launch_adopter',
+                 side_effect=_install) as install, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             mock.patch.object(mgr, '_persist_replicas') as persist, \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_legacy_mutation_runtime()
+
+        install.assert_called_once_with(info, context, start=True)
+        assert mgr._launch_thread_pool[info.replica_id] is successor
+        assert not mgr._paid_phase_a_recoveries
+        retire.assert_not_called()
+        terminate.assert_not_called()
+        persist.assert_not_called()
+
+    def test_failed_paid_worker_with_published_request_is_not_retired(self):
+        """A locally published request id means admission may have happened."""
+
+        def _fail_after_publication():
+            raise ValueError('launch stream decode failed after publication')
+
+        mgr, info, worker = self._finished_bound_paid_worker(
+            _fail_after_publication)
+        assert isinstance(worker.exception, ValueError)
+        mgr._replica_to_request_id[info.replica_id] = 'published-request'
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value={info.replica_id: info}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=None), \
+             mock.patch.object(
+                 ordinary_launch_binding,
+                 'retire_pre_admission_non_pool_launch_intent') as retire, \
+             mock.patch.object(
+                 mgr, '_emit_ordinary_launch_handoff_event') as emit, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             mock.patch.object(mgr, '_persist_replicas') as persist, \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_legacy_mutation_runtime()
+
+        # The published request may have reached the provider, so the
+        # pre-existing cleanup route (a real sky.down) must own this row.
+        terminate.assert_called_once()
+        assert terminate.call_args.args[0] == info.replica_id
+        emit.assert_any_call(
+            info, ordinary_launch_handoff.EventKind.SERVE_RESULT_PROJECTED,
+            'published-request')
+        assert not mgr._paid_phase_a_recoveries
+        retire.assert_not_called()
+        persist.assert_not_called()
+
+    def test_unresolved_paid_worker_is_redriven_not_retired(self):
+        """A lost admission acknowledgement keeps its exact re-drive lane."""
+        error = replica_managers._BoundOrdinaryLaunchUnresolvedError(
+            'response lost before pointer readback')
+
+        def _lose_acknowledgement():
+            raise error
+
+        mgr, info, worker = self._finished_bound_paid_worker(
+            _lose_acknowledgement)
+        assert worker.exception is error
+        assert replica_managers._bound_ordinary_paid_claim_owns_provider_effect(
+            info, launch_thread=worker)
+        successor = mock.Mock(name='same-controller-successor')
+
+        def _redrive(redrive_info):
+            assert redrive_info is info
+            mgr._launch_thread_pool[info.replica_id] = successor
+            return True
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value={info.replica_id: info}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=None), \
+             mock.patch.object(
+                 ordinary_launch_binding,
+                 'retire_pre_admission_non_pool_launch_intent') as retire, \
+             mock.patch.object(
+                 mgr, '_redrive_bound_ordinary_launch_after_pre_effect',
+                 side_effect=_redrive) as redrive, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             mock.patch.object(mgr, '_persist_replicas') as persist, \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_legacy_mutation_runtime()
+
+        redrive.assert_called_once_with(info)
+        assert mgr._launch_thread_pool[info.replica_id] is successor
+        assert not mgr._paid_phase_a_recoveries
+        retire.assert_not_called()
+        terminate.assert_not_called()
+        persist.assert_not_called()
+
+    @pytest.mark.parametrize('shape', ['missing_receipt', 'non_paid_profile'])
+    def test_failed_bound_worker_without_exact_paid_claim_is_not_retired(
+            self, shape):
+        """Only an exact Phase-A paid claim may enter provider-free retirement."""
+
+        def _fail_before_admission():
+            raise ValueError('prepared request is invalid')
+
+        mgr, info, worker = self._finished_bound_paid_worker(
+            _fail_before_admission,
+            receipt=None if shape == 'missing_receipt' else 'exact')
+        if shape == 'non_paid_profile':
+            # The row is no longer an ordinary-paid profile: its exact pool
+            # identity is gone even though the worker still carries a receipt.
+            info.paid_capacity_pool_key = None
+        assert isinstance(worker.exception, ValueError)
+        assert not replica_managers._bound_ordinary_paid_claim_owns_provider_effect(
+            info, launch_thread=worker)
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value={info.replica_id: info}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=None), \
+             mock.patch.object(
+                 ordinary_launch_binding,
+                 'retire_pre_admission_non_pool_launch_intent') as retire, \
+             mock.patch.object(
+                 mgr, '_emit_ordinary_launch_handoff_event') as emit, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             mock.patch.object(mgr, '_persist_replicas') as persist, \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_legacy_mutation_runtime()
+
+        terminate.assert_called_once()
+        assert terminate.call_args.args[0] == info.replica_id
+        emit.assert_any_call(
+            info, ordinary_launch_handoff.EventKind.SERVE_RESULT_PROJECTED,
+            None)
+        assert not mgr._paid_phase_a_recoveries
+        retire.assert_not_called()
+        persist.assert_not_called()
+
     def test_current_owner_redrives_finished_unresolved_bound_worker(self):
         """A local lost acknowledgement is not an ownership-loss detach."""
         mgr = _make_manager()

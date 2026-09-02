@@ -2,6 +2,7 @@
 
 import dataclasses
 import itertools
+import random
 import time
 
 import pytest
@@ -408,6 +409,64 @@ def test_small_graphs_match_brute_force_full_objective() -> None:
                             result, demand,
                             supply) == _brute_force_full_objective(
                                 demand, supply, maximum_assigned)
+
+
+def _random_counted_graph(
+    rng: random.Random,
+) -> tuple[list[compatibility_matching.CompatibilityDemand],
+           list[compatibility_matching.CompatibilitySupply], int | None]:
+    """Draw counted classes, split preferred bins, and an optional cap."""
+    cards = ('A', 'B', 'C', 'D')[:rng.randint(1, 4)]
+    demand: list[compatibility_matching.CompatibilityDemand] = []
+    demand_units = 0
+    demand_budget = rng.randint(1, 6)
+    while demand_units < demand_budget:
+        count = min(rng.randint(1, 3), demand_budget - demand_units)
+        demand.append(
+            compatibility_matching.CompatibilityDemand(
+                priority=rng.randint(0, 3),
+                compatible_cards=tuple(
+                    rng.sample(cards, rng.randint(1, len(cards)))),
+                count=count))
+        demand_units += count
+    supply: list[compatibility_matching.CompatibilitySupply] = []
+    supply_units = 0
+    supply_budget = rng.randint(1, 6)
+    while supply_units < supply_budget:
+        capacity = min(rng.randint(1, 3), supply_budget - supply_units)
+        supply.append(
+            _supply(f'supply-{len(supply)}',
+                    rng.choice(cards),
+                    capacity=capacity,
+                    preferred=rng.randint(0, capacity),
+                    rank=rng.randint(0, 2)))
+        supply_units += capacity
+    maximum_assigned = rng.choice((None, rng.randint(0, supply_units)))
+    return demand, supply, maximum_assigned
+
+
+def test_counted_random_graphs_match_brute_force_full_objective() -> None:
+    """Counted classes, split bins, and global caps stay exactly optimal.
+
+    The exhaustive oracle above only draws unit demand and unit supply.  This
+    seeded draw exercises the counted subset-rank and bin-splitting paths that
+    production actually takes (multi-unit classes, pools holding several
+    units, partial preferred prefixes, and partial waves).
+    """
+    rng = random.Random(20260902)
+    for _ in range(1500):
+        demand, supply, maximum_assigned = _random_counted_graph(rng)
+        result = _match(demand, supply, maximum_assigned=maximum_assigned)
+        assigned = dict(result.assigned_by_supply)
+        assert all(
+            0 <= assigned[item.supply_id] <= item.capacity for item in supply)
+        assert sum(assigned.values()) == sum(
+            dict(result.assigned_by_card).values())
+        if maximum_assigned is not None:
+            assert sum(assigned.values()) <= maximum_assigned
+        assert _full_objective(result, demand,
+                               supply) == _brute_force_full_objective(
+                                   demand, supply, maximum_assigned)
 
 
 def _brute_force_maximum(cards_by_demand: tuple[tuple[str, ...], ...],

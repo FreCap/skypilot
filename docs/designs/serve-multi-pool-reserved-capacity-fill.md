@@ -459,6 +459,22 @@ and public queue depth returning to zero. The same test against pre-fix commit
 not reach 10,000 within 45 seconds while the event loop starved. Homogeneous
 Helm deployment and repetition of the billable qualification remain required.
 
+The post-merge audit of that correction found the second whole-registry pass
+on the same hot path. The exact-card grant planner traverses every resident
+waiter, and the dispatcher invokes it whenever the fleet has a dispatchable
+slot, so a fleet whose only free slots belong to cards no queued request
+accepts (a cold pool beside a warm one, or a ready replica whose identity has
+not synced) paid that traversal on every enqueue and on every waiter's
+one-second disconnect poll: 2.3 ms per dispatch with 10,000 resident waiters,
+about 32 times the removed purge, or 23 seconds of event-loop work per second
+of polling. The planner now consults an exactly maintained census of resident
+compatibility profiles, updated at the two registry mutation points and
+rebuilt once when a service update re-indexes queued requests, and skips the
+traversal when no free card is acceptable to any resident waiter. A structural
+test pins 10,000 mismatched-fleet dispatches to zero traversals, and the serial
+10,000-request interface gate runs as the dedicated ``Serve LB 10k Component``
+CI job rather than only by hand.
+
 Provider availability and runtime/service readiness are separate facts. The
 write-once provider-allocation marker commits normal pool-success feedback
 after the in-tree provisioner returns a single-node full-fresh allocation
@@ -472,7 +488,12 @@ terminal feedback and do not use this checkpoint.
 
 The paid claim stores a PostgreSQL timestamp and receipt SHA-256 as an
 all-or-none pair; the closed receipt contract name is covered by that digest.
-An exact replay is a no-op; a different or partial receipt fails closed. The
+An exact replay is a no-op; a different or partial receipt fails closed. That
+fail-closed result surfaces as the terminal replica launch fence, never as a
+provider failure: the provider already returned one running allocation, so
+the launch must not classify a lost or contradicted checkpoint as capacity,
+fail over, or tear the allocation down from the stale request; the durable
+service owner reconciles the created object. The
 provider-evidence fields on the launch association remain solely
 post-terminal cleanup/recovery evidence and are not overloaded. Once the claim
 contains the marker, every later terminal request outcome is economically
@@ -3699,7 +3720,10 @@ on-demand spill.
 - Commit a durable plan and require its exact minute-history projection before
   provider effects. Inject a history-write failure and prove plan/head/admission
   remain committed and usable; require a later reconciliation to fill the
-  projection gap. In a mixed-writer minute, require the committed-plan
+  projection gap. Hold the minute-history row locked from another connection
+  and prove the commit returns within the local lock timeout with the plan and
+  head advanced, the projection unchanged and unexposed, and the next commit
+  restoring it. In a mixed-writer minute, require the committed-plan
   projection to win latest state while preserving pressure peaks; require the
   controller writer's ownership check and upsert to share one transaction under
   explicit `LEGACY_CONTROLLER` ownership.
@@ -3710,7 +3734,10 @@ on-demand spill.
   Independently corrupt each fence and require planned values to be
   unavailable rather than zero. Prove the dashboard displays the PostgreSQL
   target while controller/provider enrichment is unavailable and retains a
-  last-good projection only until its DB-relative lease expires.
+  last-good projection only until its DB-relative lease expires; a rendered
+  test with a lease shorter than the poll interval must flip to `STALE`
+  without a refetch, so the expiry clock cannot be silently dropped from the
+  page's memoized projection.
 - With complete current telemetry and a zero launch-lead seed, prove 1,000
   queued requests of ten seconds each produce the same
   priority/deadline-weighted work in the aggregate and exact-card maps. At a

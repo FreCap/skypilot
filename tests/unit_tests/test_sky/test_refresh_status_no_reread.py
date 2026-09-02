@@ -370,6 +370,52 @@ def test_up_transition_summary_reuses_refresh_fields_without_full_reread():
     cheap_read.assert_called_once_with('test-cluster')
 
 
+@pytest.mark.parametrize('summary_response', [False, True])
+def test_up_transition_returns_none_when_row_vanishes_after_write(
+        summary_response):
+    """A row removed between the status write and the reread is "cluster
+    does not exist": the refresh returns None, never an AssertionError."""
+    handle = _make_handle()
+    record = _make_record(handle)
+    record['status'] = status_lib.ClusterStatus.INIT
+    node_statuses = {'pod-0': (status_lib.ClusterStatus.UP, None)}
+
+    backend = mock.Mock(spec=backends.CloudVmRayBackend)
+    backend.probe_autostopping.return_value = False
+    external_failure = mock.Mock()
+    external_failure.get.return_value = []
+
+    with mock.patch.object(backend_utils,
+                           '_query_cluster_status_via_cloud_api',
+                           return_value=node_statuses), \
+         mock.patch.object(backend_utils, 'ExternalFailureSource',
+                           external_failure), \
+         mock.patch.object(backend_utils, 'get_backend_from_handle',
+                           return_value=backend), \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_cluster_event'), \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_or_update_cluster') as full_write, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_refresh_fields',
+                           return_value=None) as cheap_read, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=None) as full_read:
+        result = backend_utils._update_cluster_status(
+            'test-cluster',
+            record,
+            retry_if_missing=False,
+            summary_response=summary_response)
+
+    assert result is None
+    full_write.assert_called_once()
+    full_read.assert_called_once_with('test-cluster',
+                                      include_user_info=True,
+                                      summary_response=summary_response)
+    assert cheap_read.call_count == int(summary_response)
+
+
 def test_init_transition_keeps_full_writer():
     handle = _make_handle()
     record = _make_record(handle)

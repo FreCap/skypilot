@@ -2810,6 +2810,88 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
         self.assertEqual(set(autoscaler.info()['fill_by_pool']),
                          {edges[0]['pool_key'], edges[1]['pool_key']})
 
+    def test_durable_feed_headroom_is_the_service_maximum(self):
+        """Gate-on durable fill budgets against ``max_replicas``, not ``max -
+        target``.
+
+        PR #1774 made the paid guard require the utilization ceiling to cover
+        the SLA target, while the broker still budgeted the ceiling as
+        ``max_replicas - target``; a target above half of ``max_replicas``
+        could then never be covered (audit red: max 10, target 8, ceiling 2).
+        PR #1777 moved durable-feed services to the immutable service maximum.
+        Pin both formulas so the guard stays satisfiable on the durable path
+        and the retained legacy overlay keeps its documented shape.
+        """
+        east = spot_placer.Location.from_pickleable(
+            dict(_K8S_KEY, region='east-context'))
+        placer = mock.Mock()
+        placer.active_locations.return_value = [east]
+
+        def _cycle(*, durable: bool) -> dict:
+            # target_qps None: the demand target is the constant min_replicas,
+            # so the SLA target (8) sits above half of max_replicas (10).
+            autoscaler = _make_autoscaler(min_replicas=8, max_replicas=10)
+            autoscaler.reserved_fill_utilization_gate = True
+            self.assertEqual(autoscaler.get_final_target_num_replicas(), 8)
+            sample = mock.Mock()
+            sample.demonstrated_need.return_value = 8
+            sample.boot_hold.return_value = False
+            autoscaler.fill_demand_sample = mock.Mock(return_value=sample)
+            gate = types.SimpleNamespace(sequenced_active=durable,
+                                         generation=1,
+                                         reclaim_policy_identity=None)
+            observation_repository = mock.Mock()
+            observation_repository.read_reconciliation_gate.return_value = gate
+            observation_repository.read_latest_authoritative.return_value = (
+                None)
+            with mock.patch.object(reserved_capacity,
+                                   'get_kubernetes_physical_cluster_uid',
+                                   return_value='east-uid'), \
+                 mock.patch.object(
+                     reserved_capacity, 'sequenced_fill_pool_specs',
+                     side_effect=lambda zero_cost, **_kwargs: reserved_capacity.
+                     discover_fill_pool_specs(zero_cost)), \
+                 mock.patch.object(reserved_capacity.serve_state,
+                                   'get_replica_infos', return_value=[]), \
+                 mock.patch.object(reserved_capacity.serve_state,
+                                   'get_reserved_fill_service_claim_set',
+                                   return_value=None), \
+                 mock.patch.object(reserved_capacity.serve_state,
+                                   'get_reserved_fill_round',
+                                   return_value=None), \
+                 mock.patch.object(reserved_capacity_broker,
+                                   'replace_claim_set',
+                                   return_value=1) as replace, \
+                 mock.patch.object(reserved_capacity_broker,
+                                   'run_round_from_committed_observation',
+                                   return_value=None), \
+                 mock.patch.object(reserved_capacity_broker,
+                                   'run_round_if_stale', return_value=None), \
+                 mock.patch.object(
+                     reserved_capacity.provider_phase, 'provider_phase',
+                     side_effect=lambda _mode: contextlib.nullcontext()), \
+                 mock.patch.object(reserved_capacity,
+                                   '_record_allocation_observation'), \
+                 mock.patch.object(
+                     reserved_capacity.capacity_admission,
+                     'get_service_source_mode',
+                     return_value=(reserved_capacity.capacity_admission.
+                                   DemandSourceMode.DURABLE_FEED, None)):
+                reserved_capacity._broker_cycle_v2(
+                    autoscaler,
+                    placer,
+                    'svc', [east],
+                    'service-hash', (123, 'controller-ip'),
+                    observation_repository=observation_repository,
+                    allocation_repository=mock.Mock())
+            return replace.call_args.kwargs
+
+        durable = _cycle(durable=True)
+        self.assertEqual(durable['global_headroom'], 10)
+        legacy = _cycle(durable=False)
+        self.assertEqual(legacy['global_headroom'], 2)
+        self.assertLessEqual(legacy['utilization_ceiling'], 2)
+
     def _assert_one_pool_round_failure_isolated(self,
                                                 *,
                                                 lock_timeout: bool,
@@ -6849,6 +6931,107 @@ class TestQueryFreeSlots(unittest.TestCase):
                 'global_headroom': 1,
                 'utilization_state': json.dumps(state),
             })
+
+    def test_claim_utilization_witness_rejects_each_malformed_shape(self):
+        """Every schema-6 witness conjunct fails closed on its own.
+
+        PR #1773 bound the allocation map to the claim-set utilization
+        witness but only exercised the happy path; each rejection branch of
+        the decoder is a separate conjunct of one guard, so each needs its
+        own falsifying row.
+        """
+        allocation_module = reserved_capacity.reserved_fill_allocation
+
+        def _state(**overrides):
+            state = {
+                'cap': 4,
+                'hot_until': 63.0,
+                'stepped_at': 3.0,
+                'blind_since': None,
+                'demonstrated_need': 3,
+                'demand_witness_sha256': None,
+                'reservation_acquisition_classes': None,
+                'reservation_acquisition_binding_sha256': None,
+                'boot_hold': False,
+                'blind': False,
+            }
+            state.update(overrides)
+            return state
+
+        def _row(state, *, ceiling=4, headroom=8):
+            return {
+                'utilization_ceiling': ceiling,
+                'global_headroom': headroom,
+                'utilization_state': None
+                                     if state is None else json.dumps(state),
+            }
+
+        decode = allocation_module._claim_utilization_authority
+        self.assertEqual(decode(_row(_state())),
+                         (True, 3, None, False, 4, None))
+        self.assertEqual(decode(_row(None, ceiling=8, headroom=8)),
+                         (False, None, None, False, 8, None))
+        self.assertEqual(
+            decode(_row(_state(demonstrated_need=None, blind=True))),
+            (True, None, None, False, 4, None))
+
+        legacy_state = {
+            'cap': 4,
+            'hot_until': 63.0,
+            'stepped_at': 3.0,
+            'blind_since': None,
+        }
+        cases = [
+            ('ungated reduced ceiling', _row(None, ceiling=4, headroom=8),
+             'ungated reserved-fill claim'),
+            ('ceiling above headroom', _row(_state(), ceiling=9, headroom=8),
+             'ceiling is malformed'),
+            ('negative ceiling', _row(_state(), ceiling=-1,
+                                      headroom=8), 'ceiling is malformed'),
+            ('boolean headroom', _row(_state(), ceiling=4,
+                                      headroom=True), 'ceiling is malformed'),
+            ('legacy four-key state', _row(legacy_state), 'unsupported shape'),
+            ('ceiling not min of headroom and cap',
+             _row(_state(cap=6), ceiling=4,
+                  headroom=8), 'witness is malformed'),
+            ('boolean cap', _row(_state(cap=True),
+                                 ceiling=1), 'witness is malformed'),
+            ('negative cap', _row(_state(cap=-1),
+                                  ceiling=0), 'witness is malformed'),
+            ('float need', _row(_state(demonstrated_need=3.0)),
+             'witness is malformed'),
+            ('boolean need', _row(_state(demonstrated_need=True)),
+             'witness is malformed'),
+            ('negative need', _row(_state(demonstrated_need=-1)),
+             'witness is malformed'),
+            ('blind sample with need', _row(_state(blind=True)),
+             'witness is malformed'),
+            ('blind sample with boot hold',
+             _row(_state(blind=True, demonstrated_need=None,
+                         boot_hold=True)), 'witness is malformed'),
+            ('sighted sample without need',
+             _row(_state(demonstrated_need=None)), 'witness is malformed'),
+            ('integer boot hold', _row(_state(boot_hold=1)),
+             'witness is malformed'),
+            ('integer blind flag', _row(_state(blind=0)),
+             'witness is malformed'),
+            ('boolean clock', _row(_state(hot_until=True)),
+             'witness is malformed'),
+            ('negative clock', _row(_state(stepped_at=-1.0)),
+             'witness is malformed'),
+            ('non-finite clock', _row(_state(hot_until=float('inf'))),
+             'witness is malformed'),
+            ('boolean blind_since', _row(_state(blind_since=False)),
+             'witness is malformed'),
+            ('negative blind_since', _row(_state(blind_since=-5.0)),
+             'witness is malformed'),
+        ]
+        for name, row, message in cases:
+            with self.subTest(name):
+                with self.assertRaisesRegex(
+                        allocation_module.ReservedFillAllocationCorruptionError,
+                        message):
+                    decode(row)
 
     def _exact_pool_snapshot(
         self,

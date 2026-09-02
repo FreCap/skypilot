@@ -2977,6 +2977,112 @@ def test_paid_checkpoint_precedes_post_bulk_deploy_failure(
     cleanup.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    'checkpoint_error',
+    [
+        ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Paid provider allocation lost its active provider phase.'),
+        RuntimeError('Paid provider-allocation replay conflicts with the '
+                     'durable receipt.'),
+    ],
+    ids=['lost-authority', 'durable-receipt-conflict'],
+)
+def test_paid_checkpoint_conflict_is_terminal_fence_without_teardown(
+        tmp_path, monkeypatch, checkpoint_error):
+    """A failed checkpoint must not tear down the running paid allocation.
+
+    The checkpoint runs after the provider returned one RUNNING Spot VM and
+    is economic pool feedback under the retained request authority.  When it
+    loses or contradicts that authority, the zone loop must treat it exactly
+    like every other launch fence: no capacity classification, no failover,
+    and no destructive cleanup from this request.  The durable service owner
+    reconciles the created provider object.
+    """
+    events = []
+    (provisioner, _, provision_record, bulk_provision, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(tmp_path, monkeypatch,
+                                                      events, [])
+    to_provision = resources_lib.Resources(cloud=clouds.GCP(),
+                                           region='us-central1',
+                                           zone='us-central1-a',
+                                           instance_type='g2-standard-4',
+                                           accelerators={'L4': 1},
+                                           use_spot=True)
+    instance_name = 'sky-svc-head-12345678-compute'
+    provision_record.provider_name = 'gcp'
+    provision_record.region = 'us-central1'
+    provision_record.zone = 'us-central1-a'
+    provision_record.head_instance_id = instance_name
+    provision_record.resumed_instance_ids = []
+    provision_record.created_instance_ids = [instance_name]
+    provision_record.fresh_gcp_instance_identity = (
+        provision_common.GCPInstanceIdentity(project_id='boltz-spot-project',
+                                             zone='us-central1-a',
+                                             instance_name=instance_name,
+                                             instance_type='g2-standard-4',
+                                             market_type='spot'))
+    bound_context = types.SimpleNamespace(
+        association_id=uuid.uuid4(),
+        replica_record_id=uuid.uuid4(),
+        profile=types.SimpleNamespace(kind=ordinary_launch_binding.
+                                      NonPoolLaunchProfileKind.ORDINARY_PAID))
+    provisioner._extra_launch_context = {
+        ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY: 2,
+    }
+    provisioner._validate_service_replica_launch_preflight = lambda: None
+    provisioner._service_replica_launch_provider_guard = contextlib.nullcontext
+
+    def failing_checkpoint(_launch_context, _receipt):
+        events.append('provider-checkpoint')
+        raise checkpoint_error
+
+    def post_bulk_deploy_variables(*_args, **_kwargs):
+        events.append('deploy-vars:post-bulk')
+        return {}
+
+    def write_cluster_config(*_args, **_kwargs):
+        events.append('config_writer')
+        return {
+            'ray': str(tmp_path / 'gcp-cluster.yaml'),
+            'cluster_name_on_cloud': 'test-cluster',
+            'config_hash': 'generated-hash',
+        }
+
+    monkeypatch.setattr(clouds.GCP, 'check_quota_available', lambda *_: True)
+    monkeypatch.setattr(clouds.GCP, 'yield_cloud_specific_failover_overrides',
+                        lambda *_args, **_kwargs: [None])
+    monkeypatch.setattr(clouds.GCP, 'make_deploy_resources_variables',
+                        post_bulk_deploy_variables)
+    monkeypatch.setattr(provisioner, '_yield_zones',
+                        lambda *_: iter([[clouds.Zone('us-central1-a')]]))
+    monkeypatch.setattr(backend, '_capacity_cache_account', lambda *_: None)
+    monkeypatch.setattr(backend, '_get_cluster_config_template',
+                        lambda *_: '/tmp/gcp-template')
+    monkeypatch.setattr(backend.backend_utils, 'write_cluster_config',
+                        write_cluster_config)
+    monkeypatch.setattr(backend.provisioner, '_BUILTIN_BULK_PROVISION',
+                        bulk_provision)
+    monkeypatch.setattr(ordinary_launch_binding, 'has_bound_launch_context',
+                        lambda *_: True)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'parse_bound_non_pool_launch_context',
+                        lambda *_: bound_context)
+    monkeypatch.setattr(clouds.GCP, 'get_project_id',
+                        lambda *_: 'boltz-spot-project')
+    monkeypatch.setattr(ordinary_launch_binding, 'ordinary_paid_gcp_project_id',
+                        lambda *_: 'boltz-spot-project')
+    monkeypatch.setattr(ordinary_launch_request,
+                        '_record_paid_provider_allocation', failing_checkpoint)
+
+    with pytest.raises(exceptions.ServeReplicaLaunchFenceError) as exc_info:
+        _call_retry_zones(provisioner, to_provision)
+
+    assert exc_info.value.__cause__ is checkpoint_error
+    assert events == ['config_writer', 'bulk_provision', 'provider-checkpoint']
+    bulk_provision.assert_called_once()
+    cleanup.assert_not_called()
+
+
 def test_provision_with_retries_preserves_nested_terminal_failure(
         tmp_path, monkeypatch):
     to_provision = _to_provision()
