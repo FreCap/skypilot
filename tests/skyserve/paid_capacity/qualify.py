@@ -165,7 +165,9 @@ def scale_stimulus_count(profile: Profile) -> int:
 
 
 def positive_telemetry_window_seconds(profile: Profile) -> float:
-    """Return the frozen queue lifetime minus one observation margin."""
+    """Return the profile-specific first-dispatch observation window."""
+    if profile.name != 'scale':
+        return max(2 * 60, 4 * profile.poll_seconds)
     observation_margin = max(1.0, profile.poll_seconds)
     window = profile.request_queue_timeout_seconds - observation_margin
     if not math.isfinite(window) or window <= 0:
@@ -4675,12 +4677,18 @@ async def _wait_for_scale(
         expectation: ProviderExpectation | None = None) -> None:
     if expectation is None:
         expectation = provider_expectation(profile, None)
-    if progress.scale_started_monotonic is None:
-        raise QualificationError('Provider scale has no absolute start time.')
-    # Do not spend the profile's broader lifecycle timeout after the physical
-    # scale SLO has already failed.  A census started before this deadline may
-    # finish, and Progress.observe() still rejects a late qualifying sample.
-    deadline = (progress.scale_started_monotonic + profile.scale_slo_seconds)
+    if profile.name == 'scale':
+        if progress.scale_started_monotonic is None:
+            raise QualificationError(
+                'Provider scale has no absolute start time.')
+        # Do not spend the broader lifecycle timeout after the economic
+        # physical SLO has failed.  A census started before this deadline may
+        # finish, and Progress.observe() still rejects a late qualifying
+        # sample.  Canary/small profiles retain their relative timeout.
+        deadline = (progress.scale_started_monotonic +
+                    profile.scale_slo_seconds)
+    else:
+        deadline = time.monotonic() + profile.scale_timeout_seconds
     scale_iteration_id = 0
     while time.monotonic() < deadline:
         if traffic.done():
@@ -4752,6 +4760,24 @@ async def _wait_for_scale(
         f'providers {expectation.providers}.')
 
 
+async def _join_independent_proofs(
+    scale_proof: collections.abc.Awaitable[Any],
+    positive_proof: collections.abc.Awaitable[Any],
+    completion_gate: ExactRequestCompletionGate,
+) -> None:
+    """Release held work only after both substitutable proof interfaces pass."""
+    proof_tasks = (asyncio.ensure_future(scale_proof),
+                   asyncio.ensure_future(positive_proof))
+    try:
+        await asyncio.gather(*proof_tasks)
+    except BaseException:
+        for task in proof_tasks:
+            task.cancel()
+        await asyncio.gather(*proof_tasks, return_exceptions=True)
+        raise
+    completion_gate.release()
+
+
 async def _wait_for_scale_and_positive_request_telemetry(
     *,
     observer: Observer,
@@ -4764,32 +4790,22 @@ async def _wait_for_scale_and_positive_request_telemetry(
     expectation: ProviderExpectation,
     positive_deadline_monotonic: float,
 ) -> None:
-    """Join independent physical and request proofs before releasing work."""
-    scale_task = asyncio.create_task(
+    """Join independent physical and request proofs for one held cohort."""
+    await _join_independent_proofs(
         _wait_for_scale(observer=observer,
                         profile=profile,
                         progress=progress,
                         receipt=receipt,
                         traffic=traffic,
                         baseline=baseline,
-                        expectation=expectation))
-    positive_task = asyncio.create_task(
+                        expectation=expectation),
         _wait_for_positive_request_telemetry(
             observer=observer,
             profile=profile,
             receipt=receipt,
             traffic=traffic,
             baseline=baseline,
-            deadline_monotonic=positive_deadline_monotonic))
-    proof_tasks = (scale_task, positive_task)
-    try:
-        await asyncio.gather(*proof_tasks)
-    except BaseException:
-        for task in proof_tasks:
-            task.cancel()
-        await asyncio.gather(*proof_tasks, return_exceptions=True)
-        raise
-    completion_gate.release()
+            deadline_monotonic=positive_deadline_monotonic), completion_gate)
 
 
 async def _wait_for_drain(
@@ -5212,6 +5228,7 @@ class _ProviderEvidence:
     scale_elapsed_seconds: float
     scale_started_at: float
     first_scale_observed_at: float
+    last_scale_observed_at: float
     qualified_observed_at: float
 
 
@@ -5232,6 +5249,17 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
             for sample in typed_samples):
         raise QualificationError(
             'Qualification receipt has malformed request telemetry evidence.')
+    phase_ranks = {
+        'baseline': 0,
+        'scale-stimulus': 1,
+        'positive': 2,
+        'scale': 2,
+        'final': 3,
+    }
+    ranks = [phase_ranks[sample['phase']] for sample in typed_samples]
+    if any(current < previous for previous, current in zip(ranks, ranks[1:])):
+        raise QualificationError(
+            'Qualification receipt has no canonical request phase order.')
     for sample in typed_samples:
         _strict_timestamp(sample)
     baselines = [
@@ -5297,18 +5325,27 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
     scale_iteration_ids: set[int] = set()
     scale_observed_at_by_iteration: list[tuple[int, float]] = []
     scale_timestamps: list[float] = []
-    for sample in scale:
+    for expected_iteration_id, sample in enumerate(scale, start=1):
         iteration_id = sample.get('scale_iteration_id')
+        if (type(iteration_id) is not int or
+                iteration_id != expected_iteration_id):
+            raise QualificationError(
+                'Qualification receipt scale iterations are not contiguous '
+                'in request evidence order.')
+        if not _telemetry_is_exactly_attributed(sample, baseline_active):
+            raise QualificationError(
+                'Qualification receipt contains unattributed scale demand.')
         resident = sample['queue_depth'] + sample['in_flight_requests']
-        if (type(iteration_id) is not int or iteration_id < 1 or
-                iteration_id in scale_iteration_ids or
-                not _telemetry_is_exactly_attributed(sample, baseline_active) or
-                resident != (scale_stimulus_count(profile)
-                             if profile.name == 'scale' else 1)):
+        if resident != (scale_stimulus_count(profile)
+                        if profile.name == 'scale' else 1):
             raise QualificationError(
                 'Qualification receipt contains unattributed scale demand.')
         scale_iteration_ids.add(iteration_id)
         scale_observed_at = _strict_timestamp(sample)
+        if (scale_timestamps and scale_observed_at <= scale_timestamps[-1]):
+            raise QualificationError(
+                'Qualification receipt scale timestamps are not strictly '
+                'increasing in request iteration order.')
         scale_observed_at_by_iteration.append((iteration_id, scale_observed_at))
         scale_timestamps.append(scale_observed_at)
     if not scale_iteration_ids:
@@ -5322,7 +5359,6 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
         ]
         if (len(positive) != 1 or not _telemetry_is_exactly_attributed(
                 positive[0], baseline_active) or
-                positive[0]['queue_depth'] <= 0 or
                 positive[0]['in_flight_requests'] <= 0 or
                 positive[0]['processing_requests'] <= 0 or
                 positive[0]['queue_depth'] + positive[0]['in_flight_requests']
@@ -5352,7 +5388,8 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
         (scale_stimulus_observed_at is not None and
          scale_stimulus_observed_at > min(scale_timestamps)) or
         (positive_observed_at is not None and
-         (max(scale_timestamps) >= positive_observed_at or
+         (scale_stimulus_observed_at is None or
+          scale_stimulus_observed_at >= positive_observed_at or
           final_observed_at <= positive_observed_at))):
         raise QualificationError(
             'Terminal request evidence does not follow scale demand.')
@@ -5363,6 +5400,20 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
         scale_observed_at_by_iteration=tuple(scale_observed_at_by_iteration),
         positive_observed_at=positive_observed_at,
         final_observed_at=final_observed_at)
+
+
+def _validate_paid_claim_priority_evidence(
+        sample: collections.abc.Mapping[str, Any]) -> None:
+    """Bind each recorded one-L4 live claim to the offered priority."""
+    claimed_units = sample.get('claimed_units')
+    priorities = sample.get('paid_claim_priorities')
+    if (type(claimed_units) is not int or claimed_units < 0 or
+            not isinstance(priorities, list) or
+            len(priorities) != claimed_units or any(
+                type(priority) is not int or priority != _REQUEST_PRIORITY
+                for priority in priorities)):
+        raise QualificationError(
+            'Qualification receipt has invalid paid claim priority evidence.')
 
 
 def _complete_provider_sample(
@@ -5470,6 +5521,7 @@ def _validate_provider_scale_samples(
     if not isinstance(samples, list):
         raise QualificationError(
             'Qualification receipt lacks provider scale evidence.')
+    phase_ranks = {'baseline': 0, 'scale': 1, 'drain': 2}
     scale_started_at = _strict_timestamp(
         {'observed_at': payload.get('scale_started_at')})
     bound_qualified_at = _strict_timestamp(
@@ -5478,8 +5530,12 @@ def _validate_provider_scale_samples(
     qualified_iteration_id: int | None = None
     baseline_pairs: list[tuple[int, float]] = []
     provider_scale_iterations: set[int] = set()
+    provider_scale_entry_ids: list[int] = []
     request_scale_times = dict(request_evidence.scale_observed_at_by_iteration)
     first_scale_observed_at: float | None = None
+    last_scale_observed_at: float | None = None
+    previous_phase_rank = 0
+    previous_observed_at: float | None = None
     calculated_peak = 0
     calculated_gpu_peak = 0
     calculated_by_cloud = {'aws': 0, 'gcp': 0}
@@ -5488,14 +5544,49 @@ def _validate_provider_scale_samples(
         if not isinstance(sample, dict):
             raise QualificationError(
                 'Qualification receipt has a malformed provider sample.')
-        if 'observation_error_type' in sample:
-            continue
+        phase = sample.get('phase')
+        if not isinstance(phase, str) or phase not in phase_ranks:
+            raise QualificationError(
+                'Qualification receipt has no canonical provider phase '
+                'order.')
+        phase_rank = phase_ranks[phase]
+        if phase_rank < previous_phase_rank:
+            raise QualificationError(
+                'Qualification receipt has no canonical provider phase '
+                'order.')
+        previous_phase_rank = phase_rank
         observed_at = _strict_timestamp(sample)
+        if (previous_observed_at is not None and
+                observed_at <= previous_observed_at):
+            raise QualificationError(
+                'Qualification receipt provider timestamps are not strictly '
+                'increasing in canonical phase order.')
+        previous_observed_at = observed_at
+        iteration_id: int | None = None
+        if phase == 'scale':
+            raw_iteration_id = sample.get('scale_iteration_id')
+            expected_iteration_id = len(provider_scale_entry_ids) + 1
+            if (type(raw_iteration_id) is not int or
+                    raw_iteration_id != expected_iteration_id or
+                    raw_iteration_id not in request_evidence.scale_iterations):
+                raise QualificationError(
+                    'Provider scale samples have no canonical contiguous '
+                    'request pairing.')
+            iteration_id = raw_iteration_id
+            provider_scale_entry_ids.append(iteration_id)
+            last_scale_observed_at = observed_at
+        if 'observation_error_type' in sample:
+            if (not isinstance(sample['observation_error_type'], str) or
+                    not sample['observation_error_type']):
+                raise QualificationError(
+                    'Qualification receipt has a malformed provider sample.')
+            continue
+        _validate_paid_claim_priority_evidence(sample)
         totals, by_cloud = _complete_provider_sample(
             sample,
             max_units=profile.max_units,
             max_instances=profile.max_replicas)
-        if sample.get('phase') == 'baseline':
+        if phase == 'baseline':
             pair_id = sample.get('baseline_iteration_id')
             pair_at = _strict_timestamp(
                 {'observed_at': sample.get('baseline_pair_observed_at')})
@@ -5517,7 +5608,7 @@ def _validate_provider_scale_samples(
             calculated_gpu_by_cloud[cloud] = max(
                 calculated_gpu_by_cloud[cloud],
                 by_cloud[cloud]['running_gpu_units'])
-        if sample.get('phase') != 'scale':
+        if phase != 'scale':
             continue
         if (sample.get('postgres_demand_units', 0) <= 0 or
                 sample.get('lb_demand_units', 0) <= 0):
@@ -5535,10 +5626,8 @@ def _validate_provider_scale_samples(
                     is not False):
                 raise QualificationError(
                     'Provider scale sample has unattributed offered arrivals.')
-        iteration_id = sample.get('scale_iteration_id')
-        if (type(iteration_id) is not int or iteration_id < 1 or
-                iteration_id in provider_scale_iterations or
-                iteration_id not in request_evidence.scale_iterations or
+        assert iteration_id is not None
+        if (iteration_id in provider_scale_iterations or
                 observed_at < request_scale_times[iteration_id]):
             raise QualificationError(
                 'Provider scale sample has no paired exact demand evidence.')
@@ -5560,11 +5649,16 @@ def _validate_provider_scale_samples(
     final_baseline_at = request_evidence.baseline_pairs[-1][1]
     baseline_is_immediate = (0 <= scale_started_at - final_baseline_at <= max(
         1.0, profile.poll_seconds))
-    if (tuple(baseline_pairs) != request_evidence.baseline_pairs or
+    if (provider_scale_entry_ids != list(
+            range(1,
+                  len(request_evidence.scale_iterations) + 1)) or
+            tuple(baseline_pairs) != request_evidence.baseline_pairs or
             payload.get('baseline_qualified_iteration_id')
             != request_evidence.baseline_pairs[-1][0] or
             payload.get('baseline_qualified_observed_at') != final_baseline_at
             or not baseline_is_immediate or first_scale_observed_at is None or
+            last_scale_observed_at is None or
+            last_scale_observed_at >= request_evidence.final_observed_at or
             scale_started_at > first_scale_observed_at or
             scale_started_at > min(request_scale_times.values()) or
             qualified_at is None or
@@ -5587,7 +5681,7 @@ def _validate_provider_scale_samples(
         if (stimulus_at is None or not scale_started_at <= stimulus_at <=
                 scale_started_at + _CAMPAIGN_LOAD_WINDOW_SECONDS or
                 not stimulus_at <= first_scale_observed_at <= qualified_at or
-                positive_at is None or not qualified_at < positive_at <=
+                positive_at is None or not stimulus_at < positive_at <=
                 scale_started_at + positive_telemetry_window_seconds(profile)):
             raise QualificationError(
                 'Qualification receipt lacks joined scale-stimulus evidence.')
@@ -5598,6 +5692,7 @@ def _validate_provider_scale_samples(
     return _ProviderEvidence(scale_elapsed_seconds=elapsed,
                              scale_started_at=scale_started_at,
                              first_scale_observed_at=first_scale_observed_at,
+                             last_scale_observed_at=last_scale_observed_at,
                              qualified_observed_at=qualified_at)
 
 
@@ -5623,6 +5718,8 @@ def _read_qualification_evidence(
                        'qualification_projection_sha256')
     if (payload.get('schema_version') != _QUALIFICATION_RECEIPT_SCHEMA_VERSION
             or payload.get('outcome') != 'passed' or
+            type(payload.get('request_priority')) is not int or
+            payload['request_priority'] != _REQUEST_PRIORITY or
             kind is not expected_kind or not all(
                 isinstance(payload.get(field), str) and payload[field]
                 for field in identity_fields) or any(
@@ -5698,7 +5795,7 @@ def _read_qualification_evidence(
     if request_evidence.positive_observed_at is not None:
         preterminal_request_times.append(request_evidence.positive_observed_at)
     if not (max(preterminal_request_times) < request_evidence.final_observed_at
-            and provider_evidence.first_scale_observed_at < request_evidence.
+            and provider_evidence.last_scale_observed_at < request_evidence.
             final_observed_at < drain_first_at < drain_last_at < finished_at):
         raise QualificationError(
             'Qualification receipt has reordered lifecycle evidence.')
