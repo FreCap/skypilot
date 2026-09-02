@@ -8,9 +8,12 @@ for various configurations. The expected outputs are stored in:
 To update snapshots when intentional changes are made:
     UPDATE_SNAPSHOT=1 pytest tests/unit_tests/test_sky/backends/test_task_codegen.py
 """
+import ast
+import builtins
 import os
 from pathlib import Path
 import subprocess
+import symtable
 from typing import Any
 
 import pytest
@@ -178,6 +181,54 @@ def test_generated_logging_functions_are_self_contained(tmp_path: Path):
             bounded_capture=namespace['BoundedSubprocessCapture'](
                 deadline_monotonic=namespace['time'].monotonic() + 5,
                 max_output_bytes=32))
+
+
+def test_generated_logging_fragment_binds_every_referenced_global():
+    """Every global the generated driver fragment references is bound by it.
+
+    The executable-fragment test above only reaches the branches it runs.  A
+    name that is referenced only on the deadline or kill path would still
+    crash a driver in production, so bind-check the whole fragment
+    statically.  ``_get_context`` deliberately probes ``globals()`` for the
+    optional ``context`` module, so the two context names are the only
+    tolerated unbound references.
+    """
+    codegen = task_codegen.TaskCodeGen()
+    codegen._add_common_imports()  # pylint: disable=protected-access
+    codegen._add_skylet_imports()  # pylint: disable=protected-access
+    codegen._add_logging_functions()  # pylint: disable=protected-access
+    source = '\n'.join(codegen._code)  # pylint: disable=protected-access
+
+    bound: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            bound.update((alias.asname or alias.name).split('.')[0]
+                         for alias in node.names)
+        elif isinstance(node,
+                        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.Assign):
+            bound.update(name.id
+                         for target in node.targets
+                         for name in ast.walk(target)
+                         if isinstance(name, ast.Name))
+
+    referenced: set[str] = set()
+
+    def _collect(table: symtable.SymbolTable) -> None:
+        referenced.update(symbol.get_name()
+                          for symbol in table.get_symbols()
+                          if symbol.is_global() and symbol.is_referenced())
+        for child in table.get_children():
+            _collect(child)
+
+    _collect(symtable.symtable(source, '<generated>', 'exec'))
+
+    unbound = {
+        name for name in referenced
+        if name not in bound and not hasattr(builtins, name)
+    }
+    assert unbound <= {'context', 'context_utils'}, sorted(unbound)
 
 
 def test_system_oom_recovery_codegen_is_single_attempt_authority():
