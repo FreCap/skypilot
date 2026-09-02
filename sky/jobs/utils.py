@@ -340,6 +340,7 @@ def ha_recovery_for_consolidation_mode() -> None:
     # Refers to sky/templates/kubernetes-ray.yml.j2 for more details.
     stale_owner_count = (
         managed_job_state.reset_stale_jobs_for_current_controller())
+    terminal_cleanup_count = requeue_terminal_done_jobs_with_live_clusters()
     with open(constants.HA_PERSISTENT_RECOVERY_LOG_PATH.format('jobs_'),
               'a',
               encoding='utf-8') as f:
@@ -351,6 +352,12 @@ def ha_recovery_for_consolidation_mode() -> None:
                 'outer controller generation.\n')
             logger.info(message.rstrip())
             f.write(message)
+        if terminal_cleanup_count:
+            message = (
+                f'Requeued {terminal_cleanup_count} terminal managed job(s) '
+                'with live cluster rows for cleanup.\n')
+            logger.info(message.rstrip())
+            f.write(message)
         # Disposable ControllerManager processes are fixed runtime-owned
         # slots.  The successor generation resets all stale/null-slot rows
         # above, then runtime admission starts the complete fixed slot set.
@@ -358,6 +365,58 @@ def ha_recovery_for_consolidation_mode() -> None:
         # absent: Linux identities are Pod-local supervision diagnostics.
         f.write(f'HA recovery completed at {datetime.now()}\n')
         f.write(f'Total recovery time: {time.time() - start} seconds\n')
+
+
+def _task_has_launch_attempt(task: dict[str, Any]) -> bool:
+    """Whether a task can own a generated managed-job cluster."""
+    return any(
+        task.get(field) is not None
+        for field in ('submitted_at', 'start_at', 'last_recovered_at'))
+
+
+def requeue_terminal_done_jobs_with_live_clusters() -> int:
+    """Re-admit legacy DONE cluster orphans to scheduler-owned cleanup.
+
+    This function only repairs durable scheduler state. The cleanup-only
+    controller manager remains the sole owner of provider and storage effects.
+    """
+    cluster_candidates = (
+        global_user_state.get_managed_job_cluster_cleanup_candidates())
+    cluster_names_by_job_id: dict[int, set[str]] = {}
+    for cluster_name, workload_id in cluster_candidates.items():
+        candidate_id = workload_id
+        if candidate_id is None:
+            _, separator, suffix = cluster_name.rpartition('-')
+            if not separator:
+                continue
+            candidate_id = suffix
+        try:
+            job_id = int(candidate_id)
+        except (TypeError, ValueError):
+            continue
+        cluster_names_by_job_id.setdefault(job_id, set()).add(cluster_name)
+
+    job_snapshots = managed_job_state.get_jobs_status_check_info(
+        list(cluster_names_by_job_id))
+    cleanup_job_ids = []
+    for job_id, info in job_snapshots.items():
+        if (info['schedule_state']
+                != managed_job_state.ManagedJobScheduleState.DONE or
+                info['pool'] is not None or
+                not all(task['status'].is_terminal()
+                        for task in info['tasks'])):
+            continue
+        expected_cluster_names = {
+            generate_managed_job_cluster_name(task['task_name'], job_id)
+            for task in info['tasks']
+            if _task_has_launch_attempt(task)
+        }
+        if expected_cluster_names.isdisjoint(cluster_names_by_job_id[job_id]):
+            continue
+        cleanup_job_ids.append(job_id)
+
+    return managed_job_state.requeue_terminal_done_jobs_for_cleanup(
+        cleanup_job_ids)
 
 
 async def get_job_status(
