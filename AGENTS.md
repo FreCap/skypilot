@@ -83,18 +83,25 @@ skypilot/
 ### Supported Python Runtime
 
 - CPython 3.14 or newer is the only supported runtime.
-- Python 3.13 and older, including Python 3.10, are unsupported. Do not add or
-  preserve compatibility branches, tests, packaging metadata, or CI gates for
-  those versions.
+- Python 3.13 and older are not a compatibility target. Do not add new
+  compatibility branches, tests, packaging metadata, or CI gates for those
+  versions.
+- The deployed hub image still runs CPython 3.10: `boltz/Dockerfile.overlay`
+  builds on the upstream `berkeleyskypilot/skypilot-nightly` base, and every
+  role (API server, controller, executor) reported Python 3.10.19 on
+  2026-09-02. The repository `Dockerfile` (`python:3.14.5-slim`) is not that
+  image. Until the overlay base moves to Python 3.14, deployed code paths must
+  keep working on 3.10: keep the compatibility they already rely on, and keep
+  changes that need Python 3.11+ syntax, stdlib, or behavior undeployed.
 - Existing controller, worker, packaging, or CI pins below Python 3.14 are
-  migration debt rather than a compatibility contract. Keep changes that rely
-  on Python 3.14 syntax or behavior undeployed until every affected runtime has
-  moved to Python 3.14 or newer.
+  migration debt rather than a compatibility contract; retire them together
+  with the overlay base image, not piecemeal.
 
 ### Environment Setup
 
 ```bash
-# Create virtual environment with uv (Python 3.14, matching the production image)
+# Create virtual environment with uv (Python 3.14, the target runtime; the
+# deployed hub image still runs 3.10, see "Supported Python Runtime")
 # --seed is required to ensure pip is installed (needed for building wheels)
 uv venv --seed --python 3.14
 source .venv/bin/activate
@@ -624,7 +631,8 @@ Dependencies are defined in `sky/setup_files/dependencies.py`:
 When updating dependencies:
 
 1. Check version constraints carefully - some packages have breaking changes
-2. Consider Python version compatibility (3.14, the production interpreter)
+2. Consider Python version compatibility (3.14 target; the deployed hub
+   interpreter is 3.10 until the overlay base image moves)
 3. Test with both minimum and latest allowed versions
 4. Document version constraints with comments explaining why
 
