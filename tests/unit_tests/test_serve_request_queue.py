@@ -1756,6 +1756,57 @@ def test_full_queue_classifies_the_terminal_rejection():
     asyncio.run(_run())
 
 
+@pytest.mark.parametrize('fence', ['draining', 'inactive_role'])
+def test_post_admission_role_fence_exit_is_classified_as_rejected(fence):
+    """A drain/role 503 after admission is a rejection, not served work.
+
+    The request already counts as an attempt, so leaving it to the final
+    non-rejected guard would inflate the spend dashboard's non-rejected
+    denominator with a request that never reached a replica.  It stays out of
+    the autoscaling pressure gauges exactly like pre-admission drain exits.
+    """
+
+    async def _run():
+        lb = _make_lb(min_size=1, max_size=1)
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+        lb._request_body = mock.AsyncMock(return_value=b'payload')
+        request = _request()
+        mark_eligible = lb._mark_request_classification_eligible
+
+        def _mark_then_fence(eligible_request):
+            # The final pre-eligibility fence has passed; the process starts
+            # draining (or loses its slot) before the retry loop's per-attempt
+            # fence selects a replica.
+            mark_eligible(eligible_request)
+            if fence == 'draining':
+                lb._draining = True
+            else:
+                lb._lb_role = lb_ha.LbRole.STANDBY
+
+        with mock.patch.object(lb,
+                               '_mark_request_classification_eligible',
+                               side_effect=_mark_then_fence):
+            with pytest.raises(fastapi.HTTPException) as exc:
+                await lb._proxy_with_retries(request)
+
+        assert exc.value.status_code == 503
+        history = lb._request_aggregator.request_history_snapshot()
+        assert history is not None
+        assert history['buckets'][0]['request_count'] == 1
+        assert history['buckets'][0]['rejected_count'] == 0
+        assert lb._request_aggregator.request_classification_history_snapshot(
+        )['buckets'][0] == {
+            'bucket_start': history['buckets'][0]['bucket_start'],
+            'classified_request_count': 1,
+            'counted_rejected_count': 1,
+        }
+        assert lb._rejected_in_window() == 0
+        assert lb._active_request_count == 0
+        assert lb._queue_depth == 0
+
+    asyncio.run(_run())
+
+
 def test_waiter_keeps_priority_timeout_selected_at_admission():
 
     async def _run():
