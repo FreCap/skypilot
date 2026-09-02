@@ -127,11 +127,15 @@ The script runs:
 ### Tool Versions (must match exactly)
 
 From `requirements-dev.txt`:
-- yapf==0.32.0
-- pylint==2.14.5
+- yapf==0.43.0
+- pylint==4.0.4
 - mypy==1.19.1
 - isort==5.12.0
-- pylint-quotes==0.2.3
+- ruff==0.15.21
+- import-linter==2.13
+- basedpyright==1.39.9
+- flake8==7.3.0
+- flake8-async==27.7.1
 
 ### Excluded from Formatting
 
@@ -326,12 +330,27 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
   simplify or replace the abstraction before proceeding. Optimize for durable
   correctness and useful output per engineering/token cost, not for preserving
   sunk implementation effort.
+- During a long fix-forward initiative, merge coherent checkpoints once one
+  named invariant and its deterministic regression gates are green. A
+  checkpoint is not a backup of partial or knowingly red work. Record
+  source-complete, deployed, activated, and production-proven as separate
+  states so a merge never overstates operational completion.
 
 ### Critical-Path Complexity
 
 - Treat request event loops, admission and dispatch, reconciliation ticks,
   provider effects, and teardown as critical paths. Include nested callbacks
   and retries when calculating their complexity.
+- Count every independently scaling dimension (for example replicas x nodes,
+  pages x retries, or demand classes x accelerator shapes). Include work and
+  I/O hidden behind properties, callbacks, iterators, serializers, ORM lazy
+  loads, and called helpers; syntax and module boundaries do not reduce the
+  caller's effective complexity.
+- Budget remote round trips, serialized wall time, bytes, and retained objects
+  as well as CPU operations. An O(N) loop that performs N sequential database,
+  provider, DNS, or subprocess calls is not acceptable merely because its CPU
+  complexity is linear; batch it or use bounded parallelism and prove the
+  end-to-end deadline at the enforced maximum N.
 - Do not put a whole-registry scan inside each item's retry, reconciliation,
   enqueue/dequeue operation, or periodic poll. One O(N) aggregate pass per
   bounded tick is valid only with a numeric maximum resident/window
@@ -351,11 +370,20 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
   completion formula is explicit in total N (for example,
   ``ceil(N / window) * per_window_deadline``). An unbounded stream does not
   have a fixed convergence deadline.
+- Enforce a cardinality or byte bound before materializing, submitting,
+  serializing, or retaining a collection. A check inside the eventual callee
+  does not protect the caller that already allocated an unbounded list, task
+  set, SQL parameter set, or payload.
 - Scale tests must enter through the production interface, fill the maximum
   configured resident/window cardinality, exercise multiple windows, and
   prove health/control-plane responsiveness. If total N is bounded, exercise
   that bound too; do not only call helpers against pre-populated internal
   state.
+- Complexity regressions must instrument the real SQL, provider, subprocess,
+  filesystem, or socket boundary through that production entry point and
+  assert calls/statements, rows or bytes, and lock/worker cardinality. AST and
+  mock guards are useful structural supplements, but cannot by themselves
+  prove production-path cost.
 - Every critical-path owner must keep one adjacent, reviewable budget naming:
   the hard maximum resident/window N and where it is enforced; total N when it
   is bounded; work per item and per tick; worker, subprocess, file-descriptor,
@@ -396,6 +424,14 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
   or safety heartbeats. Move it behind one bounded single-flight interface and
   prove a blocked dependency cannot prevent unrelated timers or probes from
   progressing.
+- Define poll cadence explicitly as start-to-start or finish-to-start. Ordering,
+  expiry, sleep, and duration arithmetic must use one monotonic clock instance
+  in one process; never persist or compare absolute monotonic readings produced
+  by another process, replay, or test fixture. Wall-clock timestamps may be
+  persisted only as observational metadata, not safety ordering. Cadence
+  regressions must include a slow observation and a shifted synthetic clock
+  origin so dependency latency cannot become an accidental extra interval or
+  an effectively unbounded sleep.
 - Cancellation, owner loss, and interrupted observation mean ``UNKNOWN``; they
   are not negative provider or health evidence. A canceled operation must not
   increment failure counters, revoke capacity, or publish a failed receipt.

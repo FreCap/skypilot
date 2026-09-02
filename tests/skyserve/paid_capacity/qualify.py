@@ -3494,7 +3494,6 @@ def validate_observation(
     if (not math.isfinite(observation.observed_started_at) or
             not math.isfinite(observation.observed_at) or
             observation.observed_started_at <= 0 or
-            observation.observed_at < observation.observed_started_at or
             not math.isfinite(observation.observed_started_monotonic) or
             not math.isfinite(observation.observed_monotonic) or
             observation.observed_started_monotonic < 0 or

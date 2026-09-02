@@ -5,9 +5,13 @@ import asyncio
 import importlib
 import json
 import pathlib
+import shlex
 import sys
+import textwrap
+import time
 
 import pytest
+from smoke_tests import smoke_tests_utils
 
 _FIXTURE_DIR = pathlib.Path(__file__).parents[1] / 'skyserve' / 'paid_capacity'
 sys.path.insert(0, str(_FIXTURE_DIR))
@@ -50,6 +54,7 @@ def _args(tmp_path):
                               artifacts_dir=str(tmp_path),
                               source='source.yaml',
                               economic_receipt=None,
+                              workspace='paid-workspace',
                               sky_cli='sky',
                               command_timeout_seconds=60,
                               endpoint_timeout_seconds=60,
@@ -120,6 +125,39 @@ def test_paid_smoke_has_no_lifecycle_bypass():
     assert 'tests/skyserve/paid_capacity/qualify.py' not in paid_test
     assert 'sky serve up' not in paid_test
     assert '_TEARDOWN_SERVICE' not in paid_test
+    assert '--serve-paid-provider-e2e-workspace' in paid_test
+    assert '--workspace' in paid_test
+
+
+def test_sky_cli_lifecycle_pins_workspace_at_command_boundary(
+        monkeypatch, tmp_path):
+    commands = []
+
+    class _Process:
+
+        returncode = 0
+
+        async def communicate(self):
+            return None, None
+
+    async def create_subprocess_exec(*command, **_kwargs):
+        commands.append(command)
+        return _Process()
+
+    monkeypatch.setattr(lifecycle_module.asyncio, 'create_subprocess_exec',
+                        create_subprocess_exec)
+    lifecycle = lifecycle_module.SkyCliLifecycle(executable='sky',
+                                                 command_timeout_seconds=60,
+                                                 endpoint_timeout_seconds=60,
+                                                 down_timeout_seconds=60,
+                                                 poll_seconds=1,
+                                                 workspace='mt_hybrid')
+
+    asyncio.run(lifecycle.up('paid-e2e', tmp_path / 'service.yaml'))
+
+    assert commands == [('sky', 'serve', 'up', '-n', 'paid-e2e', '-y',
+                         str(tmp_path / 'service.yaml'), '--config',
+                         'active_workspace=mt_hybrid')]
 
 
 def test_lifecycle_success_owns_normal_down_and_exact_cleanup(
@@ -200,12 +238,21 @@ def test_lost_up_ack_without_recoverable_scope_never_fabricates_one(
                         events,
                         freeze_error=RuntimeError('service absent'))
 
-    with pytest.raises(RuntimeError, match='lost acknowledgement'):
+    with pytest.raises(BaseExceptionGroup) as group:
         asyncio.run(
             lifecycle_module.run_lifecycle(
                 _args(tmp_path),
                 _FakeLifecycle(events,
                                up_error=RuntimeError('lost acknowledgement'))))
+
+    primary, *finalizer_errors = group.value.exceptions
+    assert isinstance(primary, RuntimeError)
+    assert str(primary) == 'lost acknowledgement'
+    assert finalizer_errors
+    assert any(
+        isinstance(error, lifecycle_module.LifecycleError) and
+        'operator escalation is required' in str(error)
+        for error in finalizer_errors)
 
     assert [event[0] for event in events
            ] == ['render', 'absent', 'up', 'freeze', 'down', 'cleanup']
@@ -267,3 +314,78 @@ def test_down_failure_does_not_skip_exact_cleanup(monkeypatch, tmp_path):
     assert receipt['cleanup_evidence_error_type'] is None
     assert receipt['exact_cleanup_proven'] is True
     assert receipt['operator_escalation_required'] is False
+
+
+def test_primary_and_cleanup_failures_are_both_raised(monkeypatch, tmp_path):
+    events = []
+    primary_error = RuntimeError('qualification failed')
+    cleanup_error = RuntimeError('cleanup incomplete')
+    _install_operations(monkeypatch,
+                        events,
+                        qualification_error=primary_error,
+                        cleanup_error=cleanup_error)
+
+    with pytest.raises(BaseExceptionGroup) as group:
+        asyncio.run(
+            lifecycle_module.run_lifecycle(_args(tmp_path),
+                                           _FakeLifecycle(events)))
+
+    assert group.value.exceptions[0] is primary_error
+    cleanup_failures = [
+        error for error in group.value.exceptions
+        if isinstance(error, lifecycle_module.LifecycleError) and
+        'operator escalation is required' in str(error)
+    ]
+    assert len(cleanup_failures) == 1
+    assert cleanup_failures[0].__cause__ is cleanup_error
+    assert _receipt(tmp_path)['operator_escalation_required'] is True
+
+
+def test_smoke_timeout_joins_real_sigterm_finalizer_and_receipt(
+        monkeypatch, tmp_path):
+    receipt = tmp_path / 'sigterm-lifecycle.json'
+    child_source = textwrap.dedent(f'''\
+        import json
+        import pathlib
+        import signal
+        import time
+
+        receipt = pathlib.Path({str(receipt)!r})
+
+        def finalize(_signal, _frame):
+            time.sleep(0.15)
+            receipt.write_text(json.dumps({{
+                'schema_version': 1,
+                'finished_at': time.time(),
+                'outcome': 'failed',
+                'exact_cleanup_proven': True,
+                'operator_escalation_required': False,
+            }}), encoding='utf-8')
+            raise SystemExit(7)
+
+        signal.signal(signal.SIGTERM, finalize)
+        while True:
+            time.sleep(0.01)
+    ''')
+    command = f'exec {shlex.quote(sys.executable)} -c {shlex.quote(child_source)}'
+    test = smoke_tests_utils.Test(name='paid-lifecycle-sigterm-unit',
+                                  commands=[command],
+                                  timeout=1,
+                                  timeout_termination_grace_seconds=2,
+                                  timeout_completion_receipt=str(receipt))
+    monkeypatch.setenv('LOG_TO_STDOUT', '1')
+    monkeypatch.setattr(smoke_tests_utils, 'is_remote_server_test',
+                        lambda: True)
+    real_exists = smoke_tests_utils.os.path.exists
+    monkeypatch.setattr(
+        smoke_tests_utils.os.path, 'exists', lambda path: False if str(path).
+        endswith('fetch_failed_job_logs.sh') else real_exists(path))
+
+    started_at = time.monotonic()
+    with pytest.raises(Exception, match='test failed'):
+        smoke_tests_utils.run_one_test(test, check_sky_status=False)
+
+    assert time.monotonic() - started_at >= 1.1
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    assert payload['exact_cleanup_proven'] is True
+    assert payload['operator_escalation_required'] is False

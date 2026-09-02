@@ -2781,8 +2781,14 @@ def test_retained_binding_allows_provider_effect_after_claim_release():
     qualifier.validate_observation(bound, profile)
 
 
-def test_provider_observation_rejects_reordered_sample_interval():
+def test_provider_observation_allows_wall_clock_rollback():
     observation = dataclasses.replace(_observation(), observed_started_at=1001)
+    qualifier.validate_observation(observation, qualifier.PROFILES['small'])
+
+
+def test_provider_observation_rejects_reordered_monotonic_interval():
+    observation = dataclasses.replace(_observation(),
+                                      observed_started_monotonic=1001)
     with pytest.raises(qualifier.QualificationError,
                        match='invalid sample interval'):
         qualifier.validate_observation(observation, qualifier.PROFILES['small'])

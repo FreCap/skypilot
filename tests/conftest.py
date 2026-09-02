@@ -237,6 +237,12 @@ def pytest_addoption(parser):
               'missing-provider canary can be rendered or launched.'),
     )
     parser.addoption(
+        '--serve-paid-provider-e2e-workspace',
+        default=None,
+        help=('Optional exact workspace used by every SkyServe lifecycle '
+              'command in the paid provider qualification.'),
+    )
+    parser.addoption(
         '--no-resource-heavy',
         action='store_true',
         default=False,

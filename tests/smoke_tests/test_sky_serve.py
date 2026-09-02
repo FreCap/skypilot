@@ -446,6 +446,7 @@ def test_skyserve_paid_spot_postgres_e2e(request: pytest.FixtureRequest):
     provider = request.config.getoption('--serve-paid-provider-e2e-provider')
     economic_receipt = request.config.getoption(
         '--serve-paid-provider-e2e-economic-receipt')
+    workspace = request.config.getoption('--serve-paid-provider-e2e-workspace')
     if (profile == 'provider-canary') != (provider is not None):
         pytest.fail('provider-canary requires exactly one explicit provider; '
                     'economic profiles forbid provider pinning')
@@ -471,10 +472,13 @@ def test_skyserve_paid_spot_postgres_e2e(request: pytest.FixtureRequest):
     economic_receipt_arg = (
         '' if economic_receipt is None else
         f' --economic-receipt {shlex.quote(economic_receipt)}')
+    workspace_arg = ('' if workspace is None else
+                     f' --workspace {shlex.quote(workspace)}')
     lifecycle_command = (f'exec {python} {shlex.quote(lifecycle)} '
                          f'--profile {shlex.quote(profile)} '
                          f'{provider_arg} '
                          f'{economic_receipt_arg} '
+                         f'{workspace_arg} '
                          f'--service-name {shlex.quote(name)} '
                          f'--artifacts-dir {shlex.quote(artifacts_dir)}')
     env = dict(smoke_tests_utils.LOW_CONTROLLER_RESOURCE_ENV)
@@ -489,6 +493,13 @@ def test_skyserve_paid_spot_postgres_e2e(request: pytest.FixtureRequest):
         [lifecycle_command],
         env=env,
         timeout=90 * 60,
+        # On timeout the lifecycle first spends up to five minutes recovering
+        # exact provider scope.  A normal-down CLI attempt is itself bounded at
+        # fifteen minutes, followed by thirty minutes proving exact provider/
+        # PostgreSQL zero.  Keep a bounded five-minute margin for CLI
+        # termination and receipt persistence.
+        timeout_termination_grace_seconds=55 * 60,
+        timeout_completion_receipt=(f'{artifacts_dir}/{name}-lifecycle.json'),
     )
     smoke_tests_utils.run_one_test(test)
 
