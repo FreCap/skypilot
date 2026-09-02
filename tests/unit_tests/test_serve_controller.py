@@ -5923,6 +5923,50 @@ class TestAutoscalerRuntimeSnapshot:
         else:
             notify.assert_not_called()
 
+    def test_paid_preparation_notifications_do_not_starve_locked_admission(
+            self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._autoscaler = self._logical_durable_autoscaler(  # pylint: disable=protected-access
+            target=220, emit_scale_up=True)
+        manager = mock.Mock()
+        manager.spot_placer.ranked_active_locations.return_value = []
+        manager.workspace = 'default'
+        ctrl._replica_manager = manager  # pylint: disable=protected-access
+        attempts = 3
+
+        def _prepare_paid_launch_specs(**_kwargs):
+            ctrl._notify_scale_reconcile()  # pylint: disable=protected-access
+            return ()
+
+        manager.prepare_paid_launch_specs.side_effect = (
+            _prepare_paid_launch_specs)
+        with mock.patch.object(
+                controller.paid_capacity,
+                'active_paid_spot_accelerator_shapes',
+                return_value=frozenset({('l4', 1)})), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_paid_launch_version_authority',
+                 return_value=_paid_launch_version_authority()), \
+             mock.patch.object(
+                 controller.serve_utils,
+                 'parse_and_validate_version_controller_config',
+                 return_value={}), \
+             mock.patch.object(
+                 controller.paid_capacity,
+                 'resolve_gcp_project_ids_for_locations',
+                 return_value={}), \
+             mock.patch.object(
+                 controller.paid_capacity,
+                 'build_launch_budget',
+                 return_value=mock.sentinel.paid_launch_budget):
+            repository = self._run_promoted_reconciles(
+                ctrl, [self._durable_snapshot()] * attempts)
+
+        assert manager.prepare_paid_launch_specs.call_count == attempts
+        assert repository.plan_and_admit_current.call_count == attempts
+
     def test_paid_materialization_uses_fused_bindings_after_commit(self):
         ctrl = _make_controller()
         scaler = self._logical_durable_autoscaler(target=1, emit_scale_up=True)
