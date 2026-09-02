@@ -641,9 +641,16 @@ class TestEconomicDecisions:
         scaler.set_spot_placer(placer)
         replicas = [
             _Replica(replica_id, paid, 1.0)
-            for replica_id in range(replica_count)
+            for replica_id in range(1, replica_count + 1)
         ]
         _report(scaler, replicas)
+        # The controller preloads blocking inputs under its own bounded cost
+        # view before the routing-epoch lock; the decision pass below must
+        # then evaluate the workspace policy exactly once more.
+        decision_inputs = (
+            autoscalers.prepare_controller_scaling_decision_inputs(
+                scaler, replicas))
+        assert decision_inputs is not None
 
         matcher = autoscalers.spot_placer.locations_match_placement
         with mock.patch.object(
@@ -657,9 +664,10 @@ class TestEconomicDecisions:
                     'cost_per_hour',
                     side_effect=AssertionError(
                         'per-location cost lookup is forbidden')):
+            decisions = autoscalers.generate_controller_scaling_decisions(
+                scaler, replicas, [1], decision_inputs)
             launches = [
-                decision for decision in _decisions(scaler, replicas)
-                if decision.operator ==
+                decision for decision in decisions if decision.operator ==
                 autoscalers.AutoscalerDecisionOperator.SCALE_UP
             ]
 
@@ -753,6 +761,7 @@ class TestPinnedReplacementLaunch:
             'completion_event',
             'bound_ordinary_launch',
             'ordinary_legacy_launch',
+            'paid_claim_commit_receipt',
             'args',
             'kwargs',
         }
@@ -773,6 +782,7 @@ class TestPinnedReplacementLaunch:
                 is runtime.launch_completion_event)
         assert construction.kwargs['bound_ordinary_launch'] is False
         assert construction.kwargs['ordinary_legacy_launch'] is False
+        assert construction.kwargs['paid_claim_commit_receipt'] is None
         assert construction.kwargs['args'] == (
             8,
             manager.yaml_content,
