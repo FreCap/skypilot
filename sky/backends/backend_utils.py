@@ -44,6 +44,7 @@ from sky.backends import ssh_tunnel
 from sky.backends import ssm_proxy
 from sky.provision import common as provision_common
 from sky.provision import instance_setup
+from sky.provision import provider_facets
 from sky.provision.kubernetes import constants as k8s_constants
 from sky.provision.kubernetes import instance as k8s_instance
 from sky.provision.kubernetes import pod_spec as k8s_pod_spec
@@ -4611,6 +4612,79 @@ def query_cluster_instance_statuses(
     """
     return _query_cluster_status_via_cloud_api(
         handle, retry_if_missing=retry_if_missing)
+
+
+def query_cluster_instance_statuses_batch(
+    handles_by_key: dict[int, 'cloud_vm_ray_backend.CloudVmRayResourceHandle'],
+    provider_configs_by_key: dict[int, dict[str, Any]],
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[int, provider_facets.InstanceStatusInventoryObservationV1]:
+    """Project exact handles through one aggregate, deadline-bound inventory.
+
+    All cluster YAML parsing happens before this boundary.  The returned
+    UNKNOWN disposition is intentionally not liveness or interruption
+    evidence; providers without the optional batch capability never fall back
+    to per-handle status calls. Larger fleets use multiple facet-sized chunks,
+    all sharing one absolute deadline so providers and chunks cannot multiply
+    the reconciliation budget.
+    """
+    if deadline_monotonic is None:
+        deadline_monotonic = (
+            time.monotonic() +
+            provider_facets.INSTANCE_STATUS_INVENTORY_V1_TIMEOUT_SECONDS)
+    observations: dict[
+        int, provider_facets.InstanceStatusInventoryObservationV1] = {}
+    queries_by_provider: dict[str, list[tuple[
+        int, provider_facets.InstanceStatusInventoryQueryV1]]] = {}
+
+    def _unknown(
+            key: int,
+            error: str) -> provider_facets.InstanceStatusInventoryObservationV1:
+        return provider_facets.InstanceStatusInventoryObservationV1(
+            query_id=str(key),
+            disposition=(
+                provider_facets.InstanceStatusInventoryDispositionV1.UNKNOWN),
+            error=error)
+
+    for key, handle in handles_by_key.items():
+        try:
+            cloud = handle.launched_resources.cloud
+            cluster_name = handle.cluster_name
+            cluster_name_on_cloud = handle.cluster_name_on_cloud
+            provider_config = provider_configs_by_key[key]
+            if (cloud is None or not isinstance(cluster_name, str) or
+                    not cluster_name or
+                    not isinstance(cluster_name_on_cloud, str) or
+                    not cluster_name_on_cloud or
+                    type(provider_config) is not dict):
+                raise ValueError('handle provider identity is incomplete')
+            provider_name = repr(cloud)
+            query = provider_facets.InstanceStatusInventoryQueryV1(
+                query_id=str(key),
+                cluster_name=cluster_name,
+                cluster_name_on_cloud=cluster_name_on_cloud,
+                provider_config=dict(provider_config))
+        except Exception as error:  # pylint: disable=broad-except
+            observations[key] = _unknown(key,
+                                         f'{type(error).__name__}: {error}')
+            continue
+        queries_by_provider.setdefault(provider_name, []).append((key, query))
+
+    facet_batch_size = (
+        provider_facets.INSTANCE_STATUS_INVENTORY_V1_MAX_QUERIES)
+    for provider_name, keyed_queries in queries_by_provider.items():
+        for offset in range(0, len(keyed_queries), facet_batch_size):
+            chunk = keyed_queries[offset:offset + facet_batch_size]
+            provider_observations = provision_lib.query_instances_batch(
+                provider_name,
+                tuple(query for _, query in chunk),
+                deadline_monotonic=deadline_monotonic)
+            for (key, _), observation in zip(chunk,
+                                             provider_observations,
+                                             strict=True):
+                observations[key] = observation
+    return observations
 
 
 # =====================================

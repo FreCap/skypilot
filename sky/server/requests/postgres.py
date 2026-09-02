@@ -406,6 +406,26 @@ class OrdinaryLaunchReduction:
     projected: bool
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class BoundOrdinaryLaunchStatusIdentity:
+    """Exact replica lifecycle whose service job may be observed."""
+
+    replica_id: int
+    replica_record_id: str
+
+    def __post_init__(self) -> None:
+        if (isinstance(self.replica_id, bool) or
+                not isinstance(self.replica_id, int) or self.replica_id < 1):
+            raise ValueError('replica_id must be a positive integer.')
+        try:
+            record_id = uuid.UUID(self.replica_record_id)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError(
+                'replica_record_id must be a canonical UUID.') from error
+        if str(record_id) != self.replica_record_id:
+            raise ValueError('replica_record_id must be a canonical UUID.')
+
+
 @dataclasses.dataclass(frozen=True)
 class BoundOrdinaryLaunchCancelTarget:
     """Non-authorizing pointer snapshot used only to address exact cancel."""
@@ -3314,6 +3334,67 @@ def stable_bound_ordinary_launch_submission_id(
     with engine.begin() as connection:
         return stable_bound_ordinary_launch_submission_id_in_connection(
             connection, service_name, replica_id, replica_record_id)
+
+
+def read_bound_ordinary_launch_status_job_ids(
+    service_name: str,
+    identities: typing.Sequence[BoundOrdinaryLaunchStatusIdentity],
+) -> dict[BoundOrdinaryLaunchStatusIdentity, int]:
+    """Read latest positive service-job IDs for exact replicas in one query.
+
+    The result is observation material only.  It grants no request, provider,
+    projection, cancellation, or ownership authority and can become stale as
+    soon as the transaction ends.  Consumers must revalidate the replica
+    lifecycle before reducing remote job evidence.
+    """
+    if not isinstance(service_name, str) or not service_name:
+        raise ValueError('service_name must be nonempty.')
+    unique_identities = tuple(dict.fromkeys(identities))
+    if not unique_identities:
+        return {}
+    if not all(
+            isinstance(identity, BoundOrdinaryLaunchStatusIdentity)
+            for identity in unique_identities):
+        raise TypeError('identities must contain status identity records.')
+
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    requested_pairs = [(identity.replica_id,
+                        uuid.UUID(identity.replica_record_id))
+                       for identity in unique_identities]
+    rank = sqlalchemy.func.row_number().over(
+        partition_by=(associations.c.replica_id,
+                      associations.c.replica_record_id),
+        order_by=associations.c.launch_generation.desc()).label('row_rank')
+    ranked = sqlalchemy.select(associations.c.replica_id,
+                               associations.c.replica_record_id,
+                               associations.c.service_job_id, rank).where(
+                                   associations.c.service_name == service_name,
+                                   sqlalchemy.tuple_(
+                                       associations.c.replica_id,
+                                       associations.c.replica_record_id).in_(
+                                           requested_pairs)).subquery()
+    statement = sqlalchemy.select(
+        ranked.c.replica_id, ranked.c.replica_record_id,
+        ranked.c.service_job_id).where(ranked.c.row_rank == 1)
+    engine = initialize_and_get_db()
+    with engine.begin() as connection:
+        rows = connection.execute(statement).mappings().all()
+
+    identity_by_pair = {
+        (identity.replica_id, identity.replica_record_id): identity
+        for identity in unique_identities
+    }
+    results = {}
+    for row in rows:
+        service_job_id = row['service_job_id']
+        if (isinstance(service_job_id, bool) or
+                not isinstance(service_job_id, int) or service_job_id < 1):
+            continue
+        pair = (int(row['replica_id']), str(row['replica_record_id']))
+        identity = identity_by_pair.get(pair)
+        if identity is not None:
+            results[identity] = service_job_id
+    return results
 
 
 def inspect_bound_ordinary_launch(

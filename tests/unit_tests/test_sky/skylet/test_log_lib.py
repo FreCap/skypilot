@@ -1,9 +1,15 @@
 """Unit tests for skylet log_lib."""
 
 from io import StringIO
+import os
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
+
+import psutil
 
 from sky.skylet import log_lib
 
@@ -164,6 +170,85 @@ class TestRunWithLogTimeout(unittest.TestCase):
             timeout=10,
         )
         self.assertEqual(returncode, 0)
+
+    def test_bounded_capture_drains_large_stdout_and_stderr_without_helpers(
+            self):
+        cmd = [
+            sys.executable, '-c', 'import sys; '
+            'sys.stdout.write("o" * 131072); '
+            'sys.stderr.write("e" * 131072)'
+        ]
+        capture = log_lib.BoundedSubprocessCapture(
+            deadline_monotonic=time.monotonic() + 5,
+            max_output_bytes=512 * 1024)
+        with mock.patch.object(log_lib.subprocess_utils,
+                               'kill_process_daemon') as watcher, \
+             mock.patch.object(log_lib.threading, 'Timer') as timer, \
+             mock.patch.object(log_lib.multiprocessing.pool,
+                               'ThreadPool') as thread_pool:
+            returncode, stdout, stderr = log_lib.run_with_log(
+                cmd,
+                os.devnull,
+                require_outputs=True,
+                process_stream=False,
+                bounded_capture=capture)
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(len(stdout), 131072)
+        self.assertEqual(len(stderr), 131072)
+        watcher.assert_not_called()
+        timer.assert_not_called()
+        thread_pool.assert_not_called()
+
+    def test_bounded_capture_timeout_kills_child_and_grandchild(self):
+        with tempfile.NamedTemporaryFile(delete=False) as pid_file:
+            pid_path = pid_file.name
+        cmd = [
+            sys.executable, '-c',
+            ('import pathlib, subprocess, sys, time; '
+             'child = subprocess.Popen(["sleep", "60"]); '
+             'pathlib.Path(sys.argv[1]).write_text(str(child.pid)); '
+             'time.sleep(60)'), pid_path
+        ]
+        started_at = time.monotonic()
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                log_lib.run_with_log(
+                    cmd,
+                    os.devnull,
+                    require_outputs=True,
+                    process_stream=False,
+                    bounded_capture=log_lib.BoundedSubprocessCapture(
+                        deadline_monotonic=time.monotonic() + 0.5,
+                        max_output_bytes=1024))
+            self.assertLess(time.monotonic() - started_at, 2.5)
+            child_pid = int(open(pid_path, encoding='utf-8').read())
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    child = psutil.Process(child_pid)
+                    if (not child.is_running() or
+                            child.status() == psutil.STATUS_ZOMBIE):
+                        break
+                except psutil.NoSuchProcess:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail('Bounded capture left its grandchild running.')
+        finally:
+            os.unlink(pid_path)
+
+    def test_bounded_capture_output_limit_fails_closed(self):
+        cmd = [sys.executable, '-c', 'print("x" * 1048576)']
+        with self.assertRaises(log_lib.SubprocessOutputLimitExceeded):
+            log_lib.run_with_log(
+                cmd,
+                os.devnull,
+                require_outputs=True,
+                process_stream=False,
+                bounded_capture=log_lib.BoundedSubprocessCapture(
+                    deadline_monotonic=time.monotonic() + 5,
+                    max_output_bytes=64 * 1024))
 
 
 if __name__ == '__main__':

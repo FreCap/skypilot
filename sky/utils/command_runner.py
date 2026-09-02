@@ -1373,7 +1373,7 @@ class SSHCommandRunner(CommandRunner):
         os.makedirs(log_dir, exist_ok=True)
 
         executable = None
-        if not process_stream:
+        if not process_stream and not require_outputs:
             if stream_logs:
                 command += [
                     f'| tee {log_path}',
@@ -1783,7 +1783,7 @@ class KubernetesCommandRunner(CommandRunner):
         os.makedirs(log_dir, exist_ok=True)
 
         executable = None
-        if not process_stream:
+        if not process_stream and not require_outputs:
             if stream_logs:
                 command += [
                     f'| tee {log_path}',
@@ -1819,7 +1819,8 @@ class KubernetesCommandRunner(CommandRunner):
         # with the pod's termination reason so callers (setup/run failure
         # messages) surface OOMKilled etc. Only possible when outputs were
         # captured.
-        if require_outputs and isinstance(result, tuple):
+        if (require_outputs and isinstance(result, tuple) and
+                kwargs.get('bounded_capture') is None):
             returncode, stdout, stderr = result
             if returncode != 0:
                 diagnosis = self._diagnose_dead_pod(stderr)
@@ -2000,7 +2001,7 @@ class LocalProcessCommandRunner(CommandRunner):
 
         executable = None
         command = [command_str]
-        if not process_stream:
+        if not process_stream and not require_outputs:
             if stream_logs:
                 command += [
                     f'| tee {log_path}',

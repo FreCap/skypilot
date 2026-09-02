@@ -229,6 +229,10 @@ def test_run_controller_sets_connection_metric_role_before_initialization(
         lambda role: initialization_order.append(('metrics-role', role)))
     monkeypatch.setattr(controller.context_utils, 'hijack_sys_attrs',
                         lambda: initialization_order.append(('context', None)))
+    monkeypatch.setattr(
+        controller.plugins, 'load_plugins',
+        lambda extension_context: initialization_order.append(
+            ('plugins', extension_context.context)))
     controller_instance = mock.Mock()
 
     def _construct_controller(*_args, **_kwargs):
@@ -250,6 +254,7 @@ def test_run_controller_sets_connection_metric_role_before_initialization(
          '--service-incarnation incarnation-a'),
         ('metrics-role', 'serve-controller'),
         ('context', None),
+        ('plugins', controller.plugins.PluginContext.CONTROLLER),
         ('controller-construction', None),
     ]
     controller_instance.run.assert_called_once_with()
@@ -264,6 +269,7 @@ def test_run_controller_preserves_authoritative_launch_fence_bit(monkeypatch):
     monkeypatch.setattr(controller, 'SkyServeController', constructor)
     monkeypatch.setattr(controller.context_utils, 'hijack_sys_attrs',
                         mock.Mock())
+    monkeypatch.setattr(controller.plugins, 'load_plugins', mock.Mock())
 
     controller.run_controller('pool', mock.Mock(), 1, '127.0.0.1', 20001,
                               'fingerprint', None, 'incarnation-a', 123,
@@ -279,6 +285,7 @@ def test_run_controller_threads_exact_binding_authority(monkeypatch):
     monkeypatch.setattr(controller, 'SkyServeController', constructor)
     monkeypatch.setattr(controller.context_utils, 'hijack_sys_attrs',
                         mock.Mock())
+    monkeypatch.setattr(controller.plugins, 'load_plugins', mock.Mock())
     authority = mock.sentinel.controller_binding_authority
 
     controller.run_controller('svc', mock.Mock(), 1, '127.0.0.1', 20001,
@@ -339,6 +346,7 @@ def test_run_controller_uses_parent_owner_for_child_cutover_fence(monkeypatch):
     monkeypatch.setattr(controller, 'SkyServeController', _WiredController)
     monkeypatch.setattr(controller.context_utils, 'hijack_sys_attrs',
                         mock.Mock())
+    monkeypatch.setattr(controller.plugins, 'load_plugins', mock.Mock())
     monkeypatch.setattr(
         controller.serve_state, 'get_service_controller_owner',
         lambda *_args, **_kwargs: {

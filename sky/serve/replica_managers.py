@@ -39,6 +39,7 @@ from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
+from sky.provision import provider_facets
 from sky.serve import autoscaler_decisions
 from sky.serve import constants as serve_constants
 from sky.serve import drain_observability
@@ -156,42 +157,127 @@ class ProbeRouteResult:
     complete: bool
 
 
-class _ReplicaRemoteIOExecutor:
-    """One aggregate worker budget with a non-convoying phase-child lane.
+class _ReplicaRemoteIOLane(enum.Enum):
+    """Remote-I/O duties sharing one aggregate replica-manager budget."""
 
-    A job-status round holds a root provider phase while its remote workers
-    join that admission. General readiness workers may independently wait for
-    the opposite provider phase. Keeping a small admitted-child lane prevents
-    those general waiters from occupying every worker and stranding the root's
-    children. The two lane sizes sum to ``max_workers``; they are implementation
-    partitions of one service budget, not independent fan-out authorities.
+    PROBE = 'probe'
+    STATUS = 'status'
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class _JobStatusFetchInput:
+    """One immutable exact-status operation from a controller snapshot."""
+
+    info: 'ReplicaInfo'
+    handle: backends.CloudVmRayResourceHandle
+    job_ids: list[int] | None
+    with_recovery: bool
+    transport: backends.ServeJobStatusTransport | None = None
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True, order=True)
+class _StartupSentinelKey:
+    """Runtime class whose first successful setup retires one sentinel."""
+
+    service_version: int
+    cloud_type: str
+    region: str
+    zone: str
+    instance_type: str
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class _StartupSentinelCandidate:
+    """One immutable startup-status candidate from the opening snapshot."""
+
+    key: _StartupSentinelKey
+    info: 'ReplicaInfo'
+    handle: backends.CloudVmRayResourceHandle
+    cleanup_fence: reserved_capacity.ProtocolV2CleanupFence | None
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class _ReadinessProbeResult:
+    """One immutable endpoint observation from the PROBE stage."""
+
+    info: 'ReplicaInfo'
+    succeeded: bool
+    observed_at: float
+    request_started_monotonic: float
+    requires_next_probe: bool = False
+    ordered_status_required: bool = False
+
+
+class _ReplicaRemoteIOExecutor:
+    """One aggregate worker budget with non-convoying duty lanes.
+
+    A job-status round can hold a root provider phase while its workers join
+    that admission. Readiness workers may independently wait for an
+    incompatible provider phase. Explicit duty lanes prevent either producer
+    from occupying every worker and stranding the other. Their worker and
+    queue capacities are partitions of one service budget, not independent
+    fan-out authorities.
     """
 
-    def __init__(self, max_workers: int) -> None:
-        if max_workers < 2:
-            raise ValueError('Remote-I/O executor requires at least 2 workers.')
-        admitted_workers = max(1, max_workers // 4)
-        general_workers = max_workers - admitted_workers
-        self._general = subprocess_utils.ContextThreadPoolExecutor(
-            max_workers=general_workers, thread_name_prefix='serve-remote-io')
-        self._admitted = subprocess_utils.ContextThreadPoolExecutor(
-            max_workers=admitted_workers,
-            thread_name_prefix='serve-remote-io-admitted')
+    def __init__(self, *, probe_workers: int, status_workers: int,
+                 probe_queue_capacity: int, status_queue_capacity: int) -> None:
+        if (probe_workers < 1 or status_workers < 1 or
+                probe_queue_capacity < 0 or status_queue_capacity < 0):
+            raise ValueError('Remote-I/O lane budgets are invalid.')
+        self._probe = subprocess_utils.ContextThreadPoolExecutor(
+            max_workers=probe_workers,
+            thread_name_prefix='serve-remote-io-probe')
+        self._status = subprocess_utils.ContextThreadPoolExecutor(
+            max_workers=status_workers,
+            thread_name_prefix='serve-remote-io-status')
+        self._probe_slots = threading.BoundedSemaphore(probe_workers +
+                                                       probe_queue_capacity)
+        self._status_slots = threading.BoundedSemaphore(status_workers +
+                                                        status_queue_capacity)
+
+    @staticmethod
+    def _release_slot(_future: concurrent.futures.Future[Any],
+                      slot: threading.BoundedSemaphore) -> None:
+        slot.release()
 
     def submit(
         self,
         fn: Callable[..., Any],
         /,
         *args: Any,
-        provider_phase_admitted: bool = False,
+        lane: _ReplicaRemoteIOLane,
         **kwargs: Any,
     ) -> concurrent.futures.Future[Any]:
-        executor = self._admitted if provider_phase_admitted else self._general
-        return executor.submit(fn, *args, **kwargs)
+        if lane is _ReplicaRemoteIOLane.PROBE:
+            executor = self._probe
+            slot = self._probe_slots
+        elif lane is _ReplicaRemoteIOLane.STATUS:
+            executor = self._status
+            slot = self._status_slots
+        else:
+            raise ValueError(f'Unsupported replica remote-I/O lane: {lane!r}.')
+        if not slot.acquire(blocking=False):
+            raise RuntimeError(
+                f'Replica remote-I/O {lane.value} queue capacity exhausted.')
+        try:
+            future = executor.submit(fn, *args, **kwargs)
+        except BaseException:
+            slot.release()
+            raise
+        future.add_done_callback(lambda completed, lane_slot=slot: self.
+                                 _release_slot(completed, lane_slot))
+        return future
 
     def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
-        self._general.shutdown(wait=wait, cancel_futures=cancel_futures)
-        self._admitted.shutdown(wait=wait, cancel_futures=cancel_futures)
+        # Close both queues before joining either lane. Otherwise a blocked
+        # PROBE worker can keep the STATUS executor open long enough for queued
+        # callbacks to start after the manager has become terminal (and vice
+        # versa).
+        self._probe.shutdown(wait=False, cancel_futures=cancel_futures)
+        self._status.shutdown(wait=False, cancel_futures=cancel_futures)
+        if wait:
+            self._probe.shutdown(wait=True, cancel_futures=cancel_futures)
+            self._status.shutdown(wait=True, cancel_futures=cancel_futures)
 
 
 class _PreemptionPrefilterDisposition(enum.Enum):
@@ -3730,13 +3816,12 @@ class _ReplicaMutationRuntime:
 class SkyPilotReplicaManager(ReplicaManager):
     """Replica Manager for SkyPilot clusters.
 
-    It will run three daemon to monitor the status of the replicas:
+    It runs three primary monitoring daemons:
         (1) _thread_pool_refresher: Refresh the launch/down thread pool
             to monitor the progress of the launch/down thread.
-        (2) _job_status_fetcher: Fetch the job status of the service to
-            monitor the status of the service jobs.
-        (3) _replica_prober: Do readiness probe to the replicas to monitor
-            whether it is still responding to requests.
+        (2) _exact_status_fetcher: Fetch the exact service-job evidence whose
+            backend contract requires it.
+        (3) _replica_prober: Probe endpoint/provider readiness independently.
     """
 
     _scale_reconciliation_event: threading.Event
@@ -3783,6 +3868,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._scale_reconciliation_event = threading.Event()
         self._remote_io_executor_lock = threading.Lock()
         self._remote_io_executor: _ReplicaRemoteIOExecutor | None = None
+        self._remote_io_executor_closed = False
         # The controller installs its single generation coordinator after the
         # manager is constructed.  Keep the legacy event as a compatibility
         # signal for direct embedders, but route every committed feedback wake
@@ -6660,7 +6746,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # once recovery HOLDS the manager lock. Two hazards shaped this:
         #
         # 1. (original) If a daemon grabs `self.lock` before recovery —
-        #    `_job_status_fetcher` SSHes every replica under it — recovery
+        #    `_exact_status_fetcher` SSHes every replica under it — recovery
         #    (and formerly __init__) blocks for the daemon's full walk.
         #    The lock-acquired handshake below preserves the guarantee that
         #    recovery gets the lock FIRST, without recovery having to finish
@@ -6728,8 +6814,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             'replica-thread-pool-refresher',
             stop_event=self._manager_daemon_stop)
         thread_utils.start_supervised_thread(
-            self._job_status_fetcher,
-            'replica-job-status-fetcher',
+            self._exact_status_fetcher,
+            'replica-exact-status-fetcher',
             stop_event=self._manager_daemon_stop)
         thread_utils.start_supervised_thread(
             self._replica_prober,
@@ -13781,44 +13867,65 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     # We don't need to add lock here since every caller of this function
     # will acquire the lock.
-    # Thread-pool bound for the per-probe-round parallel cloud pre-filter
-    # over failed-probe spot replicas (see _cloud_instance_looks_alive).
-    _PREEMPTION_PREFILTER_PARALLELISM = 16
-    # One service may run readiness HTTP and remote job-status SSH at the same
-    # time. This is their aggregate process-memory budget, not a per-loop
-    # limit. The 24-worker general lane drains the maximum 100-member atomic
-    # paid wave in five default 15-second readiness batches (at most 75
-    # seconds). A fully phase-admitted 100-member probe takes at most thirteen
-    # such batches (195 seconds), still below the five-minute scale gate and
-    # 600-second request deadline. The eight admitted-phase workers guarantee
-    # progress and keep combined thread/child-process pressure bounded at 32.
-    _REMOTE_IO_MAX_PARALLELISM = 32
+    # One service may run endpoint/provider probes and exact job-status
+    # transport simultaneously. These explicit lanes sum to one 72-worker
+    # process budget. Producers submit fixed-size waves; the executor enforces
+    # at most one queued PROBE wave and two queued STATUS waves across sibling
+    # daemons, for 96 queued and 168 total outstanding items. At the paid
+    # qualifier's configured N=800, 48 probe workers drain default 15-second
+    # endpoint timeouts in ceil(800 / 48) * 15 = 255 seconds. In general the
+    # bound is ceil(N / 48) * readiness_timeout; 800 is not a global service
+    # limit. The 24-worker status lane has a 10-second command deadline, a
+    # 1-MiB output cap per active command, and no nested worker/watcher fan-out.
+    _REMOTE_PROBE_PARALLELISM = 48
+    _REMOTE_STATUS_PARALLELISM = 24
+    _REMOTE_PROBE_QUEUE_CAPACITY = _REMOTE_PROBE_PARALLELISM
+    _REMOTE_STATUS_QUEUE_CAPACITY = 2 * _REMOTE_STATUS_PARALLELISM
+    _REMOTE_IO_MAX_PARALLELISM = (_REMOTE_PROBE_PARALLELISM +
+                                  _REMOTE_STATUS_PARALLELISM)
+    _REMOTE_IO_MAX_QUEUED = (_REMOTE_PROBE_QUEUE_CAPACITY +
+                             _REMOTE_STATUS_QUEUE_CAPACITY)
+    _REMOTE_IO_MAX_OUTSTANDING = (_REMOTE_IO_MAX_PARALLELISM +
+                                  _REMOTE_IO_MAX_QUEUED)
+    _REMOTE_JOB_STATUS_COMMAND_TIMEOUT_SECONDS = 10
+
+    def _get_or_create_remote_io_executor_locked(
+            self) -> _ReplicaRemoteIOExecutor:
+        """Return the executor while its lifecycle lock is held."""
+        if self._remote_io_executor_closed:
+            raise RuntimeError('Replica remote-I/O executor is closed.')
+        executor = self._remote_io_executor
+        if executor is None:
+            executor = _ReplicaRemoteIOExecutor(
+                probe_workers=self._REMOTE_PROBE_PARALLELISM,
+                status_workers=self._REMOTE_STATUS_PARALLELISM,
+                probe_queue_capacity=self._REMOTE_PROBE_QUEUE_CAPACITY,
+                status_queue_capacity=self._REMOTE_STATUS_QUEUE_CAPACITY)
+            self._remote_io_executor = executor
+        return executor
 
     def _get_remote_io_executor(self) -> _ReplicaRemoteIOExecutor:
         """Return the manager's shared, bounded remote-I/O executor."""
         with self._remote_io_executor_lock:
-            executor = self._remote_io_executor
-            if executor is None:
-                executor = _ReplicaRemoteIOExecutor(
-                    self._REMOTE_IO_MAX_PARALLELISM)
-                self._remote_io_executor = executor
-            return executor
+            return self._get_or_create_remote_io_executor_locked()
 
-    def _submit_remote_io(self,
-                          fn: Callable[..., Any],
-                          *args: Any,
-                          provider_phase_admitted: bool = False,
+    def _submit_remote_io(self, fn: Callable[..., Any], *args: Any,
+                          lane: _ReplicaRemoteIOLane,
                           **kwargs: Any) -> concurrent.futures.Future[Any]:
         """Submit one readiness or job-status operation to the shared budget."""
-        return self._get_remote_io_executor().submit(
-            fn,
-            *args,
-            provider_phase_admitted=provider_phase_admitted,
-            **kwargs)
+        # Submit while holding the lifecycle lock. Terminal shutdown cannot
+        # clear and retire this executor between lookup and submit, and once it
+        # marks the owner closed no later producer can recreate a fresh pool.
+        with self._remote_io_executor_lock:
+            executor = self._get_or_create_remote_io_executor_locked()
+            return executor.submit(fn, *args, lane=lane, **kwargs)
 
     def _shutdown_remote_io_executor(self) -> None:
         """Release remote-I/O workers after this manager is terminal."""
         with self._remote_io_executor_lock:
+            if self._remote_io_executor_closed:
+                return
+            self._remote_io_executor_closed = True
             executor = self._remote_io_executor
             self._remote_io_executor = None
         if executor is not None:
@@ -15909,7 +16016,26 @@ class SkyPilotReplicaManager(ReplicaManager):
             return True
         return False
 
-    def _fetch_job_status(self) -> None:
+    @staticmethod
+    def _startup_sentinel_key(
+            info: ReplicaInfo,
+            handle: backends.CloudVmRayResourceHandle) -> _StartupSentinelKey:
+        """Return the setup-equivalent runtime class for one VM replica."""
+        resources = handle.launched_resources
+        cloud = resources.cloud
+
+        def _text(value: Any) -> str:
+            return '' if value is None else str(value)
+
+        return _StartupSentinelKey(
+            service_version=info.version,
+            cloud_type=(f'{type(cloud).__module__}:'
+                        f'{type(cloud).__qualname__}'),
+            region=_text(getattr(resources, 'region', None)),
+            zone=_text(getattr(resources, 'zone', None)),
+            instance_type=_text(getattr(resources, 'instance_type', None)))
+
+    def _fetch_exact_status(self) -> None:
         """Fetch the service job status of all replicas.
 
         This function monitors replicas whose backend or service contract
@@ -15963,12 +16089,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         # sdk.job_status. The backend object is stateless; construct it
         # once for the whole walk.
         backend = backends.CloudVmRayBackend()
-        ordinary_fetches: list[tuple[ReplicaInfo, Any, list[int] | None,
-                                     bool]] = []
-        unphased_fetches: list[tuple[ReplicaInfo, Any, list[int] | None,
-                                     bool]] = []
-        fenced_fetches: list[tuple[ReplicaInfo, Any, list[int] | None,
-                                   bool]] = []
+        startup_sentinel_candidates: dict[_StartupSentinelKey,
+                                          list[_StartupSentinelCandidate]] = {}
+        ever_ready_sentinel_keys: set[_StartupSentinelKey] = set()
+        ordinary_fetches: list[_JobStatusFetchInput] = []
+        unphased_fetches: list[_JobStatusFetchInput] = []
+        fenced_fetches_by_key: dict[tuple[str, str],
+                                    list[_JobStatusFetchInput]] = {}
         invalid_recovery_infos: dict[
             provider_phase.ProviderPhaseMode, list[ReplicaInfo]] = {
                 provider_phase.ProviderPhaseMode.V2_FENCED: [],
@@ -15980,6 +16107,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         fence_group_infos: dict[tuple[str, str], list[ReplicaInfo]] = {}
         for info in infos:
             if not info.status_property.should_track_service_status():
+                continue
+            # Pool readiness already owns the exact dummy-job observation in
+            # the probe round. A second daemon query was duplicate process and
+            # provider work with no independent reducer semantics.
+            if self._is_pool:
                 continue
             cluster_record = cluster_records.get(info.cluster_name)
             try:
@@ -16001,27 +16133,52 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # vanish mid-walk (a scale-down or preemption cleanup
                 # completing after the snapshot was taken). Skip it; the next
                 # round re-snapshots.
-                if (not self._is_pool and info.system_recovery_disposition in
-                    (system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
-                     system_recovery_state.SystemRecoveryDisposition.CAPABLE)):
+                if info.system_recovery_disposition is (
+                        system_recovery_state.SystemRecoveryDisposition.CAPABLE
+                ):
                     mode = (provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
                             if cleanup_fence is None else
                             provider_phase.ProviderPhaseMode.V2_FENCED)
                     invalid_recovery_infos[mode].append(info)
                 continue
-            with_recovery = (
-                not self._is_pool and info.system_recovery_disposition
-                in (system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
-                    system_recovery_state.SystemRecoveryDisposition.CAPABLE))
-            requires_exact_job_evidence = self._is_pool or with_recovery
-            if (not requires_exact_job_evidence and
-                    backend.serve_replica_job_status_source(handle) is
-                    backends.ServeReplicaJobStatusSource.PROVIDER_AND_ENDPOINT):
-                # The ordinary Kubernetes Serve contract has one happy path:
-                # provider lifecycle plus application readiness. Do not enter
-                # a provider phase, start a worker thread, or exec into the Pod
-                # merely to duplicate that evidence.
+            disposition = info.system_recovery_disposition
+            # Candidate release already requires exact status in the same
+            # probe cycle as readiness. Polling it again here is duplicate and
+            # can reconcile observations from two different snapshots.
+            if disposition is (
+                    system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
                 continue
+            with_recovery = disposition is (
+                system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+            job_ids: list[int] | None
+            if not with_recovery:
+                status_source = backend.serve_replica_job_status_source(handle)
+                if status_source is (backends.ServeReplicaJobStatusSource.
+                                     PROVIDER_AND_ENDPOINT):
+                    continue
+                if status_source is (backends.ServeReplicaJobStatusSource.
+                                     STARTUP_SENTINEL_AND_PROVIDER_ENDPOINT):
+                    sentinel_key = self._startup_sentinel_key(info, handle)
+                    if (info.status_property.first_ready_time is not None and
+                            info.status_property.first_ready_time >= 0):
+                        ever_ready_sentinel_keys.add(sentinel_key)
+                    # Choose one *usable* sentinel after cached transport
+                    # preparation. Selecting a row before that point would let
+                    # one malformed retained handle blind its runtime class
+                    # forever even when another replica has valid connection
+                    # state.
+                    startup_sentinel_candidates.setdefault(
+                        sentinel_key, []).append(
+                            _StartupSentinelCandidate(
+                                key=sentinel_key,
+                                info=info,
+                                handle=handle,
+                                cleanup_fence=cleanup_fence))
+                    continue
+                else:
+                    # Unknown/malformed backend contracts retain the legacy
+                    # fail-closed full job-table read.
+                    job_ids = None
             if cleanup_fence is not None:
                 # Register only rows that still require exact remote evidence.
                 # Invalid recovery rows may schedule teardown, so their
@@ -16041,17 +16198,178 @@ class SkyPilotReplicaManager(ReplicaManager):
                             provider_phase.ProviderPhaseMode.V2_FENCED)
                     invalid_recovery_infos[mode].append(info)
                     continue
-                job_ids: list[int] | None = [service_job_id]
-            else:
-                job_ids = [1] if self._is_pool else None
-            fetch = (info, handle, job_ids, with_recovery)
+                job_ids = [service_job_id]
+            fetch = _JobStatusFetchInput(info=info,
+                                         handle=handle,
+                                         job_ids=job_ids,
+                                         with_recovery=with_recovery)
             if cleanup_fence is not None:
-                fenced_fetches.append(fetch)
+                key = (cleanup_fence.kubernetes_context,
+                       cleanup_fence.physical_cluster_uid)
+                fenced_fetches_by_key.setdefault(key, []).append(fetch)
             elif reserved_capacity.ordinary_provider_phase_mode(
                     handle, info.cluster_name) is None:
                 unphased_fetches.append(fetch)
             else:
                 ordinary_fetches.append(fetch)
+
+        def _sentinel_priority(key: _StartupSentinelKey) -> tuple[Any, ...]:
+            return (-key.service_version, key.cloud_type, key.region, key.zone,
+                    key.instance_type)
+
+        for key in ever_ready_sentinel_keys:
+            startup_sentinel_candidates.pop(key, None)
+        sentinel_candidates = [
+            candidate for key in sorted(startup_sentinel_candidates,
+                                        key=_sentinel_priority)
+            for candidate in sorted(startup_sentinel_candidates[key],
+                                    key=lambda item: item.info.replica_id)
+        ]
+        sentinel_preparations = (backend.build_serve_job_status_transports(
+            [candidate.handle for candidate in sentinel_candidates],
+            command_timeout_seconds=(
+                self._REMOTE_JOB_STATUS_COMMAND_TIMEOUT_SECONDS))
+                                 if sentinel_candidates else [])
+        sentinel_preparation_by_handle_id = {
+            id(preparation.source_handle): preparation
+            for preparation in sentinel_preparations
+        }
+        sentinel_identities = {
+            candidate.info.replica_id:
+                request_postgres.BoundOrdinaryLaunchStatusIdentity(
+                    replica_id=candidate.info.replica_id,
+                    replica_record_id=candidate.info.replica_record_id)
+            for candidate in sentinel_candidates
+        }
+        try:
+            sentinel_job_ids = (
+                request_postgres.read_bound_ordinary_launch_status_job_ids(
+                    self._service_name, list(sentinel_identities.values()))
+                if sentinel_identities else {})
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Deferring startup sentinels because their batched job '
+                'associations are unavailable: %s',
+                common_utils.format_exception(error))
+            sentinel_job_ids = {}
+
+        for key in sorted(startup_sentinel_candidates, key=_sentinel_priority):
+            candidates = sorted(startup_sentinel_candidates[key],
+                                key=lambda item: item.info.replica_id)
+            selected = False
+            for candidate in candidates:
+                info = candidate.info
+                handle = candidate.handle
+                cleanup_fence = candidate.cleanup_fence
+                try:
+                    identity = sentinel_identities[info.replica_id]
+                    service_job_id = sentinel_job_ids.get(identity)
+                    if service_job_id is None:
+                        raise ValueError(
+                            'bound launch has no positive service job ID')
+                    preparation = sentinel_preparation_by_handle_id.get(
+                        id(handle))
+                    if preparation is None:
+                        raise RuntimeError('cached status transport has no '
+                                           'exact preparation')
+                    if (preparation.source_handle is not handle or
+                            preparation.transport is None):
+                        if preparation.error is None:
+                            raise RuntimeError(
+                                'cached status transport is unavailable')
+                        raise preparation.error
+                except Exception as error:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Skipping startup-sentinel candidate replica %s for '
+                        'runtime class %s: %s', info.replica_id, key,
+                        common_utils.format_exception(error))
+                    continue
+                if cleanup_fence is not None:
+                    physical_key = (cleanup_fence.kubernetes_context,
+                                    cleanup_fence.physical_cluster_uid)
+                    fence_representatives.setdefault(physical_key,
+                                                     (info, handle))
+                    fence_group_infos.setdefault(physical_key, []).append(info)
+                fetch = _JobStatusFetchInput(info=info,
+                                             handle=handle,
+                                             job_ids=[service_job_id],
+                                             with_recovery=False,
+                                             transport=preparation.transport)
+                if cleanup_fence is not None:
+                    fenced_fetches_by_key.setdefault(physical_key,
+                                                     []).append(fetch)
+                elif reserved_capacity.ordinary_provider_phase_mode(
+                        handle, info.cluster_name) is None:
+                    unphased_fetches.append(fetch)
+                else:
+                    ordinary_fetches.append(fetch)
+                selected = True
+                break
+            if not selected:
+                logger.warning(
+                    'Deferring startup-sentinel status for runtime class %s: '
+                    'no replica has a bound job and cached transport.', key)
+
+        fenced_fetches = [
+            fetch for key in sorted(fenced_fetches_by_key)
+            for fetch in fenced_fetches_by_key[key]
+        ]
+        all_fetches = fenced_fetches + ordinary_fetches + unphased_fetches
+        unique_handles = list({
+            id(item.handle): item.handle
+            for item in all_fetches
+            if item.transport is None
+        }.values())
+        preparations = (backend.build_serve_job_status_transports(
+            unique_handles,
+            command_timeout_seconds=(
+                self._REMOTE_JOB_STATUS_COMMAND_TIMEOUT_SECONDS))
+                        if unique_handles else [])
+        preparation_by_handle_id = {
+            id(preparation.source_handle): preparation
+            for preparation in preparations
+        }
+
+        def _attach_prepared_transports(
+            fetches: list[_JobStatusFetchInput],) -> list[_JobStatusFetchInput]:
+            prepared = []
+            for item in fetches:
+                if item.transport is not None:
+                    prepared.append(item)
+                    continue
+                preparation = preparation_by_handle_id.get(id(item.handle))
+                if preparation is None or preparation.transport is None:
+                    error = (None if preparation is None else preparation.error)
+                    logger.warning(
+                        'Deferring job status for replica %s because cached '
+                        'transport preparation failed: %s',
+                        item.info.replica_id,
+                        ('missing preparation' if error is None else
+                         common_utils.format_exception(error)))
+                    continue
+                prepared.append(
+                    dataclasses.replace(item, transport=preparation.transport))
+            return prepared
+
+        fenced_fetches = _attach_prepared_transports(fenced_fetches)
+        ordinary_fetches = _attach_prepared_transports(ordinary_fetches)
+        unphased_fetches = _attach_prepared_transports(unphased_fetches)
+        # The physical-pool execution loop consumes the per-fence mapping,
+        # not the flat list. Rebuild that mapping from the immutable prepared
+        # values; retaining the pre-preparation objects silently discarded
+        # their bounded cached transports and reintroduced per-row remote
+        # connection setup in the worker.
+        prepared_fenced_fetches_by_key: dict[tuple[str, str],
+                                             list[_JobStatusFetchInput]] = {}
+        for fetch in fenced_fetches:
+            cleanup_fence = (reserved_capacity.parse_protocol_v2_cleanup_fence(
+                fetch.info))
+            if cleanup_fence is None:
+                raise RuntimeError('Prepared fenced status input lost its '
+                                   'protocol-v2 physical identity.')
+            key = (cleanup_fence.kubernetes_context,
+                   cleanup_fence.physical_cluster_uid)
+            prepared_fenced_fetches_by_key.setdefault(key, []).append(fetch)
 
         def _current_exact(snapshot: ReplicaInfo) -> ReplicaInfo | None:
             fresh = serve_state.get_replica_info_from_id(
@@ -16095,7 +16413,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._terminate_replica(fresh.replica_id,
                                             replica_drain_delay_seconds=0)
 
-        def _get_job_status(info, handle, job_ids, with_recovery,
+        def _get_job_status(info, handle, job_ids, with_recovery, transport,
                             phase_admission):
             # SSH into the replica's head node -- intentionally OUTSIDE
             # self.lock so an unreachable replica cannot wedge the round.
@@ -16118,14 +16436,21 @@ class SkyPilotReplicaManager(ReplicaManager):
             with provider_context:
                 if with_recovery:
                     return backend.get_job_status_with_system_recovery(
-                        handle, job_ids, stream_logs=False)
+                        handle,
+                        job_ids,
+                        stream_logs=False,
+                        serve_transport=transport)
                 return (backend.get_job_status(handle,
                                                job_ids,
-                                               stream_logs=False), {}, {})
+                                               stream_logs=False,
+                                               serve_transport=transport), {},
+                        {})
 
         def _run_fetches(
-            fetches: list[tuple[ReplicaInfo, Any, list[int] | None, bool]],
+            fetches: list[_JobStatusFetchInput],
             phase_admission: provider_phase.ProviderPhaseAdmission | None,
+            *,
+            wait_for_completion: bool = True,
         ) -> list[tuple[ReplicaInfo, Any, concurrent.futures.Future[Any]]]:
             if not fetches or self._manager_daemon_should_stop():
                 return []
@@ -16134,117 +16459,132 @@ class SkyPilotReplicaManager(ReplicaManager):
             # classify/reduce only after the caller releases that fence. This
             # prevents provider-phase -> manager-lock inversion.
             fetch_results = [
-                (info, handle,
+                (item.info, item.handle,
                  self._submit_remote_io(_get_job_status,
-                                        info,
-                                        handle,
-                                        job_ids,
-                                        with_recovery,
+                                        item.info,
+                                        item.handle,
+                                        item.job_ids,
+                                        item.with_recovery,
+                                        item.transport,
                                         phase_admission,
-                                        provider_phase_admitted=(phase_admission
-                                                                 is not None)))
-                for info, handle, job_ids, with_recovery in fetches
+                                        lane=_ReplicaRemoteIOLane.STATUS))
+                for item in fetches
             ]
-            concurrent.futures.wait([result for _, _, result in fetch_results])
+            if wait_for_completion:
+                concurrent.futures.wait(
+                    [result for _, _, result in fetch_results])
             return fetch_results
 
-        fenced_invalid_infos = invalid_recovery_infos[
-            provider_phase.ProviderPhaseMode.V2_FENCED]
-        if fenced_fetches or fenced_invalid_infos:
-            # Blocking admission is outside self.lock, so one unreachable SSH
-            # worker does not block probe/refresher admission on the manager
-            # mutex. Result reduction happens only after owners retire.
-            fenced_identity_uncertainties: list[tuple[ReplicaInfo, str]] = []
-            fenced_results: list[tuple[ReplicaInfo, Any, Any]] = []
-            failed_replica_ids: set[int] = set()
-            try:
-                with provider_phase.provider_phase(
-                        provider_phase.ProviderPhaseMode.V2_FENCED
-                ) as phase_admission:
-                    with reserved_capacity.protocol_v2_provider_batch_fences(
-                            fence_representatives,
-                            phase_admission=phase_admission) as fence_failures:
-                        for key, error in fence_failures.items():
-                            if not isinstance(error, Exception):
-                                raise error
-                            group_infos = fence_group_infos[key]
-                            failed_replica_ids.update(
-                                info.replica_id for info in group_infos)
-                            if isinstance(
-                                    error, exceptions.
-                                    KubernetesPhysicalClusterIdentityError):
-                                message = (
-                                    'job-status batch identity was fenced off: '
-                                    f'{common_utils.format_exception(error)}')
-                                fenced_identity_uncertainties.extend(
-                                    (info, message) for info in group_infos)
-                            else:
-                                # A failed physical group contributes no job
-                                # evidence. Other v2 groups and later provider
-                                # partitions remain independently consumable.
-                                logger.warning(
-                                    'Deferring protocol-v2 job status for '
-                                    'replica IDs %s after a group fence '
-                                    'failure: %s',
-                                    [info.replica_id for info in group_infos],
-                                    common_utils.format_exception(error))
-                        admitted_fetches = [
-                            item for item in fenced_fetches
-                            if item[0].replica_id not in failed_replica_ids
-                        ]
-                        fenced_results = _run_fetches(admitted_fetches,
-                                                      phase_admission)
-            except exceptions.ProviderPhaseError as error:
-                # This partition produced no evidence. Continue the ambient
-                # and unphased partitions so an unrelated provider owner
-                # cannot convoy the whole fleet.
-                logger.info(
-                    'Deferring the protocol-v2 job-status partition because '
-                    'provider admission was unavailable: %s',
-                    common_utils.format_exception(error))
-            else:
-                for snapshot, message in fenced_identity_uncertainties:
-                    _record_identity_uncertainty(snapshot, message)
-                _terminate_invalid_recovery_rows([
-                    info for info in fenced_invalid_infos
-                    if info.replica_id not in failed_replica_ids
-                ])
-                self._handle_job_status_results(
-                    fenced_results,
-                    provider_error_phase_mode=(
-                        provider_phase.ProviderPhaseMode.V2_FENCED))
-
-        ordinary_invalid_infos = invalid_recovery_infos[
-            provider_phase.ProviderPhaseMode.AMBIENT_LEGACY]
-        if ordinary_fetches or ordinary_invalid_infos:
-            # Genuine ordinary rows run only after all physical owners retire.
-            try:
-                with provider_phase.provider_phase(
-                        provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
-                ) as phase_admission:
-                    ordinary_results = _run_fetches(ordinary_fetches,
-                                                    phase_admission)
-            except exceptions.ProviderPhaseError as error:
-                logger.info(
-                    'Deferring the ambient job-status partition because '
-                    'provider admission was unavailable: %s',
-                    common_utils.format_exception(error))
-            else:
-                _terminate_invalid_recovery_rows(ordinary_invalid_infos)
-                self._handle_job_status_results(
-                    ordinary_results,
-                    provider_error_phase_mode=(
-                        provider_phase.ProviderPhaseMode.AMBIENT_LEGACY))
-
-        # Healthy exact non-Kubernetes SSH can be arbitrarily slow without
-        # owning Kubernetes authority. If it fails, result reduction takes a
-        # fresh ambient phase before the manager lock.
-        unphased_results = _run_fetches(unphased_fetches, None)
-        if unphased_results:
+        # VM startup sentinels are ordered latest-version-first above. Process
+        # them before historical Kubernetes/recovery partitions, and keep no
+        # more completed command payloads than the STATUS lane can consume.
+        for offset in range(0, len(unphased_fetches),
+                            self._REMOTE_STATUS_PARALLELISM):
+            batch = unphased_fetches[offset:offset +
+                                     self._REMOTE_STATUS_PARALLELISM]
+            unphased_results = _run_fetches(batch,
+                                            None,
+                                            wait_for_completion=False)
             self._handle_job_status_results(
                 unphased_results,
                 provider_error_phase_mode=(
                     provider_phase.ProviderPhaseMode.AMBIENT_LEGACY))
+
+        fenced_invalid_infos = invalid_recovery_infos[
+            provider_phase.ProviderPhaseMode.V2_FENCED]
+        for key, (representative,
+                  representative_handle) in (fence_representatives.items()):
+            group_infos = fence_group_infos[key]
+            group_fetches = prepared_fenced_fetches_by_key.get(key, [])
+            physical_fence = contextlib.ExitStack()
+            try:
+                # Bound only physical-fence initialization. Once established,
+                # keep its immutable context token across small phase batches
+                # without keeping either provider phase monopolized.
+                with kubernetes_adaptor.api_call_deadline(
+                        time.monotonic() +
+                        self._REMOTE_JOB_STATUS_COMMAND_TIMEOUT_SECONDS,
+                        threading.Event()):
+                    physical_fence.enter_context(
+                        reserved_capacity.protocol_v2_provider_fence(
+                            representative,
+                            representative_handle,
+                            include_provider_phase=False,
+                            wait_for_initializer=False))
+                for offset in range(0, len(group_fetches),
+                                    self._REMOTE_STATUS_PARALLELISM):
+                    batch = group_fetches[offset:offset +
+                                          self._REMOTE_STATUS_PARALLELISM]
+                    try:
+                        with provider_phase.provider_phase(
+                                provider_phase.ProviderPhaseMode.V2_FENCED
+                        ) as phase_admission:
+                            results = _run_fetches(batch, phase_admission)
+                    except exceptions.ProviderPhaseError as error:
+                        logger.info(
+                            'Deferring protocol-v2 job-status batch because '
+                            'provider admission was unavailable: %s',
+                            common_utils.format_exception(error))
+                        break
+                    self._handle_job_status_results(
+                        results,
+                        provider_error_phase_mode=(
+                            provider_phase.ProviderPhaseMode.V2_FENCED))
+            except Exception as error:  # pylint: disable=broad-except
+                message = ('job-status physical identity was unavailable: '
+                           f'{common_utils.format_exception(error)}')
+                for info in group_infos:
+                    _record_identity_uncertainty(info, message)
+            finally:
+                physical_fence.close()
+
+        if fenced_invalid_infos:
+            try:
+                with provider_phase.provider_phase(
+                        provider_phase.ProviderPhaseMode.V2_FENCED):
+                    pass
+            except exceptions.ProviderPhaseError as error:
+                logger.info(
+                    'Deferring invalid protocol-v2 recovery rows because '
+                    'provider admission was unavailable: %s',
+                    common_utils.format_exception(error))
+            else:
+                _terminate_invalid_recovery_rows(fenced_invalid_infos)
+
+        ordinary_invalid_infos = invalid_recovery_infos[
+            provider_phase.ProviderPhaseMode.AMBIENT_LEGACY]
+        for offset in range(0, len(ordinary_fetches),
+                            self._REMOTE_STATUS_PARALLELISM):
+            batch = ordinary_fetches[offset:offset +
+                                     self._REMOTE_STATUS_PARALLELISM]
+            try:
+                with provider_phase.provider_phase(
+                        provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+                ) as phase_admission:
+                    ordinary_results = _run_fetches(batch, phase_admission)
+            except exceptions.ProviderPhaseError as error:
+                logger.info(
+                    'Deferring ambient job-status batch because provider '
+                    'admission was unavailable: %s',
+                    common_utils.format_exception(error))
+                break
+            else:
+                self._handle_job_status_results(
+                    ordinary_results,
+                    provider_error_phase_mode=(
+                        provider_phase.ProviderPhaseMode.AMBIENT_LEGACY))
+        if ordinary_invalid_infos:
+            try:
+                with provider_phase.provider_phase(
+                        provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+                    pass
+            except exceptions.ProviderPhaseError as error:
+                logger.info(
+                    'Deferring invalid ambient recovery rows because provider '
+                    'admission was unavailable: %s',
+                    common_utils.format_exception(error))
+            else:
+                _terminate_invalid_recovery_rows(ordinary_invalid_infos)
 
     def _handle_job_status_results(
         self,
@@ -16462,19 +16802,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._terminate_replica(fresh.replica_id,
                                             replica_drain_delay_seconds=0)
 
-    def _job_status_fetcher(self) -> None:
-        """Periodically fetch the service job status of all replicas."""
+    def _exact_status_fetcher(self) -> None:
+        """Periodically fetch exact job evidence without delaying readiness."""
         while not self._manager_daemon_should_stop():
-            logger.debug('Refreshing job status.')
+            logger.debug('Refreshing exact replica job status.')
             try:
-                self._fetch_job_status()
-            except Exception as e:  # pylint: disable=broad-except
-                # No matter what error happens, we should keep the
-                # job status fetcher running.
-                logger.error('Error in job status fetcher: '
-                             f'{common_utils.format_exception(e)}')
+                self._fetch_exact_status()
+            except Exception as error:  # pylint: disable=broad-except
+                # Supervision handles BaseException/process failures. Isolate
+                # ordinary round failures here so one malformed retained row
+                # does not reset the cadence for healthy rows.
+                logger.error('Error in exact replica job status fetcher: %s',
+                             common_utils.format_exception(error))
                 with ux_utils.enable_traceback():
-                    logger.error(f'  Traceback: {traceback.format_exc()}')
+                    logger.error('  Traceback: %s', traceback.format_exc())
             if self._wait_for_manager_daemon_stop(_JOB_STATUS_FETCH_INTERVAL):
                 return
 
@@ -16490,6 +16831,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         None = None,
         resolved_handles: dict[int, backends.CloudVmRayResourceHandle] |
         None = None,
+        resolved_provider_configs: dict[int, dict[str, Any]] | None = None,
     ) -> dict[int, str | None]:
         """Resolve one endpoint per replica from batched cluster state.
 
@@ -16732,6 +17074,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 urls.setdefault(info.replica_id, None)
             if resolved_handles is not None:
                 resolved_handles.update(handles)
+            if resolved_provider_configs is not None:
+                resolved_provider_configs.update(provider_configs)
             return urls
 
         # Standalone active-URL reads establish the process phase themselves,
@@ -16758,6 +17102,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             urls.setdefault(info.replica_id, None)
         if resolved_handles is not None:
             resolved_handles.update(handles)
+        if resolved_provider_configs is not None:
+            resolved_provider_configs.update(provider_configs)
         return urls
 
     def _write_resolved_route_materials(
@@ -17176,6 +17522,15 @@ class SkyPilotReplicaManager(ReplicaManager):
         if not infos_to_probe:
             return infos
         probe_handles: dict[int, backends.CloudVmRayResourceHandle] = {}
+        probe_provider_configs: dict[int, dict[str, Any]] = {}
+        provider_inventory_handles: dict[
+            int, backends.CloudVmRayResourceHandle] = {}
+        provider_inventory_configs: dict[int, dict[str, Any]] = {}
+        provider_inventory_deadline: float | None = None
+        provider_inventory_future: concurrent.futures.Future[dict[
+            int,
+            provider_facets.InstanceStatusInventoryObservationV1]] | None = (
+                None)
         provider_identity_errors: dict[int, str] = {}
         provider_identity_errors_lock = threading.Lock()
         provider_phase_deferred_replica_ids: set[int] = set()
@@ -17198,6 +17553,35 @@ class SkyPilotReplicaManager(ReplicaManager):
             # This helper may run on any readiness worker. A failed admission
             # carries no readiness, liveness, route, or recovery evidence.
             _defer_probe_error(info, error, 'provider admission failure')
+
+        recovery_backend = backends.CloudVmRayBackend()
+
+        def _prepare_status_transports(
+            info_handles: list[tuple[ReplicaInfo, Any]],
+        ) -> dict[int, backends.ServeJobStatusTransport]:
+            if not info_handles:
+                return {}
+            preparations = (recovery_backend.build_serve_job_status_transports(
+                [handle for _, handle in info_handles],
+                command_timeout_seconds=(
+                    self._REMOTE_JOB_STATUS_COMMAND_TIMEOUT_SECONDS)))
+            prepared = {}
+            for (info, handle), preparation in zip(info_handles,
+                                                   preparations,
+                                                   strict=True):
+                if (preparation.source_handle is not handle or
+                        preparation.transport is None):
+                    error = preparation.error
+                    _defer_probe_error(
+                        info, (RuntimeError('missing cached status transport')
+                               if error is None else error),
+                        'status transport preparation failure')
+                    continue
+                prepared[info.replica_id] = preparation.transport
+            return prepared
+
+        pool_handles: dict[int, Any] = {}
+        pool_status_transports: dict[int, backends.ServeJobStatusTransport] = {}
 
         if not self._is_pool:
             versions = {info.version for info in infos_to_probe}
@@ -17255,15 +17639,103 @@ class SkyPilotReplicaManager(ReplicaManager):
                 deferred_replica_ids=deferred_route_ids,
                 identity_rejected_replica_ids=identity_rejected_route_ids,
                 resolved_route_material=resolved_route_material,
-                resolved_handles=probe_handles)
+                resolved_handles=probe_handles,
+                resolved_provider_configs=probe_provider_configs)
             if deferred_route_ids is not None:
                 provider_phase_deferred_replica_ids.update(
                     deferred_route_ids - deferred_before_url_resolution)
             if self._update_recovery_required:
                 return infos
+
+            # Begin one immutable public-provider inventory before endpoint
+            # probing. Cold replicas normally consume the full HTTP timeout;
+            # overlapping this <=30s observation makes the round bound the
+            # maximum of those walks, rather than their sum. Every provider
+            # and facet-sized chunk receives the same absolute deadline.
+            for info in infos_to_probe:
+                if (not self._is_interruptible_replica(info) or info.replica_id
+                        in provider_phase_deferred_replica_ids or
+                        info.replica_id in identity_rejected_route_ids):
+                    continue
+                handle = probe_handles.get(info.replica_id)
+                provider_config = probe_provider_configs.get(info.replica_id)
+                if handle is None or provider_config is None:
+                    continue
+                try:
+                    cleanup_fence = (
+                        reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+                except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                    provider_identity_errors[info.replica_id] = (
+                        'cloud liveness could not prove the physical '
+                        'Kubernetes identity: '
+                        f'{common_utils.format_exception(error)}')
+                    continue
+                if cleanup_fence is not None:
+                    # Protocol-v2 Kubernetes absence requires a physical UID
+                    # fence and is never inferred from public-cloud inventory.
+                    continue
+                provider_inventory_handles[info.replica_id] = handle
+                provider_inventory_configs[info.replica_id] = provider_config
+
+            def _observe_provider_inventory() -> dict[
+                int, provider_facets.InstanceStatusInventoryObservationV1]:
+                if provider_inventory_deadline is None:
+                    raise RuntimeError('Provider inventory has no deadline.')
+                if phase_admission is None:
+                    phase_context = provider_phase.provider_phase(
+                        provider_phase.ProviderPhaseMode.AMBIENT_LEGACY)
+                elif phase_admission.mode is (
+                        provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+                    phase_context = provider_phase.join_provider_phase(
+                        phase_admission)
+                else:
+                    raise exceptions.ProviderPhaseMisuseError(
+                        'Public-cloud inventory cannot join a protocol-v2 '
+                        'provider phase.')
+                with phase_context:
+                    return backend_utils.query_cluster_instance_statuses_batch(
+                        provider_inventory_handles,
+                        provider_inventory_configs,
+                        deadline_monotonic=provider_inventory_deadline)
+
+            if provider_inventory_handles:
+                provider_inventory_deadline = (
+                    time.monotonic() +
+                    provider_facets.INSTANCE_STATUS_INVENTORY_V1_TIMEOUT_SECONDS
+                )
+                provider_inventory_future = self._submit_remote_io(
+                    _observe_provider_inventory,
+                    lane=_ReplicaRemoteIOLane.STATUS)
         else:
             probe_urls = {}
+            pool_cluster_records = global_user_state.get_clusters_from_names(
+                [info.cluster_name for info in infos_to_probe])
+            pool_info_handles = []
+            for info in infos_to_probe:
+                try:
+                    record = pool_cluster_records.get(info.cluster_name)
+                    cleanup_fence = (
+                        reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+                    if cleanup_fence is None:
+                        handle = None if record is None else info.handle(record)
+                    else:
+                        handle = (record.get('handle') if isinstance(
+                            record, dict) else None)
+                        reserved_capacity.protocol_v2_provider_fence(
+                            info, handle)
+                    if handle is None:
+                        raise exceptions.FetchClusterInfoError(
+                            exceptions.FetchClusterInfoError.Reason.HEAD)
+                except Exception as error:  # pylint: disable=broad-except
+                    _defer_probe_error(info, error,
+                                       'pool handle resolution failure')
+                    continue
+                pool_handles[info.replica_id] = handle
+                pool_info_handles.append((info, handle))
+            pool_status_transports = _prepare_status_transports(
+                pool_info_handles)
         candidate_status_inputs: list[tuple[ReplicaInfo, Any]] = []
+        status_transports: dict[int, backends.ServeJobStatusTransport] = {}
         route_issue_inputs: dict[
             int, tuple[Any, system_recovery_route_lease.RouteGeneration, bool,
                        float | None, str, str, dict[str, Any] | None,
@@ -17385,8 +17857,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                   route_url, readiness_path,
                                                   post_data, readiness_headers,
                                                   job_id)
+            status_info_handles = {
+                info.replica_id: (info, handle)
+                for info, handle in candidate_status_inputs
+                if handle is not None
+            }
+            status_info_handles.update({
+                replica_id: (route_issue_candidates[replica_id][0], values[0])
+                for replica_id, values in route_issue_inputs.items()
+                if values[0] is not None
+            })
+            status_transports = _prepare_status_transports(
+                list(status_info_handles.values()))
 
-        recovery_backend = backends.CloudVmRayBackend()
         # Probes are pure I/O (HTTP GET/POST with a several-second timeout).
         # Submit them through the one service-wide remote-I/O budget shared
         # with job-status SSH; neither daemon owns an independent fan-out.
@@ -17404,46 +17887,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             route_suspension_rollback.callback(
                 _rollback_pending_route_suspensions)
 
-            def _ordered_route_status(
-                info: ReplicaInfo,
-                handle: Any,
-                job_id: int,
-            ) -> tuple[job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
-                       None, job_lib.JobSystemRecoveryDetailStatus]:
-                if handle is None or job_id < 1:
-                    return (None, None,
-                            job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
-                try:
-                    with reserved_capacity.protocol_v2_provider_fence(
-                            info,
-                            handle,
-                            phase_admission=phase_admission,
-                            wait_for_initializer=False):
-                        status_payload = (recovery_backend.
-                                          get_job_status_with_system_recovery(
-                                              handle, [job_id],
-                                              stream_logs=False))
-                    if status_payload is None:
-                        raise ValueError('exact status payload is missing')
-                    statuses, recovery_infos, detail_statuses = status_payload
-                    return (
-                        statuses.get(job_id), recovery_infos.get(job_id),
-                        detail_statuses.get(
-                            job_id,
-                            job_lib.JobSystemRecoveryDetailStatus.MALFORMED))
-                # pylint: disable-next=try-except-raise
-                except (exceptions.KubernetesPhysicalClusterIdentityError,
-                        exceptions.ProviderPhaseError):
-                    # Provider contention is no route-status evidence. The
-                    # caller defers the exact lifecycle without reducing the
-                    # successful HTTP sample or a fabricated MALFORMED row.
-                    raise
-                except Exception:  # pylint: disable=broad-except,try-except-raise
-                    # A missing/malformed provider result is no route or job
-                    # evidence. The exact future boundary defers this row and
-                    # continues independently completed peers.
-                    raise
-
             def _probe_nonpool(
                 info: ReplicaInfo,
                 readiness_path: str,
@@ -17451,9 +17894,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 timeout: int,
                 readiness_headers: dict[str, str] | None,
                 route_url: str | None,
-            ) -> tuple[ReplicaInfo, bool, float, float, tuple[
-                    job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
-                    None, job_lib.JobSystemRecoveryDetailStatus] | None, bool]:
+            ) -> _ReadinessProbeResult:
                 # The fallback timestamp is used only for ordinary candidate
                 # guard bookkeeping. Route issuance fails closed unless the
                 # production HTTP probe invokes the exact-start callback.
@@ -17475,26 +17916,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                 route_input = route_issue_inputs.get(info.replica_id)
                 if (not succeeded or request_started_at is None or
                         route_input is None):
-                    return (result_info, succeeded, probe_time,
-                            (worker_started_at if request_started_at is None
-                             else request_started_at), None, False)
+                    return _ReadinessProbeResult(
+                        info=result_info,
+                        succeeded=succeeded,
+                        observed_at=probe_time,
+                        request_started_monotonic=(worker_started_at
+                                                   if request_started_at is None
+                                                   else request_started_at))
 
-                (handle, _, predicted_generation, retry_submitted_adopted_at,
-                 *_, job_id) = route_input
-                try:
-                    evidence = _ordered_route_status(result_info, handle,
-                                                     job_id)
-                except exceptions.ProviderPhaseError as error:
-                    _defer_provider_phase(result_info, error)
-                    return (result_info, succeeded, probe_time,
-                            request_started_at, None, False)
-                except exceptions.KubernetesPhysicalClusterIdentityError as error:
-                    with provider_identity_errors_lock:
-                        provider_identity_errors[result_info.replica_id] = (
-                            'ordered route-status lookup was fenced off: '
-                            f'{common_utils.format_exception(error)}')
-                    return (result_info, succeeded, probe_time,
-                            request_started_at, None, False)
+                (_, _, predicted_generation, retry_submitted_adopted_at,
+                 *_) = route_input
                 # A RETRY_SUBMITTED row may already carry a durable adoption
                 # fence from an earlier round. A probe at or before that fence
                 # requires a later readiness request. Route issuance is
@@ -17506,18 +17937,26 @@ class SkyPilotReplicaManager(ReplicaManager):
                     probe_time > float(retry_submitted_adopted_at))
                 requires_next_probe = (predicted_generation and
                                        not probe_started_after_adoption)
-                return (result_info, succeeded, probe_time, request_started_at,
-                        evidence, requires_next_probe)
+                return _ReadinessProbeResult(
+                    info=result_info,
+                    succeeded=succeeded,
+                    observed_at=probe_time,
+                    request_started_monotonic=request_started_at,
+                    requires_next_probe=requires_next_probe,
+                    ordered_status_required=True)
 
-            def _probe_pool(
-                info: ReplicaInfo,
-            ) -> tuple[ReplicaInfo, bool, float, float, tuple[
-                    job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
-                    None, job_lib.JobSystemRecoveryDetailStatus] | None, bool]:
+            def _probe_pool(info: ReplicaInfo,) -> _ReadinessProbeResult:
                 request_started_at = time.monotonic()
                 try:
+                    handle = pool_handles.get(info.replica_id)
+                    transport = pool_status_transports.get(info.replica_id)
+                    if handle is None or transport is None:
+                        raise RuntimeError(
+                            'Pool status transport is unavailable.')
                     result_info, succeeded, probe_time = info.probe_pool(
-                        provider_phase_admission=phase_admission)
+                        handle=handle,
+                        provider_phase_admission=phase_admission,
+                        job_status_transport=transport)
                 except exceptions.KubernetesPhysicalClusterIdentityError as error:
                     with provider_identity_errors_lock:
                         provider_identity_errors[info.replica_id] = (
@@ -17534,30 +17973,36 @@ class SkyPilotReplicaManager(ReplicaManager):
                                        'unexpected readiness worker failure')
                     result_info, succeeded, probe_time = (info, False,
                                                           time.time())
-                return (result_info, succeeded, probe_time, request_started_at,
-                        None, False)
+                return _ReadinessProbeResult(
+                    info=result_info,
+                    succeeded=succeeded,
+                    observed_at=probe_time,
+                    request_started_monotonic=request_started_at)
 
-            for info in infos_to_probe:
-                if self._is_pool:
-                    replica_to_probe.append(f'replica_{info.replica_id}(cluster'
-                                            f'_name={info.cluster_name})')
-                    probe_futures.append(
-                        self._submit_remote_io(
-                            _probe_pool,
-                            info,
-                            provider_phase_admitted=(phase_admission
-                                                     is not None)))
-                else:
-                    resolved_url = probe_urls[info.replica_id]
-                    readiness_path = self._get_readiness_path(info.version)
-                    post_data = self._get_post_data(info.version)
-                    timeout = self._get_readiness_timeout_seconds(info.version)
-                    readiness_headers = self._get_readiness_headers(
-                        info.version)
-                    replica_to_probe.append(
-                        f'replica_{info.replica_id}(url={resolved_url})')
-                    probe_futures.append(
-                        self._submit_remote_io(
+            probe_results: list[_ReadinessProbeResult] = []
+            probe_batch_size = (self._REMOTE_STATUS_PARALLELISM if self._is_pool
+                                else self._REMOTE_PROBE_PARALLELISM)
+            for offset in range(0, len(infos_to_probe), probe_batch_size):
+                batch_infos = infos_to_probe[offset:offset + probe_batch_size]
+                probe_futures = []
+                for info in batch_infos:
+                    if self._is_pool:
+                        replica_to_probe.append(
+                            f'replica_{info.replica_id}(cluster_name='
+                            f'{info.cluster_name})')
+                        future = self._submit_remote_io(
+                            _probe_pool, info, lane=_ReplicaRemoteIOLane.STATUS)
+                    else:
+                        resolved_url = probe_urls[info.replica_id]
+                        readiness_path = self._get_readiness_path(info.version)
+                        post_data = self._get_post_data(info.version)
+                        timeout = self._get_readiness_timeout_seconds(
+                            info.version)
+                        readiness_headers = self._get_readiness_headers(
+                            info.version)
+                        replica_to_probe.append(
+                            f'replica_{info.replica_id}(url={resolved_url})')
+                        future = self._submit_remote_io(
                             _probe_nonpool,
                             info,
                             readiness_path,
@@ -17565,216 +18010,248 @@ class SkyPilotReplicaManager(ReplicaManager):
                             timeout,
                             readiness_headers,
                             resolved_url,
-                            provider_phase_admitted=(phase_admission
-                                                     is not None),
-                        ),)
+                            lane=_ReplicaRemoteIOLane.PROBE)
+                    probe_futures.append(future)
+                for info, future in zip(batch_infos, probe_futures,
+                                        strict=True):
+                    try:
+                        probe_results.append(future.result())
+                    except exceptions.ProviderPhaseError as error:
+                        # A worker normally classifies this itself. Keep the
+                        # collection boundary defensive so one failed pool
+                        # cannot suppress independently completed peers.
+                        _defer_provider_phase(info, error)
+                    except Exception as error:  # pylint: disable=broad-except
+                        _defer_probe_error(
+                            info, error, 'unexpected readiness worker failure')
             logger.info(f'Replicas to probe: {", ".join(replica_to_probe)}')
-
-            # Draining in submission order does not serialize endpoint I/O:
-            # every bounded worker is already running. Route issuance itself
-            # remains in the exact-current reducer below so a stale opening
-            # lifecycle can never publish a token.
-            probe_results: list[tuple[
-                ReplicaInfo, bool, float, float,
-                tuple[job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
-                      None, job_lib.JobSystemRecoveryDetailStatus] | None,
-                bool]] = []
-            for info, future in zip(infos_to_probe, probe_futures):
-                try:
-                    probe_results.append(future.result())
-                except exceptions.ProviderPhaseError as error:
-                    # A worker must normally classify this itself. Keep the
-                    # collection boundary defensive so one failed pool never
-                    # suppresses independently completed peers.
-                    _defer_provider_phase(info, error)
-                except Exception as error:  # pylint: disable=broad-except
-                    _defer_probe_error(info, error,
-                                       'unexpected readiness worker failure')
             # A config/runtime transition can fail while this locked probe is
             # waiting on HTTP.  Treat every completed result as stale before
             # any route, recovery, uptime, replica, or teardown reduction.
             if self._update_recovery_required:
                 return infos
 
-            # Candidate release requires ABSENT + nonterminal status from the
-            # exact job in the same reconciliation cycle as the fresh probe.
-            # These few short-lived candidates share the probe pool; capable
-            # steady-state replicas remain on the normal job-status cadence.
-            def _candidate_status(info: ReplicaInfo, handle: Any) -> Any:
-                if (handle is None or isinstance(info.service_job_id, bool) or
-                        not isinstance(info.service_job_id, int) or
-                        info.service_job_id < 1):
-                    return None
+            provider_inventory_observations: dict[
+                int, provider_facets.InstanceStatusInventoryObservationV1] = {}
+            provider_inventory_error: Exception | None = None
+            if provider_inventory_future is not None:
+                assert provider_inventory_deadline is not None
+                remaining = max(0,
+                                provider_inventory_deadline - time.monotonic())
+                try:
+                    provider_inventory_observations = (
+                        provider_inventory_future.result(timeout=remaining))
+                except Exception as error:  # pylint: disable=broad-except
+                    provider_inventory_error = error
+                    provider_inventory_future.cancel()
+                    logger.warning(
+                        'Deferring public-provider preemption inventory: %s',
+                        common_utils.format_exception(error))
+
+            # Stage B performs one deduplicated exact-job read per replica.
+            # Candidate release and ordered route issuance consume the same
+            # immutable fact; neither may hide an SSH subprocess inside a
+            # PROBE worker or query the same job twice in one round.
+            def _exact_recovery_status(
+                info: ReplicaInfo,
+                handle: Any,
+                job_id: int,
+            ) -> tuple[job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
+                       None, job_lib.JobSystemRecoveryDetailStatus]:
+                transport = status_transports.get(info.replica_id)
+                if transport is None:
+                    raise RuntimeError('Exact status transport is '
+                                       'unavailable.')
                 with reserved_capacity.protocol_v2_provider_fence(
                         info,
                         handle,
                         phase_admission=phase_admission,
                         wait_for_initializer=False):
-                    return (
+                    status_payload = (
                         recovery_backend.get_job_status_with_system_recovery(
-                            handle, [info.service_job_id], stream_logs=False))
+                            handle, [job_id],
+                            stream_logs=False,
+                            serve_transport=transport))
+                if (not isinstance(status_payload, tuple) or
+                        len(status_payload) != 3 or not all(
+                            isinstance(payload, dict)
+                            for payload in status_payload)):
+                    raise ValueError(
+                        'Exact status worker returned a malformed payload.')
+                statuses, recovery_infos, detail_statuses = status_payload
+                return (statuses.get(job_id), recovery_infos.get(job_id),
+                        detail_statuses.get(
+                            job_id,
+                            job_lib.JobSystemRecoveryDetailStatus.MALFORMED))
 
-            candidate_status_futures = {
-                info.replica_id: (info,
-                                  self._submit_remote_io(
-                                      _candidate_status,
-                                      info,
-                                      handle,
-                                      provider_phase_admitted=(phase_admission
-                                                               is not None))
-                                 ) for info, handle in candidate_status_inputs
+            route_status_ids = {
+                result.info.replica_id
+                for result in probe_results
+                if result.ordered_status_required
             }
-            candidate_cycle_evidence: dict[int, tuple[bool, bool]] = {}
-            candidate_status_evidence: dict[int, tuple[
+            route_requires_next_probe_ids = {
+                result.info.replica_id
+                for result in probe_results
+                if result.requires_next_probe
+            }
+            exact_status_inputs = {
+                info.replica_id: (info, handle, info.service_job_id)
+                for info, handle in candidate_status_inputs
+            }
+            exact_status_inputs.update({
+                replica_id: (route_issue_candidates[replica_id][0], values[0],
+                             values[-1])
+                for replica_id, values in route_issue_inputs.items()
+                if replica_id in route_status_ids
+            })
+            exact_status_evidence: dict[int, tuple[
                 job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo | None,
                 job_lib.JobSystemRecoveryDetailStatus]] = {}
-            for replica_id, (candidate_info,
-                             status_future) in candidate_status_futures.items():
-                if self._update_recovery_required:
-                    return infos
-                try:
-                    status_payload = status_future.result()
-                    if self._update_recovery_required:
-                        return infos
-                    if (status_payload is not None and
-                        (not isinstance(status_payload, tuple) or
-                         len(status_payload) != 3 or not all(
-                             isinstance(payload, dict)
-                             for payload in status_payload))):
-                        raise ValueError(
-                            'Candidate status worker returned a malformed '
-                            'payload.')
-                except exceptions.KubernetesPhysicalClusterIdentityError as error:
-                    if self._update_recovery_required:
-                        return infos
-                    provider_identity_errors[candidate_info.replica_id] = (
-                        'candidate status lookup was fenced off: '
-                        f'{common_utils.format_exception(error)}')
-                    candidate_cycle_evidence[replica_id] = (False, False)
-                    continue
-                except exceptions.ProviderPhaseError as error:
-                    _defer_provider_phase(candidate_info, error)
-                    continue
-                except Exception as e:  # pylint: disable=broad-except
-                    _defer_probe_error(candidate_info, e,
-                                       'candidate status worker failure')
-                    continue
-                if status_payload is None:
-                    statuses: dict[int | None, job_lib.JobStatus | None] = {}
-                    recovery_infos: dict[int,
-                                         job_lib.JobSystemRecoveryInfo] = {}
-                    detail_statuses: dict[
-                        int, job_lib.JobSystemRecoveryDetailStatus] = {}
-                else:
-                    statuses, recovery_infos, detail_statuses = status_payload
-                job_id = candidate_info.service_job_id
-                valid_job_id = (isinstance(job_id, int) and
-                                not isinstance(job_id, bool) and job_id > 0)
-                if valid_job_id:
-                    assert isinstance(job_id, int)
-                    job_status = statuses.get(job_id)
-                    detail = recovery_infos.get(job_id)
-                    detail_status = detail_statuses.get(
-                        job_id, job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
-                else:
-                    job_status = None
-                    detail = None
-                    detail_status = (
+            exact_remote_inputs = []
+            for replica_id in sorted(exact_status_inputs):
+                info, handle, job_id = exact_status_inputs[replica_id]
+                if (handle is None or isinstance(job_id, bool) or
+                        not isinstance(job_id, int) or job_id < 1):
+                    exact_status_evidence[replica_id] = (
+                        None, None,
                         job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
-                candidate_status_evidence[replica_id] = (job_status, detail,
-                                                         detail_status)
-                candidate_cycle_evidence[replica_id] = (
-                    isinstance(job_status, job_lib.JobStatus) and
-                    not job_status.is_terminal(), detail_status
+                    continue
+                exact_remote_inputs.append((info, handle, job_id))
+
+            # Consume each STATUS-lane-sized wave before submitting the next,
+            # so fleet cardinality cannot become executor queue cardinality.
+            for offset in range(0, len(exact_remote_inputs),
+                                self._REMOTE_STATUS_PARALLELISM):
+                exact_batch = exact_remote_inputs[offset:offset + self.
+                                                  _REMOTE_STATUS_PARALLELISM]
+                exact_status_futures = [
+                    (info,
+                     self._submit_remote_io(_exact_recovery_status,
+                                            info,
+                                            handle,
+                                            job_id,
+                                            lane=_ReplicaRemoteIOLane.STATUS))
+                    for info, handle, job_id in exact_batch
+                ]
+                for exact_info, status_future in exact_status_futures:
+                    replica_id = exact_info.replica_id
+                    if self._update_recovery_required:
+                        return infos
+                    try:
+                        exact_status_evidence[replica_id] = (
+                            status_future.result())
+                        if self._update_recovery_required:
+                            return infos
+                    except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                        if self._update_recovery_required:
+                            return infos
+                        provider_identity_errors[replica_id] = (
+                            'exact status lookup was fenced off: '
+                            f'{common_utils.format_exception(error)}')
+                        continue
+                    except exceptions.ProviderPhaseError as error:
+                        _defer_provider_phase(exact_info, error)
+                        continue
+                    except Exception as e:  # pylint: disable=broad-except
+                        _defer_probe_error(exact_info, e,
+                                           'exact status worker failure')
+                        continue
+
+            candidate_ids = {
+                info.replica_id for info, _ in candidate_status_inputs
+            }
+            candidate_status_evidence = {
+                replica_id: evidence
+                for replica_id, evidence in exact_status_evidence.items()
+                if replica_id in candidate_ids
+            }
+            candidate_cycle_evidence = {
+                replica_id: (
+                    isinstance(evidence[0], job_lib.JobStatus) and
+                    not evidence[0].is_terminal(), evidence[2]
                     == job_lib.JobSystemRecoveryDetailStatus.ABSENT and
-                    detail is None)
+                    evidence[1] is None
+                ) for replica_id, evidence in candidate_status_evidence.items()
+            }
+            ordered_route_evidence = {
+                replica_id: evidence
+                for replica_id, evidence in exact_status_evidence.items()
+                if replica_id in route_status_ids
+            }
 
-            ordered_route_evidence: dict[int, tuple[
-                job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo | None,
-                job_lib.JobSystemRecoveryDetailStatus]] = {}
-            route_requires_next_probe_ids: set[int] = set()
-            for (route_info, _, _, _, evidence,
-                 requires_next_probe) in probe_results:
-                if evidence is not None:
-                    ordered_route_evidence[route_info.replica_id] = evidence
-                if requires_next_probe:
-                    route_requires_next_probe_ids.add(route_info.replica_id)
-
-            # Confirm interruptions with one cloud-only read per failed
-            # interruptible replica. This exact-handle evidence is final: a
-            # second name-based status refresh both duplicated provider work
-            # and could mutate a same-name replacement cluster before the
-            # replica lifecycle fence below rejected the stale result.
+            # Confirm public-cloud interruptions from the immutable inventory
+            # started before the HTTP walk. During a fleet cold start every
+            # endpoint fails by design; N singleton cloud reads here used to
+            # add an unbounded second walk. UNKNOWN inventory is deliberately
+            # no interruption evidence.
             failed_interruptible_infos = [
-                info for info, probe_succeeded, _, _, _, _ in probe_results
-                if (not probe_succeeded and
-                    self._is_interruptible_replica(info) and
-                    info.replica_id not in provider_phase_deferred_replica_ids)
+                result.info
+                for result in probe_results
+                if (not result.succeeded and
+                    self._is_interruptible_replica(result.info) and result.info.
+                    replica_id not in provider_phase_deferred_replica_ids and
+                    result.info.replica_id not in identity_rejected_route_ids)
             ]
             possibly_preempted_ids: set[int] = set()
             if failed_interruptible_infos:
-
-                def _preemption_liveness(
-                        failed_info: ReplicaInfo) -> _PreemptionPrefilterResult:
-                    handle = probe_handles.get(failed_info.replica_id,
-                                               _NOT_PROVIDED)
-                    if handle is _NOT_PROVIDED:
-                        return self._cloud_instance_looks_alive(
-                            failed_info, phase_admission=phase_admission)
-                    return self._cloud_instance_looks_alive(
-                        failed_info,
-                        phase_admission=phase_admission,
-                        handle=handle)
-
-                liveness_results: list[_PreemptionPrefilterResult] = []
-                for offset in range(0, len(failed_interruptible_infos),
-                                    self._PREEMPTION_PREFILTER_PARALLELISM):
-                    batch = failed_interruptible_infos[
-                        offset:offset + self._PREEMPTION_PREFILTER_PARALLELISM]
-                    futures = [(failed_info,
-                                self._submit_remote_io(
-                                    _preemption_liveness,
-                                    failed_info,
-                                    provider_phase_admitted=(phase_admission
-                                                             is not None)))
-                               for failed_info in batch]
-                    for failed_info, liveness_future in futures:
-                        try:
-                            liveness_results.append(liveness_future.result())
-                        except exceptions.ProviderPhaseError as error:
-                            _defer_provider_phase(failed_info, error)
-                            liveness_results.append(
-                                _PreemptionPrefilterResult(
-                                    _PreemptionPrefilterDisposition.
-                                    LIVE_OR_UNPROVEN))
-                        except Exception as error:  # pylint: disable=broad-except
-                            _defer_probe_error(
-                                failed_info, error,
-                                'unexpected preemption-liveness worker failure')
-                            # Preserve exact submission-order alignment. The
-                            # sentinel is zero interruption evidence.
-                            liveness_results.append(
-                                _PreemptionPrefilterResult(
-                                    _PreemptionPrefilterDisposition.
-                                    LIVE_OR_UNPROVEN))
-                if self._update_recovery_required:
-                    return infos
-                for failed_info, liveness in zip(failed_interruptible_infos,
-                                                 liveness_results):
-                    if self._update_recovery_required:
-                        return infos
-                    if liveness.disposition is (
-                            _PreemptionPrefilterDisposition.IDENTITY_UNCERTAIN):
+                liveness_by_id = {
+                    info.replica_id: _PreemptionPrefilterResult(
+                        _PreemptionPrefilterDisposition.LIVE_OR_UNPROVEN
+                    ) for info in failed_interruptible_infos
+                }
+                for failed_info in failed_interruptible_infos:
+                    handle = probe_handles.get(failed_info.replica_id)
+                    if handle is None:
+                        # Preserve the existing exact-handle rule: a launched,
+                        # trackable row whose opening cluster record is absent
+                        # is interruption evidence, subject to the same locked
+                        # lifecycle revalidation below.
+                        liveness_by_id[failed_info.replica_id] = (
+                            _PreemptionPrefilterResult(
+                                _PreemptionPrefilterDisposition.INTERRUPTED))
+                        continue
+                    try:
+                        cleanup_fence = (
+                            reserved_capacity.parse_protocol_v2_cleanup_fence(
+                                failed_info))
+                    except exceptions.KubernetesPhysicalClusterIdentityError as error:
                         provider_identity_errors[failed_info.replica_id] = (
                             'cloud liveness could not prove the physical '
-                            'Kubernetes identity')
+                            'Kubernetes identity: '
+                            f'{common_utils.format_exception(error)}')
+                        continue
+                    if cleanup_fence is not None:
+                        # The optional provider inventory currently covers
+                        # public-cloud Spot. Protocol-v2 Kubernetes absence
+                        # remains UNKNOWN here rather than escaping its exact
+                        # physical fence or issuing one Pod read per replica.
+                        continue
+                    if (isinstance(provider_inventory_error,
+                                   exceptions.ProviderPhaseError) and
+                            failed_info.replica_id
+                            in provider_inventory_handles):
+                        _defer_provider_phase(failed_info,
+                                              provider_inventory_error)
+                        continue
+                    observation = provider_inventory_observations.get(
+                        failed_info.replica_id)
+                    if (observation is None or
+                            observation.disposition is not provider_facets.
+                            InstanceStatusInventoryDispositionV1.OBSERVED):
+                        continue
+                    if (len(observation.entries) < handle.launched_nodes or
+                            any(entry.status != status_lib.ClusterStatus.UP
+                                for entry in observation.entries)):
+                        liveness_by_id[failed_info.replica_id] = (
+                            _PreemptionPrefilterResult(
+                                _PreemptionPrefilterDisposition.INTERRUPTED))
+                if self._update_recovery_required:
+                    return infos
                 possibly_preempted_ids = {
                     failed_info.replica_id
-                    for failed_info, liveness in zip(failed_interruptible_infos,
-                                                     liveness_results)
-                    if liveness.disposition in (
-                        _PreemptionPrefilterDisposition.INTERRUPTED,
-                        _PreemptionPrefilterDisposition.EXACT_KUBERNETES_ABSENT)
+                    for failed_info in failed_interruptible_infos
+                    if liveness_by_id[failed_info.replica_id].disposition is (
+                        _PreemptionPrefilterDisposition.INTERRUPTED)
                 }
             if self._update_recovery_required:
                 return infos
@@ -17804,7 +18281,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     accepted_probe_fingerprints.pop(replica_id, None)
 
             for result in probe_results:
-                snapshot_info = result[0]
+                snapshot_info = result.info
                 current_info = latest_by_id.get(snapshot_info.replica_id)
                 if (current_info is None or
                         not self._probe_snapshot_matches_current(
@@ -17833,7 +18310,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     continue
                 self._provider_identity_uncertain_replica_ids().discard(
                     snapshot_info.replica_id)
-                current_probe_results.append((current_info, *result[1:]))
+                current_probe_results.append(
+                    dataclasses.replace(result, info=current_info))
             probe_results = current_probe_results
             # Return current rows even when a stale observation was skipped.
             # A replacement with the same numeric id must never disappear from
@@ -17853,8 +18331,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             for future_result in probe_results:
                 if self._update_recovery_required:
                     return infos
-                (info, probe_succeeded, probe_time, probe_monotonic_started_at,
-                 route_evidence, _) = future_result
+                info = future_result.info
+                probe_succeeded = future_result.succeeded
+                probe_time = future_result.observed_at
+                probe_monotonic_started_at = (
+                    future_result.request_started_monotonic)
+                route_evidence = ordered_route_evidence.get(info.replica_id)
                 if (info.replica_id
                         in self._provider_identity_uncertain_replica_ids()):
                     # Provider identity is UNKNOWN, not a negative readiness,
@@ -18290,7 +18772,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         asyncio.run(self._system_recovery_route_probe_loop())
 
     def _replica_prober(self) -> None:
-        """Periodically probe replicas."""
+        """Periodically reconcile readiness without historical-status HOL."""
         try:
             while not self._manager_daemon_should_stop():
                 logger.debug('Running replica prober.')

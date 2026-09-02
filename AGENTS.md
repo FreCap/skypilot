@@ -152,18 +152,24 @@ pytest tests/unit_tests/test_resources.py
 
 ### Test Layers and Provider Substitution
 
-Use these three test layers consistently:
+Use these four test layers consistently:
 
 1. **Unit tests** exercise one unit of policy or orchestration in process. They
    may use focused mocks or stubs for immediate collaborators, but they do not
    prove that a provisioning workflow is integrated correctly.
-2. **Unpaid provider-interface end-to-end tests** run the real public workflow,
+2. **Production-interface component/process integration tests** enter through
+   one real HTTP/CLI/process or production scheduling boundary and keep the
+   component implementation intact. Adjacent components may be real or may be
+   replaced at narrow owned interfaces. These tests prove that component's
+   cardinality, concurrency, memory, cancellation, and responsiveness
+   contracts, but are not system E2E proof.
+3. **Unpaid provider-interface end-to-end tests** run the real public workflow,
    controller, persistence, planning, and reconciliation paths while replacing
    only external provider network calls with a typed fake provisioning adapter.
    The fake must model asynchronous provider behavior such as delayed status,
    partial success, capacity exhaustion, preemption, lost acknowledgements, and
    deletion; it must not replace the production orchestration being tested.
-3. **Paid end-to-end tests** run the same workflows through real provider
+4. **Paid end-to-end tests** run the same workflows through real provider
    adapters and billable resources. Keep them explicitly approved, bounded in
    size and time, and require teardown plus provider-side absence evidence.
 
@@ -179,6 +185,25 @@ internals is not end-to-end evidence. Such a test is a unit or integration test
 and must be described as one. If an unpaid end-to-end test cannot be written by
 swapping only the provider interface, simplify or introduce that production
 interface before adding more patches.
+
+Every production incident must gain the cheapest regression test at the
+highest practical fidelity. If a typed provider substitution boundary already
+exists, provider lifecycle and reconciliation incidents require an unpaid E2E
+test through that boundary. If the boundary is incomplete, add an honestly
+labeled component/process regression for the immediate defect and make
+completing the narrow boundary explicit follow-up work. A paid test validates
+the real adapter and environment after unpaid gates pass; it is not a substitute
+for a deterministic unpaid regression.
+
+Each non-unit test must state its layer in the module docstring and enter
+through the exact public or production scheduling boundary named there. An
+unpaid provider E2E must use PostgreSQL plus the real API server, controller,
+and executor processes; it may replace only the registered provider facet. Its
+fake provider state must survive process restart so the test can exercise lost
+acknowledgements, partial waves, delayed visibility, preemption, and deletion
+lag without patching controller or database internals. Include a negative
+control that fails if production bypasses the facet or if the scenario no
+longer traverses the claimed entry point.
 
 ### CI Tests via PR Comments
 
@@ -284,14 +309,37 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
 
 ### Critical-Path Complexity
 
+- Treat request event loops, admission and dispatch, reconciliation ticks,
+  provider effects, and teardown as critical paths. Include nested callbacks
+  and retries when calculating their complexity.
 - Do not put a whole-registry scan inside each item's retry, reconciliation,
   enqueue/dequeue operation, or periodic poll. One O(N) aggregate pass per
-  bounded tick is valid when cardinality and latency budgets are explicit.
+  bounded tick is valid only with a numeric maximum cardinality and latency
+  budget.
 - O(N²) work is forbidden on critical paths unless N is hard-enforced as small
-  and a max-bound benchmark or structural complexity test proves the budget.
+  in the same owning component and a max-bound benchmark plus a structural
+  complexity test proves the budget. Configuration convention or today's
+  observed fleet size is not a hard bound.
+- Outside critical paths, O(N²) is acceptable only for bounded offline,
+  migration, build-time, or operator-invoked work where the simpler algorithm
+  is materially clearer, the maximum N is documented and enforced, and the
+  operation cannot delay request handling, reconciliation, teardown, or
+  provider cleanup. A helper inherits critical-path status from any production
+  caller; moving the loop into a helper does not make it offline.
 - Scale tests must enter through the production interface at the maximum
   configured cardinality and prove health/control-plane responsiveness, not
   only call helpers against pre-populated internal state.
+- Every critical-path owner must keep one adjacent, reviewable budget naming:
+  the hard maximum N and where it is enforced; work per item and per tick;
+  worker, subprocess, file-descriptor, connection, queued-item, queued-byte,
+  output-byte, and resident-memory bounds; the per-operation deadline; and the
+  resulting worst-case round formula. Tests must derive their max-cardinality
+  assertions from the same production constants. A timeout without the
+  cardinality/parallelism formula is not a convergence bound.
+- An exceptional critical-path O(N²) implementation must name its owner,
+  rationale, enforced N, measured max-bound result, and removal/re-evaluation
+  gate in code. Its test must fail if the bound is increased without updating
+  that evidence. Otherwise use an indexed, incremental, or one-pass design.
 
 ### Aggregate Concurrency Budgets
 
@@ -299,12 +347,19 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
   same process memory, provider phase, database pool, or other finite resource.
   Independently bounded sibling pools do not bound their simultaneous sum.
 - Before adding or changing a worker pool, inventory overlapping executors,
-  nested fan-out, and child processes. Give the shared owner one explicit
-  aggregate budget and make internal lanes sum to that budget.
+  queued submissions and retained payload bytes, nested SDK pools and
+  connections, nested fan-out, and child processes. Give the shared owner one
+  explicit aggregate budget and make internal lanes sum to that budget.
 - Regression tests must exercise sibling producers concurrently through the
   production scheduling interface and assert aggregate active work, workers,
-  child processes, and progress under dependency contention. Testing each
-  producer at its local limit is insufficient.
+  bounded queued work, cancellation, terminal shutdown, and progress under
+  dependency contention. They must also prove every production producer routes
+  through the shared owner. Testing each producer at its local limit is
+  insufficient.
+- Executor shutdown is a lifecycle state, not a cache miss. Once the owning
+  controller is terminal, racing submissions must fail and no caller may
+  recreate workers. Tests must cover submit-versus-shutdown races and assert
+  that queued futures are cancelled and all workers/processes are reaped.
 
 ### Typed Internal State and Compatibility Boundaries
 

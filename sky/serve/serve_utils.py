@@ -598,20 +598,17 @@ def get_provider_configs_for_handles(
         if len(yaml_strings) != len(yaml_paths):
             raise ValueError('batched cluster YAML result length mismatch')
     except Exception as batch_error:  # pylint: disable=broad-except
-        # Preserve one-query behavior in the healthy path.  Only a failed
-        # batch falls back to isolated reads so one missing/file-migration
-        # error cannot black out unrelated YAML partitions.
+        # A batch-level database failure provides no trustworthy per-handle
+        # distinction. Fail this observation closed; falling back to N
+        # singleton reads amplifies an unhealthy dependency exactly when the
+        # controller needs to remain responsive.
         logger.warning(
-            'Batched Serve provider-config read failed; retrying '
-            'each unique YAML independently: %s',
-            common_utils.format_exception(batch_error))
-        yaml_strings = []
-        for yaml_path in yaml_paths:
-            try:
-                yaml_strings.append(
-                    global_user_state.get_cluster_yaml_str(yaml_path))
-            except Exception:  # pylint: disable=broad-except
-                yaml_strings.append(None)
+            'Batched Serve provider-config read failed; deferring all '
+            'matching handles: %s', common_utils.format_exception(batch_error))
+        if failed_keys is not None:
+            for keys in keys_by_yaml.values():
+                failed_keys.update(keys)
+        return {}
 
     provider_configs_by_yaml: dict[str, dict[str, Any]] = {}
     for yaml_path, yaml_string in zip(yaml_paths, yaml_strings, strict=True):

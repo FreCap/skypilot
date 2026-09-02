@@ -70,22 +70,31 @@ every byte, but it disproves retained launch YAML as the dominant allocation
 and identifies an unbounded aggregate fan-out in the production source.
 
 The source-only correction gives one service owner a 32-worker aggregate
-remote-I/O budget. A 24-worker general lane handles readiness operations and an
-eight-worker admitted-phase lane guarantees progress for job-status children
-whose caller already owns a provider phase; their sum, rather than either lane,
-is the sole concurrency authority. This avoids the FIFO convoy in which every
-worker waits for an incompatible provider phase while the phase owner's child
-work is queued behind it. At the default 15-second readiness timeout, a fully
-blocked 100-member wave drains in five batches (at most 75 seconds), below both
-the five-minute provider-scale gate and 600-second request deadline. A fully
-phase-admitted 100-member wave would use the eight-worker child lane and take at
-most thirteen timeout batches (195 seconds), which remains inside both gates.
-The unpaid production-interface test saturates both lanes with 100 fake calls each,
-asserts an aggregate peak of 32 with no child-process growth, and proves
-admitted-phase progress while every general worker is blocked on the opposite
-phase. This checkpoint changes no provider, placement, scheduler, database,
-Helm, storage, or memory-limit policy. It is source-qualified in this
-checkpoint; homogeneous deployment and current-writer qualification remain.
+remote-I/O budget. Explicit 16-worker readiness and job-status lanes sum to the
+one authority. Every production probe producer uses the readiness lane and
+every phased or unphased job-status producer uses the job-status lane. This
+avoids the FIFO convoy in which readiness workers wait for an incompatible
+provider phase while the phase owner's status children are queued behind them.
+Controller job status skips Skylet because tunnel repair happens before its RPC
+deadline. It instead uses one direct SSH/Kubernetes command with a hard
+10-second timeout; 100 worst-case calls therefore drain in seven batches, or at
+most 70 seconds. One ordinary 15-second readiness wave drains in at most 105
+seconds. Even the ordered recovery path's 15-second endpoint probe followed by
+the bounded status command takes at most 175 seconds for 100 replicas, below the
+five-minute provider-scale gate and 600-second request deadline.
+
+The clean-process scheduling integration test saturates both lanes with 100
+fake calls each, asserts an aggregate peak of 32 threads and bounded resident
+memory, and proves job-status progress while every readiness worker is blocked
+on the opposite phase. Separate producer-wiring tests enter the production
+probe and job-status methods and require their exact lane and status deadline.
+These are component/process integration gates, not full unpaid provider E2E;
+the latter requires the existing typed provider facet to subsume the remaining
+direct AWS/GCP observation and cleanup calls before one stateful fake can
+replace only provider I/O. This checkpoint changes no provider, placement,
+scheduler, database, Helm, storage, or memory-limit policy. It is
+source-qualified in this checkpoint; homogeneous deployment and current-writer
+qualification remain.
 
 The cold ``spot-e2e-0901k`` campaign reached 113
 concurrent provider-``RUNNING`` GCP Spot L4 VMs and returned its complete
@@ -3084,22 +3093,27 @@ catalog evidence, and provider market establish what was selected and billed.
 The fleet manager lock protects short in-memory reductions. It must never be a
 lease for slow or blocking work.
 
-Readiness HTTP and remote job-status SSH share one per-service aggregate
+Readiness HTTP and remote job-status transport share one per-service aggregate
 remote-I/O budget of 32 workers. They must not own independently bounded pools:
 ``256 + 256`` is still a 512-worker process fan-out when the supervised daemons
-overlap. The internal 24/8 general/admitted-phase lane split sums to the one
-budget and exists only to preserve provider-phase progress. It is not a second
-readiness or job-status policy. Unpaid coverage must run both producers
-concurrently through this production owner and assert the aggregate active
-count, worker count, process count, memory high-water delta, terminal shutdown,
-and progress under an incompatible-provider-phase queue.
+overlap. Explicit 16/16 readiness/job-status duty lanes sum to the one budget
+and exist only to preserve progress when a status caller owns a provider phase.
+They are not separate concurrency authorities or policies. Terminal shutdown
+closes the owner before retiring either lane; no racing producer may recreate a
+pool. Component/process coverage must run both lanes concurrently through this
+production owner and assert the aggregate active count, worker count, memory
+high-water delta, terminal shutdown, and progress under an
+incompatible-provider-phase queue. Producer-wiring tests must also prove the
+real probe and job-status call sites cannot bypass or misclassify that owner.
 
-Ordinary PHX endpoint readiness does not enter the eight-worker child lane: it
-uses the 24-worker general lane after URL/provider-fence resolution. Only work
-that receives an already-open provider admission uses the child lane. Even if
-all 100 readiness calls were explicitly phase-admitted and every call exhausted
-the default 15-second timeout, thirteen batches take at most 195 seconds.
-Healthy and connection-refused probes normally free their slots much sooner.
+Every controller job-status transport in these lanes skips Skylet and its
+potentially unbounded tunnel-repair prelude, then uses the direct SSH/Kubernetes
+command runner with a hard 10-second timeout. Seven 16-worker batches therefore
+take at most 70 seconds. Ordinary endpoint readiness takes at most seven
+15-second batches, or 105 seconds. The longest ordered recovery probe can spend
+15 seconds on the endpoint plus the 10-second status command per batch, or at
+most 175 seconds for 100 replicas. Healthy, refused, and status-only calls
+normally free their slots much sooner.
 
 The required probe/reconcile shape is:
 
@@ -4056,11 +4070,13 @@ these remaining current-writer acceptance gates:
 8. Homogeneously deploy both the cold-queue liveness correction and aggregate
    32-worker controller remote-I/O owner without changing the controller
    memory limit. Run the serial unpaid 10,000-request HTTP interface gate
-   against the release image. Also require the clean-subprocess remote-I/O gate
-   to prove 100 readiness plus 100 job-status calls never exceed 32 active
-   workers, create no child process, release every worker at shutdown, and let
-   admitted-phase children complete while the 24-worker general lane is
-   saturated on an incompatible phase. Only after both pass, run the
+   against the release image. Also require the clean-process remote-I/O gate to
+   prove 100 readiness plus 100 job-status calls never exceed 32 active
+   workers, retain bounded memory, release every worker at terminal shutdown,
+   and let job-status children complete while all 16 readiness workers are
+   saturated on an incompatible phase. Producer-wiring tests must prove both
+   real callers select their exact lane and 10-second status bound. Only after
+   both pass, run the
    provider-native scale profile against that exact image. Drive the
    800-logical-slot bounded Spot target to at least 100 provider-``RUNNING`` L4
    Spot VMs in aggregate within five minutes; do not require both providers to

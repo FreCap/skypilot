@@ -1,3 +1,11 @@
+"""Component integration against a caller-supplied existing Skylet cluster.
+
+This exercises the production backend-to-Skylet gRPC boundary, including
+connection-loss recovery, but deliberately does not provision infrastructure
+or run the API/controller/PostgreSQL Serve workflow.  The external cluster is
+an operator fixture; this is therefore not a provider-interface E2E.
+"""
+
 import concurrent.futures
 import random
 import statistics
@@ -14,6 +22,8 @@ from sky.schemas.generated import autostopv1_pb2
 from sky.utils import env_options
 
 logger = sky_logging.init_logger(__name__)
+
+pytestmark = pytest.mark.component
 
 
 @pytest.fixture(scope="session")

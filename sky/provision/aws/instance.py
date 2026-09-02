@@ -20,6 +20,7 @@ from sky.clouds.utils import aws_utils
 from sky.provision import capacity_policy
 from sky.provision import common
 from sky.provision import constants
+from sky.provision import provider_facets
 from sky.provision.aws import config as aws_config
 from sky.provision.aws import instance_requests
 from sky.provision.aws.instance_requests import (
@@ -58,6 +59,9 @@ _RESUME_PER_INSTANCE_TIMEOUT = 120  # 2 minutes
 _ORDINARY_PAID_PROVIDER_PROOF_RETRY_SECONDS = 5
 _FRESH_INSTANCE_TAG_MAX_ATTEMPTS = 3
 _FRESH_INSTANCE_TAG_RETRYABLE_ERROR_CODES = ('InvalidInstanceID.NotFound',)
+_SERVE_INVENTORY_CONNECT_TIMEOUT_SECONDS = 5
+_SERVE_INVENTORY_READ_TIMEOUT_SECONDS = 10
+_SERVE_INVENTORY_TOTAL_MAX_ATTEMPTS = 1
 
 # ======================== About AWS subnet/VPC ========================
 # https://stackoverflow.com/questions/37407492/are-there-differences-in-networking-performance-if-ec2-instances-are-in-differen
@@ -1038,6 +1042,144 @@ def query_instances(
             continue
         statuses[inst.id] = (status, None)
     return statuses
+
+
+def query_instances_batch(
+    queries: tuple[provider_facets.InstanceStatusInventoryQueryV1, ...],
+    *,
+    deadline_monotonic: float,
+) -> tuple[provider_facets.InstanceStatusInventoryObservationV1, ...]:
+    """Read one bounded EC2 inventory per region for a Serve generation."""
+    queries_by_region: dict[
+        str, list[provider_facets.InstanceStatusInventoryQueryV1]] = {}
+    invalid: dict[str, str] = {}
+    for query in queries:
+        region = query.provider_config.get('region')
+        if not isinstance(region, str) or not region:
+            invalid[query.query_id] = 'AWS provider config has no region'
+            continue
+        queries_by_region.setdefault(region, []).append(query)
+
+    observations: dict[
+        str, provider_facets.InstanceStatusInventoryObservationV1] = {}
+    for query_id, error in invalid.items():
+        observations[query_id] = (
+            provider_facets.InstanceStatusInventoryObservationV1(
+                query_id=query_id,
+                disposition=(provider_facets.
+                             InstanceStatusInventoryDispositionV1.UNKNOWN),
+                error=error))
+
+    status_map = {
+        'pending': status_lib.ClusterStatus.INIT,
+        'running': status_lib.ClusterStatus.UP,
+        'stopping': status_lib.ClusterStatus.STOPPED,
+        'stopped': status_lib.ClusterStatus.STOPPED,
+        'shutting-down': None,
+        'terminated': None,
+    }
+    for region, partition in queries_by_region.items():
+        query_ids_by_cluster: dict[str, list[str]] = {}
+        for query in partition:
+            query_ids_by_cluster.setdefault(query.cluster_name_on_cloud,
+                                            []).append(query.query_id)
+        entries_by_query_id: dict[
+            str, list[provider_facets.InstanceStatusInventoryEntryV1]] = {
+                query.query_id: [] for query in partition
+            }
+        try:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining < (_SERVE_INVENTORY_CONNECT_TIMEOUT_SECONDS +
+                            _SERVE_INVENTORY_READ_TIMEOUT_SECONDS):
+                raise TimeoutError(
+                    'AWS batch inventory exhausted its aggregate deadline')
+            session = aws.session_with_client_defaults(
+                connect_timeout=_SERVE_INVENTORY_CONNECT_TIMEOUT_SECONDS,
+                read_timeout=_SERVE_INVENTORY_READ_TIMEOUT_SECONDS,
+                total_max_attempts=_SERVE_INVENTORY_TOTAL_MAX_ATTEMPTS,
+                profile=aws.get_workspace_profile())
+            ec2_client = session.client('ec2', region_name=region)
+            request: dict[str, Any] = {
+                # Inventory every SkyPilot cluster in the region once and
+                # project only requested cluster names locally.  Sending up
+                # to 800 exact tag values exceeds EC2 request-size limits and
+                # couples correctness to a provider-specific filter ceiling.
+                'Filters': [{
+                    'Name': 'tag-key',
+                    'Values': [constants.TAG_RAY_CLUSTER_NAME],
+                }, {
+                    'Name': 'instance-state-name',
+                    'Values': ['pending', 'running', 'stopping', 'stopped'],
+                }],
+                'MaxResults': 1000,
+            }
+            seen_instance_ids: set[str] = set()
+            while True:
+                response = ec2_client.describe_instances(**request)
+                for reservation in response.get('Reservations', []):
+                    for instance in reservation.get('Instances', []):
+                        instance_id = instance.get('InstanceId')
+                        state = instance.get('State', {}).get('Name')
+                        tags = instance.get('Tags')
+                        if (not isinstance(instance_id, str) or
+                                state not in status_map or
+                                not isinstance(tags, list)):
+                            raise ValueError(
+                                'EC2 returned malformed instance inventory')
+                        cluster_name = next(
+                            (tag.get('Value')
+                             for tag in tags
+                             if tag.get('Key') == constants.TAG_RAY_CLUSTER_NAME
+                            ), None)
+                        if not isinstance(cluster_name, str):
+                            continue
+                        matching_query_ids = query_ids_by_cluster.get(
+                            cluster_name, [])
+                        if not matching_query_ids:
+                            continue
+                        if instance_id in seen_instance_ids:
+                            raise ValueError(
+                                'EC2 returned duplicate instance inventory')
+                        seen_instance_ids.add(instance_id)
+                        status = status_map[state]
+                        if status is None:
+                            continue
+                        entry = (provider_facets.InstanceStatusInventoryEntryV1(
+                            instance_id=instance_id, status=status))
+                        for query_id in matching_query_ids:
+                            entries_by_query_id[query_id].append(entry)
+                next_token = response.get('NextToken')
+                if not next_token:
+                    break
+                if (deadline_monotonic - time.monotonic()
+                        < (_SERVE_INVENTORY_CONNECT_TIMEOUT_SECONDS +
+                           _SERVE_INVENTORY_READ_TIMEOUT_SECONDS)):
+                    raise TimeoutError(
+                        'AWS batch inventory exhausted its aggregate deadline')
+                request['NextToken'] = next_token
+        except Exception as error:  # pylint: disable=broad-except
+            message = f'{type(error).__name__}: {error}'
+            for query in partition:
+                observations[query.query_id] = (
+                    provider_facets.InstanceStatusInventoryObservationV1(
+                        query_id=query.query_id,
+                        disposition=(
+                            provider_facets.
+                            InstanceStatusInventoryDispositionV1.UNKNOWN),
+                        error=message))
+            continue
+        for query in partition:
+            entries = tuple(
+                sorted(entries_by_query_id[query.query_id],
+                       key=lambda entry: entry.instance_id))
+            observations[query.query_id] = (
+                provider_facets.InstanceStatusInventoryObservationV1(
+                    query_id=query.query_id,
+                    disposition=(provider_facets.
+                                 InstanceStatusInventoryDispositionV1.OBSERVED),
+                    entries=entries))
+
+    return tuple(observations[query.query_id] for query in queries)
 
 
 def stop_instances(

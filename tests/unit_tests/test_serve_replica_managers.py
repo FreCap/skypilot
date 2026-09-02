@@ -2,7 +2,7 @@
 
 Covers:
 - `SkyPilotReplicaManager.__init__` startup ordering: the daemon threads
-  (especially `_job_status_fetcher`) must NOT race the main thread for
+  (especially `_exact_status_fetcher`) must NOT race the main thread for
   `self.lock` before `_recover_replica_operations` runs.
 - `launch_cluster` retry scoping: resource availability (capacity) failures
   are capped by `availability_max_retry` while other errors keep the
@@ -842,7 +842,7 @@ def test_action_fence_defers_when_the_current_owner_is_unavailable():
 class TestSkyPilotReplicaManagerInitOrdering:
     """`SkyPilotReplicaManager.__init__` must (1) hand the manager lock to
     the recovery pass BEFORE any daemon thread can grab it — otherwise
-    `_job_status_fetcher`'s per-replica SSH walk can starve recovery — and
+    `_exact_status_fetcher`'s per-replica SSH walk can starve recovery — and
     (2) NOT block on recovery finishing: at fleet scale recovery re-drives
     hundreds of interrupted launches and runs for minutes, and a blocking
     __init__ kept uvicorn from binding within _start's 60s readiness window
@@ -973,7 +973,7 @@ class TestSkyPilotReplicaManagerInitOrdering:
         started = []
         self._build(lambda self_: None, started)
         assert '_thread_pool_refresher' in started
-        assert '_job_status_fetcher' in started
+        assert '_exact_status_fetcher' in started
         assert '_replica_prober' in started
         assert '_system_recovery_route_prober' in started
         assert '_zero_cost_actuation_dispatcher' in started
@@ -1057,7 +1057,7 @@ class TestBackgroundDutyOwnershipLifecycle:
 
     @pytest.mark.parametrize(('loop_name', 'work_name'), [
         ('_thread_pool_refresher', '_refresh_thread_pool'),
-        ('_job_status_fetcher', '_fetch_job_status'),
+        ('_exact_status_fetcher', '_fetch_exact_status'),
     ])
     def test_stopped_duty_does_not_start_new_round(self, loop_name, work_name):
         mgr = self._stopped_manager()
@@ -1197,6 +1197,8 @@ class TestBackgroundDutyOwnershipLifecycle:
         info.replica_id = 9
         info.cluster_name = 'svc-9'
         info.status_property.should_track_service_status.return_value = True
+        handle = mock.sentinel.handle
+        info.handle.return_value = handle
 
         def _delayed_probe_pool(**_kwargs):
             probe_started.set()
@@ -1214,8 +1216,19 @@ class TestBackgroundDutyOwnershipLifecycle:
                     [info], phase_admission=mock.sentinel.phase_admission))
 
         probe_thread = threading.Thread(target=_run_probe)
+        backend = mock.Mock()
+        backend.build_serve_job_status_transports.return_value = [
+            mock.Mock(source_handle=handle,
+                      transport=mock.sentinel.transport,
+                      error=None)
+        ]
         with mock.patch.object(replica_managers.backends,
-                               'CloudVmRayBackend'), \
+                               'CloudVmRayBackend',
+                               return_value=backend), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_clusters_from_names',
+                 return_value={info.cluster_name: {'handle': handle}}), \
              mock.patch.object(replica_managers.serve_state,
                                'set_service_uptime') as set_uptime:
             probe_thread.start()
@@ -4536,7 +4549,9 @@ class TestBoundOrdinaryLaunchManagerIntegration:
             connection.execute.return_value.mappings.return_value.one_or_none)
         one_or_none.side_effect = [None, predecessor, predecessor]
         engine = mock.MagicMock()
-        engine.connect.return_value.__enter__.return_value = connection
+        engine.begin.return_value.__enter__.return_value = connection
+        connection.dialect.name = 'postgresql'
+        connection.in_transaction.return_value = True
         with mock.patch.object(request_postgres,
                                'initialize_and_get_db',
                                return_value=engine):
@@ -4565,7 +4580,9 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         (connection.execute.return_value.mappings.return_value.one_or_none.
          return_value) = predecessor
         engine = mock.MagicMock()
-        engine.connect.return_value.__enter__.return_value = connection
+        engine.begin.return_value.__enter__.return_value = connection
+        connection.dialect.name = 'postgresql'
+        connection.in_transaction.return_value = True
         with mock.patch.object(request_postgres,
                                'initialize_and_get_db',
                                return_value=engine), \
@@ -4991,7 +5008,8 @@ def test_probe_url_v2_group_reuses_one_outer_physical_fence():
     physical_uid_reads = 0
 
     @contextlib.contextmanager
-    def _physical_fence(context, physical_uid):
+    def _physical_fence(context, physical_uid, *, wait_for_initializer=True):
+        del wait_for_initializer
         nonlocal active_scopes, physical_uid_reads
         assert (context, physical_uid) == ('phx', 'phx-uid')
         if active_scopes == 0:
@@ -5151,6 +5169,9 @@ def test_v2_job_status_batch_reuses_one_physical_uid_proof():
         info.status_property.sky_launch_status = (
             common_utils.ProcessStatus.SUCCEEDED)
         _stamp_protocol_v2_fill(info)
+        info.system_recovery_disposition = (
+            recovery_state.SystemRecoveryDisposition.CAPABLE)
+        info.service_job_id = 1
         handle = _protocol_v2_handle(info)
         infos.append(info)
         records[info.cluster_name] = {
@@ -5158,15 +5179,25 @@ def test_v2_job_status_batch_reuses_one_physical_uid_proof():
             'handle': handle,
         }
     mgr = _make_manager()
-    mgr._is_pool = True
+    mgr._is_pool = False
     backend = mock.Mock()
-    backend.get_job_status.return_value = {1: job_lib.JobStatus.RUNNING}
+    backend.get_job_status_with_system_recovery.return_value = ({
+        1: job_lib.JobStatus.RUNNING
+    }, {}, {
+        1: job_lib.JobSystemRecoveryDetailStatus.ABSENT
+    })
+    backend.build_serve_job_status_transports.return_value = [
+        mock.Mock(source_handle=record['handle'],
+                  transport=mock.Mock(),
+                  error=None) for record in records.values()
+    ]
     active_scopes = 0
     physical_uid_reads = 0
     scope_lock = threading.Lock()
 
     @contextlib.contextmanager
-    def _physical_fence(context, physical_uid):
+    def _physical_fence(context, physical_uid, *, wait_for_initializer=True):
+        del wait_for_initializer
         nonlocal active_scopes, physical_uid_reads
         assert (context, physical_uid) == ('phx', 'phx-uid')
         with scope_lock:
@@ -5198,10 +5229,10 @@ def test_v2_job_status_batch_reuses_one_physical_uid_proof():
          mock.patch.object(replica_managers.kubernetes_adaptor,
                            'physical_cluster_uid_fence',
                            side_effect=_physical_fence):
-        mgr._fetch_job_status()
+        mgr._fetch_exact_status()
 
     assert physical_uid_reads == 1
-    assert backend.get_job_status.call_count == 2
+    assert backend.get_job_status_with_system_recovery.call_count == 2
 
 
 def test_ordinary_kubernetes_fleet_skips_remote_job_status_at_840():
@@ -5254,7 +5285,7 @@ def test_ordinary_kubernetes_fleet_skips_remote_job_status_at_840():
              'physical_cluster_uid_fence') as physical_uid_fence, \
          mock.patch.object(replica_managers.provider_phase,
                            'provider_phase') as provider_phase:
-        mgr._fetch_job_status()
+        mgr._fetch_exact_status()
 
     get_clusters.assert_called_once()
     assert len(get_clusters.call_args.args[0]) == 840
@@ -5265,8 +5296,8 @@ def test_ordinary_kubernetes_fleet_skips_remote_job_status_at_840():
     mgr._handle_job_status_results.assert_not_called()
 
 
-def test_kubernetes_system_recovery_retains_exact_remote_job_status():
-    """The ordinary Kubernetes capability cannot weaken recovery evidence."""
+def test_kubernetes_capable_recovery_retains_exact_remote_job_status():
+    """The ordinary Kubernetes capability cannot weaken capable recovery."""
     info = replica_managers.ReplicaInfo(replica_id=1,
                                         cluster_name='svc-1',
                                         replica_port='8080',
@@ -5277,7 +5308,7 @@ def test_kubernetes_system_recovery_retains_exact_remote_job_status():
     info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
     _stamp_protocol_v2_fill(info)
     info.system_recovery_disposition = (
-        recovery_state.SystemRecoveryDisposition.CANDIDATE)
+        recovery_state.SystemRecoveryDisposition.CAPABLE)
     info.service_job_id = 17
     handle = _protocol_v2_handle(info)
     records = {info.cluster_name: {'name': info.cluster_name, 'handle': handle}}
@@ -5290,6 +5321,10 @@ def test_kubernetes_system_recovery_retains_exact_remote_job_status():
     }, {}, {
         17: job_lib.JobSystemRecoveryDetailStatus.ABSENT
     }))
+    transport = mock.sentinel.status_transport
+    backend.build_serve_job_status_transports = mock.Mock(return_value=[
+        mock.Mock(source_handle=handle, transport=transport, error=None)
+    ])
 
     def _consume(results, *, provider_error_phase_mode):
         assert provider_error_phase_mode is (
@@ -5310,11 +5345,11 @@ def test_kubernetes_system_recovery_retains_exact_remote_job_status():
          mock.patch.object(replica_managers.kubernetes_adaptor,
                            'physical_cluster_uid_fence',
                            return_value=contextlib.nullcontext()):
-        mgr._fetch_job_status()
+        mgr._fetch_exact_status()
 
     backend.get_job_status.assert_not_called()
     backend.get_job_status_with_system_recovery.assert_called_once_with(
-        handle, [17], stream_logs=False)
+        handle, [17], stream_logs=False, serve_transport=transport)
     mgr._handle_job_status_results.assert_called_once()
 
 
@@ -5383,7 +5418,7 @@ def test_ordinary_kubernetes_endpoint_owns_detached_job_liveness(
          mock.patch.object(replica_managers.provider_phase,
                            'join_provider_phase',
                            return_value=contextlib.nullcontext()):
-        mgr._fetch_job_status()
+        mgr._fetch_exact_status()
         snapshot = mgr._probe_all_replicas_with_snapshot(
             [info], phase_admission=mock.sentinel.phase_admission)
 
@@ -5416,10 +5451,11 @@ def test_exact_non_kubernetes_job_status_does_not_hold_kubernetes_phase():
                                         version=1,
                                         resources_override=None)
     info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
-    handle = mock.Mock(spec=replica_managers.backends.CloudVmRayResourceHandle)
+    handle = replica_managers.backends.CloudVmRayResourceHandle.__new__(
+        replica_managers.backends.CloudVmRayResourceHandle)
     handle.cluster_name = info.cluster_name
-    handle.launched_resources = mock.Mock(cloud=clouds.GCP(),
-                                          region='us-central1')
+    handle.launched_resources = types.SimpleNamespace(cloud=clouds.GCP(),
+                                                      region='us-central1')
     records = {
         info.cluster_name: {
             'name': info.cluster_name,
@@ -5427,7 +5463,7 @@ def test_exact_non_kubernetes_job_status_does_not_hold_kubernetes_phase():
         }
     }
     mgr = _make_manager()
-    mgr._is_pool = True
+    mgr._is_pool = False
     backend = mock.Mock()
     status_started = threading.Event()
     release_status = threading.Event()
@@ -5439,6 +5475,13 @@ def test_exact_non_kubernetes_job_status_does_not_hold_kubernetes_phase():
         return {1: job_lib.JobStatus.RUNNING}
 
     backend.get_job_status.side_effect = _get_job_status
+    backend.serve_replica_job_status_source.return_value = (
+        replica_managers.backends.ServeReplicaJobStatusSource.
+        STARTUP_SENTINEL_AND_PROVIDER_ENDPOINT)
+    transport = mock.sentinel.status_transport
+    backend.build_serve_job_status_transports.return_value = [
+        mock.Mock(source_handle=handle, transport=transport, error=None)
+    ]
     with mock.patch.object(replica_managers.serve_state,
                            'get_replica_infos',
                            return_value=[info]), \
@@ -5447,8 +5490,14 @@ def test_exact_non_kubernetes_job_status_does_not_hold_kubernetes_phase():
                            return_value=records), \
          mock.patch.object(replica_managers.backends,
                            'CloudVmRayBackend',
-                           return_value=backend):
-        fetch_thread = threading.Thread(target=mgr._fetch_job_status)
+                           return_value=backend), \
+         mock.patch.object(
+             replica_managers.request_postgres,
+             'read_bound_ordinary_launch_status_job_ids',
+             side_effect=lambda _service_name, identities: {
+                 identities[0]: 1
+             }):
+        fetch_thread = threading.Thread(target=mgr._fetch_exact_status)
         fetch_thread.start()
         assert status_started.wait(timeout=5)
         try:
@@ -5461,8 +5510,14 @@ def test_exact_non_kubernetes_job_status_does_not_hold_kubernetes_phase():
             fetch_thread.join(timeout=5)
 
     assert not fetch_thread.is_alive()
-    backend.get_job_status.assert_called_once_with(handle, [1],
-                                                   stream_logs=False)
+    backend.get_job_status.assert_called_once()
+    status_args, status_kwargs = backend.get_job_status.call_args
+    assert status_args[0] is handle
+    assert status_args[1] == [1]
+    assert status_kwargs == {
+        'stream_logs': False,
+        'serve_transport': transport,
+    }
 
 
 def test_non_kubernetes_job_status_error_takes_phase_before_manager_lock():
@@ -5474,10 +5529,11 @@ def test_non_kubernetes_job_status_error_takes_phase_before_manager_lock():
                                         version=1,
                                         resources_override=None)
     info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
-    handle = mock.Mock(spec=replica_managers.backends.CloudVmRayResourceHandle)
+    handle = replica_managers.backends.CloudVmRayResourceHandle.__new__(
+        replica_managers.backends.CloudVmRayResourceHandle)
     handle.cluster_name = info.cluster_name
-    handle.launched_resources = mock.Mock(cloud=clouds.GCP(),
-                                          region='us-central1')
+    handle.launched_resources = types.SimpleNamespace(cloud=clouds.GCP(),
+                                                      region='us-central1')
     records = {
         info.cluster_name: {
             'name': info.cluster_name,
@@ -5485,7 +5541,7 @@ def test_non_kubernetes_job_status_error_takes_phase_before_manager_lock():
         }
     }
     mgr = _make_manager()
-    mgr._is_pool = True
+    mgr._is_pool = False
     backend = mock.Mock()
     status_raised = threading.Event()
     liveness_checked = threading.Event()
@@ -5496,6 +5552,10 @@ def test_non_kubernetes_job_status_error_takes_phase_before_manager_lock():
         raise exceptions.CommandError(255, 'get_job_status', 'ssh failed', None)
 
     backend.get_job_status.side_effect = _get_job_status
+    transport = mock.sentinel.status_transport
+    backend.build_serve_job_status_transports.return_value = [
+        mock.Mock(source_handle=handle, transport=transport, error=None)
+    ]
 
     def _classify_liveness(fresh, *, phase_admission, handle):
         assert fresh is info
@@ -5514,7 +5574,7 @@ def test_non_kubernetes_job_status_error_takes_phase_before_manager_lock():
 
     def _fetch():
         try:
-            mgr._fetch_job_status()
+            mgr._fetch_exact_status()
         except BaseException as error:  # pylint: disable=broad-exception-caught
             errors.append(error)
 
@@ -5529,7 +5589,11 @@ def test_non_kubernetes_job_status_error_takes_phase_before_manager_lock():
                            return_value=records), \
          mock.patch.object(replica_managers.backends,
                            'CloudVmRayBackend',
-                           return_value=backend):
+                           return_value=backend), \
+         mock.patch.object(
+             replica_managers.request_postgres,
+             'inspect_bound_ordinary_launch',
+             return_value=types.SimpleNamespace(service_job_id=1)):
         fetch_thread = threading.Thread(target=_fetch)
         try:
             with replica_managers.provider_phase.provider_phase(
@@ -5775,9 +5839,9 @@ def _system_recovery_replica(
 
 def test_invalid_recovery_job_rows_terminate_in_v2_then_ambient_phases():
     ordinary = _system_recovery_replica(
-        2, recovery_state.SystemRecoveryDisposition.CANDIDATE)
+        2, recovery_state.SystemRecoveryDisposition.CAPABLE)
     fenced = _system_recovery_replica(
-        1, recovery_state.SystemRecoveryDisposition.CANDIDATE)
+        1, recovery_state.SystemRecoveryDisposition.CAPABLE)
     _stamp_protocol_v2_fill(fenced)
     for info in (ordinary, fenced):
         info.status_property.sky_launch_status = (
@@ -5813,12 +5877,20 @@ def test_invalid_recovery_job_rows_terminate_in_v2_then_ambient_phases():
             events.append(f'{mode.value}-exit')
 
     @contextlib.contextmanager
-    def _batch(representatives, *, phase_admission):
+    def _physical_fence(info,
+                        handle,
+                        *,
+                        include_provider_phase=True,
+                        wait_for_initializer=True,
+                        phase_admission=None):
         del phase_admission
-        assert list(representatives) == [('phx', 'phx-uid')]
+        assert info is fenced
+        assert handle is fenced_handle
+        assert include_provider_phase is False
+        assert wait_for_initializer is False
         events.append('batch-enter')
         try:
-            yield {}
+            yield None
         finally:
             events.append('batch-exit')
 
@@ -5839,12 +5911,12 @@ def test_invalid_recovery_job_rows_terminate_in_v2_then_ambient_phases():
                            side_effect=_phase), \
          mock.patch.object(
              replica_managers.reserved_capacity,
-             'protocol_v2_provider_batch_fences',
-             side_effect=_batch):
-        mgr._fetch_job_status()
+             'protocol_v2_provider_fence',
+             side_effect=_physical_fence):
+        mgr._fetch_exact_status()
 
     assert events == [
-        'v2-fenced-enter', 'batch-enter', 'batch-exit', 'v2-fenced-exit',
+        'batch-enter', 'batch-exit', 'v2-fenced-enter', 'v2-fenced-exit',
         'terminate-1', 'ambient-legacy-enter', 'ambient-legacy-exit',
         'terminate-2'
     ]
@@ -6250,6 +6322,14 @@ class TestOrderedRouteIssuanceWorker:
                  replica_managers.backends.CloudVmRayBackend,
                  'get_job_status_with_system_recovery',
                  side_effect=status_result) as status_fetch, \
+             mock.patch.object(
+                 replica_managers.backends.CloudVmRayBackend,
+                 'build_serve_job_status_transports',
+                 return_value=[
+                     mock.Mock(source_handle=handle,
+                               transport=mock.sentinel.status_transport,
+                               error=None)
+                 ]), \
              mock.patch.object(replica_managers,
                                'time',
                                mock.Mock(wraps=time)) as manager_time:
@@ -7953,7 +8033,8 @@ run: echo hi
         persisted_spec = mock.sentinel.persisted_spec
 
         with mock.patch(
-                'sky.serve.replica_managers.load_task_with_service_spec',
+                'sky.serve.paid_launch_request.serve_utils.'
+                'load_task_with_service_spec',
                 return_value=task) as load_task, \
              mock.patch('sky.serve.replica_managers.usage_lib'), \
              mock.patch('sky.serve.replica_managers.sdk') as mock_sdk:
@@ -11689,7 +11770,7 @@ class TestInfrastructureInterruptionRecovery:
             spot, reason='preempted')
 
     @pytest.mark.parametrize('changed_only', [False, True])
-    def test_failed_research_probe_enters_interruption_prefilter(
+    def test_failed_research_probe_with_missing_opening_handle_interrupts(
             self, changed_only):
         research = self._location()
         manager = self._manager(research)
@@ -11722,8 +11803,7 @@ class TestInfrastructureInterruptionRecovery:
                                return_value={1: info}):
             manager._probe_all_replicas()
 
-        manager._cloud_instance_looks_alive.assert_called_once_with(
-            info, phase_admission=mock.ANY)
+        manager._cloud_instance_looks_alive.assert_not_called()
         manager._apply_confirmed_preemption.assert_called_once_with(
             info, None, persist_placement=False)
         manager._persist_replicas.assert_called_once_with([(1, info)])
@@ -21289,7 +21369,7 @@ class TestRecoveryRetryAndIsolation:
                  side_effect=_inspect) as inspect, \
              mock.patch.object(mgr,
                                '_install_bound_launch_adopter') as adopt, \
-             pytest.raises(RuntimeError, match='replicas \[1\]'):
+            pytest.raises(RuntimeError, match=r'replicas \[1\]'):
             mgr._recover_replica_operations()
 
         assert [call.args[1] for call in inspect.call_args_list] == [1, 2]

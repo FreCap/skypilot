@@ -432,6 +432,7 @@ def test_skyserve_spot_recovery():
 @pytest.mark.resource_heavy
 @pytest.mark.exclusive
 @pytest.mark.no_auto_retry
+@pytest.mark.paid_e2e
 def test_skyserve_paid_spot_postgres_e2e(request: pytest.FixtureRequest):
     """Prove authenticated PostgreSQL admission through natural Spot drain.
 

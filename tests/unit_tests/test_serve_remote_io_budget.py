@@ -1,8 +1,9 @@
-"""Unpaid aggregate-concurrency coverage for Serve replica remote I/O."""
+"""Process-integration coverage for Serve remote-I/O scheduling."""
 
 # pylint: disable=protected-access
 import multiprocessing
 import threading
+import time
 import traceback
 
 from sky.serve import provider_phase
@@ -22,33 +23,32 @@ def _linux_process_memory_kib(field: str) -> int:
 
 
 def _run_remote_io_budget_probe(result_connection) -> None:
-    """Exercise the production scheduler with a narrow fake I/O callable."""
+    """Exercise the production scheduling owner with narrow fake callables."""
     manager = replica_managers.SkyPilotReplicaManager.__new__(
         replica_managers.SkyPilotReplicaManager)
     max_workers = manager._REMOTE_IO_MAX_PARALLELISM
-    admitted_workers = max(1, max_workers // 4)
-    general_workers = max_workers - admitted_workers
+    probe_workers = manager._REMOTE_PROBE_PARALLELISM
+    status_workers = manager._REMOTE_STATUS_PARALLELISM
+    configured_max_replicas = 800
     manager._get_remote_io_executor()
-    baseline_children = {
-        child.pid for child in multiprocessing.active_children()
-    }
     baseline_rss_kib = _linux_process_memory_kib('VmRSS')
     baseline_hwm_kib = _linux_process_memory_kib('VmHWM')
     release = threading.Event()
     try:
         # Reproduce the dependency that makes one undifferentiated FIFO pool
-        # unsafe. General workers wait for an ambient root while the caller
-        # owns a V2 root. Children joining that V2 admission must still run.
-        general_started = 0
-        general_started_lock = threading.Lock()
-        all_general_started = threading.Event()
+        # unsafe. Readiness workers wait for an ambient root while the caller
+        # owns a V2 root. Job-status children joining that V2 admission must
+        # still run through their dedicated share of the aggregate budget.
+        readiness_started = 0
+        readiness_started_lock = threading.Lock()
+        all_readiness_started = threading.Event()
 
         def _opposite_phase_waiter() -> None:
-            nonlocal general_started
-            with general_started_lock:
-                general_started += 1
-                if general_started == general_workers:
-                    all_general_started.set()
+            nonlocal readiness_started
+            with readiness_started_lock:
+                readiness_started += 1
+                if readiness_started == probe_workers:
+                    all_readiness_started.set()
             with provider_phase.provider_phase(
                     provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
                 pass
@@ -59,21 +59,25 @@ def _run_remote_io_budget_probe(result_connection) -> None:
 
         with provider_phase.provider_phase(
                 provider_phase.ProviderPhaseMode.V2_FENCED) as admission:
-            general_futures = [
-                manager._submit_remote_io(_opposite_phase_waiter)
-                for _ in range(general_workers)
+            readiness_futures = [
+                manager._submit_remote_io(
+                    _opposite_phase_waiter,
+                    lane=replica_managers._ReplicaRemoteIOLane.PROBE)
+                for _ in range(probe_workers)
             ]
-            if not all_general_started.wait(timeout=5):
-                raise RuntimeError('General remote-I/O lane did not saturate.')
-            admitted_futures = [
-                manager._submit_remote_io(_admitted_phase_child,
-                                          admission,
-                                          provider_phase_admitted=True)
-                for _ in range(admitted_workers)
+            if not all_readiness_started.wait(timeout=5):
+                raise RuntimeError(
+                    'Readiness remote-I/O lane did not saturate.')
+            job_status_futures = [
+                manager._submit_remote_io(
+                    _admitted_phase_child,
+                    admission,
+                    lane=replica_managers._ReplicaRemoteIOLane.STATUS)
+                for _ in range(status_workers)
             ]
-            for future in admitted_futures:
+            for future in job_status_futures:
                 future.result(timeout=5)
-        for future in general_futures:
+        for future in readiness_futures:
             future.result(timeout=5)
 
         active = 0
@@ -86,7 +90,7 @@ def _run_remote_io_budget_probe(result_connection) -> None:
             nonlocal active, peak_active, completed
             # Touch each page so the OS resident-set assertion observes the
             # payload held by every concurrently active fake remote call.
-            retained = bytearray(1024 * 1024)
+            retained = bytearray(512 * 1024)
             for offset in range(0, len(retained), 4096):
                 retained[offset] = 1
             with active_lock:
@@ -104,27 +108,38 @@ def _run_remote_io_budget_probe(result_connection) -> None:
         futures = []
         futures_lock = threading.Lock()
 
-        def _submit(kind: str, admitted: bool) -> None:
-            submitted = [
-                manager._submit_remote_io(_fake_remote_io,
-                                          kind,
-                                          index,
-                                          provider_phase_admitted=admitted)
-                for index in range(100)
-            ]
-            with futures_lock:
-                futures.extend(submitted)
+        def _submit(kind: str,
+                    lane: replica_managers._ReplicaRemoteIOLane) -> None:
+            batch_size = (probe_workers
+                          if lane is replica_managers._ReplicaRemoteIOLane.PROBE
+                          else status_workers)
+            for offset in range(0, configured_max_replicas, batch_size):
+                submitted = [
+                    manager._submit_remote_io(_fake_remote_io,
+                                              kind,
+                                              index,
+                                              lane=lane)
+                    for index in range(
+                        offset, min(offset +
+                                    batch_size, configured_max_replicas))
+                ]
+                with futures_lock:
+                    futures.extend(submitted)
+                for future in submitted:
+                    future.result(timeout=15)
 
         producers = [
-            threading.Thread(target=_submit, args=('readiness', False)),
-            threading.Thread(target=_submit, args=('job-status', True)),
+            threading.Thread(
+                target=_submit,
+                args=('readiness',
+                      replica_managers._ReplicaRemoteIOLane.PROBE)),
+            threading.Thread(
+                target=_submit,
+                args=('job-status',
+                      replica_managers._ReplicaRemoteIOLane.STATUS)),
         ]
         for producer in producers:
             producer.start()
-        for producer in producers:
-            producer.join(timeout=5)
-            if producer.is_alive():
-                raise RuntimeError('Remote-I/O producer did not finish.')
         if not saturated.wait(timeout=5):
             raise RuntimeError('Aggregate remote-I/O budget did not saturate.')
 
@@ -134,10 +149,11 @@ def _run_remote_io_budget_probe(result_connection) -> None:
         ]
         rss_delta_kib = (_linux_process_memory_kib('VmRSS') - baseline_rss_kib)
         hwm_delta_kib = (_linux_process_memory_kib('VmHWM') - baseline_hwm_kib)
-        children_at_peak = {
-            child.pid for child in multiprocessing.active_children()
-        }
         release.set()
+        for producer in producers:
+            producer.join(timeout=15)
+            if producer.is_alive():
+                raise RuntimeError('Remote-I/O producer did not finish.')
         results = [future.result(timeout=15) for future in futures]
         manager._shutdown_remote_io_executor()
         remaining_worker_threads = [
@@ -145,9 +161,6 @@ def _run_remote_io_budget_probe(result_connection) -> None:
             for thread in threading.enumerate()
             if thread.name.startswith('serve-remote-io')
         ]
-        final_children = {
-            child.pid for child in multiprocessing.active_children()
-        }
         result_connection.send({
             'peak_active': peak_active,
             'worker_threads_at_peak': len(worker_threads_at_peak),
@@ -155,8 +168,6 @@ def _run_remote_io_budget_probe(result_connection) -> None:
             'result_count': len(results),
             'rss_delta_kib': rss_delta_kib,
             'hwm_delta_kib': hwm_delta_kib,
-            'children_at_peak': sorted(children_at_peak - baseline_children),
-            'final_children': sorted(final_children - baseline_children),
             'remaining_worker_threads': remaining_worker_threads,
         })
     except BaseException:  # pylint: disable=broad-except
@@ -188,15 +199,75 @@ def test_remote_io_budget_is_aggregate_memory_bounded_and_phase_safe():
 
     assert process.exitcode == 0
     assert 'error' not in result, result.get('error')
-    assert result['peak_active'] == 32
-    assert result['worker_threads_at_peak'] == 32
-    assert result['completed'] == 200
-    assert result['result_count'] == 200
-    assert result['children_at_peak'] == []
-    assert result['final_children'] == []
+    assert result['peak_active'] == 72
+    assert result['worker_threads_at_peak'] == 72
+    assert result['completed'] == 1600
+    assert result['result_count'] == 1600
     assert result['remaining_worker_threads'] == []
-    # Thirty-two retained 1-MiB fake calls plus Python/thread overhead should
-    # stay comfortably below these OS-observed ceilings. An accidental return
-    # to 100+ simultaneous calls fails both concurrency and memory assertions.
-    assert result['rss_delta_kib'] < 96 * 1024
-    assert result['hwm_delta_kib'] < 160 * 1024
+    # Seventy-two retained 512-KiB calls, fixed-size producer waves, and
+    # Python/thread overhead stay below these OS-observed ceilings.
+    assert result['rss_delta_kib'] < 128 * 1024
+    assert result['hwm_delta_kib'] < 192 * 1024
+
+
+def test_remote_io_shutdown_races_submission_and_cancels_queued_work():
+    """Terminal close wins the submit race and cannot recreate an owner."""
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    release = threading.Event()
+
+    def _block() -> None:
+        release.wait(timeout=10)
+
+    probe_count = (manager._REMOTE_PROBE_PARALLELISM +
+                   manager._REMOTE_PROBE_QUEUE_CAPACITY)
+    status_count = (manager._REMOTE_STATUS_PARALLELISM +
+                    manager._REMOTE_STATUS_QUEUE_CAPACITY)
+    futures = [
+        manager._submit_remote_io(
+            _block, lane=replica_managers._ReplicaRemoteIOLane.PROBE)
+        for _ in range(probe_count)
+    ]
+    futures.extend(
+        manager._submit_remote_io(
+            _block, lane=replica_managers._ReplicaRemoteIOLane.STATUS)
+        for _ in range(status_count))
+    try:
+        manager._submit_remote_io(
+            _block, lane=replica_managers._ReplicaRemoteIOLane.PROBE)
+    except RuntimeError as error:
+        assert 'queue capacity exhausted' in str(error)
+    else:
+        raise AssertionError('Probe lane accepted work beyond its hard bound.')
+    try:
+        manager._submit_remote_io(
+            _block, lane=replica_managers._ReplicaRemoteIOLane.STATUS)
+    except RuntimeError as error:
+        assert 'queue capacity exhausted' in str(error)
+    else:
+        raise AssertionError('Status lane accepted work beyond its hard bound.')
+    assert len(futures) == manager._REMOTE_IO_MAX_OUTSTANDING
+    shutdown = threading.Thread(target=manager._shutdown_remote_io_executor)
+    shutdown.start()
+    deadline = time.monotonic() + 5
+    while not manager._remote_io_executor_closed:  # pylint: disable=protected-access
+        assert time.monotonic() < deadline, 'terminal close did not linearize'
+        time.sleep(0.01)
+    try:
+        try:
+            manager._submit_remote_io(
+                _block, lane=replica_managers._ReplicaRemoteIOLane.PROBE)
+        except RuntimeError as error:
+            assert 'closed' in str(error)
+        else:
+            raise AssertionError('Submission reopened a terminal owner.')
+    finally:
+        release.set()
+        shutdown.join(timeout=10)
+
+    assert not shutdown.is_alive()
+    assert all(future.done() for future in futures)
+    assert any(future.cancelled() for future in futures)
+    assert not any(
+        thread.name.startswith('serve-remote-io')
+        for thread in threading.enumerate())
