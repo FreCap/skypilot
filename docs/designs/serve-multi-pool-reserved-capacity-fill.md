@@ -172,10 +172,10 @@ quiesced, claim-free and pin-free paid projection; every ambiguous or failed
 down marker remains rejected.
 
 The next billable qualification is bounded at 800 logical L4 slots and requires
-at least 100 physical provider-``RUNNING`` workers. The logical bound is
-intentional: the unpinned catalog permits machines up to eight L4s wide, so a
-420-slot service could legally stop at only 52 physical machines and could
-never prove the physical gate. The campaign first submits 800 immutable async
+at least 100 physical provider-``RUNNING`` workers. The rendered task uses an
+exact one-L4 backend shape without pinning an instance type, so its 800-slot
+target authorizes 800 physical backends and comfortably exceeds the provider
+gate. The campaign first submits 800 immutable async
 identities and proves that exact held prefix is resident before it submits the
 remaining 9,200 zero-duration identities. This removes client/network ordering
 from the load balancer's strict FIFO contract: the first 800 remain active for
@@ -1839,7 +1839,7 @@ it has merged or been deployed.
 | Telemetry | PR #1783 is deployed in the current source lineage. The current demand endpoint is controller-independent and, after lifecycle-141 drain, reported two fresh complete HA reporters with exact queued, async-processing, HTTP-in-flight, and total-in-flight values all zero. A source-only successor now projects each finalized `CommittedCapacityPlan` into the existing minute autoscaler history immediately after its authoritative commit. The existing history read requires the projection generation, digest, and validity horizon to match the current plan head and service version/hash, returns the PostgreSQL clock, and lets the dashboard reject expiry against that clock; no new endpoint or table is added. It is not deployed or production-proven yet. Request history retained the classified successful request. The qualification client did not create protocol-covered async-ledger rows, so a current-schema nonzero exact terminal-ledger/UI capture remains a full-design acceptance gate. Telemetry is not provider billing or launch authority. |
 | Writer protocol | Public API 93, worker projection 10, source non-pool capability cohort 15, and async request-ledger protocol 1. The deployed capability cohort must be freshly queried before activation. Fresh ordinary-paid and `UNKNOWN_CAPACITY_REPLACEMENT` GCP effects require a homogeneous cohort-15 API/controller/executor fleet; older cohorts are settlement/cleanup only. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. The historical schema-3 cutover rewrote no schema. The source successor now includes forward-only Serve067 additive constraint/guard DDL, with no table or service-data rewrite. |
-| Service activation | **The qualification service and `boltz-l4-fleet` are absent while the paid correction is qualified and deployed.** Activation requires Serve067 at the control-plane schema head, but the exact-zero test lifecycle needs no service-row rewrite or retained service-version compatibility path. The scale qualification uses an unpinned AWS/GCP Spot-only L4 catalog, an 800-logical-slot service ceiling, and the unchanged 420-prepared-physical-launch Helm throttle. It requires at least 100 physical workers even when economic selection chooses multi-GPU machines; those temporary qualification bounds do not raise the long-lived production cap. The later clean `boltz-l4-fleet` recreation retains `min_replicas: 0`, zero fill floor, `utilization_gate: true`, East A100/A100-80GB and PHX H200 through the existing server-owned contexts, and AWS/GCP L4 Spot only for genuine residual demand. |
+| Service activation | **The qualification service and `boltz-l4-fleet` are absent while the paid correction is qualified and deployed.** Activation requires Serve067 at the control-plane schema head, but the exact-zero test lifecycle needs no service-row rewrite or retained service-version compatibility path. The scale qualification uses an unpinned-instance AWS/GCP Spot-only exact-one-L4 task, an 800-logical-slot service ceiling, and the unchanged 420-prepared-physical-launch Helm throttle. Its 800 physical launch candidates exceed the at-least-100 provider gate; those temporary qualification bounds do not raise the long-lived production cap. The later clean `boltz-l4-fleet` recreation retains `min_replicas: 0`, zero fill floor, `utilization_gate: true`, East A100/A100-80GB and PHX H200 through the existing server-owned contexts, and AWS/GCP L4 Spot only for genuine residual demand. |
 | Paid-location catalog | The two regionless paid templates expand into exact immutable cloud/region/zone/shape pools and remain Spot-only. Of the four missing commercial AWS G6/L4 regions, Zurich (`eu-central-2`) is the only qualified candidate: it has a ready source patch, a compatible curated image, and a successful real Spot launch/driver/workdir/teardown proof. Upstream source PR #10587 remains approval-blocked even though all checks pass, so source support is not yet merged or released. Draft catalog PR #191 was refreshed onto catalog master `69166fce3ece5b9dffe639d3e9ceca2ee1f89fa1`; its diff remains exactly 1,127 Zurich rows and no deletions, producing v8 VM hash `2e0ca474d692a484ba60e39af45d62babd5492376394bb732ea7e9a5d2b5614b` from current base/non-Zurich hash `f242f8b176755ab0f53ec7a8f112ba49c32be746dfd2df4c8879558f3136793a`. It must remain draft until #10587 merges, the publisher identity attests Zurich opt-in, source support is released before the shared catalog, and the authorized publisher makes GitHub and S3 byte-identical. Sao Paulo lacks a compatible curated image and launch proof; Hyderabad has images but no available opted-in account or launch proof; Malaysia has neither images nor opt-in/launch proof. No other missing commercial G6/L4 location passes all three gates, so none is added speculatively. GovCloud is outside this commercial catalog scope and also lacks the required source/image/credential/proof chain. `eu-south-2` and `me-central-1` already have hosted VM and image rows and must not be duplicated. |
 | Reserved occupancy | At 2026-08-26 23:09--23:13 UTC, East had 328 healthy compatible GPUs on 41 nodes: research requested 45 and 283 `boltz-l4-fleet` Pods requested the exact remainder; all 283 were Running and Ready, with zero free compatible GPU and zero pending research or fleet GPU Pod. PHX had 512 healthy H200 GPUs: research held 482 and the unchanged Kueue policy admitted 30/30 fleet Workloads; all 30 Pods were Running/Ready and PostgreSQL `READY`, with zero pending research GPU Workload. PostgreSQL independently reported exactly 63 A100, 220 A100-80GB, and 30 H200 reserved replicas `READY`, with zero durable intent pending. Thus the same lifecycle occupied East 328/328 and PHX 512/512 without changing scheduler policy. |
 | Reserved readiness projection | For the final PHX replica, PostgreSQL committed the intent at 22:43:32, the Pod appeared at 22:43:55, Kueue admitted it at 22:43:56, and the Pod became Ready at 22:44:32. PostgreSQL projected it `READY` only between 22:52:25 and 22:52:40, exposing a separate roughly eight-minute status-freshness lag rather than a capacity/admission failure. The post-Helm 23:13 UTC census retained the exact 30/30 admission and readiness with no churn. |
@@ -3711,16 +3711,17 @@ request/provider baseline immediately precedes traffic. The staged campaign
 then proves exactly 10,000 resident and deduplicated offered arrivals within 60
 seconds; every provider scale sample must itself retain positive PostgreSQL and
 load-balancer demand, and its dispatched in-flight gauge must equal active
-exact-ledger rows. Its 800 logical-slot cap and 800 held identities permit 100
-physical machines even when the cheapest catalog shape has eight L4s. If its
+exact-ledger rows. Its exact one-L4 task shape, 800 logical-slot cap, and 800
+held identities authorize 800 physical backends and therefore permit the
+at-least-100 physical gate. If its
 completed receipt has no positive ``RUNNING`` evidence for one provider, that
 receipt may authorize exactly one provider-pinned canary rendered from the same
 source YAML. Rendering fails before ``sky serve up`` unless the requested cloud
 is exactly the provider absent from the economic result. The canary offers one
-exact async request, permits one physical backend (``max_replicas: 1``), and
-separately allows up to eight paid L4 units so any current whole-L4 catalog
-backend fits. It is provider reachability evidence, not a second
-economic-placement policy. No standalone or unnecessary canary is billable.
+exact async request and permits one exact one-L4 physical backend
+(``max_replicas: 1``, paid cap one). It is provider reachability evidence, not
+a second economic-placement policy. No standalone or unnecessary canary is
+billable.
 
 The renderer removes only its typed profile/provider fields to derive one
 canonical source-task digest, then binds each allowed projection to that digest.

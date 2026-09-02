@@ -510,12 +510,14 @@ def test_source_identity_rejects_nested_reserved_provenance(tmp_path):
     assert not output.exists()
 
 
-def test_scale_profile_can_prove_one_hundred_max_width_physical_vms():
+def test_scale_profile_exceeds_physical_gate_for_rendered_shape():
     profile = qualifier.PROFILES['scale']
 
     assert profile.max_replicas == 800
-    assert all((profile.max_units + width - 1) // width >= 100
-               for width in range(1, 9))
+    config = _qualification_config(persisted=False)
+    assert config['resources']['accelerators'] == 'L4:1'
+    assert profile.max_units == 800
+    assert profile.max_units // 1 >= 100
     assert profile.exact_requests == 10_000
     assert profile.request_concurrency == profile.exact_requests
     assert qualifier.held_request_count(profile) == profile.max_units
@@ -582,7 +584,7 @@ def test_provider_canary_is_rendered_from_the_canonical_fixture(
     config = yaml.safe_load(output.read_text(encoding='utf-8'))
     policy = config['service']['replica_policy']
     assert policy['max_replicas'] == 1
-    assert policy['max_live_paid_gpu_units'] == 8
+    assert policy['max_live_paid_gpu_units'] == 1
     assert config['resources']['any_of'] == [{'infra': provider}]
     assert qualifier._validate_qualification_service_config(
         config).providers == (provider,)
@@ -743,7 +745,7 @@ def test_provider_scope_receipt_accepts_one_provider_canary(tmp_path, provider):
     base = _provider_scope()
     scope = dataclasses.replace(
         base,
-        max_live_paid_gpu_units=8,
+        max_live_paid_gpu_units=1,
         providers=(provider,),
         project_id=(base.project_id if provider == 'gcp' else None),
         location_scope=(base.location_scope if provider == 'gcp' else None),
@@ -1722,7 +1724,7 @@ def test_wait_cleanup_writes_identity_bound_sustained_zero_receipt(
     base = _provider_scope()
     scope = dataclasses.replace(
         base,
-        max_live_paid_gpu_units=8,
+        max_live_paid_gpu_units=1,
         providers=('gcp',),
         aws_location_scope=None,
         aws_regions=(),
@@ -2805,7 +2807,7 @@ def test_economic_progress_does_not_require_an_artificial_provider_mix():
     assert progress.scale_reached_monotonic == 1000
 
 
-def test_provider_canary_enforces_one_physical_instance():
+def test_provider_canary_enforces_exact_one_gpu_cap():
     names = _provider_cluster_names('gcp', 2)
     observation = _observation(
         database=_database_state(bound_cluster_zones=tuple(
@@ -2815,7 +2817,7 @@ def test_provider_canary_enforces_one_physical_instance():
     expectation = qualifier.provider_expectation(
         qualifier.PROFILES['provider-canary'], 'gcp')
 
-    with pytest.raises(qualifier.GuardViolation, match='physical-instance cap'):
+    with pytest.raises(qualifier.GuardViolation, match='armed GPU cap'):
         qualifier.validate_observation(observation,
                                        qualifier.PROFILES['provider-canary'],
                                        expectation)

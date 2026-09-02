@@ -131,12 +131,11 @@ PROFILES = {
                      poll_seconds=10,
                      scale_up_min_replicas=800,
                      scale_up_period_seconds=10),
-    # The provider canary requests one logical slot but permits any whole-L4
-    # physical backend in the catalog.  The eight-unit cap therefore admits
-    # one current maximum-width backend without naming an instance type.
+    # The provider canary uses the same exact one-L4 task shape as the economic
+    # run and permits one physical backend without naming an instance type.
     'provider-canary': Profile(name='provider-canary',
                                max_replicas=1,
-                               max_units=8,
+                               max_units=1,
                                minimum_running=1,
                                exact_requests=1,
                                request_concurrency=1,
