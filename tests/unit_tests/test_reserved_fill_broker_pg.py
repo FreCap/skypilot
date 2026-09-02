@@ -3752,6 +3752,146 @@ class TestPaidCapacityAuthorityPG:
             expected_controller_owner=(999, '10.0.0.1')) == 'ownership_lost'
         assert serve_state.get_replica_info_from_id('svc', 2) is None
 
+    def _acquire_paid_claim(self, replica_id: int, pool_key: str,
+                            priority: int) -> replica_managers.ReplicaInfo:
+        info = self._info('svc', replica_id)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            replica_id,
+            info,
+            pool_key=pool_key,
+            priority=priority,
+            base_limit=60,
+            max_limit=480,
+            now=100,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        persisted = serve_state.get_replica_info_from_id('svc', replica_id)
+        assert persisted is not None
+        return persisted
+
+    @staticmethod
+    def _receipt_rows(engine, replica_id: int) -> tuple[dict, dict]:
+        """Read the complete replica and claim halves of one receipt."""
+        with sqlalchemy.orm.Session(engine) as session:
+            replica = dict(
+                session.execute(
+                    sqlalchemy.select(serve_state.replicas_table).where(
+                        serve_state.replicas_table.c.service_name == 'svc',
+                        serve_state.replicas_table.c.replica_id ==
+                        replica_id)).mappings().one())
+            claim = dict(
+                session.execute(
+                    sqlalchemy.select(
+                        serve_state.paid_capacity_claims_table).where(
+                            serve_state.paid_capacity_claims_table.c.
+                            service_name == 'svc',
+                            serve_state.paid_capacity_claims_table.c.replica_id
+                            == replica_id)).mappings().one())
+        return replica, claim
+
+    @staticmethod
+    def _corrupt_replica_state(engine, replica_id: int, **fields) -> None:
+        """Model external corruption of the versioned JSON replica state.
+
+        Only the JSON half drifts; the projected column still matches the
+        claim, so the claim stays valid and the split reaches the writers.
+        """
+        with engine.begin() as connection:
+            state = connection.execute(
+                sqlalchemy.select(
+                    serve_state.replicas_table.c.replica_state).where(
+                        serve_state.replicas_table.c.service_name == 'svc',
+                        serve_state.replicas_table.c.replica_id ==
+                        replica_id)).scalar_one()
+            connection.exec_driver_sql(
+                "SET LOCAL session_replication_role = 'replica'")
+            connection.execute(
+                sqlalchemy.update(serve_state.replicas_table).where(
+                    serve_state.replicas_table.c.service_name == 'svc',
+                    serve_state.replicas_table.c.replica_id ==
+                    replica_id).values(replica_state={
+                        **state,
+                        **fields
+                    }))
+
+    def test_restart_adoption_mixed_batch_keeps_retained_receipt(
+            self, broker_engine, monkeypatch):
+        """One restart batch composes both adoption dispositions.
+
+        The retained claim stays byte-identical while the claimless legacy
+        row still takes the insert branch at the supplied restart priority.
+        """
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        pool_a = self._test_pool('pool-a')
+        pool_b = self._test_pool('pool-b')
+        retained = self._acquire_paid_claim(1, pool_a, 20)
+        legacy = self._info('svc', 2)
+        assert serve_state.add_or_update_replica('svc', 2, legacy)
+        replica_before, claim_before = self._receipt_rows(broker_engine, 1)
+        assert claim_before['priority'] == 20
+
+        stale = self._info('svc', 1)
+        stale.replica_record_id = retained.replica_record_id
+        stale.version = 99
+        stale.cluster_name = 'stale-restart-snapshot'
+        assert serve_state.adopt_paid_capacity_claims(
+            'svc',
+            'hash', [(1, pool_a, 0, stale), (2, pool_b, 0, legacy)],
+            base_limit=60,
+            now=200,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        assert self._receipt_rows(broker_engine,
+                                  1) == (replica_before, claim_before)
+        replica_2, claim_2 = self._receipt_rows(broker_engine, 2)
+        assert replica_2['paid_capacity_pool_key'] == pool_b
+        assert (claim_2['pool_key'], claim_2['priority'],
+                claim_2['claimed_at']) == (pool_b, 0, 0)
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            pools = set(
+                session.execute(
+                    sqlalchemy.select(serve_state.paid_capacity_pools_table.c.
+                                      pool_key)).scalars())
+        assert {pool_a, pool_b} <= pools
+
+    @pytest.mark.parametrize('split', ['pool_key', 'reserved_fill'])
+    def test_restart_adoption_fails_closed_on_split_receipt(
+            self, broker_engine, monkeypatch, split):
+        """A retained claim whose replica half drifted is never repaired."""
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        pool_a = self._test_pool('pool-a')
+        retained = self._acquire_paid_claim(1, pool_a, 20)
+        if split == 'pool_key':
+            self._corrupt_replica_state(
+                broker_engine,
+                1,
+                paid_capacity_pool_key=self._test_pool('pool-b'))
+        else:
+            self._corrupt_replica_state(broker_engine,
+                                        1,
+                                        reserved_fill_pool_key='reserved')
+        replica_before, claim_before = self._receipt_rows(broker_engine, 1)
+
+        stale = self._info('svc', 1)
+        stale.replica_record_id = retained.replica_record_id
+        with pytest.raises(ValueError,
+                           match='lost its exact provider-pool identity'):
+            serve_state.adopt_paid_capacity_claims(
+                'svc',
+                'hash', [(1, pool_a, 0, stale)],
+                base_limit=60,
+                now=200,
+                expected_controller_owner=(11, '10.0.0.1'))
+        assert self._receipt_rows(broker_engine,
+                                  1) == (replica_before, claim_before)
+
 
 class TestServiceLivenessSnapshotPG:
     """The slim liveness query is portable to the production DB dialect."""
