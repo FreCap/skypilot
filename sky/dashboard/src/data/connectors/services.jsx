@@ -7,6 +7,7 @@ import {
   SERVE_DASHBOARD_REPLICA_READS_API_VERSION,
   SERVE_DURABLE_DEMAND_API_VERSION,
   SERVE_EXACT_REQUEST_SUMMARY_API_VERSION,
+  SERVE_OFFERED_ARRIVAL_TELEMETRY_API_VERSION,
 } from '@/data/connectors/constants';
 
 // Normalize a raw replica_info entry from the /serve/status response.
@@ -619,6 +620,46 @@ export function normalizeRequestTelemetry(record) {
   const requestTelemetryBreakdownAvailable = breakdownFields.every((field) =>
     Object.prototype.hasOwnProperty.call(record || {}, field)
   );
+  const offeredArrivalFields = [
+    'unique_job_arrivals_60s',
+    'unique_job_arrivals_300s',
+    'headerless_arrivals_60s',
+    'headerless_arrivals_300s',
+    'offered_arrival_tracking_saturated',
+  ];
+  const offeredArrivalTelemetryPresent = offeredArrivalFields.every((field) =>
+    Object.prototype.hasOwnProperty.call(record || {}, field)
+  );
+  const uniqueJobArrivals60s = nullableNonnegativeInteger(
+    record?.unique_job_arrivals_60s
+  );
+  const uniqueJobArrivals300s = nullableNonnegativeInteger(
+    record?.unique_job_arrivals_300s
+  );
+  const headerlessArrivals60s = nullableNonnegativeInteger(
+    record?.headerless_arrivals_60s
+  );
+  const headerlessArrivals300s = nullableNonnegativeInteger(
+    record?.headerless_arrivals_300s
+  );
+  const offeredArrivalTrackingSaturated =
+    typeof record?.offered_arrival_tracking_saturated === 'boolean'
+      ? record.offered_arrival_tracking_saturated
+      : null;
+  const offeredArrivalTelemetryAvailable =
+    [
+      uniqueJobArrivals60s,
+      uniqueJobArrivals300s,
+      headerlessArrivals60s,
+      headerlessArrivals300s,
+    ].every((value) => value !== null) &&
+    offeredArrivalTrackingSaturated !== null;
+  const offeredArrivalTelemetryUnavailable = offeredArrivalFields.every(
+    (field) => record?.[field] === null
+  );
+  const offeredArrivalTelemetryValid =
+    offeredArrivalTelemetryPresent &&
+    (offeredArrivalTelemetryAvailable || offeredArrivalTelemetryUnavailable);
   return {
     requestTelemetrySource:
       record?.request_telemetry_source === 'postgresql_lb_demand_reports'
@@ -669,6 +710,13 @@ export function normalizeRequestTelemetry(record) {
     httpInFlightRequests: nullableNonnegativeInteger(
       record?.http_in_flight_requests
     ),
+    offeredArrivalTelemetryAvailable,
+    offeredArrivalTelemetryValid,
+    uniqueJobArrivals60s,
+    uniqueJobArrivals300s,
+    headerlessArrivals60s,
+    headerlessArrivals300s,
+    offeredArrivalTrackingSaturated,
   };
 }
 
@@ -1153,6 +1201,9 @@ export async function getServiceDemand({ serviceName, serviceHash }) {
       serverApiVersion >= SERVE_EXACT_REQUEST_SUMMARY_API_VERSION &&
       (demand.requestTelemetrySource !== 'postgresql_lb_demand_reports' ||
         demand.asyncRequestSummary == null)) ||
+    (Number.isInteger(serverApiVersion) &&
+      serverApiVersion >= SERVE_OFFERED_ARRIVAL_TELEMETRY_API_VERSION &&
+      !demand.offeredArrivalTelemetryValid) ||
     (demand.asyncRequestSummary?.available === true &&
       demand.asyncRequestSummary.serviceHash !== serviceHash)
   ) {

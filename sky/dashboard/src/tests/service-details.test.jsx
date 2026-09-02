@@ -3480,7 +3480,7 @@ describe('ServiceDetails route ownership rendering', () => {
       expect(getDetailValue('Endpoint')).toHaveTextContent('Loading...');
       expect(
         screen.getByText(
-          'complete reporter-set snapshot · unassigned, selecting, or retry-backoff work · 0.50 req/s recent · 30 requests in 60s · 0 rejected · activity report 2s old'
+          'complete reporter-set snapshot · unassigned, selecting, or retry-backoff work · 0.50 req/s recent · 30 recorded requests in 60s · 0 rejected · activity report 2s old'
         )
       ).toBeVisible();
       expect(
@@ -4347,7 +4347,7 @@ describe('ServiceDetailCard cost and request estimates', () => {
     ).toBeTruthy();
     expect(
       screen.getByText(
-        '0.50 req/s recent · 30 requests in 60s · 1,234 requests in last hour · 1 queued · 3 rejected · activity report 4s old'
+        '0.50 req/s recent · 30 recorded requests in 60s · 1,234 recorded requests in last hour · 1 queued · 3 rejected · activity report 4s old'
       )
     ).toBeTruthy();
     expect(screen.getByText('$3.0556')).toBeTruthy();
@@ -4384,6 +4384,12 @@ describe('ServiceDetailCard cost and request estimates', () => {
           unknownInFlightReplicaCount: 0,
           requestQueueDepth: 4,
           rejectedRequests: 1,
+          offeredArrivalTelemetryAvailable: true,
+          uniqueJobArrivals60s: 18,
+          uniqueJobArrivals300s: 25,
+          headerlessArrivals60s: 2,
+          headerlessArrivals300s: 5,
+          offeredArrivalTrackingSaturated: true,
           asyncRequestSummary: {
             available: true,
             coverage: 'partial',
@@ -4418,6 +4424,20 @@ describe('ServiceDetailCard cost and request estimates', () => {
     );
     expect(getDetailValue('Queued now')).toHaveTextContent(
       '4 queued / unassigned'
+    );
+    expect(getDetailValue('Offered arrivals (60s)')).toHaveTextContent(
+      '20 offered in 60s'
+    );
+    expect(getDetailValue('Offered arrivals (5m)')).toHaveTextContent(
+      '30 offered in 5m'
+    );
+    expect(
+      screen.getByText(/18 stable-ID \+ 2 headerless in 60s/)
+    ).toHaveTextContent('tracking saturated; reported counts are lower bounds');
+    expect(
+      screen.getByText(/25 stable-ID \+ 5 headerless in 5m/)
+    ).toHaveTextContent(
+      'includes pre-admission attempts; stable IDs are deduplicated within each load-balancer window'
     );
     expect(screen.queryByText('Requests now')).toBeNull();
     expect(
@@ -5275,13 +5295,13 @@ describe('ServiceDetailCard cost and request estimates', () => {
       />
     );
 
-    expect(screen.queryByText('0 requests in last hour')).toBeNull();
+    expect(screen.queryByText('0 recorded requests in last hour')).toBeNull();
     expect(
       screen.getByText('2 last reported tracked in flight (legacy aggregate)')
     ).toBeTruthy();
     expect(
       screen.getByText(
-        'last reported 0.50 req/s · last reported 30 requests in 60s · last reported 1 queued · last reported 0 rejected · request telemetry stale; showing last persisted snapshot'
+        'last reported 0.50 req/s · last reported 30 recorded requests in 60s · last reported 1 queued · last reported 0 rejected · request telemetry stale; showing last persisted snapshot'
       )
     ).toBeTruthy();
   });
@@ -5327,7 +5347,7 @@ describe('ServiceDetailCard cost and request estimates', () => {
     ).toBeTruthy();
     expect(
       screen.getByText(
-        '0.00 req/s recent · 0 requests in 60s · 0 queued · 0 rejected · activity report 2s old'
+        '0.00 req/s recent · 0 recorded requests in 60s · 0 queued · 0 rejected · activity report 2s old'
       )
     ).toBeTruthy();
     expect(screen.getByText('Reserved fill grants')).toBeTruthy();
@@ -5372,7 +5392,7 @@ describe('ServiceDetailCard cost and request estimates', () => {
     ).toBeTruthy();
     expect(
       screen.getByText(
-        '0.00 req/s recent · 0 requests in 60s · 0 queued · 5 backends with unknown occupancy · 0 rejected · activity report 2s old'
+        '0.00 req/s recent · 0 recorded requests in 60s · 0 queued · 5 backends with unknown occupancy · 0 rejected · activity report 2s old'
       )
     ).toBeTruthy();
   });

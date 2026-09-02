@@ -171,6 +171,15 @@ describe('RequestHistoryCard semantics', () => {
     expect(
       screen.getByText(/Traffic target includes autoscaler hysteresis/)
     ).toBeTruthy();
+    expect(
+      screen.getByText(
+        /attempts canceled or disconnected while awaiting admission are excluded/
+      )
+    ).toBeTruthy();
+    expect(screen.getByText('Recorded attempts in range')).toBeTruthy();
+    expect(screen.getByTestId('history-series').textContent).toContain(
+      'Recorded request attempts|'
+    );
     expect(screen.getByTestId('history-series').textContent).toContain(
       'Traffic target (with hysteresis)|Traffic or reservation target|Ready capacity|Committed / unready capacity|Non-failed tracked capacity'
     );

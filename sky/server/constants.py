@@ -11,7 +11,7 @@ from sky.utils import controller_constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 93  # SkyServe shared-cache projection protocol v10
+API_VERSION = 94  # SkyServe offered-arrival telemetry
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -160,6 +160,9 @@ MIN_SERVE_LAZY_VERSION_YAML_API_VERSION = 90
 # Minimum API version whose direct durable-demand response includes the
 # incarnation-scoped PostgreSQL asynchronous request-ledger summary.
 MIN_SERVE_EXACT_REQUEST_SUMMARY_API_VERSION = 92
+# Minimum API version whose direct durable-demand response exposes bounded
+# 60-second and 300-second offered-arrival counts plus their saturation bit.
+MIN_SERVE_OFFERED_ARRIVAL_TELEMETRY_API_VERSION = 94
 NON_POOL_LAUNCH_BINDING_PATH = '/internal/serve/non-pool-launch'
 
 # The split-role SkyServe controller uses its existing controller-admin token

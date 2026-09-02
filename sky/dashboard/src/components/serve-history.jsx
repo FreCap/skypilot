@@ -40,15 +40,15 @@ export function ServeHistorySection({
   if (!history) {
     return loading ? (
       <div className="mb-4 rounded-lg border border-gray-200 bg-white px-4 py-8 text-center text-sm text-gray-500">
-        Loading request and capacity history...
+        Loading recorded request and capacity history...
       </div>
     ) : null;
   }
   if (history.available === false) {
     return (
       <div className="mb-4 rounded-lg border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-600">
-        Request and capacity history is temporarily unavailable. Other service
-        data is still available. Refresh to retry.
+        Recorded request and capacity history is temporarily unavailable. Other
+        service data is still available. Refresh to retry.
       </div>
     );
   }

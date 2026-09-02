@@ -238,7 +238,7 @@ def test_lost_up_ack_without_recoverable_scope_never_fabricates_one(
                         events,
                         freeze_error=RuntimeError('service absent'))
 
-    with pytest.raises(BaseExceptionGroup) as group:
+    with pytest.raises(lifecycle_module.LifecycleFailureGroup) as group:
         asyncio.run(
             lifecycle_module.run_lifecycle(
                 _args(tmp_path),
@@ -325,7 +325,7 @@ def test_primary_and_cleanup_failures_are_both_raised(monkeypatch, tmp_path):
                         qualification_error=primary_error,
                         cleanup_error=cleanup_error)
 
-    with pytest.raises(BaseExceptionGroup) as group:
+    with pytest.raises(lifecycle_module.LifecycleFailureGroup) as group:
         asyncio.run(
             lifecycle_module.run_lifecycle(_args(tmp_path),
                                            _FakeLifecycle(events)))

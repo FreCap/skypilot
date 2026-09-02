@@ -222,6 +222,9 @@ _REQUEST_PRIORITY = 50
 _GCP_LIST_PAGE_SIZE = 500
 _GCP_API_RETRIES = 3
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+_ENDPOINT_AUTHENTICATION_TIMEOUT_SECONDS = 5 * 60
+_ENDPOINT_AUTHENTICATION_POLL_SECONDS = 2
+_ENDPOINT_AUTHENTICATION_REQUEST_TIMEOUT_SECONDS = 15
 _ASYNC_ACTIVE_STATES = frozenset({
     'DISPATCH_MAY_HAVE_OCCURRED',
     'ACCEPTED',
@@ -570,7 +573,6 @@ class AwsProviderIdentity:
     aws_account_id: str
     client_token: str
     cluster_name_on_cloud: str
-    credential_profile: str | None
     gpu_units_per_instance: int
     instance_type: str
     num_nodes: int
@@ -2653,14 +2655,13 @@ def aws_identity_from_retained_request(
                     instance_type=pool_identity['instance_type'],
                     width=gpu_units)):
             raise ValueError('request provider scope mismatch')
-        credential_profile = (
-            skypilot_config.get_effective_workspace_region_config_from_snapshot(
-                config_snapshot,
-                'aws', ('profile',),
-                region=region,
-                workspace=workspace))
+        # Server-controller launch requests intentionally retain only the
+        # active workspace.  AwsRegionScope.credential_profile selects the
+        # qualifier observer's credentials; it is not durable launch identity.
+        # Bind the retained launch to the frozen scope by stable AWS account
+        # and placement identity instead.
         identity = ordinary_launch_binding.ordinary_paid_aws_provider_identity(
-            binding, credential_profile=credential_profile)
+            binding, credential_profile=None)
         matching_region_scopes = [
             region_scope for region_scope in scope.aws_regions
             if region_scope.region == region
@@ -2671,8 +2672,6 @@ def aws_identity_from_retained_request(
                 identity['num_nodes'] != 1 or
                 identity['use_spot'] is not True or
                 len(matching_region_scopes) != 1 or
-                matching_region_scopes[0].credential_profile
-                != identity['credential_profile'] or
                 matching_region_scopes[0].aws_account_id
                 != identity['aws_account_id']):
             raise ValueError('request-derived provider identity mismatch')
@@ -2680,7 +2679,6 @@ def aws_identity_from_retained_request(
             aws_account_id=identity['aws_account_id'],
             client_token=identity['client_token'],
             cluster_name_on_cloud=identity['cluster_name_on_cloud'],
-            credential_profile=identity['credential_profile'],
             gpu_units_per_instance=gpu_units,
             instance_type=identity['instance_type'],
             num_nodes=identity['num_nodes'],
@@ -3384,22 +3382,61 @@ class HttpObserver:
         self._capacity_url = endpoint.rstrip('/') + '/_lb/capacity'
         self._token = token
 
+    async def _authentication_ready(self,
+                                    session: aiohttp.ClientSession) -> bool:
+        """Return whether one reachable endpoint probe is authenticated."""
+        async with session.get(self._capacity_url) as response:
+            await response.read()
+            if response.status in _RETRYABLE_STATUSES:
+                return False
+            if response.status not in (401, 403):
+                raise QualificationError(
+                    'Data-plane authentication is not enforced.')
+        async with session.get(self._capacity_url,
+                               headers={_AUTH_HEADER: f'Bearer {self._token}'
+                                       }) as response:
+            await response.read()
+            if response.status in _RETRYABLE_STATUSES:
+                return False
+            if response.status != 200:
+                raise QualificationError(
+                    f'Authenticated capacity probe returned {response.status}.')
+        return True
+
     async def prove_authentication(self) -> None:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(self._capacity_url) as response:
-                await response.read()
-                if response.status not in (401, 403):
+        # A newly published AWS NLB hostname can precede DNS propagation and
+        # listener readiness.  Keep this startup boundary distinct from the
+        # authentication verdict: only transport/readiness failures retry.
+        deadline = (time.monotonic() + _ENDPOINT_AUTHENTICATION_TIMEOUT_SECONDS)
+        last_transient: BaseException | None = None
+        timeout = aiohttp.ClientTimeout(
+            total=_ENDPOINT_AUTHENTICATION_REQUEST_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while True:
+                started = time.monotonic()
+                try:
+                    if await self._authentication_ready(session):
+                        return
+                    last_transient = None
+                except (aiohttp.ClientConnectionError,
+                        asyncio.TimeoutError) as error:
+                    last_transient = error
+                now = time.monotonic()
+                if now >= deadline:
                     raise QualificationError(
-                        'Data-plane authentication is not enforced.')
-            async with session.get(self._capacity_url,
-                                   headers={
-                                       _AUTH_HEADER: f'Bearer {self._token}'
-                                   }) as response:
-                if response.status != 200:
+                        'Capacity endpoint did not become reachable and ready '
+                        'before the authentication deadline.'
+                    ) from last_transient
+                await asyncio.sleep(
+                    max(
+                        0,
+                        min(deadline, started +
+                            _ENDPOINT_AUTHENTICATION_POLL_SECONDS) - now))
+                if time.monotonic() >= deadline:
                     raise QualificationError(
-                        f'Authenticated capacity probe returned {response.status}.'
-                    )
-                await response.read()
+                        'Capacity endpoint did not become reachable and ready '
+                        'before the authentication deadline.'
+                    ) from last_transient
 
     async def snapshot(self) -> LoadBalancerState:
         async with aiohttp.ClientSession() as session:
