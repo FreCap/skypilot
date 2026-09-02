@@ -229,13 +229,27 @@ def test_connection_close_error_cannot_mask_transaction_interrupt(
     engine.connect.return_value = connection
     monkeypatch.setattr(reserved_fill_admission.request_postgres,
                         'initialize_and_get_db', lambda: engine)
+    # The transaction acquires Serve mutation admission, replica launch
+    # authority, and the mutation count before staging (#1728); a bare Mock
+    # connection has no dialect, so grant them and keep the interrupt at
+    # staging.
+    monkeypatch.setattr(reserved_fill_admission.serve_state,
+                        'try_acquire_serve_mutation_admission_in_transaction',
+                        lambda _connection: True)
+    monkeypatch.setattr(reserved_fill_admission.serve_state,
+                        'try_acquire_replica_launch_authority_in_transaction',
+                        lambda _connection, _engine, _service_name: True)
+    monkeypatch.setattr(reserved_fill_admission.serve_state,
+                        'get_replica_mutation_counts_in_transaction',
+                        lambda _connection: (0, 0))
     monkeypatch.setattr(reserved_fill_admission, '_stage_and_bind',
                         mock.Mock(side_effect=_InjectedInterrupt()))
+    spec = mock.Mock()
+    spec.authority.service_name = 'service-a'
+    spec.launch_limit = 1
 
     with pytest.raises(_InjectedInterrupt) as raised:
-        reserved_fill_admission._transaction(mock.sentinel.spec,
-                                             37,
-                                             require_existing=False)
+        reserved_fill_admission._transaction(spec, 37, require_existing=False)
 
     assert isinstance(raised.value.__cause__, RuntimeError)
     connection.begin.return_value.rollback.assert_called_once_with()
