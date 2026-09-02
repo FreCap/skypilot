@@ -108,6 +108,17 @@ _INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 5
 # Public because operational safety checks outside the request backend must
 # use the same freshness boundary as the instance registry itself.
 INSTANCE_STALE_AFTER_SECONDS = 20
+
+
+@dataclasses.dataclass(frozen=True)
+class NonPoolLaunchBindingRuntime:
+    """Process-static request capabilities resolved before correctness locks."""
+
+    handler_name: str
+    storage_backend_type: str
+    queue_backend_type: str
+
+
 ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS = 70
 _VALID_SERVER_ROLES = frozenset({'all', 'api', 'executor', 'controller'})
 _CONTROLLER_LEADERSHIP_KEY = 'api-controller'
@@ -586,6 +597,29 @@ def _resolved_request_backend_capability() -> tuple[str, str, bool]:
     return storage_type, queue_type, capable
 
 
+def prepare_non_pool_launch_binding_runtime() -> NonPoolLaunchBindingRuntime:
+    """Resolve handler and backend globals before a caller opens its txn."""
+    ordinary_launch_binding.NonPoolBindingIdentity  # pylint: disable=pointless-statement
+    try:
+        registration = request_registry.registration_for_handler(
+            non_pool_launch_request.launch)
+    except ValueError as error:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Generic launch request handler is not registered.') from error
+    storage_type, queue_type, capable = _resolved_request_backend_capability()
+    if (registration.name
+            != non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME or
+            not capable or
+            storage_type != POSTGRES_REQUEST_STORAGE_BACKEND_TYPE or
+            queue_type != POSTGRES_REQUEST_QUEUE_BACKEND_TYPE):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Generic launch binding requires the built-in PostgreSQL request '
+            'handler, storage, and queue backends.')
+    return NonPoolLaunchBindingRuntime(handler_name=registration.name,
+                                       storage_backend_type=storage_type,
+                                       queue_backend_type=queue_type)
+
+
 def _ordinary_launch_binding_process_capable(role: str,
                                              backend_capable: bool) -> bool:
     """Whether this exact process implements its API009 protocol duties."""
@@ -935,7 +969,7 @@ def ordinary_launch_binding_fleet_capable(
             not isinstance(quiescence_seconds, (int, float)) or
             not math.isfinite(quiescence_seconds) or quiescence_seconds < 0):
         raise ValueError('quiescence_seconds must be finite and non-negative.')
-    engine = initialize_and_get_db()
+    engine = None if connection is not None else initialize_and_get_db()
 
     def _read(active_connection: sqlalchemy.engine.Connection) -> bool:
         rows = active_connection.execute(
@@ -971,6 +1005,7 @@ def ordinary_launch_binding_fleet_capable(
 
     if connection is not None:
         return _read(connection)
+    assert engine is not None
     with engine.connect() as owned_connection:
         return _read(owned_connection)
 
@@ -986,7 +1021,7 @@ def non_pool_launch_binding_fleet_capable(
             not isinstance(quiescence_seconds, (int, float)) or
             not math.isfinite(quiescence_seconds) or quiescence_seconds < 0):
         raise ValueError('quiescence_seconds must be finite and non-negative.')
-    engine = initialize_and_get_db()
+    engine = None if connection is not None else initialize_and_get_db()
     expected_digest = (
         ordinary_launch_binding.supported_non_pool_profile_set_digest())
 
@@ -1035,6 +1070,7 @@ def non_pool_launch_binding_fleet_capable(
 
     if connection is not None:
         return _read(connection)
+    assert engine is not None
     with engine.connect() as owned_connection:
         return _read(owned_connection)
 
@@ -1050,7 +1086,7 @@ def ordered_capacity_admission_fleet_capable(
             not isinstance(quiescence_seconds, (int, float)) or
             not math.isfinite(quiescence_seconds) or quiescence_seconds < 0):
         raise ValueError('quiescence_seconds must be finite and non-negative.')
-    engine = initialize_and_get_db()
+    engine = None if connection is not None else initialize_and_get_db()
 
     def _read(active_connection: sqlalchemy.engine.Connection) -> bool:
         rows = active_connection.execute(
@@ -1083,6 +1119,7 @@ def ordered_capacity_admission_fleet_capable(
 
     if connection is not None:
         return _read(connection)
+    assert engine is not None
     with engine.connect() as owned_connection:
         return _read(owned_connection)
 
@@ -2911,6 +2948,8 @@ def bind_and_enqueue_non_pool_launch_in_transaction(
     connection: sqlalchemy.engine.Connection,
     request: requests_lib.Request,
     identity: ordinary_launch_binding_lib.NonPoolBindingIdentity,
+    *,
+    runtime: NonPoolLaunchBindingRuntime,
 ) -> ordinary_launch_binding_lib.BindingAdmission:
     """Commit one generic association/request/queue/pin on a caller txn."""
     if not isinstance(identity, ordinary_launch_binding.NonPoolBindingIdentity):
@@ -2920,12 +2959,14 @@ def bind_and_enqueue_non_pool_launch_in_transaction(
             not request.should_enqueue):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Generic launch requires its exact non-retryable queue delivery.')
-    registration = request_registry.registration_for_handler(request.entrypoint)
-    if registration.name != non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME:
+    if (request.entrypoint is not non_pool_launch_request.launch or
+            not isinstance(runtime, NonPoolLaunchBindingRuntime) or
+            runtime.handler_name
+            != non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Generic launch requires its distinct durable handler.')
-    _, _, backend_capable = _resolved_request_backend_capability()
-    if not backend_capable:
+    if (runtime.storage_backend_type != POSTGRES_REQUEST_STORAGE_BACKEND_TYPE or
+            runtime.queue_backend_type != POSTGRES_REQUEST_QUEUE_BACKEND_TYPE):
         raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
             'Generic launch binding requires the built-in PostgreSQL '
             'request and queue backends.')
@@ -2967,6 +3008,7 @@ def bind_and_enqueue_non_pool_launch(
     identity: ordinary_launch_binding_lib.NonPoolBindingIdentity,
 ) -> ordinary_launch_binding_lib.BindingAdmission:
     """Atomically commit one generic association/request/queue/pin tuple."""
+    runtime = prepare_non_pool_launch_binding_runtime()
     engine = initialize_and_get_db()
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
         raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
@@ -2979,8 +3021,10 @@ def bind_and_enqueue_non_pool_launch(
             'Generic launch binding is waiting for one exact capable '
             'API/executor cohort stale window.')
     with engine.begin() as connection:
-        return bind_and_enqueue_non_pool_launch_in_transaction(
-            connection, request, identity)
+        return bind_and_enqueue_non_pool_launch_in_transaction(connection,
+                                                               request,
+                                                               identity,
+                                                               runtime=runtime)
 
 
 def _bound_context_from_association(
@@ -3202,12 +3246,18 @@ def _bound_association_for_replica(
     return typing.cast(Mapping[str, Any] | None, association)
 
 
-def stable_bound_ordinary_launch_submission_id(
+def stable_bound_ordinary_launch_submission_id_in_connection(
+    connection: sqlalchemy.engine.Connection,
     service_name: str,
     replica_id: int,
     replica_record_id: str,
 ) -> str:
-    """Derive a retry-stable submission UUID from durable generation state."""
+    """Derive a retry-stable submission UUID on a caller-owned transaction."""
+    if (connection.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value
+            or not connection.in_transaction()):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Stable bound-launch submission IDs require an active PostgreSQL '
+            'transaction.')
     try:
         record_uuid = uuid.UUID(replica_record_id)
     except (AttributeError, TypeError, ValueError) as error:
@@ -3218,25 +3268,22 @@ def stable_bound_ordinary_launch_submission_id(
     if isinstance(replica_id,
                   bool) or not isinstance(replica_id, int) or replica_id < 1:
         raise ValueError('replica_id must be a positive integer.')
-    engine = initialize_and_get_db()
-    with engine.connect() as connection:
-        latest = connection.execute(
-            sqlalchemy.select(
+    latest = connection.execute(
+        sqlalchemy.select(
+            ordinary_launch_binding.ordinary_launch_associations_table.c.
+            submission_id, ordinary_launch_binding.
+            ordinary_launch_associations_table.c.launch_generation,
+            ordinary_launch_binding.ordinary_launch_associations_table.c.
+            resolution, ordinary_launch_binding.
+            ordinary_launch_associations_table.c.cancel_reason).where(
                 ordinary_launch_binding.ordinary_launch_associations_table.c.
-                submission_id, ordinary_launch_binding.
-                ordinary_launch_associations_table.c.launch_generation,
+                service_name == service_name, ordinary_launch_binding.
+                ordinary_launch_associations_table.c.replica_id == replica_id,
                 ordinary_launch_binding.ordinary_launch_associations_table.c.
-                resolution, ordinary_launch_binding.
-                ordinary_launch_associations_table.c.cancel_reason).where(
+                replica_record_id == record_uuid).order_by(
                     ordinary_launch_binding.ordinary_launch_associations_table.
-                    c.service_name == service_name,
-                    ordinary_launch_binding.ordinary_launch_associations_table.
-                    c.replica_id == replica_id,
-                    ordinary_launch_binding.ordinary_launch_associations_table.
-                    c.replica_record_id == record_uuid).
-            order_by(
-                ordinary_launch_binding.ordinary_launch_associations_table.c.
-                launch_generation.desc()).limit(1)).mappings().one_or_none()
+                    c.launch_generation.desc()).limit(
+                        1)).mappings().one_or_none()
     if latest is None:
         generation = 1
     else:
@@ -3255,6 +3302,18 @@ def stable_bound_ordinary_launch_submission_id(
         generation = int(latest['launch_generation']) + 1
     material = f'{service_name}\0{replica_id}\0{record_uuid}\0{generation}'
     return str(uuid.uuid5(_ORDINARY_LAUNCH_SUBMISSION_NAMESPACE, material))
+
+
+def stable_bound_ordinary_launch_submission_id(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> str:
+    """Derive a retry-stable submission UUID from durable generation state."""
+    engine = initialize_and_get_db()
+    with engine.begin() as connection:
+        return stable_bound_ordinary_launch_submission_id_in_connection(
+            connection, service_name, replica_id, replica_record_id)
 
 
 def inspect_bound_ordinary_launch(
@@ -4475,12 +4534,14 @@ def _ordinary_paid_gcp_provider_identity_from_locked_request(
                 workspace=workspace))
         if managed_instance_group is not None:
             return None
-        project_id = (
-            skypilot_config.get_effective_workspace_region_config_from_snapshot(
-                config_snapshot,
-                'gcp', ('project_id',),
-                region=pool_identity['region'],
-                workspace=workspace))
+        project_id = None
+        if pool_identity.get('version') == 1:
+            project_id = (skypilot_config.
+                          get_effective_workspace_region_config_from_snapshot(
+                              config_snapshot,
+                              'gcp', ('project_id',),
+                              region=pool_identity['region'],
+                              workspace=workspace))
         return ordinary_launch_binding.ordinary_paid_gcp_provider_identity(
             association, project_id=project_id)
     except Exception:  # pylint: disable=broad-except
@@ -5096,12 +5157,14 @@ def _paid_provider_allocation_identity_from_locked_request(
                         association, credential_profile=credential_profile))
         if cloud != 'gcp':
             return None
-        project_id = (
-            skypilot_config.get_effective_workspace_region_config_from_snapshot(
-                config_snapshot,
-                'gcp', ('project_id',),
-                region=region,
-                workspace=workspace))
+        project_id = None
+        if pool_identity.get('version') == 1:
+            project_id = (skypilot_config.
+                          get_effective_workspace_region_config_from_snapshot(
+                              config_snapshot,
+                              'gcp', ('project_id',),
+                              region=region,
+                              workspace=workspace))
         return ('gcp',
                 ordinary_launch_binding.ordinary_paid_gcp_provider_identity(
                     association, project_id=project_id))

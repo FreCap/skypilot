@@ -6335,16 +6335,50 @@ class SkyServeController:
              (type(max_live_paid_gpu_units) is not int or
               max_live_paid_gpu_units < 0))):
             return ()
-        shapes = dict(decision_autoscaler.configured_accelerator_shapes)
-        if len(shapes) > paid_capacity.MAX_PREPARED_LAUNCH_SPECS:
+        raw_shapes = dict(decision_autoscaler.configured_accelerator_shapes)
+        shapes: dict[str, int] = {}
+        for raw_card, width in raw_shapes.items():
+            if not isinstance(raw_card, str):
+                return ()
+            card = raw_card.casefold()
+            if not card or card in shapes:
+                return ()
+            if type(width) is not int or width < 1:  # pylint: disable=unidiomatic-typecheck
+                return ()
+            shapes[card] = width
+        shapes = dict(sorted(shapes.items()))
+        placer = self._replica_manager.spot_placer
+        if placer is None:
+            return ()
+        try:
+            paid_shapes = paid_capacity.active_paid_spot_accelerator_shapes(
+                placer)
+        except ValueError as error:
+            logger.warning(
+                'Suppressing paid launch preparation because the paid catalog '
+                'projection is invalid: %s',
+                common_utils.format_exception(error))
+            return ()
+        # A reserved-only configured card must not consume a speculative paid
+        # transaction member.  Successor reconciles can then use the whole
+        # bounded wave for cards that actually have a paid Spot backend.
+        shapes = {
+            card: width
+            for card, width in shapes.items()
+            if (card, width) in paid_shapes
+        }
+        if not shapes:
+            return ()
+        atomic_wave_limit = (
+            paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS)
+        if len(shapes) > atomic_wave_limit:
             logger.warning(
                 'Suppressing paid launch preparation because %s '
-                'accounting cards exceed the bounded spec set.', len(shapes))
+                'accounting cards exceed the atomic admission wave bound.',
+                len(shapes))
             return ()
         desired_backends: dict[str, int] = {}
         for card, width in shapes.items():
-            if type(width) is not int or width < 1:
-                return ()
             physical_units = width * backend_num_nodes
             logical_limit = math.ceil(logical_max / width)
             physical_limit = (logical_limit if max_live_paid_gpu_units is None
@@ -6353,8 +6387,7 @@ class SkyServeController:
         backend_limits = {
             card: 1 for card, desired in desired_backends.items() if desired > 0
         }
-        remaining_specs = (paid_capacity.MAX_PREPARED_LAUNCH_SPECS -
-                           len(backend_limits))
+        remaining_specs = atomic_wave_limit - len(backend_limits)
         while remaining_specs > 0:
             made_progress = False
             for card in shapes:
@@ -6388,20 +6421,23 @@ class SkyServeController:
                 decision_version)
             return ()
         try:
-            serve_utils.parse_and_validate_version_controller_config(
-                version_authority.controller_config,
-                self._replica_manager.workspace,
-                'prepared paid launch controller config')
+            frozen_controller_config = (
+                serve_utils.parse_and_validate_version_controller_config(
+                    version_authority.controller_config,
+                    self._replica_manager.workspace,
+                    'prepared paid launch controller config'))
         except Exception as error:  # pylint: disable=broad-except
             logger.warning(
                 'Suppressing paid candidates because elected-version '
                 'controller config is invalid: %s',
                 common_utils.format_exception(error))
             return ()
-        placer = self._replica_manager.spot_placer
-        if placer is None:
-            return ()
         try:
+            gcp_project_ids = (
+                paid_capacity.resolve_gcp_project_ids_for_locations(
+                    placer.ranked_active_locations(),
+                    workspace=self._replica_manager.workspace,
+                    frozen_controller_config=frozen_controller_config))
             # This optimistic read is deliberately before ReplicaManager and
             # PostgreSQL correctness locks.  The fused admission transaction
             # revalidates every selected pool and any stale underfill schedules
@@ -6415,6 +6451,7 @@ class SkyServeController:
                 service_hash=self._service_hash,
                 requested_frontier_keys={(card,) for card in backend_limits},
                 max_live_paid_gpu_units=max_live_paid_gpu_units,
+                gcp_project_id_by_location=gcp_project_ids,
                 prospective_backend_claims_by_accelerator=backend_limits)
         except Exception as error:  # pylint: disable=broad-except
             logger.warning(
@@ -6532,8 +6569,8 @@ class SkyServeController:
                tuple[paid_capacity.PaidLaunchSpec, ...]] | None:
         """Plan and atomically admit one already-fenced paid wave in PostgreSQL.
 
-        Production callers must install the exact process-local materialization
-        handoff before supplying ``prepared_paid_launch_specs``.
+        Queue visibility committed by the repository is the durable handoff;
+        any process-local adopter publication after this method is optional.
         """
         binding = self._ordinary_launch_binding_authority
         service_hash = self._service_hash
@@ -6973,7 +7010,7 @@ class SkyServeController:
         sequenced_reserved_fill: bool,
     ) -> tuple[capacity_admission.CommittedCapacityPlan, _LinearizedScalePlan,
                tuple[paid_capacity.PaidLaunchSpec, ...]] | None:
-        """Own paid identities continuously from commit through publication."""
+        """Commit paid request graphs, then optionally publish local adopters."""
         if not isinstance(decision_autoscaler,
                           autoscalers.ConcurrencyAutoscaler):
             logger.warning('Suppressing promoted capacity planning because the '
@@ -6983,28 +7020,24 @@ class SkyServeController:
             decision_autoscaler, decision_version, replica_infos)
         if prepared_specs is None:
             return None
-        handoff = self._replica_manager.begin_paid_launch_materialization(
-            prepared_specs)
-        try:
-            current_plan = self._plan_and_admit_current_capacity(
-                decision_autoscaler,
-                decision_version,
-                actuation_generation,
-                notification_generation,
-                planning_state_fingerprint,
-                prepared_decision_inputs,
-                replica_infos,
-                sequenced_reserved_fill=sequenced_reserved_fill,
-                prepared_paid_launch_specs=prepared_specs)
-            if current_plan is None:
-                return None
-            committed, planned, _ = current_plan
-            if self._paid_launch_receipt_can_materialize(committed, planned):
-                self._replica_manager.materialize_paid_launch_receipt(
-                    committed.paid_launch_receipt, handoff)
-            return current_plan
-        finally:
-            self._replica_manager.end_paid_launch_materialization(handoff)
+        current_plan = self._plan_and_admit_current_capacity(
+            decision_autoscaler,
+            decision_version,
+            actuation_generation,
+            notification_generation,
+            planning_state_fingerprint,
+            prepared_decision_inputs,
+            replica_infos,
+            sequenced_reserved_fill=sequenced_reserved_fill,
+            prepared_paid_launch_specs=prepared_specs)
+        if current_plan is None:
+            return None
+        committed, planned, _ = current_plan
+        if self._paid_launch_receipt_can_materialize(committed, planned):
+            self._replica_manager.materialize_paid_launch_receipt(
+                committed.paid_launch_receipt, committed.paid_launch_bindings,
+                prepared_specs)
+        return current_plan
 
     def _reconcile_scale_once(self, reconcile_generation: int) -> None:
         """Plan and actuate one optimistic, version-fenced scale epoch."""

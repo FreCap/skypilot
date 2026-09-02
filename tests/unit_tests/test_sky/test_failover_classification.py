@@ -1329,6 +1329,93 @@ def test_retry_zones_refuses_pre_identity_aws_paid_replacement(
     bulk_provision.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    'profile_kind',
+    (ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+     ordinary_launch_binding.NonPoolLaunchProfileKind.
+     UNKNOWN_CAPACITY_REPLACEMENT))
+def test_retry_zones_refuses_wrong_gcp_project_before_bulk(
+        tmp_path, monkeypatch, profile_kind):
+    provisioner = _early_retry_provisioner(tmp_path, monkeypatch)
+    provisioner._local_wheel_path = None
+    provisioner._wheel_hash = None
+    provisioner._active_cluster_hash = None
+    provisioner._is_managed = False
+    provisioner._workload_type = 'service'
+    provisioner._is_launched_by_jobs_controller = False
+    provisioner._extra_launch_context = {
+        ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY: 2,
+    }
+    provisioner._validate_service_replica_launch_preflight = lambda: None
+    provisioner._service_replica_launch_provider_guard = (
+        lambda: contextlib.nullcontext())
+    bound_context = types.SimpleNamespace(
+        profile=types.SimpleNamespace(kind=profile_kind),
+        capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH))
+    to_provision = resources_lib.Resources(cloud=clouds.GCP(),
+                                           region='us-east1',
+                                           zone='us-east1-b',
+                                           instance_type='g2-standard-4',
+                                           accelerators={'L4': 1},
+                                           use_spot=True)
+    monkeypatch.setattr(clouds.GCP, 'check_quota_available', lambda *_: True)
+    monkeypatch.setattr(clouds.GCP, 'get_active_user_identity',
+                        lambda *_: ['user@example.test'])
+    monkeypatch.setattr(clouds.GCP, 'get_project_id',
+                        lambda *_: 'different-project')
+    monkeypatch.setattr(provisioner, '_yield_zones',
+                        lambda *_: iter([[clouds.Zone('us-east1-b')]]))
+    monkeypatch.setattr(backend, '_capacity_cache_exhausted_zone_names',
+                        lambda *_: set())
+    monkeypatch.setattr(backend, '_get_image_demand_attribution',
+                        lambda *_: mock.MagicMock())
+    monkeypatch.setattr(backend, '_resolve_container_image_for_placement',
+                        lambda resources, **_: resources)
+    monkeypatch.setattr(backend, '_get_cluster_config_template',
+                        lambda *_: '/tmp/template')
+    monkeypatch.setattr(
+        backend.backend_utils, 'write_cluster_config', lambda *_, **__: {
+            'ray': '/tmp/cluster.yaml',
+            'cluster_name_on_cloud': 'test-cluster',
+        })
+    monkeypatch.setattr(backend, '_get_workload_attribution', lambda *_:
+                        (None, None))
+    monkeypatch.setattr(backend.global_user_state, 'add_or_update_cluster',
+                        lambda *_, **__: 'cluster-hash')
+    monkeypatch.setattr(backend.global_user_state, 'add_cluster_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.global_user_state,
+                        'set_owner_identity_for_cluster', lambda *_, **__: None)
+    monkeypatch.setattr(backend.usage_lib.messages.usage,
+                        'update_final_cluster_status', lambda *_: None)
+    monkeypatch.setattr(backend.controller_utils.Controllers, 'from_name',
+                        lambda *_: None)
+    bulk_provision = mock.Mock()
+    monkeypatch.setattr(backend.provisioner, '_BUILTIN_BULK_PROVISION',
+                        bulk_provision)
+    monkeypatch.setattr(backend.provisioner, 'bulk_provision', bulk_provision)
+    monkeypatch.setattr(backend, '_record_service_placement_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(ordinary_launch_binding, 'has_bound_launch_context',
+                        lambda *_: True)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'parse_bound_non_pool_launch_context',
+                        lambda *_: bound_context)
+    expected_project = mock.Mock(return_value='boltz-spot-project')
+    monkeypatch.setattr(ordinary_launch_binding, 'ordinary_paid_gcp_project_id',
+                        expected_project)
+
+    with pytest.raises(exceptions.ServeReplicaLaunchFenceError,
+                       match='GCP project changed'):
+        _call_retry_zones(provisioner,
+                          to_provision,
+                          cloud_user_identity=['user@example.test'])
+
+    expected_project.assert_called_once_with(bound_context)
+    bulk_provision.assert_not_called()
+
+
 def test_retry_zones_passes_template_override_to_config_writer(
         tmp_path, monkeypatch):
     provisioner = _early_retry_provisioner(tmp_path, monkeypatch)

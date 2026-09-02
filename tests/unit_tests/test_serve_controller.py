@@ -25,6 +25,7 @@ from unittest import mock
 from fastapi import testclient as fastapi_testclient
 import pytest
 
+from sky import clouds
 from sky import exceptions
 from sky import skypilot_config
 from sky.serve import autoscalers
@@ -40,6 +41,7 @@ from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import spot_placer
 from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
 from sky.utils import yaml_utils
@@ -4874,6 +4876,7 @@ class TestAutoscalerRuntimeSnapshot:
                                  authority=None,
                                  repository=None,
                                  paid_launch_receipt=None,
+                                 paid_launch_bindings=(),
                                  max_live_paid_gpu_units=None,
                                  replica_infos=()):
         ctrl._replica_manager.max_live_paid_gpu_units = (  # pylint: disable=protected-access
@@ -4957,7 +4960,8 @@ class TestAutoscalerRuntimeSnapshot:
                 planner_snapshot=planner_snapshot,
                 candidate=candidate,
                 allocation_map=supply.allocation_map,
-                paid_launch_receipt=(paid_launch_receipt))
+                paid_launch_receipt=paid_launch_receipt,
+                paid_launch_bindings=paid_launch_bindings)
 
         if repository.plan_and_admit_current.side_effect is None:
             repository.plan_and_admit_current.side_effect = _plan_current
@@ -5014,22 +5018,32 @@ class TestAutoscalerRuntimeSnapshot:
                 ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
         return repository
 
-    def test_paid_spec_preparation_is_card_fair_and_builds_budget_first(self):
+    @pytest.mark.parametrize('configured_shapes', [{
+        'L4': 1,
+        'A100': 8,
+        'H200': 1,
+    }, {
+        'H200': 1,
+        'A100': 8,
+        'L4': 1,
+    }])
+    def test_paid_spec_preparation_is_card_fair_and_builds_budget_first(
+            self, configured_shapes):
         ctrl = _make_controller()
         call_order = []
         authority = _paid_launch_version_authority()
         budget = mock.sentinel.paid_budget
         manager = mock.Mock()
-        manager.spot_placer = mock.sentinel.placer
+        manager.spot_placer.ranked_active_locations.return_value = []
         manager.workspace = 'default'
 
         def _prepare(**kwargs):
             call_order.append('prepare')
-            assert kwargs['max_candidates'] == 512
+            assert kwargs['max_candidates'] == 100
             assert kwargs['max_gpu_units_by_accelerator'] == {
-                'L4': 171,
-                'A100': 1368,
-                'H200': 170,
+                'a100': 272,
+                'h200': 33,
+                'l4': 33,
             }
             assert tuple(kwargs['occupied_replica_ids']) == (7, 9)
             assert kwargs['version_authority'] == authority
@@ -5038,23 +5052,21 @@ class TestAutoscalerRuntimeSnapshot:
 
         manager.prepare_paid_launch_specs.side_effect = _prepare
         ctrl._replica_manager = manager  # pylint: disable=protected-access
-        scaler = types.SimpleNamespace(max_replicas=10_000,
-                                       backend_num_nodes=1,
-                                       configured_accelerator_shapes={
-                                           'L4': 1,
-                                           'A100': 8,
-                                           'H200': 1,
-                                       })
+        scaler = types.SimpleNamespace(
+            max_replicas=10_000,
+            backend_num_nodes=1,
+            configured_accelerator_shapes=(configured_shapes))
 
         def _build_budget(*args, **kwargs):
             assert not manager.prepare_paid_launch_specs.called
             assert args == (manager.spot_placer,)
             assert kwargs['workspace'] == 'default'
             assert kwargs['service_name'] == 'svc'
+            assert kwargs['gcp_project_id_by_location'] == {}
             assert kwargs['prospective_backend_claims_by_accelerator'] == {
-                'L4': 171,
-                'A100': 171,
-                'H200': 170,
+                'a100': 34,
+                'h200': 33,
+                'l4': 33,
             }
             call_order.append('budget')
             return budget
@@ -5064,10 +5076,16 @@ class TestAutoscalerRuntimeSnapshot:
                 'get_paid_launch_version_authority',
                 return_value=authority) as get_authority, mock.patch.object(
                     controller.serve_utils,
-                    'parse_and_validate_version_controller_config'
-                ), mock.patch.object(controller.paid_capacity,
-                                     'build_launch_budget',
-                                     side_effect=_build_budget) as build_budget:
+                    'parse_and_validate_version_controller_config',
+                    return_value={}), mock.patch.object(
+                        controller.paid_capacity,
+                        'active_paid_spot_accelerator_shapes',
+                        return_value=frozenset({
+                            ('a100', 8), ('h200', 1), ('l4', 1)
+                        })), mock.patch.object(
+                            controller.paid_capacity,
+                            'build_launch_budget',
+                            side_effect=_build_budget) as build_budget:
             prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
                 scaler, 1, [
                     types.SimpleNamespace(replica_id=7),
@@ -5079,10 +5097,116 @@ class TestAutoscalerRuntimeSnapshot:
         get_authority.assert_called_once_with('svc', 1)
         build_budget.assert_called_once()
 
+    def test_paid_spec_preparation_gives_reserved_only_cards_no_wave_members(
+            self):
+        ctrl = _make_controller()
+        authority = _paid_launch_version_authority()
+        manager = mock.Mock()
+        manager.spot_placer.ranked_active_locations.return_value = []
+        manager.workspace = 'default'
+        manager.prepare_paid_launch_specs.return_value = ()
+        ctrl._replica_manager = manager  # pylint: disable=protected-access
+        scaler = types.SimpleNamespace(max_replicas=10_000,
+                                       backend_num_nodes=1,
+                                       configured_accelerator_shapes={
+                                           'L4': 1,
+                                           'A100': 8,
+                                           'A100-80GB': 8,
+                                           'H200': 8,
+                                       })
+
+        def _build_budget(*_args, **kwargs):
+            assert kwargs['requested_frontier_keys'] == {('l4',)}
+            assert kwargs['prospective_backend_claims_by_accelerator'] == {
+                'l4': 100
+            }
+            return mock.sentinel.paid_budget
+
+        with mock.patch.object(
+                controller.serve_state,
+                'get_paid_launch_version_authority',
+                return_value=authority), mock.patch.object(
+                    controller.serve_utils,
+                    'parse_and_validate_version_controller_config',
+                    return_value={}), mock.patch.object(
+                        controller.paid_capacity,
+                        'active_paid_spot_accelerator_shapes',
+                        return_value=frozenset({
+                            ('l4', 1)
+                        })), mock.patch.object(controller.paid_capacity,
+                                               'build_launch_budget',
+                                               side_effect=_build_budget):
+            prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
+                scaler, 1, [], None)
+
+        assert prepared == ()
+        manager.prepare_paid_launch_specs.assert_called_once_with(
+            accelerator_shapes={'l4': 1},
+            max_gpu_units_by_accelerator={'l4': 100},
+            max_candidates=100,
+            occupied_replica_ids=mock.ANY,
+            version_authority=authority,
+            paid_location_launch_budget=mock.sentinel.paid_budget)
+
+    def test_paid_spec_preparation_keeps_aws_when_gcp_project_is_invalid(
+            self, caplog):
+        ctrl = _make_controller()
+        authority = _paid_launch_version_authority()
+        aws = spot_placer.Location(cloud=clouds.AWS(),
+                                   region='us-east-1',
+                                   zone=None,
+                                   accelerators={'L4': 1},
+                                   instance_type='g6.xlarge')
+        gcp = spot_placer.Location(cloud=clouds.GCP(),
+                                   region='us-central1',
+                                   zone=None,
+                                   accelerators={'L4': 1},
+                                   instance_type='g2-standard-4')
+        manager = mock.Mock()
+        manager.spot_placer.ranked_active_locations.return_value = [gcp, aws]
+        manager.workspace = 'default'
+        manager.prepare_paid_launch_specs.return_value = ()
+        ctrl._replica_manager = manager  # pylint: disable=protected-access
+        scaler = types.SimpleNamespace(max_replicas=1,
+                                       backend_num_nodes=1,
+                                       configured_accelerator_shapes={'L4': 1})
+
+        def _build_budget(*args, **kwargs):
+            assert args == (manager.spot_placer,)
+            assert kwargs['gcp_project_id_by_location'] == {}
+            return mock.sentinel.paid_budget
+
+        with mock.patch.object(
+                controller.serve_state,
+                'get_paid_launch_version_authority',
+                return_value=authority), mock.patch.object(
+                    controller.serve_utils,
+                    'parse_and_validate_version_controller_config',
+                    return_value={}), mock.patch.object(
+                        controller.paid_capacity,
+                        'active_paid_spot_accelerator_shapes',
+                        return_value=frozenset({('l4', 1)})), mock.patch.object(
+                            controller.paid_capacity,
+                            'build_launch_budget',
+                            side_effect=_build_budget), caplog.at_level(
+                                'WARNING'):
+            prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
+                scaler, 1, [], None)
+
+        assert prepared == ()
+        assert 'Omitting GCP paid candidate' in caplog.text
+        manager.prepare_paid_launch_specs.assert_called_once_with(
+            accelerator_shapes={'l4': 1},
+            max_gpu_units_by_accelerator={'l4': 1},
+            max_candidates=1,
+            occupied_replica_ids=mock.ANY,
+            version_authority=authority,
+            paid_location_launch_budget=mock.sentinel.paid_budget)
+
     def test_paid_spec_preparation_converts_logical_and_physical_caps(self):
         ctrl = _make_controller()
         manager = mock.Mock()
-        manager.spot_placer = mock.sentinel.placer
+        manager.spot_placer.ranked_active_locations.return_value = []
         manager.workspace = 'default'
         manager.prepare_paid_launch_specs.return_value = ()
         ctrl._replica_manager = manager  # pylint: disable=protected-access
@@ -5097,7 +5221,11 @@ class TestAutoscalerRuntimeSnapshot:
                 'get_paid_launch_version_authority',
                 return_value=authority), mock.patch.object(
                     controller.serve_utils,
-                    'parse_and_validate_version_controller_config'), \
+                    'parse_and_validate_version_controller_config',
+                    return_value={}), mock.patch.object(
+                        controller.paid_capacity,
+                        'active_paid_spot_accelerator_shapes',
+                        return_value=frozenset({('a100', 8)})), \
              mock.patch.object(controller.paid_capacity,
                                'build_launch_budget',
                                return_value=mock.sentinel.paid_budget):
@@ -5106,8 +5234,8 @@ class TestAutoscalerRuntimeSnapshot:
 
         assert prepared == ()
         manager.prepare_paid_launch_specs.assert_called_once_with(
-            accelerator_shapes={'A100': 8},
-            max_gpu_units_by_accelerator={'A100': 112},
+            accelerator_shapes={'a100': 8},
+            max_gpu_units_by_accelerator={'a100': 112},
             max_candidates=7,
             occupied_replica_ids=mock.ANY,
             version_authority=authority,
@@ -5118,7 +5246,7 @@ class TestAutoscalerRuntimeSnapshot:
     def test_paid_spec_preparation_budget_failure_suppresses_candidates(self):
         ctrl = _make_controller()
         manager = mock.Mock()
-        manager.spot_placer = mock.sentinel.placer
+        manager.spot_placer.ranked_active_locations.return_value = []
         manager.workspace = 'default'
         manager.prepare_paid_launch_specs.return_value = ()
         ctrl._replica_manager = manager  # pylint: disable=protected-access
@@ -5132,11 +5260,11 @@ class TestAutoscalerRuntimeSnapshot:
                 'get_paid_launch_version_authority',
                 return_value=authority), mock.patch.object(
                     controller.serve_utils,
-                    'parse_and_validate_version_controller_config'
-                ), mock.patch.object(
-                    controller.paid_capacity,
-                    'build_launch_budget',
-                    side_effect=ValueError('pool state unavailable')):
+                    'parse_and_validate_version_controller_config',
+                    return_value={}), mock.patch.object(
+                        controller.paid_capacity,
+                        'build_launch_budget',
+                        side_effect=ValueError('pool state unavailable')):
             prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
                 scaler, 1, [], None)
 
@@ -5163,11 +5291,11 @@ class TestAutoscalerRuntimeSnapshot:
             'return_value': None
         })
 
-        with mock.patch.object(
-                controller.serve_state, 'get_paid_launch_version_authority',
-                **patch_kwargs), mock.patch.object(
-                    controller.paid_capacity,
-                    'build_launch_budget') as build_budget:
+        with mock.patch.object(controller.serve_state,
+                               'get_paid_launch_version_authority',
+                               **patch_kwargs), mock.patch.object(
+                                   controller.paid_capacity,
+                                   'build_launch_budget') as build_budget:
             prepared = ctrl._prepare_current_paid_launch_specs(  # pylint: disable=protected-access
                 scaler, 1, [], None)
 
@@ -5686,29 +5814,68 @@ class TestAutoscalerRuntimeSnapshot:
             spec=controller.paid_capacity.PaidLaunchSpec),)
         receipt = types.SimpleNamespace(
             members=(types.SimpleNamespace(accelerator='l4', plan_units=1),))
+        bindings = (mock.sentinel.binding,)
 
         with mock.patch.object(ctrl,
                                '_prepare_current_paid_launch_specs',
                                return_value=prepared_specs):
             repository = self._run_promoted_reconciles(
-                ctrl, [self._durable_snapshot()], paid_launch_receipt=receipt)
+                ctrl, [self._durable_snapshot()],
+                paid_launch_receipt=receipt,
+                paid_launch_bindings=bindings)
 
         ctrl._replica_manager.materialize_paid_launch_receipt.assert_called_once_with(  # pylint: disable=line-too-long
-            receipt, ctrl._replica_manager.begin_paid_launch_materialization.
-            return_value)
+            receipt, bindings, prepared_specs)
         ctrl._replica_manager.scale_up_batch.assert_not_called()
         ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
         repository.plan_and_admit_current.assert_called_once()
 
-    def test_paid_materialization_handoff_spans_commit_and_publication(self):
+    @pytest.mark.parametrize(('target', 'accepted_members', 'expect_successor'),
+                             [(220, 100, True), (20, 20, False)])
+    def test_atomic_paid_wave_reconciles_only_while_target_is_underfilled(
+            self, target, accepted_members, expect_successor):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._autoscaler = self._logical_durable_autoscaler(  # pylint: disable=protected-access
+            target=target,
+            emit_scale_up=True)
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        prepared_specs = tuple(
+            mock.Mock(spec=controller.paid_capacity.PaidLaunchSpec)
+            for _ in range(accepted_members))
+        receipt = types.SimpleNamespace(members=tuple(
+            types.SimpleNamespace(accelerator='l4', plan_units=1)
+            for _ in range(accepted_members)))
+        bindings = (mock.sentinel.binding,) * accepted_members
+
+        with mock.patch.object(ctrl,
+                               '_prepare_current_paid_launch_specs',
+                               return_value=prepared_specs), \
+             mock.patch.object(ctrl, '_notify_scale_reconcile') as notify:
+            repository = self._run_promoted_reconciles(
+                ctrl, [self._durable_snapshot()],
+                paid_launch_receipt=receipt,
+                paid_launch_bindings=bindings)
+
+        repository.plan_and_admit_current.assert_called_once()
+        ctrl._replica_manager.materialize_paid_launch_receipt.assert_called_once_with(  # pylint: disable=line-too-long
+            receipt, bindings, prepared_specs)
+        if expect_successor:
+            notify.assert_called_once_with()
+        else:
+            notify.assert_not_called()
+
+    def test_paid_materialization_uses_fused_bindings_after_commit(self):
         ctrl = _make_controller()
         scaler = self._logical_durable_autoscaler(target=1, emit_scale_up=True)
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         prepared_specs = (mock.Mock(
             spec=controller.paid_capacity.PaidLaunchSpec),)
-        handoff = mock.sentinel.handoff
         receipt = types.SimpleNamespace(members=(mock.sentinel.member,))
-        committed = types.SimpleNamespace(paid_launch_receipt=receipt)
+        bindings = (mock.sentinel.binding,)
+        committed = types.SimpleNamespace(paid_launch_receipt=receipt,
+                                          paid_launch_bindings=bindings)
         candidate = mock.Mock()
         candidate.kind = capacity_planning.CapacityPlanKind.DEMAND
         candidate.reserved_launch_target.as_dict.return_value = {}
@@ -5716,18 +5883,11 @@ class TestAutoscalerRuntimeSnapshot:
             capacity_plan_candidate=candidate,
             capacity_planning_snapshot=mock.sentinel.planning_snapshot)
         current_plan = (committed, linearized, prepared_specs)
-        begin = ctrl._replica_manager.begin_paid_launch_materialization
-        end = ctrl._replica_manager.end_paid_launch_materialization
-        begin.return_value = handoff
+        publish = ctrl._replica_manager.materialize_paid_launch_receipt
 
         def _commit(*_args, **_kwargs):
-            begin.assert_called_once_with(prepared_specs)
-            end.assert_not_called()
+            publish.assert_not_called()
             return current_plan
-
-        def _publish(*_args, **_kwargs):
-            begin.assert_called_once_with(prepared_specs)
-            end.assert_not_called()
 
         inputs = autoscalers.ScalingDecisionInputs(replica_ids=(),
                                                    gpu_shape_handles={},
@@ -5739,11 +5899,7 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  ctrl,
                  '_plan_and_admit_current_capacity',
-                 side_effect=_commit) as commit, \
-             mock.patch.object(
-                 ctrl._replica_manager,
-                 'materialize_paid_launch_receipt',
-                 side_effect=_publish) as publish:
+                 side_effect=_commit) as commit:
             result = ctrl._plan_admit_and_materialize_current_capacity(  # pylint: disable=protected-access
                 scaler,
                 1,
@@ -5755,19 +5911,18 @@ class TestAutoscalerRuntimeSnapshot:
 
         assert result == current_plan
         commit.assert_called_once()
-        publish.assert_called_once_with(receipt, handoff)
-        end.assert_called_once_with(handoff)
+        publish.assert_called_once_with(receipt, bindings, prepared_specs)
 
     @pytest.mark.parametrize('failure', ('no_plan', 'invariant', 'publish'))
-    def test_paid_materialization_handoff_releases_on_every_failure(
+    def test_paid_materialization_propagates_plan_and_publication_failures(
             self, failure):
         ctrl = _make_controller()
         scaler = self._logical_durable_autoscaler(target=1, emit_scale_up=True)
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         prepared_specs = (mock.Mock(
             spec=controller.paid_capacity.PaidLaunchSpec),)
-        handoff = mock.sentinel.handoff
         receipt = types.SimpleNamespace(members=(mock.sentinel.member,))
+        bindings = (mock.sentinel.binding,)
         candidate = mock.Mock()
         candidate.kind = (capacity_planning.CapacityPlanKind.GATE_ACQUISITION
                           if failure == 'invariant' else
@@ -5776,10 +5931,9 @@ class TestAutoscalerRuntimeSnapshot:
         linearized = types.SimpleNamespace(
             capacity_plan_candidate=candidate,
             capacity_planning_snapshot=mock.sentinel.planning_snapshot)
-        current_plan = (types.SimpleNamespace(paid_launch_receipt=receipt),
+        current_plan = (types.SimpleNamespace(paid_launch_receipt=receipt,
+                                              paid_launch_bindings=bindings),
                         linearized, prepared_specs)
-        ctrl._replica_manager.begin_paid_launch_materialization.return_value = (
-            handoff)
         planned = None if failure == 'no_plan' else current_plan
         publish_error = (RuntimeError('publication failed')
                          if failure == 'publish' else None)
@@ -5822,12 +5976,10 @@ class TestAutoscalerRuntimeSnapshot:
                         inputs, [],
                         sequenced_reserved_fill=False)
 
-        if failure == 'invariant' or failure == 'no_plan':
+        if failure in ('invariant', 'no_plan'):
             publish.assert_not_called()
         else:
-            publish.assert_called_once_with(receipt, handoff)
-        ctrl._replica_manager.end_paid_launch_materialization.assert_called_once_with(  # pylint: disable=line-too-long
-            handoff)
+            publish.assert_called_once_with(receipt, bindings, prepared_specs)
 
     def test_settled_usage_gate_commits_whole_reserved_backend_before_paid(
             self):
@@ -5990,6 +6142,7 @@ class TestAutoscalerRuntimeSnapshot:
             spec=controller.paid_capacity.PaidLaunchSpec),)
         receipt = types.SimpleNamespace(
             members=(types.SimpleNamespace(accelerator='l4', plan_units=1),))
+        bindings = (mock.sentinel.binding,)
 
         with mock.patch.object(ctrl,
                                '_prepare_current_paid_launch_specs',
@@ -5997,12 +6150,12 @@ class TestAutoscalerRuntimeSnapshot:
             repository = self._run_promoted_reconciles(
                 ctrl, [self._durable_snapshot()],
                 supply=settled_zero,
-                paid_launch_receipt=receipt)
+                paid_launch_receipt=receipt,
+                paid_launch_bindings=bindings)
 
         repository.plan_and_admit_current.assert_called_once()
         ctrl._replica_manager.materialize_paid_launch_receipt.assert_called_once_with(  # pylint: disable=line-too-long
-            receipt, ctrl._replica_manager.begin_paid_launch_materialization.
-            return_value)
+            receipt, bindings, prepared_specs)
         ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
 
     def test_matching_gate_witness_commits_reserved_then_spot_residual(self):
@@ -6066,6 +6219,7 @@ class TestAutoscalerRuntimeSnapshot:
             spec=controller.paid_capacity.PaidLaunchSpec),)
         receipt = types.SimpleNamespace(
             members=(types.SimpleNamespace(accelerator='l4', plan_units=1),))
+        bindings = (mock.sentinel.binding,)
 
         with mock.patch.object(ctrl,
                                '_prepare_current_paid_launch_specs',
@@ -6073,12 +6227,12 @@ class TestAutoscalerRuntimeSnapshot:
             repository = self._run_promoted_reconciles(
                 ctrl, [self._durable_snapshot(generation=4)],
                 supply=materialized,
-                paid_launch_receipt=receipt)
+                paid_launch_receipt=receipt,
+                paid_launch_bindings=bindings)
 
         repository.plan_and_admit_current.assert_called_once()
         ctrl._replica_manager.materialize_paid_launch_receipt.assert_called_once_with(  # pylint: disable=line-too-long
-            receipt, ctrl._replica_manager.begin_paid_launch_materialization.
-            return_value)
+            receipt, bindings, prepared_specs)
         ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
 
     def test_usage_gate_off_statically_prefills_settled_reservation(self):
