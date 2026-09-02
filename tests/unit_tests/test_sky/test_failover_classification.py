@@ -3067,6 +3067,10 @@ def test_paid_checkpoint_conflict_is_terminal_fence_without_teardown(
     monkeypatch.setattr(ordinary_launch_binding,
                         'parse_bound_non_pool_launch_context',
                         lambda *_: bound_context)
+    monkeypatch.setattr(clouds.GCP, 'get_project_id',
+                        lambda *_: 'boltz-spot-project')
+    monkeypatch.setattr(ordinary_launch_binding, 'ordinary_paid_gcp_project_id',
+                        lambda *_: 'boltz-spot-project')
     monkeypatch.setattr(ordinary_launch_request,
                         '_record_paid_provider_allocation', failing_checkpoint)
 
