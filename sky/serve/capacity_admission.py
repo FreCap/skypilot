@@ -6,9 +6,7 @@ capacity ledger one immutable authority tuple to bind into each claim.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
-from collections.abc import Mapping
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 import contextlib
 import dataclasses
 import datetime
@@ -1604,6 +1602,7 @@ def _validate_planner_against_locked_supply(
     static_fill_target: Mapping[str, int],
     supply_projection: ReservedSupplyProjection | None,
     expected_planning_state_fingerprint: str | None,
+    expected_planner_input_fingerprint: str | None = None,
 ) -> None:
     """Bind a pure planner envelope to the PostgreSQL-locked supply facts."""
     configured_cards = {
@@ -1613,10 +1612,12 @@ def _validate_planner_against_locked_supply(
             configured_cards != accounting_cards):
         raise CapacityAdmissionConflict(
             'Planner snapshot names a different service version or card set.')
-    expected_source_fingerprint = expected_planning_state_fingerprint
+    expected_source_fingerprint = (
+        expected_planner_input_fingerprint if expected_planner_input_fingerprint
+        is not None else expected_planning_state_fingerprint)
     if supply_projection is not None:
         expected_source_fingerprint = locked_planning_source_fingerprint(
-            expected_planning_state_fingerprint,
+            expected_source_fingerprint,
             supply_projection.economic_capacity_graph_sha256)
     if (expected_source_fingerprint is not None and
             planner_snapshot.source_fingerprint != expected_source_fingerprint):
@@ -5443,6 +5444,7 @@ class CapacityAdmissionRepository:
         prepared_paid_launch_specs: Sequence[
             serve_paid_capacity.PaidLaunchSpec] = (),
         expected_planning_state_fingerprint: str | None = None,
+        expected_planner_input_fingerprint: str | None = None,
         ttl_seconds: int = constants.CAPACITY_PLAN_TTL_SECONDS,
     ) -> CommittedCapacityPlan:
         """Plan and atomically admit from one PostgreSQL-linearized graph.
@@ -5477,6 +5479,14 @@ class CapacityAdmissionRepository:
                 not _SHA256_RE.fullmatch(expected_planning_state_fingerprint)):
             raise ValueError('expected_planning_state_fingerprint must be a '
                              'lowercase SHA-256 digest.')
+        if (expected_planner_input_fingerprint is not None and
+                not _SHA256_RE.fullmatch(expected_planner_input_fingerprint)):
+            raise ValueError('expected_planner_input_fingerprint must be a '
+                             'lowercase SHA-256 digest.')
+        if (expected_planning_state_fingerprint is not None and
+                expected_planner_input_fingerprint is not None):
+            raise ValueError('Only one optimistic planning fingerprint may '
+                             'be supplied.')
         if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
             raise ValueError('ttl_seconds must be positive.')
 
@@ -6018,7 +6028,9 @@ class CapacityAdmissionRepository:
                 static_fill_target=static_fill_target,
                 supply_projection=supply_projection,
                 expected_planning_state_fingerprint=(
-                    expected_planning_state_fingerprint))
+                    expected_planning_state_fingerprint),
+                expected_planner_input_fingerprint=(
+                    expected_planner_input_fingerprint))
             statically_incompatible_cards = None
             if (sequenced_reserved_fill and positive_target and
                     candidate.reservation_demand_relation is capacity_planning.

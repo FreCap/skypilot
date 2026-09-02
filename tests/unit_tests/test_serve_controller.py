@@ -5040,7 +5040,9 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  controller.serve_state,
                  'get_scale_planning_state_fingerprint',
-                 return_value='f' * 64), \
+                 side_effect=AssertionError(
+                     'promoted planning must not read a whole-row '
+                     'fingerprint')), \
              mock.patch.object(
                  autoscalers,
                  'controller_prepares_scaling_decision_inputs',
@@ -5049,8 +5051,13 @@ class TestAutoscalerRuntimeSnapshot:
                  autoscalers,
                  'prepare_controller_scaling_decision_inputs',
                  return_value=autoscalers.ScalingDecisionInputs(
-                     replica_ids=tuple(info.replica_id
-                                       for info in replica_infos),
+                     replica_bindings=(
+                         autoscalers.build_replica_planning_bindings(
+                             replica_infos, {
+                                 info.replica_id:
+                                     ('l4', info.planned_capacity)
+                                 for info in replica_infos
+                             })),
                      gpu_shape_handles={},
                      gpu_shapes_by_replica_id={
                          info.replica_id: ('l4', info.planned_capacity)
@@ -5527,7 +5534,9 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  autoscalers,
                  'prepare_controller_scaling_decision_inputs',
-                 return_value=mock.Mock()), \
+                 return_value=autoscalers.ScalingDecisionInputs(
+                     gpu_shape_handles={},
+                     historical_scaling_values={})), \
              mock.patch.object(ctrl,
                                '_plan_and_admit_current_capacity',
                                return_value=None) as publish:
@@ -5594,7 +5603,9 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  autoscalers,
                  'prepare_controller_scaling_decision_inputs',
-                 return_value=mock.Mock()), \
+                 return_value=autoscalers.ScalingDecisionInputs(
+                     gpu_shape_handles={},
+                     historical_scaling_values={})), \
              mock.patch.object(ctrl,
                                '_plan_and_admit_current_capacity',
                                return_value=None):
@@ -5990,8 +6001,7 @@ class TestAutoscalerRuntimeSnapshot:
             publish.assert_not_called()
             return current_plan
 
-        inputs = autoscalers.ScalingDecisionInputs(replica_ids=(),
-                                                   gpu_shape_handles={},
+        inputs = autoscalers.ScalingDecisionInputs(gpu_shape_handles={},
                                                    historical_scaling_values={})
         with mock.patch.object(
                 ctrl,
@@ -6006,7 +6016,6 @@ class TestAutoscalerRuntimeSnapshot:
                 1,
                 0,
                 0,
-                'f' * 64,
                 inputs, [],
                 sequenced_reserved_fill=False)
 
@@ -6038,8 +6047,7 @@ class TestAutoscalerRuntimeSnapshot:
         planned = None if failure == 'no_plan' else current_plan
         publish_error = (RuntimeError('publication failed')
                          if failure == 'publish' else None)
-        inputs = autoscalers.ScalingDecisionInputs(replica_ids=(),
-                                                   gpu_shape_handles={},
+        inputs = autoscalers.ScalingDecisionInputs(gpu_shape_handles={},
                                                    historical_scaling_values={})
 
         with mock.patch.object(
@@ -6060,7 +6068,6 @@ class TestAutoscalerRuntimeSnapshot:
                     1,
                     0,
                     0,
-                    'f' * 64,
                     inputs, [],
                     sequenced_reserved_fill=False)
                 assert result is None
@@ -6073,7 +6080,6 @@ class TestAutoscalerRuntimeSnapshot:
                         1,
                         0,
                         0,
-                        'f' * 64,
                         inputs, [],
                         sequenced_reserved_fill=False)
 
@@ -6777,7 +6783,9 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  autoscalers,
                  'prepare_controller_scaling_decision_inputs',
-                 return_value=mock.Mock()), \
+                 return_value=autoscalers.ScalingDecisionInputs(
+                     gpu_shape_handles={},
+                     historical_scaling_values={})), \
              mock.patch.object(ctrl,
                                '_sequenced_reserved_fill_is_active',
                                return_value=True), \
@@ -6828,9 +6836,7 @@ class TestAutoscalerRuntimeSnapshot:
         def _prepare(*_args, **_kwargs):
             call_order.append('planning-inputs')
             return autoscalers.ScalingDecisionInputs(
-                replica_ids=(),
-                gpu_shape_handles={},
-                historical_scaling_values={})
+                gpu_shape_handles={}, historical_scaling_values={})
 
         def _durable_plan(_replica_infos, request_information,
                           reservation_input, *, source_fingerprint, fresh_zero,
@@ -6989,7 +6995,6 @@ class TestAutoscalerRuntimeSnapshot:
         snapshot.request_information['queue_depth'] = 1
         snapshot.normalized_demand = {'queue_depth': 1}
         prepared_inputs = autoscalers.ScalingDecisionInputs(
-            replica_ids=(),
             gpu_shape_handles={},
             historical_scaling_values={},
             cold_paid_accelerator_order=('L4',),
@@ -7987,11 +7992,8 @@ class TestAutoscalerRuntimeSnapshot:
                     1,
                     0,
                     0,
-                    'f' * 64,
                     autoscalers.ScalingDecisionInputs(
-                        replica_ids=(),
-                        gpu_shape_handles={},
-                        historical_scaling_values={}),
+                        gpu_shape_handles={}, historical_scaling_values={}),
                     sequenced_reserved_fill=False,
                     prepared_paid_launch_specs=()))
 
@@ -8064,7 +8066,8 @@ class TestAutoscalerRuntimeSnapshot:
             economic_kueue_capacity=locked_kueue)
         supply = self._bind_policy_history(supply, scaler)
         prepared = autoscalers.ScalingDecisionInputs(
-            replica_ids=(7,),
+            replica_bindings=autoscalers.build_replica_planning_bindings(
+                (info,), {7: ('l4', 1)}),
             gpu_shape_handles={},
             gpu_shapes_by_replica_id={7: ('l4', 1)},
             historical_scaling_values={},
@@ -8110,7 +8113,6 @@ class TestAutoscalerRuntimeSnapshot:
                 1,
                 0,
                 0,
-                'f' * 64,
                 prepared,
                 sequenced_reserved_fill=False,
                 prepared_paid_launch_specs=())
@@ -8123,7 +8125,8 @@ class TestAutoscalerRuntimeSnapshot:
         }
         assert bound_source == (
             controller.capacity_admission.locked_planning_source_fingerprint(
-                'f' * 64, supply.economic_capacity_graph_sha256))
+                autoscalers.replica_planning_binding_fingerprint(bound_inputs),
+                supply.economic_capacity_graph_sha256))
 
     def test_incomplete_exact_logical_tick_revokes_prior_target(self):
         ctrl = _make_controller()

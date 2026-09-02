@@ -1,16 +1,17 @@
 """Autoscalers: perform autoscaling by monitoring metrics."""
 import bisect
-from collections.abc import Iterable
-from collections.abc import Mapping
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 import contextlib
 import copy
 import dataclasses
+import hashlib
+import json
 import math
 import threading
 import time
 import typing
 from typing import Any
+import uuid
 
 from sky import global_user_state
 from sky import sky_logging
@@ -51,6 +52,23 @@ FillDemandSample: typing.TypeAlias = autoscaler_decisions.FillDemandSample
 AutoscalerDecision: typing.TypeAlias = autoscaler_decisions.AutoscalerDecision
 
 
+class PreparedReplicaSnapshotChanged(ValueError):
+    """A blocking planning preload no longer names the locked replica rows."""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PreparedReplicaPlanningBinding:
+    """Immutable identity and exact shape for one prepared replica input."""
+
+    replica_id: int
+    replica_record_id: uuid.UUID
+    service_version: int
+    cluster_name: str
+    exact_gpu_shape: tuple[str, int] | None
+    durable_gpu_shape: tuple[str, int] | None
+    planned_capacity: int
+
+
 @dataclasses.dataclass(frozen=True)
 class ScalingDecisionInputs:
     """Blocking inputs prepared for one exact autoscaler replica snapshot.
@@ -62,7 +80,7 @@ class ScalingDecisionInputs:
     read inside that lock.
     """
 
-    replica_ids: tuple[int, ...]
+    replica_bindings: tuple[PreparedReplicaPlanningBinding, ...] = ()
     gpu_shape_handles: dict[int, Any] | None = None
     gpu_shapes_by_replica_id: dict[int, tuple[str, int]] = (dataclasses.field(
         default_factory=dict))
@@ -81,28 +99,116 @@ class ScalingDecisionInputs:
     cold_paid_accelerator_order: tuple[str, ...] = ()
     prospective_paid_accelerator_order: tuple[str, ...] = ()
 
+    @property
+    def replica_ids(self) -> tuple[int, ...]:
+        """Return the one canonical identity tuple's numeric projections."""
+        return tuple(binding.replica_id for binding in self.replica_bindings)
+
+
+def _canonical_exact_gpu_shape(raw_shape: Any) -> tuple[str, int] | None:
+    if raw_shape is None:
+        return None
+    if (not isinstance(raw_shape, tuple) or len(raw_shape) != 2 or
+            not isinstance(raw_shape[0], str) or not raw_shape[0] or
+            type(raw_shape[1]) is not int or raw_shape[1] < 1):
+        raise ValueError('Replica planning shape is malformed.')
+    return raw_shape[0].casefold(), raw_shape[1]
+
+
+def _durable_exact_gpu_shape(
+    info: 'replica_managers.ReplicaInfo',) -> tuple[str, int] | None:
+    resources_override = getattr(info, 'resources_override', None)
+    if resources_override is None:
+        return None
+    if not isinstance(resources_override, Mapping):
+        raise ValueError('Replica resource override is malformed.')
+    accelerators = resources_override.get('accelerators')
+    if accelerators is None:
+        return None
+    if not isinstance(accelerators, Mapping) or len(accelerators) != 1:
+        raise ValueError('Replica accelerator override is malformed.')
+    raw_card = next(iter(accelerators))
+    return _canonical_exact_gpu_shape((raw_card, accelerators[raw_card]))
+
+
+def build_replica_planning_bindings(
+    replica_infos: Sequence['replica_managers.ReplicaInfo'],
+    gpu_shapes_by_replica_id: Mapping[int, tuple[str, int]],
+) -> tuple[PreparedReplicaPlanningBinding, ...]:
+    """Build the canonical ABA-safe identity for one prepared row set."""
+    bindings = []
+    for info in replica_infos:
+        replica_id = getattr(info, 'replica_id', None)
+        raw_record_id = getattr(info, 'replica_record_id', None)
+        service_version = getattr(info, 'version', None)
+        cluster_name = getattr(info, 'cluster_name', None)
+        if (type(replica_id) is not int or replica_id < 1 or
+                type(service_version) is not int or service_version < 0 or
+                not isinstance(cluster_name, str) or not cluster_name):
+            raise ValueError('Replica planning identity is malformed.')
+        try:
+            record_id = uuid.UUID(str(raw_record_id))
+        except (TypeError, ValueError, AttributeError) as error:
+            raise ValueError(
+                'Replica planning record identity is malformed.') from error
+        planned_capacity = getattr(info, 'planned_capacity', None)
+        if type(planned_capacity) is not int or planned_capacity < 1:
+            raise ValueError('Replica planned capacity is malformed.')
+        shape = _canonical_exact_gpu_shape(
+            gpu_shapes_by_replica_id.get(replica_id))
+        durable_shape = _durable_exact_gpu_shape(info)
+        if durable_shape is not None and durable_shape != shape:
+            raise ValueError('Replica durable and prepared shapes differ.')
+        bindings.append(
+            PreparedReplicaPlanningBinding(replica_id=replica_id,
+                                           replica_record_id=record_id,
+                                           service_version=service_version,
+                                           cluster_name=cluster_name,
+                                           exact_gpu_shape=shape,
+                                           durable_gpu_shape=durable_shape,
+                                           planned_capacity=planned_capacity))
+    if len({binding.replica_id for binding in bindings}) != len(bindings):
+        raise ValueError('Replica planning bindings contain duplicate ids.')
+    return tuple(sorted(bindings, key=lambda binding: binding.replica_id))
+
+
+def replica_planning_binding_fingerprint(
+        decision_inputs: ScalingDecisionInputs) -> str:
+    """Hash only immutable prepared facts consumed after blocking preload."""
+    bindings = decision_inputs.replica_bindings
+    if not isinstance(bindings, tuple):
+        raise ValueError('Replica planning bindings are malformed.')
+    material = [{
+        'replica_id': binding.replica_id,
+        'replica_record_id': str(binding.replica_record_id),
+        'service_version': binding.service_version,
+        'cluster_name': binding.cluster_name,
+        'exact_gpu_shape': binding.exact_gpu_shape,
+        'durable_gpu_shape': binding.durable_gpu_shape,
+        'planned_capacity': binding.planned_capacity,
+    } for binding in bindings]
+    encoded = json.dumps(material, sort_keys=True,
+                         separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
 
 def _exact_gpu_shape_from_decision_inputs(
     info: 'replica_managers.ReplicaInfo',
     decision_inputs: ScalingDecisionInputs,
 ) -> tuple[str, int] | None:
     """Resolve an exact shape without I/O from one prepared input token."""
-    raw_shape = decision_inputs.gpu_shapes_by_replica_id.get(info.replica_id)
+    raw_shape = _durable_exact_gpu_shape(info)
     if raw_shape is None:
-        resources_override = getattr(info, 'resources_override', None)
-        accelerators = (resources_override.get('accelerators') if isinstance(
-            resources_override, Mapping) else None)
-        if isinstance(accelerators, Mapping) and len(accelerators) == 1:
-            raw_card = next(iter(accelerators))
-            raw_shape = (raw_card, accelerators[raw_card])
+        raw_shape = decision_inputs.gpu_shapes_by_replica_id.get(
+            info.replica_id)
     if raw_shape is None:
         handles = decision_inputs.gpu_shape_handles
         handle = None if handles is None else handles.get(info.replica_id)
         accelerators = getattr(getattr(handle, 'launched_resources', None),
                                'accelerators', None)
         if isinstance(accelerators, Mapping) and len(accelerators) == 1:
-            raw_card = next(iter(accelerators))
-            raw_shape = (raw_card, accelerators[raw_card])
+            raw_card, raw_count = next(iter(accelerators.items()))
+            raw_shape = (raw_card, raw_count)
     if (not isinstance(raw_shape, tuple) or len(raw_shape) != 2 or
             not isinstance(raw_shape[0], str) or not raw_shape[0]):
         return None
@@ -139,8 +245,45 @@ def bind_locked_kueue_capacity_snapshot(
             len(set(prepared_replica_ids)) != len(prepared_replica_ids) or
             len(set(replica_ids)) != len(replica_ids) or
             set(prepared_replica_ids) != set(replica_ids)):
-        raise ValueError('Locked Kueue capacity names a different replica '
-                         'snapshot.')
+        raise PreparedReplicaSnapshotChanged(
+            'Locked capacity names a different replica snapshot.')
+    prepared_bindings = decision_inputs.replica_bindings
+    if (not isinstance(prepared_bindings, tuple) or
+            len(prepared_bindings) != len(replica_infos) or
+            any(not isinstance(binding, PreparedReplicaPlanningBinding)
+                for binding in prepared_bindings)):
+        raise ValueError('Prepared replica planning bindings are malformed.')
+    prepared_by_id = {
+        binding.replica_id: binding for binding in prepared_bindings
+    }
+    if len(prepared_by_id) != len(prepared_bindings):
+        raise ValueError('Prepared replica planning bindings are malformed.')
+    locked_shapes: dict[int, tuple[str, int] | None] = {}
+    for info in replica_infos:
+        prepared = prepared_by_id.get(info.replica_id)
+        if prepared is None:
+            raise PreparedReplicaSnapshotChanged(
+                'Locked capacity names a different replica snapshot.')
+        try:
+            locked_record_id = uuid.UUID(str(info.replica_record_id))
+        except (TypeError, ValueError, AttributeError) as error:
+            raise ValueError(
+                'Locked replica record identity is malformed.') from error
+        locked_shape = _durable_exact_gpu_shape(info)
+        prepared_shape = _canonical_exact_gpu_shape(prepared.exact_gpu_shape)
+        prepared_durable_shape = _canonical_exact_gpu_shape(
+            prepared.durable_gpu_shape)
+        if (prepared.replica_record_id != locked_record_id or
+                prepared.service_version != info.version or
+                prepared.cluster_name != info.cluster_name or
+                prepared.planned_capacity != info.planned_capacity or
+                prepared_durable_shape != locked_shape or
+            (locked_shape is not None and locked_shape != prepared_shape)):
+            raise PreparedReplicaSnapshotChanged(
+                'Locked capacity changed a prepared replica identity or '
+                'shape.')
+        locked_shapes[info.replica_id] = (locked_shape if locked_shape
+                                          is not None else prepared_shape)
     replica_id_set = set(replica_ids)
     classes = dict(snapshot.by_replica_id)
     ordinary_replica_ids = set(snapshot.ordinary_scheduler_replica_ids)
@@ -157,10 +300,7 @@ def bind_locked_kueue_capacity_snapshot(
                 for replica_id in ordinary_replica_ids)):
         raise ValueError('Locked ordinary-scheduler capacity is malformed.')
 
-    shapes_by_replica_id = {
-        info.replica_id: _exact_gpu_shape_from_decision_inputs(
-            info, decision_inputs) for info in replica_infos
-    }
+    shapes_by_replica_id = dict(locked_shapes)
     blocked_shapes = set(snapshot.unknown_shapes)
     for info in replica_infos:
         has_reserved_intent = isinstance(
@@ -220,9 +360,20 @@ def bind_locked_kueue_capacity_snapshot(
                 if (not info.is_terminal and
                     info.status_property.is_scale_down is not True))
 
+    rebound_bindings = build_replica_planning_bindings(
+        replica_infos, {
+            replica_id: shape
+            for replica_id, shape in locked_shapes.items()
+            if shape is not None
+        })
     return dataclasses.replace(
         decision_inputs,
-        replica_ids=replica_ids,
+        replica_bindings=rebound_bindings,
+        gpu_shapes_by_replica_id={
+            replica_id: shape
+            for replica_id, shape in locked_shapes.items()
+            if shape is not None
+        },
         kueue_capacity_by_replica_id=classes,
         kueue_blocked_retirement_shapes=frozenset(blocked_shapes),
         kueue_transition_replica_ids=frozenset(transition_ids),
@@ -928,7 +1079,8 @@ class Autoscaler:
                                                          spot_placer.Location],
                                                    float] = {}
         self._cost_rebalance_state_dirty = False
-        self._cost_rebalance_replica_cost_cache: dict[int, float] = {}
+        self._cost_rebalance_replica_cost_cache: dict[tuple[int, str],
+                                                      float] = {}
         # Freshness fence for priority-only gauges. A stale LB report may keep
         # a conservative scale-up target, but it must not keep refreshing a
         # high-priority paid-capacity waiter indefinitely.
@@ -3392,10 +3544,11 @@ class Autoscaler:
     def _get_hourly_cost_from_replica_info(
             self, replica_info: 'replica_managers.ReplicaInfo') -> float:
         """Resolve whole-replica hourly cost conservatively."""
-        cached = self._cost_rebalance_replica_cost_cache.get(
-            replica_info.replica_id)
-        if cached is not None:
-            return cached
+        cache_key = self._cost_rebalance_replica_cache_key(replica_info)
+        if cache_key is not None:
+            cached = self._cost_rebalance_replica_cost_cache.get(cache_key)
+            if cached is not None:
+                return cached
         cost = 0.0
         resolved = False
         try:
@@ -3405,11 +3558,23 @@ class Autoscaler:
                 resolved = True
         except Exception:  # pylint: disable=broad-except
             cost = 0.0
-        if (resolved and replica_info.status_property.sky_launch_status
+        if (cache_key is not None and resolved and
+                replica_info.status_property.sky_launch_status
                 == common_utils.ProcessStatus.SUCCEEDED):
-            self._cost_rebalance_replica_cost_cache[
-                replica_info.replica_id] = cost
+            self._cost_rebalance_replica_cost_cache[cache_key] = cost
         return cost
+
+    @staticmethod
+    def _cost_rebalance_replica_cache_key(
+        replica_info: 'replica_managers.ReplicaInfo',
+    ) -> tuple[int, str] | None:
+        """Return an ABA-safe memo key, or disable caching without identity."""
+        replica_id = getattr(replica_info, 'replica_id', None)
+        record_id = getattr(replica_info, 'replica_record_id', None)
+        if (type(replica_id) is not int or replica_id < 1 or
+                not isinstance(record_id, str) or not record_id):
+            return None
+        return replica_id, record_id
 
     def _cost_rebalance_pairs(
         self, replica_infos: list['replica_managers.ReplicaInfo']
@@ -3531,12 +3696,16 @@ class Autoscaler:
         ordinary_decisions: list[AutoscalerDecision],
     ) -> list[AutoscalerDecision]:
         """Progress durable pairs and, when stable, start cheaper replacements."""
-        live_replica_ids = {
-            info.replica_id for info in replica_infos if not info.is_terminal
-        }
-        for replica_id in list(self._cost_rebalance_replica_cost_cache):
-            if replica_id not in live_replica_ids:
-                del self._cost_rebalance_replica_cost_cache[replica_id]
+        live_replica_records: set[tuple[int, str]] = set()
+        for info in replica_infos:
+            if info.is_terminal:
+                continue
+            cache_key = self._cost_rebalance_replica_cache_key(info)
+            if cache_key is not None:
+                live_replica_records.add(cache_key)
+        for cache_key in list(self._cost_rebalance_replica_cost_cache):
+            if cache_key not in live_replica_records:
+                del self._cost_rebalance_replica_cost_cache[cache_key]
         pairs = self._cost_rebalance_pairs(replica_infos)
         by_id = {info.replica_id: info for info in replica_infos}
         decisions: list[AutoscalerDecision] = []
@@ -4221,6 +4390,10 @@ class _GpuShapeResolverMixin:
     # rules as the shape cache). Backs cost-aware victim ordering in both
     # shape-aware autoscalers.
     _replica_cost_cache: dict[int, float]
+    # Numeric replica ids are reusable after exact cleanup.  This map binds
+    # both memos above to the immutable database-record identity so a newly
+    # created row can never inherit its predecessor's shape or cost.
+    _replica_cache_record_ids: dict[int, str]
     configured_accelerator_shapes: dict[str, int]
     latest_version: int
     _service_name: str
@@ -4240,6 +4413,8 @@ class _GpuShapeResolverMixin:
         self, replica_infos: list['replica_managers.ReplicaInfo']
     ) -> ScalingDecisionInputs:
         """Resolve every durable input before routing serialization."""
+        for info in replica_infos:
+            self._bind_replica_cache_identity(info)
         historical_versions = {
             info.version
             for info in replica_infos
@@ -4305,7 +4480,6 @@ class _GpuShapeResolverMixin:
                     self._prospective_paid_card_order(configured_cards))
         gpu_shape_handles = self._resolve_gpu_shape_handles(replica_infos)
         base_inputs = ScalingDecisionInputs(
-            replica_ids=tuple(info.replica_id for info in replica_infos),
             gpu_shape_handles=gpu_shape_handles,
             historical_scaling_values=historical_values,
             service_time_estimates_by_accelerator=service_time_estimates,
@@ -4319,8 +4493,11 @@ class _GpuShapeResolverMixin:
                      _exact_gpu_shape_from_decision_inputs(info, base_inputs))
             if shape is not None:
                 exact_shapes[info.replica_id] = shape
-        base_inputs = dataclasses.replace(base_inputs,
-                                          gpu_shapes_by_replica_id=exact_shapes)
+        base_inputs = dataclasses.replace(
+            base_inputs,
+            replica_bindings=build_replica_planning_bindings(
+                replica_infos, exact_shapes),
+            gpu_shapes_by_replica_id=exact_shapes)
         return bind_locked_kueue_capacity_snapshot(base_inputs, replica_infos,
                                                    kueue_snapshot)
 
@@ -4345,9 +4522,18 @@ class _GpuShapeResolverMixin:
         if not isinstance(decision_inputs, ScalingDecisionInputs):
             raise TypeError('Invalid scaling decision input token.')
         replica_ids = tuple(info.replica_id for info in replica_infos)
-        if decision_inputs.replica_ids != replica_ids:
+        if (any(
+                type(replica_id) is not int or replica_id < 1
+                for replica_id in replica_ids) or
+                len(set(replica_ids)) != len(replica_ids) or
+                decision_inputs.replica_ids != tuple(sorted(replica_ids))):
             raise ValueError('Scaling decision inputs do not match the exact '
                              'replica snapshot.')
+        expected_bindings = build_replica_planning_bindings(
+            replica_infos, decision_inputs.gpu_shapes_by_replica_id)
+        if decision_inputs.replica_bindings != expected_bindings:
+            raise ValueError('Scaling decision inputs do not match the exact '
+                             'replica identities.')
         gpu_shapes = decision_inputs.gpu_shapes_by_replica_id
         if (not isinstance(gpu_shapes, dict) or
                 set(gpu_shapes) - set(replica_ids) or
@@ -4496,6 +4682,31 @@ class _GpuShapeResolverMixin:
         for replica_id in list(self._replica_cost_cache):
             if replica_id not in live_replica_ids:
                 del self._replica_cost_cache[replica_id]
+        record_ids = getattr(self, '_replica_cache_record_ids', None)
+        if record_ids is not None:
+            for replica_id in list(record_ids):
+                if replica_id not in live_replica_ids:
+                    del record_ids[replica_id]
+
+    def _bind_replica_cache_identity(
+            self, replica_info: 'replica_managers.ReplicaInfo') -> None:
+        """Invalidate both memos when a numeric id names a new DB row."""
+        record_id = getattr(replica_info, 'replica_record_id', None)
+        if not isinstance(record_id, str) or not record_id:
+            # An identity-less row can be read, but it can never safely own a
+            # memo across calls.
+            self._gpu_shape_cache.pop(replica_info.replica_id, None)
+            self._replica_cost_cache.pop(replica_info.replica_id, None)
+            return
+        record_ids = getattr(self, '_replica_cache_record_ids', None)
+        if record_ids is None:
+            record_ids = {}
+            self._replica_cache_record_ids = record_ids
+        previous = record_ids.get(replica_info.replica_id)
+        if previous is not None and previous != record_id:
+            self._gpu_shape_cache.pop(replica_info.replica_id, None)
+            self._replica_cost_cache.pop(replica_info.replica_id, None)
+        record_ids[replica_info.replica_id] = record_id
 
     def _resolve_replica_handles(
             self, replica_infos: list['replica_managers.ReplicaInfo']
@@ -4510,6 +4721,8 @@ class _GpuShapeResolverMixin:
         scores shape and cost from the same record snapshot instead of two
         reads at different times mid-sort.
         """
+        for info in replica_infos:
+            self._bind_replica_cache_identity(info)
         uncached = [
             info for info in replica_infos
             if info.replica_id not in self._gpu_shape_cache or
@@ -4546,6 +4759,8 @@ class _GpuShapeResolverMixin:
         every missing shape or cost memo is included in this one outside-lock
         batch instead of falling back to per-replica reads under the lock.
         """
+        for info in replica_infos:
+            self._bind_replica_cache_identity(info)
         unresolved = [
             info for info in replica_infos if (not info.is_terminal and (
                 (info.replica_id not in self._gpu_shape_cache and
@@ -4574,6 +4789,7 @@ class _GpuShapeResolverMixin:
         Unknown costs resolve to 0.0 (treated like reserved capacity, so
         they are shed last -- the conservative direction for cost).
         """
+        self._bind_replica_cache_identity(replica_info)
         cached = self._replica_cost_cache.get(replica_info.replica_id)
         if cached is not None:
             return cached
@@ -4604,6 +4820,7 @@ class _GpuShapeResolverMixin:
             replica_info: 'replica_managers.ReplicaInfo',
             handle: Any = _UNRESOLVED_HANDLE) -> tuple[str, int]:
         """Extract (GPU type, GPU count) from ReplicaInfo object."""
+        self._bind_replica_cache_identity(replica_info)
         cached = self._gpu_shape_cache.get(replica_info.replica_id)
         if cached is not None:
             return cached
@@ -4645,6 +4862,7 @@ class _GpuShapeResolverMixin:
             self, replica_info: 'replica_managers.ReplicaInfo'
     ) -> tuple[str, int] | None:
         """Return only already-materialized exact-card facts, without I/O."""
+        self._bind_replica_cache_identity(replica_info)
         cached = self._gpu_shape_cache.get(replica_info.replica_id)
         if cached is not None:
             return cached
@@ -4714,6 +4932,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         # replica_id -> hourly cost of launched resources (same lifecycle
         # rules as the shape cache).
         self._replica_cost_cache: dict[int, float] = {}
+        self._replica_cache_record_ids: dict[int, str] = {}
         # Shapes already warned about bare-key per-GPU scaling.
         self._bare_key_warned: set[tuple[str, int]] = set()
         # One-shot hysteresis bypass, armed by update_version AND at
@@ -6135,6 +6354,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # before zero-cost reserved capacity); pruned with the shape
         # cache each tick.
         self._replica_cost_cache: dict[int, float] = {}
+        self._replica_cache_record_ids: dict[int, str] = {}
         # Replaceable exact-card gauges shipped with the authoritative
         # concurrency report. Running work is attributed separately from the
         # per-replica in-flight map at decision time, so it remains pinned to
@@ -6680,7 +6900,6 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             saturated = request_information.get(
                 'offered_arrival_tracking_saturated') is True
 
-            shape_cache = dict(self._gpu_shape_cache)
             shape_handles = decision_inputs.gpu_shape_handles
             if shape_handles is None:
                 return None
@@ -6690,8 +6909,6 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             ) -> tuple[str, int] | None:
                 raw_shape = decision_inputs.gpu_shapes_by_replica_id.get(
                     info.replica_id)
-                if raw_shape is None:
-                    raw_shape = shape_cache.get(info.replica_id)
                 if raw_shape is None:
                     raw_shape = self._gpu_shape_from_resources_override(info)
                 if raw_shape is None:

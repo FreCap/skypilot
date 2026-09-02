@@ -5838,7 +5838,6 @@ def test_controller_successor_admission_tolerates_only_nonstructural_churn(
             1,
             0,
             0,
-            planning_fingerprint,
             prepared_inputs,
             sequenced_reserved_fill=False,
             prepared_paid_launch_specs=prepared_specs)
@@ -6018,9 +6017,6 @@ def test_controller_suppresses_actuation_on_committed_candidate_drift(
 
     monkeypatch.setattr(capacity_admission.CapacityAdmissionRepository,
                         'plan_and_admit_current', _drifted_plan_and_admit)
-    planning_fingerprint = serve_state.get_scale_planning_state_fingerprint(
-        'svc', require_version=True)
-    assert planning_fingerprint is not None
     prepared_inputs = autoscalers.prepare_controller_scaling_decision_inputs(
         autoscaler, [])
     result = ctrl._plan_and_admit_current_capacity(
@@ -6028,7 +6024,6 @@ def test_controller_suppresses_actuation_on_committed_candidate_drift(
         1,
         0,
         0,
-        planning_fingerprint,
         prepared_inputs,
         sequenced_reserved_fill=False,
         prepared_paid_launch_specs=manager.prepare_paid_launch_specs())
@@ -6140,7 +6135,6 @@ def test_fresh_zero_multi_pool_admission_accepts_yaml_card_casing(
         'H200': 1,
     })
     prepared_inputs = autoscalers.ScalingDecisionInputs(
-        replica_ids=(),
         gpu_shape_handles={},
         historical_scaling_values={},
         cold_paid_accelerator_order=('L4',),
@@ -6154,17 +6148,12 @@ def test_fresh_zero_multi_pool_admission_accepts_yaml_card_casing(
     ctrl = _current_capacity_controller(incarnation, autoscaler, manager)
 
     def _admit():
-        planning_fingerprint = (
-            serve_state.get_scale_planning_state_fingerprint(
-                'svc', require_version=True))
-        assert planning_fingerprint is not None
         prepared_specs = manager.prepare_paid_launch_specs()
         result = ctrl._plan_and_admit_current_capacity(
             autoscaler,
             1,
             0,
             0,
-            planning_fingerprint,
             prepared_inputs,
             sequenced_reserved_fill=True,
             prepared_paid_launch_specs=prepared_specs)

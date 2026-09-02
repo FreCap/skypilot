@@ -65,6 +65,7 @@ class _Replica:
                  status=serve_state.ReplicaStatus.READY,
                  replacement_for=None):
         self.replica_id = replica_id
+        self.replica_record_id = _replica_record_id(replica_id)
         self.cluster_name = f'cluster-{replica_id}'
         self.version = 1
         self.status = status
@@ -127,6 +128,19 @@ def _report(scaler, replicas):
 
 def _decisions(scaler, replicas):
     return scaler.generate_scaling_decisions(replicas, [1])
+
+
+def test_scalar_cost_cache_is_bound_to_replica_record_identity():
+    """A reused numeric id cannot inherit its predecessor's hourly cost."""
+    spec = _spec(target_qps_per_replica=1.0,
+                 target_concurrency_per_replica=None)
+    scaler = autoscalers.RequestRateAutoscaler('svc', spec, version=1)
+    location = make_location('paid', accelerators={'L4': 1}, use_spot=True)
+    predecessor = _Replica(1, location, 1.0)
+    replacement = _Replica(1, location, 2.0)
+    replacement.replica_record_id = ('00000000-0000-4000-8000-000000000002')
+    assert scaler._get_hourly_cost_from_replica_info(predecessor) == 1.0
+    assert scaler._get_hourly_cost_from_replica_info(replacement) == 2.0
 
 
 def _status_property(

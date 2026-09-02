@@ -502,6 +502,7 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
             autoscalers.InstanceAwareRequestRateAutoscaler)
         autoscaler._gpu_shape_cache = {}
         autoscaler._replica_cost_cache = {}
+        autoscaler._replica_cache_record_ids = {}
         autoscaler._gpu_shape_handles_for_tick = None
         autoscaler._bare_key_warned = set()
         autoscaler._snap_target_on_next_recompute = False
@@ -524,11 +525,15 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         autoscaler._service_name = 'svc'
         return autoscaler
 
-    def _make_replica(self, gpu_type, launch_status, count=1):
+    def _make_replica(self, gpu_type, launch_status, count=1, replica_id=1):
         info = mock.Mock()
-        info.replica_id = 1
+        info.replica_id = replica_id
+        info.replica_record_id = (f'00000000-0000-4000-8000-{replica_id:012d}')
         info.version = 1
-        info.cluster_name = 'mock-cluster'
+        info.cluster_name = f'mock-cluster-{replica_id}'
+        info.planned_capacity = count
+        info.resources_override = None
+        info.is_terminal = False
         info.status_property.sky_launch_status = launch_status
         info.handle.return_value.launched_resources.accelerators = {
             gpu_type: count
@@ -549,12 +554,14 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
     def test_decision_preload_skips_terminal_replica_without_cluster(self):
         """A retained failed row must not reopen PostgreSQL every tick."""
         autoscaler = self._make_autoscaler()
-        terminal = self._make_replica('A100', common_utils.ProcessStatus.FAILED)
-        terminal.replica_id = 1
+        terminal = self._make_replica('A100',
+                                      common_utils.ProcessStatus.FAILED,
+                                      replica_id=1)
         terminal.cluster_name = 'deleted-cluster'
         terminal.is_terminal = True
-        live = self._make_replica('L4', common_utils.ProcessStatus.RUNNING)
-        live.replica_id = 2
+        live = self._make_replica('L4',
+                                  common_utils.ProcessStatus.RUNNING,
+                                  replica_id=2)
         live.cluster_name = 'live-cluster'
         live.is_terminal = False
 
@@ -1166,9 +1173,11 @@ class TestInstanceAwareUpdateRolloutSafety(unittest.TestCase):
         self.assertIn(1, autoscaler._qps_dict_by_version)
         info = mock.Mock()
         info.replica_id = 1
+        info.replica_record_id = ('00000000-0000-4000-8000-000000000001')
         info.cluster_name = 'svc-1'
         info.version = 2
         info.is_terminal = False
+        info.planned_capacity = 1
         info.resources_override = {'accelerators': {'A100': 1}}
         with mock.patch.object(
                 autoscaler,
@@ -1211,9 +1220,13 @@ class TestInstanceAwareMixedVersionArithmetic(unittest.TestCase):
     def _replica(self, replica_id, gpu_type, version, is_ready=True):
         info = mock.Mock()
         info.replica_id = replica_id
+        info.replica_record_id = (f'00000000-0000-4000-8000-{replica_id:012d}')
+        info.cluster_name = f'svc-{replica_id}'
         info.version = version
         info.is_terminal = False
         info.is_ready = is_ready
+        info.planned_capacity = 1
+        info.resources_override = {'accelerators': {gpu_type: 1}}
         info.status_property.sky_launch_status = (
             common_utils.ProcessStatus.SUCCEEDED)
         info.handle.return_value.launched_resources.accelerators = {gpu_type: 1}
@@ -1491,11 +1504,13 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
                  version=1):
         info = mock.Mock()
         info.replica_id = replica_id
+        info.replica_record_id = (f'00000000-0000-4000-8000-{replica_id:012d}')
         info.cluster_name = f'svc-{replica_id}'
         info.version = version
         info.is_terminal = False
         info.is_ready = ready
         info.is_zero_cost = zero_cost
+        info.planned_capacity = 1
         info.resources_override = {'accelerators': {card: 1}}
         info.status_property.sky_launch_status = (
             common_utils.ProcessStatus.SUCCEEDED if ready else None)
