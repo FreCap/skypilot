@@ -23,8 +23,10 @@ matches. Request-log directory creation is post-commit best effort, so no
 filesystem or EFS path can roll back paid admission. One invalid GCP project
 entry is omitted without suppressing healthy AWS or GCP siblings. Qualification
 source now proves through the production durable planner adapter that the exact
-cold-start scale contract authorizes 800 logical L4 units, including exactly
-100 widest eight-L4 backends. Qualification runner merge, deployment, the final
+cold-start scale contract authorizes 800 logical L4 units. The rendered task's
+exact one-L4 backend shape therefore authorizes 800 physical backends and
+exceeds the 100-worker provider gate. Qualification runner merge, deployment,
+the final
 current-writer AWS/GCP
 scale/traffic/drain receipt, and clean `boltz-l4-fleet` recreation remain
 open.** One
@@ -194,10 +196,11 @@ The hermetic qualification gate enters through the production durable planner
 adapter with this exact cold-start contract: 10,000 priority-50 L4 requests,
 the 600-second default queue deadline, a ten-second configured service time,
 the 600-second automatic cold-lead seed, an 800-logical-slot service/paid
-ceiling, and the widest admitted eight-L4 backend. The canonical planner
-returns an 800-slot deadline, raw, supply-aware, wave-limited, paid-residual,
-and paid-launch target, which is exactly 100 widest backends. It also publishes
-all 10,000 requests as infeasible against the cold-start SLA; the 800 target is
+ceiling, and the rendered task's exact one-L4 backend shape. The canonical
+planner returns an 800-slot deadline, raw, supply-aware, wave-limited,
+paid-residual, and paid-launch target, which authorizes 800 physical backends
+and therefore exceeds the 100-worker provider gate. It also publishes all
+10,000 requests as infeasible against the cold-start SLA; the 800 target is
 therefore explicitly bounded backlog recovery and not a claim that capacity
 arriving after the deadline can satisfy that deadline.
 The 100-member atomic PostgreSQL wave bound is independent from the logical
@@ -452,7 +455,10 @@ instance/disk/operation guards, authenticated request identity, scale timing,
 and normal drain/cleanup receipts. Its focused tests and smoke-test collection
 qualify the runner, not a billable provider effect. No live PR-#1813 billable
 receipt has been captured yet, so provider-native end-to-end qualification
-remains an open production gate.
+remains an open production gate. PR #1854 supersedes that GCP-only runner with
+the canonical provider-neutral AWS/GCP economic qualifier and its narrowly
+authorized missing-provider canary; the historical #1813 result remains source
+evidence only.
 
 Lifecycle 148 on the preceding `1.1.1575` release accepted a sustained
 exact-L4 pressure test: 270,000 attempts over 184.8 seconds produced a raw logical target of
@@ -1844,7 +1850,7 @@ it has merged or been deployed.
 | Routing and queue | Lifecycle 119's low-priority run produced a small deadline-weighted target; the high-priority run increased the target through 49, 64, 128, and 178 before the paid cap clipped it at 100. The bounded stimulus recorded 2,248 submission starts, 289 accepted requests, 252 completion markers, and definitive queue-full rejections/retries; it is not the separate 10,000-terminal-request ledger proof. PR #1765's deployed capacity-time planner uses deadline buckets, exact compatibility, per-card service-time estimates, finite supply availability, and paid cold lead. A fresh current-schema nonzero queued/processing/in-flight/completed UI and heterogeneous capacity-time proof remains open. |
 | Partial mixed proof | Provider/DB censuses at 2026-08-25 19:45:47.538 and 19:45:56.281 UTC bracketed a 72-request completion wave and both had 44 reserved plus 28 paid replicas all `READY`, the same 28 AWS Spot instances—27 `g6.2xlarge` and one `g6.4xlarge`—and zero on-demand. The wave completed from 19:45:48.956 through 19:45:51.187; every request performed 9.533–12.451 seconds of concurrency-one GPU work, so at least 28 necessarily executed on Spot beside the 44 reserved workers. The Spot instances later fully drained at the provider. |
 | GCP Spot lifecycle proof | **Count, no-spill, warm-request, and teardown are complete.** Lifecycle 137 on `1.1.1554` reached exactly 100 concurrently provider-`RUNNING` one-L4 GCP Spot VMs with zero ordinary on-demand/wrong-shape capacity, served 10,000/10,000 authenticated warm requests with first-attempt HTTP 200, and completed normal exact-zero teardown. Earlier clean-frontier evidence reached 100 in 3 minutes 41.9 seconds and peaked at 117; lifecycle 137's roughly 9.5-minute run correctly retained recent-failure cooldowns. |
-| Final load proof | **The constituent exact-card placement and warm-transport proofs are complete; final-writer mixed convergence remains open.** Lifecycle 137 completed 10,000/10,000 authenticated warm requests, the historical mixed campaign proved 44 reserved plus 28 Spot workers serving concurrently with zero on-demand, lifecycle 139 proved exact compatible reservation admission, and lifecycle 141 proved a final-writer statically disjoint Spot request and teardown. Lifecycle 152 peaked at 87 real provider-`RUNNING` Spot VMs and then froze on restart recovery/cleanup; release `1.1.1583` safely returned its real AWS provider resources to zero but does not supersede lifecycle 137's scale receipt. A current-schema PR-#1813 multi-wave campaign with exact async-ledger coverage, HA takeover, and provider-native teardown remains required. |
+| Final load proof | **The constituent exact-card placement and warm-transport proofs are complete; final-writer mixed convergence remains open.** Lifecycle 137 completed 10,000/10,000 authenticated warm requests, the historical mixed campaign proved 44 reserved plus 28 Spot workers serving concurrently with zero on-demand, lifecycle 139 proved exact compatible reservation admission, and lifecycle 141 proved a final-writer statically disjoint Spot request and teardown. Lifecycle 152 peaked at 87 real provider-`RUNNING` Spot VMs and then froze on restart recovery/cleanup; release `1.1.1583` safely returned its real AWS provider resources to zero but does not supersede lifecycle 137's scale receipt. A current-schema PR-#1854 AWS/GCP multi-wave campaign with exact async-ledger coverage, HA takeover, and provider-native teardown remains required. |
 | Demand/publication ordering | The deployed plan/head/policy/replica/claim writer leaves request binding postcommit, and `spot-e2e-0901ac` exposed both that publication race and its 420-singleton database fanout. Merged PR #1857 removes the gap per accepted wave: every accepted member's complete generic request graph is in the same capacity transaction, and queue visibility at commit is durable recovery authority. Optional local workers adopt exact committed request IDs; construction failure, lost acknowledgement, process death, and HA takeover all recover from PostgreSQL without singleton resubmission. The same-checkout best-effort-history outcomes pass. A maximum 100-member transaction survives a real post-COMMIT acknowledgement loss with its queue claimable; a 420 target converges across five fresh bounded generations with exact debit/graph cardinality; stale authority between waves fails before planner entry and resumes without duplicates after a fresh report. Provider-free GCP project/cohort and executable-tamper gates pass. Deployment and live scale/teardown receipts remain open. |
 | Utilization/allocation causality | **Production-qualified for compatible and statically disjoint exact-card demand.** PR #1792 stabilized the decision-equivalent acquisition witness; PR #1794 bound budgets to exact cards; PRs #1795 and #1796 made statically disjoint L4 admission canonical and independent of unrelated A100/H200 allocation churn. Lifecycle 139 selected one zero-cost A100 and no paid claim. Lifecycle 141 selected one L4 Spot while committing zero incompatible reserved capacity, then returned to exact zero under `utilization_gate: true`. Flexible mixed-card acquisition, nonzero exact-ledger UI capture, multi-node paid accounting, and HA takeover remain full-design acceptance gates. |
 
@@ -3732,15 +3738,16 @@ increasing pre-down natural-drain samples, and three distinct increasing
 post-down cleanup samples with canonical AWS and GCP zero projections. Runtime
 placement policy remains unchanged.
 
-PR #1813 is the canonical executable provider-native qualifier for the next
-run. Its merged code is source evidence only. The gate closes only when the
+PR #1854 is the canonical executable provider-native qualifier for the next
+run and supersedes PR #1813's GCP-only runner. Its merged code is source
+evidence only. The gate closes only when the
 qualifier emits one immutable live receipt from the intended deployed image and
 service version, proves every bound provider effect is the approved GCP Spot L4
-shape, reaches the selected small or scale threshold within its SLO, serves its
-authenticated stable request identities, naturally drains, and holds exact
-PostgreSQL/VM/disk/operation zero for the configured interval. A collected
-smoke test, mocked provider response, unit receipt, or historical pre-#1813 run
-does not satisfy this gate.
+or AWS Spot L4 shape, reaches the selected small or scale threshold within its
+SLO, serves its authenticated stable request identities, naturally drains, and
+holds exact PostgreSQL/VM/disk/operation zero for the configured interval. A
+collected smoke test, mocked provider response, unit receipt, or historical
+pre-#1854 run does not satisfy this gate.
 
 The production qualifier reads instances, disks, and operations through
 the Google Compute v1 API with application-default credentials; it has no

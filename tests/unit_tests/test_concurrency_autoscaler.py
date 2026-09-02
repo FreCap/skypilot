@@ -489,8 +489,8 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             last_reduced_demand_generation, 1)
         self.assertIsNone(result.rollout_failure)
 
-    def test_paid_scale_qualification_reaches_one_hundred_widest_backends(self):
-        """The production adapter bounds the paid campaign at 100 VMs."""
+    def test_paid_scale_qualification_authorizes_physical_gate(self):
+        """The rendered exact-L4 contract exceeds the 100-VM gate."""
         autoscaler = _durable_autoscaler(max_replicas=800,
                                          target_utilization_percentage=100,
                                          expected_request_duration_seconds=10,
@@ -501,7 +501,10 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                                              'timeout_seconds': 600,
                                              'timeout_seconds_by_priority': [],
                                          })
-        autoscaler.set_configured_accelerator_shapes({'L4': 8})
+        # The rendered service requests L4:1.  Production derives this exact
+        # shape from task resources and paid admission rejects another width;
+        # do not replace it with a synthetic widest-catalog shape here.
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
         report = _durable_report(queue_depth=10_000,
                                  queued_profiles=[{
                                      'priority': 50,
@@ -547,10 +550,13 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         self.assertEqual(candidate.paid_launch_target.as_dict(),
                          expected_target)
         self.assertEqual(candidate.physical_gpu_width_by_accelerator.as_dict(),
-                         {'L4': 8})
+                         {'L4': 1})
         paid_units = candidate.paid_launch_target.get('L4')
         width = candidate.physical_gpu_width_by_accelerator.get('L4')
-        self.assertEqual(divmod(paid_units, width), (100, 0))
+        physical_target, remainder = divmod(paid_units, width)
+        self.assertEqual(remainder, 0)
+        self.assertEqual(physical_target, 800)
+        self.assertGreaterEqual(physical_target, 100)
         self.assertEqual(candidate.infeasible_demand_by_priority,
                          ((50, 10_000.0),))
         self.assertIsNone(result.rollout_failure)
