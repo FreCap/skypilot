@@ -1911,6 +1911,7 @@ def parse_aws_state(*,
     seen_instance_ids: set[str] = set()
     attached_volume_ids: set[str] = set()
     live_clusters: list[str] = []
+    attachment_incomplete: str | None = None
     for instance in instances:
         token = instance.get('client_token')
         observed_identity = (identity_by_token.get(token) if isinstance(
@@ -1939,14 +1940,16 @@ def parse_aws_state(*,
                 'AWS service instance repeats one EBS volume identity.')
         if not raw_volume_ids:
             # EC2 may expose a correctly bound instance before its root EBS
-            # mapping.  Identity and shape mismatches above remain fatal; this
-            # single provider snapshot is incomplete and can be retried.
-            raise QualificationError(
+            # mapping.  Defer the retryable result until every other effect in
+            # this census has passed the fatal guards below.
+            attachment_incomplete = (
                 'AWS instance EBS attachment is not yet visible.')
-        overlap = attached_volume_ids.intersection(raw_volume_ids)
-        if overlap:
-            raise GuardViolation('AWS service instances share an EBS volume.')
-        attached_volume_ids.update(raw_volume_ids)
+        else:
+            overlap = attached_volume_ids.intersection(raw_volume_ids)
+            if overlap:
+                raise GuardViolation(
+                    'AWS service instances share an EBS volume.')
+            attached_volume_ids.update(raw_volume_ids)
         seen_instance_ids.add(instance_id)
         allocation_counts[observed_identity.client_token] += 1
         if (allocation_counts[observed_identity.client_token]
@@ -1973,8 +1976,9 @@ def parse_aws_state(*,
                 'AWS service EBS effect has no retained launch binding.')
         existing_volume_ids.add(volume_id)
         volume_clusters.add(cluster_name)
-    if not attached_volume_ids.issubset(existing_volume_ids):
-        raise QualificationError(
+    if (not attached_volume_ids.issubset(existing_volume_ids) and
+            attachment_incomplete is None):
+        attachment_incomplete = (
             'AWS attached EBS volume is not yet visible in the service census.')
 
     if len(live_clusters) != len(set(live_clusters)):
@@ -1989,6 +1993,8 @@ def parse_aws_state(*,
     if gpu_units > profile.max_units:
         raise GuardViolation('Provider GPU units exceeded the armed cap.')
     shapes = _aws_shape_states(instances)
+    if attachment_incomplete is not None:
+        raise QualificationError(attachment_incomplete)
     cloud_state = ProviderCloudState(
         cloud='aws',
         instance_count=len(instances),

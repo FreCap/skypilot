@@ -1492,6 +1492,83 @@ def test_aws_invalid_binding_remains_fatal_before_empty_ebs_retry(
 
 
 @pytest.mark.parametrize(('field', 'replacement'), [
+    ('market', 'on_demand'),
+    ('client_token', 'wrong-token'),
+    ('instance_type', 'g6.12xlarge'),
+    ('provider_gpu_units', 4),
+])
+def test_aws_empty_ebs_does_not_mask_later_invalid_instance(field, replacement):
+    first = {
+        **_aws_instance(state='pending'),
+        'volume_ids': (),
+    }
+    invalid = {
+        **_aws_instance(instance_id='i-later'),
+        field: replacement,
+    }
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='escaped its retained launch binding'):
+        qualifier.parse_aws_state(identities=(_aws_identity(),),
+                                  profile=qualifier.PROFILES['small'],
+                                  service_instances=(first, invalid),
+                                  service_volumes=(_aws_volume(),))
+
+
+def test_aws_empty_ebs_does_not_mask_later_unbound_volume():
+    pending = {
+        **_aws_instance(state='pending'),
+        'volume_ids': (),
+    }
+    unbound = _aws_volume(cluster_name='unbound-cluster')
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='EBS effect has no retained launch binding'):
+        qualifier.parse_aws_state(identities=(_aws_identity(),),
+                                  profile=qualifier.PROFILES['small'],
+                                  service_instances=(pending,),
+                                  service_volumes=(unbound,))
+
+
+def test_aws_empty_ebs_does_not_mask_later_duplicate_instance():
+    pending = {
+        **_aws_instance(state='pending'),
+        'volume_ids': (),
+    }
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='escaped its retained launch binding'):
+        qualifier.parse_aws_state(identities=(_aws_identity(),),
+                                  profile=qualifier.PROFILES['small'],
+                                  service_instances=(pending, dict(pending)),
+                                  service_volumes=())
+
+
+def test_aws_empty_ebs_does_not_mask_later_gpu_cap_violation():
+    first_identity = _aws_identity()
+    second_identity = _aws_identity(client_token='token-second',
+                                    cluster_name='paid-e2e-2-tenant')
+    pending = {
+        **_aws_instance(state='pending'),
+        'volume_ids': (),
+    }
+    second = _aws_instance(client_token=second_identity.client_token,
+                           cluster_name=second_identity.cluster_name_on_cloud,
+                           instance_id='i-second',
+                           volume_id='vol-second')
+
+    with pytest.raises(qualifier.GuardViolation,
+                       match='GPU units exceeded the armed cap'):
+        qualifier.parse_aws_state(
+            identities=(first_identity, second_identity),
+            profile=qualifier.PROFILES['provider-canary'],
+            service_instances=(pending, second),
+            service_volumes=(_aws_volume(
+                cluster_name=second_identity.cluster_name_on_cloud,
+                volume_id='vol-second'),))
+
+
+@pytest.mark.parametrize(('field', 'replacement'), [
     ('availability_zone', 'us-east-2b'),
     ('client_token', 'different-token'),
     ('cluster_name_on_cloud', 'paid-e2e-2-1234567890-tenant'),
