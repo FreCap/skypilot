@@ -80,6 +80,17 @@ skypilot/
 
 ## Development Setup
 
+### Supported Python Runtime
+
+- CPython 3.14 or newer is the only supported runtime.
+- Python 3.13 and older, including Python 3.10, are unsupported. Do not add or
+  preserve compatibility branches, tests, packaging metadata, or CI gates for
+  those versions.
+- Existing controller, worker, packaging, or CI pins below Python 3.14 are
+  migration debt rather than a compatibility contract. Keep changes that rely
+  on Python 3.14 syntax or behavior undeployed until every affected runtime has
+  moved to Python 3.14 or newer.
+
 ### Environment Setup
 
 ```bash
