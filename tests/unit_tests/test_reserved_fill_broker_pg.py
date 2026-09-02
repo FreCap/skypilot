@@ -49,6 +49,7 @@ from sky import global_user_state
 from sky import global_user_state_schema
 from sky.serve import constants
 from sky.serve import lb_ha
+from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
 from sky.serve import placement_contract_normalization
 from sky.serve import placement_history
@@ -257,6 +258,13 @@ def _pg_mechanics_template(pg_server):
         migration_utils.safe_alembic_upgrade(engine,
                                              migration_utils.SERVE_DB_NAME,
                                              migration_utils.SERVE_VERSION)
+        # Final PostgreSQL service deletion performs its request-layer
+        # census (api_requests, queue and retention pins) on the same
+        # database as the Serve tables, exactly as the central deployment
+        # does; the template must therefore carry both schemas.
+        migration_utils.safe_alembic_upgrade(
+            engine, migration_utils.API_REQUESTS_DB_NAME,
+            migration_utils.API_REQUESTS_VERSION)
     finally:
         engine.dispose()
     try:
@@ -379,7 +387,35 @@ class TestBlackoutPG(sqlite_suite.TestBlackout):
 
 
 class TestClaimLifecyclePG(sqlite_suite.TestClaimLifecycle):
-    pass
+
+    def test_service_teardown_requires_lifecycle_fence(self):
+        # PostgreSQL final deletion is one same-name authority census.  A
+        # non-pool service row whose durable name fence is missing cannot
+        # prove which incarnation is retiring, so the whole transaction
+        # must roll back: the claim row is the observable witness that no
+        # child row was deleted before the barrier failed.
+        sqlite_suite._upsert('svc-a')
+        engine = serve_state._db_manager.get_engine()
+        with sqlalchemy.orm.Session(engine) as session:
+            session.execute(serve_state.services_table.insert().values(
+                name='svc-a',
+                hash='incarnation-a',
+                lifecycle_epoch=1,
+                status=serve_state.ServiceStatus.SHUTTING_DOWN.value))
+            session.commit()
+        with pytest.raises(
+                ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                match='lifecycle fence'):
+            serve_state.remove_service_completely('svc-a', 'incarnation-a')
+        with sqlalchemy.orm.Session(engine) as session:
+            remaining = session.execute(
+                sqlalchemy.select(serve_state.services_table.c.name).where(
+                    serve_state.services_table.c.name == 'svc-a')).scalar()
+        assert remaining == 'svc-a'
+        assert {
+            row['service_name'] for row in serve_state.get_reserved_fill_claims(
+                pool_key=sqlite_suite._POOL)
+        } == {'svc-a'}
 
 
 class TestEpochFencingPG(sqlite_suite.TestEpochFencing):

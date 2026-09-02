@@ -3349,6 +3349,12 @@ class TestClaimLifecycle:
         _upsert('svc-b')
         engine = serve_state._db_manager.get_engine()
         with orm.Session(engine) as session:
+            # Every fenced service row is born beside its durable name fence
+            # (claim_service_lifecycle_epoch writes both in one transaction);
+            # PostgreSQL final deletion fails closed without that exact row.
+            session.execute(
+                serve_state.service_lifecycle_fences_table.insert().values(
+                    name='svc-a', epoch=1))
             session.execute(serve_state.services_table.insert().values(
                 name='svc-a',
                 hash='incarnation-a',
