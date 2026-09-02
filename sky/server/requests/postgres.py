@@ -599,7 +599,7 @@ def _resolved_request_backend_capability() -> tuple[str, str, bool]:
 
 def prepare_non_pool_launch_binding_runtime() -> NonPoolLaunchBindingRuntime:
     """Resolve handler and backend globals before a caller opens its txn."""
-    ordinary_launch_binding.NonPoolBindingIdentity  # pylint: disable=pointless-statement
+    ordinary_launch_binding.load_module()
     try:
         registration = request_registry.registration_for_handler(
             non_pool_launch_request.launch)
