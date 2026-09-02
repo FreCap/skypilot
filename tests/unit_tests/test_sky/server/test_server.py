@@ -1326,8 +1326,11 @@ def _unbound_system_recovery_launch_context() -> dict[str, object]:
         intent,
         service_name='svc',
         service_version=3,
+        service_lifecycle_epoch=1,
         controller_pid=123,
-        controller_ip='10.0.0.1')
+        controller_ip='10.0.0.1',
+        controller_incarnation='33333333-3333-4333-8333-333333333333',
+        controller_owner_epoch=1)
 
 
 @pytest.mark.asyncio

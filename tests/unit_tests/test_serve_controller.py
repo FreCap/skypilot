@@ -323,6 +323,55 @@ def test_controller_validates_binding_authority_before_manager_construction(
     manager.assert_not_called()
 
 
+def test_controller_projects_exact_observer_fence_into_replica_manager(
+        monkeypatch):
+    authority = _binding_authority('bound', 5, generic=True)
+    manager = mock.Mock(side_effect=RuntimeError('manager construction stop'))
+    monkeypatch.setattr(controller.replica_managers, 'SkyPilotReplicaManager',
+                        manager)
+    monkeypatch.setattr(controller.ordinary_launch_binding,
+                        'validate_controller_authority',
+                        lambda supplied, **_kwargs: supplied)
+    monkeypatch.setattr(controller.serve_state,
+                        'service_uses_logical_replica_semantics',
+                        lambda _service_name: False)
+    monkeypatch.setattr(controller.serve_state, 'get_latest_committed_version',
+                        lambda _name: 1)
+    monkeypatch.setattr(controller.serve_state,
+                        'get_latest_quarantined_version', lambda _name: None)
+    monkeypatch.setattr(controller.serve_state, 'get_lb_cutover_state',
+                        lambda _name: None)
+    spec = types.SimpleNamespace(uses_logical_replicas=False,
+                                 lb_high_availability=False,
+                                 lb_stream_timeout_seconds=10,
+                                 graceful_drain_seconds=10,
+                                 pool=False)
+
+    with pytest.raises(RuntimeError, match='manager construction stop'):
+        controller.SkyServeController(
+            'svc',
+            spec,
+            version=1,
+            host='127.0.0.1',
+            port=20001,
+            controller_owner_fingerprint='fingerprint',
+            service_hash='incarnation-a',
+            controller_pid=123,
+            controller_ip='10.0.0.1',
+            controller_binding_authority=authority)
+
+    fence = manager.call_args.kwargs['replica_observer_owner_fence']
+    assert isinstance(
+        fence, controller.system_recovery_persistence.ReplicaObserverOwnerFence)
+    assert fence.service_name == authority.service_name
+    assert fence.service_hash == authority.service_hash
+    assert fence.service_lifecycle_epoch == authority.service_lifecycle_epoch
+    assert fence.controller_owner == (authority.controller_pid,
+                                      authority.controller_ip)
+    assert fence.controller_incarnation == authority.controller_incarnation
+    assert fence.controller_owner_epoch == authority.controller_owner_epoch
+
+
 def test_run_controller_uses_parent_owner_for_child_cutover_fence(monkeypatch):
     """The child fence must compare the durable parent owner, not its PID."""
     actual_controller_class = controller.SkyServeController

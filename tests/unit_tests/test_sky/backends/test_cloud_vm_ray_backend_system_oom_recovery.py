@@ -102,8 +102,11 @@ def _context(*,
         intent,
         service_name=_SERVICE_NAME,
         service_version=4,
+        service_lifecycle_epoch=3,
         controller_pid=123,
-        controller_ip='10.0.0.2')
+        controller_ip='10.0.0.2',
+        controller_incarnation='33333333-3333-4333-8333-333333333333',
+        controller_owner_epoch=5)
     context = serve_recovery.bind_launch_context(context, 'request-1')
     if not include_contract:
         context.pop(

@@ -67,6 +67,7 @@ from sky.serve import scale_reconciliation
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
+from sky.serve import system_recovery_persistence
 from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
 from sky.serve import zero_cost_actuation
@@ -529,6 +530,20 @@ class SkyServeController:
                 service_hash=service_hash,
                 controller_pid=controller_pid,
                 controller_ip=controller_ip))
+        observer_authority = self._ordinary_launch_binding_authority
+        self._replica_observer_owner_fence = (
+            None if observer_authority is None else
+            system_recovery_persistence.ReplicaObserverOwnerFence(
+                service_name=observer_authority.service_name,
+                service_hash=observer_authority.service_hash,
+                service_lifecycle_epoch=(
+                    observer_authority.service_lifecycle_epoch),
+                controller_pid=observer_authority.controller_pid,
+                controller_ip=observer_authority.controller_ip,
+                controller_incarnation=(
+                    observer_authority.controller_incarnation),
+                controller_owner_epoch=(
+                    observer_authority.controller_owner_epoch)))
         self._history_session_id = uuid.uuid4().hex
         self._controller_owner = ((controller_pid,
                                    controller_ip) if service_hash is not None or
@@ -651,7 +666,9 @@ class SkyServeController:
                 controller_ip=controller_ip,
                 enforce_launch_fence=enforce_launch_fence,
                 controller_binding_authority=(
-                    self._ordinary_launch_binding_authority)))
+                    self._ordinary_launch_binding_authority),
+                replica_observer_owner_fence=(
+                    self._replica_observer_owner_fence)))
         # Pass `version` so a controller rebuilt on restart/respawn starts the
         # autoscaler at the recovered latest version (matching the replica
         # manager above), not INITIAL_VERSION. Otherwise a service updated past

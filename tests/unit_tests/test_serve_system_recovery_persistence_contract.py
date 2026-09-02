@@ -32,7 +32,7 @@ def _write(**overrides):
             system_recovery=None,
             system_recovery_quarantine=None))
     assert not overrides
-    return system_recovery_persistence.ReplicaSystemRecoveryWrite(
+    return system_recovery_persistence.ReplicaObservationWrite(
         replica_id=replica_id,
         replica_record_id=record_id,
         service_version=version,
