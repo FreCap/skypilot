@@ -6265,12 +6265,16 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         preparations = []
         for handle in handles:
             try:
-                path = handle.cluster_yaml
-                config = None if path is None else configs[path]
+                cluster_yaml_path = handle.cluster_yaml
+                config = (None if cluster_yaml_path is None else
+                          configs[cluster_yaml_path])
                 if isinstance(config, Exception):
                     raise config
                 credential = backend_utils.ssh_credential_from_yaml(
-                    path, handle.docker_user, handle.ssh_user, config=config)
+                    cluster_yaml_path,
+                    handle.docker_user,
+                    handle.ssh_user,
+                    config=config)
                 runners = (
                     handle._get_cached_command_runners_with_credentials(  # pylint: disable=protected-access
                         credential,

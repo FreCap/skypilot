@@ -140,7 +140,7 @@ def _capture_subprocess_bounded(
             if not events:
                 raise subprocess.TimeoutExpired(cmd, max(0, remaining))
             for key, _ in events:
-                chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                chunk = os.read(key.fd, 64 * 1024)
                 if not chunk:
                     selector.unregister(key.fileobj)
                     continue
@@ -465,6 +465,7 @@ def run_with_log(
 
             # Check if timeout was triggered during stream processing
             if timeout_triggered:
+                assert timeout is not None
                 logger.error(
                     f'Command timed out after {timeout} seconds: {cmd}')
                 raise subprocess.TimeoutExpired(cmd, timeout)

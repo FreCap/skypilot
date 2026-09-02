@@ -21,6 +21,21 @@ SKY_LOG_TAILING_GAP_SECONDS: float = ...
 LOG_FILE_START_STREAMING_AT: str = ...
 
 
+class BoundedSubprocessCapture:
+    """Finite POSIX capture contract for short control-plane commands."""
+
+    deadline_monotonic: int | float
+    max_output_bytes: int
+
+    def __init__(self, *, deadline_monotonic: int | float,
+                 max_output_bytes: int) -> None:
+        ...
+
+
+class SubprocessOutputLimitExceeded(RuntimeError):
+    ...
+
+
 class _ProcessingArgs:
     log_path: str
     stream_logs: bool
@@ -72,6 +87,7 @@ def run_with_log(cmd: list[str] | str,
                  streaming_prefix: str | None = ...,
                  log_cmd: bool = ...,
                  timeout: int | None = ...,
+                 bounded_capture: BoundedSubprocessCapture | None = ...,
                  **kwargs) -> int:
     ...
 
@@ -92,6 +108,7 @@ def run_with_log(cmd: list[str] | str,
                  streaming_prefix: str | None = ...,
                  log_cmd: bool = ...,
                  timeout: int | None = ...,
+                 bounded_capture: BoundedSubprocessCapture | None = ...,
                  **kwargs) -> tuple[int, str, str]:
     ...
 
@@ -112,6 +129,7 @@ def run_with_log(cmd: list[str] | str,
                  streaming_prefix: str | None = ...,
                  log_cmd: bool = ...,
                  timeout: int | None = ...,
+                 bounded_capture: BoundedSubprocessCapture | None = ...,
                  **kwargs) -> int | tuple[int, str, str]:
     ...
 
