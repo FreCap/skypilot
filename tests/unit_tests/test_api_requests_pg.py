@@ -2673,6 +2673,12 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
     monkeypatch.setattr(ordinary_launch_binding,
                         'resolve_non_pool_launch_profile_in_connection',
                         lambda *_args, **_kwargs: profile)
+    # Admission recomputes the profile through the connection-local resolver
+    # (not the public wrapper) since #1685; this test seeds no committed
+    # intent graph, so pin that seam to the same frozen profile.
+    monkeypatch.setattr(ordinary_launch_binding,
+                        '_resolve_non_pool_launch_profile_in_connection',
+                        lambda *_args, **_kwargs: (profile, None))
     monkeypatch.setattr(
         ordinary_launch_binding, '_reserved_fill_cleanup_payload',
         lambda *_args, **_kwargs: {'physical_cluster_uid': 'physical-uid-a'})
