@@ -91,6 +91,7 @@ class _HttpSession:
 def _provider_scope(**overrides):
     values = {
         'service_hash': 'incarnation',
+        'resource_scope': 'resource-scope',
         'lifecycle_epoch': 7,
         'service_version': 11,
         'max_live_paid_gpu_units': 2,
@@ -770,6 +771,7 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
     service_yaml = yaml.safe_dump(persisted_service, sort_keys=False)
     authority = {
         'service_hash': 'incarnation',
+        'resource_scope': 'resource-scope',
         'service_lifecycle_epoch': 7,
         'current_version': 11,
         'workspace': 'workspace-a',
@@ -781,6 +783,7 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
     }
     scope = qualifier.provider_scope_from_controller_config(authority)
     assert scope.project_id == 'durable-project'
+    assert scope.resource_scope == 'resource-scope'
     assert (scope.location_scope is qualifier.GcpLocationScope.PROJECT_WIDE)
     receipt = tmp_path / 'scope.json'
     qualifier.write_provider_scope(receipt, 'paid-e2e', scope)
