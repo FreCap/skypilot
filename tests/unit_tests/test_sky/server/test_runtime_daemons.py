@@ -27,8 +27,9 @@ from sky.server.requests import postgres as request_postgres
 from sky.utils import controller_capability
 from sky.utils.db import db_utils
 
-_STUBBORN_GRANDCHILD_SCRIPT = ('import signal,time; '
+_STUBBORN_GRANDCHILD_SCRIPT = ('import os,signal,sys,time; '
                                'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                               "os.write(int(sys.argv[1]), b'1'); "
                                'time.sleep(300)')
 _CONTROLLER_OWNER = ('12345678-1234-4abc-9234-56789abcdef0', 7)
 
@@ -43,10 +44,18 @@ from sky.server import internal_daemon_runner as runner
 parent_pid = int(sys.argv[1])
 parent_ticks = int(sys.argv[2])
 runner._arm_parent_death_contract(parent_pid, parent_ticks)
+runner._GUARDIAN_TERM_TIMEOUT_SECONDS = 0.2
 guardian_pid = runner._start_parent_death_group_guardian(parent_pid,
                                                          parent_ticks)
+ready_read_fd, ready_write_fd = os.pipe()
 grandchild = subprocess.Popen([sys.executable, '-c',
-                               {_STUBBORN_GRANDCHILD_SCRIPT!r}])
+                               {_STUBBORN_GRANDCHILD_SCRIPT!r},
+                               str(ready_write_fd)],
+                              pass_fds=(ready_write_fd,))
+os.close(ready_write_fd)
+grandchild_ready = os.read(ready_read_fd, 1)
+os.close(ready_read_fd)
+assert grandchild_ready == b'1'
 print('RUNTIME-GUARDIAN-READY', os.getpid(), guardian_pid, grandchild.pid,
       flush=True)
 time.sleep(300)
