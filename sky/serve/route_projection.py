@@ -84,6 +84,10 @@ class RouteProjectionConflict(RouteProjectionError):
     """The requested service incarnation or owner does not match."""
 
 
+class RouteProjectionSnapshotChanged(RouteProjectionConflict):
+    """Composition inputs changed while the publisher still owns the service."""
+
+
 class RouteProjectionUnavailable(RouteProjectionError):
     """The selected projected route source has no usable fresh snapshot."""
 
@@ -1495,7 +1499,7 @@ def _validate_revalidated_leases(
     """Accept only identical safety state and monotonic lease extension."""
     if _lease_safety_snapshot(prepared_rows) != _lease_safety_snapshot(
             current_rows):
-        raise RouteProjectionConflict(
+        raise RouteProjectionSnapshotChanged(
             'Route lease safety state changed during composition.')
     prepared_by_key = {_lease_key(row): row for row in prepared_rows}
     for current in current_rows:
@@ -1508,7 +1512,7 @@ def _validate_revalidated_leases(
                 prepared_until.tzinfo is None or
                 not isinstance(current_until, datetime.datetime) or
                 current_until.tzinfo is None or current_until < prepared_until):
-            raise RouteProjectionConflict(
+            raise RouteProjectionSnapshotChanged(
                 'Route lease validity regressed during composition.')
 
 
@@ -2690,7 +2694,7 @@ class RouteProjectionRepository:
                         'Incremental route version is no longer elected.')
                 active_versions = _active_versions_from_owner(owner)
                 if active_versions != prepared_active_versions:
-                    raise RouteProjectionConflict(
+                    raise RouteProjectionSnapshotChanged(
                         'Service active versions changed during composition.')
                 current_replica_rows = session.execute(
                     _incremental_replica_query(
@@ -2699,7 +2703,7 @@ class RouteProjectionRepository:
                         for_update=True)).mappings().all()
                 if (_replica_fingerprints(current_replica_rows)
                         != prepared_replica_fingerprints):
-                    raise RouteProjectionConflict(
+                    raise RouteProjectionSnapshotChanged(
                         'Replica state changed during route composition.')
                 current_lease_rows = session.execute(
                     _incremental_lease_query(identity,
@@ -2710,7 +2714,7 @@ class RouteProjectionRepository:
                         sqlalchemy.func.clock_timestamp())).scalar_one()
                 if (_lease_freshness_snapshot(lease_rows, prepared_now)
                         != _lease_freshness_snapshot(current_lease_rows, now)):
-                    raise RouteProjectionConflict(
+                    raise RouteProjectionSnapshotChanged(
                         'Route lease freshness changed during composition.')
                 return self._publish_in_session(
                     session,

@@ -575,6 +575,50 @@ def test_exact_owner_conflict_clears_targets_and_terminates_worker_instance():
     asyncio.run(_run())
 
 
+def test_composition_snapshot_churn_retries_without_losing_targets():
+
+    async def _run():
+        identity = _identity()
+        target = _target(identity)
+        repository = mock.Mock()
+        repository.list_probe_targets.return_value = [target]
+        compose = mock.Mock(side_effect=[
+            route_projection.RouteProjectionSnapshotChanged(
+                'replica changed during composition'),
+            None,
+        ])
+        worker = incremental_route_worker.IncrementalRouteWorker(
+            repository, identity, compose, threading.Event())
+        probe_blocked = asyncio.Event()
+
+        async def _blocked_probe(_session, _target_arg):
+            await probe_blocked.wait()
+
+        worker._probe = _blocked_probe
+        tasks = {}
+        try:
+            assert await worker._run_tick(mock.Mock(), tasks)
+            await _wait_for_call(worker._target_refresh)
+            await _wait_for_call(worker._composition)
+
+            # Optimistic composition churn carries no ownership evidence. The
+            # same worker must retain probe progress and retry in place.
+            assert await worker._run_tick(mock.Mock(), tasks)
+            assert worker._current_targets == (target,)
+            assert len(tasks) == 1
+            await _wait_for_call(worker._composition)
+            assert await worker._run_tick(mock.Mock(), tasks)
+            assert compose.call_count >= 2
+            assert worker._current_targets == (target,)
+        finally:
+            probe_blocked.set()
+            if tasks:
+                await asyncio.gather(*tasks.values(), return_exceptions=True)
+            _close_worker(worker)
+
+    asyncio.run(_run())
+
+
 def test_initial_target_completion_schedules_http_before_next_grid(monkeypatch):
 
     async def _run():

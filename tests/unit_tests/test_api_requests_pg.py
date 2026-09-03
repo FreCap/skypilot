@@ -6996,7 +6996,12 @@ def test_server_instance_lease_publishes_ready_and_draining(
     lease = request_postgres.ServerInstanceLease('executor',
                                                  heartbeat_interval_seconds=60)
     lease.start()
-    lease.set_ready(True, health_detail={'phase': 'claiming'})
+    lease.set_ready(
+        True,
+        health_detail={
+            'phase': 'claiming',
+            request_postgres._ROLE_SUPERVISOR_START_TIME_TICKS_HEALTH_KEY: -1,
+        })
     assert lease.is_locally_ready()
     assert request_postgres.current_instance_is_ready()
     with engine.connect() as connection:
@@ -7010,7 +7015,14 @@ def test_server_instance_lease_publishes_ready_and_draining(
     assert row['pod_namespace'] == 'skypilot'
     assert row['ready']
     assert row['draining_at'] is None
-    assert row['health_detail'] == {'phase': 'claiming'}
+    process_start_ticks = row['health_detail'][
+        request_postgres._ROLE_SUPERVISOR_START_TIME_TICKS_HEALTH_KEY]
+    assert isinstance(process_start_ticks, int)
+    assert process_start_ticks > 0
+    assert row['health_detail'] == {
+        'phase': 'claiming',
+        request_postgres._ROLE_SUPERVISOR_START_TIME_TICKS_HEALTH_KEY: process_start_ticks,
+    }
     assert row['supported_handlers']
     assert row['request_storage_backend'] == (
         request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE)
@@ -7049,7 +7061,10 @@ def test_server_instance_lease_publishes_ready_and_draining(
                     instance_id))).mappings().one()
     assert not row['ready']
     assert row['draining_at'] is not None
-    assert row['health_detail'] == {'phase': 'draining'}
+    assert row['health_detail'] == {
+        'phase': 'draining',
+        request_postgres._ROLE_SUPERVISOR_START_TIME_TICKS_HEALTH_KEY: process_start_ticks,
+    }
     drain_started_at = row['draining_at']
     prior_heartbeat_at = row['heartbeat_at']
     time.sleep(0.01)
@@ -9649,6 +9664,142 @@ def test_managed_job_recovery_retains_tombstone_across_two_successors(
             leader.release()
 
     assert successor_generations == [1, 2]
+
+
+@pytest.mark.parametrize(
+    ('new_process_start_ticks', 'same_pod_uid', 'worker_matches_origin',
+     'retain_pid', 'expect_quiesced'), [
+         (1001, True, True, True, True),
+         (1001, True, False, True, True),
+         (1000, True, True, True, False),
+         (999, True, True, True, False),
+         (1001, False, True, True, False),
+         (None, True, True, True, False),
+         (1001, True, True, False, False),
+     ])
+def test_managed_job_cutover_uses_strict_newer_container_incarnation(
+        request_database, monkeypatch, new_process_start_ticks, same_pod_uid,
+        worker_matches_origin, retain_pid, expect_quiesced):
+    """Same-Pod restart proof is strict; heartbeat and PID absence are not."""
+    engine, backend = request_database
+    old_leader = _controller_leader(engine, monkeypatch, backend.instance_id)
+    old_attempt = uuid.uuid4()
+    worker_id = (old_leader.instance_id
+                 if worker_matches_origin else str(uuid.uuid4()))
+    worker_pod_name = 'managed-job-cutover-controller'
+    request_id = 'managed-job-dead-executor-tombstone'
+    old_execution_start_ticks = 1000
+    new_leader = None
+    try:
+        _seed_managed_job_attempt(engine,
+                                  old_leader,
+                                  job_id=52,
+                                  slot_id=7,
+                                  slot_attempt=old_attempt)
+        request = _managed_job_request(request_id,
+                                       old_leader,
+                                       job_id=52,
+                                       slot_id=7,
+                                       slot_attempt=old_attempt)
+        assert asyncio.run(backend.create_if_not_exists_async(request))
+
+        controller_queue = request_postgres.PostgresQueueBackend(
+            'short',
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}),
+            controller_generation=old_leader.generation)
+        item = controller_queue.get()
+        assert item is not None
+        assert item.request_id == request_id
+        assert item.claim_token is not None
+        assert backend.try_mark_running(request_id, 1234,
+                                        item.execution_generation,
+                                        item.claim_token,
+                                        old_execution_start_ticks)
+        if not worker_matches_origin or not retain_pid:
+            with engine.begin() as connection:
+                values = {}
+                if not worker_matches_origin:
+                    values['worker_instance_id'] = uuid.UUID(worker_id)
+                if not retain_pid:
+                    values['pid'] = None
+                connection.execute(
+                    sqlalchemy.update(request_postgres.REQUESTS).where(
+                        request_postgres.REQUESTS.c.request_id ==
+                        request_id).values(**values))
+
+        old_leader.release()
+        monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR,
+                           worker_id)
+        if new_process_start_ticks is None:
+
+            def missing_process_identity(_pid):
+                raise FileNotFoundError('procfs identity unavailable')
+
+            monkeypatch.setattr(storage, 'read_linux_process_start_time_ticks',
+                                missing_process_identity)
+        else:
+            monkeypatch.setattr(storage, 'read_linux_process_start_time_ticks',
+                                lambda _pid: new_process_start_ticks)
+        restarted_pod_uid = worker_id if same_pod_uid else str(uuid.uuid4())
+        restarted_instance = request_postgres.ServerInstanceLease(
+            'controller',
+            pod_identity=request_postgres.ServerPodIdentity(
+                name=worker_pod_name,
+                namespace='skypilot',
+                uid=restarted_pod_uid,
+                ip='10.0.0.1'))
+        restarted_instance._register()
+        new_leader = _controller_leader(engine, monkeypatch, worker_id)
+        assert new_leader.generation is not None
+        new_owner = (new_leader.instance_id, new_leader.generation)
+        new_backend = request_postgres.PostgresRequestBackend()
+        monkeypatch.setattr(request_postgres, '_signal_exact_executor_process',
+                            lambda *_args: False)
+
+        with pytest.raises(storage.ManagedJobRequestQuiescenceError,
+                           match=request_id):
+            new_backend.quiesce_stale_managed_job_requests(new_owner,
+                                                           timeout_seconds=0)
+        if expect_quiesced:
+            assert new_backend.quiesce_stale_managed_job_requests(
+                new_owner, timeout_seconds=0) == 1
+        else:
+            with pytest.raises(storage.ManagedJobRequestQuiescenceError,
+                               match=request_id):
+                new_backend.quiesce_stale_managed_job_requests(
+                    new_owner, timeout_seconds=0)
+        restored = backend.get_request(request_id)
+        assert restored is not None
+        assert restored.status is requests.RequestStatus.CANCELLED
+        assert restored.execution_generation == item.execution_generation
+        assert restored.execution_quiescence_required
+        if expect_quiesced:
+            assert (restored.execution_quiesced_generation ==
+                    item.execution_generation)
+            assert restored.execution_quiesced_at is not None
+        else:
+            assert restored.execution_quiesced_generation is None
+            assert restored.execution_quiesced_at is None
+        with engine.connect() as connection:
+            health_detail = connection.execute(
+                sqlalchemy.select(
+                    request_postgres.SERVER_INSTANCES.c.health_detail).where(
+                        request_postgres.SERVER_INSTANCES.c.instance_id ==
+                        uuid.UUID(worker_id))).scalar_one()
+            evidence_count = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(request_postgres.EXECUTOR_TERMINATION_EVIDENCE)
+            ).scalar_one()
+        marker = health_detail.get(
+            request_postgres._ROLE_SUPERVISOR_START_TIME_TICKS_HEALTH_KEY)
+        assert marker == new_process_start_ticks
+        assert evidence_count == 0
+    finally:
+        if new_leader is not None:
+            new_leader.release()
+        old_leader.release()
 
 
 def test_managed_job_first_slot_rollout_requires_fresh_outer_generation(

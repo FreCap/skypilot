@@ -266,7 +266,14 @@ def test_role_drain_marker_fails_readiness_before_shutdown(
     values = lease._values(include_started_at=False)  # pylint: disable=protected-access
     assert not values['ready']
     assert values['draining_at'] is not None
-    assert values['health_detail'] == {'phase': 'draining'}
+    process_start_ticks = values['health_detail'][
+        runtime.request_postgres._ROLE_SUPERVISOR_START_TIME_TICKS_HEALTH_KEY]
+    assert isinstance(process_start_ticks, int)
+    assert process_start_ticks > 0
+    assert values['health_detail'] == {
+        'phase': 'draining',
+        runtime.request_postgres._ROLE_SUPERVISOR_START_TIME_TICKS_HEALTH_KEY: process_start_ticks,
+    }
 
 
 def test_role_drain_monitor_publishes_before_requesting_shutdown(tmp_path):

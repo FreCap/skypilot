@@ -29,6 +29,7 @@ from sky.serve import controller_transport
 from sky.serve import demand_state
 from sky.serve import maintenance
 from sky.serve import ordinary_launch_binding
+from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
@@ -2215,6 +2216,62 @@ def test_bounded_teardown_empty_admission_fails_closed_without_hanging():
     worker.start.assert_not_called()
     restore.assert_not_called()
     succeeded.assert_not_called()
+    failed.assert_not_called()
+
+
+def test_bounded_teardown_drains_large_backlog_in_memory_safe_waves():
+    infos = []
+    workers = []
+    for replica_id in range(100):
+        info = types.SimpleNamespace(
+            replica_id=replica_id,
+            replica_record_id=str(uuid.UUID(int=replica_id + 1)),
+            status_property=types.SimpleNamespace(
+                sky_down_status=common_utils.ProcessStatus.SCHEDULED))
+        worker = mock.Mock(spec=thread_utils.SafeThread)
+        worker.is_alive.return_value = False
+        worker.ident = None
+
+        def _start(worker=worker):
+            worker.ident = 1
+
+        worker.start.side_effect = _start
+        worker.format_exc = None
+        infos.append(info)
+        workers.append(worker)
+
+    reserved_batches = []
+
+    def _reserve_running(batch, _termination_limit):
+        reserved_batches.append([info.replica_id for info in batch])
+        for info in batch:
+            info.status_property.sky_down_status = (
+                common_utils.ProcessStatus.RUNNING)
+        return {info.replica_id: info for info in batch}
+
+    succeeded = []
+    restore = mock.Mock()
+    failed = mock.Mock()
+    with mock.patch.object(serve_utils.time, 'sleep'):
+        serve_utils.run_bounded_serve_teardown_threads(
+            list(zip(infos, workers)),
+            pool=False,
+            reserve_running=_reserve_running,
+            restore_never_started=restore,
+            handle_success=lambda info: succeeded.append(info.replica_id),
+            handle_failure=failed,
+            continue_guard=lambda: True,
+            max_concurrent_per_service=(
+                replica_managers.MAX_CONCURRENT_DOWNS_PER_SERVICE))
+
+    assert max(map(len, reserved_batches)) <= 4
+    assert [replica_id for batch in reserved_batches for replica_id in batch
+           ] == list(range(100))
+    assert succeeded == list(range(100))
+    for worker in workers:
+        worker.start.assert_called_once_with()
+        worker.join.assert_called_once_with()
+    restore.assert_not_called()
     failed.assert_not_called()
 
 

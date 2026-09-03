@@ -231,7 +231,9 @@ class IncrementalRouteWorker:
                        for outcome in (target_outcome, compose_outcome)
                        if outcome is not None and outcome.error is not None)
         if any(
-                isinstance(error, route_projection.RouteProjectionConflict)
+                isinstance(error, route_projection.RouteProjectionConflict) and
+                not isinstance(error,
+                               route_projection.RouteProjectionSnapshotChanged)
                 for error in errors):
             self._install_target_snapshot(())
             logger.info('Incremental route worker lost exact publication '
@@ -270,9 +272,15 @@ class IncrementalRouteWorker:
                     f'{common_utils.format_exception(target_outcome.error)}')
 
         if compose_outcome is not None and compose_outcome.error is not None:
-            logger.warning(
-                'Incremental route composition failed: '
-                f'{common_utils.format_exception(compose_outcome.error)}')
+            if isinstance(compose_outcome.error,
+                          route_projection.RouteProjectionSnapshotChanged):
+                logger.debug(
+                    'Incremental route inputs changed during composition; '
+                    'retrying with a fresh snapshot.')
+            else:
+                logger.warning(
+                    'Incremental route composition failed: '
+                    f'{common_utils.format_exception(compose_outcome.error)}')
         return True
 
     async def _probe(
