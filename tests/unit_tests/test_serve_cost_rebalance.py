@@ -418,6 +418,35 @@ class TestEconomicDecisions:
             if d.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
         ]) == 1
 
+    def test_stabilization_timer_does_not_cross_replica_record_aba(
+            self, monkeypatch):
+        """A replacement row cannot inherit its predecessor's elapsed time."""
+        now = [100.0]
+        monkeypatch.setattr(autoscalers.time, 'time', lambda: now[0])
+        spec = _spec(min_replicas=1,
+                     max_replicas=1,
+                     cost_rebalance_stabilization_seconds=300.0)
+        scaler = _autoscaler(spec)
+        placer, paid, _, replicas = self._fleet()
+        scaler.set_spot_placer(placer)
+        predecessor = replicas[0]
+        _report(scaler, [predecessor])
+        assert not _decisions(scaler, [predecessor])
+
+        successor = _Replica(predecessor.replica_id, paid, 1.0)
+        successor.replica_record_id = _replica_record_id(999)
+        now[0] = 400.0
+        _report(scaler, [successor])
+        assert not _decisions(scaler, [successor])
+
+        now[0] = 699.0
+        assert not _decisions(scaler, [successor])
+        now[0] = 700.0
+        assert len([
+            decision for decision in _decisions(scaler, [successor]) if
+            decision.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
+        ]) == 1
+
     def test_stabilization_survives_restart(self, monkeypatch):
         paid = spot_placer.Location(cloud=clouds.AWS(),
                                     region='us-east-1',
@@ -451,6 +480,41 @@ class TestEconomicDecisions:
         now[0] = 400.0
         assert len([
             decision for decision in _decisions(restored, replicas) if
+            decision.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
+        ]) == 1
+
+    def test_restored_stabilization_timer_does_not_cross_replica_record_aba(
+            self, monkeypatch):
+        """Restart state names the durable row identity, not its reusable id."""
+        now = [100.0]
+        monkeypatch.setattr(autoscalers.time, 'time', lambda: now[0])
+        spec = _spec(min_replicas=1,
+                     max_replicas=1,
+                     cost_rebalance_stabilization_seconds=300.0)
+        scaler = _autoscaler(spec)
+        placer, paid, _, replicas = self._fleet()
+        scaler.set_spot_placer(placer)
+        predecessor = replicas[0]
+        _report(scaler, [predecessor])
+        assert not _decisions(scaler, [predecessor])
+        state = scaler.dump_cost_rebalance_state()
+        assert state['candidates'][0]['replica_record_id'] == (
+            predecessor.replica_record_id)
+        assert 'replica_id' not in state['candidates'][0]
+
+        successor = _Replica(predecessor.replica_id, paid, 1.0)
+        successor.replica_record_id = _replica_record_id(999)
+        now[0] = 399.0
+        restored = _autoscaler(spec)
+        restored.load_cost_rebalance_state(state)
+        restored.set_spot_placer(placer)
+        _report(restored, [successor])
+        assert not _decisions(restored, [successor])
+        now[0] = 400.0
+        assert not _decisions(restored, [successor])
+        now[0] = 699.0
+        assert len([
+            decision for decision in _decisions(restored, [successor]) if
             decision.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
         ]) == 1
 

@@ -1,6 +1,8 @@
 """Autoscalers: perform autoscaling by monitoring metrics."""
 import bisect
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable
+from collections.abc import Mapping
+from collections.abc import Sequence
 import contextlib
 import copy
 import dataclasses
@@ -552,7 +554,7 @@ _LOGICAL_ROLLING_UPDATE_MAX_RETIREMENTS_PER_TICK = 20
 # while restoring downscale liveness under trickle traffic. The veto does
 # not restart the already elapsed downscale delay.
 _MAX_CONSECUTIVE_DOWNSCALE_VETOES = 2
-_COST_REBALANCE_STATE_VERSION = 1
+_COST_REBALANCE_STATE_VERSION = 2
 _COST_REBALANCE_STATE_MAX_ENTRIES = 256
 # Converting a modeled work floor back into whole slots divides one float by
 # another, and both sides carry binary-float tails. A retention floor built
@@ -1075,7 +1077,7 @@ class Autoscaler:
         self._cold_paid_costs_tick_active = False
         self._cold_paid_location_costs_for_tick: (Mapping[spot_placer.Location,
                                                           float] | None) = None
-        self._cost_rebalance_candidate_since: dict[tuple[int,
+        self._cost_rebalance_candidate_since: dict[tuple[str,
                                                          spot_placer.Location],
                                                    float] = {}
         self._cost_rebalance_state_dirty = False
@@ -1415,12 +1417,12 @@ class Autoscaler:
         limit = min(_COST_REBALANCE_STATE_MAX_ENTRIES,
                     max(16, 4 * self.cost_rebalance_max_parallel_replacements))
         candidates = []
-        for (replica_id, location), first_seen_at in list(
+        for (replica_record_id, location), first_seen_at in list(
                 self._cost_rebalance_candidate_since.items())[:limit]:
             if not math.isfinite(first_seen_at):
                 continue
             candidates.append({
-                'replica_id': replica_id,
+                'replica_record_id': replica_record_id,
                 'location': location.to_pickleable(),
                 'first_seen_at': first_seen_at,
             })
@@ -1446,13 +1448,16 @@ class Autoscaler:
         for raw in candidates[:limit]:
             if not isinstance(raw, dict):
                 continue
-            replica_id = raw.get('replica_id')
+            raw_replica_record_id = raw.get('replica_record_id')
             first_seen_at = raw.get('first_seen_at')
-            if (not isinstance(replica_id, int) or
-                    isinstance(replica_id, bool) or replica_id < 0 or
+            if (not isinstance(raw_replica_record_id, str) or
                     not isinstance(first_seen_at, (int, float)) or
                     isinstance(first_seen_at, bool) or
                     not math.isfinite(first_seen_at)):
+                continue
+            try:
+                replica_record_id = str(uuid.UUID(raw_replica_record_id))
+            except ValueError:
                 continue
             raw_location = raw.get('location')
             if not isinstance(raw_location, dict):
@@ -1463,7 +1468,8 @@ class Autoscaler:
                 continue
             if location is None:
                 continue
-            restored[(replica_id, location)] = min(float(first_seen_at), now)
+            restored[(replica_record_id,
+                      location)] = min(float(first_seen_at), now)
         self._cost_rebalance_candidate_since = restored
         self._cost_rebalance_state_dirty = False
 
@@ -3784,14 +3790,19 @@ class Autoscaler:
             ) for location in active_locations
         }
         now = time.time()
-        current_candidate_keys: set[tuple[int, spot_placer.Location]] = set()
+        current_candidate_keys: set[tuple[str, spot_placer.Location]] = set()
         for incumbent in candidates:
             location = self._best_cost_rebalance_candidate(
                 incumbent, active_locations, location_load,
                 known_location_costs)
             if location is None:
                 continue
-            key = (incumbent.replica_id, location)
+            try:
+                replica_record_id = str(
+                    uuid.UUID(str(incumbent.replica_record_id)))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            key = (replica_record_id, location)
             current_candidate_keys.add(key)
             first_seen = self._cost_rebalance_candidate_since.get(key)
             if first_seen is None:
