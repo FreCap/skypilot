@@ -34,7 +34,6 @@ jobs:
       release_version: ${{ steps.determine_version.outputs.release_version }}
       new_commit_sha: ${{ steps.create_test_branch.outputs.new_commit_sha }}
       previous_release_branch: ${{ steps.find_previous_release_branch.outputs.previous_release_branch }}
-      previous_minor_release_branch: ${{ steps.find_previous_release_branch.outputs.previous_minor_release_branch }}
 
     steps:
       - name: Clone repository
@@ -67,20 +66,6 @@ jobs:
 
           # Output the latest PyPI version for subsequent steps
           echo "latest_pypi_version=${LATEST_PYPI_VERSION}" >> $GITHUB_OUTPUT
-
-          # Find the latest version of the previous minor version
-          MAJOR=$(echo $LATEST_PYPI_VERSION | cut -d. -f1)
-          MINOR=$(echo $LATEST_PYPI_VERSION | cut -d. -f2)
-          PREVIOUS_MINOR=$((MINOR - 1))
-          PREVIOUS_MINOR_LATEST_VERSION=$(curl -s https://pypi.org/pypi/skypilot/json | jq -r ".releases | keys[]" | grep "^${MAJOR}\.${PREVIOUS_MINOR}\." | sort -V | tail -n 1)
-          if [ -n "${PREVIOUS_MINOR_LATEST_VERSION}" ]; then
-            PREVIOUS_MINOR_RELEASE_BRANCH="releases/${PREVIOUS_MINOR_LATEST_VERSION}"
-            echo "previous_minor_release_branch=${PREVIOUS_MINOR_RELEASE_BRANCH}" >> $GITHUB_OUTPUT
-            echo "Determined previous minor release branch: ${PREVIOUS_MINOR_RELEASE_BRANCH}"
-          else
-            echo "Could not determine previous minor release branch."
-            echo "previous_minor_release_branch=" >> $GITHUB_OUTPUT
-          fi
 
       # Determine release version based on trigger type
       - name: Determine release version
@@ -259,29 +244,9 @@ jobs:
     with:
       commit: ${{ needs.release-build.outputs.new_commit_sha }}
       branch: ${{ needs.release-build.outputs.test_branch }}
-      message: "Release ${{ needs.release-build.outputs.release_version }}"
+      message: "Release ${{ needs.release-build.outputs.release_version }} (vs Boltz compatibility floor v1.1.1653)"
       pipeline: "quicktest-core"
-      build_env_vars: '{"ARGS": "--base-branch ${{ needs.release-build.outputs.previous_release_branch }}"}'
-      timeout_minutes: 180
-      wait: true
-      fail_on_buildkite_failure: true
-    secrets:
-      BUILDKITE_TOKEN: ${{ secrets.BUILDKITE_TOKEN }}
-
-  quicktest-core-previous-minor:
-    needs: release-build
-    if: |
-      always() &&
-      needs.release-build.result == 'success' &&
-      github.event.inputs.skip_smoke_tests != 'true' &&
-      github.event.inputs.promote_rc_to_stable != 'true'
-    uses: ./.github/workflows/buildkite-trigger-wait.yml
-    with:
-      commit: ${{ needs.release-build.outputs.new_commit_sha }}
-      branch: ${{ needs.release-build.outputs.test_branch }}
-      message: "Release ${{ needs.release-build.outputs.release_version }} (vs previous minor)"
-      pipeline: "quicktest-core"
-      build_env_vars: '{"ARGS": "--base-branch ${{ needs.release-build.outputs.previous_minor_release_branch }}"}'
+      build_env_vars: '{"ARGS": "--base-branch v1.1.1653"}'
       timeout_minutes: 180
       wait: true
       fail_on_buildkite_failure: true
@@ -348,7 +313,7 @@ jobs:
       BUILDKITE_TOKEN: ${{ secrets.BUILDKITE_TOKEN }}
 
   create-pr:
-    needs: [release-build, smoke-tests, quicktest-core, quicktest-core-previous-minor, smoke-tests-remote-server-kubernetes, smoke-tests-kubernetes-jobs-consolidation, release-tests]
+    needs: [release-build, smoke-tests, quicktest-core, smoke-tests-remote-server-kubernetes, smoke-tests-kubernetes-jobs-consolidation, release-tests]
     if: always() && needs.release-build.result == 'success'
     runs-on: namespace-profile-skypilot-ci-1x2
     steps:
@@ -399,8 +364,7 @@ jobs:
 
           Buildkite Test Links:
           - [Full Smoke Tests](https://buildkite.com/skypilot-1/full-smoke-tests-run/builds/${{ needs.smoke-tests.outputs.build_number }}) - $([ "${{ needs.smoke-tests.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
-          - [Quicktest Core](https://buildkite.com/skypilot-1/quicktest-core/builds/${{ needs.quicktest-core.outputs.build_number }}) - $([ "${{ needs.quicktest-core.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
-          - [Quicktest Core (vs Previous Minor)](https://buildkite.com/skypilot-1/quicktest-core/builds/${{ needs.quicktest-core-previous-minor.outputs.build_number }}) - $([ "${{ needs.quicktest-core-previous-minor.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
+          - [Quicktest Core (vs Boltz Floor v1.1.1653)](https://buildkite.com/skypilot-1/quicktest-core/builds/${{ needs.quicktest-core.outputs.build_number }}) - $([ "${{ needs.quicktest-core.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
           - [Smoke Tests Remote Server Kubernetes](https://buildkite.com/skypilot-1/smoke-tests/builds/${{ needs.smoke-tests-remote-server-kubernetes.outputs.build_number }}) - $([ "${{ needs.smoke-tests-remote-server-kubernetes.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
           - [Smoke Tests Kubernetes (Jobs Consolidation)](https://buildkite.com/skypilot-1/smoke-tests/builds/${{ needs.smoke-tests-kubernetes-jobs-consolidation.outputs.build_number }}) - $([ "${{ needs.smoke-tests-kubernetes-jobs-consolidation.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
           - [Release Tests](https://buildkite.com/skypilot-1/release/builds/${{ needs.release-tests.outputs.build_number }}) - ⏳ (not waiting for completion)
@@ -445,8 +409,7 @@ jobs:
 
           ## Buildkite Test Links
           - [Full Smoke Tests](https://buildkite.com/skypilot-1/full-smoke-tests-run/builds/${{ needs.smoke-tests.outputs.build_number }}) - $([ "${{ needs.smoke-tests.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
-          - [Quicktest Core](https://buildkite.com/skypilot-1/quicktest-core/builds/${{ needs.quicktest-core.outputs.build_number }}) - $([ "${{ needs.quicktest-core.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
-          - [Quicktest Core (vs Previous Minor)](https://buildkite.com/skypilot-1/quicktest-core/builds/${{ needs.quicktest-core-previous-minor.outputs.build_number }}) - $([ "${{ needs.quicktest-core-previous-minor.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
+          - [Quicktest Core (vs Boltz Floor v1.1.1653)](https://buildkite.com/skypilot-1/quicktest-core/builds/${{ needs.quicktest-core.outputs.build_number }}) - $([ "${{ needs.quicktest-core.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
           - [Smoke Tests Remote Server Kubernetes](https://buildkite.com/skypilot-1/smoke-tests/builds/${{ needs.smoke-tests-remote-server-kubernetes.outputs.build_number }}) - $([ "${{ needs.smoke-tests-remote-server-kubernetes.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
           - [Smoke Tests Kubernetes (Jobs Consolidation)](https://buildkite.com/skypilot-1/smoke-tests/builds/${{ needs.smoke-tests-kubernetes-jobs-consolidation.outputs.build_number }}) - $([ "${{ needs.smoke-tests-kubernetes-jobs-consolidation.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
           - [Release Tests](https://buildkite.com/skypilot-1/release/builds/${{ needs.release-tests.outputs.build_number }}) - ⏳ (not waiting for completion)

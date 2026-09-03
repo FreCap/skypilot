@@ -29,15 +29,15 @@ import re
 import shlex
 import subprocess
 import sys
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import click
 from conftest import all_clouds_in_smoke_tests
 from conftest import cloud_to_pytest_keyword
 from conftest import default_clouds_to_run
-import requests
 import yaml
+
+from sky.server import constants as server_constants
 
 DEFAULT_CLOUDS_TO_RUN = default_clouds_to_run
 PYTEST_TO_CLOUD_KEYWORD = {v: k for k, v in cloud_to_pytest_keyword.items()}
@@ -528,74 +528,28 @@ def _convert_release(test_files: List[str], args: str,
                                   trigger_command)
 
 
-def _rest_request(url: str,
-                  method: str,
-                  json: Optional[Dict[str, Any]] = None) -> Any:
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            resp = requests.request(method, url, json=json, timeout=10)
-        except Exception as e:  # pylint: disable=broad-except
-            # Retry on transient network errors
-            if attempt >= 3:
-                raise RuntimeError(f'network error: {e}') from e
-            time.sleep(1)
-            continue
-
-        # Retry on 5xx and 429
-        if resp.status_code >= 500 or resp.status_code == 429:
-            if attempt >= 3:
-                raise RuntimeError(f'error {resp.status_code}: {resp.text}')
-            time.sleep(1)
-            continue
-
-        if resp.status_code >= 400:
-            # Non-retryable client error
-            raise RuntimeError(f'error {resp.status_code}: {resp.text}')
-
-        if resp.text:
-            try:
-                return resp.json()
-            except Exception:  # pylint: disable=broad-except
-                return resp.text
-        return None
-
-
-def _get_latest_pypi_version():
-    resp = _rest_request('https://pypi.org/pypi/skypilot/json', 'GET')
-    if isinstance(resp, dict):
-        return resp.get('info', {}).get('version')
-    raise RuntimeError(f'Failed to get latest pypi version: {resp}')
-
-
 def _convert_quick_tests_core(test_files: List[str], args: str,
                               trigger_command: str) -> int:
     yaml_file_path = '.buildkite/pipeline_smoke_tests_quick_tests_core.yaml'
-    base_branch = '--base-branch' in args
-    base_branches = []
-    if not base_branch:
-        latest_pypi_version = _get_latest_pypi_version()
-        print(f'latest_pypi_version: {latest_pypi_version}')
-        base_branches = ['master', f'v{latest_pypi_version}']
-    print(f'base_branches: {base_branches}')
+    has_explicit_base_branch = any(
+        arg == '--base-branch' or arg.startswith('--base-branch=')
+        for arg in shlex.split(args))
+    compatibility_base_branch = (None if has_explicit_base_branch else
+                                 f'v{server_constants.MIN_COMPATIBLE_VERSION}')
+    print(f'compatibility_base_branch: {compatibility_base_branch}')
     output_file_pipelines = []
     for test_file in test_files:
         print(f'Converting {test_file} to {yaml_file_path}')
         # We want enable all clouds by default for each test function
         # for pre-merge. And let the author controls which clouds
         # to run by parameter.
-        if base_branches:
-            for branch in base_branches:
-                if ('test_quick_tests_core.py' in test_file and
-                        branch != 'master'):
-                    continue
-                pipeline = _generate_pipeline(test_file,
-                                              args + f' --base-branch {branch}')
-                output_file_pipelines.append(pipeline)
-        else:
-            pipeline = _generate_pipeline(test_file, args)
-            output_file_pipelines.append(pipeline)
+        test_args = args
+        if (compatibility_base_branch is not None and
+                'test_backward_compat.py' in test_file):
+            test_args = (
+                f'{args} --base-branch {compatibility_base_branch}').strip()
+        pipeline = _generate_pipeline(test_file, test_args)
+        output_file_pipelines.append(pipeline)
         print(f'Converted {test_file} to {yaml_file_path}\n\n')
     return _dump_pipeline_to_file(
         yaml_file_path,

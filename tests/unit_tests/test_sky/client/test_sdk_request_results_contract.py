@@ -212,7 +212,7 @@ def test_v95_detail_without_marker_never_authorizes_replay():
             _get()
 
 
-def test_v94_exact_legacy_detail_authorizes_replay_during_upgrade():
+def test_v94_exact_legacy_detail_is_rejected_after_marker_cutover():
     response = _response(
         503,
         headers={server_constants.API_VERSION_HEADER: '94'},
@@ -220,9 +220,18 @@ def test_v94_exact_legacy_detail_authorizes_replay_during_upgrade():
 
     with mock.patch.object(request_results.server_common,
                            'make_authenticated_request',
-                           return_value=response):
-        with pytest.raises(exceptions.RequestResultShouldRetryError):
+                           return_value=response) as fetch, mock.patch.object(
+                               request_results.context_utils,
+                               'sleep_with_cancellation') as sleep:
+        with pytest.raises(exceptions.RequestResultUnavailableError) as exc:
             _get()
+
+    assert exc.value.request_id == _REQUEST_ID
+    assert fetch.call_count == 3
+    assert sleep.call_count == 2
+    # Transitional characterization: the floor rejects v94, but the legacy
+    # parser remains until the stacked cleanup PR removes it.
+    assert response.json.call_count == 3
 
 
 def test_malformed_success_is_an_unknown_observation():

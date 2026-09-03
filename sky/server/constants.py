@@ -13,17 +13,20 @@ from sky.utils import controller_constants
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
 API_VERSION = 95  # Exact request-result retry marker
 
-# The minimum peer API version that the code should still work with.
+# The minimum declared peer API version that the code should still work with.
 # Notes (dev):
-# - This value is maintained by the CI pipeline, DO NOT EDIT this manually.
-# - Compatibility code for versions lower than this can be safely removed.
+# - Advancing this value is an explicit compatibility cutover. Artifact
+#   publishing does not update it automatically.
+# - A compatibility branch can be removed when its only reachable callers are
+#   peers that declare a version below this floor.  Headerless and internal
+#   routes must be audited separately.
 # Refer to API_VERSION for more details.
-MIN_COMPATIBLE_API_VERSION = 24
+MIN_COMPATIBLE_API_VERSION = 95
 
 # The semantic version of the minimum compatible API version.
 # Refer to MIN_COMPATIBLE_API_VERSION for more details.
-# Note (dev): DO NOT EDIT this constant manually.
-MIN_COMPATIBLE_VERSION = '0.11.0'
+# Note (dev): update this with MIN_COMPATIBLE_API_VERSION during a cutover.
+MIN_COMPATIBLE_VERSION = '1.1.1653'
 
 # The HTTP header name for the API version of the sender.
 API_VERSION_HEADER = 'X-SkyPilot-API-Version'
