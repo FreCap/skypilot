@@ -51,6 +51,7 @@ from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
 from sky.serve import route_projection
 from sky.serve import route_projection_schema
+from sky.serve import serve_history
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import serve_utils
@@ -3397,9 +3398,14 @@ def test_paid_atomic_commit_precedes_best_effort_history_transaction(
     history_error = RuntimeError('injected best-effort history failure')
     history_writer = mock.Mock(
         side_effect=history_error if history_fails else None, return_value=1)
-    monkeypatch.setattr(capacity_admission.serve_history,
-                        'record_autoscaler_snapshot_in_connection',
-                        history_writer)
+    history_writer_name = 'record_autoscaler_snapshot_in_connection'
+    monkeypatch.setattr(serve_history, history_writer_name, history_writer)
+    # Patch the loaded module, not the LazyImport facade.  Patching the facade
+    # leaves a restored attribute in its __dict__, shadowing later patches to
+    # the real module and making test outcomes depend on collection order.
+    assert history_writer_name not in vars(capacity_admission.serve_history)
+    assert (capacity_admission.serve_history.
+            record_autoscaler_snapshot_in_connection is history_writer)
     call_kwargs = {
         **_current_owner_kwargs(engine),
         'service_name': 'svc',
@@ -3431,6 +3437,15 @@ def test_paid_atomic_commit_precedes_best_effort_history_transaction(
     history_writer.assert_called_once()
     provider_io.assert_not_called()
     materialize_log.assert_called_once()
+
+
+def test_paid_history_writer_patch_preserves_lazy_import_delegation():
+    history_writer_name = 'record_autoscaler_snapshot_in_connection'
+
+    assert history_writer_name not in vars(capacity_admission.serve_history)
+    assert (capacity_admission.serve_history.
+            record_autoscaler_snapshot_in_connection
+            is serve_history.record_autoscaler_snapshot_in_connection)
 
 
 def test_paid_canonical_preflight_and_log_io_are_outside_correctness_locks(
