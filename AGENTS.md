@@ -228,7 +228,9 @@ production state it observes. Model admission, processing/occupancy, and
 terminal-publication clocks explicitly, and keep the dependency graph from
 stimulus through production effects to proof acyclic. A verifier may consume
 those effects; success or failure of the verifier must not determine when the
-observed work finishes or when its terminal state is published.
+observed work finishes or when its terminal state is published. A failed proof
+may stop future, never-offered stimulus, but the driver must drain already-
+offered work through its real terminal-publication path before it exits.
 
 Each non-unit test must state its layer in the module docstring and enter
 through the exact public or production scheduling boundary named there. An

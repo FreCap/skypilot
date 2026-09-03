@@ -4556,13 +4556,120 @@ def test_scale_and_positive_proof_failure_cancels_sibling():
             sibling_cancelled.set()
 
     async def exercise():
+        campaign_progress = qualifier.ExactRequestCampaignProgress(
+            total_count=1, window_size=1)
+
+        async def wait_for_stop():
+            while (await campaign_progress.snapshot()).accepting_offers:
+                await asyncio.sleep(0)
+            return 0
+
+        traffic = asyncio.create_task(wait_for_stop())
         with pytest.raises(qualifier.QualificationError,
                            match='physical gate failed'):
-            await qualifier._join_independent_proofs(fail_scale(),
-                                                     wait_positive())
+            await qualifier._join_independent_proofs(
+                fail_scale(),
+                wait_positive(),
+                traffic=traffic,
+                campaign_progress=campaign_progress)
         assert sibling_cancelled.is_set()
+        assert traffic.result() == 0
 
     asyncio.run(exercise())
+
+
+def test_observer_failure_drains_offered_request_before_campaign_exit():
+    offered: list[str] = []
+    completed: list[str] = []
+    first_accepted = asyncio.Event()
+
+    def receipt_headers(request_id, *, state, revision):
+        return {
+            qualifier.serve_constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: '1',
+            qualifier.serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: 'incarnation',
+            qualifier.serve_constants.LB_ASYNC_ATTEMPT_ID_HEADER: str(
+                uuid.uuid5(uuid.NAMESPACE_URL, request_id)),
+            qualifier.serve_constants.LB_ASYNC_ATTEMPT_NO_HEADER: '1',
+            qualifier.serve_constants.LB_ASYNC_LEDGER_REVISION_HEADER:
+                str(revision),
+            qualifier.serve_constants.LB_ASYNC_LEDGER_STATE_HEADER: state,
+        }
+
+    async def predict(request):
+        payload = await request.json()
+        request_id = payload['request_id']
+        offered.append(request_id)
+        first_accepted.set()
+        return aiohttp.web.json_response(
+            {
+                'request_id': request_id,
+                'status': 'accepted',
+            },
+            status=202,
+            headers=receipt_headers(request_id, state='ACCEPTED', revision=2))
+
+    async def complete(request):
+        payload = await request.json()
+        request_id = payload['request_id']
+        completed.append(request_id)
+        return aiohttp.web.Response(status=204,
+                                    headers=receipt_headers(request_id,
+                                                            state='SUCCEEDED',
+                                                            revision=3))
+
+    async def exercise():
+        app = aiohttp.web.Application()
+        app.router.add_post('/v1/models/model:predict', predict)
+        app.router.add_post(
+            qualifier.serve_constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+            complete)
+        runner = aiohttp.web.AppRunner(app)
+        await runner.setup()
+        site = aiohttp.web.TCPSite(runner, '127.0.0.1', 0)
+        await site.start()
+        assert site._server is not None
+        endpoint = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
+        progress = qualifier.ExactRequestCampaignProgress(total_count=3,
+                                                          window_size=1)
+        traffic = asyncio.create_task(
+            qualifier.send_exact_async_requests(endpoint=endpoint,
+                                                token='secret',
+                                                service_hash='incarnation',
+                                                prefix='observer-failure',
+                                                count=3,
+                                                concurrency=1,
+                                                hold_requests=3,
+                                                hold_seconds=0.01,
+                                                timeout_seconds=2,
+                                                campaign_progress=progress))
+
+        async def fail_observer():
+            await first_accepted.wait()
+            raise qualifier.QualificationError('observer failed')
+
+        async def sibling_observer():
+            await asyncio.Event().wait()
+
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='observer failed'):
+                await qualifier._join_independent_proofs(
+                    fail_observer(),
+                    sibling_observer(),
+                    traffic=traffic,
+                    campaign_progress=progress)
+            return await progress.snapshot()
+        finally:
+            if not traffic.done():
+                traffic.cancel()
+                await asyncio.gather(traffic, return_exceptions=True)
+            await runner.cleanup()
+
+    snapshot = asyncio.run(exercise())
+    assert offered == completed
+    assert len(completed) == 1
+    assert snapshot == qualifier.ExactRequestCampaignCounters(
+        offered=1, succeeded=1, accepting_offers=False)
 
 
 def test_scale_wait_accepts_provider_convergence_after_diagnostic_slo(tmp_path):

@@ -180,6 +180,7 @@ class ExactRequestCampaignCounters:
 
     offered: int
     succeeded: int
+    accepting_offers: bool = True
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -190,6 +191,9 @@ class ExactRequestCampaignProgress:
     window_size: int
     _offered: int = dataclasses.field(default=0, init=False, repr=False)
     _succeeded: int = dataclasses.field(default=0, init=False, repr=False)
+    _accepting_offers: bool = dataclasses.field(default=True,
+                                                init=False,
+                                                repr=False)
     _lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock,
                                             init=False,
                                             repr=False)
@@ -200,9 +204,11 @@ class ExactRequestCampaignProgress:
                 self.window_size > self.total_count):
             raise ValueError('Exact request campaign progress is invalid.')
 
-    async def mark_offered(self) -> None:
+    async def mark_offered(self) -> bool:
         """Record a never-before-offered ID immediately before its first POST."""
         async with self._lock:
+            if not self._accepting_offers:
+                return False
             if self._offered >= self.total_count:
                 raise QualificationError(
                     'Exact request campaign offered too many identities.')
@@ -210,6 +216,7 @@ class ExactRequestCampaignProgress:
                 raise QualificationError(
                     'Exact request campaign exceeded its active window.')
             self._offered += 1
+            return True
 
     async def mark_succeeded(self) -> None:
         """Record one exact terminal receipt before the worker takes another ID."""
@@ -219,11 +226,18 @@ class ExactRequestCampaignProgress:
                     'Exact request campaign terminal order is invalid.')
             self._succeeded += 1
 
+    async def stop_offering(self) -> None:
+        """Stop new IDs while allowing already-offered work to complete."""
+        async with self._lock:
+            self._accepting_offers = False
+
     async def snapshot(self) -> ExactRequestCampaignCounters:
         """Return a read-only atomic view for an evidence observer."""
         async with self._lock:
-            return ExactRequestCampaignCounters(offered=self._offered,
-                                                succeeded=self._succeeded)
+            return ExactRequestCampaignCounters(
+                offered=self._offered,
+                succeeded=self._succeeded,
+                accepting_offers=(self._accepting_offers))
 
 
 def _next_scale_arrival_attribution_state(
@@ -4697,7 +4711,9 @@ async def send_exact_async_requests(
                 index, request_id = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
-            await campaign_progress.mark_offered()
+            if not await campaign_progress.mark_offered():
+                queue.task_done()
+                return
             await _one_exact_async_request(
                 session,
                 endpoint=endpoint,
@@ -4716,7 +4732,10 @@ async def send_exact_async_requests(
                                      connector=connector) as session:
         await asyncio.gather(*(worker() for _ in range(worker_count)))
     final = await campaign_progress.snapshot()
-    if final != ExactRequestCampaignCounters(offered=count, succeeded=count):
+    complete = (final.offered == count and final.succeeded == count)
+    drained_after_stop = (not final.accepting_offers and
+                          final.offered == final.succeeded)
+    if not (complete or drained_after_stop):
         raise QualificationError('Exact request campaign is incomplete.')
     return final.succeeded
 
@@ -5078,9 +5097,23 @@ async def _wait_for_scale(
         f'providers {expectation.providers}.')
 
 
+async def _stop_new_campaign_work_and_drain(
+    *,
+    traffic: asyncio.Task[int],
+    campaign_progress: ExactRequestCampaignProgress,
+) -> int | None:
+    """Stop new stimulus and drain every identity already offered."""
+    await campaign_progress.stop_offering()
+    result, = await asyncio.gather(traffic, return_exceptions=True)
+    return result if type(result) is int else None
+
+
 async def _join_independent_proofs(
     scale_proof: collections.abc.Awaitable[Any],
     positive_proof: collections.abc.Awaitable[Any],
+    *,
+    traffic: asyncio.Task[int],
+    campaign_progress: ExactRequestCampaignProgress,
 ) -> None:
     """Await two read-only proof consumers without controlling request work."""
     proof_tasks = (asyncio.ensure_future(scale_proof),
@@ -5088,9 +5121,11 @@ async def _join_independent_proofs(
     try:
         await asyncio.gather(*proof_tasks)
     except BaseException:
+        await campaign_progress.stop_offering()
         for task in proof_tasks:
             task.cancel()
         await asyncio.gather(*proof_tasks, return_exceptions=True)
+        await asyncio.gather(traffic, return_exceptions=True)
         raise
 
 
@@ -5122,7 +5157,9 @@ async def _wait_for_scale_and_positive_request_telemetry(
             receipt=receipt,
             traffic=traffic,
             baseline=baseline,
-            deadline_monotonic=positive_deadline_monotonic))
+            deadline_monotonic=positive_deadline_monotonic),
+        traffic=traffic,
+        campaign_progress=campaign_progress)
 
 
 async def _wait_for_drain(
@@ -6467,7 +6504,8 @@ async def qualify(args: argparse.Namespace) -> None:
     ledger_baseline: RequestTelemetry | None = None
     ledger_final: RequestTelemetry | None = None
     failure: BaseException | None = None
-    campaign_tasks: list[asyncio.Task[int]] = []
+    campaign_progress: ExactRequestCampaignProgress | None = None
+    traffic: asyncio.Task[int] | None = None
     run_id = f'{args.service_name}-{int(time.time())}'
     try:
         await http.prove_authentication()
@@ -6499,7 +6537,6 @@ async def qualify(args: argparse.Namespace) -> None:
                     timeout_seconds=(profile.scale_timeout_seconds +
                                      profile.drain_timeout_seconds),
                     campaign_progress=campaign_progress))
-            campaign_tasks.append(traffic)
             stimulus_deadline = (progress.scale_started_monotonic +
                                  _CAMPAIGN_LOAD_WINDOW_SECONDS)
             await _wait_for_scale_stimulus(observer=observer,
@@ -6510,6 +6547,11 @@ async def qualify(args: argparse.Namespace) -> None:
                                            expected_resident=stimulus_count,
                                            deadline_monotonic=stimulus_deadline)
         else:
+            worker_count = min(expectation.exact_request_count,
+                               profile.request_concurrency)
+            campaign_progress = ExactRequestCampaignProgress(
+                total_count=expectation.exact_request_count,
+                window_size=worker_count)
             traffic = asyncio.create_task(
                 send_exact_async_requests(
                     endpoint=args.endpoint,
@@ -6521,10 +6563,12 @@ async def qualify(args: argparse.Namespace) -> None:
                     hold_requests=scale_stimulus_count(profile),
                     hold_seconds=request_processing_seconds(profile),
                     timeout_seconds=(profile.scale_timeout_seconds +
-                                     profile.drain_timeout_seconds)))
-            campaign_tasks.append(traffic)
+                                     profile.drain_timeout_seconds),
+                    campaign_progress=campaign_progress))
         try:
             assert ledger_baseline is not None
+            assert traffic is not None
+            assert campaign_progress is not None
             if profile.name == 'scale':
                 await _wait_for_scale_and_positive_request_telemetry(
                     observer=observer,
@@ -6554,8 +6598,10 @@ async def qualify(args: argparse.Namespace) -> None:
                                       expectation=expectation)
             exact_request_successes = await traffic
         except BaseException:
-            traffic.cancel()
-            await asyncio.gather(traffic, return_exceptions=True)
+            drained_successes = await _stop_new_campaign_work_and_drain(
+                traffic=traffic, campaign_progress=campaign_progress)
+            if drained_successes is not None:
+                exact_request_successes = drained_successes
             raise
         if exact_request_successes != expectation.exact_request_count:
             raise QualificationError('Exact request count is incomplete.')
@@ -6572,9 +6618,12 @@ async def qualify(args: argparse.Namespace) -> None:
                               receipt=receipt,
                               expectation=expectation)
     except BaseException as error:
-        for task in campaign_tasks:
-            task.cancel()
-        await asyncio.gather(*campaign_tasks, return_exceptions=True)
+        if (traffic is not None and campaign_progress is not None and
+                not traffic.done()):
+            drained_successes = await _stop_new_campaign_work_and_drain(
+                traffic=traffic, campaign_progress=campaign_progress)
+            if drained_successes is not None:
+                exact_request_successes = drained_successes
         failure = error
         raise
     finally:

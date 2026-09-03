@@ -273,14 +273,20 @@ campaign produces a bounded sliding demand window; ordinary admission,
 processing, and terminal publication produce production evidence; the positive
 telemetry and at-least-100 provider observers only consume that evidence. The
 observers neither feed back into request lifetime nor depend on one another.
-They may pass in either order. Missing the independent 300-second provider
-benchmark remains diagnostic, and correctness observation continues to the
-900-second bound while naturally sustained campaign work remains. The final
-gate remains exactly 10,000 new ``SUCCEEDED`` rows followed by natural and
-provider-native exact zero. A deterministic delayed-provider regression must
-reach the provider threshold only after earlier campaign identities have
-naturally finished and been replaced; this prevents reintroducing a static
-completion latch under another name.
+They may pass in either order. On a fatal proof failure, the qualification
+orchestrator may tell the driver to stop offering identities that have never
+been submitted; it must still let every already-offered identity finish its
+declared work and publish its terminal callback before returning the proof
+failure. The observer itself never mutates campaign progress. Missing the
+independent 300-second provider benchmark remains diagnostic, and correctness
+observation continues to the 900-second bound while naturally sustained
+campaign work remains. The final gate remains exactly 10,000 new ``SUCCEEDED``
+rows followed by natural and provider-native exact zero. A deterministic
+delayed-provider regression must reach the provider threshold only after
+earlier campaign identities have naturally finished and been replaced; a
+second failure-path regression must prove an observer failure cannot cancel an
+accepted request. Together they prevent reintroducing a static completion latch
+under another name.
 
 The first release-``1.1.1648`` campaign, ``paid-e2e-1648a``, was deliberately
 interrupted when review found that the five-minute provider-``RUNNING``
