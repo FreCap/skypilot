@@ -7,8 +7,9 @@ compatibility, bounded Spot-only paid admission, historical at-least-100 Spot
 scale, 10,000-request transport, and current-writer provider-native teardown
 are production-proven. Release 1.1.1660 exposed a qualifier-only circular proof
 dependency after the provider reached 93 observed and later at least 100 actual
-running VMs. Receipt schema 11's single sliding campaign and terminal-frontier
-proof are source-qualified but not yet merged, deployed, or paid-proven.
+running VMs. Receipt schema 12's single sliding campaign, terminal-frontier,
+and exact campaign-membership proof are being source-qualified and are not yet
+merged, deployed, or paid-proven.
 Multi-wave current-writer scale, traffic, and drain requalification is still
 open.**
 Campaign `paid-e2e-1643a` committed the first 100 complete paid
@@ -251,6 +252,16 @@ Receipt schema 11 therefore names and keeps three clocks separate:
    attempt advances to ``SUCCEEDED``. Provider and telemetry observation never
    delay, release, or otherwise control this transition.
 
+The verifier ownership boundary is normative:
+
+| Owner | Permitted power | Forbidden power |
+|---|---|---|
+| Campaign offerer | Create each frozen identity once and, after a proof failure, stop only stimulus that has never been offered. | Cancel, shorten, or withhold completion from an offered or accepted request. |
+| Accepted production request path | Own queueing, backend processing/occupancy, and bounded terminal publication through the real load-balancer and ledger protocol. | Gate request lifetime or terminal publication on a verifier verdict. |
+| Provider and telemetry observers | Read production/provider state and append observations to evidence. | Launch, terminate, admit, complete, or otherwise mutate production state. |
+| Lifecycle finalizer | Always run scope-fenced provider-native cleanup and absence proof after success, failure, or cancellation. | Expand cleanup beyond frozen ownership or rewrite the qualification verdict. |
+| Receipt verdict | Persist local evidence and derive pass or failure after observation. | Mutate demand, requests, replicas, providers, or any other production state. |
+
 The campaign freezes all 10,000 stable identities once. At most 800 are active
 at a time. The first exact 800-resident observation proves the cold scale
 stimulus, then every natural completion immediately admits the next
@@ -287,6 +298,30 @@ earlier campaign identities have naturally finished and been replaced; a
 second failure-path regression must prove an observer failure cannot cancel an
 accepted request. Together they prevent reintroducing a static completion latch
 under another name.
+
+Receipt schema 12 also makes the request driver one shielded cohort. The first
+worker failure closes admission under the same lock that advances the offered
+frontier, but it does not close the HTTP session or cancel sibling workers.
+Every already-offered member finishes its accepted attempt and terminal
+callback; only after all worker results are collected does the driver re-raise
+the first failure. Caller cancellation follows the same drain path and then
+re-raises ``CancelledError``. Admission has one campaign cutoff, while every
+valid acceptance receives a separate named 600-second
+``terminal_publication_timeout_seconds`` budget; it does not reuse the
+35-minute campaign cutoff. A
+header-valid ``202/ACCEPTED`` is therefore terminalized even when its response
+body is malformed; the deferred protocol error is raised only after the exact
+accepted attempt reaches a terminal receipt.
+
+The receipt stores the immutable request prefix and a canonical digest of the
+complete request-key manifest. The final PostgreSQL gate must observe exactly
+that key set as current ``SUCCEEDED`` attempts, then records the same membership
+digest. Offline validation recomputes the manifest and requires both digests to
+match, rather than accepting an unrelated equal-sized ledger delta. Cleanup is
+deliberately less strict than qualification: the cleanup-only EBS identity
+reader accepts receipt schemas 10 through 12, while qualification accepts only
+schema 12. This permits a newer teardown observer to clean an older in-flight
+run without allowing old evidence to qualify the new protocol.
 
 The first release-``1.1.1648`` campaign, ``paid-e2e-1648a``, was deliberately
 interrupted when review found that the five-minute provider-``RUNNING``

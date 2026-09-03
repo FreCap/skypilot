@@ -232,6 +232,14 @@ observed work finishes or when its terminal state is published. A failed proof
 may stop future, never-offered stimulus, but the driver must drain already-
 offered work through its real terminal-publication path before it exits.
 
+Concurrent stimulus drivers that acquire a terminal-publication obligation
+must use one structured, all-results worker cohort. The first failure closes
+new admission atomically; worker failure or caller cancellation must not close
+shared clients or cancel already-accepted siblings. Shield and drain accepted
+work to a separate bounded terminal deadline, then re-raise the original
+failure. Determine that cleanup ownership from the authoritative protocol
+status and headers before decoding an advisory response body.
+
 Each non-unit test must state its layer in the module docstring and enter
 through the exact public or production scheduling boundary named there. An
 unpaid provider E2E must use PostgreSQL plus the real API server, controller,

@@ -2259,6 +2259,27 @@ def test_optional_aws_receipt_never_blocks_tag_scoped_cleanup(tmp_path):
                                                           'paid-e2e') == {}
 
 
+def test_schema_ten_receipt_is_cleanup_compatible_but_cannot_qualify(tmp_path):
+    """Cleanup may span versions; qualification evidence may not."""
+    receipt = tmp_path / 'schema-10.json'
+    receipt.write_text(json.dumps({
+        'schema_version': 10,
+        'service_name': 'paid-e2e',
+        'aws_retained_volume_ids': {
+            'us-east-2': ['vol-0001'],
+        },
+    }),
+                       encoding='utf-8')
+
+    assert qualifier.read_aws_volume_ids_receipt(receipt, 'paid-e2e') == {
+        'us-east-2': ['vol-0001'],
+    }
+    with pytest.raises(qualifier.QualificationError,
+                       match='malformed|unavailable'):
+        qualifier._read_qualification_evidence(
+            receipt, qualifier.ExpectationKind.ECONOMIC)
+
+
 def test_provider_guard_rejects_on_demand_wrong_shape_and_overshoot():
     profile = qualifier.PROFILES['small']
     valid = _instance()
@@ -2893,7 +2914,7 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
                                 profile=qualifier.PROFILES['small'])
     receipt.sample('scale', observation)
 
-    assert receipt._payload['schema_version'] == 11
+    assert receipt._payload['schema_version'] == 12
     assert receipt._payload['request_priority'] == 50
     assert receipt._payload['scale_slo_seconds'] == 300
     assert receipt._payload['scale_timeout_seconds'] == 900
@@ -3032,6 +3053,62 @@ def test_request_telemetry_uses_observer_postgres_engine(monkeypatch):
         'ledger_engine': observer._engine,
     }
     assert telemetry.is_exact_zero()
+
+
+def test_campaign_membership_reads_current_attempts_from_observer_postgres():
+    prefix = 'postgres-membership'
+    request_keys = qualifier._campaign_request_key_sha256s(prefix, 3)
+    rows = [{
+        'request_key_sha256': request_key,
+        'state': 'SUCCEEDED',
+    } for request_key in request_keys]
+    seen = {}
+
+    class Result:
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return rows
+
+    class Connection:
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def execute(statement, params):
+            seen['statement'] = str(statement)
+            seen['params'] = params
+            return Result()
+
+    class Engine:
+
+        @staticmethod
+        def connect():
+            return Connection()
+
+    observer = object.__new__(qualifier.PostgresObserver)
+    observer._engine = Engine()
+    observer._service_name = 'paid-e2e'
+    observer._provider_scope = _provider_scope(service_hash='service-hash',
+                                               lifecycle_epoch=1,
+                                               service_version=1,
+                                               project_id='project-a')
+
+    assert observer.campaign_terminal_membership(
+        prefix, 3) == qualifier._campaign_manifest_sha256(prefix, 3)
+    assert seen['params'] == {
+        'service_name': 'paid-e2e',
+        'service_hash': 'service-hash',
+        'request_keys': request_keys,
+    }
+    assert 'attempt.attempt_id = request.current_attempt_id' in seen[
+        'statement']
 
 
 def test_cleanup_command_preserves_primary_failure_and_still_cleans(tmp_path):
@@ -4332,6 +4409,8 @@ def test_scale_sliding_window_finishes_before_delayed_provider_proof(tmp_path):
                 hold_requests=profile.exact_requests,
                 hold_seconds=0.02,
                 timeout_seconds=2,
+                request_queue_timeout_seconds=2,
+                terminal_timeout_seconds=2,
                 campaign_progress=campaign_progress))
         try:
             await qualifier._wait_for_scale_stimulus(
@@ -4416,6 +4495,8 @@ def test_generated_concurrent_receipt_passes_aggregate_gate(tmp_path):
                                 expectation=qualifier.provider_expectation(
                                     profile, None),
                                 scope=scope)
+    campaign_prefix = f'{service_name}-campaign'
+    receipt.bind_campaign_manifest(campaign_prefix, 10_000)
     progress = qualifier.Progress(baseline_qualified_iteration_id=3,
                                   baseline_qualified_observed_at=3.0,
                                   scale_started_monotonic=started_monotonic,
@@ -4508,6 +4589,8 @@ def test_generated_concurrent_receipt_passes_aggregate_gate(tmp_path):
     asyncio.run(generate_concurrent_proof())
     final = _request_telemetry(state_counts={'SUCCEEDED': 10_000},
                                observed_at=500.0)
+    receipt.bind_campaign_terminal_membership(
+        qualifier._campaign_manifest_sha256(campaign_prefix, 10_000))
     receipt.request_telemetry('final', final)
     for observed_at in (1000.0, 1180.0, 1360.0):
         receipt.sample(
@@ -4641,6 +4724,8 @@ def test_observer_failure_drains_offered_request_before_campaign_exit():
                                                 hold_requests=3,
                                                 hold_seconds=0.01,
                                                 timeout_seconds=2,
+                                                request_queue_timeout_seconds=2,
+                                                terminal_timeout_seconds=2,
                                                 campaign_progress=progress))
 
         async def fail_observer():
@@ -4966,15 +5051,16 @@ def test_exact_async_request_uses_canonical_acceptance_and_completion():
 
     session = Session()
     asyncio.run(
-        qualifier._one_exact_async_request(session,
-                                           endpoint='https://service.test',
-                                           token='secret',
-                                           service_hash='incarnation-a',
-                                           request_id='execution-1',
-                                           stable_job_id='job-1',
-                                           duration_seconds=0,
-                                           deadline=qualifier.time.monotonic() +
-                                           2))
+        qualifier._one_exact_async_request(
+            session,
+            endpoint='https://service.test',
+            token='secret',
+            service_hash='incarnation-a',
+            request_id='execution-1',
+            stable_job_id='job-1',
+            duration_seconds=0,
+            admission_deadline=(qualifier.time.monotonic() + 2),
+            terminal_timeout_seconds=2))
 
     assert len(session.calls) == 2
     submit_url, submit = session.calls[0]
@@ -5070,7 +5156,7 @@ def _accepted_exact_response(*,
 
 
 def _submit_exact_with_session(session):
-    return asyncio.run(
+    admission = asyncio.run(
         qualifier._submit_exact_async_request(
             session,
             endpoint='https://service.test',
@@ -5080,6 +5166,7 @@ def _submit_exact_with_session(session):
             stable_job_id='job-1',
             duration_seconds=0,
             deadline=qualifier.time.monotonic() + 2))
+    return admission.receipt, admission.intent_sha256
 
 
 async def _skip_exact_retry_delay(_delay):
@@ -5523,7 +5610,7 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
 
     monkeypatch.setattr(qualifier.asyncio, 'sleep', fake_sleep)
     session = Session()
-    receipt, _ = asyncio.run(
+    admission = asyncio.run(
         qualifier._submit_exact_async_request(
             session,
             endpoint='https://service.test',
@@ -5533,6 +5620,7 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
             stable_job_id='job-1',
             duration_seconds=0,
             deadline=qualifier.time.monotonic() + 2))
+    receipt = admission.receipt
 
     assert receipt.attempt_id == accepted_attempt_id
     assert receipt.attempt_no == 2
@@ -5682,15 +5770,16 @@ def test_exact_async_request_accepts_terminal_success_race():
 
     session = Session()
     asyncio.run(
-        qualifier._one_exact_async_request(session,
-                                           endpoint='https://service.test',
-                                           token='secret',
-                                           service_hash='incarnation-a',
-                                           request_id='execution-1',
-                                           stable_job_id='job-1',
-                                           duration_seconds=0,
-                                           deadline=qualifier.time.monotonic() +
-                                           2))
+        qualifier._one_exact_async_request(
+            session,
+            endpoint='https://service.test',
+            token='secret',
+            service_hash='incarnation-a',
+            request_id='execution-1',
+            stable_job_id='job-1',
+            duration_seconds=0,
+            admission_deadline=(qualifier.time.monotonic() + 2),
+            terminal_timeout_seconds=2))
     assert session.calls == 1
 
 
@@ -5907,7 +5996,9 @@ def test_exact_async_request_publishes_terminal_after_declared_work():
                                                 concurrency=24,
                                                 hold_requests=24,
                                                 hold_seconds=0.01,
-                                                timeout_seconds=5))
+                                                timeout_seconds=5,
+                                                request_queue_timeout_seconds=5,
+                                                terminal_timeout_seconds=5))
         try:
             assert await asyncio.wait_for(traffic, timeout=3) == 24
         finally:
@@ -5918,6 +6009,277 @@ def test_exact_async_request_publishes_terminal_after_declared_work():
     asyncio.run(exercise())
     assert completed == admitted
     assert peak_active_requests <= 24
+
+
+def _aiohttp_exact_receipt_headers(request_id, *, state, revision):
+    return {
+        qualifier.serve_constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: '1',
+        qualifier.serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: 'incarnation-a',
+        qualifier.serve_constants.LB_ASYNC_ATTEMPT_ID_HEADER: str(
+            uuid.uuid5(uuid.NAMESPACE_URL, request_id)),
+        qualifier.serve_constants.LB_ASYNC_ATTEMPT_NO_HEADER: '1',
+        qualifier.serve_constants.LB_ASYNC_LEDGER_REVISION_HEADER:
+            str(revision),
+        qualifier.serve_constants.LB_ASYNC_LEDGER_STATE_HEADER: state,
+    }
+
+
+async def _start_exact_protocol_server(predict, complete):
+    app = aiohttp.web.Application()
+    app.router.add_post('/v1/models/model:predict', predict)
+    app.router.add_post(
+        qualifier.serve_constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+        complete)
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, '127.0.0.1', 0)
+    await site.start()
+    assert site._server is not None
+    endpoint = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
+    return runner, endpoint
+
+
+def test_exact_campaign_worker_failure_drains_accepted_sibling():
+    """One pre-admission failure cannot strand two accepted siblings."""
+    offered = []
+    terminalized = []
+    accepted_siblings = 0
+    both_siblings_accepted = asyncio.Event()
+
+    async def predict(request):
+        nonlocal accepted_siblings
+        payload = await request.json()
+        request_id = payload['request_id']
+        offered.append(request_id)
+        if request_id.endswith('00000'):
+            await both_siblings_accepted.wait()
+            return aiohttp.web.Response(status=400)
+        accepted_siblings += 1
+        if accepted_siblings == 2:
+            both_siblings_accepted.set()
+        return aiohttp.web.json_response(
+            {
+                'request_id': request_id,
+                'status': 'accepted',
+            },
+            status=202,
+            headers=_aiohttp_exact_receipt_headers(request_id,
+                                                   state='ACCEPTED',
+                                                   revision=2))
+
+    async def complete(request):
+        payload = await request.json()
+        request_id = payload['request_id']
+        terminalized.append(request_id)
+        return aiohttp.web.Response(status=204,
+                                    headers=_aiohttp_exact_receipt_headers(
+                                        request_id,
+                                        state='SUCCEEDED',
+                                        revision=3))
+
+    async def exercise():
+        runner, endpoint = await _start_exact_protocol_server(predict, complete)
+        progress = qualifier.ExactRequestCampaignProgress(total_count=4,
+                                                          window_size=3)
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='00000 returned HTTP 400'):
+                await qualifier.send_exact_async_requests(
+                    endpoint=endpoint,
+                    token='secret',
+                    service_hash='incarnation-a',
+                    prefix='worker-failure',
+                    count=4,
+                    concurrency=3,
+                    hold_requests=4,
+                    hold_seconds=0.02,
+                    timeout_seconds=2,
+                    request_queue_timeout_seconds=2,
+                    terminal_timeout_seconds=2,
+                    campaign_progress=progress)
+            return await progress.snapshot()
+        finally:
+            await asyncio.sleep(0.05)
+            await runner.cleanup()
+
+    snapshot = asyncio.run(exercise())
+    assert len(offered) == 3
+    assert set(
+        terminalized) == set(offered) - {'worker-failure-execution-00000'}
+    assert snapshot == qualifier.ExactRequestCampaignCounters(
+        offered=3, succeeded=2, accepting_offers=False)
+
+
+def test_exact_campaign_caller_cancellation_drains_accepted_workers():
+    """Caller cancellation stops admission but cannot cancel accepted work."""
+    offered = []
+    terminalized = []
+    both_accepted = asyncio.Event()
+
+    async def predict(request):
+        payload = await request.json()
+        request_id = payload['request_id']
+        offered.append(request_id)
+        if len(offered) == 2:
+            both_accepted.set()
+        return aiohttp.web.json_response(
+            {
+                'request_id': request_id,
+                'status': 'accepted',
+            },
+            status=202,
+            headers=_aiohttp_exact_receipt_headers(request_id,
+                                                   state='ACCEPTED',
+                                                   revision=2))
+
+    async def complete(request):
+        payload = await request.json()
+        request_id = payload['request_id']
+        terminalized.append(request_id)
+        return aiohttp.web.Response(status=204,
+                                    headers=_aiohttp_exact_receipt_headers(
+                                        request_id,
+                                        state='SUCCEEDED',
+                                        revision=3))
+
+    async def exercise():
+        runner, endpoint = await _start_exact_protocol_server(predict, complete)
+        progress = qualifier.ExactRequestCampaignProgress(total_count=3,
+                                                          window_size=2)
+        traffic = asyncio.create_task(
+            qualifier.send_exact_async_requests(endpoint=endpoint,
+                                                token='secret',
+                                                service_hash='incarnation-a',
+                                                prefix='caller-cancel',
+                                                count=3,
+                                                concurrency=2,
+                                                hold_requests=3,
+                                                hold_seconds=0.02,
+                                                timeout_seconds=2,
+                                                request_queue_timeout_seconds=2,
+                                                terminal_timeout_seconds=2,
+                                                campaign_progress=progress))
+        try:
+            await both_accepted.wait()
+            traffic.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await traffic
+            return await progress.snapshot()
+        finally:
+            if not traffic.done():
+                traffic.cancel()
+                await asyncio.gather(traffic, return_exceptions=True)
+            await runner.cleanup()
+
+    snapshot = asyncio.run(exercise())
+    assert len(offered) == 2
+    assert set(terminalized) == set(offered)
+    assert snapshot == qualifier.ExactRequestCampaignCounters(
+        offered=2, succeeded=2, accepting_offers=False)
+
+
+def test_late_exact_acceptance_gets_a_fresh_terminal_deadline():
+    """A valid late 202 has callback budget independent of admission cutoff."""
+    terminalized = []
+
+    async def predict(request):
+        payload = await request.json()
+        request_id = payload['request_id']
+        await asyncio.sleep(0.08)
+        return aiohttp.web.json_response(
+            {
+                'request_id': request_id,
+                'status': 'accepted',
+            },
+            status=202,
+            headers=_aiohttp_exact_receipt_headers(request_id,
+                                                   state='ACCEPTED',
+                                                   revision=2))
+
+    async def complete(request):
+        payload = await request.json()
+        request_id = payload['request_id']
+        terminalized.append(request_id)
+        return aiohttp.web.Response(status=204,
+                                    headers=_aiohttp_exact_receipt_headers(
+                                        request_id,
+                                        state='SUCCEEDED',
+                                        revision=3))
+
+    async def exercise():
+        runner, endpoint = await _start_exact_protocol_server(predict, complete)
+        try:
+            return await qualifier.send_exact_async_requests(
+                endpoint=endpoint,
+                token='secret',
+                service_hash='incarnation-a',
+                prefix='late-acceptance',
+                count=1,
+                concurrency=1,
+                hold_requests=1,
+                hold_seconds=0,
+                timeout_seconds=0.05,
+                request_queue_timeout_seconds=0.2,
+                terminal_timeout_seconds=0.2)
+        finally:
+            await runner.cleanup()
+
+    assert asyncio.run(exercise()) == 1
+    assert terminalized == ['late-acceptance-execution-00000']
+
+
+def test_malformed_accepted_body_terminalizes_before_protocol_error():
+    """Accepted headers own a callback even when the 202 body is malformed."""
+    terminalized = []
+
+    async def predict(request):
+        payload = await request.json()
+        request_id = payload['request_id']
+        return aiohttp.web.Response(body=b'{malformed',
+                                    status=202,
+                                    headers=_aiohttp_exact_receipt_headers(
+                                        request_id,
+                                        state='ACCEPTED',
+                                        revision=2))
+
+    async def complete(request):
+        payload = await request.json()
+        request_id = payload['request_id']
+        terminalized.append(request_id)
+        return aiohttp.web.Response(status=204,
+                                    headers=_aiohttp_exact_receipt_headers(
+                                        request_id,
+                                        state='SUCCEEDED',
+                                        revision=3))
+
+    async def exercise():
+        runner, endpoint = await _start_exact_protocol_server(predict, complete)
+        progress = qualifier.ExactRequestCampaignProgress(total_count=1,
+                                                          window_size=1)
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='returned invalid JSON'):
+                await qualifier.send_exact_async_requests(
+                    endpoint=endpoint,
+                    token='secret',
+                    service_hash='incarnation-a',
+                    prefix='malformed-acceptance',
+                    count=1,
+                    concurrency=1,
+                    hold_requests=1,
+                    hold_seconds=0,
+                    timeout_seconds=1,
+                    request_queue_timeout_seconds=1,
+                    terminal_timeout_seconds=1,
+                    campaign_progress=progress)
+            return await progress.snapshot()
+        finally:
+            await runner.cleanup()
+
+    snapshot = asyncio.run(exercise())
+    assert terminalized == ['malformed-acceptance-execution-00000']
+    assert snapshot == qualifier.ExactRequestCampaignCounters(
+        offered=1, succeeded=1, accepting_offers=False)
 
 
 def test_request_telemetry_requires_exact_positive_and_terminal_delta(tmp_path):
@@ -5941,12 +6303,17 @@ def test_request_telemetry_requires_exact_positive_and_terminal_delta(tmp_path):
         async def request_telemetry(self):
             return self.values.pop(0)
 
+        @staticmethod
+        async def campaign_terminal_membership(prefix, count):
+            return qualifier._campaign_manifest_sha256(prefix, count)
+
     async def exercise():
         profile = dataclasses.replace(qualifier.PROFILES['small'],
                                       poll_seconds=0)
         receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
                                     service_name='paid-e2e',
                                     profile=profile)
+        receipt.bind_campaign_manifest('terminal-proof', 16)
         held = asyncio.create_task(asyncio.Event().wait())
         try:
             observed_positive = await (
@@ -5962,7 +6329,8 @@ def test_request_telemetry_requires_exact_positive_and_terminal_delta(tmp_path):
                 profile=profile,
                 receipt=receipt,
                 baseline=baseline,
-                expected_succeeded_delta=16)
+                expected_succeeded_delta=16,
+                campaign_prefix='terminal-proof')
             return observed_positive, observed_final, receipt
         finally:
             held.cancel()
@@ -5975,6 +6343,30 @@ def test_request_telemetry_requires_exact_positive_and_terminal_delta(tmp_path):
         sample['phase']
         for sample in receipt._payload['request_telemetry_samples']
     ] == ['positive', 'final']
+    assert receipt._payload['campaign_terminal_membership_sha256'] == (
+        qualifier._campaign_manifest_sha256('terminal-proof', 16))
+
+
+def test_campaign_terminal_membership_rejects_equal_count_substitution():
+    prefix = 'exact-membership'
+    keys = qualifier._campaign_request_key_sha256s(prefix, 3)
+    expected_digest = qualifier._campaign_manifest_sha256(prefix, 3)
+    rows = [{
+        'request_key_sha256': key,
+        'state': 'SUCCEEDED',
+    } for key in keys]
+
+    assert qualifier._validate_campaign_terminal_rows(
+        prefix=prefix, count=3, rows=rows) == expected_digest
+    rows[-1] = {
+        'request_key_sha256': hashlib.sha256(b'unrelated').hexdigest(),
+        'state': 'SUCCEEDED',
+    }
+    with pytest.raises(qualifier.QualificationError,
+                       match='exact campaign membership'):
+        qualifier._validate_campaign_terminal_rows(prefix=prefix,
+                                                   count=3,
+                                                   rows=rows)
 
 
 def _request_evidence_sample(*,
@@ -6067,6 +6459,9 @@ def _write_aggregate_qualification(path,
     count = 10_000 if economic else 1
     profile = (qualifier.PROFILES['scale']
                if economic else qualifier.PROFILES['provider-canary'])
+    campaign_prefix = f'{service_name}-campaign'
+    campaign_manifest_sha256 = qualifier._campaign_manifest_sha256(
+        campaign_prefix, count)
     stimulus = qualifier.scale_stimulus_count(profile)
     in_flight = min(128, stimulus) if economic else 1
     active = in_flight
@@ -6102,7 +6497,7 @@ def _write_aggregate_qualification(path,
         } if economic else {}),
     }
     payload = {
-        'schema_version': 11,
+        'schema_version': 12,
         'service_name': service_name,
         'service_hash': f'{service_name}-hash',
         'lifecycle_epoch': 1,
@@ -6142,6 +6537,11 @@ def _write_aggregate_qualification(path,
         'baseline_qualified_observed_at': 3.0,
         'exact_request_count': count,
         'exact_request_successes': count,
+        'terminal_publication_timeout_seconds':
+            profile.terminal_publication_timeout_seconds,
+        'campaign_prefix': campaign_prefix,
+        'campaign_manifest_sha256': campaign_manifest_sha256,
+        'campaign_terminal_membership_sha256': campaign_manifest_sha256,
         'ledger_request_delta': count,
         'ledger_succeeded_delta': count,
         'samples': [
@@ -6583,6 +6983,25 @@ def test_qualification_receipt_binds_exact_request_priority(
 
     with pytest.raises(qualifier.QualificationError,
                        match='request priority|malformed'):
+        qualifier._read_qualification_evidence(
+            receipt, qualifier.ExpectationKind.ECONOMIC)
+
+
+@pytest.mark.parametrize('mutation', ('prefix', 'manifest', 'terminal'))
+def test_qualification_receipt_rejects_substituted_campaign_membership(
+        tmp_path, mutation):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    if mutation == 'prefix':
+        payload['campaign_prefix'] = 'unrelated-campaign'
+    elif mutation == 'manifest':
+        payload['campaign_manifest_sha256'] = '0' * 64
+    else:
+        payload['campaign_terminal_membership_sha256'] = '0' * 64
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError, match='malformed'):
         qualifier._read_qualification_evidence(
             receipt, qualifier.ExpectationKind.ECONOMIC)
 
