@@ -1441,8 +1441,9 @@ class TestStreamLogsByIdTaskFiltering:
         task_info = self._create_task_info(tasks)
         self._stub_stream_frontend(monkeypatch)
 
-        monkeypatch.setattr(jobs_utils.managed_job_state, 'get_num_tasks',
-                            lambda jid: len(tasks))
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state, 'get_num_tasks',
+            mock.Mock(side_effect=AssertionError('split task count used')))
         monkeypatch.setattr(
             jobs_utils.managed_job_state,
             'get_all_task_ids_names_statuses_logs',
@@ -1452,9 +1453,13 @@ class TestStreamLogsByIdTaskFiltering:
             jobs_utils.managed_job_state, 'get_latest_task_id_status',
             mock.Mock(side_effect=AssertionError('scalar latest-task poll '
                                                  'used')))
-        monkeypatch.setattr(jobs_utils.managed_job_state,
-                            'get_latest_log_stream_snapshot',
-                            lambda jid: self._terminal_snapshot(1, 'eval'))
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state, 'get_latest_log_stream_snapshot',
+            mock.Mock(side_effect=AssertionError('split latest snapshot used')))
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state, 'get_latest_log_stream_lookup',
+            lambda jid: managed_job_state.LatestLogStreamLookup(
+                self._terminal_snapshot(1, 'eval'), len(tasks)))
         monkeypatch.setattr(
             jobs_utils.managed_job_state, 'get_status',
             mock.Mock(side_effect=AssertionError('scalar status poll used')))

@@ -29,12 +29,19 @@ class TaskWaitStatusLookup(typing.NamedTuple):
     num_tasks: int
 
 
+class LatestLogStreamLookup(typing.NamedTuple):
+    """One latest-task log snapshot plus exact task-count context."""
+    snapshot: JobLogStreamSnapshot
+    num_tasks: int
+
+
 # Preserve the historical public and pickle identities exposed by the facade.
 TaskLogStreamLookup.__module__ = 'sky.jobs.state'
 TaskWaitStatusLookup.__module__ = 'sky.jobs.state'
+LatestLogStreamLookup.__module__ = 'sky.jobs.state'
 
 
-def _task_wait_job_scope(job_id: int) -> Any:
+def _job_task_count_scope(job_id: int) -> Any:
     task_count = sqlalchemy.select(
         sqlalchemy.func.count(spot_table.c.task_id)  # pylint: disable=not-callable
     ).where(spot_table.c.spot_job_id == job_id).scalar_subquery()
@@ -104,7 +111,7 @@ def get_task_wait_status_lookup(job_id: int,
     exact task count for missing-task classification. Keep that contract on one
     database snapshot without paying for log-routing or log-file metadata.
     """
-    job_scope = _task_wait_job_scope(job_id)
+    job_scope = _job_task_count_scope(job_id)
     matching_task = sqlalchemy.select(
         spot_table.c.spot_job_id,
         spot_table.c.task_id,
@@ -138,7 +145,7 @@ def get_task_wait_status_lookup_by_name(job_id: int,
     task_id order. Preserve that contract while keeping the wait path on one
     slim database snapshot.
     """
-    job_scope = _task_wait_job_scope(job_id)
+    job_scope = _job_task_count_scope(job_id)
     matching_task = sqlalchemy.select(
         spot_table.c.spot_job_id,
         spot_table.c.task_id,
@@ -176,13 +183,7 @@ def get_task_log_stream_lookup(job_id: int,
     can be classified as either "job missing" or "task ID invalid" without a
     second point query.
     """
-    task_count = sqlalchemy.select(
-        sqlalchemy.func.count(spot_table.c.task_id)  # pylint: disable=not-callable
-    ).where(spot_table.c.spot_job_id == job_id).scalar_subquery()
-    job_scope = sqlalchemy.select(
-        sqlalchemy.literal(job_id).label('spot_job_id'),
-        task_count.label('num_tasks'),
-    ).subquery()
+    job_scope = _job_task_count_scope(job_id)
     matching_task = _preferred_log_task(job_id, task_id=task_id)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -229,13 +230,7 @@ def get_task_log_stream_lookup_by_name(job_id: int,
     task_id order. Preserve that contract while resolving the match, task
     status, and the exact task count from one database snapshot.
     """
-    task_count = sqlalchemy.select(
-        sqlalchemy.func.count(spot_table.c.task_id)  # pylint: disable=not-callable
-    ).where(spot_table.c.spot_job_id == job_id).scalar_subquery()
-    job_scope = sqlalchemy.select(
-        sqlalchemy.literal(job_id).label('spot_job_id'),
-        task_count.label('num_tasks'),
-    ).subquery()
+    job_scope = _job_task_count_scope(job_id)
     matching_task = _preferred_log_task(job_id, task_name=task_name)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -273,12 +268,68 @@ def get_task_log_stream_lookup_by_name(job_id: int,
     )
 
 
+@db_retries.retry
+def get_latest_log_stream_lookup(job_id: int) -> LatestLogStreamLookup:
+    """Return one latest-task log snapshot plus exact task-count context.
+
+    The unfiltered log follower must classify "job missing" and choose its
+    latest task/cluster target from one database snapshot. Otherwise a deleted
+    job can pass a stale task-count check, then present an empty latest-task
+    snapshot forever and wedge the initial wait loop.
+    """
+    terminal_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    latest_task_id = sqlalchemy.select(
+        sqlalchemy.func.coalesce(  # pylint: disable=not-callable
+            sqlalchemy.func.min(
+                sqlalchemy.case(
+                    (~spot_table.c.status.in_(terminal_values),
+                     spot_table.c.task_id),
+                    else_=None,
+                )),
+            sqlalchemy.func.max(spot_table.c.task_id),
+        )).where(spot_table.c.spot_job_id == job_id).scalar_subquery()
+    job_scope = _job_task_count_scope(job_id)
+    latest_task = _preferred_log_task(job_id,
+                                      task_id=typing.cast(Any, latest_task_id))
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                latest_task.c.task_id,
+                latest_task.c.status,
+                job_info_table.c.pool,
+                job_info_table.c.current_cluster_name,
+                job_info_table.c.job_id_on_pool_cluster,
+                latest_task.c.task_name,
+                job_scope.c.num_tasks,
+            ).select_from(
+                job_scope.outerjoin(
+                    latest_task, latest_task.c.spot_job_id ==
+                    job_scope.c.spot_job_id).outerjoin(
+                        job_info_table, job_info_table.c.spot_job_id ==
+                        latest_task.c.spot_job_id))).fetchone()
+    assert row is not None, job_id
+    snapshot = JobLogStreamSnapshot(
+        row.task_id,
+        (None if row.status is None else ManagedJobStatus(row.status)),
+        row.pool,
+        row.current_cluster_name,
+        row.job_id_on_pool_cluster,
+        row.task_name,
+    )
+    return LatestLogStreamLookup(snapshot=snapshot,
+                                 num_tasks=int(row.num_tasks or 0))
+
+
 # Preserve reflection and function pickle lookup through the historical facade.
 for _lookup_function in (
         get_task_wait_status_lookup,
         get_task_wait_status_lookup_by_name,
         get_task_log_stream_lookup,
         get_task_log_stream_lookup_by_name,
+        get_latest_log_stream_lookup,
 ):
     _lookup_function.__module__ = 'sky.jobs.state'
     if hasattr(_lookup_function, '__wrapped__'):

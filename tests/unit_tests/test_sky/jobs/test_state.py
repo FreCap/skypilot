@@ -25,6 +25,8 @@ from sky.jobs.state import ManagedJobStatus
 def test_task_lookup_public_identity_and_facade_patch(monkeypatch):
     assert state.TaskLogStreamLookup is state_task_lookups.TaskLogStreamLookup
     assert state.TaskWaitStatusLookup is state_task_lookups.TaskWaitStatusLookup
+    assert (state.LatestLogStreamLookup
+            is state_task_lookups.LatestLogStreamLookup)
     assert (state.get_task_wait_status_lookup
             is state_task_lookups.get_task_wait_status_lookup)
     assert (state.get_task_wait_status_lookup_by_name
@@ -33,18 +35,24 @@ def test_task_lookup_public_identity_and_facade_patch(monkeypatch):
             is state_task_lookups.get_task_log_stream_lookup)
     assert (state.get_task_log_stream_lookup_by_name
             is state_task_lookups.get_task_log_stream_lookup_by_name)
+    assert (state.get_latest_log_stream_lookup
+            is state_task_lookups.get_latest_log_stream_lookup)
     assert state.TaskLogStreamLookup.__module__ == 'sky.jobs.state'
     assert state.TaskWaitStatusLookup.__module__ == 'sky.jobs.state'
+    assert state.LatestLogStreamLookup.__module__ == 'sky.jobs.state'
     assert pickle.loads(pickle.dumps(
         state.TaskLogStreamLookup)) is state.TaskLogStreamLookup
     assert pickle.loads(pickle.dumps(
         state.TaskWaitStatusLookup)) is state.TaskWaitStatusLookup
+    assert pickle.loads(pickle.dumps(
+        state.LatestLogStreamLookup)) is state.LatestLogStreamLookup
 
     lookup_functions = (
         state.get_task_wait_status_lookup,
         state.get_task_wait_status_lookup_by_name,
         state.get_task_log_stream_lookup,
         state.get_task_log_stream_lookup_by_name,
+        state.get_latest_log_stream_lookup,
     )
     assert all(function.__module__ == 'sky.jobs.state'
                for function in lookup_functions)
@@ -1002,6 +1010,44 @@ def test_get_latest_log_stream_snapshot_reads_one_recovery_snapshot(
     assert counts['n'] == 1, counts
 
 
+def test_get_latest_log_stream_lookup_reads_one_recovery_snapshot(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine, job_id, 2, status=ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, job_id, 3, status=ManagedJobStatus.RUNNING)
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.job_info_table).where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    pool='pool-a',
+                    current_cluster_name='replica-a',
+                    job_id_on_pool_cluster=41,
+                ))
+        session.commit()
+
+    with _count_sql_statements(engine) as counts:
+        lookup = state.get_latest_log_stream_lookup(job_id)
+
+    assert lookup == state.LatestLogStreamLookup(
+        state.JobLogStreamSnapshot(3, ManagedJobStatus.RUNNING, 'pool-a',
+                                   'replica-a', 41, 'task-3'),
+        2,
+    )
+    assert counts['n'] == 1, counts
+
+    state.set_current_cluster_name(job_id, 'replica-b')
+    with _count_sql_statements(engine) as counts:
+        recovered_lookup = state.get_latest_log_stream_lookup(job_id)
+
+    assert recovered_lookup == state.LatestLogStreamLookup(
+        state.JobLogStreamSnapshot(3, ManagedJobStatus.RUNNING, 'pool-a',
+                                   'replica-b', 41, 'task-3'),
+        2,
+    )
+    assert counts['n'] == 1, counts
+
+
 def test_get_latest_log_stream_snapshot_missing_job_is_one_query(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
@@ -1011,6 +1057,18 @@ def test_get_latest_log_stream_snapshot_missing_job_is_one_query(
 
     assert snapshot == state.JobLogStreamSnapshot(None, None, None, None, None,
                                                   None)
+    assert counts['n'] == 1, counts
+
+
+def test_get_latest_log_stream_lookup_missing_job_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        lookup = state.get_latest_log_stream_lookup(999)
+
+    assert lookup == state.LatestLogStreamLookup(
+        state.JobLogStreamSnapshot(None, None, None, None, None, None), 0)
     assert counts['n'] == 1, counts
 
 
@@ -1024,6 +1082,22 @@ def test_get_latest_log_stream_snapshot_keeps_task_without_job_info(
 
     assert snapshot == state.JobLogStreamSnapshot(3, ManagedJobStatus.RUNNING,
                                                   None, None, None, 'task-3')
+    assert counts['n'] == 1, counts
+
+
+def test_get_latest_log_stream_lookup_keeps_task_without_job_info(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    _insert_task(engine, 999, 3, status=ManagedJobStatus.RUNNING)
+
+    with _count_sql_statements(engine) as counts:
+        lookup = state.get_latest_log_stream_lookup(999)
+
+    assert lookup == state.LatestLogStreamLookup(
+        state.JobLogStreamSnapshot(3, ManagedJobStatus.RUNNING, None, None,
+                                   None, 'task-3'),
+        1,
+    )
     assert counts['n'] == 1, counts
 
 
