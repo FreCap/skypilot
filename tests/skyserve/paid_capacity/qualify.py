@@ -79,6 +79,7 @@ _CAMPAIGN_LOAD_WINDOW_SECONDS = (
     serve_constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
 _SCALE_TAIL_BATCH_SIZE = 400
 _AWS_CENSUS_MAX_WORKERS = 8
+_AWS_FILTER_MAX_VALUES = 200
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -2380,10 +2381,13 @@ class AwsObserver:
                     'Name': f'tag:{tag_key}',
                     'Values': [f'{self._service_name}-*'],
                 }]))
+            sorted_volume_ids = sorted(exact_volume_ids)
             volume_queries.extend((True, [{
                 'Name': 'volume-id',
-                'Values': sorted(exact_volume_ids)[start:start + 500],
-            }]) for start in range(0, len(exact_volume_ids), 500))
+                'Values': sorted_volume_ids[start:start +
+                                            _AWS_FILTER_MAX_VALUES],
+            }]) for start in range(0, len(sorted_volume_ids),
+                                   _AWS_FILTER_MAX_VALUES))
             for exact_lookup, filters in volume_queries:
                 pages = client.get_paginator('describe_volumes').paginate(
                     Filters=filters)

@@ -2084,6 +2084,63 @@ def test_aws_cleanup_census_retains_exact_legacy_ebs_identity(monkeypatch):
         service_volumes=census.service_volumes).disk_count == 1
 
 
+def test_aws_cleanup_census_batches_retained_ebs_identity(monkeypatch):
+    retained_volume_ids = [f'vol-{index:03d}' for index in range(201)]
+    exact_lookups = []
+
+    class Paginator:
+
+        def __init__(self, name):
+            self.name = name
+
+        def paginate(self, *, Filters):  # pylint: disable=invalid-name
+            if self.name == 'describe_instances':
+                return ({'Reservations': []},)
+            if Filters[0]['Name'] == 'volume-id':
+                values = Filters[0]['Values']
+                if len(values) > 200:
+                    raise RuntimeError('AWS rejects more than 200 filter values')
+                exact_lookups.append(values)
+            return ({'Volumes': []},)
+
+    class Ec2:
+
+        @staticmethod
+        def get_paginator(name):
+            return Paginator(name)
+
+    class Sts:
+
+        @staticmethod
+        def get_caller_identity():
+            return {'Account': '123456789012'}
+
+    class Session:
+
+        @staticmethod
+        def client(name, *, region_name):
+            assert region_name == 'us-east-2'
+            return Sts() if name == 'sts' else Ec2()
+
+    monkeypatch.setattr(qualifier.aws_adaptor, 'session',
+                        lambda profile: Session())
+    observer = qualifier.AwsObserver(
+        profile=qualifier.PROFILES['small'],
+        service_name='paid-e2e',
+        scope=_provider_scope(),
+        retained_volume_ids_by_region={
+            'us-east-2': retained_volume_ids,
+        })
+
+    census = observer.census()
+
+    assert census.service_instances == ()
+    assert census.service_volumes == ()
+    assert [len(batch) for batch in exact_lookups] == [200, 1]
+    assert [volume_id for batch in exact_lookups
+            for volume_id in batch] == retained_volume_ids
+
+
 def test_optional_aws_receipt_never_blocks_tag_scoped_cleanup(tmp_path):
     missing = tmp_path / 'missing.json'
     assert qualifier.read_optional_aws_volume_ids_receipt(missing,
