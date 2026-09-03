@@ -20,6 +20,7 @@ from sky.jobs import constants as managed_job_constants
 from sky.jobs import runtime as managed_job_runtime
 from sky.jobs import state as managed_job_state
 from sky.jobs.naming import generate_managed_job_cluster_name
+from sky.server import runtime_profile
 from sky.skylet import job_lib
 from sky.skylet import log_lib
 from sky.utils import context_utils
@@ -36,17 +37,45 @@ JOB_STATUS_CHECK_GAP_SECONDS = 15
 _PROVISION_LOG_POLL_GAP_SECONDS = 1
 _JOB_WAITING_STATUS_MESSAGE = ux_utils.spinner_message(
     'Waiting for task to start[/]'
-    '{status_str}. It may take a few minutes.{provision_str}\n'
-    '  [dim]View controller logs: sky jobs logs --controller {job_id}')
+    '{status_str}. It may take a few minutes.{provision_str}'
+    '{controller_hint}')
 _JOB_CANCELLED_MESSAGE = (
     ux_utils.spinner_message('Waiting for task status to be updated.') +
     ' It may take a minute.')
 _FINAL_JOB_STATUS_WAIT_TIMEOUT_SECONDS = 120
+_CONTROLLER_LOGS_UNAVAILABLE_MESSAGE = (
+    'Controller logs are unavailable in PostgreSQL guarded HA because '
+    'pod-local files are not shared between API server roles.')
 
 
 def _sleep_log_follow_wait(seconds: float) -> None:
     """Sleep between log-follow polls while honoring cancellation."""
     context_utils.sleep_with_cancellation(seconds)
+
+
+def controller_logs_available() -> bool:
+    """Whether controller logs can be served in the current runtime profile."""
+    return not runtime_profile.guarded_ha_ephemeral_artifacts_enabled()
+
+
+def controller_log_guidance(job_id: int,
+                            *,
+                            available_prefix: str,
+                            unavailable_message: str | None = None) -> str:
+    """Render capability-aware controller-log guidance for one job."""
+    if controller_logs_available():
+        return f'{available_prefix}sky jobs logs --controller {job_id}'
+    if unavailable_message is not None:
+        return unavailable_message
+    return _CONTROLLER_LOGS_UNAVAILABLE_MESSAGE
+
+
+def controller_log_waiting_hint(job_id: int) -> str:
+    """Render the optional waiting-state controller-log hint."""
+    return controller_log_guidance(
+        job_id,
+        available_prefix='\n  [dim]View controller logs: ',
+        unavailable_message='')
 
 
 def _missing_batch_streamer(*args: typing.Any,
@@ -334,13 +363,14 @@ def _render_stopped_snapshot_logs(
                   flush=True)
         return '', exceptions.JobExitCode.from_managed_job_status(
             managed_job_status)
-    return (f'{colorama.Fore.YELLOW}'
-            f'Job {job_id} is already in terminal state '
-            f'{managed_job_status.value}. For more details, run: '
-            f'sky jobs logs --controller {job_id}'
-            f'{colorama.Style.RESET_ALL}'
-            f'{job_msg}',
-            exceptions.JobExitCode.from_managed_job_status(managed_job_status))
+    return (
+        f'{colorama.Fore.YELLOW}'
+        f'Job {job_id} is already in terminal state '
+        f'{managed_job_status.value}. '
+        f'{controller_log_guidance(job_id, available_prefix="For more details, run: ")}'
+        f'{colorama.Style.RESET_ALL}'
+        f'{job_msg}',
+        exceptions.JobExitCode.from_managed_job_status(managed_job_status))
 
 
 def stream_logs_by_id(job_id: int,
@@ -450,9 +480,11 @@ def stream_logs_by_id(job_id: int,
                            tail=tail,
                            tail_offset=tail_offset)
 
-    msg = _JOB_WAITING_STATUS_MESSAGE.format(status_str='',
-                                             provision_str='',
-                                             job_id=job_id)
+    msg = _JOB_WAITING_STATUS_MESSAGE.format(
+        status_str='',
+        provision_str='',
+        controller_hint=controller_log_waiting_hint(job_id),
+        job_id=job_id)
     status_display = rich_utils.safe_status(msg)
     num_tasks: int | None = None
     prefetched_snapshot: managed_job_state.JobLogStreamSnapshot | None = None
@@ -670,6 +702,7 @@ def stream_logs_by_id(job_id: int,
                     msg = _JOB_WAITING_STATUS_MESSAGE.format(
                         status_str=status_str,
                         provision_str=provision_str,
+                        controller_hint=controller_log_waiting_hint(job_id),
                         job_id=job_id)
                     if msg != prev_msg:
                         status_display.update(msg)

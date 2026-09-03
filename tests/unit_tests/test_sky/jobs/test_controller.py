@@ -2778,6 +2778,52 @@ class TestUserJobStatusClassification:
                 managed_job_state.ManagedJobStatus.FAILED)
         assert 'job driver on the remote cluster failed' in (
             set_failed.call_args.kwargs['failure_reason'])
+        assert 'sky jobs logs --controller 1' in (
+            set_failed.call_args.kwargs['failure_reason'])
+
+    @pytest.mark.asyncio
+    async def test_failed_driver_hides_controller_log_command_in_guarded_ha(
+            self, monkeypatch):
+        monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'postgres')
+        monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'api')
+        monkeypatch.setenv('SKYPILOT_API_SERVER_STORAGE_ENABLED', 'false')
+        controller = self._make_controller()
+        task = MagicMock(name='task')
+        task.name = 'test-task'
+        task.num_nodes = 1
+        executor = MagicMock()
+        executor.should_restart_on_failure.return_value = False
+        handle = MagicMock()
+
+        with patch('asyncio.sleep', new=AsyncMock()), patch(
+                'sky.backends.backend_utils.async_check_network_connection',
+                new=AsyncMock()), patch(
+                    'sky.jobs.utils.get_job_status',
+                    new=AsyncMock(return_value=(
+                        job_lib.JobStatus.FAILED_DRIVER, None))), patch(
+                            'sky.jobs.utils.try_to_get_job_end_time',
+                            return_value=12345.0), patch(
+                                'sky.backends.backend_utils.'
+                                'refresh_cluster_status_handle',
+                                return_value=(
+                                    status_lib.ClusterStatus.UP,
+                                    handle)), patch(
+                                        'sky.jobs.state.'
+                                        'set_failed_async',
+                                        new=AsyncMock()) as set_failed:
+            succeeded = await controller._monitor_one_task(
+                task_id=0,
+                task=task,
+                cluster_name='test-cluster',
+                executor=executor,
+                callback_func=MagicMock(),
+            )
+
+        assert succeeded is False
+        failure_reason = set_failed.call_args.kwargs['failure_reason']
+        assert 'sky jobs logs --controller 1' not in failure_reason
+        assert 'Controller logs are unavailable in PostgreSQL guarded HA' in (
+            failure_reason)
 
 
 class TestCancelSignalScan:
@@ -3985,6 +4031,44 @@ class TestRunJobLoopOwnershipCleanup:
         assert kwargs['override_terminal']
         assert 'worker connection timed out' in kwargs['failure_reason']
         job_done.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_failure_hides_controller_log_command_in_guarded_ha(
+            self, monkeypatch):
+        monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'postgres')
+        monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'api')
+        monkeypatch.setenv('SKYPILOT_API_SERVER_STORAGE_ENABLED', 'false')
+        manager = _make_controller_manager()
+        manager.starting.add(3)
+        manager._cleanup = AsyncMock(
+            side_effect=RuntimeError('worker connection timed out'))
+        manager._cleanup_api_server_access_token = MagicMock()
+
+        ctx = MagicMock()
+        controller = MagicMock()
+        controller.run = AsyncMock(return_value=True)
+
+        with patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'get_job_env_content', return_value=''), \
+                patch('sky.jobs.controller.usage_lib.'
+                      'install_fresh_messages_for_current_context'), \
+                patch('sky.jobs.controller.JobController',
+                      return_value=controller), \
+                patch('sky.jobs.controller.managed_job_state.get_status_async',
+                      new_callable=AsyncMock,
+                      side_effect=[
+                          managed_job_state.ManagedJobStatus.RUNNING,
+                          managed_job_state.ManagedJobStatus.FAILED_CONTROLLER,
+                      ]), \
+                patch('sky.jobs.controller.managed_job_state.set_failed_async',
+                      new_callable=AsyncMock) as set_failed:
+            await manager.run_job_loop(3, '/dev/null')
+
+        _, kwargs = set_failed.await_args
+        assert 'sky jobs logs --controller 3' not in kwargs['failure_reason']
+        assert 'Controller logs are unavailable in PostgreSQL guarded HA' in (
+            kwargs['failure_reason'])
 
 
 class TestTerminalCleanupAdoption:

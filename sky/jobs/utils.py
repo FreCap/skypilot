@@ -139,8 +139,8 @@ JOB_STATUS_FETCH_TOTAL_TIMEOUT_SECONDS = 60
 
 _JOB_WAITING_STATUS_MESSAGE = ux_utils.spinner_message(
     'Waiting for task to start[/]'
-    '{status_str}. It may take a few minutes.{provision_str}\n'
-    '  [dim]View controller logs: sky jobs logs --controller {job_id}')
+    '{status_str}. It may take a few minutes.{provision_str}'
+    '{controller_hint}')
 _JOB_CANCELLED_MESSAGE = (
     ux_utils.spinner_message('Waiting for task status to be updated.') +
     ' It may take a minute.')
@@ -867,7 +867,8 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
 
         failure_message = (
             f'Controller process has exited abnormally ({failure_reason}). '
-            f'For more details, run: sky jobs logs --controller {job_id}')
+            f'{controller_log_guidance(job_id, available_prefix="For more details, run: ")}'
+        )
         failure_decision = (
             managed_job_state.set_failed_controller_if_current_snapshot(
                 job_id,
@@ -1303,6 +1304,10 @@ _is_relayed_status_payload_line = (
     managed_job_log_streaming.is_relayed_status_payload_line)
 _provision_status_headline = (
     managed_job_log_streaming.provision_status_headline)
+controller_logs_available = managed_job_log_streaming.controller_logs_available
+controller_log_guidance = managed_job_log_streaming.controller_log_guidance
+controller_log_waiting_hint = (
+    managed_job_log_streaming.controller_log_waiting_hint)
 _should_keep_logging = managed_job_log_streaming.should_keep_logging
 select = managed_job_log_streaming.select_module
 signal = managed_job_log_streaming.signal_module

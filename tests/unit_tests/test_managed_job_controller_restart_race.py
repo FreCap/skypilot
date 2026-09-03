@@ -206,6 +206,26 @@ def test_done_nonterminal_without_workspace_terminalizes(monkeypatch):
     assert len(terminalized) == 1
 
 
+def test_dead_controller_failure_reason_omits_log_command_in_guarded_ha(
+        monkeypatch):
+    info = _make_status_check_info()
+    set_failed_calls = []
+
+    monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'postgres')
+    monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'api')
+    monkeypatch.setenv('SKYPILOT_API_SERVER_STORAGE_ENABLED', 'false')
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+    _wire_legacy_dead_controller(monkeypatch, set_failed_calls)
+
+    utils.update_managed_jobs_statuses(job_ids=[1], jobs_info=info)
+
+    assert len(set_failed_calls) == 1
+    failure_reason = set_failed_calls[0][1]['failure_reason']
+    assert 'sky jobs logs --controller 1' not in failure_reason
+    assert 'Controller logs are unavailable in PostgreSQL guarded HA' in (
+        failure_reason)
+
+
 @pytest.mark.parametrize(('recorded_owner', 'terminal'), [
     (('current-instance', 7), False),
     (('stale-instance', 6), True),
