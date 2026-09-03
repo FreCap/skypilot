@@ -285,7 +285,7 @@ class RequestTimestamp(RequestsAggregator):
         # getattr() keeps a new process compatible with a RequestTimestamp
         # restored from a previous-version pickle.  Such a process starts with
         # no coverage authority and therefore cannot backfill false zeros.
-        acknowledged_coverage = getattr(
+        acknowledged_coverage: set[int] = getattr(
             self, '_acknowledged_request_history_coverage', set())
         self._acknowledged_request_history_coverage = {
             bucket for bucket in acknowledged_coverage
