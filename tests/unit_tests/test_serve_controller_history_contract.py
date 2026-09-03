@@ -87,7 +87,9 @@ def test_extracted_history_methods_keep_controller_dependency_patch_surface():
     original_writer = mock.Mock(return_value=1)
     replacement_writer = mock.Mock(return_value=1)
     replacement_history = types.SimpleNamespace(
-        record_request_activity=replacement_writer)
+        record_request_activity=replacement_writer,
+        RequestHistoryCoverageAuthority=(
+            controller.serve_history.RequestHistoryCoverageAuthority))
     with mock.patch.object(controller.controller_history.serve_history,
                            'record_request_activity', original_writer), \
          mock.patch.object(controller, 'serve_history', replacement_history):
@@ -139,6 +141,7 @@ def test_history_writer_uses_controller_module_patch_surface_once():
         'service-hash',
         f"lb-a:{'a' * 32}",
         request_data['request_history'],
+        coverage_authority=None,
     )
 
 
@@ -177,6 +180,7 @@ def test_malformed_v1_does_not_promote_generic_request_history():
         'service-hash',
         f"lb-a:{'a' * 32}",
         request_data['request_history'],
+        coverage_authority=None,
     )
     # The independent validator drops malformed current-v1 history, but the
     # generic arrival write above remains nullable instead of advertising

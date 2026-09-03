@@ -13,6 +13,7 @@ from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 from sky.serve import constants
 from sky.serve import demand_state
 from sky.serve import demand_state_schema
+from sky.serve import serve_history
 from sky.serve import serve_state_schema
 from sky.utils.db import migration_utils
 
@@ -191,6 +192,53 @@ def test_report_sequence_idempotency_freshness_and_summary(demand_database):
     assert stale['headerless_arrivals_60s'] is None
     assert stale['headerless_arrivals_300s'] is None
     assert stale['offered_arrival_tracking_saturated'] is None
+
+
+def test_cutover_between_demand_commit_and_history_write_keeps_idle_gap(
+        demand_database, monkeypatch):
+    """History rechecks DB authority after the demand-report transaction."""
+    now = time.time()
+    covered_bucket = int(now // 60) * 60 - 60
+    report = _report(now)
+    report['applied_generation'] = 2
+    report['request_history'] = {
+        'bucket_seconds': 60,
+        'buckets': [{
+            'bucket_start': covered_bucket,
+            'request_count': 0,
+            'rejected_count': 0,
+            'coverage_complete': True,
+        }],
+    }
+    with demand_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    lb_ha_enabled=1,
+                    lb_active_slot='a',
+                    lb_cutover_generation=2,
+                    lb_cutover_phase='STABLE'))
+
+    original_record_history = demand_state._record_history
+
+    def cut_over_before_history(service_name, service_hash, payload):
+        with demand_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name == 'svc').values(
+                        lb_active_slot='b',
+                        lb_cutover_generation=3,
+                        lb_pending_slot='a',
+                        lb_cutover_phase='DRAINING'))
+        return original_record_history(service_name, service_hash, payload)
+
+    monkeypatch.setattr(demand_state, '_record_history',
+                        cut_over_before_history)
+    receipt = demand_state.ingest_report('svc', 'svc-hash', report)
+
+    assert receipt.request_history_accepted is True
+    history = serve_history.get_status_history('svc', timestamp=now)
+    assert history['request_samples'] == []
 
 
 def test_request_summary_accepts_explicit_postgres_engine(

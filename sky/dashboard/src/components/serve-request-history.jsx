@@ -49,7 +49,9 @@ export function buildRequestHistoryView(history, range) {
     timestamp += bucketSeconds
   ) {
     timestamps.push(timestamp);
-    counts.push(requestCounts.get(timestamp) || 0);
+    counts.push(
+      requestCounts.has(timestamp) ? requestCounts.get(timestamp) : null
+    );
     const sample = autoscalerSamples.get(timestamp);
     demandTargets.push(sample?.demandTarget ?? null);
     capacityTargets.push(sample?.capacityTarget ?? null);
@@ -57,7 +59,10 @@ export function buildRequestHistoryView(history, range) {
     provisioningCapacities.push(sample?.provisioningCapacity ?? null);
     totalCapacities.push(sample?.totalCapacity ?? null);
   }
-  const total = counts.reduce((sum, count) => sum + count, 0);
+  const observedCounts = counts.filter((count) => count !== null);
+  const requestHistoryComplete =
+    counts.length > 0 && counts.every((count) => count !== null);
+  const total = observedCounts.reduce((sum, count) => sum + count, 0);
   const observedCapacity = timestamps
     .map((timestamp, index) => ({
       timestamp,
@@ -150,9 +155,9 @@ export function buildRequestHistoryView(history, range) {
     totalCapacities,
     events,
     stats: {
-      total,
-      averagePerMinute: counts.length ? total / counts.length : 0,
-      peakPerMinute: counts.length ? Math.max(...counts) : 0,
+      total: requestHistoryComplete ? total : null,
+      averagePerMinute: requestHistoryComplete ? total / counts.length : null,
+      peakPerMinute: requestHistoryComplete ? Math.max(...counts) : null,
     },
     capacityStats,
   };
@@ -211,6 +216,7 @@ export function RequestHistoryCard({
         pointRadius: 0,
         borderWidth: 1.75,
         stepped: 'middle',
+        spanGaps: false,
         tension: 0,
       },
       ...(hasCapacity
@@ -321,12 +327,14 @@ export function RequestHistoryCard({
           <div className="text-sm text-gray-500">
             Recorded attempts include admitted requests and explicit queue-full
             or queue-timeout rejections; attempts canceled or disconnected while
-            awaiting admission are excluded. Traffic target includes autoscaler
-            hysteresis. Traffic or reservation target is the larger of traffic
-            and reserved-capacity fill. Committed / unready capacity combines
-            queued, provider-launching, application-starting, and not-ready
-            work. Non-failed tracked capacity also includes stopping and
-            preempted rows until cleanup finishes
+            awaiting admission are excluded. Missing minutes are unknown; an
+            explicit zero means the active load balancer observed the complete
+            minute. Traffic target includes autoscaler hysteresis. Traffic or
+            reservation target is the larger of traffic and reserved-capacity
+            fill. Committed / unready capacity combines queued,
+            provider-launching, application-starting, and not-ready work.
+            Non-failed tracked capacity also includes stopping and preempted
+            rows until cleanup finishes
             {loading ? ' · Refreshing…' : ''}
           </div>
         </div>
@@ -342,21 +350,27 @@ export function RequestHistoryCard({
               <div>
                 <div className="text-gray-500">Recorded attempts in range</div>
                 <div className="font-semibold">
-                  {view.stats.total.toLocaleString()}
+                  {view.stats.total === null
+                    ? 'N/A'
+                    : view.stats.total.toLocaleString()}
                 </div>
               </div>
               <div>
                 <div className="text-gray-500">Average / minute</div>
                 <div className="font-semibold">
-                  {view.stats.averagePerMinute.toLocaleString(undefined, {
-                    maximumFractionDigits: 1,
-                  })}
+                  {view.stats.averagePerMinute === null
+                    ? 'N/A'
+                    : view.stats.averagePerMinute.toLocaleString(undefined, {
+                        maximumFractionDigits: 1,
+                      })}
                 </div>
               </div>
               <div>
                 <div className="text-gray-500">Peak / minute</div>
                 <div className="font-semibold">
-                  {view.stats.peakPerMinute.toLocaleString()}
+                  {view.stats.peakPerMinute === null
+                    ? 'N/A'
+                    : view.stats.peakPerMinute.toLocaleString()}
                 </div>
               </div>
             </div>

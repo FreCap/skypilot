@@ -4124,12 +4124,20 @@ def test_exact_async_request_never_replays_ambiguous_submission():
 
 def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
         monkeypatch):
-    attempt_id = '11111111-1111-4111-8111-111111111111'
+    rejected_attempt_id = '11111111-1111-4111-8111-111111111111'
+    accepted_attempt_id = '22222222-2222-4222-8222-222222222222'
 
     class Response:
         """One exact async admission response."""
 
-        def __init__(self, status, state, revision, body=b'{}'):
+        def __init__(self,
+                     status,
+                     state,
+                     revision,
+                     body=b'{}',
+                     *,
+                     attempt_id=rejected_attempt_id,
+                     attempt_no=1):
             self.status = status
             self._body = body
             self.headers = {
@@ -4137,7 +4145,7 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
                 'X-SkyServe-Async-Ledger-Protocol': '1',
                 'X-SkyServe-Service-Incarnation': 'incarnation-a',
                 'X-SkyServe-Async-Attempt-Id': attempt_id,
-                'X-SkyServe-Async-Attempt-No': '1',
+                'X-SkyServe-Async-Attempt-No': str(attempt_no),
                 'X-SkyServe-Async-Ledger-Revision': str(revision),
                 'X-SkyServe-Async-Ledger-State': state,
             }
@@ -4162,7 +4170,12 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
             self.responses = [
                 Response(429, 'REJECTED_PRE_DISPATCH', 1),
                 Response(503, 'REJECTED_PRE_DISPATCH', 1),
-                Response(202, 'ACCEPTED', 2, accepted),
+                Response(202,
+                         'ACCEPTED',
+                         2,
+                         accepted,
+                         attempt_id=accepted_attempt_id,
+                         attempt_no=2),
             ]
             self.calls = []
 
@@ -4177,7 +4190,7 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
 
     monkeypatch.setattr(qualifier.asyncio, 'sleep', fake_sleep)
     session = Session()
-    asyncio.run(
+    receipt, _ = asyncio.run(
         qualifier._submit_exact_async_request(
             session,
             endpoint='https://service.test',
@@ -4188,6 +4201,8 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
             duration_seconds=0,
             deadline=qualifier.time.monotonic() + 2))
 
+    assert receipt.attempt_id == accepted_attempt_id
+    assert receipt.attempt_no == 2
     assert len(session.calls) == 3
     assert len({call[1]['data'] for call in session.calls}) == 1
     assert {call[1]['headers']['X-SkyServe-Job-Id'] for call in session.calls
@@ -4202,6 +4217,211 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
             != qualifier._bounded_retry_delay('1',
                                               attempt=0,
                                               request_id='execution-2'))
+
+
+@pytest.mark.parametrize(
+    ('previous', 'current', 'accepted_response', 'valid'), [
+        (None, ('accepted', 1, 'ACCEPTED', 2), True, True),
+        (None, ('accepted', 1, 'SUCCEEDED', 2), True, True),
+        (None, ('accepted', 1, 'SUCCEEDED', 3), True, True),
+        (None, ('accepted', 1, 'ACCEPTED', 1), True, False),
+        (None, ('accepted', 1, 'ACCEPTED', 99), True, False),
+        (None, ('accepted', 1, 'SUCCEEDED', 99), True, False),
+        (None, ('rejected', 1, 'REJECTED_PRE_DISPATCH', 1), False, True),
+        (None, ('rejected', 1, 'REJECTED_PRE_DISPATCH', 2), False, True),
+        (None, ('rejected', 2, 'REJECTED_PRE_DISPATCH', 1), False, False),
+        (None, ('rejected', 2, 'REJECTED_PRE_DISPATCH', 2), False, True),
+        (None, ('rejected', 2, 'REJECTED_PRE_DISPATCH', 99), False, False),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('rejected', 1, 'REJECTED_PRE_DISPATCH', 1), False, True),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('rejected', 1, 'REJECTED_PRE_DISPATCH', 2), False, False),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 2, 'REJECTED_PRE_DISPATCH', 1), False, False),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 2, 'REJECTED_PRE_DISPATCH', 2), False, True),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 3, 'ACCEPTED', 2), True, True),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 4, 'SUCCEEDED', 3), True, True),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 2, 'REJECTED_PRE_DISPATCH', 99), False, False),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 2, 'ACCEPTED', 99), True, False),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 2, 'SUCCEEDED', 99), True, False),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('rejected', 1, 'ACCEPTED', 2), True, False),
+        (None, ('accepted', 1, 'FAILED', 2), True, False),
+    ])
+def test_exact_async_submission_receipt_state_machine(previous, current,
+                                                      accepted_response, valid):
+    """Only ledger-reachable submission receipts qualify the campaign."""
+
+    def receipt(fields):
+        if fields is None:
+            return None
+        attempt_id, attempt_no, state, revision = fields
+        attempt_ids = {
+            'rejected': '11111111-1111-4111-8111-111111111111',
+            'accepted': '22222222-2222-4222-8222-222222222222',
+            'successor': '33333333-3333-4333-8333-333333333333',
+        }
+        return qualifier.ExactAsyncReceipt(attempt_id=attempt_ids[attempt_id],
+                                           attempt_no=attempt_no,
+                                           state=state,
+                                           revision=revision)
+
+    previous_receipt = receipt(previous)
+    current_receipt = receipt(current)
+    assert current_receipt is not None
+    if valid:
+        qualifier._validate_submission_receipt(
+            current_receipt,
+            previous_rejection=previous_receipt,
+            accepted_response=accepted_response)
+    else:
+        with pytest.raises(qualifier.QualificationError,
+                           match='conflicting receipt transition'):
+            qualifier._validate_submission_receipt(
+                current_receipt,
+                previous_rejection=previous_receipt,
+                accepted_response=accepted_response)
+
+
+@pytest.mark.parametrize(('current_revision', 'valid'), [(3, True),
+                                                         (99, False)])
+def test_exact_async_completion_receipt_revision(current_revision, valid):
+    """Terminal success advances the accepted attempt exactly once."""
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+    accepted = qualifier.ExactAsyncReceipt(attempt_id=attempt_id,
+                                           attempt_no=1,
+                                           state='ACCEPTED',
+                                           revision=2)
+    current = qualifier.ExactAsyncReceipt(attempt_id=attempt_id,
+                                          attempt_no=1,
+                                          state='SUCCEEDED',
+                                          revision=current_revision)
+    if valid:
+        qualifier._validate_completion_receipt(accepted, current)
+    else:
+        with pytest.raises(qualifier.QualificationError,
+                           match='conflicting receipt transition'):
+            qualifier._validate_completion_receipt(accepted, current)
+
+
+def test_exact_async_request_accepts_terminal_success_race():
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+
+    class Response:
+
+        status = 202
+        headers = {
+            'X-SkyServe-Async-Ledger-Protocol': '1',
+            'X-SkyServe-Service-Incarnation': 'incarnation-a',
+            'X-SkyServe-Async-Attempt-Id': attempt_id,
+            'X-SkyServe-Async-Attempt-No': '1',
+            'X-SkyServe-Async-Ledger-Revision': '2',
+            'X-SkyServe-Async-Ledger-State': 'SUCCEEDED',
+        }
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        @staticmethod
+        async def read():
+            return json.dumps({
+                'request_id': 'execution-1',
+                'status': 'accepted',
+            }).encode()
+
+    class Session:
+
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, _url, **_kwargs):
+            self.calls += 1
+            return Response()
+
+    session = Session()
+    asyncio.run(
+        qualifier._one_exact_async_request(session,
+                                           endpoint='https://service.test',
+                                           token='secret',
+                                           service_hash='incarnation-a',
+                                           request_id='execution-1',
+                                           stable_job_id='job-1',
+                                           duration_seconds=0,
+                                           deadline=qualifier.time.monotonic() +
+                                           2))
+    assert session.calls == 1
+
+
+def test_exact_async_request_rejects_non_successor_after_typed_rejection(
+        monkeypatch):
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+
+    class Response:
+
+        def __init__(self, status, state, revision, body=b'{}'):
+            self.status = status
+            self._body = body
+            self.headers = {
+                'Retry-After': '0.1',
+                'X-SkyServe-Async-Ledger-Protocol': '1',
+                'X-SkyServe-Service-Incarnation': 'incarnation-a',
+                'X-SkyServe-Async-Attempt-Id': attempt_id,
+                'X-SkyServe-Async-Attempt-No': '1',
+                'X-SkyServe-Async-Ledger-Revision': str(revision),
+                'X-SkyServe-Async-Ledger-State': state,
+            }
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def read(self):
+            return self._body
+
+    class Session:
+
+        def __init__(self):
+            accepted = json.dumps({
+                'request_id': 'execution-1',
+                'status': 'accepted',
+            }).encode()
+            self.responses = [
+                Response(503, 'REJECTED_PRE_DISPATCH', 1),
+                # A rejected attempt cannot itself become accepted. The
+                # ledger must authorize a distinct successor attempt.
+                Response(202, 'ACCEPTED', 2, accepted),
+            ]
+
+        def post(self, _url, **_kwargs):
+            return self.responses.pop(0)
+
+    async def fake_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', fake_sleep)
+    with pytest.raises(qualifier.QualificationError,
+                       match='conflicting receipt transition'):
+        asyncio.run(
+            qualifier._submit_exact_async_request(
+                Session(),
+                endpoint='https://service.test',
+                token='secret',
+                service_hash='incarnation-a',
+                request_id='execution-1',
+                stable_job_id='job-1',
+                duration_seconds=0,
+                deadline=qualifier.time.monotonic() + 2))
 
 
 def test_exact_completion_retries_with_stable_exponential_jitter(monkeypatch):
@@ -4333,7 +4553,7 @@ def test_exact_async_completion_gate_holds_real_http_requests_until_release():
                 status=202,
                 headers=receipt_headers(request_id,
                                         state='ACCEPTED',
-                                        revision=1))
+                                        revision=2))
         finally:
             active_requests -= 1
 
@@ -4346,7 +4566,7 @@ def test_exact_async_completion_gate_holds_real_http_requests_until_release():
         return aiohttp.web.Response(status=204,
                                     headers=receipt_headers(request_id,
                                                             state='SUCCEEDED',
-                                                            revision=2))
+                                                            revision=3))
 
     async def exercise():
         app = aiohttp.web.Application()
@@ -4428,7 +4648,7 @@ def test_exact_async_tail_batches_use_bounded_real_http_concurrency():
                 status=202,
                 headers=receipt_headers(request_id,
                                         state='ACCEPTED',
-                                        revision=1))
+                                        revision=2))
         finally:
             active_requests -= 1
 
@@ -4445,7 +4665,7 @@ def test_exact_async_tail_batches_use_bounded_real_http_concurrency():
                                         headers=receipt_headers(
                                             request_id,
                                             state='SUCCEEDED',
-                                            revision=2))
+                                            revision=3))
         finally:
             active_requests -= 1
 

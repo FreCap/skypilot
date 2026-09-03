@@ -70,6 +70,8 @@ def _record_request_history(self: Any, request_data: dict[str, Any]) -> bool:
         service_hash,
         reporter_session_id,
         request_history,
+        coverage_authority=(serve_history.RequestHistoryCoverageAuthority.
+                            from_payload(request_data)),
     )
     return True
 

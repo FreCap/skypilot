@@ -411,6 +411,9 @@ def test_zero_replica_projected_route_emits_complete_active_demand(
     assert projected.response['num_ready_replicas'] == 0
     assert sync_payload['in_flight'] == {}
     assert sync_payload['unknown_in_flight_urls'] == []
+    assert sync_payload['lb_slot'] == 'a'
+    assert sync_payload['applied_role'] == lb_ha.LbRole.ACTIVE.value
+    assert sync_payload['applied_generation'] == 4
     assert normalized['applied_role'] == lb_ha.LbRole.ACTIVE.value
     assert normalized['applied_generation'] == 4
     assert normalized['routing_version'] == 7
@@ -632,6 +635,36 @@ def test_durable_demand_sync_posts_directly_and_acknowledges_history():
     assert kwargs['json']['demand_window']['buckets'][0]['request_count'] == 1
     assert kwargs['timeout'].total == constants.LB_DEMAND_REPORT_TIMEOUT_SECONDS
     assert lb._request_aggregator.request_history_snapshot() is None
+
+
+def test_only_stable_active_lb_reports_idle_history_coverage(monkeypatch):
+    now = [120.0]
+    monkeypatch.setattr(load_balancer.time, 'time', lambda: now[0])
+    monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'lb-pod-uid-a')
+    lb = load_balancer.SkyServeLoadBalancer('http://ctrl:8001',
+                                            8890,
+                                            lb_slot=lb_ha.LbSlot.A)
+
+    assert lb._lb_role is lb_ha.LbRole.STANDBY
+    assert lb._build_demand_report()[0]['request_history'] is None
+    now[0] = 180.0
+    assert lb._build_demand_report()[0]['request_history'] is None
+
+    lb._lb_role = lb_ha.LbRole.ARMED
+    assert lb._build_demand_report()[0]['request_history'] is None
+    now[0] = 240.0
+    assert lb._build_demand_report()[0]['request_history'] is None
+
+    lb._lb_role = lb_ha.LbRole.ACTIVE
+    assert lb._build_demand_report()[0]['request_history'] is None
+    now[0] = 300.0
+    history = lb._build_demand_report()[0]['request_history']
+    assert history['buckets'] == [{
+        'bucket_start': 240,
+        'request_count': 0,
+        'rejected_count': 0,
+        'coverage_complete': True,
+    }]
 
 
 @pytest.mark.parametrize('role', [lb_ha.LbRole.ACTIVE, lb_ha.LbRole.STANDBY])

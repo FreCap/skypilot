@@ -1,6 +1,7 @@
 """PostgreSQL-backed aggregate history for SkyServe status and requests."""
 
 from collections.abc import Collection
+from collections.abc import Mapping
 import dataclasses
 import datetime
 import math
@@ -14,6 +15,7 @@ from sky import sky_logging
 from sky.serve import async_request_ledger
 from sky.serve import capacity_admission_schema
 from sky.serve import constants
+from sky.serve import lb_ha
 from sky.serve import serve_state
 from sky.utils import common_utils
 from sky.utils.db import db_utils
@@ -27,6 +29,35 @@ REQUEST_CLASSIFICATION_PROTOCOL_VERSION = 1
 ACCELERATOR_BREAKDOWN_CAPACITY_SEMANTICS_VERSION = 2
 STATUS_HISTORY_SECTIONS = frozenset(
     {'requests', 'replicas', 'prediction', 'autoscaler'})
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class RequestHistoryCoverageAuthority:
+    """Reporter role evidence required for an observed-zero history row."""
+
+    reporter_slot: lb_ha.LbSlot
+    applied_role: lb_ha.LbRole
+    applied_generation: int
+
+    @classmethod
+    def from_payload(
+            cls,
+            payload: Mapping[str,
+                             Any]) -> 'RequestHistoryCoverageAuthority | None':
+        """Parse only complete ACTIVE HA evidence; otherwise fail closed."""
+        reporter_slot = lb_ha.parse_slot(payload.get('lb_slot'))
+        try:
+            applied_role = lb_ha.LbRole(payload.get('applied_role'))
+        except (TypeError, ValueError):
+            return None
+        applied_generation = payload.get('applied_generation')
+        if (reporter_slot is None or applied_role is not lb_ha.LbRole.ACTIVE or
+                type(applied_generation) is not int or applied_generation < 1):
+            return None
+        return cls(reporter_slot=reporter_slot,
+                   applied_role=applied_role,
+                   applied_generation=applied_generation)
+
 
 metadata = sqlalchemy.MetaData()
 
@@ -1020,7 +1051,13 @@ def _request_history_rows(
     request_history: dict[str, Any],
     observed_at: datetime.datetime,
 ) -> list[dict[str, Any]]:
-    """Validate one LB report and convert it to minute-bucket DB rows."""
+    """Validate one LB report and convert it to minute-bucket DB rows.
+
+    A zero row is reserved for an explicit complete-coverage heartbeat.  Its
+    presence in the existing activity table, with rejection coverage set, is
+    the durable observed-zero marker.  Sparse missing minutes therefore remain
+    distinguishable without another table or migration.
+    """
     if not isinstance(request_history, dict):
         raise ValueError('request_history must be an object.')
     if request_history.get('bucket_seconds') != BUCKET_SECONDS:
@@ -1049,6 +1086,7 @@ def _request_history_rows(
         request_count = bucket.get('request_count')
         rejection_count_available = 'rejected_count' in bucket
         rejected_count = bucket.get('rejected_count', 0)
+        coverage_complete = bucket.get('coverage_complete', False)
         if (not isinstance(bucket_start, int) or
                 isinstance(bucket_start, bool) or
                 bucket_start % BUCKET_SECONDS != 0):
@@ -1065,9 +1103,16 @@ def _request_history_rows(
                 isinstance(rejected_count, bool) or rejected_count < 0):
             raise ValueError('request_history rejected_count must be a '
                              'nonnegative integer.')
-        if request_count == 0 and rejected_count == 0:
+        if not isinstance(coverage_complete, bool):
+            raise ValueError('request_history coverage_complete must be a '
+                             'boolean.')
+        if coverage_complete and not rejection_count_available:
+            raise ValueError('request_history complete coverage must include '
+                             'rejected_count.')
+        if (request_count == 0 and rejected_count == 0 and
+                not coverage_complete):
             raise ValueError('request_history bucket must contain a request '
-                             'or rejection count.')
+                             'or rejection count, or prove complete coverage.')
         bucket_datetime = _utc_datetime(bucket_start)
         if not oldest_bucket <= bucket_datetime <= newest_bucket:
             raise ValueError('request_history bucket_start is outside the '
@@ -1091,6 +1136,8 @@ def record_request_activity(
     reporter_session_id: str,
     request_history: dict[str, Any] | None,
     timestamp: float | None = None,
+    *,
+    coverage_authority: RequestHistoryCoverageAuthority | None = None,
 ) -> int:
     """Persist cumulative minute arrival counters from one LB process.
 
@@ -1105,10 +1152,50 @@ def record_request_activity(
     rows = _request_history_rows(service_name, service_hash,
                                  reporter_session_id, request_history,
                                  observed_at)
+    zero_coverage_buckets = {
+        _utc_datetime(bucket['bucket_start'])
+        for bucket in request_history['buckets']
+        if (bucket.get('coverage_complete') is True and bucket['request_count']
+            == 0 and bucket.get('rejected_count', 0) == 0)
+    }
     engine = _postgres_engine()
     if engine is None or not rows:
         return 0
     with engine.begin() as connection:
+        if zero_coverage_buckets:
+            authority_valid = (
+                isinstance(coverage_authority, RequestHistoryCoverageAuthority)
+                and coverage_authority.applied_role is lb_ha.LbRole.ACTIVE and
+                isinstance(coverage_authority.reporter_slot, lb_ha.LbSlot) and
+                type(coverage_authority.applied_generation) is int and
+                coverage_authority.applied_generation >= 1)
+            if authority_valid:
+                assert isinstance(coverage_authority,
+                                  RequestHistoryCoverageAuthority)
+                services = serve_state.services_table
+                current_service = connection.execute(
+                    sqlalchemy.select(services.c.name).where(
+                        services.c.name == service_name,
+                        services.c.hash == service_hash,
+                        services.c.pool == 0,
+                        services.c.lb_ha_enabled == 1,
+                        services.c.lb_active_slot ==
+                        coverage_authority.reporter_slot.value,
+                        services.c.lb_cutover_generation ==
+                        coverage_authority.applied_generation,
+                        services.c.lb_cutover_phase.in_((
+                            lb_ha.LbCutoverPhase.STABLE.value,
+                            lb_ha.LbCutoverPhase.DRAINING.value,
+                        )),
+                    ).with_for_update(read=True)).scalar_one_or_none()
+                authority_valid = current_service is not None
+            if not authority_valid:
+                rows = [
+                    row for row in rows
+                    if row['bucket_start'] not in zero_coverage_buckets
+                ]
+            if not rows:
+                return 0
         insert = postgresql.insert(serve_request_activity_history_table).values(
             rows)
         excluded = insert.excluded
@@ -1245,7 +1332,11 @@ def _request_classification_rows(
             'observed_at': observed_at,
             'request_count': 0,
             'rejected_count': 0,
-            'rejection_count_available': True,
+            # Terminal classification is independently acknowledged and does
+            # not prove that this reporter's sparse rejection counter covered
+            # the minute.  A paired request-history row (including an explicit
+            # zero heartbeat) promotes this through the monotonic OR upsert.
+            'rejection_count_available': False,
             'classified_request_count': classified_request_count,
             'counted_rejected_count': counted_rejected_count,
         })
@@ -1289,9 +1380,19 @@ def record_request_classification(
             # the generic writer will acknowledge and drop that sibling
             # snapshot without promoting false support evidence.
             support_rows = []
+        # Idle coverage has one canonical, transactionally fenced writer.
+        # Classification may retain real counters, but cannot bypass the
+        # current HA slot/generation check with an all-zero support row.
+        support_rows = [
+            row for row in support_rows
+            if row['request_count'] > 0 or row['rejected_count'] > 0
+        ]
         for support_row in support_rows:
-            support_row['request_count'] = 0
-            support_row['rejected_count'] = 0
+            # The current classification protocol is persisted before the
+            # independently acknowledged arrival writer.  Retain the exact
+            # counters here so that writer failure cannot expose its support
+            # row as a fabricated idle minute.  The later cumulative upsert is
+            # idempotent for the same reporter and bucket.
             support_row['rejection_count_available'] = True
             support_row['classified_request_count'] = 0
             support_row['counted_rejected_count'] = 0
@@ -2119,6 +2220,12 @@ def get_status_history(
                     request_history.c.service_hash == service_hash,
                     request_history.c.bucket_start >= window_start,
                     request_history.c.bucket_start <= observed_at,
+                    # Classification-only rows share this table but prove
+                    # neither arrival nor rejection coverage.  Keep them out
+                    # of the request series until an actual counter or an
+                    # explicit complete-coverage heartbeat promotes the row.
+                    sqlalchemy.or_(request_history.c.request_count > 0,
+                                   request_history.c.rejection_count_available),
                 ).group_by(request_history.c.bucket_start).order_by(
                     request_history.c.bucket_start)).all()
         if 'prediction' in requested_sections:

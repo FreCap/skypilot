@@ -4386,7 +4386,6 @@ class SkyServeLoadBalancer:
                 url: int(generation) for url, generation in
                 self._occupancy_sample_generation.items() if url in sampled_set
             }
-        session_id = self._get_lb_session_id()
         async with aiohttp.ClientSession() as session:
             if route_only:
                 # A route retry is not a demand-reporting round.  In
@@ -4403,7 +4402,10 @@ class SkyServeLoadBalancer:
                 # cancelled send restores this batch ahead of newer arrivals.
                 request_batch = self._request_aggregator.drain()
                 request_history = (
-                    self._request_aggregator.request_history_snapshot())
+                    self._request_aggregator.request_history_snapshot(
+                        include_idle_coverage=(
+                            not self._draining and
+                            self._lb_role is lb_ha.LbRole.ACTIVE)))
                 request_classification_history = (
                     self._request_aggregator.
                     request_classification_history_snapshot())
@@ -4436,7 +4438,7 @@ class SkyServeLoadBalancer:
                 'total_slots_by_url': total_slots_by_url,
                 'occupancy_sample_generation': occupancy_sample_generation,
                 'draining_urls': list(self._draining_clients),
-                'lb_session_id': session_id,
+                **self._ha_identity_payload(),
                 **queue_snapshot.payload(),
                 **rejection_snapshot.payload(),
                 **self._offered_arrival_counts(),
@@ -5060,7 +5062,9 @@ class SkyServeLoadBalancer:
     ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any],
                dict[str, Any] | None]:
         """Build one complete non-destructive central demand snapshot."""
-        request_history = self._request_aggregator.request_history_snapshot()
+        request_history = self._request_aggregator.request_history_snapshot(
+            include_idle_coverage=(
+                not self._draining and self._lb_role is lb_ha.LbRole.ACTIVE))
         classification = (
             self._request_aggregator.request_classification_history_snapshot())
         prediction = (
@@ -5243,6 +5247,16 @@ class SkyServeLoadBalancer:
                 return
             await asyncio.sleep(delay)
 
+    def _ha_identity_payload(self) -> dict[str, Any]:
+        """Return the process identity and last locally applied HA role."""
+        return {
+            'lb_session_id': self._get_lb_session_id(),
+            'lb_slot': self._lb_slot.value
+                       if self._lb_slot is not None else None,
+            'applied_role': self._lb_role.value,
+            'applied_generation': self._lb_role_generation,
+        }
+
     def _ha_role_payload(self,
                          *,
                          current_routes_only: bool = False) -> dict[str, Any]:
@@ -5328,19 +5342,12 @@ class SkyServeLoadBalancer:
         }
         sample_ages = {url: sample_ages[url] for url in common_urls}
         return {
-            'lb_session_id': self._get_lb_session_id(),
-            'lb_slot': self._lb_slot.value
-                       if self._lb_slot is not None else None,
+            **self._ha_identity_payload(),
             'routing_version': routing_version,
             'route_projection_generation': route_projection_generation,
             'route_projection_sha256': route_projection_sha256,
             'route_source_epoch': route_source_epoch,
             'armed_generation': self._armed_generation,
-            # Echo only the role response already applied locally. The
-            # controller uses this acknowledgement to prove that a former
-            # active stopped admission before accepting its zero-work report.
-            'applied_role': self._lb_role.value,
-            'applied_generation': self._lb_role_generation,
             # Process-local admissions include queued, dispatching, and
             # streaming requests. Unlike backend async occupancy, this count
             # belongs to exactly one LB session and is the authoritative
@@ -5460,10 +5467,13 @@ class SkyServeLoadBalancer:
                                 'generation.')
                         previous_role = self._lb_role
                         previous_generation = self._lb_role_generation
-                        requires_fresh_occupancy = (
-                            role in (lb_ha.LbRole.ARMED, lb_ha.LbRole.ACTIVE)
-                            and (role is not previous_role or
-                                 generation != previous_generation))
+                        role_authority_changed = (
+                            role is not previous_role or
+                            generation != previous_generation)
+                        requires_fresh_occupancy = (role
+                                                    in (lb_ha.LbRole.ARMED,
+                                                        lb_ha.LbRole.ACTIVE) and
+                                                    role_authority_changed)
                         rollout_evidence = body.get('ha_rollout')
                         with self._client_pool_lock:
                             self._lb_role = role
@@ -5471,6 +5481,13 @@ class SkyServeLoadBalancer:
                             self._lb_ha_rollout_evidence = (
                                 rollout_evidence if isinstance(
                                     rollout_evidence, dict) else None)
+                            if role_authority_changed:
+                                # Even a sub-report-interval role change makes
+                                # the crossing minute unknowable.  Reset at the
+                                # authority transition itself; the next ACTIVE
+                                # demand report starts a fresh exact interval.
+                                (self._request_aggregator.
+                                 reset_request_history_coverage())
                             if role is lb_ha.LbRole.ARMED:
                                 self._armed_generation = generation
                             else:
@@ -5533,7 +5550,10 @@ class SkyServeLoadBalancer:
 
     async def _flush_request_history_on_drain(self) -> None:
         """Best-effort bounded history flush that cannot report demand."""
-        request_history = self._request_aggregator.request_history_snapshot()
+        # Draining is not a traffic-authoritative interval.  Flush changed
+        # counters, but never manufacture an idle-minute coverage marker.
+        request_history = self._request_aggregator.request_history_snapshot(
+            include_idle_coverage=False)
         request_classification_history = (
             self._request_aggregator.request_classification_history_snapshot())
         prediction_time_history = (
@@ -5544,13 +5564,12 @@ class SkyServeLoadBalancer:
             return
         try:
             sync_tokens = serve_utils.get_lb_sync_auth_tokens(required=True)
-            session_id = self._get_lb_session_id()
             payload = {
                 'request_history': request_history,
                 'request_classification_history': request_classification_history,
                 'prediction_time_history': prediction_time_history,
                 'request_history_session_id': self._request_history_session_id,
-                'lb_session_id': session_id,
+                **self._ha_identity_payload(),
             }
             async with aiohttp.ClientSession() as session:
                 token_attempts: tuple[str | None,

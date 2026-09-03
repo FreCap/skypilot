@@ -34,11 +34,13 @@ from sky.serve import constants
 from sky.serve import controller
 from sky.serve import drain_observability
 from sky.serve import kueue_lane_capacity
+from sky.serve import lb_ha
 from sky.serve import paid_retirement
 from sky.serve import placement_policy
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
+from sky.serve import serve_history
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -8829,6 +8831,9 @@ class TestAuthoritativeLbReportIngestion:
         ctrl, _, report = self._controller_and_report()
         ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
         report['request_history_session_id'] = 'a' * 32
+        report['lb_slot'] = 'a'
+        report['applied_role'] = lb_ha.LbRole.ACTIVE.value
+        report['applied_generation'] = 7
         report['request_history'] = {
             'bucket_seconds': 60,
             'buckets': [{
@@ -8848,6 +8853,11 @@ class TestAuthoritativeLbReportIngestion:
             'service-hash',
             f"lb-a:{'a' * 32}",
             report['request_history'],
+            coverage_authority=(
+                serve_history.RequestHistoryCoverageAuthority(
+                    reporter_slot=lb_ha.LbSlot.A,
+                    applied_role=lb_ha.LbRole.ACTIVE,
+                    applied_generation=7)),
         )
 
     def test_response_time_history_uses_separate_persistence_contract(self):

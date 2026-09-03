@@ -486,6 +486,20 @@ def test_request_history_rows_validate_and_normalize_recent_buckets():
     assert rejection_only[0]['rejected_count'] == 1
     assert rejection_only[0]['rejection_count_available'] is True
 
+    idle_heartbeat = serve_history._request_history_rows(
+        'svc', 'hash', 'pod:process', {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': int(observed_at.timestamp()) // 60 * 60 - 60,
+                'request_count': 0,
+                'rejected_count': 0,
+                'coverage_complete': True,
+            }],
+        }, observed_at)
+    assert idle_heartbeat[0]['request_count'] == 0
+    assert idle_heartbeat[0]['rejected_count'] == 0
+    assert idle_heartbeat[0]['rejection_count_available'] is True
+
 
 @pytest.mark.parametrize(
     'request_history',
@@ -506,6 +520,24 @@ def test_request_history_rows_validate_and_normalize_recent_buckets():
             'buckets': [{
                 'bucket_start': 60,
                 'request_count': 0,
+            }],
+        },
+        {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': 60,
+                'request_count': 0,
+                'rejected_count': 0,
+                'coverage_complete': False,
+            }],
+        },
+        {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': 60,
+                'request_count': 0,
+                'rejected_count': 0,
+                'coverage_complete': 'yes',
             }],
         },
         {

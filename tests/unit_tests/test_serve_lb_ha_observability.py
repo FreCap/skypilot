@@ -113,6 +113,10 @@ def test_active_role_transition_invalidates_then_immediately_reprobes(
                                        occupancy={url: 0},
                                        total_slots={url: 4},
                                        free_slots={url: 4})
+    # A previous observation interval must never cross this role/generation
+    # transition, even if no periodic demand-report tick sees the old role.
+    request_aggregator = lb._request_aggregator  # pylint: disable=protected-access
+    setattr(request_aggregator, '_request_history_coverage_started_at', 60.0)
 
     class _RoleResponse:
         """Minimal successful controller role response."""
@@ -156,6 +160,8 @@ def test_active_role_transition_invalidates_then_immediately_reprobes(
         assert lb._lb_role.value == 'ACTIVE'  # pylint: disable=protected-access
         assert lb._lb_role_generation == 2  # pylint: disable=protected-access
         assert lb._occupancy_role_epoch == 1  # pylint: disable=protected-access
+        assert getattr(request_aggregator,
+                       '_request_history_coverage_started_at') is None
 
     reprobe = mock.AsyncMock(side_effect=_assert_invalidated_then_probe)
     monkeypatch.setattr(load_balancer.aiohttp, 'ClientSession', _RoleSession)
