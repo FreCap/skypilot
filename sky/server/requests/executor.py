@@ -701,6 +701,7 @@ class RequestWorker:
             request_element.request_id, request_element.execution_generation,
             request_element.claim_token)
         try:
+            execution_claim_revoked = False
             if request_element.claim_token is not None:
                 claim = request_storage.ExecutionClaim(
                     request_element.request_id,
@@ -741,6 +742,10 @@ class RequestWorker:
                     while not future_done.is_set():
                         try:
                             if not backend.heartbeat_claim(claim):
+                                # A Future cancelled after durable claim loss
+                                # was admitted and ran; it is not a dispatcher
+                                # submission failure.
+                                execution_claim_revoked = True
                                 if backend.interrupt_cancelled_claim(claim):
                                     if not revocation_reported:
                                         logger.info(
@@ -767,7 +772,10 @@ class RequestWorker:
                                 f'{common_utils.format_exception(heartbeat_error)}'
                             )
                         future_done.wait(interval)
-            self._handle_task_result(fut, original_request_element)
+            self._handle_task_result(
+                fut,
+                original_request_element,
+                execution_claim_revoked=execution_claim_revoked)
         finally:
             request_storage.deactivate_execution_claim(claim_context_token)
 
@@ -861,8 +869,11 @@ class RequestWorker:
                                'without a boundary result.')
         fut.acknowledge_receipt()
 
-    def _handle_task_result(self, fut: concurrent.futures.Future,
-                            request_element: queue_base.QueueItemLike) -> None:
+    def _handle_task_result(self,
+                            fut: concurrent.futures.Future,
+                            request_element: queue_base.QueueItemLike,
+                            *,
+                            execution_claim_revoked: bool = False) -> None:
         requeue_element = request_element
         request_element = queue_base.normalize_queue_item(request_element)
         claim = (request_storage.ExecutionClaim(
@@ -894,7 +905,9 @@ class RequestWorker:
                     self._converge_execution_completion(
                         claim,
                         error=e,
-                        terminal_cause='dispatcher_submit_failed')
+                        terminal_cause=('execution_lease_expired'
+                                        if execution_claim_revoked else
+                                        'dispatcher_submit_failed'))
                 else:
                     api_requests.set_request_failed(request_element.request_id,
                                                     e)

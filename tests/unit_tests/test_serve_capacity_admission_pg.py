@@ -64,6 +64,7 @@ from sky.server.requests import paid_wave_admission
 from sky.server.requests import payloads as request_payloads
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import requests as request_lib
+from sky.server.requests import storage as request_storage
 from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
 from sky.utils import yaml_utils
@@ -3757,6 +3758,109 @@ def _single_pool_paid_wave(engine, incarnation, monkeypatch, *, member_count,
                             first_replica_id=first_replica_id)
 
 
+@dataclasses.dataclass(frozen=True)
+class _RunningPaidRequest:
+    repository: capacity_admission.CapacityAdmissionRepository
+    request_id: str
+    association_id: uuid.UUID
+    backend: request_postgres.PostgresRequestBackend
+    claim: request_storage.ExecutionClaim
+
+
+def _commit_and_claim_running_paid_request(
+    engine: sqlalchemy.engine.Engine,
+    incarnation: uuid.UUID,
+    *,
+    replica_id: int,
+) -> _RunningPaidRequest:
+    """Commit and claim one provider request for admission-lock tests."""
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    committed = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 1},
+        backend_num_nodes=1,
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 1),
+        prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, replica_id),))
+    assert len(committed.paid_launch_bindings) == 1
+    graph = _fused_paid_graph_identities(engine)
+    assert len(graph) == 1
+    request_id = graph[0]['request_id']
+    association_id = graph[0]['association_id']
+    assert isinstance(association_id, uuid.UUID)
+
+    queue = request_postgres.PostgresQueueBackend(
+        'long',
+        supported_handler_names=frozenset(
+            {non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME}))
+    candidate = queue.peek_provider_mutation()
+    assert candidate is not None
+    assert candidate.request_id == request_id
+    item = queue.claim_provider_mutation(candidate)
+    assert item is not None
+    assert item.claim_token is not None
+    backend = request_postgres.PostgresRequestBackend()
+    assert backend.try_mark_running(item.request_id, 1234,
+                                    item.execution_generation, item.claim_token,
+                                    5678)
+    claim = request_storage.ExecutionClaim(item.request_id,
+                                           item.execution_generation,
+                                           item.claim_token,
+                                           item.worker_instance_id)
+    return _RunningPaidRequest(repository, request_id, association_id, backend,
+                               claim)
+
+
+def _request_heartbeat_at(engine: sqlalchemy.engine.Engine,
+                          request_id: str) -> datetime.datetime:
+    with engine.connect() as connection:
+        return connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS.c.heartbeat_at).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request_id)).scalar_one()
+
+
+def _assert_request_roots_lockable(engine: sqlalchemy.engine.Engine,
+                                   request_id: str) -> None:
+    """Acquire every mutable execution root without waiting."""
+    with engine.begin() as connection:
+        assert connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS.c.request_id).where(
+                request_postgres.REQUESTS.c.request_id == request_id).
+            with_for_update(nowait=True)).scalar_one() == request_id
+        assert connection.execute(
+            sqlalchemy.select(request_postgres.QUEUE.c.request_id).where(
+                request_postgres.QUEUE.c.request_id == request_id).
+            with_for_update(nowait=True)).scalar_one() == request_id
+        assert connection.execute(
+            sqlalchemy.select(
+                request_postgres.REQUEST_RETENTION_PINS.c.request_id).where(
+                    request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                    request_id).with_for_update(
+                        nowait=True)).scalar_one() == request_id
+
+
+def _assert_request_roots_locked(engine: sqlalchemy.engine.Engine,
+                                 request_id: str) -> None:
+    """Prove every mutable execution root is locked by another transaction."""
+    columns = (
+        request_postgres.REQUESTS.c.request_id,
+        request_postgres.QUEUE.c.request_id,
+        request_postgres.REQUEST_RETENTION_PINS.c.request_id,
+    )
+    for column in columns:
+        with pytest.raises(sqlalchemy.exc.OperationalError):
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.select(column).where(
+                        column == request_id).with_for_update(nowait=True))
+
+
 def test_committed_fused_wave_is_adoptable_and_unretirable_from_durable_state(
         capacity_database, monkeypatch):
     """No process-local fence is needed between commit and publication.
@@ -3888,6 +3992,184 @@ def test_paid_correctness_transaction_takes_no_second_database_checkout(
     assert len(committed.paid_launch_bindings) == 2
     assert checkouts_under_lock == []
     assert _fused_paid_graph_counts(engine) == (1, 1, 2, 2, 2, 2, 2, 2, 2)
+
+
+def test_bounded_successor_does_not_lock_active_request_liveness_roots(
+        capacity_database, monkeypatch):
+    """A long planning callback cannot starve an active execution lease.
+
+    A strict format-6 head makes the locked association frontier the complete,
+    conservative effect authority for every bounded successor.  Mutable
+    request delivery and retention rows must therefore remain available to
+    executors while the capacity transaction runs its pure planner.
+    """
+    engine, incarnation, _ = capacity_database
+    running = _commit_and_claim_running_paid_request(engine,
+                                                     incarnation,
+                                                     replica_id=2500)
+    # This test intentionally uses the same real PostgreSQL engine for the
+    # liveness lane.  A separate pool cannot evade a database row lock, which
+    # is the production failure this regression exercises.
+    monkeypatch.setattr(request_postgres, '_initialize_and_get_liveness_db',
+                        lambda: engine)
+    heartbeat_before = _request_heartbeat_at(engine, running.request_id)
+
+    planner_entered = threading.Event()
+    release_planner = threading.Event()
+    committed = []
+    errors = []
+
+    def _held_planner(snapshot, supply):
+        planner_entered.set()
+        if not release_planner.wait(timeout=15):
+            raise TimeoutError('test did not release the capacity planner')
+        return _current_decision(snapshot, supply, 1)
+
+    def _run_successor():
+        try:
+            committed.append(
+                running.repository.plan_and_admit_current(
+                    **_current_owner_kwargs(engine),
+                    service_name='svc',
+                    service_hash='svc-hash',
+                    service_lifecycle_epoch=3,
+                    service_version=1,
+                    accounting_cards={'l4': 1},
+                    backend_num_nodes=1,
+                    sequenced_reserved_fill=False,
+                    planner=_held_planner))
+        except BaseException as error:  # pylint: disable=broad-exception-caught
+            errors.append(error)
+
+    planning_thread = threading.Thread(target=_run_successor,
+                                       name='held-capacity-successor',
+                                       daemon=True)
+    planning_thread.start()
+    try:
+        assert planner_entered.wait(timeout=10)
+
+        heartbeat_started_at = time.monotonic()
+        assert running.backend.heartbeat_claim(running.claim)
+        heartbeat_elapsed = time.monotonic() - heartbeat_started_at
+        assert heartbeat_elapsed < (request_postgres._CLAIM_LEASE_SECONDS / 5)
+        heartbeat_after = _request_heartbeat_at(engine, running.request_id)
+        assert heartbeat_after > heartbeat_before
+
+        # The routine plan may lock the stable association authority, but not
+        # the active execution's request, queue, or retention-pin roots.
+        _assert_request_roots_lockable(engine, running.request_id)
+        with pytest.raises(sqlalchemy.exc.OperationalError):
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.select(
+                        ordinary_launch_binding.
+                        ordinary_launch_associations_table.c.association_id).
+                    where(ordinary_launch_binding.
+                          ordinary_launch_associations_table.c.association_id ==
+                          running.association_id).with_for_update(nowait=True))
+    finally:
+        release_planner.set()
+        planning_thread.join(timeout=15)
+    assert not planning_thread.is_alive()
+    assert not errors
+    assert len(committed) == 1
+    with engine.connect() as connection:
+        status = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS.c.status).where(
+                request_postgres.REQUESTS.c.request_id ==
+                running.request_id)).scalar_one()
+    assert status == request_lib.RequestStatus.RUNNING.value
+
+
+def test_exhaustive_census_does_not_lock_active_request_liveness_roots(
+        capacity_database, monkeypatch):
+    """The conservative genesis/fallback census also stays read-only.
+
+    An active association makes clean genesis fail closed, but inspecting that
+    graph must never suspend its executor.  Force the exhaustive path and hold
+    it immediately after the root census to exercise the exact lock boundary.
+    """
+    engine, incarnation, _ = capacity_database
+    running = _commit_and_claim_running_paid_request(engine,
+                                                     incarnation,
+                                                     replica_id=2501)
+    monkeypatch.setattr(request_postgres, '_initialize_and_get_liveness_db',
+                        lambda: engine)
+    heartbeat_before = _request_heartbeat_at(engine, running.request_id)
+
+    # A non-current or missing trust anchor selects the exhaustive census.
+    # Force that branch without corrupting the committed format-6 fixture.
+    monkeypatch.setattr(capacity_admission, '_resolve_validated_format_6_head',
+                        lambda **_kwargs: None)
+    real_resolve = capacity_admission._resolve_locked_policy_history
+    census_complete = threading.Event()
+    release_census = threading.Event()
+    committed = []
+    errors = []
+
+    def _held_resolve(*args, **kwargs):
+        census_complete.set()
+        if not release_census.wait(timeout=15):
+            raise TimeoutError('test did not release the exhaustive census')
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(capacity_admission, '_resolve_locked_policy_history',
+                        _held_resolve)
+
+    def _run_successor():
+        try:
+            committed.append(
+                running.repository.plan_and_admit_current(
+                    **_current_owner_kwargs(engine),
+                    service_name='svc',
+                    service_hash='svc-hash',
+                    service_lifecycle_epoch=3,
+                    service_version=1,
+                    accounting_cards={'l4': 1},
+                    backend_num_nodes=1,
+                    sequenced_reserved_fill=False,
+                    planner=lambda snapshot, supply: _current_decision(
+                        snapshot, supply, 1)))
+        except BaseException as error:  # pylint: disable=broad-exception-caught
+            errors.append(error)
+
+    planning_thread = threading.Thread(target=_run_successor,
+                                       name='held-exhaustive-census',
+                                       daemon=True)
+    planning_thread.start()
+    try:
+        assert census_complete.wait(timeout=10)
+        heartbeat_started_at = time.monotonic()
+        assert running.backend.heartbeat_claim(running.claim)
+        heartbeat_elapsed = time.monotonic() - heartbeat_started_at
+        assert heartbeat_elapsed < (request_postgres._CLAIM_LEASE_SECONDS / 5)
+        heartbeat_after = _request_heartbeat_at(engine, running.request_id)
+        assert heartbeat_after > heartbeat_before
+        _assert_request_roots_lockable(engine, running.request_id)
+
+        # The service/association creation fence remains locked even though
+        # the mutable request suffix is deliberately readable and writable.
+        with pytest.raises(sqlalchemy.exc.OperationalError):
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.select(
+                        ordinary_launch_binding.
+                        ordinary_launch_associations_table.c.association_id).
+                    where(ordinary_launch_binding.
+                          ordinary_launch_associations_table.c.association_id ==
+                          running.association_id).with_for_update(nowait=True))
+    finally:
+        release_census.set()
+        planning_thread.join(timeout=15)
+    assert not planning_thread.is_alive()
+    assert not errors
+    assert len(committed) == 1
+    with engine.connect() as connection:
+        status = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS.c.status).where(
+                request_postgres.REQUESTS.c.request_id ==
+                running.request_id)).scalar_one()
+    assert status == request_lib.RequestStatus.RUNNING.value
 
 
 def test_paid_420_target_converges_across_fresh_bounded_atomic_waves(
@@ -4971,6 +5253,60 @@ def test_final_service_delete_rejects_noninert_same_name_association(
                 sqlalchemy.func.count()).select_from(associations).where(
                     associations.c.association_id ==
                     tombstone['association_id'])).scalar_one() == 1
+
+
+def test_final_service_delete_still_locks_request_retention_roots(
+        capacity_database, monkeypatch):
+    """Destructive name reuse retains the exact request-root lock census."""
+    engine, _, _ = capacity_database
+    tombstone = _insert_old_incarnation_tombstone(engine)
+    for reference_kind in ('request', 'queue', 'pin'):
+        _insert_old_tombstone_reference(engine, tombstone, reference_kind)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    status='SHUTTING_DOWN'))
+
+    real_lock_roots = capacity_admission._lock_request_retention_roots
+    roots_locked = threading.Event()
+    release_deletion = threading.Event()
+    results = []
+    errors = []
+
+    def _held_lock_roots(*args, **kwargs):
+        roots = real_lock_roots(*args, **kwargs)
+        roots_locked.set()
+        if not release_deletion.wait(timeout=15):
+            raise TimeoutError('test did not release final deletion')
+        return roots
+
+    monkeypatch.setattr(capacity_admission, '_lock_request_retention_roots',
+                        _held_lock_roots)
+
+    def _remove_service():
+        try:
+            results.append(
+                serve_state.remove_service_completely(
+                    'svc', 'svc-hash', expected_lifecycle_epoch=3))
+        except BaseException as error:  # pylint: disable=broad-exception-caught
+            errors.append(error)
+
+    deletion_thread = threading.Thread(target=_remove_service,
+                                       name='held-final-service-deletion',
+                                       daemon=True)
+    deletion_thread.start()
+    try:
+        assert roots_locked.wait(timeout=10)
+        _assert_request_roots_locked(engine, str(tombstone['request_id']))
+    finally:
+        release_deletion.set()
+        deletion_thread.join(timeout=15)
+    assert not deletion_thread.is_alive()
+    assert not results
+    assert len(errors) == 1
+    assert isinstance(errors[0],
+                      ordinary_launch_binding.OrdinaryLaunchBindingConflict)
 
 
 @pytest.mark.parametrize('pre_effect_unknown', [False, True])

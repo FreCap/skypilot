@@ -866,6 +866,47 @@ def test_task_monitor_retries_revocation_after_heartbeat_wins_reaper_race(
     assert executor.request_storage.active_execution_claim() is None
 
 
+def test_revoked_cancelled_future_is_not_a_dispatch_submit_failure(monkeypatch):
+    """Cancellation after durable claim loss reports lease revocation."""
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.SHORT,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    interrupted = threading.Event()
+    backend = mock.Mock()
+    backend.claim_heartbeat_interval_seconds = 0.01
+    backend.heartbeat_claim.return_value = False
+    backend.interrupt_cancelled_claim.side_effect = (
+        lambda _claim: interrupted.set() or True)
+    backend.converge_execution_completion.return_value = True
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+
+    future = concurrent.futures.Future()
+    item = executor.queue_base.QueueItem('revoked-cancelled-future',
+                                         False,
+                                         False,
+                                         execution_generation=12,
+                                         claim_token='exact-claim',
+                                         worker_instance_id='worker-id')
+    monitor = threading.Thread(target=worker.handle_task_result,
+                               args=(future, item))
+    monitor.start()
+    assert interrupted.wait(timeout=1)
+    assert future.cancel()
+    monitor.join(timeout=2)
+
+    assert not monitor.is_alive()
+    backend.converge_execution_completion.assert_called_once()
+    call = backend.converge_execution_completion.call_args
+    assert call.args == (executor.request_storage.ExecutionClaim(
+        item.request_id, item.execution_generation, item.claim_token,
+        item.worker_instance_id),)
+    assert isinstance(call.kwargs['error'], concurrent.futures.CancelledError)
+    assert call.kwargs['terminal_cause'] == 'execution_lease_expired'
+
+
 def test_task_monitor_waits_for_normal_future_before_quiescence(monkeypatch):
     worker = executor.RequestWorker(
         schedule_type=requests_lib.ScheduleType.SHORT,
