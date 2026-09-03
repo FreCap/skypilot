@@ -181,6 +181,8 @@ class StrategyExecutor:
         self.starting_lock = starting_lock
         self.starting_signal = starting_signal
         self.file_mounts_blob_id = file_mounts_blob_id
+        self.cluster_termination_state = (
+            managed_job_utils.ClusterTerminationState())
 
     def _launch_in_workspace(
         self, *args: Any, **kwargs: Any
@@ -197,6 +199,15 @@ class StrategyExecutor:
         """Runs an SDK exec in the durable job workspace on its worker."""
         with skypilot_config.local_active_workspace_ctx(self.workspace):
             return sdk.exec(*args, **kwargs)
+
+    def _get_cluster_termination_state(
+            self) -> managed_job_utils.ClusterTerminationState:
+        """Return cleanup state, initializing objects from older versions."""
+        termination_state = getattr(self, 'cluster_termination_state', None)
+        if termination_state is None:
+            termination_state = managed_job_utils.ClusterTerminationState()
+            self.cluster_termination_state = termination_state
+        return termination_state
 
     def set_strategy_config(self, config: dict) -> None:
         """Handle strategy-specific config from the job_recovery dict.
@@ -278,6 +289,8 @@ class StrategyExecutor:
         starting_lock: asyncio.Lock,
         starting_signal: asyncio.Condition,
         file_mounts_blob_id: str | None = None,
+        cluster_termination_state: (managed_job_utils.ClusterTerminationState |
+                                    None) = None,
     ) -> 'StrategyExecutor':
         """Create a strategy from a task."""
 
@@ -336,6 +349,10 @@ class StrategyExecutor:
                                          task_id, pool, starting, starting_lock,
                                          starting_signal, recover_on_exit_codes,
                                          file_mounts_blob_id)
+        if cluster_termination_state is not None:
+            # Bind after plugin construction so third-party strategy
+            # constructors do not need a new positional parameter.
+            executor.cluster_termination_state = cluster_termination_state
         executor.set_strategy_config(strategy_config)
         return executor
 
@@ -531,7 +548,9 @@ class StrategyExecutor:
         if self.cluster_name is None:
             return
         if self.pool is None:
-            managed_job_utils.terminate_cluster(self.cluster_name)
+            managed_job_utils.terminate_cluster(
+                self.cluster_name,
+                request_state=self._get_cluster_termination_state())
 
     def _refresh_priority_from_persisted_dag(self) -> None:
         """Re-read the persisted job DAG and apply any updated priority.
@@ -677,6 +696,12 @@ class StrategyExecutor:
                                     container_image_consumers.
                                     MANAGED_JOB_RECOVERY_GENERATION_KEY] = (
                                         recovery_generation)
+                                # A completed down belongs to the previous
+                                # cluster incarnation.  Rotate that state at
+                                # the exact boundary before a replacement
+                                # launch; an unresolved result fails closed.
+                                self._get_cluster_termination_state(
+                                ).prepare_for_launch()
                                 request_id = await asyncio.to_thread(
                                     self._launch_in_workspace,
                                     self.dag,
@@ -810,6 +835,11 @@ class StrategyExecutor:
                             return None
                         logger.info('Failed to launch a cluster with error: '
                                     f'{common_utils.format_exception(e)})')
+                    except managed_job_utils.ClusterTerminationPendingError:
+                        # A prior down may already have taken effect.  This is
+                        # a reconciliation fence, not a launch failure that a
+                        # new cleanup/retry cycle may erase.
+                        raise
                     except Exception as e:  # pylint: disable=broad-except
                         # A pod OOM during cluster/runtime setup is
                         # deterministic (e.g. the requested memory is too

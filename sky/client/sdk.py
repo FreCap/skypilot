@@ -2741,6 +2741,12 @@ def status_kubernetes() -> server_common.RequestId[
 
 
 # === API request APIs ===
+def _get_request_result_for_reconciliation(
+        request_id: server_common.RequestId[T]) -> T:
+    """Observe one exact result without losing application-error provenance."""
+    return request_results.get_for_reconciliation(request_id, logger=logger)
+
+
 @usage_lib.entrypoint
 @annotations.client_api
 def get(request_id: server_common.RequestId[T]) -> T:

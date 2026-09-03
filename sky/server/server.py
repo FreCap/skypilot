@@ -504,7 +504,10 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=['*'],
     allow_headers=['*'],
-    expose_headers=['X-Skypilot-Request-ID'])
+    expose_headers=[
+        'X-Skypilot-Request-ID',
+        server_constants.REQUEST_RESULT_RETRY_REQUIRED_HEADER,
+    ])
 # Authentication based on oauth2-proxy.
 app.add_middleware(oauth2_proxy.OAuth2ProxyMiddleware)
 # AuthProxyMiddleware should precede BasicAuthMiddleware and
@@ -2180,6 +2183,16 @@ async def get_expanded_request_id(
 
 
 # === API server related APIs ===
+def _request_result_retry_is_quiescent(
+        request_task: requests_lib.Request) -> bool:
+    """Whether replay cannot overlap the request's prior effect generation."""
+    if not request_task.execution_quiescence_required:
+        return True
+    return (request_task.execution_quiesced_generation
+            == request_task.execution_generation and
+            request_task.execution_quiesced_at is not None)
+
+
 @app.get('/api/get')
 async def api_get(request: fastapi.Request,
                   request_id: str) -> payloads.RequestPayload:
@@ -2193,6 +2206,7 @@ async def api_get(request: fastapi.Request,
     # status/queue, then back off to 100ms for long requests like
     # launch/exec.
     poll_interval = 0.01
+    request_task = None
     while True:
         req_status = await requests_lib.get_request_status_async(request_id)
         if req_status is None:
@@ -2200,21 +2214,28 @@ async def api_get(request: fastapi.Request,
             raise fastapi.HTTPException(
                 status_code=404, detail=f'Request {request_id!r} not found')
         if req_status.status > requests_lib.RequestStatus.RUNNING:
-            break
+            request_task = await requests_lib.get_request_async(request_id)
+            if request_task is None:
+                # Request retention can delete an old terminal row after the
+                # status poll above and before this full-row fetch.
+                raise fastapi.HTTPException(
+                    status_code=404, detail=f'Request {request_id!r} not found')
+            if (not request_task.should_retry or
+                    _request_result_retry_is_quiescent(request_task)):
+                break
         await asyncio.sleep(poll_interval)
         # Back off: 10ms -> 20ms -> 40ms -> 80ms -> 100ms (cap)
         poll_interval = min(poll_interval * 2, 0.1)
-    request_task = await requests_lib.get_request_async(request_id)
-    if request_task is None:
-        # Request retention can delete an old terminal row after the status
-        # poll above and before this full-row fetch.
-        raise fastapi.HTTPException(status_code=404,
-                                    detail=f'Request {request_id!r} not found')
-    # TODO(aylei): refine this, /api/get will not be retried and this is
-    # meaningless to retry. It is the original request that should be retried.
+    assert request_task is not None
+    # The exact effect generation is quiescent, so the original operation can
+    # now be replayed under a new durable request ID.
     if request_task.should_retry:
         raise fastapi.HTTPException(
-            status_code=503, detail=f'Request {request_id!r} should be retried')
+            status_code=503,
+            detail=f'Request {request_id!r} should be retried',
+            headers={
+                server_constants.REQUEST_RESULT_RETRY_REQUIRED_HEADER: request_id
+            })
     request_error = request_task.get_error()
     if request_error is not None:
         raise fastapi.HTTPException(status_code=500,

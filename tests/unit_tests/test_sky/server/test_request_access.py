@@ -165,6 +165,96 @@ async def test_api_get_scopes_exact_and_prefix_before_polling(
 
 
 @pytest.mark.asyncio
+async def test_api_get_should_retry_marks_the_exact_expanded_request(
+        monkeypatch):
+    user = models.User('owner-user')
+    request = _make_request(user)
+    _set_roles(monkeypatch, [rbac.RoleName.USER.value])
+    full_request_id = 'owned-request-id'
+
+    async def get_with_prefix(_request_id_prefix, fields=None, user_id=None):
+        del fields, user_id
+        return [types.SimpleNamespace(request_id=full_request_id)]
+
+    async def get_status(_request_id):
+        return requests_lib.StatusWithMsg(
+            status=requests_lib.RequestStatus.CANCELLED)
+
+    request_record = mock.Mock(
+        should_retry=True,
+        execution_generation=1,
+        execution_quiescence_required=False,
+        execution_quiesced_generation=None,
+        execution_quiesced_at=None,
+    )
+    monkeypatch.setattr(requests_lib, 'get_requests_async_with_prefix',
+                        get_with_prefix)
+    monkeypatch.setattr(requests_lib, 'get_request_status_async', get_status)
+    monkeypatch.setattr(requests_lib, 'get_request_async',
+                        mock.AsyncMock(return_value=request_record))
+
+    with pytest.raises(fastapi.HTTPException) as exc:
+        await server.api_get(request, 'owned-req')
+
+    assert exc.value.status_code == 503
+    assert exc.value.headers == {
+        server_constants.REQUEST_RESULT_RETRY_REQUIRED_HEADER: full_request_id,
+    }
+    assert exc.value.detail == (
+        f'Request {full_request_id!r} should be retried')
+
+
+@pytest.mark.asyncio
+async def test_api_get_withholds_retry_marker_until_exact_quiescence_receipt(
+        monkeypatch):
+    user = models.User('owner-user')
+    request = _make_request(user)
+    _set_roles(monkeypatch, [rbac.RoleName.USER.value])
+    full_request_id = 'owned-request-id'
+
+    async def get_with_prefix(_request_id_prefix, fields=None, user_id=None):
+        del fields, user_id
+        return [types.SimpleNamespace(request_id=full_request_id)]
+
+    async def get_status(_request_id):
+        return requests_lib.StatusWithMsg(
+            status=requests_lib.RequestStatus.CANCELLED)
+
+    pending_quiescence = types.SimpleNamespace(
+        should_retry=True,
+        execution_generation=7,
+        execution_quiescence_required=True,
+        execution_quiesced_generation=None,
+        execution_quiesced_at=None,
+    )
+    proven_quiescence = types.SimpleNamespace(
+        should_retry=True,
+        execution_generation=7,
+        execution_quiescence_required=True,
+        execution_quiesced_generation=7,
+        execution_quiesced_at=123.0,
+    )
+    get_request = mock.AsyncMock(
+        side_effect=[pending_quiescence, proven_quiescence])
+    sleep = mock.AsyncMock()
+    monkeypatch.setattr(requests_lib, 'get_requests_async_with_prefix',
+                        get_with_prefix)
+    monkeypatch.setattr(requests_lib, 'get_request_status_async', get_status)
+    monkeypatch.setattr(requests_lib, 'get_request_async', get_request)
+    monkeypatch.setattr(server.asyncio, 'sleep', sleep)
+
+    with pytest.raises(fastapi.HTTPException) as exc:
+        await server.api_get(request, 'owned-req')
+
+    assert exc.value.status_code == 503
+    assert exc.value.headers == {
+        server_constants.REQUEST_RESULT_RETRY_REQUIRED_HEADER: full_request_id,
+    }
+    assert get_request.await_count == 2
+    sleep.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('requested_id', ['foreign-request-id', 'foreign-req'])
 async def test_api_get_hides_foreign_exact_and_prefix_before_payload_reads(
         monkeypatch, requested_id):

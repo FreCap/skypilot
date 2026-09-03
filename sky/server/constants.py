@@ -11,7 +11,7 @@ from sky.utils import controller_constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 94  # SkyServe offered-arrival telemetry
+API_VERSION = 95  # Exact request-result retry marker
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -30,6 +30,11 @@ API_VERSION_HEADER = 'X-SkyPilot-API-Version'
 
 # The HTTP header name for the SkyPilot version of the sender.
 VERSION_HEADER = 'X-SkyPilot-Version'
+
+# API v95 makes replay authorization distinguishable from a proxy-generated
+# 503.  The value is the exact full durable request ID, not a prefix.
+MIN_REQUEST_RESULT_RETRY_MARKER_API_VERSION = 95
+REQUEST_RESULT_RETRY_REQUIRED_HEADER = 'X-SkyPilot-Request-Retry-Required'
 
 # Minimum client API version required to launch recipes.
 MIN_RECIPE_LAUNCH_API_VERSION = 33

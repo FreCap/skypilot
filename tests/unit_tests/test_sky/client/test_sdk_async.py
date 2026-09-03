@@ -9,6 +9,8 @@ from sky import exceptions
 from sky.client import sdk
 from sky.client import sdk_async
 from sky.schemas.api import responses
+from sky.server import constants as server_constants
+from sky.server.requests import requests as requests_lib
 from sky.utils import common as common_utils
 
 
@@ -371,10 +373,17 @@ def _request_payload_dict(status):
 
 class _FakeGetResponse:
 
-    def __init__(self, status, body):
+    def __init__(self, status, body, *, headers=None, body_error=None):
         self.status = status
         self._body = body
+        self.headers = {} if headers is None else headers
+        self._body_error = body_error
         self.closed = False
+
+    async def read(self):
+        if self._body_error is not None:
+            raise self._body_error
+        return b'buffered response body'
 
     async def json(self):
         return self._body
@@ -392,6 +401,7 @@ async def test_get_raises_typed_error_from_500_detail():
     response = _FakeGetResponse(500,
                                 {'detail': _request_payload_dict('FAILED')})
     decoded = mock.MagicMock()
+    decoded.status = requests_lib.RequestStatus.FAILED
     decoded.get_error.return_value = {
         'object': exceptions.StorageSpecError('bad storage spec')
     }
@@ -421,7 +431,7 @@ async def test_get_success_still_decodes_top_level_payload():
     response = _FakeGetResponse(200, _request_payload_dict('SUCCEEDED'))
     decoded = mock.MagicMock()
     decoded.get_error.return_value = None
-    decoded.status = 'SUCCEEDED'
+    decoded.status = requests_lib.RequestStatus.SUCCEEDED
     decoded.get_return_value.return_value = {'result': 42}
 
     with mock.patch(
@@ -441,3 +451,257 @@ async def test_get_success_still_decodes_top_level_payload():
     assert decoded_payload.request_id == 'req-1'
     assert decoded_payload.status == 'SUCCEEDED'
     assert response.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('transient_status', [502, 503, 504])
+async def test_get_retries_transient_gateway_result_with_same_id(
+        transient_status):
+    transient = _FakeGetResponse(transient_status, {'detail': 'gateway'})
+    success = _FakeGetResponse(200, _request_payload_dict('SUCCEEDED'))
+    decoded = mock.MagicMock()
+    decoded.get_error.return_value = None
+    decoded.status = requests_lib.RequestStatus.SUCCEEDED
+    decoded.get_return_value.return_value = 'done'
+    fetch = mock.AsyncMock(side_effect=[transient, success])
+
+    with mock.patch('sky.client.sdk_async.server_common.'
+                    'make_authenticated_request_async', new=fetch), \
+            mock.patch('sky.client.sdk_async.server_common.'
+                       'check_server_healthy_or_start_fn'), \
+            mock.patch('sky.client.sdk_async.requests_lib.Request.decode',
+                       return_value=decoded), \
+            mock.patch('sky.client.sdk_async.asyncio.sleep',
+                       new=mock.AsyncMock()):
+        assert await sdk_async.get('req-1') == 'done'
+
+    assert [call.args[2] for call in fetch.await_args_list] == [
+        '/api/get?request_id=req-1',
+        '/api/get?request_id=req-1',
+    ]
+    assert all(call.kwargs['raise_for_server_unavailable'] is False
+               for call in fetch.await_args_list)
+    assert all(call.kwargs['timeout'].sock_read is not None
+               for call in fetch.await_args_list)
+    assert transient.closed
+    assert success.closed
+
+
+@pytest.mark.asyncio
+async def test_get_retries_timeout_while_buffering_body():
+    timed_out = _FakeGetResponse(
+        200,
+        _request_payload_dict('SUCCEEDED'),
+        body_error=asyncio.TimeoutError('body ACK lost'))
+    success = _FakeGetResponse(200, _request_payload_dict('SUCCEEDED'))
+    decoded = mock.MagicMock()
+    decoded.get_error.return_value = None
+    decoded.status = requests_lib.RequestStatus.SUCCEEDED
+    decoded.get_return_value.return_value = 'done'
+    fetch = mock.AsyncMock(side_effect=[timed_out, success])
+
+    with mock.patch('sky.client.sdk_async.server_common.'
+                    'make_authenticated_request_async', new=fetch), \
+            mock.patch('sky.client.sdk_async.server_common.'
+                       'check_server_healthy_or_start_fn'), \
+            mock.patch('sky.client.sdk_async.requests_lib.Request.decode',
+                       return_value=decoded), \
+            mock.patch('sky.client.sdk_async.asyncio.sleep',
+                       new=mock.AsyncMock()):
+        assert await sdk_async.get('req-1') == 'done'
+
+    assert fetch.await_count == 2
+    assert timed_out.closed
+    assert success.closed
+
+
+@pytest.mark.asyncio
+async def test_get_cancellation_while_buffering_body_closes_without_retry():
+    cancelled = _FakeGetResponse(200,
+                                 _request_payload_dict('SUCCEEDED'),
+                                 body_error=asyncio.CancelledError())
+    fetch = mock.AsyncMock(return_value=cancelled)
+
+    with mock.patch('sky.client.sdk_async.server_common.'
+                    'make_authenticated_request_async', new=fetch), \
+            mock.patch('sky.client.sdk_async.server_common.'
+                       'check_server_healthy_or_start_fn'), \
+            mock.patch('sky.client.sdk_async.asyncio.sleep',
+                       new=mock.AsyncMock()):
+        with pytest.raises(asyncio.CancelledError):
+            await sdk_async.get('req-1')
+
+    assert fetch.await_count == 1
+    assert cancelled.closed
+
+
+@pytest.mark.asyncio
+async def test_get_exhausted_timeouts_raise_typed_unavailable():
+    fetch = mock.AsyncMock(
+        side_effect=asyncio.TimeoutError('result endpoint unavailable'))
+
+    with mock.patch('sky.client.sdk_async.server_common.'
+                    'make_authenticated_request_async', new=fetch), \
+            mock.patch('sky.client.sdk_async.server_common.'
+                       'check_server_healthy_or_start_fn'), \
+            mock.patch('sky.client.sdk_async.asyncio.sleep',
+                       new=mock.AsyncMock()):
+        with pytest.raises(exceptions.RequestResultUnavailableError) as exc:
+            await sdk_async.get('req-1')
+
+    assert exc.value.request_id == 'req-1'
+    assert fetch.await_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', [
+    requests_lib.RequestStatus.PENDING,
+    requests_lib.RequestStatus.WAITING,
+    requests_lib.RequestStatus.RUNNING,
+    requests_lib.RequestStatus.FAILED,
+])
+async def test_get_rejects_non_success_without_error(status):
+    response = _FakeGetResponse(200, _request_payload_dict(status.value))
+    decoded = mock.MagicMock()
+    decoded.status = status
+    decoded.get_error.return_value = None
+    decoded.get_return_value.return_value = 'unsafe-result'
+
+    with mock.patch('sky.client.sdk_async.server_common.'
+                    'make_authenticated_request_async',
+                    new=mock.AsyncMock(return_value=response)), \
+            mock.patch('sky.client.sdk_async.server_common.'
+                       'check_server_healthy_or_start_fn'), \
+            mock.patch('sky.client.sdk_async.requests_lib.Request.decode',
+                       return_value=decoded):
+        with pytest.raises(exceptions.RequestResultUnavailableError):
+            await sdk_async.get('req-1')
+
+    decoded.get_return_value.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_terminal_error_requires_failed_http_response():
+    response = _FakeGetResponse(200, _request_payload_dict('FAILED'))
+    decoded = mock.MagicMock()
+    decoded.status = requests_lib.RequestStatus.FAILED
+    decoded.get_error.return_value = {
+        'object': exceptions.StorageSpecError('unsafe projection')
+    }
+
+    with mock.patch('sky.client.sdk_async.server_common.'
+                    'make_authenticated_request_async',
+                    new=mock.AsyncMock(return_value=response)), \
+            mock.patch('sky.client.sdk_async.server_common.'
+                       'check_server_healthy_or_start_fn'), \
+            mock.patch('sky.client.sdk_async.requests_lib.Request.decode',
+                       return_value=decoded):
+        with pytest.raises(exceptions.RequestResultUnavailableError):
+            await sdk_async.get('req-1')
+
+
+@pytest.mark.asyncio
+async def test_get_success_requires_success_http_response():
+    response = _FakeGetResponse(500,
+                                {'detail': _request_payload_dict('SUCCEEDED')})
+    decoded = mock.MagicMock()
+    decoded.status = requests_lib.RequestStatus.SUCCEEDED
+    decoded.get_error.return_value = None
+    decoded.get_return_value.return_value = 'unsafe-result'
+
+    with mock.patch('sky.client.sdk_async.server_common.'
+                    'make_authenticated_request_async',
+                    new=mock.AsyncMock(return_value=response)), \
+            mock.patch('sky.client.sdk_async.server_common.'
+                       'check_server_healthy_or_start_fn'), \
+            mock.patch('sky.client.sdk_async.requests_lib.Request.decode',
+                       return_value=decoded):
+        with pytest.raises(exceptions.RequestResultUnavailableError):
+            await sdk_async.get('req-1')
+
+    decoded.get_return_value.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_v95_exact_marker_authorizes_replay():
+    response = _FakeGetResponse(
+        503, {'detail': "Request 'req-1' should be retried"},
+        headers={
+            server_constants.API_VERSION_HEADER: '95',
+            server_constants.REQUEST_RESULT_RETRY_REQUIRED_HEADER: 'req-1',
+        })
+
+    with mock.patch('sky.client.sdk_async.server_common.'
+                    'make_authenticated_request_async',
+                    new=mock.AsyncMock(return_value=response)), \
+            mock.patch('sky.client.sdk_async.server_common.'
+                       'check_server_healthy_or_start_fn'):
+        with pytest.raises(exceptions.RequestResultShouldRetryError):
+            await sdk_async.get('req-1')
+
+    assert response.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('version', 'marker'), [
+    (None, 'req-1'),
+    ('94', 'req-1'),
+    ('95', 'req'),
+    ('95', 'different-request'),
+    ('95', None),
+])
+async def test_get_rejects_untrusted_or_non_exact_retry_marker(version, marker):
+    headers = {}
+    if version is not None:
+        headers[server_constants.API_VERSION_HEADER] = version
+    if marker is not None:
+        headers[server_constants.REQUEST_RESULT_RETRY_REQUIRED_HEADER] = marker
+    detail = ("Request 'req-1' should be retried"
+              if version != '94' else 'proxy unavailable')
+    response = _FakeGetResponse(503, {'detail': detail}, headers=headers)
+
+    with mock.patch('sky.client.sdk_async.server_common.'
+                    'make_authenticated_request_async',
+                    new=mock.AsyncMock(return_value=response)), \
+            mock.patch('sky.client.sdk_async.server_common.'
+                       'check_server_healthy_or_start_fn'), \
+            mock.patch('sky.client.sdk_async.asyncio.sleep',
+                       new=mock.AsyncMock()):
+        with pytest.raises(exceptions.RequestResultUnavailableError):
+            await sdk_async.get('req-1')
+
+
+@pytest.mark.asyncio
+async def test_get_accepts_exact_v94_legacy_retry_detail():
+    response = _FakeGetResponse(503,
+                                {'detail': "Request 'req-1' should be retried"},
+                                headers={
+                                    server_constants.API_VERSION_HEADER: '94',
+                                })
+
+    with mock.patch('sky.client.sdk_async.server_common.'
+                    'make_authenticated_request_async',
+                    new=mock.AsyncMock(return_value=response)), \
+            mock.patch('sky.client.sdk_async.server_common.'
+                       'check_server_healthy_or_start_fn'):
+        with pytest.raises(exceptions.RequestResultShouldRetryError):
+            await sdk_async.get('req-1')
+
+
+@pytest.mark.asyncio
+async def test_get_cancellation_during_backoff_stops_observation():
+    transient = _FakeGetResponse(502, {'detail': 'gateway'})
+    success = _FakeGetResponse(200, _request_payload_dict('SUCCEEDED'))
+    fetch = mock.AsyncMock(side_effect=[transient, success])
+
+    with mock.patch('sky.client.sdk_async.server_common.'
+                    'make_authenticated_request_async', new=fetch), \
+            mock.patch('sky.client.sdk_async.server_common.'
+                       'check_server_healthy_or_start_fn'), \
+            mock.patch('sky.client.sdk_async.asyncio.sleep',
+                       new=mock.AsyncMock(side_effect=asyncio.CancelledError)):
+        with pytest.raises(asyncio.CancelledError):
+            await sdk_async.get('req-1')
+
+    assert fetch.await_count == 1
+    assert transient.closed

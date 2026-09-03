@@ -844,6 +844,44 @@ class RequestCancelled(Exception):
     pass
 
 
+class RequestResultUnavailableError(Exception):
+    """A durable request's terminal result could not be observed safely.
+
+    This is an observation failure, not evidence that the original operation
+    failed.  Mutation callers must retain ``request_id`` and reconcile it
+    instead of submitting the operation again.
+    """
+
+    def __init__(self, request_id: str, message: str) -> None:
+        super().__init__(request_id, message)
+        self.request_id = request_id
+        self.message = message
+
+    def __str__(self) -> str:
+        return (f'Failed to observe result for request {self.request_id!r}: '
+                f'{self.message}')
+
+
+class RequestResultApplicationError(Exception):
+    """A decoded terminal request contains a proven application failure."""
+
+    def __init__(self, request_id: str, error: BaseException) -> None:
+        super().__init__(request_id, error)
+        self.request_id = request_id
+        self.error = error
+
+
+class RequestResultShouldRetryError(Exception):
+    """The authoritative server says the original operation may be replayed."""
+
+    def __init__(self, request_id: str) -> None:
+        super().__init__(request_id)
+        self.request_id = request_id
+
+    def __str__(self) -> str:
+        return f'Request {self.request_id!r} should be retried.'
+
+
 class ServeReplicaLaunchFenceError(RequestCancelled):
     """A SkyServe replica request no longer has durable launch authority.
 

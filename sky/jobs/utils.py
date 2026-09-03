@@ -5,10 +5,12 @@ jobs.constants.MANAGED_JOBS_VERSION and handle the API change in the
 ManagedJobCodeGen.
 """
 import asyncio
+import dataclasses
 from datetime import datetime
 import os
 import pathlib
 import re
+import threading
 import time
 import traceback
 import typing
@@ -49,6 +51,7 @@ from sky.utils import ux_utils
 
 if typing.TYPE_CHECKING:
     from sky.schemas.generated import managed_jobsv1_pb2
+    from sky.server import common as server_common
 
 if typing.TYPE_CHECKING:
     from google.protobuf import descriptor
@@ -160,11 +163,36 @@ def _sleep_log_follow_wait(seconds: float) -> None:
     context_utils.sleep_with_cancellation(seconds)
 
 
+class ClusterTerminationPendingError(RuntimeError):
+    """Raised when a replacement launch would race an unresolved down."""
+
+
+@dataclasses.dataclass
+class ClusterTerminationState:
+    """Process-local reconciliation state for one managed-job cluster."""
+
+    request_id: 'server_common.RequestId[None] | None' = None
+    completed: bool = False
+    _operation_lock: typing.Any = dataclasses.field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False)
+
+    def prepare_for_launch(self) -> None:
+        """Rotate a completed termination state for a new cluster incarnation."""
+        with self._operation_lock:
+            if self.request_id is not None and not self.completed:
+                raise ClusterTerminationPendingError(
+                    'Cannot launch a replacement cluster while its previous '
+                    f'termination request {self.request_id!r} is unresolved.')
+            self.request_id = None
+            self.completed = False
+
+
 def terminate_cluster(
     cluster_name: str,
     max_retry: int = 6,
     graceful: bool = False,
     graceful_timeout: int | None = None,
+    request_state: ClusterTerminationState | None = None,
 ) -> None:
     """Terminate a managed-job cluster through the fenced request path.
 
@@ -173,6 +201,27 @@ def terminate_cluster(
     generation and exact job slot attempt, allowing handoff to revoke and
     quiesce the effect before a successor attempt is admitted.
     """
+    if request_state is None:
+        request_state = ClusterTerminationState()
+    # asyncio.to_thread() keeps running after its awaiter is cancelled.  A
+    # successor cleanup phase can therefore reach the same process-local state
+    # while the first worker is still reconciling it.  Serialize the complete
+    # operation so request_id/completed always describe one observation path.
+    with request_state._operation_lock:  # pylint: disable=protected-access
+        _terminate_cluster(cluster_name, max_retry, graceful, graceful_timeout,
+                           request_state)
+
+
+def _terminate_cluster(
+    cluster_name: str,
+    max_retry: int,
+    graceful: bool,
+    graceful_timeout: int | None,
+    request_state: ClusterTerminationState,
+) -> None:
+    """Implementation of terminate_cluster() under the state's lock."""
+    if request_state.completed:
+        return
     retry_cnt = 0
     # In some cases, e.g. botocore.exceptions.NoCredentialsError due to AWS
     # metadata service throttling, the failed sky.down attempt can take 10-11
@@ -188,27 +237,61 @@ def terminate_cluster(
         max_backoff_factor=20)
     while True:
         try:
-            usage_lib.messages.usage.set_internal()
-            request_id = sdk.down(cluster_name,
-                                  graceful=graceful,
-                                  graceful_timeout=graceful_timeout)
-            sdk.get(request_id)
+            if request_state.request_id is None:
+                usage_lib.messages.usage.set_internal()
+                request_state.request_id = sdk.down(
+                    cluster_name,
+                    graceful=graceful,
+                    graceful_timeout=graceful_timeout)
+            sdk._get_request_result_for_reconciliation(  # pylint: disable=protected-access
+                request_state.request_id)
+            request_state.completed = True
             return
-        except exceptions.ClusterDoesNotExist:
-            # The cluster is already down.
-            logger.debug(f'The cluster {cluster_name} is already down.')
-            return
+        except exceptions.RequestResultApplicationError as result_error:
+            if result_error.request_id != request_state.request_id:
+                # A result for any other request is not evidence about this
+                # mutation.  Retain the known ID and keep observing it.
+                error: Exception = result_error
+            else:
+                operation_error = result_error.error
+                if isinstance(operation_error, exceptions.ClusterDoesNotExist):
+                    # The cluster is already down.
+                    request_state.completed = True
+                    logger.debug(f'The cluster {cluster_name} is already down.')
+                    return
+                if not isinstance(operation_error, Exception):
+                    # Preserve cancellation and process-control semantics.
+                    # These are not ordinary operation failures and cannot
+                    # authorize a new mutation request.
+                    raise operation_error from result_error
+                # A decoded terminal operation failure is authoritative: a
+                # new request may retry the mutation after backoff.
+                request_state.request_id = None
+                error = operation_error
+        except exceptions.RequestResultShouldRetryError as retry_error:
+            if retry_error.request_id == request_state.request_id:
+                # This marker is the server's explicit authorization to replay
+                # the original operation under a new request.
+                request_state.request_id = None
+            error = retry_error
         except Exception as e:  # pylint: disable=broad-except
-            retry_cnt += 1
-            if retry_cnt >= max_retry:
-                raise RuntimeError(
-                    f'Failed to terminate the cluster {cluster_name}.') from e
-            logger.error(
-                f'Failed to terminate the cluster {cluster_name}. Retrying.'
-                f'Details: {common_utils.format_exception(e)}')
-            with ux_utils.enable_traceback():
-                logger.error(f'  Traceback: {traceback.format_exc()}')
-            time.sleep(backoff.current_backoff())
+            # Observation errors and unknown local failures retain the exact
+            # request ID.  A later attempt may only re-read its durable result.
+            error = e
+
+        retry_cnt += 1
+        if retry_cnt >= max_retry:
+            raise RuntimeError(
+                f'Failed to terminate the cluster {cluster_name}.') from error
+        logger.error(
+            f'Failed to terminate the cluster {cluster_name}. Retrying.'
+            f'Details: {common_utils.format_exception(error)}')
+        with ux_utils.enable_traceback():
+            formatted_traceback = ''.join(
+                traceback.format_exception(type(error), error,
+                                           error.__traceback__))
+            logger.error(f'  Traceback: {formatted_traceback}')
+        context_utils.sleep_with_cancellation(backoff.current_backoff())
 
 
 def setup_consolidation_mode_on_startup(deploy: bool) -> None:

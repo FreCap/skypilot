@@ -4,16 +4,20 @@
 # pylint: disable=import-outside-toplevel,use-implicit-booleaness-not-comparison
 
 import asyncio
+import concurrent.futures
 import os
 import pathlib
 import tempfile
+import threading
 import time
 from unittest import mock
 
 import pytest
+import requests
 
 from sky import exceptions
 from sky.backends import cloud_vm_ray_backend
+from sky.client import request_results
 from sky.exceptions import ClusterDoesNotExist
 from sky.jobs import state
 from sky.jobs import utils
@@ -66,45 +70,42 @@ def _clear_consolidation_mode_caches():
     controller_utils._effective_jobs_consolidation_with_warnings.cache_clear()
 
 
-@mock.patch('sky.jobs.utils.time.sleep')
-@mock.patch('sky.jobs.utils.sdk.get')
+@mock.patch('sky.jobs.utils.context_utils.sleep_with_cancellation')
+@mock.patch('sky.jobs.utils.sdk._get_request_result_for_reconciliation')
 @mock.patch('sky.jobs.utils.sdk.down')
 @mock.patch('sky.usage.usage_lib.messages.usage.set_internal')
-def test_terminate_cluster_retry_on_value_error(mock_set_internal,
-                                                mock_sdk_down, mock_sdk_get,
-                                                mock_sleep) -> None:
-    mock_sdk_down.side_effect = ['request-1', 'request-2', 'request-3']
-    mock_sdk_get.side_effect = [
+def test_terminate_cluster_unknown_error_never_replays_down(
+        mock_set_internal, mock_sdk_down, mock_get_result, mock_sleep) -> None:
+    mock_sdk_down.return_value = 'request-1'
+    mock_get_result.side_effect = [
         ValueError('Mock error 1'),
         ValueError('Mock error 2'),
         None,
     ]
 
-    # Call should succeed after retries
     utils.terminate_cluster('test-cluster')
 
-    assert mock_sdk_down.call_count == 3
-    mock_sdk_down.assert_has_calls([
-        mock.call('test-cluster', graceful=False, graceful_timeout=None),
-        mock.call('test-cluster', graceful=False, graceful_timeout=None),
-        mock.call('test-cluster', graceful=False, graceful_timeout=None),
-    ])
-    assert mock_sdk_get.call_args_list == [
+    mock_sdk_down.assert_called_once_with('test-cluster',
+                                          graceful=False,
+                                          graceful_timeout=None)
+    assert mock_get_result.call_args_list == [
         mock.call('request-1'),
-        mock.call('request-2'),
-        mock.call('request-3'),
+        mock.call('request-1'),
+        mock.call('request-1'),
     ]
-    assert mock_set_internal.call_count == 3
+    assert mock_set_internal.call_count == 1
     assert mock_sleep.call_count == 2
 
 
-@mock.patch('sky.jobs.utils.sdk.get')
+@mock.patch('sky.jobs.utils.sdk._get_request_result_for_reconciliation')
 @mock.patch('sky.jobs.utils.sdk.down', return_value='request-1')
 @mock.patch('sky.usage.usage_lib.messages.usage.set_internal')
 def test_terminate_cluster_handles_concurrent_cluster_removal(
-        mock_set_internal, mock_sdk_down, mock_sdk_get) -> None:
+        mock_set_internal, mock_sdk_down, mock_get_result) -> None:
     """A cluster removed before execution remains an idempotent no-op."""
-    mock_sdk_get.side_effect = ClusterDoesNotExist('test-cluster')
+    missing = ClusterDoesNotExist('test-cluster')
+    mock_get_result.side_effect = exceptions.RequestResultApplicationError(
+        'request-1', missing)
 
     # Call should succeed silently
     utils.terminate_cluster('test-cluster')
@@ -112,8 +113,254 @@ def test_terminate_cluster_handles_concurrent_cluster_removal(
     mock_sdk_down.assert_called_once_with('test-cluster',
                                           graceful=False,
                                           graceful_timeout=None)
-    mock_sdk_get.assert_called_once_with('request-1')
+    mock_get_result.assert_called_once_with('request-1')
     assert mock_set_internal.call_count == 1
+
+
+def test_terminate_cluster_rejects_mismatched_application_error_provenance(
+) -> None:
+    termination_state = utils.ClusterTerminationState(request_id='request-1')
+    mismatched = exceptions.RequestResultApplicationError(
+        'different-request', ClusterDoesNotExist('test-cluster'))
+
+    with mock.patch('sky.jobs.utils.sdk.down') as down, mock.patch(
+            'sky.jobs.utils.sdk._get_request_result_for_reconciliation',
+            side_effect=mismatched) as get_result, mock.patch(
+                'sky.jobs.utils.context_utils.sleep_with_cancellation'):
+        with pytest.raises(RuntimeError, match='Failed to terminate'):
+            utils.terminate_cluster('test-cluster',
+                                    max_retry=1,
+                                    request_state=termination_state)
+
+    down.assert_not_called()
+    get_result.assert_called_once_with('request-1')
+    assert termination_state.request_id == 'request-1'
+    assert not termination_state.completed
+
+
+def test_terminate_cluster_reconciles_lost_ack_without_duplicate_down() -> None:
+    """A lost result ACK is recovered through the original request ID.
+
+    The down request has already removed the provider resource when the first
+    result read loses its response.  Reconciliation must read that same request
+    again; submitting another down request would duplicate the mutation.
+    """
+    provider_state = {'present': True, 'result_reads': 0}
+
+    def submit_down(*_args, **_kwargs):
+        assert provider_state['present'], 'down mutation was submitted twice'
+        return 'down-request'
+
+    response = mock.MagicMock(status_code=200)
+    response.headers = {}
+    response.json.return_value = {'request_id': 'down-request'}
+    request = mock.MagicMock()
+    request.request_id = 'down-request'
+    request.status = request_results.requests_lib.RequestStatus.SUCCEEDED
+    request.get_error.return_value = None
+    request.get_return_value.return_value = None
+
+    def get_down_result(method, path, **_kwargs):
+        assert method == 'GET'
+        assert path == '/api/get?request_id=down-request'
+        provider_state['result_reads'] += 1
+        if provider_state['result_reads'] <= 3:
+            provider_state['present'] = False
+            raise requests.exceptions.ReadTimeout(
+                'down completed but result ACK was lost')
+        assert not provider_state['present']
+        return response
+
+    with mock.patch(
+            'sky.jobs.utils.sdk.down',
+            side_effect=submit_down) as down, mock.patch(
+                'sky.client.request_results.server_common.'
+                'make_authenticated_request',
+                side_effect=get_down_result) as fetch_result, mock.patch(
+                    'sky.client.request_results.payloads.RequestPayload',
+                    return_value=mock.sentinel.payload), mock.patch(
+                        'sky.client.request_results.requests_lib.Request.'
+                        'decode',
+                        return_value=request), mock.patch(
+                            'sky.client.request_results.context_utils.'
+                            'sleep_with_cancellation'), mock.patch(
+                                'sky.jobs.utils.context_utils.'
+                                'sleep_with_cancellation'):
+        utils.terminate_cluster('test-cluster', max_retry=2)
+
+    down.assert_called_once_with('test-cluster',
+                                 graceful=False,
+                                 graceful_timeout=None)
+    assert fetch_result.call_count == 4
+    assert provider_state == {'present': False, 'result_reads': 4}
+
+
+def test_terminate_cluster_exhaustion_fails_closed_with_pending_request_id(
+) -> None:
+    termination_state = utils.ClusterTerminationState()
+    unavailable = exceptions.RequestResultUnavailableError(
+        'request-1', 'result endpoint remained unreachable')
+
+    with mock.patch('sky.jobs.utils.sdk.down',
+                    return_value='request-1') as down, mock.patch(
+                        'sky.jobs.utils.sdk.'
+                        '_get_request_result_for_reconciliation',
+                        side_effect=unavailable) as get_result, mock.patch(
+                            'sky.jobs.utils.context_utils.'
+                            'sleep_with_cancellation'):
+        with pytest.raises(RuntimeError, match='Failed to terminate'):
+            utils.terminate_cluster('test-cluster',
+                                    max_retry=2,
+                                    request_state=termination_state)
+
+    down.assert_called_once()
+    assert get_result.call_args_list == [
+        mock.call('request-1'),
+        mock.call('request-1'),
+    ]
+    assert termination_state.request_id == 'request-1'
+    assert not termination_state.completed
+
+
+def test_terminate_cluster_retry_log_preserves_caught_traceback() -> None:
+    unavailable = exceptions.RequestResultUnavailableError(
+        'request-1', 'lost result acknowledgement')
+
+    with mock.patch('sky.jobs.utils.sdk.down',
+                    return_value='request-1'), mock.patch(
+                        'sky.jobs.utils.sdk.'
+                        '_get_request_result_for_reconciliation',
+                        side_effect=unavailable), mock.patch(
+                            'sky.jobs.utils.context_utils.'
+                            'sleep_with_cancellation'), mock.patch(
+                                'sky.jobs.utils.logger.error') as log_error:
+        with pytest.raises(RuntimeError, match='Failed to terminate'):
+            utils.terminate_cluster('test-cluster', max_retry=2)
+
+    messages = [str(call.args[0]) for call in log_error.call_args_list]
+    assert any('RequestResultUnavailableError' in message and
+               'lost result acknowledgement' in message for message in messages)
+    assert all('NoneType: None' not in message for message in messages)
+
+
+def test_terminate_cluster_authoritative_retry_submits_one_new_down() -> None:
+    retry_original = exceptions.RequestResultShouldRetryError('request-1')
+
+    with mock.patch('sky.jobs.utils.sdk.down',
+                    side_effect=['request-1', 'request-2']) as down, mock.patch(
+                        'sky.jobs.utils.sdk.'
+                        '_get_request_result_for_reconciliation',
+                        side_effect=[retry_original, None]) as get_result, \
+            mock.patch('sky.jobs.utils.context_utils.'
+                       'sleep_with_cancellation'):
+        utils.terminate_cluster('test-cluster')
+
+    assert down.call_count == 2
+    assert get_result.call_args_list == [
+        mock.call('request-1'),
+        mock.call('request-2'),
+    ]
+
+
+def test_terminate_cluster_decoded_operation_failure_can_retry() -> None:
+    provider_error = ValueError('provider rejected the first down')
+    decoded_failure = exceptions.RequestResultApplicationError(
+        'request-1', provider_error)
+
+    with mock.patch('sky.jobs.utils.sdk.down',
+                    side_effect=['request-1', 'request-2']) as down, mock.patch(
+                        'sky.jobs.utils.sdk.'
+                        '_get_request_result_for_reconciliation',
+                        side_effect=[decoded_failure, None]) as get_result, \
+            mock.patch('sky.jobs.utils.context_utils.'
+                       'sleep_with_cancellation'):
+        utils.terminate_cluster('test-cluster')
+
+    assert down.call_count == 2
+    assert get_result.call_args_list == [
+        mock.call('request-1'),
+        mock.call('request-2'),
+    ]
+
+
+def test_terminate_cluster_cancellation_during_backoff_never_replays_down(
+) -> None:
+    unavailable = exceptions.RequestResultUnavailableError(
+        'request-1', 'lost result acknowledgement')
+
+    with mock.patch('sky.jobs.utils.sdk.down',
+                    return_value='request-1') as down, mock.patch(
+                        'sky.jobs.utils.sdk.'
+                        '_get_request_result_for_reconciliation',
+                        side_effect=unavailable), mock.patch(
+                            'sky.jobs.utils.context_utils.'
+                            'sleep_with_cancellation',
+                            side_effect=asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
+            utils.terminate_cluster('test-cluster')
+
+    down.assert_called_once()
+
+
+def test_terminate_cluster_completed_state_is_idempotent() -> None:
+    termination_state = utils.ClusterTerminationState()
+
+    with mock.patch('sky.jobs.utils.sdk.down',
+                    return_value='request-1') as down, mock.patch(
+                        'sky.jobs.utils.sdk.'
+                        '_get_request_result_for_reconciliation',
+                        return_value=None) as get_result:
+        utils.terminate_cluster('test-cluster', request_state=termination_state)
+        utils.terminate_cluster('test-cluster', request_state=termination_state)
+
+    down.assert_called_once()
+    get_result.assert_called_once_with('request-1')
+    assert termination_state.completed
+
+
+def test_terminate_cluster_serializes_reconciliation_for_shared_state() -> None:
+    """Concurrent cleanup owners must not race on one request state."""
+    termination_state = utils.ClusterTerminationState()
+    first_result_read_started = threading.Event()
+    release_first_result_read = threading.Event()
+    second_result_read_started = threading.Event()
+    result_read_count = 0
+    result_read_count_lock = threading.Lock()
+
+    def get_result(_request_id):
+        nonlocal result_read_count
+        with result_read_count_lock:
+            result_read_count += 1
+            call_number = result_read_count
+        if call_number == 1:
+            first_result_read_started.set()
+            assert release_first_result_read.wait(timeout=5)
+        else:
+            second_result_read_started.set()
+
+    with mock.patch('sky.jobs.utils.sdk.down',
+                    return_value='request-1') as down, mock.patch(
+                        'sky.jobs.utils.sdk.'
+                        '_get_request_result_for_reconciliation',
+                        side_effect=get_result) as get_result_mock:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(utils.terminate_cluster,
+                                    'test-cluster',
+                                    request_state=termination_state)
+            assert first_result_read_started.wait(timeout=5)
+            second = executor.submit(utils.terminate_cluster,
+                                     'test-cluster',
+                                     request_state=termination_state)
+            try:
+                assert not second_result_read_started.wait(timeout=0.5)
+            finally:
+                release_first_result_read.set()
+            first.result(timeout=5)
+            second.result(timeout=5)
+
+    down.assert_called_once()
+    get_result_mock.assert_called_once_with('request-1')
+    assert termination_state.completed
 
 
 @pytest.mark.asyncio
@@ -309,33 +556,33 @@ def test_job_recovery_skips_autostopping():
 # ======== Graceful cancel tests ========
 
 
-@mock.patch('sky.jobs.utils.sdk.get')
+@mock.patch('sky.jobs.utils.sdk._get_request_result_for_reconciliation')
 @mock.patch('sky.jobs.utils.sdk.down', return_value='request-1')
 @mock.patch('sky.usage.usage_lib.messages.usage.set_internal')
 def test_terminate_cluster_graceful(mock_set_internal, mock_sdk_down,
-                                    mock_sdk_get) -> None:
+                                    mock_get_result) -> None:
     """Test terminate_cluster submits and awaits a graceful down request."""
     utils.terminate_cluster('test-cluster', graceful=True, graceful_timeout=120)
 
     mock_sdk_down.assert_called_once_with('test-cluster',
                                           graceful=True,
                                           graceful_timeout=120)
-    mock_sdk_get.assert_called_once_with('request-1')
+    mock_get_result.assert_called_once_with('request-1')
     assert mock_set_internal.call_count == 1
 
 
-@mock.patch('sky.jobs.utils.sdk.get')
+@mock.patch('sky.jobs.utils.sdk._get_request_result_for_reconciliation')
 @mock.patch('sky.jobs.utils.sdk.down', return_value='request-1')
 @mock.patch('sky.usage.usage_lib.messages.usage.set_internal')
 def test_terminate_cluster_graceful_no_timeout(mock_set_internal, mock_sdk_down,
-                                               mock_sdk_get) -> None:
+                                               mock_get_result) -> None:
     """Test terminate_cluster with graceful=True but no timeout."""
     utils.terminate_cluster('test-cluster', graceful=True)
 
     mock_sdk_down.assert_called_once_with('test-cluster',
                                           graceful=True,
                                           graceful_timeout=None)
-    mock_sdk_get.assert_called_once_with('request-1')
+    mock_get_result.assert_called_once_with('request-1')
 
 
 def test_cancel_signal_file_no_graceful():
@@ -366,8 +613,6 @@ def test_cancel_signal_file_no_graceful():
 
 
 def test_cancel_pending_wrong_workspace_is_not_mutated():
-    snapshot = state.JobCancellationState(state.ManagedJobStatus.PENDING,
-                                          'team-b')
     initial_info = _make_cancel_status_check_info(
         42, state.ManagedJobStatus.PENDING, workspace='team-b')
     with mock.patch('sky.jobs.state.get_jobs_status_check_info',
@@ -383,8 +628,6 @@ def test_cancel_pending_wrong_workspace_is_not_mutated():
 
 
 def test_cancel_skips_job_that_finishes_during_status_refresh(tmp_path):
-    running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                         'default')
     succeeded = state.JobCancellationState(state.ManagedJobStatus.SUCCEEDED,
                                            'default')
     initial_info = _make_cancel_status_check_info(
@@ -407,8 +650,6 @@ def test_cancel_skips_job_that_finishes_during_status_refresh(tmp_path):
 
 
 def test_cancel_refreshed_pending_job_reuses_atomic_finalizer(tmp_path):
-    running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                         'default')
     pending = state.JobCancellationState(state.ManagedJobStatus.PENDING,
                                          'default')
     initial_info = _make_cancel_status_check_info(
@@ -435,8 +676,6 @@ def test_cancel_refreshed_pending_job_reuses_atomic_finalizer(tmp_path):
 
 
 def test_cancel_refreshed_pending_job_still_signals_after_claim_race(tmp_path):
-    running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                         'default')
     pending = state.JobCancellationState(state.ManagedJobStatus.PENDING,
                                          'default')
     initial_info = _make_cancel_status_check_info(
