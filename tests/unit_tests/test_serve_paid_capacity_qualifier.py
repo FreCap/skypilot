@@ -4223,8 +4223,15 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
     ('previous', 'current', 'accepted_response', 'valid'), [
         (None, ('accepted', 1, 'ACCEPTED', 2), True, True),
         (None, ('accepted', 1, 'SUCCEEDED', 2), True, True),
+        (None, ('accepted', 1, 'SUCCEEDED', 3), True, True),
         (None, ('accepted', 1, 'ACCEPTED', 1), True, False),
+        (None, ('accepted', 1, 'ACCEPTED', 99), True, False),
+        (None, ('accepted', 1, 'SUCCEEDED', 99), True, False),
         (None, ('rejected', 1, 'REJECTED_PRE_DISPATCH', 1), False, True),
+        (None, ('rejected', 1, 'REJECTED_PRE_DISPATCH', 2), False, True),
+        (None, ('rejected', 2, 'REJECTED_PRE_DISPATCH', 1), False, False),
+        (None, ('rejected', 2, 'REJECTED_PRE_DISPATCH', 2), False, True),
+        (None, ('rejected', 2, 'REJECTED_PRE_DISPATCH', 99), False, False),
         (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
          ('rejected', 1, 'REJECTED_PRE_DISPATCH', 1), False, True),
         (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
@@ -4237,6 +4244,12 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
          ('successor', 3, 'ACCEPTED', 2), True, True),
         (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
          ('successor', 4, 'SUCCEEDED', 3), True, True),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 2, 'REJECTED_PRE_DISPATCH', 99), False, False),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 2, 'ACCEPTED', 99), True, False),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 2, 'SUCCEEDED', 99), True, False),
         (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
          ('rejected', 1, 'ACCEPTED', 2), True, False),
         (None, ('accepted', 1, 'FAILED', 2), True, False),
@@ -4274,6 +4287,27 @@ def test_exact_async_submission_receipt_state_machine(previous, current,
                 current_receipt,
                 previous_rejection=previous_receipt,
                 accepted_response=accepted_response)
+
+
+@pytest.mark.parametrize(('current_revision', 'valid'), [(3, True),
+                                                         (99, False)])
+def test_exact_async_completion_receipt_revision(current_revision, valid):
+    """Terminal success advances the accepted attempt exactly once."""
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+    accepted = qualifier.ExactAsyncReceipt(attempt_id=attempt_id,
+                                           attempt_no=1,
+                                           state='ACCEPTED',
+                                           revision=2)
+    current = qualifier.ExactAsyncReceipt(attempt_id=attempt_id,
+                                          attempt_no=1,
+                                          state='SUCCEEDED',
+                                          revision=current_revision)
+    if valid:
+        qualifier._validate_completion_receipt(accepted, current)
+    else:
+        with pytest.raises(qualifier.QualificationError,
+                           match='conflicting receipt transition'):
+            qualifier._validate_completion_receipt(accepted, current)
 
 
 def test_exact_async_request_accepts_terminal_success_race():

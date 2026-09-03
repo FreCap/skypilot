@@ -4184,9 +4184,15 @@ def _validate_submission_receipt(
     accepted_response: bool,
 ) -> None:
     """Validate one public response against reachable ledger transitions."""
-    valid_state = (current.state in ('ACCEPTED', 'SUCCEEDED') and
-                   current.revision >= 2 if accepted_response else current.state
-                   == 'REJECTED_PRE_DISPATCH')
+    if accepted_response:
+        valid_state_revision = (
+            (current.state == 'ACCEPTED' and current.revision == 2) or
+            (current.state == 'SUCCEEDED' and current.revision in (2, 3)))
+    else:
+        valid_state_revision = (
+            current.state == 'REJECTED_PRE_DISPATCH' and
+            (current.revision == 2 or
+             (current.attempt_no == 1 and current.revision == 1)))
     valid_attempt = True
     if previous_rejection is not None:
         same_rejection = (
@@ -4195,11 +4201,10 @@ def _validate_submission_receipt(
             current.attempt_no == previous_rejection.attempt_no and
             current.revision == previous_rejection.revision)
         later_attempt = (current.attempt_id != previous_rejection.attempt_id and
-                         current.attempt_no > previous_rejection.attempt_no and
-                         current.revision >= 2)
+                         current.attempt_no > previous_rejection.attempt_no)
         valid_attempt = later_attempt if accepted_response else (
             same_rejection or later_attempt)
-    if not valid_state or not valid_attempt:
+    if not valid_state_revision or not valid_attempt:
         raise QualificationError(
             'Exact async response has a conflicting receipt transition.')
 
@@ -4207,10 +4212,11 @@ def _validate_submission_receipt(
 def _validate_completion_receipt(accepted: ExactAsyncReceipt,
                                  current: ExactAsyncReceipt) -> None:
     """Require the exact accepted attempt to advance to terminal success."""
-    if (current.state != 'SUCCEEDED' or
+    if (accepted.state != 'ACCEPTED' or accepted.revision != 2 or
+            current.state != 'SUCCEEDED' or
             current.attempt_id != accepted.attempt_id or
             current.attempt_no != accepted.attempt_no or
-            current.revision <= accepted.revision):
+            current.revision != accepted.revision + 1):
         raise QualificationError(
             'Exact async response has a conflicting receipt transition.')
 
