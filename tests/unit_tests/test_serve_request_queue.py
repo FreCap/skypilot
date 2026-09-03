@@ -45,6 +45,12 @@ def _request() -> mock.MagicMock:
     request.method = 'POST'
     request.headers = {}
     request.is_disconnected = mock.AsyncMock(return_value=False)
+
+    async def _receive() -> dict[str, str]:
+        await asyncio.Future()
+        raise AssertionError('unreachable')
+
+    request.receive = mock.AsyncMock(side_effect=_receive)
     return request
 
 
@@ -1619,9 +1625,9 @@ def test_zero_capacity_dispatch_never_traverses_ten_thousand_waiters():
     }
     lb._waiting_request_count = 10000
 
-    # Model one disconnect poll from every resident waiter. This is a
-    # structural complexity assertion, not a wall-clock benchmark: a cold
-    # dispatch has no work to grant and must never inspect the backlog.
+    # Model a burst of redundant capacity signals. This is a structural
+    # complexity assertion, not a wall-clock benchmark: a cold dispatch has no
+    # work to grant and must never inspect the backlog.
     for _ in range(10000):
         lb._dispatch_request_queue_locked()
 
@@ -1715,9 +1721,9 @@ def test_incompatible_free_slot_dispatch_never_traverses_ten_thousand_waiters():
     lb._waiting_request_count = 10000
     lb._request_queue_profile_census = {('A100',): 10000}
 
-    # One free L4 slot is dispatchable, so the exact-card planner runs on
-    # every enqueue and on every waiter's disconnect poll. No resident waiter
-    # accepts an L4: the planner must answer from the profile census alone.
+    # One free L4 slot is dispatchable, so a capacity signal reaches the
+    # exact-card planner. No resident waiter accepts an L4: the planner must
+    # answer from the profile census alone.
     for _ in range(10000):
         lb._dispatch_request_queue_locked()
 
@@ -1907,9 +1913,7 @@ def test_timeout_and_cancellation_remove_waiters():
                       use_async_occupancy=True,
                       timeout_seconds=0.01)
         lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
-        request = mock.MagicMock()
-        request.headers = {}
-        request.is_disconnected = mock.AsyncMock(return_value=False)
+        request = _request()
         with pytest.raises(fastapi.HTTPException) as exc:
             await lb._acquire_request_slot(request)
         assert exc.value.status_code == 503
@@ -2115,16 +2119,14 @@ def test_disconnected_waiter_is_removed_without_dispatch():
                       max_size=1,
                       use_async_occupancy=True,
                       timeout_seconds=10)
-        request = mock.MagicMock()
-        request.headers = {}
-        request.is_disconnected = mock.AsyncMock(return_value=True)
+        request = _request()
+        request.receive = mock.AsyncMock(
+            return_value={'type': 'http.disconnect'})
         lb._request_body = mock.AsyncMock(return_value=b'payload')
         lb._proxy_with_retries_inner = mock.AsyncMock()
 
-        with mock.patch.object(load_balancer,
-                               '_REQUEST_QUEUE_DISCONNECT_POLL_SECONDS', 0.001):
-            with pytest.raises(fastapi.HTTPException) as exc:
-                await lb._proxy_with_retries(request)
+        with pytest.raises(fastapi.HTTPException) as exc:
+            await lb._proxy_with_retries(request)
 
         assert exc.value.status_code == 499
         lb._request_body.assert_awaited_once_with(request)
@@ -2137,21 +2139,62 @@ def test_disconnected_waiter_is_removed_without_dispatch():
     asyncio.run(_run())
 
 
+def test_queued_waiter_uses_event_driven_disconnect_receive():
+
+    async def _run():
+        lb = _make_lb(min_size=1,
+                      size_per_replica=0,
+                      max_size=1,
+                      use_async_occupancy=True,
+                      timeout_seconds=10)
+        request = _request()
+        receive_started = asyncio.Event()
+        disconnect = asyncio.Event()
+
+        async def _receive():
+            receive_started.set()
+            await disconnect.wait()
+            return {'type': 'http.disconnect'}
+
+        request.receive = mock.AsyncMock(side_effect=_receive)
+        waiter = asyncio.create_task(lb._acquire_request_slot(request))
+        await _wait_until(lambda: lb._waiting_request_count == 1)
+
+        # A resident waiter blocks on the ASGI receive channel. It must not
+        # manufacture a timer and poll every second for every queued request.
+        await _wait_until(receive_started.is_set)
+        assert request.receive.await_count == 1
+        disconnect.set()
+
+        with pytest.raises(fastapi.HTTPException) as exc:
+            await waiter
+        assert exc.value.status_code == 499
+        assert lb._waiting_request_count == 0
+        assert lb._active_request_count == 0
+
+    asyncio.run(_run())
+
+
 def test_disconnect_racing_slot_notification_does_not_dispatch():
 
     async def _run():
         lb = _make_lb(timeout_seconds=10)
         lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
         lb._active_request_count = 1
-        request = mock.MagicMock()
-        request.headers = {}
-        request.is_disconnected = mock.AsyncMock(return_value=False)
+        request = _request()
+        disconnect = asyncio.Event()
+
+        async def _receive():
+            await disconnect.wait()
+            return {'type': 'http.disconnect'}
+
+        request.receive.side_effect = _receive
         lb._request_body = mock.AsyncMock(return_value=b'payload')
         lb._proxy_with_retries_inner = mock.AsyncMock()
 
         waiter = asyncio.create_task(lb._proxy_with_retries(request))
         await _wait_until(lambda: lb._waiting_request_count == 1)
-        request.is_disconnected.return_value = True
+        disconnect.set()
         await lb._release_request_slot()
 
         with pytest.raises(fastapi.HTTPException) as exc:
@@ -2175,25 +2218,27 @@ def test_cancellation_after_grant_reclaims_slot():
         disconnect_check_started = asyncio.Event()
         never = asyncio.Event()
 
-        async def _is_disconnected():
+        async def _receive():
             disconnect_check_started.set()
             await never.wait()
             raise AssertionError('unreachable')
 
-        request.is_disconnected.side_effect = _is_disconnected
+        request.receive.side_effect = _receive
         waiter = asyncio.create_task(lb._acquire_request_slot(request, 100))
         await _wait_until(lambda: lb._waiting_request_count == 1)
 
-        await lb._release_request_slot()
         await asyncio.wait_for(disconnect_check_started.wait(), timeout=1)
-        waiter.cancel()
+        async with lb._request_queue_condition:
+            lb._active_request_count = 0
+            lb._dispatch_request_queue_locked()
+            waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiter
 
         assert lb._active_request_count == 0
         assert lb._waiting_request_count == 0
         assert lb._occupancy_unassigned_reservations == 0
-        assert not lb._background_tasks
+        await _wait_until(lambda: not lb._background_tasks)
 
     asyncio.run(_run())
 
@@ -2208,13 +2253,11 @@ def test_draining_waiter_is_rejected_without_dispatch():
         lb._request_body = mock.AsyncMock(return_value=b'payload')
         lb._proxy_with_retries_inner = mock.AsyncMock()
 
-        with mock.patch.object(load_balancer,
-                               '_REQUEST_QUEUE_DISCONNECT_POLL_SECONDS', 0.001):
-            waiter = asyncio.create_task(lb._proxy_with_retries(request))
-            await _wait_until(lambda: lb._waiting_request_count == 1)
-            lb._begin_draining()
-            with pytest.raises(fastapi.HTTPException) as exc:
-                await waiter
+        waiter = asyncio.create_task(lb._proxy_with_retries(request))
+        await _wait_until(lambda: lb._waiting_request_count == 1)
+        lb._begin_draining()
+        with pytest.raises(fastapi.HTTPException) as exc:
+            await waiter
 
         assert exc.value.status_code == 503
         assert exc.value.headers['Retry-After']
@@ -2234,24 +2277,17 @@ def test_drain_racing_slot_notification_does_not_dispatch():
         lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
         lb._active_request_count = 1
         request = _request()
-        disconnect_check_started = asyncio.Event()
-        finish_disconnect_check = asyncio.Event()
-
-        async def _is_disconnected():
-            disconnect_check_started.set()
-            await finish_disconnect_check.wait()
-            return False
-
-        request.is_disconnected.side_effect = _is_disconnected
         lb._request_body = mock.AsyncMock(return_value=b'payload')
         lb._proxy_with_retries_inner = mock.AsyncMock()
 
         waiter = asyncio.create_task(lb._proxy_with_retries(request))
         await _wait_until(lambda: lb._waiting_request_count == 1)
-        await lb._release_request_slot()
-        await asyncio.wait_for(disconnect_check_started.wait(), timeout=1)
-        lb._begin_draining()
-        finish_disconnect_check.set()
+        # Resolve the grant while retaining the queue lock, then fence the LB
+        # before the woken request can consume that grant.
+        async with lb._request_queue_condition:
+            lb._active_request_count = 0
+            lb._dispatch_request_queue_locked()
+            lb._begin_draining()
 
         with pytest.raises(fastapi.HTTPException) as exc:
             await waiter
