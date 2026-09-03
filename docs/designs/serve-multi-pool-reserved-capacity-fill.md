@@ -48,6 +48,17 @@ convergence, not continuing spend. The release-``1.1.1643`` campaign described
 above proves the corrected current writer reaches exact provider and
 PostgreSQL zero automatically.
 
+The deterministic component gate now crosses the same production orchestration
+boundary with a temporary PostgreSQL database and a stateful AWS network fake:
+one create blocks after provider-I/O authority, teardown times out after exactly
+one delete, recovery ownership moves to a fresh controller, and a later exact
+``ABSENT`` census consumes the service, replica, paid claim, association,
+request, and retention pin. The test is RED on ``26bdbc6e6`` because that
+writer removes the HA recovery script after the first timeout, and GREEN on the
+current source. It is honestly a component test, not unpaid E2E, because the
+AWS cleanup path still calls ``aws_adaptor.session`` directly rather than a
+registered typed provider facet.
+
 Commits `26bdbc6e6` and `413d4dcde` are the surgical source corrections. The
 executor now uses `limits.memory` when configured and retains the existing
 `requests.memory` fallback. Failed teardown retains HA recovery only when a
@@ -4335,7 +4346,11 @@ these remaining current-writer acceptance gates:
    seconds, reached 90 AWS Spot VMs with ten exact capacity failures, and then
    naturally reconciled all late successes to joined provider/PostgreSQL zero.
    PR #1913 gives the late-provider-success shutdown race a deterministic real
-   PostgreSQL gate. The remaining scale blocker is distinct: continuous
+   PostgreSQL reducer gate. A production-orchestration component test also
+   proves timeout, recovery-owner transfer, exact provider absence, finalizer,
+   request retention, and tombstone collection reach exact zero with exactly
+   one create and one delete; its pre-fix control loses the HA recovery script.
+   The remaining scale blocker is distinct: continuous
    notifications and probe bookkeeping invalidated the optimistic preload
    before a second bounded wave could commit. RED tests reproduce both
    starvation and numeric-replica-id cache reuse. The source correction adopts
@@ -4343,10 +4358,14 @@ these remaining current-writer acceptance gates:
    prepared facts to a sorted immutable tuple of row UUID, version, cluster,
    physical shape, and logical capacity, and consumes volatile lifecycle state
    fresh under the repository lock. Merge and deploy that correction, then
-   drive the 800-logical-slot target to at least 100 provider-``RUNNING`` L4
-   Spot VMs in aggregate within five minutes. Keep the shared 420-physical
-   launch throttle unchanged. Require zero ordinary on-demand or wrong-shape
-   capacity, then run exactly 10,000 authenticated async identities as one
+   drive the 800-logical-slot target toward at least 100 L4 Spot VMs in the
+   AWS/GCP union. Record three separate clocks: durable graph commit,
+   provider-native VM provisioning/``RUNNING`` (with five minutes as a
+   diagnostic benchmark rather than a correctness deadline), and eventual
+   SkyServe application ``READY`` after image/model initialization. Keep the
+   shared 420-physical launch throttle unchanged. Require zero ordinary
+   on-demand or wrong-shape capacity, then run exactly 10,000 authenticated
+   async identities as one
    retained 800-identity scale stimulus plus 23 sequential batches of 400 at
    at most 128 HTTP connections. Every identity must finish ``SUCCEEDED``.
    Finally stop demand and retain three natural exact-zero PostgreSQL, VM,
