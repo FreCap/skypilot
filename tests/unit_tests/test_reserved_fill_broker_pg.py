@@ -5236,7 +5236,13 @@ class TestServeStatusHistoryPG:
         with history_engine.begin() as connection:
             connection.execute(
                 sqlalchemy.insert(serve_state.services_table).values(
-                    name='svc', hash='hash-a', current_version=1, pool=0))
+                    name='svc',
+                    hash='hash-a',
+                    current_version=1,
+                    pool=0,
+                    lb_ha_enabled=1,
+                    lb_active_slot='a',
+                    lb_cutover_generation=1))
 
         heartbeat = {
             'bucket_seconds': 60,
@@ -5247,9 +5253,17 @@ class TestServeStatusHistoryPG:
                 'coverage_complete': True,
             }],
         }
-        assert serve_history.record_request_activity('svc', 'hash-a',
-                                                     'pod-a:process-a',
-                                                     heartbeat, timestamp) == 1
+        authority = serve_history.RequestHistoryCoverageAuthority(
+            reporter_slot=lb_ha.LbSlot.A,
+            applied_role=lb_ha.LbRole.ACTIVE,
+            applied_generation=1)
+        assert serve_history.record_request_activity(
+            'svc',
+            'hash-a',
+            'pod-a:process-a',
+            heartbeat,
+            timestamp,
+            coverage_authority=authority) == 1
 
         history = serve_history.get_status_history('svc', timestamp=timestamp)
         assert history['request_samples'] == [{
@@ -5258,6 +5272,155 @@ class TestServeStatusHistoryPG:
             'rejected_count': 0,
         }]
         assert history['rejection_history_available'] is True
+
+    @pytest.mark.parametrize(
+        ('phase', 'expected_rows'),
+        [
+            (lb_ha.LbCutoverPhase.STABLE, 1),
+            (lb_ha.LbCutoverPhase.DRAINING, 1),
+            (lb_ha.LbCutoverPhase.PREPARING, 0),
+            (lb_ha.LbCutoverPhase.MIGRATING, 0),
+            (lb_ha.LbCutoverPhase.ROLLING_BACK, 0),
+        ],
+    )
+    def test_idle_coverage_requires_selector_committed_cutover_phase(
+            self, history_engine, phase, expected_rows):
+        timestamp = 1784207110.0
+        covered_bucket = int(timestamp) // 60 * 60 - 60
+        pending_slot = ('b'
+                        if phase in (lb_ha.LbCutoverPhase.PREPARING,
+                                     lb_ha.LbCutoverPhase.DRAINING) else None)
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.services_table).values(
+                    name='svc',
+                    hash='hash-a',
+                    current_version=1,
+                    pool=0,
+                    lb_ha_enabled=1,
+                    lb_active_slot='a',
+                    lb_cutover_generation=2,
+                    lb_pending_slot=pending_slot,
+                    lb_cutover_phase=phase.value))
+
+        heartbeat = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': covered_bucket,
+                'request_count': 0,
+                'rejected_count': 0,
+                'coverage_complete': True,
+            }],
+        }
+        authority = serve_history.RequestHistoryCoverageAuthority(
+            reporter_slot=lb_ha.LbSlot.A,
+            applied_role=lb_ha.LbRole.ACTIVE,
+            applied_generation=2)
+        assert serve_history.record_request_activity(
+            'svc',
+            'hash-a',
+            'pod-a:process-a',
+            heartbeat,
+            timestamp,
+            coverage_authority=authority) == expected_rows
+
+    def test_db_cutover_fences_stale_idle_coverage_but_keeps_events(
+            self, history_engine):
+        """A former ACTIVE cannot fill a gap before learning its demotion."""
+        timestamp = 1784207110.0
+        current_bucket = int(timestamp) // 60 * 60
+        stale_authority = serve_history.RequestHistoryCoverageAuthority(
+            reporter_slot=lb_ha.LbSlot.A,
+            applied_role=lb_ha.LbRole.ACTIVE,
+            applied_generation=1)
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.services_table).values(
+                    name='svc',
+                    hash='hash-a',
+                    current_version=1,
+                    pool=0,
+                    lb_ha_enabled=1,
+                    lb_active_slot='a',
+                    lb_cutover_generation=1))
+            # PostgreSQL commits the cutover before the old process receives
+            # and applies its DRAINING role heartbeat.
+            connection.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == 'svc').values(
+                        lb_active_slot='b', lb_cutover_generation=2))
+
+        report = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': current_bucket - 60,
+                'request_count': 0,
+                'rejected_count': 0,
+                'coverage_complete': True,
+            }, {
+                'bucket_start': current_bucket,
+                'request_count': 2,
+                'rejected_count': 0,
+            }],
+        }
+        assert serve_history.record_request_activity(
+            'svc',
+            'hash-a',
+            'pod-a:process-a',
+            report,
+            timestamp,
+            coverage_authority=stale_authority) == 1
+
+        history = serve_history.get_status_history('svc', timestamp=timestamp)
+        assert history['request_samples'] == [{
+            'timestamp': float(current_bucket),
+            'request_count': 2,
+            'rejected_count': 0,
+        }]
+
+    @pytest.mark.parametrize('missing_payload_authority', [True, False])
+    def test_unknown_or_non_ha_reporter_cannot_create_idle_coverage(
+            self, history_engine, missing_payload_authority):
+        timestamp = 1784207110.0
+        covered_bucket = int(timestamp) // 60 * 60 - 60
+        service_values = {
+            'name': 'svc',
+            'hash': 'hash-a',
+            'current_version': 1,
+            'pool': 0,
+        }
+        coverage_authority = (None if missing_payload_authority else
+                              serve_history.RequestHistoryCoverageAuthority(
+                                  reporter_slot=lb_ha.LbSlot.A,
+                                  applied_role=lb_ha.LbRole.ACTIVE,
+                                  applied_generation=1))
+        if missing_payload_authority:
+            service_values.update(lb_ha_enabled=1,
+                                  lb_active_slot='a',
+                                  lb_cutover_generation=1)
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state.services_table).values(**service_values))
+
+        heartbeat = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': covered_bucket,
+                'request_count': 0,
+                'rejected_count': 0,
+                'coverage_complete': True,
+            }],
+        }
+        assert serve_history.record_request_activity(
+            'svc',
+            'hash-a',
+            'pod-a:process-a',
+            heartbeat,
+            timestamp,
+            coverage_authority=coverage_authority) == 0
+        assert serve_history.get_status_history(
+            'svc', timestamp=timestamp)['request_samples'] == []
 
     def test_classification_only_row_does_not_fabricate_idle_coverage(
             self, history_engine):
@@ -5283,6 +5446,45 @@ class TestServeStatusHistoryPG:
         history = serve_history.get_status_history('svc', timestamp=timestamp)
         assert history['request_samples'] == []
         assert history['rejection_history_available'] is False
+
+    def test_classification_support_cannot_bypass_idle_authority_fence(
+            self, history_engine):
+        timestamp = 1784207110.0
+        covered_bucket = int(timestamp) // 60 * 60 - 60
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.services_table).values(
+                    name='svc',
+                    hash='hash-a',
+                    current_version=1,
+                    pool=0,
+                    lb_ha_enabled=1,
+                    lb_active_slot='b',
+                    lb_cutover_generation=2))
+
+        classification = {
+            'classification_version': 1,
+            'bucket_seconds': 60,
+            'buckets': [],
+        }
+        stale_heartbeat = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': covered_bucket,
+                'request_count': 0,
+                'rejected_count': 0,
+                'coverage_complete': True,
+            }],
+        }
+        assert serve_history.record_request_classification(
+            'svc',
+            'hash-a',
+            'pod-a:process-a',
+            classification,
+            timestamp,
+            request_history=stale_heartbeat) == 0
+        assert serve_history.get_status_history(
+            'svc', timestamp=timestamp)['request_samples'] == []
 
     def test_classification_support_preserves_arrivals_before_second_writer(
             self, history_engine):

@@ -60,6 +60,8 @@ export function buildRequestHistoryView(history, range) {
     totalCapacities.push(sample?.totalCapacity ?? null);
   }
   const observedCounts = counts.filter((count) => count !== null);
+  const requestHistoryComplete =
+    counts.length > 0 && counts.every((count) => count !== null);
   const total = observedCounts.reduce((sum, count) => sum + count, 0);
   const observedCapacity = timestamps
     .map((timestamp, index) => ({
@@ -153,11 +155,9 @@ export function buildRequestHistoryView(history, range) {
     totalCapacities,
     events,
     stats: {
-      total: observedCounts.length ? total : null,
-      averagePerMinute: observedCounts.length
-        ? total / observedCounts.length
-        : null,
-      peakPerMinute: observedCounts.length ? Math.max(...observedCounts) : null,
+      total: requestHistoryComplete ? total : null,
+      averagePerMinute: requestHistoryComplete ? total / counts.length : null,
+      peakPerMinute: requestHistoryComplete ? Math.max(...counts) : null,
     },
     capacityStats,
   };

@@ -360,14 +360,29 @@ class RequestTimestamp(RequestsAggregator):
                 range(first_full_bucket, last_full_bucket + 1, bucket_seconds)
             ) if first_full_bucket <= last_full_bucket else set()
 
-        bucket_starts = sorted(
-            set(self._request_history) | set(self._rejection_history) |
-            covered_buckets)
+        count_bucket_starts = {
+            bucket for bucket in set(self._request_history) |
+            set(self._rejection_history)
+            if (self._request_history.get(bucket, 0) >
+                self._acknowledged_request_history.get(bucket, 0) or
+                self._rejection_history.get(bucket, 0) >
+                self._acknowledged_rejection_history.get(bucket, 0))
+        }
+        # A previous controller rejects and acknowledges the entire snapshot
+        # when it sees the newer coverage marker. Always make real counters
+        # durable in one legacy-compatible snapshot before offering any
+        # coverage-only evidence on a later round.
+        if count_bucket_starts:
+            bucket_starts = sorted(count_bucket_starts)
+            snapshot_covered_buckets: set[int] = set()
+        else:
+            bucket_starts = sorted(covered_buckets)
+            snapshot_covered_buckets = covered_buckets
         buckets = []
         for bucket in bucket_starts:
             request_count = self._request_history.get(bucket, 0)
             rejected_count = self._rejection_history.get(bucket, 0)
-            coverage_complete = bucket in covered_buckets
+            coverage_complete = bucket in snapshot_covered_buckets
             counts_unchanged = (
                 request_count <= self._acknowledged_request_history.get(
                     bucket, 0) and

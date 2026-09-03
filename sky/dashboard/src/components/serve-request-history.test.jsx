@@ -50,11 +50,33 @@ describe('buildRequestHistoryView', () => {
     expect(view.totalCapacities).toEqual([null, null, null]);
     expect(view.events).toEqual([]);
     expect(view.stats).toEqual({
-      total: 3,
-      averagePerMinute: 1.5,
-      peakPerMinute: 3,
+      total: null,
+      averagePerMinute: null,
+      peakPerMinute: null,
     });
     expect(view.capacityStats).toBeNull();
+  });
+
+  it('computes exact request stats only for a fully covered range', () => {
+    const view = buildRequestHistoryView(
+      {
+        available: true,
+        bucketSeconds: 60,
+        requestSamples: [
+          { timestamp: 120, requestCount: 3 },
+          { timestamp: 180, requestCount: 0 },
+          { timestamp: 240, requestCount: 6 },
+        ],
+      },
+      { start: 120, end: 240 }
+    );
+
+    expect(view.counts).toEqual([3, 0, 6]);
+    expect(view.stats).toEqual({
+      total: 9,
+      averagePerMinute: 3,
+      peakPerMinute: 6,
+    });
   });
 
   it('derives target deficits and lifecycle markers', () => {

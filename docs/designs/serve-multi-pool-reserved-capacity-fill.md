@@ -106,7 +106,14 @@ held prefix was cancelled. The current dashboard source also renders the
 turns a missing rejection-history minute into an exact zero. Until the load
 balancer publishes an explicit active-authority coverage heartbeat, a missing
 minute remains an honest line gap and a range containing one cannot report an
-exact rejection total. No schema or historical-series migration is added.
+exact request total, average, peak, or rejection total. PostgreSQL accepts an
+idle heartbeat only while a shared lock on the current service row proves the
+same service hash, HA ACTIVE slot, cutover generation, and a STABLE or DRAINING
+cutover phase. Selector-transition phases and non-HA or unknown authority stay
+gaps. During a mixed-version rollout, a new load balancer sends changed
+positive counters in a marker-free batch before sending coverage-only evidence,
+so an older controller cannot discard real events when it rejects the newer
+coverage marker. No schema or historical-series migration is added.
 
 The final current-writer AWS/GCP scale/traffic/drain receipt and clean
 `boltz-l4-fleet` recreation remain open. The first clean release-1.1.1631

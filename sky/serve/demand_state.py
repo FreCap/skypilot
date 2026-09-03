@@ -678,8 +678,14 @@ def _record_history(service_name: str, service_hash: str,
     request_history = payload.get('request_history')
     classification = payload.get('request_classification_history')
     prediction = payload.get('prediction_time_history')
-    serve_history.record_request_activity(service_name, service_hash, reporter,
-                                          request_history, observed_at)
+    serve_history.record_request_activity(
+        service_name,
+        service_hash,
+        reporter,
+        request_history,
+        observed_at,
+        coverage_authority=(serve_history.RequestHistoryCoverageAuthority.
+                            from_payload(payload)))
     serve_history.record_request_classification(service_name,
                                                 service_hash,
                                                 reporter,

@@ -129,6 +129,45 @@ def test_completed_nonzero_minute_is_republished_with_coverage(monkeypatch):
         include_idle_coverage=True) is None
 
 
+def test_dirty_counts_precede_coverage_for_previous_controller(monkeypatch):
+    """An old controller may reject a whole batch containing a v2 marker."""
+    now = [120.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    aggregator = serve_utils.RequestTimestamp()
+
+    # Begin an ACTIVE interval, then let one fully idle minute elapse before a
+    # request arrives in the current minute.  The real counter must travel in
+    # a legacy-compatible batch by itself.
+    assert aggregator.request_history_snapshot(
+        include_idle_coverage=True) is None
+    now[0] = 180.0
+    aggregator.add(None)
+    dirty = aggregator.request_history_snapshot(include_idle_coverage=True)
+    assert dirty == {
+        'bucket_seconds': 60,
+        'buckets': [{
+            'bucket_start': 180,
+            'request_count': 1,
+            'rejected_count': 0,
+        }],
+    }
+
+    # Simulate the previous controller accepting that marker-free batch.  Only
+    # then may the new LB offer the unsupported zero heartbeat, whose loss on
+    # an old controller cannot erase the already-durable request.
+    aggregator.mark_request_history_accepted(dirty)
+    coverage = aggregator.request_history_snapshot(include_idle_coverage=True)
+    assert coverage == {
+        'bucket_seconds': 60,
+        'buckets': [{
+            'bucket_start': 120,
+            'request_count': 0,
+            'rejected_count': 0,
+            'coverage_complete': True,
+        }],
+    }
+
+
 def test_idle_request_history_coverage_resets_around_inactive_role(monkeypatch):
     now = [120.0]
     monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])

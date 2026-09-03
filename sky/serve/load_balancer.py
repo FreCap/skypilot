@@ -4386,7 +4386,6 @@ class SkyServeLoadBalancer:
                 url: int(generation) for url, generation in
                 self._occupancy_sample_generation.items() if url in sampled_set
             }
-        session_id = self._get_lb_session_id()
         async with aiohttp.ClientSession() as session:
             if route_only:
                 # A route retry is not a demand-reporting round.  In
@@ -4439,7 +4438,7 @@ class SkyServeLoadBalancer:
                 'total_slots_by_url': total_slots_by_url,
                 'occupancy_sample_generation': occupancy_sample_generation,
                 'draining_urls': list(self._draining_clients),
-                'lb_session_id': session_id,
+                **self._ha_identity_payload(),
                 **queue_snapshot.payload(),
                 **rejection_snapshot.payload(),
                 **self._offered_arrival_counts(),
@@ -5248,6 +5247,16 @@ class SkyServeLoadBalancer:
                 return
             await asyncio.sleep(delay)
 
+    def _ha_identity_payload(self) -> dict[str, Any]:
+        """Return the process identity and last locally applied HA role."""
+        return {
+            'lb_session_id': self._get_lb_session_id(),
+            'lb_slot': self._lb_slot.value
+                       if self._lb_slot is not None else None,
+            'applied_role': self._lb_role.value,
+            'applied_generation': self._lb_role_generation,
+        }
+
     def _ha_role_payload(self,
                          *,
                          current_routes_only: bool = False) -> dict[str, Any]:
@@ -5333,19 +5342,12 @@ class SkyServeLoadBalancer:
         }
         sample_ages = {url: sample_ages[url] for url in common_urls}
         return {
-            'lb_session_id': self._get_lb_session_id(),
-            'lb_slot': self._lb_slot.value
-                       if self._lb_slot is not None else None,
+            **self._ha_identity_payload(),
             'routing_version': routing_version,
             'route_projection_generation': route_projection_generation,
             'route_projection_sha256': route_projection_sha256,
             'route_source_epoch': route_source_epoch,
             'armed_generation': self._armed_generation,
-            # Echo only the role response already applied locally. The
-            # controller uses this acknowledgement to prove that a former
-            # active stopped admission before accepting its zero-work report.
-            'applied_role': self._lb_role.value,
-            'applied_generation': self._lb_role_generation,
             # Process-local admissions include queued, dispatching, and
             # streaming requests. Unlike backend async occupancy, this count
             # belongs to exactly one LB session and is the authoritative
@@ -5562,13 +5564,12 @@ class SkyServeLoadBalancer:
             return
         try:
             sync_tokens = serve_utils.get_lb_sync_auth_tokens(required=True)
-            session_id = self._get_lb_session_id()
             payload = {
                 'request_history': request_history,
                 'request_classification_history': request_classification_history,
                 'prediction_time_history': prediction_time_history,
                 'request_history_session_id': self._request_history_session_id,
-                'lb_session_id': session_id,
+                **self._ha_identity_payload(),
             }
             async with aiohttp.ClientSession() as session:
                 token_attempts: tuple[str | None,

@@ -411,6 +411,9 @@ def test_zero_replica_projected_route_emits_complete_active_demand(
     assert projected.response['num_ready_replicas'] == 0
     assert sync_payload['in_flight'] == {}
     assert sync_payload['unknown_in_flight_urls'] == []
+    assert sync_payload['lb_slot'] == 'a'
+    assert sync_payload['applied_role'] == lb_ha.LbRole.ACTIVE.value
+    assert sync_payload['applied_generation'] == 4
     assert normalized['applied_role'] == lb_ha.LbRole.ACTIVE.value
     assert normalized['applied_generation'] == 4
     assert normalized['routing_version'] == 7
