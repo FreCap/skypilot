@@ -1,6 +1,6 @@
 # SkyServe multi-pool reserved-capacity admission
 
-Last updated: 2026-09-02
+Last updated: 2026-09-03
 
 Status: **the PostgreSQL-authoritative reservation-aware planner, exact-card
 compatibility, bounded Spot-only paid admission, historical at-least-100 Spot
@@ -31,6 +31,11 @@ by the record UUID. Probe timestamps, readiness, recovery, and other lifecycle
 fields are consumed fresh from the locked rows rather than used as optimistic
 transaction preconditions. Identity, version, shape, and row-set drift still
 fail closed and request a fresh preload.
+
+The promoted repository accepts only that structural planner-input
+fingerprint. The former whole-replica planning fingerprint remains solely as
+the legacy, non-promoted controller's pre-planning fence and cannot select a
+second repository validation path.
 
 An earlier release-``1.1.1638`` down removed every provider VM, disk, and
 in-flight provider operation, but retained 13 exact claims/debits at the

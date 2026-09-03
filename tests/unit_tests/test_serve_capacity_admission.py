@@ -2,6 +2,7 @@
 
 import copy
 import dataclasses
+import inspect
 import threading
 import time
 
@@ -15,6 +16,15 @@ from sky.serve import capacity_planning
 from sky.serve import kueue_lane_capacity
 from sky.serve import reserved_fill_planner
 from sky.serve import serve_state_schema
+
+
+def test_current_admission_has_one_structural_planner_precondition() -> None:
+    parameters = inspect.signature(
+        capacity_admission.CapacityAdmissionRepository.plan_and_admit_current
+    ).parameters
+
+    assert 'expected_planner_input_fingerprint' in parameters
+    assert 'expected_planning_state_fingerprint' not in parameters
 
 
 def _input(**overrides) -> capacity_admission.CapacityPlanInput:
@@ -692,7 +702,7 @@ def test_planner_reservation_evidence_must_match_locked_supply():
         reservation_commitment={'l4': 2},
         static_fill_target={'l4': 0},
         supply_projection=supply,
-        expected_planning_state_fingerprint='f' * 64)
+        expected_planner_input_fingerprint='f' * 64)
     changed = capacity_admission.ReservedSupplyProjection(**{
         **supply.__dict__,
         'reservation_evidence_sha256': '9' * 64,
@@ -708,7 +718,7 @@ def test_planner_reservation_evidence_must_match_locked_supply():
             reservation_commitment={'l4': 2},
             static_fill_target={'l4': 0},
             supply_projection=changed,
-            expected_planning_state_fingerprint='f' * 64)
+            expected_planner_input_fingerprint='f' * 64)
 
 
 @pytest.mark.parametrize(
