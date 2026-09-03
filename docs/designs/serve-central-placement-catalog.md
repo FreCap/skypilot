@@ -1,7 +1,7 @@
 # SkyServe centralized placement catalog
 
 _Status: implementation and local verification complete; pull request and
-production deployment pending. Created: 2026-07-24. Last updated: 2026-08-28._
+production deployment pending. Created: 2026-07-24. Last updated: 2026-09-03._
 
 ## Decision summary
 

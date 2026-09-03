@@ -599,15 +599,24 @@ class TestManagedJobControllerOwnership:
         # A repeated recovery pass leaves the claimed row alone.
         assert requeue() == 0
 
-    def test_null_task_status_candidate_does_not_block_recovery(
+    def test_null_task_status_candidate_does_not_block_valid_orphan_repair(
             self, _mock_managed_jobs_db_conn, monkeypatch, tmp_path):
-        job_id = self._seed_done_orphan(
+        valid_job_id = self._seed_done_orphan(
+            [state.ManagedJobStatus.SUCCEEDED])
+        malformed_job_id = self._seed_done_orphan(
             [state.ManagedJobStatus.SUCCEEDED, None])
-        cluster_name = managed_job_utils.generate_managed_job_cluster_name(
-            't0', job_id)
-        monkeypatch.setattr(managed_job_utils.global_user_state,
-                            'get_managed_job_cluster_cleanup_candidates',
-                            lambda: {cluster_name: str(job_id)})
+        valid_cluster_name = (
+            managed_job_utils.generate_managed_job_cluster_name(
+                't0', valid_job_id))
+        malformed_cluster_name = (
+            managed_job_utils.generate_managed_job_cluster_name(
+                't0', malformed_job_id))
+        monkeypatch.setattr(
+            managed_job_utils.global_user_state,
+            'get_managed_job_cluster_cleanup_candidates', lambda: {
+                valid_cluster_name: str(valid_job_id),
+                malformed_cluster_name: str(malformed_job_id),
+            })
         monkeypatch.setattr(state, 'reset_stale_jobs_for_current_controller',
                             lambda: 0)
         monkeypatch.setattr(constants, 'HA_PERSISTENT_RECOVERY_LOG_PATH',
@@ -615,9 +624,13 @@ class TestManagedJobControllerOwnership:
 
         managed_job_utils.ha_recovery_for_consolidation_mode()
 
-        assert (self._schedule_state(job_id) ==
+        assert (self._schedule_state(valid_job_id) ==
+                state.ManagedJobScheduleState.WAITING.value)
+        assert (self._schedule_state(malformed_job_id) ==
                 state.ManagedJobScheduleState.DONE.value)
-        assert (tmp_path / 'jobs_recovery.log').exists()
+        recovery_log = (tmp_path /
+                        'jobs_recovery.log').read_text(encoding='utf-8')
+        assert 'Requeued 1 terminal managed job(s)' in recovery_log
 
     def test_first_slot_rollout_adopts_only_non_done_legacy_jobs(
             self, _mock_managed_jobs_db_conn, monkeypatch):

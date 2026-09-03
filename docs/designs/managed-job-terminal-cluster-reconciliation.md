@@ -1,8 +1,8 @@
 # Managed-job terminal cluster reconciliation
 
-Status: Deployed
+Status: Baseline deployed; malformed-row isolation correction pending deployment
 
-Last updated: 2026-09-02
+Last updated: 2026-09-03
 
 ## Context
 
@@ -56,6 +56,9 @@ The lifecycle invariants are:
 5. A concurrent disappearance of the cluster row is harmless: the canonical
    teardown observes absence idempotently and finalizes the cleanup-only job.
 6. Terminal task statuses are never rewritten by reconciliation.
+7. One malformed lifecycle row excludes its whole job from the shared slim
+   snapshot, but cannot suppress repair of valid jobs in the same batch. The
+   malformed job receives no scheduler or provider effect from partial data.
 
 ## Architecture
 
@@ -67,7 +70,9 @@ performs one additional durable repair:
    global-state gateway.
 2. Derive candidate job IDs from `workload_id`; support legacy rows only when
    the generated task-cluster name proves the association.
-3. Read the slim job/task snapshots for those IDs and retain only dedicated,
+3. Read the slim job/task snapshots for those IDs. Decode each job atomically:
+   exclude the whole job when any lifecycle enum is undecodable, while
+   retaining valid peers from the same query. Then retain only dedicated,
    terminal, scheduler-`DONE` jobs with a matching launched task identity.
 4. In one managed-job database transaction, compare-and-set those exact jobs
    from `DONE` to `WAITING`, clear stale controller/slot ownership, and confirm
@@ -79,6 +84,11 @@ The candidate inventory is current state, not history, so the work is bounded
 by live managed-job cluster rows. The repair runs once per elected recovery,
 which is sufficient for pre-fix rows; current finalizers cannot create this
 state under invariant 1.
+
+Malformed jobs remain fail-closed for separate data repair, but do not poison
+the batch. The outer recovery guard still contains database or programming
+failures so fixed-slot admission cannot be held closed by this best-effort
+legacy repair.
 
 ## Incident data correction
 
@@ -130,6 +140,9 @@ at least two API replicas and two executors.
   changes are preserved.
 - Test recovery ordering: orphan requeue occurs after stale-owner recovery and
   before the recovery gate opens.
+- Test a mixed batch containing one valid terminal orphan and one multi-task
+  job with an undecodable status: the valid job becomes cleanup-only work, the
+  malformed job stays `DONE`, and recovery still completes.
 - Re-run managed-job ownership, cleanup-only scheduler, and refresh ownership
   suites.
 - In production, verify the exact incident interval, rollup rows, API total,
@@ -147,3 +160,6 @@ at least two API replicas and two executors.
   recovery completed with zero legacy orphan candidates; the API reported
   commit `1cad3f6d0442926f30ee26b2b8a294cceeceb245`, all role deployments were
   Ready, and no live clusters or in-progress managed jobs remained.
+- [ ] Deploy the malformed-row isolation correction and verify that an
+  excluded legacy row cannot suppress valid orphan repair. This is an
+  operational gate only; no schema or compatibility migration is required.

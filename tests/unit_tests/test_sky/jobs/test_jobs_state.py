@@ -1515,6 +1515,31 @@ class TestJobsToCheckStatusInfoLegacyRows:
         assert job_id not in state.get_jobs_to_check_status_info(None)
         assert job_id not in state.get_jobs_to_check_status()
 
+    def test_malformed_status_excludes_only_its_job_from_global_sweep(
+            self, _mock_managed_jobs_db_conn):
+        valid_job_id = _insert_null_workspace_job(
+            _mock_managed_jobs_db_conn,
+            schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+            status=state.ManagedJobStatus.RUNNING.value,
+            workspace='default')
+        malformed_job_id = _insert_null_workspace_job(
+            _mock_managed_jobs_db_conn,
+            schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+            status=state.ManagedJobStatus.RUNNING.value,
+            workspace='default')
+        with _mock_managed_jobs_db_conn.begin() as connection:
+            connection.execute(state.spot_table.insert().values(
+                spot_job_id=malformed_job_id,
+                task_id=1,
+                task_name='task-1',
+                status=None,
+            ))
+
+        info = state.get_jobs_to_check_status_info(None)
+
+        assert valid_job_id in info
+        assert malformed_job_id not in info
+
 
 class TestGetJobsStatusCheckInfo:
     """Tests for the slim batched get_jobs_status_check_info helper.
@@ -1589,6 +1614,32 @@ class TestGetJobsStatusCheckInfo:
         info = state.get_jobs_status_check_info([job_id])
         assert job_id in info
         assert info[job_id]['workspace'] is None
+
+    @pytest.mark.parametrize('malformed_status', [None, 'FUTURE_STATUS'])
+    def test_malformed_task_status_excludes_only_its_job(
+            self, _mock_managed_jobs_db_conn, malformed_status):
+        malformed_job_id = _insert_null_workspace_job(
+            _mock_managed_jobs_db_conn,
+            schedule_state=state.ManagedJobScheduleState.DONE.value,
+            status=state.ManagedJobStatus.SUCCEEDED.value,
+            workspace='default')
+        with _mock_managed_jobs_db_conn.begin() as connection:
+            connection.execute(state.spot_table.insert().values(
+                spot_job_id=malformed_job_id,
+                task_id=1,
+                task_name='task-1',
+                status=malformed_status,
+            ))
+        valid_job_id = _insert_null_workspace_job(
+            _mock_managed_jobs_db_conn,
+            schedule_state=state.ManagedJobScheduleState.DONE.value,
+            status=state.ManagedJobStatus.SUCCEEDED.value,
+            workspace='default')
+
+        info = state.get_jobs_status_check_info(
+            [malformed_job_id, valid_job_id])
+
+        assert set(info) == {valid_job_id}
 
     def test_cancellation_snapshot_parity_for_legacy_rows(
             self, _mock_managed_jobs_db_conn):

@@ -1,6 +1,6 @@
 # SkyServe multi-pool reserved-capacity admission
 
-Last updated: 2026-09-02
+Last updated: 2026-09-03
 
 Status: **the PostgreSQL-authoritative reservation-aware planner, exact-card
 compatibility, bounded Spot-only paid admission, historical at-least-100 Spot
@@ -1769,14 +1769,6 @@ projection inside the committed v4 witness and made budget authority explicit:
 - `HOLDINGS_ONLY` retains bounded existing fill but cannot acquire a new pool.
   Missing, stale, flexible, mixed, configured-minimum, floor/fixed-inflated,
   or otherwise incomplete durable evidence always selects this mode.
-  A current witness whose plan has no reservation-compatible demand (zero
-  demand, or paid-only demand on a non-reserved card) publishes no
-  acquisition classes and a zero target; that is a proven zero for the
-  release governor (`demonstrated_need = 0`, not blind), so idle release
-  starts after the ordinary dwell instead of the blind grace period. Only an
-  absent or stale witness is blind, and a blind heartbeat publishes
-  `boot_hold = false` because the governor ignores the hold while blind and
-  the allocation publisher rejects a blind witness that carries one.
 - `EXACT_SINGLETON` is permitted only when the adopted positive target is no
   greater than raw demand and is explained by singleton request classes
   already bound by the v4 digest. A normal rate-limited upscale wave may use a
@@ -1819,6 +1811,15 @@ matcher before settlement. The implementation uses the bounded accelerator
 card domain directly and has no residual-flow, min-cost, or alternate fallback
 allocator. `EXACT_SINGLETON` is removed from current source; the bullets above
 remain only as the production history of the schema-3 writer.
+
+In the current schema-4 contract, a fresh witness whose plan has no
+reservation-compatible demand (zero demand, or paid-only demand on a
+non-reserved card) publishes no acquisition classes and a zero target. That is
+a proven zero for the release governor (`demonstrated_need = 0`, not blind),
+so idle release starts after the ordinary dwell instead of the blind grace
+period. Only an absent or stale witness is blind. A blind heartbeat publishes
+`boot_hold = false` because the governor ignores that hold while blind and the
+allocation publisher rejects a blind witness that carries one.
 
 The canonical correction is deliberately smaller than adding a second
 per-accelerator entitlement protocol. A service with
