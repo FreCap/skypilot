@@ -4491,6 +4491,8 @@ class _ExactAdmissionResponse:
         return False
 
     async def read(self):
+        if isinstance(self._body, BaseException):
+            raise self._body
         return self._body
 
 
@@ -4581,6 +4583,134 @@ def test_exact_async_request_recovers_lost_response_via_lookup_before_replay(
         'Content-Type': 'application/json',
         'X-SkyServe-Service-Incarnation': 'incarnation-a',
     }
+
+
+def test_exact_async_request_recovers_truncated_response_body_via_lookup(
+        monkeypatch):
+    """Headers without a complete body do not strand the exact campaign."""
+    session = _ExactAdmissionSession([
+        _ExactAdmissionResponse(
+            202,
+            state='ACCEPTED',
+            revision=2,
+            body=qualifier.aiohttp.ClientPayloadError('truncated body')),
+        _ExactAdmissionResponse(200, state='ACCEPTED', revision=2),
+    ])
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', _skip_exact_retry_delay)
+
+    receipt, _ = _submit_exact_with_session(session)
+
+    assert receipt.state == 'ACCEPTED'
+    assert [call[0] for call in session.calls] == [
+        _EXACT_SUBMIT_URL,
+        _EXACT_RECEIPT_URL,
+    ]
+
+
+@pytest.mark.parametrize(('hop', 'tail', 'state', 'expected_urls'), [
+    (_ExactAdmissionResponse(
+        200,
+        state='DISPATCH_MAY_HAVE_OCCURRED',
+        revision=1,
+        attempt_id='22222222-2222-4222-8222-222222222222',
+        attempt_no=2), [
+            _ExactAdmissionResponse(
+                200,
+                state='ACCEPTED',
+                revision=2,
+                attempt_id='22222222-2222-4222-8222-222222222222',
+                attempt_no=2)
+        ], 'ACCEPTED', [
+            _EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_RECEIPT_URL,
+            _EXACT_RECEIPT_URL
+        ]),
+    (_ExactAdmissionResponse(200,
+                             state='ACCEPTED',
+                             revision=2,
+                             attempt_id='22222222-2222-4222-8222-222222222222',
+                             attempt_no=2), [], 'ACCEPTED',
+     [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_RECEIPT_URL]),
+    (_ExactAdmissionResponse(200,
+                             state='ACCEPTED',
+                             revision=2,
+                             attempt_id='44444444-4444-4444-8444-444444444444',
+                             attempt_no=4), [], 'ACCEPTED',
+     [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_RECEIPT_URL]),
+    (_ExactAdmissionResponse(200,
+                             state='SUCCEEDED',
+                             revision=2,
+                             attempt_id='22222222-2222-4222-8222-222222222222',
+                             attempt_no=2), [], 'SUCCEEDED',
+     [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_RECEIPT_URL]),
+    (_ExactAdmissionResponse(
+        200,
+        state='REJECTED_PRE_DISPATCH',
+        revision=2,
+        attempt_id='22222222-2222-4222-8222-222222222222',
+        attempt_no=2), [
+            _accepted_exact_response(
+                attempt_id='33333333-3333-4333-8333-333333333333', attempt_no=3)
+        ], 'ACCEPTED', [
+            _EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_RECEIPT_URL,
+            _EXACT_SUBMIT_URL
+        ]),
+],
+                         ids=[
+                             'dispatch', 'accepted', 'multiple-rebinds',
+                             'succeeded', 'rejected'
+                         ])
+def test_exact_async_request_accepts_internal_rebinds_after_dispatch(
+        monkeypatch, hop, tail, state, expected_urls):
+    """Pre-send failures may durably reject N and internally bind N+k."""
+    first_dispatch = _ExactAdmissionResponse(200,
+                                             state='DISPATCH_MAY_HAVE_OCCURRED',
+                                             revision=1)
+    session = _ExactAdmissionSession([
+        qualifier.aiohttp.ClientConnectionError('lost response'),
+        first_dispatch,
+        hop,
+        *tail,
+    ])
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', _skip_exact_retry_delay)
+
+    receipt, _ = _submit_exact_with_session(session)
+
+    assert receipt.state == state
+    assert [call[0] for call in session.calls] == expected_urls
+
+
+@pytest.mark.parametrize(('pending', 'current'), [
+    (qualifier.ExactAsyncReceipt(
+        attempt_id='11111111-1111-4111-8111-111111111111',
+        attempt_no=1,
+        state='DISPATCH_MAY_HAVE_OCCURRED',
+        revision=1),
+     qualifier.ExactAsyncReceipt(
+         attempt_id='11111111-1111-4111-8111-111111111111',
+         attempt_no=1,
+         state='ACCEPTED',
+         revision=3)),
+    (qualifier.ExactAsyncReceipt(
+        attempt_id='22222222-2222-4222-8222-222222222222',
+        attempt_no=2,
+        state='DISPATCH_MAY_HAVE_OCCURRED',
+        revision=1),
+     qualifier.ExactAsyncReceipt(
+         attempt_id='11111111-1111-4111-8111-111111111111',
+         attempt_no=1,
+         state='ACCEPTED',
+         revision=2)),
+],
+                         ids=['same-invalid-revision', 'backwards'])
+def test_exact_recovery_rejects_invalid_internal_rebind_hop(pending, current):
+    """Recovery rejects malformed same-attempt and backwards observations."""
+    with pytest.raises(qualifier.QualificationError,
+                       match='conflicting receipt transition'):
+        qualifier._validate_recovered_submission_receipt(
+            current,
+            request_id='execution-1',
+            previous_rejection=None,
+            pending_dispatch=pending)
 
 
 @pytest.mark.parametrize(('outcomes', 'expected_urls', 'state'), [
@@ -4701,6 +4831,14 @@ def test_exact_async_request_does_not_trust_unfenced_lookup_miss(monkeypatch):
         _ExactAdmissionResponse(404)
     ], [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_RECEIPT_URL]),
     ([
+        _ExactAdmissionResponse(
+            202,
+            state='ACCEPTED',
+            revision=2,
+            body=qualifier.aiohttp.ClientPayloadError('truncated body')),
+        _ExactAdmissionResponse(404)
+    ], [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL]),
+    ([
         qualifier.aiohttp.ClientConnectionError('lost response'),
         _ExactAdmissionResponse(200, state='REJECTED_PRE_DISPATCH', revision=2),
         qualifier.aiohttp.ClientConnectionError('lost successor response'),
@@ -4710,7 +4848,10 @@ def test_exact_async_request_does_not_trust_unfenced_lookup_miss(monkeypatch):
         _EXACT_RECEIPT_URL
     ]),
 ],
-                         ids=['pending-dispatch', 'previous-rejection'])
+                         ids=[
+                             'pending-dispatch', 'truncated-acceptance',
+                             'previous-rejection'
+                         ])
 def test_exact_async_request_fails_closed_if_durable_receipt_disappears(
         monkeypatch, outcomes, expected_urls):
     """A 404 cannot erase already observed durable attempt evidence."""

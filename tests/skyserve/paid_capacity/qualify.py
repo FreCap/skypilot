@@ -4292,7 +4292,10 @@ def _validate_recovered_submission_receipt(
             raise QualificationError(
                 'Exact async response has a conflicting receipt transition.')
         if pending_dispatch is not None:
-            valid_attempt = current == pending_dispatch
+            valid_attempt = (
+                current == pending_dispatch or
+                (current.attempt_id != pending_dispatch.attempt_id and
+                 current.attempt_no > pending_dispatch.attempt_no))
         elif previous_rejection is not None:
             valid_attempt = (current.attempt_id != previous_rejection.attempt_id
                              and
@@ -4314,18 +4317,16 @@ def _validate_recovered_submission_receipt(
                                      accepted_response=accepted)
         return (_ExactAdmissionRecoveryAction.RETURN
                 if accepted else _ExactAdmissionRecoveryAction.RETRY_SUBMISSION)
-    valid_attempt = (current.attempt_id == pending_dispatch.attempt_id and
-                     current.attempt_no == pending_dispatch.attempt_no)
-    if accepted:
-        valid_transition = (
-            (current.state == 'ACCEPTED' and current.revision == 2) or
-            (current.state == 'SUCCEEDED' and current.revision in (2, 3)))
-    else:
-        valid_transition = (current.state == 'REJECTED_PRE_DISPATCH' and
-                            current.revision == 2)
-    if not valid_attempt or not valid_transition:
+    same_attempt = (current.attempt_id == pending_dispatch.attempt_id and
+                    current.attempt_no == pending_dispatch.attempt_no)
+    later_attempt = (current.attempt_id != pending_dispatch.attempt_id and
+                     current.attempt_no > pending_dispatch.attempt_no)
+    if not (same_attempt or later_attempt):
         raise QualificationError(
             'Exact async response has a conflicting receipt transition.')
+    _validate_submission_receipt(current,
+                                 previous_rejection=None,
+                                 accepted_response=accepted)
     return (_ExactAdmissionRecoveryAction.RETURN
             if accepted else _ExactAdmissionRecoveryAction.RETRY_SUBMISSION)
 
@@ -4420,6 +4421,7 @@ async def _submit_exact_async_request(
     retry_attempt = 0
     previous_rejection: ExactAsyncReceipt | None = None
     pending_dispatch: ExactAsyncReceipt | None = None
+    durable_receipt_observed = False
     recovering = False
     while time.monotonic() < deadline:
         retry_after = '0.5'
@@ -4433,13 +4435,11 @@ async def _submit_exact_async_request(
             else:
                 request = session.post(url, headers=headers, data=body)
             async with request as response:
-                response_body = await response.read()
                 if read_only:
                     if response.status == 404:
                         _validate_exact_response_fence(
                             response, service_hash=service_hash)
-                        if (pending_dispatch is not None or
-                                previous_rejection is not None):
+                        if durable_receipt_observed:
                             raise QualificationError(
                                 f'{request_id} lost a previously durable exact '
                                 'admission receipt.')
@@ -4447,6 +4447,7 @@ async def _submit_exact_async_request(
                     elif response.status == 200:
                         observed_receipt = _receipt_from_headers(
                             response, service_hash=service_hash)
+                        durable_receipt_observed = True
                         retry_after = response.headers.get('Retry-After', '0.5')
                     elif response.status not in _RETRYABLE_STATUSES:
                         raise QualificationError(
@@ -4457,11 +4458,13 @@ async def _submit_exact_async_request(
                 elif response.status == 202:
                     receipt = _receipt_from_headers(response,
                                                     service_hash=service_hash)
+                    durable_receipt_observed = True
                     _validate_submission_receipt(
                         receipt,
                         previous_rejection=previous_rejection,
                         accepted_response=True)
                     try:
+                        response_body = await response.read()
                         result = json.loads(response_body)
                     except (UnicodeDecodeError, ValueError) as error:
                         raise QualificationError(
@@ -4478,6 +4481,7 @@ async def _submit_exact_async_request(
                     try:
                         observed_receipt = _receipt_from_headers(
                             response, service_hash=service_hash)
+                        durable_receipt_observed = True
                     except QualificationError:
                         if response.status == 409:
                             raise
@@ -4486,7 +4490,8 @@ async def _submit_exact_async_request(
                 else:
                     raise QualificationError(
                         f'{request_id} returned HTTP {response.status}.')
-        except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError,
+                asyncio.TimeoutError):
             # Once a submission response is lost, only the read-only durable
             # receipt endpoint can authorize an identical replay. A lookup
             # transport error remains read-only and is retried to the same
