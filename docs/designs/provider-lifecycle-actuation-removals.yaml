@@ -13311,7 +13311,7 @@ artifacts:
     call: _capacity_cache_exhausted_zone_names
   - kind: python_call_within
     path: sky/backends/cloud_vm_ray_backend.py
-    symbol: RetryingVmProvisioner._retry_zones
+    symbol: _clear_satisfied_capacity_cache_entries
     call: capacity_cache.clear
   - kind: python_call_within
     path: sky/backends/cloud_vm_ray_backend.py
@@ -13378,7 +13378,7 @@ artifacts:
     call: _quota_cooldown_key
   - kind: python_call_within
     path: sky/backends/cloud_vm_ray_backend.py
-    symbol: RetryingVmProvisioner._retry_zones
+    symbol: _clear_satisfied_capacity_cache_entries
     call: capacity_cache.clear_quota_cooldown
   - kind: python_call_within
     path: sky/backends/cloud_vm_ray_backend.py

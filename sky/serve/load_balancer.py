@@ -3030,12 +3030,18 @@ class SkyServeLoadBalancer:
             'processing_time_us': processing_time_us,
         }
         try:
+            compatibility_conflict: (
+                async_request_ledger_client.AsyncLedgerTransportError |
+                None) = None
+            receipt = None
             try:
                 receipt = await self._post_async_ledger(ledger_payload)
-                validation_minimum_revision = payload['expected_revision']
             except async_request_ledger_client.AsyncLedgerTransportError as error:
                 if error.status_code != 409:
                     raise
+                compatibility_conflict = error
+            validation_minimum_revision = payload['expected_revision']
+            if compatibility_conflict is not None:
                 # A mixed-version API server may still require the exact current
                 # revision.  Resolve and retry once only on its conflict; the
                 # current server treats expected_revision as a minimum and keeps
@@ -3043,7 +3049,7 @@ class SkyServeLoadBalancer:
                 current = await self._lookup_async_ledger_receipt(
                     payload['request_id'], payload['intent_sha256'])
                 if current is None:
-                    raise error
+                    raise compatibility_conflict
                 current = (async_request_ledger_client.
                            validate_terminal_lookup_receipt(
                                payload['request_id'], payload['attempt_id'],
@@ -3052,6 +3058,9 @@ class SkyServeLoadBalancer:
                 ledger_payload['expected_revision'] = current.revision
                 validation_minimum_revision = current.revision
                 receipt = await self._post_async_ledger(ledger_payload)
+            if receipt is None:
+                raise async_request_ledger_client.AsyncLedgerTransportError(
+                    503, 'Async ledger terminal write produced no receipt.')
             receipt = (async_request_ledger_client.
                        validate_terminal_observation_receipt(
                            payload['request_id'], payload['attempt_id'],
