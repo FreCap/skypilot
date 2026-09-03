@@ -188,6 +188,23 @@ class ExactRequestCampaignCounters:
     accepting_offers: bool = True
 
 
+class ExactRequestTrafficEvidence(typing.Protocol):
+    """Read-only traffic completion capability exposed to proof consumers."""
+
+    def done(self) -> bool:
+        ...
+
+    def result(self) -> int:
+        ...
+
+
+class ExactRequestCampaignEvidence(typing.Protocol):
+    """Read-only campaign frontier exposed to proof consumers."""
+
+    async def snapshot(self) -> ExactRequestCampaignCounters:
+        ...
+
+
 @dataclasses.dataclass(kw_only=True)
 class ExactRequestCampaignProgress:
     """Serialize the sliding window independently of proof observers."""
@@ -5036,7 +5053,7 @@ async def _wait_for_scale_stimulus(
     observer: Observer,
     profile: Profile,
     receipt: Receipt,
-    traffic: asyncio.Task[int],
+    traffic: ExactRequestTrafficEvidence,
     baseline: RequestTelemetry,
     expected_resident: int,
     deadline_monotonic: float,
@@ -5076,7 +5093,7 @@ async def _wait_for_positive_request_telemetry(
     observer: Observer,
     profile: Profile,
     receipt: Receipt,
-    traffic: asyncio.Task[int],
+    traffic: ExactRequestTrafficEvidence,
     baseline: RequestTelemetry,
     deadline_monotonic: float,
 ) -> RequestTelemetry:
@@ -5186,9 +5203,9 @@ async def _wait_for_scale(
         profile: Profile,
         progress: Progress,
         receipt: Receipt,
-        traffic: asyncio.Task[int],
+        traffic: ExactRequestTrafficEvidence,
         baseline: RequestTelemetry,
-        campaign_progress: ExactRequestCampaignProgress | None = None,
+        campaign_progress: ExactRequestCampaignEvidence | None = None,
         expectation: ProviderExpectation | None = None) -> None:
     if expectation is None:
         expectation = provider_expectation(profile, None)

@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import types
+import typing
 from typing import Any
 import urllib.error
 import urllib.request
@@ -4661,10 +4662,27 @@ def test_scale_and_positive_proof_failure_cancels_sibling():
     asyncio.run(exercise())
 
 
-def test_observer_failure_drains_offered_request_before_campaign_exit():
+def test_proof_consumers_receive_only_read_only_campaign_evidence():
+    traffic_consumers = (
+        qualifier._wait_for_scale_stimulus,
+        qualifier._wait_for_positive_request_telemetry,
+        qualifier._wait_for_scale,
+    )
+    for consumer in traffic_consumers:
+        assert typing.get_type_hints(
+            consumer)['traffic'] is qualifier.ExactRequestTrafficEvidence
+    assert typing.get_type_hints(
+        qualifier._wait_for_scale)['campaign_progress'] == (
+            qualifier.ExactRequestCampaignEvidence | None)
+
+
+def test_observer_failure_before_202_drains_offered_request_before_exit():
     offered: list[str] = []
     completed: list[str] = []
-    first_accepted = asyncio.Event()
+    post_received = asyncio.Event()
+    release_acceptance = asyncio.Event()
+    progress = qualifier.ExactRequestCampaignProgress(total_count=3,
+                                                      window_size=1)
 
     def receipt_headers(request_id, *, state, revision):
         return {
@@ -4682,7 +4700,8 @@ def test_observer_failure_drains_offered_request_before_campaign_exit():
         payload = await request.json()
         request_id = payload['request_id']
         offered.append(request_id)
-        first_accepted.set()
+        post_received.set()
+        await release_acceptance.wait()
         return aiohttp.web.json_response(
             {
                 'request_id': request_id,
@@ -4712,8 +4731,6 @@ def test_observer_failure_drains_offered_request_before_campaign_exit():
         await site.start()
         assert site._server is not None
         endpoint = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
-        progress = qualifier.ExactRequestCampaignProgress(total_count=3,
-                                                          window_size=1)
         traffic = asyncio.create_task(
             qualifier.send_exact_async_requests(endpoint=endpoint,
                                                 token='secret',
@@ -4729,11 +4746,17 @@ def test_observer_failure_drains_offered_request_before_campaign_exit():
                                                 campaign_progress=progress))
 
         async def fail_observer():
-            await first_accepted.wait()
+            await post_received.wait()
             raise qualifier.QualificationError('observer failed')
 
         async def sibling_observer():
-            await asyncio.Event().wait()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                # The proof coordinator must close only future offers before
+                # releasing an in-flight POST to receive its 202 obligation.
+                assert not (await progress.snapshot()).accepting_offers
+                release_acceptance.set()
 
         try:
             with pytest.raises(qualifier.QualificationError,
