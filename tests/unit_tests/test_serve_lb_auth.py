@@ -1937,7 +1937,14 @@ def test_drain_flush_uses_history_only_endpoint_and_acknowledges(monkeypatch):
         'prediction_time_history',
         'request_history_session_id',
         'lb_session_id',
+        'lb_slot',
+        'applied_role',
+        'applied_generation',
     }
+    assert captured['json']['lb_session_id'] == 'test-pod-uid'
+    assert captured['json']['lb_slot'] is None
+    assert captured['json']['applied_role'] == lb_ha.LbRole.ACTIVE.value
+    assert captured['json']['applied_generation'] == 0
     assert captured['json']['request_history']['buckets'] == [{
         'bucket_start': 120,
         'request_count': 1,

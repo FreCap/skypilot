@@ -3777,7 +3777,7 @@ artifacts:
   locators:
   - kind: file_digest
     path: sky/templates/kubernetes-ray.yml.j2
-    sha256: 0a0475194589c7f50501da7a5b267e8d59f28a669f9470aef46a3502c66b5392
+    sha256: f6d581517096d4074d0dd2e9d1a1aec1de48b813e5c48af4f7eefcdd67d9fa7d
   - kind: runtime_metadata
     path: sky/utils/kubernetes_template_source.py
     name: _BUILTIN_KUBERNETES_MONOLITH_SIZE
@@ -13311,7 +13311,7 @@ artifacts:
     call: _capacity_cache_exhausted_zone_names
   - kind: python_call_within
     path: sky/backends/cloud_vm_ray_backend.py
-    symbol: RetryingVmProvisioner._retry_zones
+    symbol: _clear_satisfied_capacity_cache_entries
     call: capacity_cache.clear
   - kind: python_call_within
     path: sky/backends/cloud_vm_ray_backend.py
@@ -13378,7 +13378,7 @@ artifacts:
     call: _quota_cooldown_key
   - kind: python_call_within
     path: sky/backends/cloud_vm_ray_backend.py
-    symbol: RetryingVmProvisioner._retry_zones
+    symbol: _clear_satisfied_capacity_cache_entries
     call: capacity_cache.clear_quota_cooldown
   - kind: python_call_within
     path: sky/backends/cloud_vm_ray_backend.py
@@ -13491,7 +13491,7 @@ artifacts:
   locators:
   - kind: python_call_within
     path: sky/backends/cloud_vm_ray_backend.py
-    symbol: CloudVmRayBackend.get_job_status
+    symbol: CloudVmRayBackend._run_job_status_command
     call: self.run_on_head
   replacement: SkyletCapabilitiesV1 GetJobStatus router
   dependencies: []
@@ -16983,7 +16983,7 @@ artifacts:
   locators:
   - kind: python_call_within
     path: sky/serve/replica_managers.py
-    symbol: SkyPilotReplicaManager._fetch_job_status
+    symbol: SkyPilotReplicaManager._fetch_exact_status
     call: backend.get_job_status
   replacement: ChildWorkloadObservationV1
   dependencies: []
@@ -17210,7 +17210,7 @@ artifacts:
   locators:
   - kind: python_call_within
     path: sky/serve/replica_managers.py
-    symbol: SkyPilotReplicaManager._terminate_replica
+    symbol: launch_cluster
     call: sdk.api_cancel
   replacement: M5 durable Serve action cancellation runtime
   dependencies: []
@@ -17257,7 +17257,7 @@ artifacts:
   locators:
   - kind: python_call_within
     path: sky/serve/replica_managers.py
-    symbol: SkyPilotReplicaManager._terminate_replica
+    symbol: launch_cluster
     call: sdk.api_cancel
   replacement: Dialect-capable durable Serve cancellation runtime or product deprecation
   dependencies: []
@@ -17304,7 +17304,7 @@ artifacts:
   locators:
   - kind: python_call_within
     path: sky/serve/replica_managers.py
-    symbol: SkyPilotReplicaManager._terminate_replica
+    symbol: launch_cluster
     call: sdk.api_cancel
   replacement: Dialect-capable durable Serve cancellation runtime or product deprecation
   dependencies: []

@@ -321,6 +321,38 @@ class TestExactLedgerPredispatch(unittest.TestCase):
             balancer._post_async_ledger.await_args.args[0]['request_id'],
             'execution-1')
 
+    def test_cancelled_predispatch_handoff_has_no_active_http_exception(self):
+
+        async def _run():
+            balancer = self._balancer()
+            original_error = fastapi.HTTPException(status_code=503,
+                                                   detail='no route')
+            balancer._proxy_with_retries_inner = mock.AsyncMock(
+                side_effect=original_error)
+            entered_handoff = asyncio.Event()
+            never_complete = asyncio.Event()
+            handed_off_errors = []
+
+            async def _predispatch_response(_request, error):
+                handed_off_errors.append(error)
+                entered_handoff.set()
+                await never_complete.wait()
+
+            balancer._predispatch_error_response = _predispatch_response
+            task = asyncio.create_task(
+                balancer._proxy_with_retries(_exact_ledger_request(
+                    self._body())))
+            await asyncio.wait_for(entered_handoff.wait(), timeout=1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError) as cancelled:
+                await task
+
+            self.assertEqual(handed_off_errors, [original_error])
+            self.assertIsNone(cancelled.exception.__context__)
+            self.assertEqual(balancer._queue_depth, 0)
+
+        asyncio.run(_run())
+
     def test_admitted_request_skips_redundant_read_before_atomic_bind(self):
         balancer = self._balancer()
         balancer._proxy_with_retries_inner = mock.AsyncMock(

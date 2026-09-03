@@ -322,8 +322,11 @@ class KueuePodAdmissionObserver(Protocol):
     by provider latency or later lock contention.
     """
 
+    # pylint: disable=unnecessary-ellipsis
+
     def begin_observation(self) -> datetime.datetime:
         """Sample the durable clock immediately before provider I/O."""
+        ...
 
     def __call__(self, observation: KueuePodAdmissionObservation,
                  provider_read_started_at: datetime.datetime) -> None:

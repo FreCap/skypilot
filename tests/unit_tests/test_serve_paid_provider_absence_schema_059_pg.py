@@ -31,6 +31,8 @@ _SERVICE_JOB_IO_MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.064_paid_service_job_io_reconciliation')
 _LATEST_MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.067_project_scoped_gcp_paid_admission')
+_LATEST_PROJECTION_MIGRATION = importlib.import_module(
+    'sky.schemas.db.serve_state.068_infrastructure_terminal_paid_cleanup')
 
 
 def _function_definition(engine: sqlalchemy.engine.Engine,
@@ -272,7 +274,7 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
         if item.name == _MIGRATION._PROJECTION_CONSTRAINT)
     assert _compact(str(constraint.sqltext)) == _compact(
-        _LATEST_MIGRATION._PROJECTION_CHECK)
+        _LATEST_PROJECTION_MIGRATION._PROJECTION_CHECK)
     paid_pool_constraint = next(
         item for item in
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
