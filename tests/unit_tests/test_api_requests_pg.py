@@ -5919,6 +5919,144 @@ def test_bound_reducer_blocks_on_protocol_before_authority_rows(
         request_postgres.OrdinaryLaunchReductionDisposition.PRE_EFFECT_TERMINAL)
 
 
+def test_paid_active_snapshot_does_not_wait_for_reserved_protocol_lock(
+        bound_request_database, monkeypatch):
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch,
+        effect_phase=ordinary_launch_binding.EffectPhase.NOT_STARTED,
+        terminalize=False)
+    protocol = pool_capacity_observation_schema.protocol_state_sequence_table
+
+    with graph.engine.connect() as holder:
+        transaction = holder.begin()
+        holder.execute(
+            sqlalchemy.select(protocol.c.id).where(
+                protocol.c.id == 1).with_for_update()).one()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(
+                request_postgres.read_bound_non_pool_active_snapshot,
+                graph.context, graph.authority)
+            reduction = future.result(timeout=5)
+        finally:
+            transaction.rollback()
+            executor.shutdown(wait=True)
+
+    assert reduction is not None
+    assert reduction.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.ADOPT_ACTIVE)
+    assert not reduction.projected
+
+
+@pytest.mark.parametrize('invalid_state', [
+    'missing_claim',
+    'mismatched_claim',
+    'extra_claim',
+    'missing_pool',
+    'replica_pool_mismatch',
+    'missing_retention_pin',
+    'terminal_request',
+    'expired_claim',
+    'cancelled_association',
+    'stale_cohort',
+])
+def test_paid_active_snapshot_fails_closed_for_invalid_graph(
+        bound_request_database, monkeypatch, invalid_state):
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch,
+        effect_phase=ordinary_launch_binding.EffectPhase.NOT_STARTED,
+        terminalize=False)
+    claims = serve_state_schema.paid_capacity_claims_table
+    pools = serve_state_schema.paid_capacity_pools_table
+    authority = graph.authority
+
+    if invalid_state == 'expired_claim':
+        queue = request_postgres.PostgresQueueBackend(
+            requests.ScheduleType.LONG.value,
+            supported_handler_names=frozenset(
+                {non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME}))
+        candidate = queue.peek_provider_mutation()
+        assert candidate is not None
+        item = queue.claim_provider_mutation(candidate)
+        assert item is not None
+        _expire_claim(graph.engine, graph.context.request_id)
+    elif invalid_state == 'stale_cohort':
+        authority = dataclasses.replace(
+            authority,
+            non_pool_capability_cohort_epoch=(
+                authority.non_pool_capability_cohort_epoch + 1))
+    else:
+        with graph.engine.begin() as connection:
+            logical_claim = sqlalchemy.and_(
+                claims.c.service_name == graph.context.service_name,
+                claims.c.replica_id == graph.context.replica_id)
+            if invalid_state == 'missing_claim':
+                connection.execute(
+                    sqlalchemy.delete(claims).where(logical_claim))
+            elif invalid_state == 'mismatched_claim':
+                connection.execute(
+                    sqlalchemy.update(claims).where(logical_claim).values(
+                        service_hash='stale-service-hash'))
+            elif invalid_state == 'extra_claim':
+                connection.execute(
+                    sqlalchemy.insert(claims).values(
+                        service_name=graph.context.service_name,
+                        service_hash='stale-service-hash',
+                        replica_id=graph.context.replica_id,
+                        pool_key=graph.pool_key,
+                        priority=1,
+                        claimed_at=time.time()))
+            elif invalid_state == 'missing_pool':
+                # The production foreign key cascades the associated claim.
+                connection.execute(
+                    sqlalchemy.delete(pools).where(
+                        pools.c.pool_key == graph.pool_key))
+            elif invalid_state == 'replica_pool_mismatch':
+                connection.execute(
+                    sqlalchemy.update(serve_state_schema.replicas_table).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        graph.context.service_name,
+                        serve_state_schema.replicas_table.c.replica_id ==
+                        graph.context.replica_id).values(
+                            paid_capacity_pool_key='stale-pool'))
+            elif invalid_state == 'missing_retention_pin':
+                connection.execute(
+                    sqlalchemy.delete(
+                        request_postgres.REQUEST_RETENTION_PINS).where(
+                            request_postgres.REQUEST_RETENTION_PINS.c.request_id
+                            == graph.context.request_id))
+            elif invalid_state == 'terminal_request':
+                connection.execute(
+                    sqlalchemy.delete(request_postgres.QUEUE).where(
+                        request_postgres.QUEUE.c.request_id ==
+                        graph.context.request_id))
+                now = sqlalchemy.func.clock_timestamp()
+                connection.execute(
+                    sqlalchemy.update(request_postgres.REQUESTS).where(
+                        request_postgres.REQUESTS.c.request_id ==
+                        graph.context.request_id).values(
+                            status=requests.RequestStatus.FAILED.value,
+                            terminal_cause=(event_api_models.EventCause.
+                                            HANDLER_FAILED.value),
+                            execution_generation=1,
+                            execution_quiescence_required=True,
+                            execution_quiesced_generation=1,
+                            execution_quiesced_at=now,
+                            error='test terminal failure',
+                            finished_at=now,
+                            updated_at=now))
+            elif invalid_state == 'cancelled_association':
+                ordinary_launch_binding.request_cancel_in_connection(
+                    connection, graph.context, 'test-cancel')
+            else:
+                raise AssertionError(f'Unknown invalid state: {invalid_state}')
+
+    assert request_postgres.read_bound_non_pool_active_snapshot(
+        graph.context, authority) is None
+
+
 def test_terminal_bound_pidless_claim_settles_immediately_before_provider_io(
         bound_request_database):
     engine, backend = bound_request_database

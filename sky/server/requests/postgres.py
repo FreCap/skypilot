@@ -3491,11 +3491,11 @@ def inspect_bound_ordinary_launch(
         projected=False)
 
 
-def read_bound_reserved_fill_active_snapshot(
+def read_bound_non_pool_active_snapshot(
     context: ordinary_launch_binding_lib.BoundLaunchContext,
     authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
 ) -> OrdinaryLaunchReduction | None:
-    """Return one active reserved-fill snapshot without row/advisory locks.
+    """Return one active non-pool snapshot without row/advisory locks.
 
     This read keeps an already-adopted active request out of the mutation
     reducer's global protocol/lifecycle lock prefix. It grants no provider,
@@ -3504,15 +3504,17 @@ def read_bound_reserved_fill_active_snapshot(
     enter the canonical locked reducer on its next poll.
 
     False negatives deliberately fall through to that reducer. Every immutable
-    identity, current controller/lifecycle tuple, replica projection, zero-paid
+    identity, current controller/lifecycle tuple, replica projection, funding
     invariant, request, pin, queue, and live-claim predicate needed for a
     positive result is checked in one PostgreSQL SELECT without FOR UPDATE or
-    an advisory lock.
+    an advisory lock. Only reserved-fill and ordinary-paid profiles have that
+    complete read-only contract; every other profile uses the locked reducer.
     """
     if (not isinstance(context,
                        ordinary_launch_binding.BoundNonPoolLaunchContext) or
-            context.profile.kind is not ordinary_launch_binding.
-            NonPoolLaunchProfileKind.RESERVED_FILL):
+            context.profile.kind not in
+        (ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+         ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)):
         return None
     try:
         context.profile.validate()
@@ -3529,7 +3531,10 @@ def read_bound_reserved_fill_active_snapshot(
             authority.non_pool_receipt_protocol_version
             != context.receipt_protocol_version):
         return None
-    engine = initialize_and_get_db()
+    try:
+        engine = initialize_and_get_db()
+    except Exception:  # pylint: disable=broad-except
+        return None
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
         return None
 
@@ -3538,7 +3543,11 @@ def read_bound_reserved_fill_active_snapshot(
     lifecycle = serve_state_schema.service_lifecycle_fences_table
     replica = serve_state_schema.replicas_table
     paid_claim = serve_state_schema.paid_capacity_claims_table
+    paid_pool = serve_state_schema.paid_capacity_pools_table
     profile = context.profile
+    reserved_fill = (
+        profile.kind
+        is ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
     active_statuses = tuple(
         status.value for status in requests_lib.RequestStatus.active_statuses())
     executable_statuses = tuple(
@@ -3566,6 +3575,58 @@ def read_bound_reserved_fill_active_snapshot(
             REQUESTS.c.pid.is_not(None)),
         REQUESTS.c.execution_quiescence_required,
     )
+    logical_replica_claim = sqlalchemy.and_(
+        paid_claim.c.service_name == association.c.service_name,
+        paid_claim.c.replica_id == association.c.replica_id)
+    funding_predicates: tuple[sqlalchemy.ColumnElement[bool], ...]
+    if reserved_fill:
+        any_paid_claim_exists = sqlalchemy.exists(
+            sqlalchemy.select(sqlalchemy.literal(True)).select_from(
+                paid_claim).where(logical_replica_claim).correlate(association))
+        funding_predicates = (
+            association.c.paid_capacity_pool_key.is_(None),
+            replica.c.paid_capacity_pool_key.is_(None),
+            service.c.owner_user_id == association.c.tenant_scope,
+            service.c.reserved_fill_actuation_mode ==
+            zero_cost_actuation.ActuationMode.DURABLE_INTENT.value,
+            service.c.reserved_fill_actuation_capable.is_(True),
+            service.c.reserved_fill_actuation_controller_incarnation ==
+            association.c.owner_controller_incarnation,
+            service.c.reserved_fill_actuation_protocol_version ==
+            zero_cost_actuation.PROTOCOL_VERSION,
+            ~any_paid_claim_exists,
+        )
+    else:
+        exact_paid_claim_exists = sqlalchemy.exists(
+            sqlalchemy.select(
+                sqlalchemy.literal(True)).select_from(paid_claim).where(
+                    logical_replica_claim,
+                    paid_claim.c.service_hash == association.c.service_hash,
+                    paid_claim.c.pool_key ==
+                    association.c.paid_capacity_pool_key,
+                ).correlate(association))
+        mismatched_paid_claim_exists = sqlalchemy.exists(
+            sqlalchemy.select(
+                sqlalchemy.literal(True)).select_from(paid_claim).where(
+                    logical_replica_claim,
+                    sqlalchemy.or_(
+                        paid_claim.c.service_hash != association.c.service_hash,
+                        paid_claim.c.pool_key
+                        != association.c.paid_capacity_pool_key,
+                    )).correlate(association))
+        paid_pool_exists = sqlalchemy.exists(
+            sqlalchemy.select(
+                sqlalchemy.literal(True)).select_from(paid_pool).where(
+                    paid_pool.c.pool_key == association.c.paid_capacity_pool_key
+                ).correlate(association))
+        funding_predicates = (
+            association.c.paid_capacity_pool_key.is_not(None),
+            replica.c.paid_capacity_pool_key ==
+            association.c.paid_capacity_pool_key,
+            exact_paid_claim_exists,
+            ~mismatched_paid_claim_exists,
+            paid_pool_exists,
+        )
     joined = association.join(
         service, service.c.name == association.c.service_name).join(
             lifecycle, lifecycle.c.name == association.c.service_name).join(
@@ -3633,7 +3694,8 @@ def read_bound_reserved_fill_active_snapshot(
             '_request_quiescence_required'),
         QUEUE.c.delivery_state.label('_queue_delivery_state'),
         QUEUE.c.claim_generation.label('_queue_claim_generation'),
-    ).select_from(joined).where(
+    ).select_from(joined)
+    statement = statement.where(
         association.c.association_id == context.association_id,
         association.c.request_id == context.request_id,
         association.c.service_name == context.service_name,
@@ -3649,7 +3711,6 @@ def read_bound_reserved_fill_active_snapshot(
         ordinary_launch_binding.ReconciliationOutcome.ACTIVE_ADOPT.value,
         association.c.provider_evidence ==
         ordinary_launch_binding.ProviderEvidence.NOT_QUERIED.value,
-        association.c.paid_capacity_pool_key.is_(None),
         association.c.binding_protocol_version ==
         ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION,
         association.c.profile_kind == context.profile.kind.value,
@@ -3667,15 +3728,6 @@ def read_bound_reserved_fill_active_snapshot(
         association.c.authorization_generation ==
         profile.authorization_generation,
         association.c.authorization_digest == profile.authorization_digest,
-        replica.c.paid_capacity_pool_key.is_(None),
-        service.c.owner_user_id == association.c.tenant_scope,
-        service.c.reserved_fill_actuation_mode ==
-        zero_cost_actuation.ActuationMode.DURABLE_INTENT.value,
-        service.c.reserved_fill_actuation_capable.is_(True),
-        service.c.reserved_fill_actuation_controller_incarnation ==
-        association.c.owner_controller_incarnation,
-        service.c.reserved_fill_actuation_protocol_version ==
-        zero_cost_actuation.PROTOCOL_VERSION,
         REQUESTS.c.handler_name ==
         non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME,
         REQUESTS.c.user_id == association.c.tenant_scope,
@@ -3699,15 +3751,31 @@ def read_bound_reserved_fill_active_snapshot(
         REQUESTS.c.execution_quiesced_generation.is_(None),
         REQUESTS.c.execution_quiesced_at.is_(None),
         sqlalchemy.or_(queued, claimed),
-        ~sqlalchemy.exists(
-            sqlalchemy.select(paid_claim.c.replica_id).where(
-                paid_claim.c.service_name == association.c.service_name,
-                paid_claim.c.replica_id == association.c.replica_id)),
+        *funding_predicates,
     ).limit(1)
-    with engine.connect() as connection:
-        row = connection.execute(statement).mappings().one_or_none()
-    if row is None or not _controller_authority_matches_reduction(
-            row, authority):
+    try:
+        with engine.connect() as connection:
+            row = connection.execute(statement).mappings().one_or_none()
+    except Exception:  # pylint: disable=broad-except
+        return None
+    try:
+        authority_matches = (row is not None and
+                             _controller_authority_matches_reduction(
+                                 row, authority))
+    except Exception:  # pylint: disable=broad-except
+        return None
+    if not authority_matches:
+        return None
+    assert row is not None
+    association_paid_pool_key = row['paid_capacity_pool_key']
+    replica_paid_pool_key = row['_replica_paid_pool_key']
+    if reserved_fill:
+        if (association_paid_pool_key is not None or
+                replica_paid_pool_key is not None):
+            return None
+    elif (not isinstance(association_paid_pool_key, str) or
+          not association_paid_pool_key or
+          replica_paid_pool_key != association_paid_pool_key):
         return None
 
     lifecycle_snapshot = {'epoch': row['_fence_epoch']}
@@ -3790,8 +3858,11 @@ def read_bound_reserved_fill_active_snapshot(
         return_value=None,
         error=None,
         error_decode_failed=False)
-    return _reduction_result(OrdinaryLaunchReductionDisposition.ADOPT_ACTIVE,
-                             facts, row)
+    try:
+        return _reduction_result(
+            OrdinaryLaunchReductionDisposition.ADOPT_ACTIVE, facts, row)
+    except Exception:  # pylint: disable=broad-except
+        return None
 
 
 def lookup_bound_ordinary_launch_cancel_target(

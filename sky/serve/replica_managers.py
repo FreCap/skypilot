@@ -5307,9 +5307,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             # locked reducer below.
             launch_context = _context()
             try:
-                active = (
-                    request_postgres.read_bound_reserved_fill_active_snapshot(
-                        launch_context, authority))
+                active = request_postgres.read_bound_non_pool_active_snapshot(
+                    launch_context, authority)
             except Exception:  # pylint: disable=broad-except
                 active = None
             if active is not None:
