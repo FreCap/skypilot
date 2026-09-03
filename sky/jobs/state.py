@@ -319,12 +319,14 @@ set_batch_failed = batch_state.set_batch_failed
 # Keep the historical task-filtered lookup facade as direct aliases.
 TaskLogStreamLookup = state_task_lookups.TaskLogStreamLookup
 TaskWaitStatusLookup = state_task_lookups.TaskWaitStatusLookup
+LatestLogStreamLookup = state_task_lookups.LatestLogStreamLookup
 get_task_wait_status_lookup = (state_task_lookups.get_task_wait_status_lookup)
 get_task_wait_status_lookup_by_name = (
     state_task_lookups.get_task_wait_status_lookup_by_name)
 get_task_log_stream_lookup = state_task_lookups.get_task_log_stream_lookup
 get_task_log_stream_lookup_by_name = (
     state_task_lookups.get_task_log_stream_lookup_by_name)
+get_latest_log_stream_lookup = state_task_lookups.get_latest_log_stream_lookup
 
 # Keep the historical log-cleanup metadata facade as direct aliases.
 get_task_logs_to_clean = state_log_cleanup.get_task_logs_to_clean
@@ -1999,41 +2001,7 @@ def get_task_log_stream_snapshot(job_id: int,
 @db_retries.retry
 def get_latest_log_stream_snapshot(job_id: int) -> JobLogStreamSnapshot:
     """Return one latest-task status and routing snapshot for log following."""
-    terminal_status_values = [
-        status.value for status in ManagedJobStatus.terminal_statuses()
-    ]
-    latest_task = _latest_task_status_query([job_id],
-                                            terminal_status_values).subquery()
-    query = sqlalchemy.select(
-        latest_task.c.task_id,
-        latest_task.c.status,
-        job_info_table.c.pool,
-        job_info_table.c.current_cluster_name,
-        job_info_table.c.job_id_on_pool_cluster,
-        spot_table.c.task_name,
-    ).select_from(
-        latest_task.join(
-            spot_table,
-            sqlalchemy.and_(
-                spot_table.c.spot_job_id == latest_task.c.spot_job_id,
-                spot_table.c.task_id == latest_task.c.task_id,
-            )).outerjoin(
-                job_info_table,
-                job_info_table.c.spot_job_id == latest_task.c.spot_job_id))
-
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.execute(query).fetchone()
-    if row is None:
-        return JobLogStreamSnapshot(None, None, None, None, None, None)
-    return JobLogStreamSnapshot(
-        row.task_id,
-        ManagedJobStatus(row.status),
-        row.pool,
-        row.current_cluster_name,
-        row.job_id_on_pool_cluster,
-        row.task_name,
-    )
+    return get_latest_log_stream_lookup(job_id).snapshot
 
 
 @db_retries.retry

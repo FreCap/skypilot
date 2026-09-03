@@ -455,13 +455,15 @@ def stream_logs_by_id(job_id: int,
                                              job_id=job_id)
     status_display = rich_utils.safe_status(msg)
     num_tasks: int | None = None
+    prefetched_snapshot: managed_job_state.JobLogStreamSnapshot | None = None
     if task is None:
-        num_tasks = managed_job_state.get_num_tasks(job_id)
+        latest_lookup = managed_job_state.get_latest_log_stream_lookup(job_id)
+        num_tasks = latest_lookup.num_tasks
+        prefetched_snapshot = latest_lookup.snapshot
 
     # Resolve task filter to a specific task_id if provided
     # This is used for running jobs to stream logs from the correct task
     filtered_task_id: int | None = None
-    prefetched_snapshot: managed_job_state.JobLogStreamSnapshot | None = None
     prefetched_lookup: managed_job_state.TaskLogStreamLookup | None = None
     if task is not None:
         if isinstance(task, int):
