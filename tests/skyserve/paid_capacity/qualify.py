@@ -164,6 +164,28 @@ def scale_stimulus_count(profile: Profile) -> int:
     return min(profile.max_units, profile.exact_requests)
 
 
+def _scale_arrivals_are_attributable(
+    *,
+    unique_job_arrivals_60s: object,
+    unique_job_arrivals_300s: object,
+    headerless_arrivals_60s: object,
+    headerless_arrivals_300s: object,
+    offered_arrival_tracking_saturated: object,
+    expected_arrivals: int,
+    require_stimulus_commit: bool,
+) -> bool:
+    """Validate offered arrivals at stimulus commit or while observing scale."""
+    if (type(unique_job_arrivals_60s) is not int or
+            type(unique_job_arrivals_300s) is not int):
+        return False
+    return (0 <= unique_job_arrivals_60s <= unique_job_arrivals_300s <=
+            expected_arrivals and
+            (not require_stimulus_commit or
+             unique_job_arrivals_300s == expected_arrivals) and
+            headerless_arrivals_60s == 0 and headerless_arrivals_300s == 0 and
+            offered_arrival_tracking_saturated is False)
+
+
 def positive_telemetry_window_seconds(profile: Profile) -> float:
     """Return the profile-specific first-dispatch observation window."""
     if profile.name != 'scale':
@@ -4776,6 +4798,7 @@ async def _wait_for_scale(
     else:
         deadline = time.monotonic() + profile.scale_timeout_seconds
     scale_iteration_id = 0
+    stimulus_arrivals_committed = False
     while time.monotonic() < deadline:
         if traffic.done():
             try:
@@ -4826,13 +4849,22 @@ async def _wait_for_scale(
         if profile.name == 'scale':
             arrivals = observation.load_balancer
             expected_arrivals = scale_stimulus_count(profile)
-            if (arrivals.unique_job_arrivals_300s != expected_arrivals or not 0
-                    <= arrivals.unique_job_arrivals_60s <= expected_arrivals or
-                    arrivals.headerless_arrivals_60s != 0 or
-                    arrivals.headerless_arrivals_300s != 0 or
-                    arrivals.offered_arrival_tracking_saturated):
+            if not _scale_arrivals_are_attributable(
+                    unique_job_arrivals_60s=(arrivals.unique_job_arrivals_60s),
+                    unique_job_arrivals_300s=(
+                        arrivals.unique_job_arrivals_300s),
+                    headerless_arrivals_60s=arrivals.headerless_arrivals_60s,
+                    headerless_arrivals_300s=arrivals.headerless_arrivals_300s,
+                    offered_arrival_tracking_saturated=(
+                        arrivals.offered_arrival_tracking_saturated),
+                    expected_arrivals=expected_arrivals,
+                    require_stimulus_commit=(not stimulus_arrivals_committed)):
                 raise QualificationError(
                     'Scale stimulus contains unattributed offered arrivals.')
+            # The first complete provider sample commits the exact bounded
+            # stimulus.  Later counters are rolling observations and may age
+            # to zero while the paired request ledger remains resident.
+            stimulus_arrivals_committed = True
         if progress.scale_reached_monotonic is not None:
             if progress.scale_qualified_iteration_id is not None:
                 raise QualificationError(
@@ -5662,6 +5694,7 @@ def _validate_provider_scale_samples(
     calculated_gpu_peak = 0
     calculated_by_cloud = {'aws': 0, 'gcp': 0}
     calculated_gpu_by_cloud = {'aws': 0, 'gcp': 0}
+    stimulus_arrivals_committed = False
     for sample in samples:
         if not isinstance(sample, dict):
             raise QualificationError(
@@ -5739,16 +5772,22 @@ def _validate_provider_scale_samples(
                 'Provider scale sample has no same-observation demand.')
         if profile.name == 'scale':
             expected_arrivals = scale_stimulus_count(profile)
-            arrivals_60s = sample.get('lb_unique_job_arrivals_60s')
-            if (sample.get('lb_unique_job_arrivals_300s') != expected_arrivals
-                    or type(arrivals_60s) is not int or
-                    not 0 <= arrivals_60s <= expected_arrivals or
-                    sample.get('lb_headerless_arrivals_60s') != 0 or
-                    sample.get('lb_headerless_arrivals_300s') != 0 or
-                    sample.get('lb_offered_arrival_tracking_saturated')
-                    is not False):
+            if not _scale_arrivals_are_attributable(
+                    unique_job_arrivals_60s=sample.get(
+                        'lb_unique_job_arrivals_60s'),
+                    unique_job_arrivals_300s=sample.get(
+                        'lb_unique_job_arrivals_300s'),
+                    headerless_arrivals_60s=sample.get(
+                        'lb_headerless_arrivals_60s'),
+                    headerless_arrivals_300s=sample.get(
+                        'lb_headerless_arrivals_300s'),
+                    offered_arrival_tracking_saturated=sample.get(
+                        'lb_offered_arrival_tracking_saturated'),
+                    expected_arrivals=expected_arrivals,
+                    require_stimulus_commit=(not stimulus_arrivals_committed)):
                 raise QualificationError(
                     'Provider scale sample has unattributed offered arrivals.')
+            stimulus_arrivals_committed = True
         assert iteration_id is not None
         if (iteration_id in provider_scale_iterations or
                 observed_at < request_scale_times[iteration_id]):
