@@ -58,6 +58,7 @@ from sky.server.requests import requests
 from sky.server.requests import storage
 from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
+from sky.utils import thread_utils
 from sky.utils.db import migration_utils
 
 pytestmark = pytest.mark.component
@@ -86,7 +87,6 @@ class _Graph:
     context: ordinary_launch_binding.BoundNonPoolLaunchContext
     allocation: paid_capacity.PaidProviderAllocationReceipt
     provider_identity: dict[str, Any]
-    pool_key: str
 
 
 class _ProviderClock:
@@ -549,7 +549,7 @@ workspaces:
         created_instance_ids=('i-shutdown-component',),
         resumed_instance_ids=(),
         use_spot=True)
-    return _Graph(engine, backend, context, allocation, identity, pool_key)
+    return _Graph(engine, backend, context, allocation, identity)
 
 
 def _wait_for_status(engine: sqlalchemy.engine.Engine, status: str) -> None:
@@ -594,6 +594,53 @@ def _count(connection: sqlalchemy.engine.Connection, table: sqlalchemy.Table,
     return connection.execute(
         sqlalchemy.select(sqlalchemy.func.count()).select_from(table).where(
             *predicates)).scalar_one()
+
+
+def _graph_counts(graph: _Graph) -> dict[str, int]:
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    scopes = (
+        ('service', serve_state_schema.services_table,
+         serve_state_schema.services_table.c.name, _SERVICE_NAME),
+        ('replica', serve_state_schema.replicas_table,
+         serve_state_schema.replicas_table.c.service_name, _SERVICE_NAME),
+        ('claim', serve_state_schema.paid_capacity_claims_table,
+         serve_state_schema.paid_capacity_claims_table.c.service_name,
+         _SERVICE_NAME),
+        ('association', associations, associations.c.association_id,
+         graph.context.association_id),
+        ('request', request_postgres.REQUESTS,
+         request_postgres.REQUESTS.c.request_id, graph.context.request_id),
+        ('pin', request_postgres.REQUEST_RETENTION_PINS,
+         request_postgres.REQUEST_RETENTION_PINS.c.request_id,
+         graph.context.request_id),
+        ('queue', request_postgres.QUEUE, request_postgres.QUEUE.c.request_id,
+         graph.context.request_id),
+        ('recovery', serve_state_schema.serve_ha_recovery_script_table,
+         serve_state_schema.serve_ha_recovery_script_table.c.service_name,
+         _SERVICE_NAME),
+    )
+    with graph.engine.connect() as connection:
+        return {
+            name: _count(connection, table, column == value)
+            for name, table, column, value in scopes
+        }
+
+
+def _expected_graph_counts(*present: str) -> dict[str, int]:
+    names = ('service', 'replica', 'claim', 'association', 'request', 'pin',
+             'queue', 'recovery')
+    assert set(present) <= set(names)
+    return {name: int(name in present) for name in names}
+
+
+def _association(graph: _Graph) -> dict[str, Any]:
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with graph.engine.connect() as connection:
+        return dict(
+            connection.execute(
+                sqlalchemy.select(associations).where(
+                    associations.c.association_id ==
+                    graph.context.association_id)).mappings().one())
 
 
 def test_late_paid_create_shutdown_recovers_to_exact_zero(
@@ -647,7 +694,6 @@ def test_late_paid_create_shutdown_recovers_to_exact_zero(
                                    item.claim_token, item.worker_instance_id)
     launch_context = graph.backend.get_request(
         graph.context.request_id).request_body.extra_launch_context
-    provider_errors: list[BaseException] = []
 
     def _provider_worker() -> None:
         try:
@@ -665,18 +711,17 @@ def test_late_paid_create_shutdown_recovers_to_exact_zero(
                         launch_context,
                         graph.allocation,
                         request_validator=lambda *_args: True)
-        except BaseException as error:  # pylint: disable=broad-except
-            provider_errors.append(error)
         finally:
-            graph.backend.converge_execution_completion(claim)
+            assert graph.backend.converge_execution_completion(claim)
 
-    provider_thread = threading.Thread(target=_provider_worker)
+    provider_thread = thread_utils.SafeThread(target=_provider_worker)
     provider_thread.start()
     assert provider.create_entered.wait(timeout=10)
     spec = _service_spec()
-    cleanup_thread = threading.Thread(target=service._run_cleanup_and_finalize,
-                                      args=(_SERVICE_NAME, spec, '/unused', 987,
-                                            _SERVICE_HASH, *_ORIGINAL_OWNER))
+    cleanup_thread = thread_utils.SafeThread(
+        target=service._run_cleanup_and_finalize,
+        args=(_SERVICE_NAME, spec, '/unused', 987, _SERVICE_HASH,
+              *_ORIGINAL_OWNER))
     cleanup_thread.start()
     _wait_for_status(graph.engine, 'SHUTTING_DOWN')
     provider.allow_create_return.set()
@@ -684,17 +729,38 @@ def test_late_paid_create_shutdown_recovers_to_exact_zero(
     cleanup_thread.join(timeout=10)
     assert not provider_thread.is_alive()
     assert not cleanup_thread.is_alive()
-    assert not provider_errors
+    assert provider_thread.exception is None
+    assert cleanup_thread.exception is None
 
     # The first controller accepted exactly one provider delete, but its
     # deadline expired before visibility changed.  Recovery authority and the
     # complete graph must remain durable.
     assert provider.create_calls == provider.down_calls == 1
+    census_after_timeout = provider.census_calls
+    assert census_after_timeout > 0
     assert serve_state.get_ha_recovery_script(
         _SERVICE_NAME) == 'recover shutdown'
     first = serve_state.get_service_from_name(_SERVICE_NAME)
     assert first is not None
     assert first['status'] is serve_state.ServiceStatus.FAILED_CLEANUP
+    assert _graph_counts(graph) == _expected_graph_counts(
+        'service', 'replica', 'claim', 'association', 'request', 'pin',
+        'recovery')
+    terminal_request = graph.backend.get_request(graph.context.request_id)
+    assert terminal_request is not None
+    assert terminal_request.status is requests.RequestStatus.CANCELLED
+    assert terminal_request.execution_quiescence_required
+    assert (terminal_request.execution_quiesced_generation ==
+            terminal_request.execution_generation)
+    assert terminal_request.execution_quiesced_at is not None
+    retained_association = _association(graph)
+    assert retained_association['resolution'] == 'AMBIGUOUS'
+    assert retained_association['provider_evidence'] == 'PRESENT'
+    retained_replica = serve_state.get_replica_info_from_id(
+        _SERVICE_NAME, _REPLICA_ID)
+    assert retained_replica is not None
+    assert ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+        retained_replica)
 
     # Provider visibility converges while the first controller is gone.  The
     # production recovery owner-transfer and finalizer consume the same graph;
@@ -702,8 +768,17 @@ def test_late_paid_create_shutdown_recovers_to_exact_zero(
     provider.make_absent()
     _run_recovery_retry(spec)
     assert provider.create_calls == provider.down_calls == 1
+    assert provider.census_calls > census_after_timeout
     assert lb_deletes == [_SERVICE_NAME, _SERVICE_NAME]
     generic_terminate.assert_not_called()
+    assert serve_state.get_ha_recovery_script(_SERVICE_NAME) is None
+    assert _graph_counts(graph) == _expected_graph_counts(
+        'association', 'request')
+    settled_association = _association(graph)
+    assert settled_association['resolution'] == 'PROJECTED'
+    assert settled_association['provider_evidence'] == 'ABSENT'
+    assert settled_association['pin_released_at'] is not None
+    assert settled_association['tombstone_not_before'] is not None
 
     # Run the real request-retention and request-owned tombstone GC paths.  The
     # 60-day timestamp change represents elapsed test time only; it does not
@@ -726,29 +801,4 @@ def test_late_paid_create_shutdown_recovers_to_exact_zero(
                                          datetime.timedelta(seconds=1))))
     assert asyncio.run(graph.backend.gc_request_owned_tombstones()) == 1
 
-    with graph.engine.connect() as connection:
-        exact_zero = {
-            'service': _count(
-                connection, serve_state_schema.services_table,
-                serve_state_schema.services_table.c.name == _SERVICE_NAME),
-            'replica': _count(
-                connection, serve_state_schema.replicas_table,
-                serve_state_schema.replicas_table.c.service_name ==
-                _SERVICE_NAME),
-            'claim': _count(
-                connection, serve_state_schema.paid_capacity_claims_table,
-                serve_state_schema.paid_capacity_claims_table.c.service_name ==
-                _SERVICE_NAME),
-            'association': _count(
-                connection, associations,
-                associations.c.association_id == graph.context.association_id),
-            'request': _count(
-                connection, request_postgres.REQUESTS,
-                request_postgres.REQUESTS.c.request_id ==
-                graph.context.request_id),
-            'pin': _count(
-                connection, request_postgres.REQUEST_RETENTION_PINS,
-                request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
-                graph.context.request_id),
-        }
-    assert exact_zero == {name: 0 for name in exact_zero}
+    assert _graph_counts(graph) == _expected_graph_counts()
