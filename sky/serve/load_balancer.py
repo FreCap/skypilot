@@ -4403,7 +4403,10 @@ class SkyServeLoadBalancer:
                 # cancelled send restores this batch ahead of newer arrivals.
                 request_batch = self._request_aggregator.drain()
                 request_history = (
-                    self._request_aggregator.request_history_snapshot())
+                    self._request_aggregator.request_history_snapshot(
+                        include_idle_coverage=(
+                            not self._draining and
+                            self._lb_role is lb_ha.LbRole.ACTIVE)))
                 request_classification_history = (
                     self._request_aggregator.
                     request_classification_history_snapshot())
@@ -5060,7 +5063,9 @@ class SkyServeLoadBalancer:
     ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any],
                dict[str, Any] | None]:
         """Build one complete non-destructive central demand snapshot."""
-        request_history = self._request_aggregator.request_history_snapshot()
+        request_history = self._request_aggregator.request_history_snapshot(
+            include_idle_coverage=(
+                not self._draining and self._lb_role is lb_ha.LbRole.ACTIVE))
         classification = (
             self._request_aggregator.request_classification_history_snapshot())
         prediction = (
@@ -5460,10 +5465,13 @@ class SkyServeLoadBalancer:
                                 'generation.')
                         previous_role = self._lb_role
                         previous_generation = self._lb_role_generation
-                        requires_fresh_occupancy = (
-                            role in (lb_ha.LbRole.ARMED, lb_ha.LbRole.ACTIVE)
-                            and (role is not previous_role or
-                                 generation != previous_generation))
+                        role_authority_changed = (
+                            role is not previous_role or
+                            generation != previous_generation)
+                        requires_fresh_occupancy = (role
+                                                    in (lb_ha.LbRole.ARMED,
+                                                        lb_ha.LbRole.ACTIVE) and
+                                                    role_authority_changed)
                         rollout_evidence = body.get('ha_rollout')
                         with self._client_pool_lock:
                             self._lb_role = role
@@ -5471,6 +5479,13 @@ class SkyServeLoadBalancer:
                             self._lb_ha_rollout_evidence = (
                                 rollout_evidence if isinstance(
                                     rollout_evidence, dict) else None)
+                            if role_authority_changed:
+                                # Even a sub-report-interval role change makes
+                                # the crossing minute unknowable.  Reset at the
+                                # authority transition itself; the next ACTIVE
+                                # demand report starts a fresh exact interval.
+                                (self._request_aggregator.
+                                 reset_request_history_coverage())
                             if role is lb_ha.LbRole.ARMED:
                                 self._armed_generation = generation
                             else:
@@ -5533,7 +5548,10 @@ class SkyServeLoadBalancer:
 
     async def _flush_request_history_on_drain(self) -> None:
         """Best-effort bounded history flush that cannot report demand."""
-        request_history = self._request_aggregator.request_history_snapshot()
+        # Draining is not a traffic-authoritative interval.  Flush changed
+        # counters, but never manufacture an idle-minute coverage marker.
+        request_history = self._request_aggregator.request_history_snapshot(
+            include_idle_coverage=False)
         request_classification_history = (
             self._request_aggregator.request_classification_history_snapshot())
         prediction_time_history = (

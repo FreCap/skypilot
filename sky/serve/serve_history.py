@@ -1020,7 +1020,13 @@ def _request_history_rows(
     request_history: dict[str, Any],
     observed_at: datetime.datetime,
 ) -> list[dict[str, Any]]:
-    """Validate one LB report and convert it to minute-bucket DB rows."""
+    """Validate one LB report and convert it to minute-bucket DB rows.
+
+    A zero row is reserved for an explicit complete-coverage heartbeat.  Its
+    presence in the existing activity table, with rejection coverage set, is
+    the durable observed-zero marker.  Sparse missing minutes therefore remain
+    distinguishable without another table or migration.
+    """
     if not isinstance(request_history, dict):
         raise ValueError('request_history must be an object.')
     if request_history.get('bucket_seconds') != BUCKET_SECONDS:
@@ -1049,6 +1055,7 @@ def _request_history_rows(
         request_count = bucket.get('request_count')
         rejection_count_available = 'rejected_count' in bucket
         rejected_count = bucket.get('rejected_count', 0)
+        coverage_complete = bucket.get('coverage_complete', False)
         if (not isinstance(bucket_start, int) or
                 isinstance(bucket_start, bool) or
                 bucket_start % BUCKET_SECONDS != 0):
@@ -1065,9 +1072,16 @@ def _request_history_rows(
                 isinstance(rejected_count, bool) or rejected_count < 0):
             raise ValueError('request_history rejected_count must be a '
                              'nonnegative integer.')
-        if request_count == 0 and rejected_count == 0:
+        if not isinstance(coverage_complete, bool):
+            raise ValueError('request_history coverage_complete must be a '
+                             'boolean.')
+        if coverage_complete and not rejection_count_available:
+            raise ValueError('request_history complete coverage must include '
+                             'rejected_count.')
+        if (request_count == 0 and rejected_count == 0 and
+                not coverage_complete):
             raise ValueError('request_history bucket must contain a request '
-                             'or rejection count.')
+                             'or rejection count, or prove complete coverage.')
         bucket_datetime = _utc_datetime(bucket_start)
         if not oldest_bucket <= bucket_datetime <= newest_bucket:
             raise ValueError('request_history bucket_start is outside the '
@@ -1245,7 +1259,11 @@ def _request_classification_rows(
             'observed_at': observed_at,
             'request_count': 0,
             'rejected_count': 0,
-            'rejection_count_available': True,
+            # Terminal classification is independently acknowledged and does
+            # not prove that this reporter's sparse rejection counter covered
+            # the minute.  A paired request-history row (including an explicit
+            # zero heartbeat) promotes this through the monotonic OR upsert.
+            'rejection_count_available': False,
             'classified_request_count': classified_request_count,
             'counted_rejected_count': counted_rejected_count,
         })
@@ -1290,8 +1308,11 @@ def record_request_classification(
             # snapshot without promoting false support evidence.
             support_rows = []
         for support_row in support_rows:
-            support_row['request_count'] = 0
-            support_row['rejected_count'] = 0
+            # The current classification protocol is persisted before the
+            # independently acknowledged arrival writer.  Retain the exact
+            # counters here so that writer failure cannot expose its support
+            # row as a fabricated idle minute.  The later cumulative upsert is
+            # idempotent for the same reporter and bucket.
             support_row['rejection_count_available'] = True
             support_row['classified_request_count'] = 0
             support_row['counted_rejected_count'] = 0
@@ -2119,6 +2140,12 @@ def get_status_history(
                     request_history.c.service_hash == service_hash,
                     request_history.c.bucket_start >= window_start,
                     request_history.c.bucket_start <= observed_at,
+                    # Classification-only rows share this table but prove
+                    # neither arrival nor rejection coverage.  Keep them out
+                    # of the request series until an actual counter or an
+                    # explicit complete-coverage heartbeat promotes the row.
+                    sqlalchemy.or_(request_history.c.request_count > 0,
+                                   request_history.c.rejection_count_available),
                 ).group_by(request_history.c.bucket_start).order_by(
                     request_history.c.bucket_start)).all()
         if 'prediction' in requested_sections:

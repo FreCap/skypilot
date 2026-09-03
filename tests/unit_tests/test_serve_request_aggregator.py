@@ -21,6 +21,25 @@ def test_request_timestamp_public_identity_and_pickle_round_trip():
     assert repr(aggregator) == 'RequestTimestamp(timestamps=[1.0, 2.0])'
 
 
+def test_previous_version_pickle_starts_coverage_fail_closed(monkeypatch):
+    now = [240.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    aggregator = serve_utils.RequestTimestamp()
+    del aggregator._request_history_coverage_started_at
+    del aggregator._acknowledged_request_history_coverage
+    restored = pickle.loads(pickle.dumps(aggregator))
+
+    assert restored.request_history_snapshot(include_idle_coverage=True) is None
+    now[0] = 300.0
+    assert restored.request_history_snapshot(
+        include_idle_coverage=True)['buckets'] == [{
+            'bucket_start': 240,
+            'request_count': 0,
+            'rejected_count': 0,
+            'coverage_complete': True,
+        }]
+
+
 def test_request_timestamp_accounts_and_acknowledges_one_bucket(monkeypatch):
     monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
     aggregator = serve_utils.RequestTimestamp()
@@ -47,6 +66,96 @@ def test_request_timestamp_accounts_and_acknowledges_one_bucket(monkeypatch):
     aggregator.mark_prediction_time_history_accepted(prediction_history)
     assert aggregator.request_history_snapshot() is None
     assert aggregator.prediction_time_history_snapshot() is None
+
+
+def test_idle_request_history_coverage_waits_for_one_full_minute(monkeypatch):
+    now = [125.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    aggregator = serve_utils.RequestTimestamp()
+
+    # The partial minute in which this reporter starts is unknowable.  The
+    # first exact zero is emitted only after the reporter observes all of the
+    # following minute while it owns traffic.
+    assert aggregator.request_history_snapshot(
+        include_idle_coverage=True) is None
+    now[0] = 239.0
+    assert aggregator.request_history_snapshot(
+        include_idle_coverage=True) is None
+    now[0] = 240.0
+    snapshot = aggregator.request_history_snapshot(include_idle_coverage=True)
+    assert snapshot == {
+        'bucket_seconds': 60,
+        'buckets': [{
+            'bucket_start': 180,
+            'request_count': 0,
+            'rejected_count': 0,
+            'coverage_complete': True,
+        }],
+    }
+
+    aggregator.mark_request_history_accepted(snapshot)
+    assert aggregator.request_history_snapshot(
+        include_idle_coverage=True) is None
+
+
+def test_completed_nonzero_minute_is_republished_with_coverage(monkeypatch):
+    now = [120.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    aggregator = serve_utils.RequestTimestamp()
+
+    assert aggregator.request_history_snapshot(
+        include_idle_coverage=True) is None
+    aggregator.add(None)
+    partial = aggregator.request_history_snapshot(include_idle_coverage=True)
+    assert partial['buckets'] == [{
+        'bucket_start': 120,
+        'request_count': 1,
+        'rejected_count': 0,
+    }]
+    aggregator.mark_request_history_accepted(partial)
+
+    # Closing the minute advances its coverage proof even though the cumulative
+    # request counter itself has already been acknowledged.
+    now[0] = 180.0
+    complete = aggregator.request_history_snapshot(include_idle_coverage=True)
+    assert complete['buckets'] == [{
+        'bucket_start': 120,
+        'request_count': 1,
+        'rejected_count': 0,
+        'coverage_complete': True,
+    }]
+    aggregator.mark_request_history_accepted(complete)
+    assert aggregator.request_history_snapshot(
+        include_idle_coverage=True) is None
+
+
+def test_idle_request_history_coverage_resets_around_inactive_role(monkeypatch):
+    now = [120.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    aggregator = serve_utils.RequestTimestamp()
+
+    assert aggregator.request_history_snapshot(
+        include_idle_coverage=True) is None
+    now[0] = 170.0
+    assert aggregator.request_history_snapshot(
+        include_idle_coverage=False) is None
+    now[0] = 190.0
+    assert aggregator.request_history_snapshot(
+        include_idle_coverage=True) is None
+
+    # Neither the old authority's partial 120 bucket nor the transition's 180
+    # bucket is reported as zero.  A complete post-transition bucket is.
+    now[0] = 299.0
+    assert aggregator.request_history_snapshot(
+        include_idle_coverage=True) is None
+    now[0] = 300.0
+    assert aggregator.request_history_snapshot(
+        include_idle_coverage=True)['buckets'] == [{
+            'bucket_start': 240,
+            'request_count': 0,
+            'rejected_count': 0,
+            'coverage_complete': True,
+        }]
 
 
 def test_request_classification_snapshot_always_advertises_v1(monkeypatch):

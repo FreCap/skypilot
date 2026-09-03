@@ -65,8 +65,8 @@ export function buildDemandPressureView(history, range) {
     const requestSample = requestSamples.get(timestamp);
     inFlight.push(autoscalerSample?.peakInFlight ?? null);
     queued.push(autoscalerSample?.peakQueueDepth ?? null);
-    // Sparse history has no per-minute coverage heartbeat. A missing row is
-    // therefore unknown, not proof that the load balancer rejected nothing.
+    // Missing rows remain unknown. New active load balancers publish explicit
+    // zero rows only after observing a complete minute.
     rejected.push(
       rejectionSupported ? (requestSample?.rejectedCount ?? null) : null
     );

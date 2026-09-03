@@ -4,7 +4,14 @@ jest.mock('@/components/serve-history-range', () => {
     SelectableHistoryLine: ({ data }) =>
       React.createElement(
         'div',
-        { 'data-testid': 'history-series' },
+        {
+          'data-testid': 'history-series',
+          'data-request-span-gaps': String(
+            data.datasets.find(
+              (dataset) => dataset.label === 'Recorded request attempts'
+            )?.spanGaps
+          ),
+        },
         data.datasets.map((dataset) => dataset.label).join('|')
       ),
     historyLinearScale: () => ({}),
@@ -20,14 +27,14 @@ import {
 } from './serve-request-history';
 
 describe('buildRequestHistoryView', () => {
-  it('fills missing minute buckets and derives selected-range statistics', () => {
+  it('distinguishes missing minutes from explicit zero coverage', () => {
     const view = buildRequestHistoryView(
       {
         available: true,
         bucketSeconds: 60,
         requestSamples: [
           { timestamp: 120, requestCount: 3 },
-          { timestamp: 240, requestCount: 9 },
+          { timestamp: 240, requestCount: 0 },
           { timestamp: 300, requestCount: 99 },
         ],
       },
@@ -35,7 +42,7 @@ describe('buildRequestHistoryView', () => {
     );
 
     expect(view.timestamps).toEqual([120, 180, 240]);
-    expect(view.counts).toEqual([3, 0, 9]);
+    expect(view.counts).toEqual([3, null, 0]);
     expect(view.demandTargets).toEqual([null, null, null]);
     expect(view.capacityTargets).toEqual([null, null, null]);
     expect(view.readyCapacities).toEqual([null, null, null]);
@@ -43,9 +50,9 @@ describe('buildRequestHistoryView', () => {
     expect(view.totalCapacities).toEqual([null, null, null]);
     expect(view.events).toEqual([]);
     expect(view.stats).toEqual({
-      total: 12,
-      averagePerMinute: 4,
-      peakPerMinute: 9,
+      total: 3,
+      averagePerMinute: 1.5,
+      peakPerMinute: 3,
     });
     expect(view.capacityStats).toBeNull();
   });
@@ -97,6 +104,12 @@ describe('buildRequestHistoryView', () => {
     expect(view.readyCapacities).toEqual([1, 3, 2]);
     expect(view.provisioningCapacities).toEqual([3, 2, 0]);
     expect(view.totalCapacities).toEqual([6, 7, 2]);
+    expect(view.counts).toEqual([null, null, null]);
+    expect(view.stats).toEqual({
+      total: null,
+      averagePerMinute: null,
+      peakPerMinute: null,
+    });
     expect(view.capacityStats).toEqual({
       peakDemandTarget: 3,
       peakCapacityTarget: 5,
@@ -179,6 +192,10 @@ describe('RequestHistoryCard semantics', () => {
     expect(screen.getByText('Recorded attempts in range')).toBeTruthy();
     expect(screen.getByTestId('history-series').textContent).toContain(
       'Recorded request attempts|'
+    );
+    expect(screen.getByTestId('history-series')).toHaveAttribute(
+      'data-request-span-gaps',
+      'false'
     );
     expect(screen.getByTestId('history-series').textContent).toContain(
       'Traffic target (with hysteresis)|Traffic or reservation target|Ready capacity|Committed / unready capacity|Non-failed tracked capacity'

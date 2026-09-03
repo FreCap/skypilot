@@ -634,6 +634,36 @@ def test_durable_demand_sync_posts_directly_and_acknowledges_history():
     assert lb._request_aggregator.request_history_snapshot() is None
 
 
+def test_only_stable_active_lb_reports_idle_history_coverage(monkeypatch):
+    now = [120.0]
+    monkeypatch.setattr(load_balancer.time, 'time', lambda: now[0])
+    monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'lb-pod-uid-a')
+    lb = load_balancer.SkyServeLoadBalancer('http://ctrl:8001',
+                                            8890,
+                                            lb_slot=lb_ha.LbSlot.A)
+
+    assert lb._lb_role is lb_ha.LbRole.STANDBY
+    assert lb._build_demand_report()[0]['request_history'] is None
+    now[0] = 180.0
+    assert lb._build_demand_report()[0]['request_history'] is None
+
+    lb._lb_role = lb_ha.LbRole.ARMED
+    assert lb._build_demand_report()[0]['request_history'] is None
+    now[0] = 240.0
+    assert lb._build_demand_report()[0]['request_history'] is None
+
+    lb._lb_role = lb_ha.LbRole.ACTIVE
+    assert lb._build_demand_report()[0]['request_history'] is None
+    now[0] = 300.0
+    history = lb._build_demand_report()[0]['request_history']
+    assert history['buckets'] == [{
+        'bucket_start': 240,
+        'request_count': 0,
+        'rejected_count': 0,
+        'coverage_complete': True,
+    }]
+
+
 @pytest.mark.parametrize('role', [lb_ha.LbRole.ACTIVE, lb_ha.LbRole.STANDBY])
 def test_durable_demand_projects_occupancy_onto_current_routes(
         monkeypatch: pytest.MonkeyPatch, role: lb_ha.LbRole):

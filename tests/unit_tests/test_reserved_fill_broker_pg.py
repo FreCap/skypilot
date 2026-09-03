@@ -5228,6 +5228,99 @@ class TestServeStatusHistoryPG:
         assert not current['request_samples']
         assert current['requests_last_hour'] == 0
 
+    def test_request_history_persists_explicit_idle_coverage(
+            self, history_engine):
+        timestamp = 1784207110.0
+        current_bucket = int(timestamp) // 60 * 60
+        covered_bucket = current_bucket - 60
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.services_table).values(
+                    name='svc', hash='hash-a', current_version=1, pool=0))
+
+        heartbeat = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': covered_bucket,
+                'request_count': 0,
+                'rejected_count': 0,
+                'coverage_complete': True,
+            }],
+        }
+        assert serve_history.record_request_activity('svc', 'hash-a',
+                                                     'pod-a:process-a',
+                                                     heartbeat, timestamp) == 1
+
+        history = serve_history.get_status_history('svc', timestamp=timestamp)
+        assert history['request_samples'] == [{
+            'timestamp': float(covered_bucket),
+            'request_count': 0,
+            'rejected_count': 0,
+        }]
+        assert history['rejection_history_available'] is True
+
+    def test_classification_only_row_does_not_fabricate_idle_coverage(
+            self, history_engine):
+        timestamp = 1784207110.0
+        bucket_start = int(timestamp) // 60 * 60
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.services_table).values(
+                    name='svc', hash='hash-a', current_version=1, pool=0))
+
+        classification = {
+            'classification_version': 1,
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': bucket_start,
+                'classified_request_count': 1,
+                'counted_rejected_count': 1,
+            }],
+        }
+        assert serve_history.record_request_classification(
+            'svc', 'hash-a', 'pod-a:process-a', classification, timestamp) == 1
+
+        history = serve_history.get_status_history('svc', timestamp=timestamp)
+        assert history['request_samples'] == []
+        assert history['rejection_history_available'] is False
+
+    def test_classification_support_preserves_arrivals_before_second_writer(
+            self, history_engine):
+        timestamp = 1784207110.0
+        bucket_start = int(timestamp) // 60 * 60
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.services_table).values(
+                    name='svc', hash='hash-a', current_version=1, pool=0))
+
+        classification = {
+            'classification_version': 1,
+            'bucket_seconds': 60,
+            'buckets': [],
+        }
+        request_history = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': bucket_start,
+                'request_count': 3,
+                'rejected_count': 0,
+            }],
+        }
+        assert serve_history.record_request_classification(
+            'svc',
+            'hash-a',
+            'pod-a:process-a',
+            classification,
+            timestamp,
+            request_history=request_history) == 1
+
+        history = serve_history.get_status_history('svc', timestamp=timestamp)
+        assert history['request_samples'] == [{
+            'timestamp': float(bucket_start),
+            'request_count': 3,
+            'rejected_count': 0,
+        }]
+
     def test_request_classification_is_exact_monotonic_and_version_safe(
             self, history_engine):
         day = datetime.datetime(2026, 7, 31, tzinfo=datetime.timezone.utc)

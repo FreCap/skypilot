@@ -47,8 +47,19 @@ class RequestsAggregator:
         """Convert the aggregator to a dict."""
         raise NotImplementedError
 
-    def request_history_snapshot(self) -> dict[str, Any] | None:
-        """Return request-history counters awaiting acknowledgement."""
+    def request_history_snapshot(
+            self,
+            *,
+            include_idle_coverage: bool = False) -> dict[str, Any] | None:
+        """Return request-history counters awaiting acknowledgement.
+
+        ``include_idle_coverage`` is authority-sensitive: callers may set it
+        only while this process is the stable traffic-owning load balancer.
+        """
+        raise NotImplementedError
+
+    def reset_request_history_coverage(self) -> None:
+        """End any interval that could prove explicit idle coverage."""
         raise NotImplementedError
 
     def demand_window_snapshot(self) -> dict[str, Any]:
@@ -121,6 +132,12 @@ class RequestTimestamp(RequestsAggregator):
         self._acknowledged_request_history: dict[int, int] = {}
         self._rejection_history: dict[int, int] = {}
         self._acknowledged_rejection_history: dict[int, int] = {}
+        # An explicit, fully observed zero minute is the coverage heartbeat for
+        # sparse request history.  Coverage begins only when the load balancer
+        # confirms this process owns traffic; inactive role observations reset
+        # it so standby or transition time can never be fabricated as idle.
+        self._request_history_coverage_started_at: float | None = None
+        self._acknowledged_request_history_coverage: set[int] = set()
         # Terminal classifications intentionally use a separate cumulative
         # report and acknowledgement from arrival history. A new LB talking to
         # an old controller must retain these counters when only the legacy
@@ -231,6 +248,8 @@ class RequestTimestamp(RequestsAggregator):
         self._acknowledged_request_history.clear()
         self._rejection_history.clear()
         self._acknowledged_rejection_history.clear()
+        self._request_history_coverage_started_at = None
+        self._acknowledged_request_history_coverage = set()
         self._classified_request_history.clear()
         self._counted_rejection_history.clear()
         self._acknowledged_classified_request_history.clear()
@@ -261,6 +280,15 @@ class RequestTimestamp(RequestsAggregator):
         self._acknowledged_rejection_history = {
             bucket: count
             for bucket, count in self._acknowledged_rejection_history.items()
+            if bucket >= oldest_bucket
+        }
+        # getattr() keeps a new process compatible with a RequestTimestamp
+        # restored from a previous-version pickle.  Such a process starts with
+        # no coverage authority and therefore cannot backfill false zeros.
+        acknowledged_coverage = getattr(
+            self, '_acknowledged_request_history_coverage', set())
+        self._acknowledged_request_history_coverage = {
+            bucket for bucket in acknowledged_coverage
             if bucket >= oldest_bucket
         }
         self._classified_request_history = {
@@ -298,27 +326,65 @@ class RequestTimestamp(RequestsAggregator):
         }
         self._last_pruned_request_history_bucket = newest_bucket
 
-    def request_history_snapshot(self) -> dict[str, Any] | None:
-        """Return counters changed since their last durable acknowledgement."""
+    def request_history_snapshot(
+            self,
+            *,
+            include_idle_coverage: bool = False) -> dict[str, Any] | None:
+        """Return changed counters and authoritative completed zero minutes."""
         bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
-        newest_bucket = int(time.time() // bucket_seconds) * bucket_seconds
+        now = time.time()
+        newest_bucket = int(now // bucket_seconds) * bucket_seconds
         self._prune_request_history(newest_bucket)
+        coverage_started_at = getattr(self,
+                                      '_request_history_coverage_started_at',
+                                      None)
+        if not include_idle_coverage:
+            # A stable ACTIVE role is the only authority for service-level idle
+            # coverage.  Starting a new interval on reactivation deliberately
+            # leaves the transition minute unknown.
+            self._request_history_coverage_started_at = None
+            covered_buckets: set[int] = set()
+        else:
+            if coverage_started_at is None:
+                coverage_started_at = now
+                self._request_history_coverage_started_at = now
+            first_full_bucket = (
+                math.ceil(coverage_started_at / bucket_seconds) *
+                bucket_seconds)
+            oldest_retained_bucket = (
+                newest_bucket -
+                (constants.LB_REQUEST_HISTORY_MAX_BUCKETS - 1) * bucket_seconds)
+            first_full_bucket = max(first_full_bucket, oldest_retained_bucket)
+            last_full_bucket = newest_bucket - bucket_seconds
+            covered_buckets = set(
+                range(first_full_bucket, last_full_bucket + 1, bucket_seconds)
+            ) if first_full_bucket <= last_full_bucket else set()
+
         bucket_starts = sorted(
-            set(self._request_history) | set(self._rejection_history))
+            set(self._request_history) | set(self._rejection_history) |
+            covered_buckets)
         buckets = []
         for bucket in bucket_starts:
             request_count = self._request_history.get(bucket, 0)
             rejected_count = self._rejection_history.get(bucket, 0)
-            if (request_count <= self._acknowledged_request_history.get(
+            coverage_complete = bucket in covered_buckets
+            counts_unchanged = (
+                request_count <= self._acknowledged_request_history.get(
                     bucket, 0) and
-                    rejected_count <= self._acknowledged_rejection_history.get(
-                        bucket, 0)):
+                rejected_count <= self._acknowledged_rejection_history.get(
+                    bucket, 0))
+            coverage_unchanged = (
+                not coverage_complete or
+                bucket in self._acknowledged_request_history_coverage)
+            if counts_unchanged and coverage_unchanged:
                 continue
             bucket_payload = {
                 'bucket_start': bucket,
                 'request_count': request_count,
                 'rejected_count': rejected_count,
             }
+            if coverage_complete:
+                bucket_payload['coverage_complete'] = True
             buckets.append(bucket_payload)
         if not buckets:
             return None
@@ -326,6 +392,10 @@ class RequestTimestamp(RequestsAggregator):
             'bucket_seconds': constants.LB_REQUEST_HISTORY_BUCKET_SECONDS,
             'buckets': buckets,
         }
+
+    def reset_request_history_coverage(self) -> None:
+        """End the current traffic-authority coverage interval."""
+        self._request_history_coverage_started_at = None
 
     def demand_window_snapshot(self) -> dict[str, Any]:
         """Return one non-destructive, bounded rolling demand snapshot."""
@@ -392,6 +462,8 @@ class RequestTimestamp(RequestsAggregator):
         """
         if snapshot is None:
             return
+        if not hasattr(self, '_acknowledged_request_history_coverage'):
+            self._acknowledged_request_history_coverage = set()
         for bucket in snapshot.get('buckets', []):
             bucket_start = bucket.get('bucket_start')
             request_count = bucket.get('request_count')
@@ -408,6 +480,8 @@ class RequestTimestamp(RequestsAggregator):
                 self._acknowledged_rejection_history[bucket_start] = max(
                     accepted_rejected,
                     self._acknowledged_rejection_history.get(bucket_start, 0))
+            if bucket.get('coverage_complete') is True:
+                self._acknowledged_request_history_coverage.add(bucket_start)
 
     def request_classification_history_snapshot(self) -> dict[str, Any]:
         """Return terminal counters changed since durable acceptance.
