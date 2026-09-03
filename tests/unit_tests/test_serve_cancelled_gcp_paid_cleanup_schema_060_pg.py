@@ -21,7 +21,7 @@ pytestmark = pytest.mark.xdist_group(
 _MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.060_cancelled_gcp_paid_cleanup')
 _LATEST_MIGRATION = importlib.import_module(
-    'sky.schemas.db.serve_state.067_project_scoped_gcp_paid_admission')
+    'sky.schemas.db.serve_state.068_infrastructure_terminal_paid_cleanup')
 
 
 def _function_definition(engine: sqlalchemy.engine.Engine,

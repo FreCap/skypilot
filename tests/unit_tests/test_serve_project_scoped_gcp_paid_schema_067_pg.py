@@ -22,6 +22,8 @@ pytestmark = pytest.mark.xdist_group(
 
 _MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.067_project_scoped_gcp_paid_admission')
+_LATEST_MIGRATION = importlib.import_module(
+    'sky.schemas.db.serve_state.068_infrastructure_terminal_paid_cleanup')
 
 
 def _compact(expression: str) -> str:
@@ -217,7 +219,7 @@ def test_serve067_upgrades_exact_constraints_and_guards_without_rewrite(
     assert runtime_constraints[_MIGRATION._PAID_POOL_SCOPE_CONSTRAINT] == (
         _compact(_MIGRATION._PAID_POOL_SCOPE_CHECK))
     assert runtime_constraints[_MIGRATION._PROJECTION_CONSTRAINT] == _compact(
-        _MIGRATION._PROJECTION_CHECK)
+        _LATEST_MIGRATION._PROJECTION_CHECK)
     for constraint_name in (_MIGRATION._PAID_POOL_SCOPE_CONSTRAINT,
                             _MIGRATION._PROJECTION_CONSTRAINT):
         installed = _constraint_definition(empty_postgres, constraint_name)
