@@ -798,7 +798,13 @@ def test_get_job_controller_processes_batches_and_normalizes(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
     current_job = _insert_job_info(engine)
-    legacy_job = _insert_job_info(engine)
+    with engine.begin() as connection:
+        result = connection.execute(state.job_info_table.insert().values(
+            name='legacy',
+            workspace='legacy-team',
+            schedule_state=None,
+        ))
+        legacy_job = result.lastrowid
     no_controller_job = _insert_job_info(engine)
     _set_controller_process(engine, current_job, 101, 1001.5)
     _set_controller_process(engine, legacy_job, -202, None)
@@ -1577,7 +1583,13 @@ def test_get_job_cancellation_states_batches_lifecycle_snapshot(
         pool_hash=None,
         user_hash='u',
     )
-    legacy_job = _insert_job_info(engine)
+    with engine.begin() as connection:
+        result = connection.execute(state.job_info_table.insert().values(
+            name='legacy',
+            workspace='legacy-team',
+            schedule_state=None,
+        ))
+        legacy_job = result.lastrowid
     _set_controller_process(engine, active_job, 101, 1001.5)
     _set_controller_process(engine, completed_job, -202, None)
 
@@ -1604,7 +1616,7 @@ def test_get_job_cancellation_states_batches_lifecycle_snapshot(
     assert counts['n'] == 1, counts
 
 
-def test_get_job_cancellation_state_rows_use_latest_task_only(
+def test_get_jobs_status_check_summary_uses_latest_task_only_for_explicit_jobs(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
     active_job = state.set_job_info_without_job_id(
@@ -1623,7 +1635,13 @@ def test_get_job_cancellation_state_rows_use_latest_task_only(
         pool_hash=None,
         user_hash='u',
     )
-    legacy_job = _insert_job_info(engine)
+    with engine.begin() as connection:
+        result = connection.execute(state.job_info_table.insert().values(
+            name='legacy',
+            workspace='legacy-team',
+            schedule_state=None,
+        ))
+        legacy_job = result.lastrowid
     _set_controller_process(engine, active_job, 101, 1001.5)
     _set_controller_process(engine, completed_job, -202, None)
 
@@ -1647,17 +1665,24 @@ def test_get_job_cancellation_state_rows_use_latest_task_only(
     _insert_task(engine, legacy_job, 0, status=state.ManagedJobStatus.STARTING)
 
     with _count_sql_statements(engine) as counts:
-        rows = state._fetch_job_cancellation_state_rows(
+        summary = state.get_jobs_status_check_summary(
             [active_job, completed_job, legacy_job, 999999, active_job])
 
-    assert rows == [
-        (active_job, 1, state.ManagedJobStatus.RUNNING.value, 'team-a'),
-        (completed_job, 29, state.ManagedJobStatus.FAILED.value, 'team-b'),
-    ]
+    assert list(summary) == [active_job, completed_job]
+    assert summary[active_job]['workspace'] == 'team-a'
+    assert summary[active_job]['_latest_task_id'] == 1
+    assert summary[active_job]['_latest_task_status'] == (
+        state.ManagedJobStatus.RUNNING)
+    assert summary[active_job]['all_tasks_terminal'] is False
+    assert summary[completed_job]['workspace'] == 'team-b'
+    assert summary[completed_job]['_latest_task_id'] == 29
+    assert summary[completed_job]['_latest_task_status'] == (
+        state.ManagedJobStatus.FAILED)
+    assert summary[completed_job]['all_tasks_terminal'] is True
     assert counts['n'] == 1, counts
 
 
-def test_get_job_cancellation_state_rows_preserve_duplicate_nonterminal_latest_task(  # pylint: disable=line-too-long
+def test_get_jobs_status_check_summary_preserves_duplicate_nonterminal_latest_task(  # pylint: disable=line-too-long
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
     active_job = state.set_job_info_without_job_id(
@@ -1683,11 +1708,26 @@ def test_get_job_cancellation_state_rows_preserve_duplicate_nonterminal_latest_t
         }])
 
     with _count_sql_statements(engine) as counts:
-        rows = state._fetch_job_cancellation_state_rows(
-            [active_job, active_job])
+        summary = state.get_jobs_status_check_summary([active_job, active_job])
 
-    assert rows == [(active_job, 0, state.ManagedJobStatus.RUNNING.value,
-                     'team-a')]
+    assert summary == {
+        active_job: {
+            'schedule_state': state.ManagedJobScheduleState.INACTIVE,
+            'controller_pid': 101,
+            'controller_pid_started_at': 1001.5,
+            'controller_instance_id': None,
+            'controller_generation': None,
+            'controller_slot_id': None,
+            'controller_slot_attempt': None,
+            'controller_slot_quiescing': False,
+            'pool': None,
+            'workspace': 'team-a',
+            '_latest_task_id': 0,
+            '_latest_task_status': state.ManagedJobStatus.RUNNING,
+            '_latest_task_has_nonterminal': True,
+            'all_tasks_terminal': False,
+        },
+    }
     assert counts['n'] == 1, counts
 
 

@@ -8,12 +8,11 @@ from unittest import mock
 
 import pytest
 from sqlalchemy import event
-from test_jobs_state import _mock_managed_jobs_db_conn
-from test_jobs_state import _seed_multi_task_job
-from test_jobs_state import _seed_test_jobs
 
 from sky.jobs import state
 from sky.jobs import utils as jobs_utils
+
+pytest_plugins = ['test_jobs_state']
 
 
 def _insert_legacy_running_job(engine, *, workspace='default') -> int:
@@ -237,6 +236,164 @@ class TestGetJobsToCheckStatusInfo:
                                           workspace='default')
         }
         assert info[7]['_latest_task_status'] == state.ManagedJobStatus.RUNNING
+
+
+class TestGetJobsToCheckStatusSummary:
+    """Coverage for the aggregated one-row-per-job refresh/cancel snapshot."""
+
+    def test_summary_matches_full_snapshot_invariants(self, _seed_test_jobs):
+        job_ids = state.get_jobs_to_check_status()
+        full = state.get_jobs_to_check_status_info(job_ids)
+        summary = state.get_jobs_to_check_status_summary()
+
+        assert list(summary) == job_ids
+        assert state.get_job_cancellation_states_from_status_check_info(
+            summary
+        ) == state.get_job_cancellation_states_from_status_check_info(full)
+        for job_id, full_info in full.items():
+            summary_info = summary[job_id]
+            assert summary_info['schedule_state'] == full_info['schedule_state']
+            assert summary_info['controller_pid'] == full_info['controller_pid']
+            assert summary_info['controller_pid_started_at'] == full_info[
+                'controller_pid_started_at']
+            assert summary_info['workspace'] == full_info['workspace']
+            assert summary_info['pool'] == full_info['pool']
+            assert summary_info['all_tasks_terminal'] == all(
+                task['status'].is_terminal() for task in full_info['tasks'])
+
+    def test_summary_uses_one_row_for_multi_task_job(self,
+                                                     _mock_managed_jobs_db_conn,
+                                                     _seed_multi_task_job):
+        pipeline_id = _seed_multi_task_job['pipeline_job_id']
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id == pipeline_id).values(
+                    schedule_state=state.ManagedJobScheduleState.DONE.value))
+            session.commit()
+
+        summary = state.get_jobs_to_check_status_summary([pipeline_id])
+
+        assert list(summary) == [pipeline_id]
+        assert 'tasks' not in summary[pipeline_id]
+        assert summary[pipeline_id]['_latest_task_status'] == (
+            state.ManagedJobStatus.RUNNING)
+        assert summary[pipeline_id]['all_tasks_terminal'] is False
+
+    def test_summary_helper_dedupes_duplicate_job_ids(
+            self, _mock_managed_jobs_db_conn, _seed_test_jobs, monkeypatch):
+        monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 1)
+        job_id = _seed_test_jobs['job_id1']
+        expected = state.get_jobs_status_check_summary([job_id])[job_id]
+        select_count = 0
+
+        def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                                   executemany):
+            del conn, cursor, parameters, context, executemany
+            nonlocal select_count
+            if statement.lstrip().upper().startswith('SELECT'):
+                select_count += 1
+
+        event.listen(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                     _before_cursor_execute)
+        try:
+            summary = state.get_jobs_status_check_summary([job_id, job_id])
+        finally:
+            event.remove(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                         _before_cursor_execute)
+
+        assert summary == {job_id: expected}
+        assert select_count == 1
+
+    def test_refresh_summary_issues_single_select(self,
+                                                  _mock_managed_jobs_db_conn,
+                                                  _seed_test_jobs):
+        del _seed_test_jobs
+        select_count = 0
+
+        def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                                   executemany):
+            del conn, cursor, parameters, context, executemany
+            nonlocal select_count
+            if statement.lstrip().upper().startswith('SELECT'):
+                select_count += 1
+
+        event.listen(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                     _before_cursor_execute)
+        try:
+            summary = state.get_jobs_to_check_status_summary()
+        finally:
+            event.remove(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                         _before_cursor_execute)
+
+        assert summary
+        assert select_count == 1
+
+    @pytest.mark.parametrize(
+        ('inserted_rows', 'expected_status'),
+        [
+            # Rows are inserted out of task-id order on purpose: a summary
+            # query that loses its latest-task resolution rules would diverge
+            # from the direct SQL lookup used by cancellation.
+            pytest.param([(2, state.ManagedJobStatus.PENDING),
+                          (0, state.ManagedJobStatus.SUCCEEDED),
+                          (1, state.ManagedJobStatus.RUNNING)],
+                         state.ManagedJobStatus.RUNNING,
+                         id='first-nonterminal-task-wins-over-row-order'),
+            pytest.param([(1, state.ManagedJobStatus.FAILED),
+                          (0, state.ManagedJobStatus.RUNNING)],
+                         state.ManagedJobStatus.RUNNING,
+                         id='later-terminal-task-does-not-hide-nonterminal'),
+            pytest.param([(0, state.ManagedJobStatus.SUCCEEDED),
+                          (1, state.ManagedJobStatus.RUNNING),
+                          (1, state.ManagedJobStatus.PENDING)],
+                         state.ManagedJobStatus.PENDING,
+                         id='nonterminal-duplicates-resolve-to-min-status'),
+            pytest.param([(1, state.ManagedJobStatus.CANCELLED),
+                          (0, state.ManagedJobStatus.SUCCEEDED),
+                          (2, state.ManagedJobStatus.FAILED)],
+                         state.ManagedJobStatus.FAILED,
+                         id='all-terminal-picks-highest-task-id'),
+            pytest.param([(0, state.ManagedJobStatus.SUCCEEDED),
+                          (1, state.ManagedJobStatus.FAILED),
+                          (1, state.ManagedJobStatus.SUCCEEDED)],
+                         state.ManagedJobStatus.SUCCEEDED,
+                         id='terminal-duplicates-resolve-to-max-status'),
+            pytest.param([(0, state.ManagedJobStatus.RUNNING),
+                          (0, state.ManagedJobStatus.SUCCEEDED)],
+                         state.ManagedJobStatus.RUNNING,
+                         id='same-task-nonterminal-beats-terminal'),
+        ])
+    def test_summary_cancellation_matches_direct_lookup_for_any_row_order(
+            self, _mock_managed_jobs_db_conn, inserted_rows, expected_status):
+        job_id = state.set_job_info_without_job_id(name='row-order',
+                                                   workspace='default',
+                                                   entrypoint='ep',
+                                                   pool=None,
+                                                   pool_hash=None,
+                                                   user_hash='user')
+        with _mock_managed_jobs_db_conn.begin() as connection:
+            connection.execute(state.spot_table.insert(), [{
+                'spot_job_id': job_id,
+                'task_id': task_id,
+                'task_name': f'task-{task_id}',
+                'status': status.value,
+            } for task_id, status in inserted_rows])
+        expected = {
+            job_id: state.JobCancellationState(status=expected_status,
+                                               workspace='default')
+        }
+
+        assert state.get_job_cancellation_states([job_id]) == expected
+        summary = state.get_jobs_status_check_summary([job_id])
+        assert (state.get_job_cancellation_states_from_status_check_info(
+            summary) == expected)
+        sweep_summary = state.get_jobs_to_check_status_summary([job_id])
+        assert (state.get_job_cancellation_states_from_status_check_info(
+            sweep_summary) == expected)
+
+
+class TestStatusCheckSnapshotParity:
+    """Parity coverage shared with the full per-task snapshot helpers."""
 
     @pytest.mark.parametrize(
         ('inserted_rows', 'expected_status'),

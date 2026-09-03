@@ -14,7 +14,7 @@ import threading
 import time
 import traceback
 import typing
-from typing import Any, Optional
+from typing import Any, cast, Optional
 
 import colorama
 import filelock
@@ -675,9 +675,9 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
 
     Note: we expect that job_ids, if provided, refer to nonterminal jobs or
     jobs that have not completed their cleanup (schedule state not DONE).
-    Callers that already fetched ``get_jobs_status_check_info()`` for the same
-    explicit ``job_ids`` may pass that snapshot via ``jobs_info`` to reuse the
-    first lifecycle read instead of re-querying before refresh.
+    Callers that already fetched ``get_jobs_status_check_summary()`` for the
+    same explicit ``job_ids`` may pass that snapshot via ``jobs_info`` to
+    reuse the first lifecycle read instead of re-querying before refresh.
     """
     # The signal file suggests that the controller is recovering from a
     # failure. See sky/templates/kubernetes-ray.yml.j2 for more details.
@@ -738,18 +738,17 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
     # the loop consumes. This keeps the refresh tick on a single slim query
     # instead of a filtered job-id query followed by a second detail query.
     if jobs_info is None:
-        jobs_info = managed_job_state.get_jobs_to_check_status_info(job_ids)
+        jobs_info = managed_job_state.get_jobs_to_check_status_summary(job_ids)
     if not jobs_info:
         # The given jobs are already terminal, or if job_ids is None, there
         # are no jobs that need to be checked.
         return
 
     for job_id, info in jobs_info.items():
-        tasks = info['tasks']
+        tasks = cast(list[dict[str, Any]] | None, info.get('tasks'))
         # Note: controller_pid and schedule_state are in the job_info table
-        # which is joined to the spot table, so all tasks with the same job_id
-        # share these columns. get_jobs_to_check_status_info returns them once
-        # per job.
+        # which is joined to the spot table, so all rows with the same job_id
+        # share these columns. The summary snapshot returns them once per job.
         schedule_state = info['schedule_state']
 
         # Handle jobs with schedule state (non-legacy jobs):
@@ -769,8 +768,12 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
             logger.debug(f'Job {job_id} has a complete fixed-slot identity; '
                          'deferring liveness and cleanup to slot supervision.')
             continue
-        snapshot_all_tasks_terminal = all(
-            task['status'].is_terminal() for task in tasks)
+        snapshot_all_tasks_terminal = cast(bool | None,
+                                           info.get('all_tasks_terminal'))
+        if snapshot_all_tasks_terminal is None:
+            assert tasks is not None
+            snapshot_all_tasks_terminal = all(
+                task['status'].is_terminal() for task in tasks)
         if snapshot_all_tasks_terminal:
             # Terminal cleanup has one canonical owner: the controller manager
             # or a replacement scheduler cleanup adopter.  Keep old/incomplete
@@ -796,20 +799,20 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
                 continue
         if schedule_state == managed_job_state.ManagedJobScheduleState.DONE:
             # There are two cases where we could get a job that is DONE.
-            # 1. At snapshot time (get_jobs_to_check_status_info), the job was
-            #    not yet DONE, but since then it has hit a terminal status,
+            # 1. At summary snapshot time, the job was not yet DONE, but since
+            #    then it has hit a terminal status,
             #    marked itself done, and exited. This is fine.
             # 2. The job is DONE, but in a non-terminal status. This is
             #    unexpected. For instance, the task status is RUNNING, but the
             #    job schedule_state is DONE.
-            if all(task['status'].is_terminal() for task in tasks):
+            if snapshot_all_tasks_terminal:
                 # Turns out this job is fine, even though it got pulled by
-                # get_jobs_to_check_status_info. Probably case #1 above.
+                # get_jobs_to_check_status_summary. Probably case #1 above.
                 continue
 
-            logger.error(f'Job {job_id} has DONE schedule state, but some '
-                         f'tasks are not terminal. Task statuses: '
-                         f'{", ".join(task["status"].value for task in tasks)}')
+            logger.error(
+                'Job %s has DONE schedule state, but not all tasks '
+                'are terminal.', job_id)
             failure_reason = ('Inconsistent internal job state. This is a bug.')
         elif pid is None:
             # Non-legacy job and controller process has not yet started.
@@ -1132,7 +1135,7 @@ def cancel_jobs_by_id(job_ids: list[int] | None,
     cancelled_job_ids: list[int] = []
     wrong_workspace_job_ids: list[int] = []
     jobs_to_refresh: list[int] = []
-    initial_info = managed_job_state.get_jobs_status_check_info(job_ids)
+    initial_info = managed_job_state.get_jobs_status_check_summary(job_ids)
     initial_states = (
         managed_job_state.get_job_cancellation_states_from_status_check_info(
             initial_info))
@@ -1169,8 +1172,8 @@ def cancel_jobs_by_id(job_ids: list[int] | None,
         }
         update_managed_jobs_statuses(jobs_to_refresh,
                                      jobs_info=refresh_jobs_info)
-    fresh_states = managed_job_state.get_job_cancellation_states(
-        jobs_to_refresh)
+    fresh_states = managed_job_state.get_job_cancellation_states_from_status_check_info(
+        managed_job_state.get_jobs_status_check_summary(jobs_to_refresh))
     for job_id in jobs_to_refresh:
         snapshot = fresh_states.get(job_id)
         if snapshot is None:

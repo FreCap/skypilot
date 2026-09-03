@@ -1179,6 +1179,76 @@ def _spot_job_info_outerjoin():
         spot_table.c.spot_job_id == job_info_table.c.spot_job_id)
 
 
+def _status_check_summary_select(from_clause) -> 'sqlalchemy.Select':
+    """The per-job projection shared by refresh/cancel summary snapshots."""
+    return sqlalchemy.select(
+        from_clause.c.spot_job_id,
+        from_clause.c.task_id,
+        from_clause.c.status,
+        from_clause.c.nonterminal_task_count,
+        job_info_table.c.schedule_state,
+        job_info_table.c.controller_pid,
+        job_info_table.c.controller_pid_started_at,
+        job_info_table.c.controller_instance_id,
+        job_info_table.c.controller_generation,
+        job_info_table.c.controller_slot_id,
+        job_info_table.c.controller_slot_attempt,
+        job_info_table.c.controller_slot_quiescing,
+        job_info_table.c.pool,
+        job_info_table.c.workspace,
+    ).select_from(
+        from_clause.outerjoin(
+            job_info_table,
+            from_clause.c.spot_job_id == job_info_table.c.spot_job_id))
+
+
+def _collect_status_check_summary(
+    job_ids: list[int] | None,
+    fetch_chunk: Callable[[list[int] | None], list[Any]],
+) -> dict[int, dict[str, Any]]:
+    """Chunk ``job_ids`` and merge one summary row per job."""
+    result: dict[int, dict[str, Any]] = {}
+    if job_ids is None:
+        _merge_jobs_status_check_summary_rows(result, fetch_chunk(None))
+        return result
+    unique_job_ids = list(dict.fromkeys(job_ids))
+    for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+        chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
+        _merge_jobs_status_check_summary_rows(result, fetch_chunk(chunk))
+    return {
+        job_id: result[job_id] for job_id in unique_job_ids if job_id in result
+    }
+
+
+def _merge_jobs_status_check_summary_rows(result: dict[int, dict[str, Any]],
+                                          rows: list[Any]) -> None:
+    """Decode one-row-per-job refresh/cancel summaries."""
+    for row in rows:
+        mapping = row._mapping  # pylint: disable=protected-access
+        schedule_state = mapping['schedule_state']
+        if schedule_state is None:
+            continue
+        latest_status = ManagedJobStatus(mapping['status'])
+        result[mapping['spot_job_id']] = {
+            'schedule_state': ManagedJobScheduleState(schedule_state),
+            'controller_pid': mapping['controller_pid'],
+            'controller_pid_started_at': mapping['controller_pid_started_at'],
+            'controller_instance_id': mapping['controller_instance_id'],
+            'controller_generation': mapping['controller_generation'],
+            'controller_slot_id': mapping['controller_slot_id'],
+            'controller_slot_attempt': mapping['controller_slot_attempt'],
+            'controller_slot_quiescing': mapping['controller_slot_quiescing'],
+            'pool': mapping['pool'],
+            'workspace': mapping['workspace'],
+            '_latest_task_id': mapping['task_id'],
+            '_latest_task_status': latest_status,
+            '_latest_task_has_nonterminal': int(
+                mapping['nonterminal_task_count'] or 0) > 0,
+            'all_tasks_terminal': int(mapping['nonterminal_task_count'] or 0) ==
+                                  0,
+        }
+
+
 def _collect_status_check_snapshot(
     job_ids: list[int] | None, fetch_chunk: Callable[[list[int] | None],
                                                      list[Any]]
@@ -1355,6 +1425,52 @@ def _get_latest_task_status_from_status_check_info(
     return latest_status
 
 
+def _status_check_summary_query(
+    chunk: list[int] | None,
+    *,
+    filter_to_jobs_to_check: bool,
+) -> 'sqlalchemy.Select':
+    """Build the aggregated one-row-per-job status summary query."""
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    jobs = sqlalchemy.select(
+        spot_table.c.spot_job_id.label('spot_job_id')).select_from(
+            _spot_job_info_outerjoin())
+    if filter_to_jobs_to_check:
+        jobs = jobs.where(_get_jobs_to_check_status_condition(chunk))
+    elif chunk is not None:
+        jobs = jobs.where(spot_table.c.spot_job_id.in_(chunk))
+    jobs_to_read = jobs.distinct().subquery()
+
+    latest_task = _latest_task_status_query_from_scope(
+        _latest_task_ids_subquery_from_scope(jobs_to_read,
+                                             terminal_status_values),
+        terminal_status_values).subquery()
+    task_counts = sqlalchemy.select(
+        jobs_to_read.c.spot_job_id,
+        sqlalchemy.func.sum(
+            sqlalchemy.case(
+                (~spot_table.c.status.in_(terminal_status_values), 1),
+                else_=0)).label('nonterminal_task_count'),
+    ).select_from(
+        jobs_to_read.join(
+            spot_table,
+            spot_table.c.spot_job_id == jobs_to_read.c.spot_job_id)).group_by(
+                jobs_to_read.c.spot_job_id).subquery()
+    summary = sqlalchemy.select(
+        latest_task.c.spot_job_id,
+        latest_task.c.task_id,
+        latest_task.c.status,
+        task_counts.c.nonterminal_task_count,
+    ).select_from(
+        latest_task.join(
+            task_counts,
+            latest_task.c.spot_job_id == task_counts.c.spot_job_id)).subquery()
+    return _status_check_summary_select(summary).order_by(
+        summary.c.spot_job_id.desc())
+
+
 def get_job_cancellation_states_from_status_check_info(
         jobs_info: dict[int, dict[str,
                                   Any]]) -> dict[int, JobCancellationState]:
@@ -1407,9 +1523,22 @@ def get_jobs_to_check_status_info(
             spot_table.c.spot_job_id == jobs_to_check.c.spot_job_id)).order_by(
                 spot_table.c.spot_job_id.desc(), spot_table.c.task_id.asc())
         with orm.Session(engine) as session:
-            return session.execute(query).fetchall()
+            return list(session.execute(query).fetchall())
 
     return _collect_status_check_snapshot(job_ids, _fetch_chunk)
+
+
+def get_jobs_to_check_status_summary(
+        job_ids: list[int] | None = None) -> dict[int, dict[str, Any]]:
+    """One-row-per-job refresh summary for controller liveness checks."""
+    engine = _db_manager.get_engine()
+
+    def _fetch_chunk(chunk: list[int] | None) -> list[Any]:
+        query = _status_check_summary_query(chunk, filter_to_jobs_to_check=True)
+        with orm.Session(engine) as session:
+            return list(session.execute(query).fetchall())
+
+    return _collect_status_check_summary(job_ids, _fetch_chunk)
 
 
 def get_jobs_status_check_info(job_ids: list[int]) -> dict[int, dict[str, Any]]:
@@ -1450,9 +1579,26 @@ def get_jobs_status_check_info(job_ids: list[int]) -> dict[int, dict[str, Any]]:
             spot_table.c.spot_job_id.in_(chunk)).order_by(
                 spot_table.c.spot_job_id.asc(), spot_table.c.task_id.asc())
         with orm.Session(engine) as session:
-            return session.execute(query).fetchall()
+            return list(session.execute(query).fetchall())
 
     return _collect_status_check_snapshot(job_ids, _fetch_chunk)
+
+
+def get_jobs_status_check_summary(
+        job_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """One-row-per-job lifecycle summary for explicit managed-job ids."""
+    if not job_ids:
+        return {}
+    engine = _db_manager.get_engine()
+
+    def _fetch_chunk(chunk: list[int] | None) -> list[Any]:
+        assert chunk is not None
+        query = _status_check_summary_query(chunk,
+                                            filter_to_jobs_to_check=False)
+        with orm.Session(engine) as session:
+            return list(session.execute(query).fetchall())
+
+    return _collect_status_check_summary(job_ids, _fetch_chunk)
 
 
 def get_job_status_check_state(job_id: int) -> dict[str, Any] | None:
@@ -1651,30 +1797,12 @@ def get_job_cancellation_states(
         job_ids: list[int]) -> dict[int, JobCancellationState]:
     """Return slim, batched snapshots for managed-job cancellation.
 
-    Cancellation needs the currently executable task's status together with
-    workspace authorization. Reading those fields together avoids separate
-    point queries and prevents decisions assembled from different lifecycle
-    snapshots. Only the latest task row per job matters for cancellation, so
-    the query keeps the row volume bounded by job count instead of total task
-    count.
-
-    Only jobs with durable modern lifecycle fields (workspace and
-    schedule_state) participate in this snapshot. Legacy single-job
-    controllers used a separate signal transport; without backward-compatibility
-    support, modern cancellation excludes those rows instead of carrying a
-    second delivery path.
+    Cancellation reuses the same one-row-per-job summary snapshot as refresh,
+    so both paths share latest-task resolution, duplicate-row collapse, legacy
+    row filtering, and chunked query behavior.
     """
-    if not job_ids:
-        return {}
-
-    snapshots: dict[int, JobCancellationState] = {}
-    for job_id, _, status, workspace in _fetch_job_cancellation_state_rows(
-            job_ids):
-        snapshots[job_id] = JobCancellationState(
-            status=ManagedJobStatus(status),
-            workspace=workspace,
-        )
-    return snapshots
+    return get_job_cancellation_states_from_status_check_info(
+        get_jobs_status_check_summary(job_ids))
 
 
 def _latest_task_ids_subquery(
@@ -1699,11 +1827,39 @@ def _latest_task_ids_subquery(
                 spot_table.c.spot_job_id).subquery()
 
 
+def _latest_task_ids_subquery_from_scope(
+        job_scope: sqlalchemy.sql.Selectable,
+        terminal_status_values: list[str]) -> sqlalchemy.sql.Selectable:
+    """Select one latest-task identity for the given job-id scope."""
+    return sqlalchemy.select(
+        job_scope.c.spot_job_id.label('spot_job_id'),
+        sqlalchemy.func.coalesce(  # pylint: disable=not-callable
+            sqlalchemy.func.min(
+                sqlalchemy.case(
+                    (~spot_table.c.status.in_(terminal_status_values),
+                     spot_table.c.task_id),
+                    else_=None)),
+            sqlalchemy.func.max(spot_table.c.task_id),
+        ).label('task_id')).select_from(
+            job_scope.join(
+                spot_table,
+                spot_table.c.spot_job_id == job_scope.c.spot_job_id)).group_by(
+                    job_scope.c.spot_job_id).subquery()
+
+
 def _latest_task_status_query(
         job_ids: list[int],
         terminal_status_values: list[str]) -> sqlalchemy.sql.Selectable:
     """Select the latest-task status row for each requested job."""
     latest_task_ids = _latest_task_ids_subquery(job_ids, terminal_status_values)
+    return _latest_task_status_query_from_scope(latest_task_ids,
+                                                terminal_status_values)
+
+
+def _latest_task_status_query_from_scope(
+        latest_task_ids: sqlalchemy.sql.Selectable,
+        terminal_status_values: list[str]) -> sqlalchemy.sql.Selectable:
+    """Select the latest-task status row for each requested job scope."""
     selected_status = sqlalchemy.func.coalesce(  # pylint: disable=not-callable
         sqlalchemy.func.min(
             sqlalchemy.case((~spot_table.c.status.in_(terminal_status_values),
@@ -1724,46 +1880,6 @@ def _latest_task_status_query(
                     latest_task_ids.c.spot_job_id,
                     latest_task_ids.c.task_id).order_by(
                         latest_task_ids.c.spot_job_id.asc())
-
-
-def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
-    """Fetch one cancellation-driving task row per requested job.
-
-    Cancellation follows ``get_latest_task_id_from_statuses`` semantics:
-    pick the first non-terminal task if one exists, otherwise the last
-    terminal task. Only jobs with durable modern ``job_info`` fields are
-    cancellable through the consolidated signal path, so legacy rows are
-    excluded here. Reuse ``_latest_task_status_query`` so cancellation shares
-    the same duplicate-row resolution as every other latest-task reader.
-    """
-    unique_job_ids = list(dict.fromkeys(job_ids))
-    if not unique_job_ids:
-        return []
-
-    engine = _db_manager.get_engine()
-    rows: list[Any] = []
-    terminal_status_values = [
-        status.value for status in ManagedJobStatus.terminal_statuses()
-    ]
-    with orm.Session(engine) as session:
-        for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
-            chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
-            latest_task = _latest_task_status_query(
-                chunk, terminal_status_values).subquery()
-            query = sqlalchemy.select(
-                latest_task.c.spot_job_id,
-                latest_task.c.task_id,
-                latest_task.c.status,
-                job_info_table.c.workspace,
-            ).select_from(
-                latest_task.join(
-                    job_info_table, latest_task.c.spot_job_id ==
-                    job_info_table.c.spot_job_id)).where(
-                        job_info_table.c.workspace.is_not(None),
-                        job_info_table.c.schedule_state.is_not(None),
-                    ).order_by(latest_task.c.spot_job_id.asc())
-            rows.extend(session.execute(query).fetchall())
-    return rows
 
 
 def has_jobs_requiring_recovery_grace_wait() -> bool:
