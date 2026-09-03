@@ -283,22 +283,30 @@ def demand_scoped_fill_pool_authority(
     witness: capacity_admission.CommittedFillDemandWitness | None,
 ) -> FillPoolDemandAuthority:
     """Fail closed unless a witness proves complete acquisition classes."""
-    classes = (None
-               if witness is None else witness.reservation_acquisition_classes)
-    if witness is None or classes is None:
+    if witness is None:
         return FillPoolDemandAuthority(mode=FillPoolBudgetMode.HOLDINGS_ONLY,
                                        demand_target_capacity=0,
                                        acquisition_classes=None,
                                        demonstrated_need=None,
                                        demand_witness_sha256=None)
+    classes = witness.reservation_acquisition_classes
     if witness.target_capacity == 0:
-        # Zero demand revokes acquisition immediately, but existing holdings
-        # still drain through the release governor's bounded cap instead of
-        # collapsing every edge in one reconciliation.
+        # The current committed plan proves zero reservation-compatible
+        # demand.  A non-compatible relation publishes no classes at all, so
+        # this check must precede the missing-classes fence.  Zero demand
+        # revokes acquisition immediately, but existing holdings still drain
+        # through the release governor's bounded cap instead of collapsing
+        # every edge in one reconciliation; it is never blind telemetry.
         return FillPoolDemandAuthority(mode=FillPoolBudgetMode.HOLDINGS_ONLY,
                                        demand_target_capacity=0,
                                        acquisition_classes=None,
                                        demonstrated_need=0,
+                                       demand_witness_sha256=None)
+    if classes is None:
+        return FillPoolDemandAuthority(mode=FillPoolBudgetMode.HOLDINGS_ONLY,
+                                       demand_target_capacity=0,
+                                       acquisition_classes=None,
+                                       demonstrated_need=None,
                                        demand_witness_sha256=None)
     return FillPoolDemandAuthority(
         mode=FillPoolBudgetMode.MATCHED,
@@ -3776,7 +3784,12 @@ def _broker_cycle_v2(
                     'count': item.count,
                 } for item in acquisition_classes]),
             'reservation_acquisition_binding_sha256': acquisition_binding_sha256,
-            'boot_hold': boot_hold,
+            # The release governor ignores boot_hold while blind, and the
+            # allocation publisher authenticates a blind witness only when it
+            # carries no boot hold.  Publish the same invariant here so a
+            # stale witness with a booting reserved replica cannot turn every
+            # allocation read into a corruption error.
+            'boot_hold': boot_hold and demonstrated_need is not None,
             'blind': demonstrated_need is None,
         })
         utilization_ceiling = min(global_headroom,

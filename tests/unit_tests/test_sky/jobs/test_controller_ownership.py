@@ -12,6 +12,8 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from sky.jobs import state
+from sky.jobs import utils as managed_job_utils
+from sky.skylet import constants
 
 _SLOT_ID = 3
 _SLOT_ATTEMPT = '12345678-1234-4234-8234-123456789abc'
@@ -529,6 +531,106 @@ class TestManagedJobControllerOwnership:
             state.ManagedJobScheduleState.DONE.value)
         assert rows[3].schedule_state == (
             state.ManagedJobScheduleState.DONE.value)
+
+    def _seed_done_orphan(self, task_statuses):
+        """Seed one DONE job with launched tasks in ``task_statuses``."""
+        job_id = self._seed_waiting_job()
+        for task_id in range(1, len(task_statuses)):
+            state.set_pending(job_id,
+                              task_id=task_id,
+                              task_name=f't{task_id}',
+                              resources_str='{}',
+                              metadata='{}')
+        with state.orm.Session(state._db_manager.get_engine()) as session:
+            for task_id, status in enumerate(task_statuses):
+                session.execute(state.spot_table.update().where(
+                    state.spot_table.c.spot_job_id == job_id,
+                    state.spot_table.c.task_id == task_id).values(
+                        status=None if status is None else status.value,
+                        submitted_at=100.0))
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    schedule_state=state.ManagedJobScheduleState.DONE.value,
+                    controller_pid=111,
+                    controller_instance_id=_OLD_OWNER_INSTANCE_ID,
+                    controller_generation=21,
+                    controller_slot_id=_SLOT_ID,
+                    controller_slot_attempt=_SLOT_ATTEMPT,
+                    controller_slot_quiescing=True))
+            session.commit()
+        return job_id
+
+    def _schedule_state(self, job_id):
+        with state.orm.Session(state._db_manager.get_engine()) as session:
+            return session.execute(
+                sqlalchemy.select(state.job_info_table.c.schedule_state).where(
+                    state.job_info_table.c.spot_job_id == job_id)).scalar_one()
+
+    def test_requeued_done_orphan_is_claimed_as_cleanup_only(
+            self, _mock_managed_jobs_db_conn, monkeypatch):
+        job_id = self._seed_done_orphan([state.ManagedJobStatus.SUCCEEDED])
+        cluster_name = managed_job_utils.generate_managed_job_cluster_name(
+            't0', job_id)
+        monkeypatch.setattr(managed_job_utils.global_user_state,
+                            'get_managed_job_cluster_cleanup_candidates',
+                            lambda: {cluster_name: str(job_id)})
+
+        requeue = managed_job_utils.requeue_terminal_done_jobs_with_live_clusters
+        assert requeue() == 1
+
+        owner = ('2bc9ae9e-3871-4cb1-a15d-c4557b1daaa1', 41)
+        monkeypatch.setattr(state, 'get_current_controller_owner',
+                            lambda: owner)
+        monkeypatch.setattr(state, 'get_current_controller_slot_identity',
+                            lambda: (*owner, _SLOT_ID, _SLOT_ATTEMPT))
+
+        async def _no_lock(_session, _owner):
+            return None
+
+        monkeypatch.setattr(state, '_lock_current_controller_owner_async',
+                            _no_lock)
+        claimed = asyncio.run(
+            state.get_waiting_job_async(pid=4242,
+                                        pid_started_at=1.5,
+                                        controller_slot_id=_SLOT_ID,
+                                        controller_slot_attempt=_SLOT_ATTEMPT))
+
+        assert claimed == {'job_id': job_id, 'pool': None, 'cleanup_only': True}
+        # A repeated recovery pass leaves the claimed row alone.
+        assert requeue() == 0
+
+    def test_null_task_status_candidate_does_not_block_valid_orphan_repair(
+            self, _mock_managed_jobs_db_conn, monkeypatch, tmp_path):
+        valid_job_id = self._seed_done_orphan(
+            [state.ManagedJobStatus.SUCCEEDED])
+        malformed_job_id = self._seed_done_orphan(
+            [state.ManagedJobStatus.SUCCEEDED, None])
+        valid_cluster_name = (
+            managed_job_utils.generate_managed_job_cluster_name(
+                't0', valid_job_id))
+        malformed_cluster_name = (
+            managed_job_utils.generate_managed_job_cluster_name(
+                't0', malformed_job_id))
+        monkeypatch.setattr(
+            managed_job_utils.global_user_state,
+            'get_managed_job_cluster_cleanup_candidates', lambda: {
+                valid_cluster_name: str(valid_job_id),
+                malformed_cluster_name: str(malformed_job_id),
+            })
+        monkeypatch.setattr(state, 'reset_stale_jobs_for_current_controller',
+                            lambda: 0)
+        monkeypatch.setattr(constants, 'HA_PERSISTENT_RECOVERY_LOG_PATH',
+                            str(tmp_path / '{}recovery.log'))
+
+        managed_job_utils.ha_recovery_for_consolidation_mode()
+
+        assert (self._schedule_state(valid_job_id) ==
+                state.ManagedJobScheduleState.WAITING.value)
+        assert (self._schedule_state(malformed_job_id) ==
+                state.ManagedJobScheduleState.DONE.value)
+        recovery_log = (tmp_path /
+                        'jobs_recovery.log').read_text(encoding='utf-8')
+        assert 'Requeued 1 terminal managed job(s)' in recovery_log
 
     def test_first_slot_rollout_adopts_only_non_done_legacy_jobs(
             self, _mock_managed_jobs_db_conn, monkeypatch):

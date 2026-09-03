@@ -1203,10 +1203,17 @@ def _collect_status_check_snapshot(
 
 def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
                                   rows: list[Any]) -> None:
-    """Decode slim status-check rows into the per-job refresh snapshot."""
+    """Decode slim status-check rows into the per-job refresh snapshot.
+
+    Each job is staged atomically. A malformed lifecycle enum excludes that
+    whole job, rather than one task or the whole batch, so callers cannot act
+    on a partial DAG and one legacy row cannot suppress unrelated work.
+    """
+    staged: dict[int, dict[str, Any]] = {}
+    malformed_job_ids: set[int] = set()
     for row in rows:
         mapping = row._mapping  # pylint: disable=protected-access
-        schedule_state = mapping['schedule_state']
+        raw_schedule_state = mapping['schedule_state']
         workspace = mapping['workspace']
         # Legacy single-job controllers have a NULL schedule_state. Fence them
         # out here instead of raising while decoding a NULL enum; the same
@@ -1221,15 +1228,30 @@ def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
         # reclaim. Cancellation routing does require a workspace, and
         # get_job_cancellation_states_from_status_check_info applies that
         # narrowing itself.
-        if schedule_state is None:
+        if raw_schedule_state is None:
             continue
         job_id = mapping['spot_job_id']
-        info = result.get(job_id)
+        if job_id in malformed_job_ids:
+            continue
+        raw_status = mapping['status']
+        try:
+            schedule_state = ManagedJobScheduleState(raw_schedule_state)
+            status = ManagedJobStatus(raw_status)
+        except (TypeError, ValueError) as e:
+            staged.pop(job_id, None)
+            malformed_job_ids.add(job_id)
+            logger.error(
+                f'Excluding managed job {job_id} from the shared status '
+                'snapshot because one lifecycle row is malformed '
+                f'(schedule_state={raw_schedule_state!r}, '
+                f'status={raw_status!r}): {common_utils.format_exception(e)}')
+            continue
+        info = staged.get(job_id)
         # WARNING: Keep this decode (enum conversion + job_name fallback)
         # in sync with get_managed_job_tasks.
         if info is None:
             info = {
-                'schedule_state': ManagedJobScheduleState(schedule_state),
+                'schedule_state': schedule_state,
                 'controller_pid': mapping['controller_pid'],
                 'controller_pid_started_at':
                     mapping['controller_pid_started_at'],
@@ -1246,11 +1268,10 @@ def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
                 '_latest_task_has_nonterminal': False,
                 'tasks': [],
             }
-            result[job_id] = info
+            staged[job_id] = info
         job_name = mapping['job_info_name']
         if job_name is None:
             job_name = mapping['task_name']
-        status = ManagedJobStatus(mapping['status'])
         _merge_latest_task_status(info, mapping['task_id'], status)
         info['tasks'].append({
             'task_id': mapping['task_id'],
@@ -1261,6 +1282,9 @@ def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
             'start_at': mapping['start_at'],
             'last_recovered_at': mapping['last_recovered_at'],
         })
+    for job_id in malformed_job_ids:
+        result.pop(job_id, None)
+    result.update(staged)
 
 
 def _merge_latest_task_status(info: dict[str, Any], task_id: int,
@@ -1404,8 +1428,10 @@ def get_jobs_status_check_info(job_ids: list[int]) -> dict[int, dict[str, Any]]:
     Returns a mapping ``job_id -> {schedule_state, controller_pid,
     controller_pid_started_at, pool, tasks: [{task_id, status, job_name,
     task_name, submitted_at, start_at, last_recovered_at}]}``
-    with ``tasks`` ordered by ``task_id``. Job ids with no task rows are absent
-    from the result.
+    with ``tasks`` ordered by ``task_id``. Job ids with no task rows, a NULL
+    schedule state, or any undecodable lifecycle enum are absent from the
+    result. Malformed jobs are omitted atomically so valid peers in the same
+    batch remain available while no caller can act on a partial task list.
 
     ``job_name`` mirrors ``get_managed_job_tasks`` (public display name with a
     fallback to ``task_name``); ``task_name`` preserves the controller launch
