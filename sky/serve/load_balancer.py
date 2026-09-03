@@ -5467,9 +5467,9 @@ class SkyServeLoadBalancer:
                                 'generation.')
                         previous_role = self._lb_role
                         previous_generation = self._lb_role_generation
-                        role_authority_changed = (
-                            role is not previous_role or
-                            generation != previous_generation)
+                        role_authority_changed = (role is not previous_role or
+                                                  generation
+                                                  != previous_generation)
                         requires_fresh_occupancy = (role
                                                     in (lb_ha.LbRole.ARMED,
                                                         lb_ha.LbRole.ACTIVE) and
@@ -6052,69 +6052,82 @@ class SkyServeLoadBalancer:
         had_admission_slot = False
         body_cleanup_transferred = False
         try:
-            # Cache the bounded body before the queue starts polling the ASGI
-            # receive channel for disconnects. This also rejects oversized
-            # work without occupying a queue slot.
-            if self._request_queue_config is not None:
-                await self._request_body(request)
-            legacy_demand = (not self._queued_compatibility_demand_supported or
-                             self._configured_accelerators is None)
-            if legacy_demand:
-                # Until capability negotiation succeeds, retain the old
-                # pre-admission signal. This is required for a new LB rolled
-                # out before (or rolled back onto) an old controller: the old
-                # controller ignores the replaceable queue gauge. Services
-                # without an exact-card catalog also retain aggregate arrival
-                # scaling because their queue cannot publish card profiles.
-                self._record_request_demand_once(request)
-            acquired_slot = await self._acquire_request_slot(request)
-            had_admission_slot = acquired_slot
-            if acquired_slot:
-                # The configured active-concurrency budget owns the body now.
-                self._release_waiting_body_budget(request)
-            # Draining may begin while admission awaits. Recheck immediately
-            # before the inner handler records this arrival; there is no await
-            # between this fence and RequestTimestamp.add(), so the shutdown
-            # snapshot cannot miss a request that starts after draining.
-            if self._draining:
-                raise self._draining_request_error()
-            if not self._accepts_new_requests():
-                raise self._inactive_role_request_error()
-            # Commit arrival/history only after admission and its final role
-            # fence. Waiting work is reported separately as a live queue gauge,
-            # so an empty compatible fleet can still launch without leaving a
-            # phantom arrival behind when this LB drains during admission.
-            self._record_request_demand_once(request)
-            self._mark_request_classification_eligible(request)
+            predispatch_error: fastapi.HTTPException | None = None
             try:
-                response = await self._proxy_with_retries_inner(request)
-            finally:
-                # A terminal rejection classifies itself before raising. Every
-                # other return, exception, or cancellation after the final
-                # admission fence is part of the non-rejected subset.
-                self._record_request_classification_once(request,
-                                                         rejected=False)
-            if (acquired_slot and
-                    isinstance(response, _ReleasingStreamingResponse)):
-                response.hold_cleanup_until_complete(
-                    lambda: self._release_request_slot(request))
-                acquired_slot = False
-            if (vars(request).get(_WAITING_REQUEST_BODY_BYTES_ATTR, 0) and
-                    isinstance(response, _ReleasingStreamingResponse)):
+                # Cache the bounded body before the queue starts polling the
+                # ASGI receive channel for disconnects. This also rejects
+                # oversized work without occupying a queue slot.
+                if self._request_queue_config is not None:
+                    await self._request_body(request)
+                legacy_demand = (not self._queued_compatibility_demand_supported
+                                 or self._configured_accelerators is None)
+                if legacy_demand:
+                    # Until capability negotiation succeeds, retain the old
+                    # pre-admission signal. This is required for a new LB rolled
+                    # out before (or rolled back onto) an old controller: the
+                    # old controller ignores the replaceable queue gauge.
+                    # Services without an exact-card catalog also retain
+                    # aggregate arrival scaling because their queue cannot
+                    # publish card profiles.
+                    self._record_request_demand_once(request)
+                acquired_slot = await self._acquire_request_slot(request)
+                had_admission_slot = acquired_slot
+                if acquired_slot:
+                    # The configured active-concurrency budget owns the body
+                    # now.
+                    self._release_waiting_body_budget(request)
+                # Draining may begin while admission awaits. Recheck immediately
+                # before the inner handler records this arrival; there is no
+                # await between this fence and RequestTimestamp.add(), so the
+                # shutdown snapshot cannot miss a request that starts after
+                # draining.
+                if self._draining:
+                    raise self._draining_request_error()
+                if not self._accepts_new_requests():
+                    raise self._inactive_role_request_error()
+                # Commit arrival/history only after admission and its final role
+                # fence. Waiting work is reported separately as a live queue
+                # gauge, so an empty compatible fleet can still launch without
+                # leaving a phantom arrival behind when this LB drains during
+                # admission.
+                self._record_request_demand_once(request)
+                self._mark_request_classification_eligible(request)
+                try:
+                    response = await self._proxy_with_retries_inner(request)
+                finally:
+                    # A terminal rejection classifies itself before raising.
+                    # Every other return, exception, or cancellation after the
+                    # final admission fence is part of the non-rejected subset.
+                    self._record_request_classification_once(request,
+                                                             rejected=False)
+                if (acquired_slot and
+                        isinstance(response, _ReleasingStreamingResponse)):
+                    response.hold_cleanup_until_complete(
+                        lambda: self._release_request_slot(request))
+                    acquired_slot = False
+                if (vars(request).get(_WAITING_REQUEST_BODY_BYTES_ATTR, 0) and
+                        isinstance(response, _ReleasingStreamingResponse)):
 
-                async def _release_body() -> None:
-                    self._release_waiting_body_budget(request, drop_body=True)
+                    async def _release_body() -> None:
+                        self._release_waiting_body_budget(request,
+                                                          drop_body=True)
 
-                # A live update may disable queueing between body buffering and
-                # admission. Keep that body's bytes charged until its streaming
-                # response releases the underlying httpx request owner.
-                response.hold_cleanup_until_complete(_release_body)
-                body_cleanup_transferred = True
-            return response
-        except fastapi.HTTPException as error:
-            if ledger_identity is not None:
-                return await self._predispatch_error_response(request, error)
-            raise
+                    # A live update may disable queueing between body buffering
+                    # and admission. Keep that body's bytes charged until its
+                    # streaming response releases the underlying httpx request
+                    # owner.
+                    response.hold_cleanup_until_complete(_release_body)
+                    body_cleanup_transferred = True
+                return response
+            except fastapi.HTTPException as error:
+                if ledger_identity is None:
+                    raise
+                # Leave the exception handler before the ledger checkpoint so
+                # cancellation cannot replace an active routing exception.
+                predispatch_error = error
+            assert predispatch_error is not None
+            return await self._predispatch_error_response(
+                request, predispatch_error)
         finally:
             try:
                 if acquired_slot:
