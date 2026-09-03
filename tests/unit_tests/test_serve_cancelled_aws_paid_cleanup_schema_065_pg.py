@@ -36,9 +36,9 @@ def test_serve065_lineage_and_runtime_metadata() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['067']
+    assert scripts.get_heads() == ['068']
     assert scripts.get_revision('065').down_revision == '064'
-    assert migration_utils.SERVE_VERSION == '067'
+    assert migration_utils.SERVE_VERSION == '068'
     assert '065' in (
         placement_normalization_authority.RECOGNIZED_ADDITIVE_REVISIONS)
 

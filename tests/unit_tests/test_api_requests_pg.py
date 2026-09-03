@@ -42,6 +42,7 @@ from sky.jobs.server import core as managed_jobs_core
 from sky.provision import common as provision_common
 from sky.serve import constants as serve_constants
 from sky.serve import kueue_lane_lineage_schema
+from sky.serve import non_pool_launch_reconciliation
 from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
 from sky.serve import paid_retirement
@@ -652,6 +653,8 @@ def _prepare_paid_provider_absence_graph(
     pool_key: str | None = None,
     production_http_normalization: bool = False,
     explicit_cancel: bool = False,
+    terminal_status: requests.RequestStatus | None = None,
+    terminal_cause: event_api_models.EventCause | None = None,
     profile_kind: ordinary_launch_binding.NonPoolLaunchProfileKind = (
         ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID),
     effect_phase: ordinary_launch_binding.EffectPhase = (
@@ -667,6 +670,14 @@ def _prepare_paid_provider_absence_graph(
             terminalize):
         raise ValueError('A pre-effect graph must be terminalized by the '
                          'production reducer.')
+    if (terminal_status is None) != (terminal_cause is None):
+        raise ValueError('Terminal status and cause must be supplied together.')
+    if terminal_status is None:
+        terminal_status = (requests.RequestStatus.CANCELLED if explicit_cancel
+                           else requests.RequestStatus.FAILED)
+        terminal_cause = (event_api_models.EventCause.EXPLICIT_CANCEL
+                          if explicit_cancel else
+                          event_api_models.EventCause.HANDLER_FAILED)
     engine, _ = bound_request_database
     if pool_key is None:
         pool_key = _gc_paid_pool_key()
@@ -977,18 +988,14 @@ def _prepare_paid_provider_absence_graph(
                 sqlalchemy.update(request_postgres.REQUESTS).where(
                     request_postgres.REQUESTS.c.request_id ==
                     context.request_id).values(
-                        status=(requests.RequestStatus.CANCELLED.value
-                                if explicit_cancel else
-                                requests.RequestStatus.FAILED.value),
-                        terminal_cause=(
-                            event_api_models.EventCause.EXPLICIT_CANCEL.value
-                            if explicit_cancel else
-                            event_api_models.EventCause.HANDLER_FAILED.value),
+                        status=terminal_status.value,
+                        terminal_cause=terminal_cause.value,
                         execution_generation=1,
                         execution_quiescence_required=True,
                         execution_quiesced_generation=1,
                         execution_quiesced_at=quiesced_at,
-                        error=(None if explicit_cancel else
+                        error=(None if terminal_status
+                               is requests.RequestStatus.CANCELLED else
                                _gc_provider_negative_ack_error(receipt)),
                         finished_at=now,
                         updated_at=now))
@@ -3244,6 +3251,134 @@ workspaces:
         provider_identity=identity, credential_profile='prod')
 
 
+@pytest.mark.parametrize(
+    ('terminal_status', 'terminal_cause'),
+    ((requests.RequestStatus.FAILED,
+      event_api_models.EventCause.DISPATCHER_SUBMIT_FAILED),
+     (requests.RequestStatus.CANCELLED,
+      event_api_models.EventCause.EXECUTION_LEASE_EXPIRED)))
+@pytest.mark.parametrize(
+    ('provider_evidence', 'instance_state'),
+    ((ordinary_launch_binding.ProviderEvidence.PRESENT, 'running'),
+     (ordinary_launch_binding.ProviderEvidence.ABSENT, 'terminated')))
+def test_aws_paid_infrastructure_terminal_census_reaches_exact_cleanup(
+        bound_request_database, monkeypatch,
+        terminal_status: requests.RequestStatus,
+        terminal_cause: event_api_models.EventCause,
+        provider_evidence: ordinary_launch_binding.ProviderEvidence,
+        instance_state: str) -> None:
+    """Post-effect infrastructure terminals retain exact AWS cleanup."""
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch,
+        terminal_status=terminal_status,
+        terminal_cause=terminal_cause)
+    scope = request_postgres.bound_non_pool_aws_provider_census_scope(
+        graph.context, graph.authority)
+    assert scope is not None
+    identity = scope.provider_identity
+    payload = {
+        'association_id': str(graph.context.association_id),
+        'cluster_name': 'gc-service-3',
+        'instances': [{
+            'availability_zone': identity['zone'],
+            'client_token': identity['client_token'],
+            'cluster_name_on_cloud': identity['cluster_name_on_cloud'],
+            'instance_id': 'i-0123456789abcdef0',
+            'instance_type': identity['instance_type'],
+            'market': 'spot',
+            'state': instance_state,
+        }],
+        'probe_contract': 'aws-client-token-instance-presence-v1',
+        'profile_kind': 'ORDINARY_PAID',
+        'provider_identity': identity,
+        'replica_record_id': str(_GC_REPLICA_RECORD_ID),
+        'result': provider_evidence.value,
+    }
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, graph.authority, provider_evidence, payload)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    manager._ordinary_launch_binding_authority = graph.authority
+    projector = lambda connection, projection: manager._project_bound_ordinary_launch(  # noqa: E501
+        None, connection, projection)
+
+    if provider_evidence is ordinary_launch_binding.ProviderEvidence.PRESENT:
+        assert request_postgres.authorize_bound_non_pool_provider_present_cleanup(
+            graph.context, graph.authority, project_replica_result=projector)
+        info = serve_state.get_replica_info_from_id('gc-service', 3)
+        assert info is not None
+        assert ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+            info, require_scheduled=True)
+        expected_claims = expected_pins = 1
+    else:
+        assert request_postgres.project_bound_non_pool_provider_absence(
+            graph.context, graph.authority, project_replica_result=projector)
+        expected_claims = expected_pins = 0
+
+    with graph.engine.connect() as connection:
+        claim_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table).where(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == 'gc-service',
+                    serve_state_schema.paid_capacity_claims_table.c.replica_id
+                    == 3)).scalar_one()
+        pin_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUEST_RETENTION_PINS).where(
+                    request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                    graph.context.request_id)).scalar_one()
+    assert claim_count == expected_claims
+    assert pin_count == expected_pins
+
+
+@pytest.mark.parametrize(
+    ('terminal_status', 'terminal_cause'),
+    ((requests.RequestStatus.FAILED,
+      event_api_models.EventCause.DISPATCHER_SUBMIT_FAILED),
+     (requests.RequestStatus.CANCELLED,
+      event_api_models.EventCause.EXECUTION_LEASE_EXPIRED)))
+def test_aws_paid_infrastructure_terminal_without_binding_pin_stays_unknown(
+        bound_request_database, monkeypatch,
+        terminal_status: requests.RequestStatus,
+        terminal_cause: event_api_models.EventCause) -> None:
+    """A terminal cause alone never grants provider-read authority."""
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch,
+        terminal_status=terminal_status,
+        terminal_cause=terminal_cause)
+    with graph.engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(request_postgres.REQUEST_RETENTION_PINS).where(
+                request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                graph.context.request_id))
+    monkeypatch.setattr(
+        non_pool_launch_reconciliation, '_query_aws_paid_provider_census',
+        lambda *_args, **_kwargs: pytest.fail(
+            'incomplete binding evidence must not reach AWS'))
+    info = serve_state.get_replica_info_from_id('gc-service', 3)
+    assert info is not None
+
+    observation = non_pool_launch_reconciliation.observe_provider(
+        graph.context, info, graph.authority)
+
+    assert observation.evidence is ordinary_launch_binding.ProviderEvidence.UNKNOWN
+    assert observation.payload[
+        'reason'] == 'missing-immutable-aws-provider-access'
+    with graph.engine.connect() as connection:
+        claim_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table).where(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == 'gc-service',
+                    serve_state_schema.paid_capacity_claims_table.c.replica_id
+                    == 3)).scalar_one()
+    assert claim_count == 1
+
+
 @pytest.mark.parametrize('config_failure',
                          ('missing', 'corrupt', 'wrong_workspace'))
 def test_aws_paid_census_scope_fails_closed_without_version_config(
@@ -3956,15 +4091,26 @@ def test_gcp_paid_exact_presence_authorizes_only_immediate_cleanup(
         graph.context, graph.authority)
 
 
-def test_cancelled_gcp_v2_paid_present_cleanup_then_absence_retires_atomically(
-        bound_request_database, monkeypatch) -> None:
-    """Cohort-15 teardown keeps debits until exact GCP-v2 cleanup is absent."""
+@pytest.mark.parametrize(
+    ('terminal_status', 'terminal_cause'),
+    ((requests.RequestStatus.CANCELLED,
+      event_api_models.EventCause.EXPLICIT_CANCEL),
+     (requests.RequestStatus.FAILED,
+      event_api_models.EventCause.DISPATCHER_SUBMIT_FAILED),
+     (requests.RequestStatus.CANCELLED,
+      event_api_models.EventCause.EXECUTION_LEASE_EXPIRED)))
+def test_gcp_v2_paid_terminal_present_then_absent_retires_atomically(
+        bound_request_database, monkeypatch,
+        terminal_status: requests.RequestStatus,
+        terminal_cause: event_api_models.EventCause) -> None:
+    """A retained exact GCP-v2 graph owns debits through provider cleanup."""
     graph = _prepare_paid_provider_absence_graph(
         bound_request_database,
         monkeypatch,
         pool_key=_gc_gcp_paid_pool_key(),
         production_http_normalization=True,
-        explicit_cancel=True)
+        terminal_status=terminal_status,
+        terminal_cause=terminal_cause)
     assert graph.context.capability_cohort_epoch == 15
     pool_identity = json.loads(graph.pool_key)
     assert pool_identity['version'] == 2
@@ -4056,8 +4202,8 @@ def test_cancelled_gcp_v2_paid_present_cleanup_then_absence_retires_atomically(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
                 request_postgres.REQUEST_RETENTION_PINS)).scalar_one()
     assert association['resolution'] == 'PROJECTED'
-    assert association['terminal_status'] == 'CANCELLED'
-    assert association['terminal_cause'] == 'explicit_cancel'
+    assert association['terminal_status'] == terminal_status.value
+    assert association['terminal_cause'] == terminal_cause.value
     assert association['provider_evidence_payload'] == absent_payload
     assert replica['ordinary_launch_association_id'] is None
     assert claim_count == pin_count == 0

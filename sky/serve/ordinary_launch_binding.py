@@ -461,6 +461,9 @@ class TerminalStatus(str, enum.Enum):
     CANCELLED = 'CANCELLED'
 
 
+_TERMINAL_STATUS_VALUES = frozenset(value.value for value in TerminalStatus)
+
+
 def ordinary_paid_provider_terminal_shape_matches(
     status: TerminalStatus | str | Any,
     cause: str | Any,
@@ -468,40 +471,41 @@ def ordinary_paid_provider_terminal_shape_matches(
 ) -> bool:
     """Whether terminal evidence can safely enter paid-provider cleanup.
 
-    Provider failures retain the original cross-cloud contract.  An explicit
-    cancellation is additionally actionable only for an exact provider-census
-    pool: GCP VM/disk/operation reads or an account-scoped AWS ClientToken
-    census can prove PRESENT/ABSENT after provider I/O quiesces.
+    A terminal cause is diagnostic, not cleanup authority.  Any terminal
+    request may use an exact v2 GCP or AWS census; callers remain responsible
+    for proving the immutable request/binding graph, paid claim, retention pin,
+    effect phase, and execution quiescence before provider access.  The two
+    narrow legacy arms preserve pre-v2 behavior.
     """
     status_value = getattr(status, 'value', status)
     cause_value = getattr(cause, 'value', cause)
     if (status_value == TerminalStatus.FAILED.value and
             cause_value == 'handler_failed'):
         return True
-    if (status_value != TerminalStatus.CANCELLED.value or
-            cause_value != 'explicit_cancel' or
-            not isinstance(paid_capacity_pool_key, str) or
+    if (not isinstance(paid_capacity_pool_key, str) or
             not paid_capacity_pool_key):
         return False
     identity = paid_capacity.pool_key_payload(paid_capacity_pool_key)
     if not isinstance(identity,
                       Mapping) or identity.get('use_spot') is not True:
         return False
-    if identity.get('cloud') == 'gcp':
-        if identity.get('version') == 1:
-            return True
-        provider_identity = identity.get('provider_identity')
-        return bool(
-            identity.get('version') == 2 and
-            isinstance(provider_identity, Mapping) and
-            _GCP_PROJECT_ID_RE.fullmatch(
-                str(provider_identity.get('gcp_project_id'))) is not None)
     provider_identity = identity.get('provider_identity')
-    return bool(
+    exact_aws_pool = bool(
         identity.get('cloud') == 'aws' and identity.get('version') == 2 and
         isinstance(provider_identity, Mapping) and
         re.fullmatch(r'[0-9]{12}', str(
             provider_identity.get('aws_account_id'))) is not None)
+    exact_gcp_pool = bool(
+        identity.get('cloud') == 'gcp' and identity.get('version') == 2 and
+        isinstance(provider_identity, Mapping) and _GCP_PROJECT_ID_RE.fullmatch(
+            str(provider_identity.get('gcp_project_id'))) is not None)
+    if (exact_aws_pool or exact_gcp_pool):
+        return bool(status_value in _TERMINAL_STATUS_VALUES and
+                    isinstance(cause_value, str) and cause_value)
+    if (status_value != TerminalStatus.CANCELLED.value or
+            cause_value != 'explicit_cancel'):
+        return False
+    return bool(identity.get('cloud') == 'gcp' and identity.get('version') == 1)
 
 
 def paid_provider_reconciliation_pool_shape_matches(
@@ -570,19 +574,23 @@ _PROVIDER_EVIDENCE_SQL = ', '.join(
 _LEGACY_RESOLUTION_SQL = ', '.join(
     f"'{value.value}'" for value in LegacyReconciliationResolution)
 _ORDINARY_PAID_PROVIDER_TERMINAL_SQL = (
-    "((terminal_status = 'FAILED' AND terminal_cause = 'handler_failed') OR "
-    "(terminal_status = 'CANCELLED' AND terminal_cause = 'explicit_cancel' "
-    "AND ((paid_capacity_pool_key::jsonb ->> 'cloud' = 'gcp' "
-    "AND paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true' AND "
-    "((paid_capacity_pool_key::jsonb ->> 'version' = '1') OR "
-    "(paid_capacity_pool_key::jsonb ->> 'version' = '2' AND "
+    "(((terminal_status IN ('SUCCEEDED', 'FAILED', 'CANCELLED') AND "
+    "terminal_cause IS NOT NULL AND terminal_cause <> '') AND "
+    "((paid_capacity_pool_key::jsonb ->> 'cloud' = 'gcp' AND "
+    "paid_capacity_pool_key::jsonb ->> 'version' = '2' AND "
+    "paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true' AND "
     "paid_capacity_pool_key::jsonb -> 'provider_identity' ->> "
-    "'gcp_project_id' ~ '^[a-z][a-z0-9-]{4,28}[a-z0-9]$'))) OR "
-    "(paid_capacity_pool_key::jsonb ->> 'cloud' = 'aws' "
-    "AND paid_capacity_pool_key::jsonb ->> 'version' = '2' "
-    "AND paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true' "
-    "AND paid_capacity_pool_key::jsonb -> 'provider_identity' ->> "
-    "'aws_account_id' ~ '^[0-9]{12}$'))))")
+    "'gcp_project_id' ~ '^[a-z][a-z0-9-]{4,28}[a-z0-9]$') OR "
+    "(paid_capacity_pool_key::jsonb ->> 'cloud' = 'aws' AND "
+    "paid_capacity_pool_key::jsonb ->> 'version' = '2' AND "
+    "paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true' AND "
+    "paid_capacity_pool_key::jsonb -> 'provider_identity' ->> "
+    "'aws_account_id' ~ '^[0-9]{12}$'))) OR "
+    "(terminal_status = 'FAILED' AND terminal_cause = 'handler_failed') OR "
+    "(terminal_status = 'CANCELLED' AND terminal_cause = 'explicit_cancel' "
+    "AND paid_capacity_pool_key::jsonb ->> 'cloud' = 'gcp' AND "
+    "paid_capacity_pool_key::jsonb ->> 'version' = '1' AND "
+    "paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true'))")
 
 metadata = sqlalchemy.MetaData()
 ordinary_launch_associations_table = sqlalchemy.Table(
