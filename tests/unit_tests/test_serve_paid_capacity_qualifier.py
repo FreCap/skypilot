@@ -579,13 +579,13 @@ def test_scale_profile_exceeds_physical_gate_for_rendered_shape():
     assert profile.scale_up_min_replicas == profile.max_units
 
 
-def test_positive_telemetry_deadline_uses_frozen_queue_timeout_margin():
+def test_positive_telemetry_deadline_allows_one_retry_after_scale_timeout():
     profile = qualifier.PROFILES['scale']
     small = qualifier.PROFILES['small']
 
     assert profile.request_queue_timeout_seconds == 600
     assert qualifier.positive_telemetry_deadline_monotonic(
-        profile, scale_started_monotonic=100.0) == 690.0
+        profile, scale_started_monotonic=100.0) == 1590.0
 
     with pytest.raises(ValueError, match='polling margin'):
         qualifier.positive_telemetry_window_seconds(
@@ -4961,7 +4961,7 @@ def test_schema_ten_accepts_positive_after_queue_fully_dispatches(tmp_path):
 
 @pytest.mark.parametrize(
     ('positive_observed_at', 'final_observed_at'),
-    [(4.5, 500.0), (595.0, 700.0), (501.0, 500.0)],
+    [(4.5, 500.0), (1495.0, 1600.0), (501.0, 500.0)],
 )
 def test_schema_ten_rejects_positive_outside_stimulus_queue_and_final_bounds(
         tmp_path, positive_observed_at, final_observed_at):

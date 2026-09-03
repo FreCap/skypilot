@@ -169,7 +169,17 @@ def positive_telemetry_window_seconds(profile: Profile) -> float:
     if profile.name != 'scale':
         return max(2 * 60, 4 * profile.poll_seconds)
     observation_margin = max(1.0, profile.poll_seconds)
-    window = profile.request_queue_timeout_seconds - observation_margin
+    queue_attempt_window = (profile.request_queue_timeout_seconds -
+                            observation_margin)
+    if not math.isfinite(queue_attempt_window) or queue_attempt_window <= 0:
+        raise ValueError(
+            'Request queue timeout has no positive telemetry polling margin.')
+    # Provider convergence and application readiness are independent clocks.
+    # The resident stimulus retries only after the load balancer returns its
+    # typed REJECTED_PRE_DISPATCH receipt, so allow the provider its complete
+    # qualification window followed by one complete queue attempt.  This does
+    # not extend any individual request's configured queue deadline.
+    window = profile.scale_timeout_seconds + queue_attempt_window
     if not math.isfinite(window) or window <= 0:
         raise ValueError(
             'Request queue timeout has no positive telemetry polling margin.')

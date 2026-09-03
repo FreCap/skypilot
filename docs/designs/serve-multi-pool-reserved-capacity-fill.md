@@ -146,9 +146,13 @@ in-flight, processing, confirmed occupancy, exact active-ledger attribution,
 and exactly 800 queued plus in-flight identities, but queue depth may already
 be zero after full dispatch. The completion gate opens only after both tasks
 succeed; either failure cancels and awaits its sibling while leaving the gate
-closed. The positive sample's absolute deadline is the frozen 600-second queue
-timeout minus one 10-second observation margin, or 590 seconds from the
-pre-demand clock. The physical proof records its independent 300-second
+closed. A timed-out queue attempt must return an exact
+``REJECTED_PRE_DISPATCH`` receipt before the same immutable request identity is
+resubmitted. The positive sample therefore has the 900-second provider
+qualification window plus one frozen 600-second queue attempt, minus one
+10-second observation margin: 1,490 seconds from the pre-demand clock. No
+individual request receives a longer queue deadline. The physical proof records
+its independent 300-second
 provider-``RUNNING`` benchmark as ``scale_slo_met`` and continues until its
 900-second correctness timeout. Missing the benchmark is diagnostic evidence,
 not a reason to cancel otherwise healthy convergence. Only then
@@ -433,10 +437,13 @@ After the resident-stimulus proof, the physical scale gate and request
 telemetry gate run concurrently. The request gate must observe positive
 in-flight, processing, confirmed-occupancy, and active-ledger evidence for the
 same exact stimulus. Queue depth may be zero once all 800 identities dispatch,
-but queued plus in-flight must remain exactly 800. Its absolute deadline is
-derived directly from the frozen contract rather than provider readiness:
-queue timeout minus one observation interval. For the current 600-second queue
-and 10-second polling contracts, that is 590 seconds from the pre-demand clock.
+but queued plus in-flight must remain exactly 800. Its absolute deadline allows
+the complete 900-second provider qualification window followed by one frozen
+600-second queue attempt, minus one observation interval. For the current
+contracts, that is 1,490 seconds from the pre-demand clock. A request that
+crosses its own 600-second deadline must first become an exact
+``REJECTED_PRE_DISPATCH`` attempt; only then may the client resubmit its stable
+identity.
 The completion gate opens only after both proofs succeed. Either proof failure
 cancels and awaits the other without opening the gate. The qualifier then sends
 the remaining 9,200 identities in 23 sequential batches of 400,
@@ -4104,8 +4111,8 @@ stimulus is established. The request proof requires positive in-flight,
 processing, confirmed occupancy, and active-ledger attribution; queue depth may
 be zero after full dispatch, while queued plus in-flight remains exactly 800.
 It may complete before or after physical qualification and must complete by the
-queue-derived 590-second deadline. The completion gate opens only when both
-proofs pass.
+1,490-second provider-plus-one-queue-attempt deadline. The completion gate opens
+only when both proofs pass.
 Its exact one-L4 task shape and 800 logical-slot cap therefore permit the
 at-least-100 physical gate. After that gate, the remaining 9,200 identities run
 in sequential 400-request batches with bounded 128-request HTTP concurrency;
