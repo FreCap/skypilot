@@ -4093,6 +4093,92 @@ def test_gcp_paid_exact_presence_authorizes_only_immediate_cleanup(
         graph.context, graph.authority)
 
 
+def test_paid_teardown_submission_completion_releases_only_mutation_slot(
+        bound_request_database, monkeypatch) -> None:
+    """Provider acknowledgement preserves every debit until exact ABSENT."""
+    graph = _prepare_paid_provider_absence_graph(bound_request_database,
+                                                 monkeypatch)
+    scope = request_postgres.bound_non_pool_aws_provider_census_scope(
+        graph.context, graph.authority)
+    assert scope is not None
+    identity = scope.provider_identity
+    present_payload = {
+        'association_id': str(graph.context.association_id),
+        'cluster_name': 'gc-service-3',
+        'instances': [{
+            'availability_zone': identity['zone'],
+            'client_token': identity['client_token'],
+            'cluster_name_on_cloud': identity['cluster_name_on_cloud'],
+            'instance_id': 'i-0123456789abcdef0',
+            'instance_type': identity['instance_type'],
+            'market': 'spot',
+            'state': 'running',
+        }],
+        'probe_contract': 'aws-client-token-instance-presence-v1',
+        'profile_kind': 'ORDINARY_PAID',
+        'provider_identity': identity,
+        'replica_record_id': str(_GC_REPLICA_RECORD_ID),
+        'result': 'PRESENT',
+    }
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, graph.authority,
+        ordinary_launch_binding.ProviderEvidence.PRESENT, present_payload)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    manager._ordinary_launch_binding_authority = graph.authority
+    projector = lambda connection, projection: manager._project_bound_ordinary_launch(  # noqa: E501
+        None, connection, projection)
+    assert request_postgres.authorize_bound_non_pool_provider_present_cleanup(
+        graph.context, graph.authority, project_replica_result=projector)
+    reserved = serve_state.reserve_replica_teardowns_running_if_capacity(
+        'gc-service', [(3, str(_GC_REPLICA_RECORD_ID))],
+        termination_limit=4,
+        expected_service_hash='gc-service-hash',
+        expected_lifecycle_epoch=4,
+        expected_controller_owner=(123, '10.0.0.2'))
+    assert set(reserved) == {3}
+
+    pending = request_postgres.mark_bound_non_pool_provider_teardown_observation_pending(
+        graph.context, graph.authority)
+
+    assert ordinary_launch_binding.provider_present_teardown_phase(pending) is (
+        ordinary_launch_binding.ProviderPresentTeardownPhase.
+        ABSENCE_OBSERVATION_PENDING)
+    assert pending.status_property.sky_down_status is common_utils.ProcessStatus.FAILED
+    assert ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+        pending)
+    with graph.engine.begin() as connection:
+        _, terminating = serve_state.get_replica_mutation_counts_in_transaction(
+            connection)
+        claim_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table).where(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == 'gc-service')).scalar_one()
+        pin_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUEST_RETENTION_PINS).where(
+                    request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                    graph.context.request_id)).scalar_one()
+        pointer = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.
+                ordinary_launch_association_id).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    'gc-service', serve_state_schema.replicas_table.c.replica_id
+                    == 3)).scalar_one()
+    assert terminating == 0
+    assert claim_count == pin_count == 1
+    assert pointer == graph.context.association_id
+
+    scheduled = request_postgres.requeue_bound_non_pool_provider_teardown_submission(
+        graph.context, graph.authority)
+    assert ordinary_launch_binding.provider_present_teardown_phase(
+        scheduled) is (ordinary_launch_binding.ProviderPresentTeardownPhase.
+                       SUBMISSION_SCHEDULED)
+
+
 @pytest.mark.parametrize(
     ('terminal_status', 'terminal_cause'),
     ((requests.RequestStatus.CANCELLED,

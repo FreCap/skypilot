@@ -4361,8 +4361,9 @@ def _purge_ownership_failure(service_name: str, detail: str) -> str:
 
 
 def run_bounded_serve_teardown_threads(
-    work: list[tuple[Any, thread_utils.SafeThread]],
+    work: list[Any],
     *,
+    make_worker: Callable[[Any], thread_utils.SafeThread],
     pool: bool,
     reserve_running: Callable[[list[Any], int], Mapping[int, Any]],
     restore_never_started: Callable[[Any], Any | None],
@@ -4407,13 +4408,14 @@ def run_bounded_serve_teardown_threads(
                              'record UUID.')
         return replica_id, replica_record_id
 
-    pending: dict[tuple[int, str], tuple[Any, thread_utils.SafeThread]] = {}
-    for info, worker in work:
+    pending: dict[tuple[int, str], tuple[Any,
+                                         thread_utils.SafeThread | None]] = {}
+    for info in work:
         identity = _replica_identity(info)
         if identity in pending:
             raise ValueError('Serve teardown work contains duplicate replica '
                              f'identity {identity!r}.')
-        pending[identity] = (info, worker)
+        pending[identity] = (info, None)
     effective_infos: dict[tuple[int, str], Any] = {}
     no_progress_polls = 0
     while pending:
@@ -4421,14 +4423,25 @@ def run_bounded_serve_teardown_threads(
         if not continue_guard():
             raise RuntimeError('Serve teardown ownership was lost.')
         scheduled: list[tuple[tuple[int, str], Any,
-                              thread_utils.SafeThread]] = []
+                              thread_utils.SafeThread | None]] = []
         running_to_adopt: list[tuple[tuple[int, str], Any,
-                                     thread_utils.SafeThread]] = []
+                                     thread_utils.SafeThread | None]] = []
         concurrent_workers = 0
         for identity, (info, worker) in list(pending.items()):
             effective_info = effective_infos.get(identity)
             if effective_info is None:
                 effective_info = info
+            if worker is None:
+                phase = effective_info.status_property.sky_down_status
+                if phase == common_utils.ProcessStatus.SCHEDULED:
+                    scheduled.append((identity, effective_info, worker))
+                    continue
+                if phase == common_utils.ProcessStatus.RUNNING:
+                    running_to_adopt.append((identity, effective_info, worker))
+                    continue
+                raise RuntimeError(
+                    'Serve teardown work has no runnable durable phase for '
+                    f'replica {effective_info.replica_id}.')
             if worker.is_alive():
                 concurrent_workers += 1
                 continue
@@ -4455,10 +4468,13 @@ def run_bounded_serve_teardown_threads(
             else:
                 handle_failure(effective_info, worker.format_exc)
         available = max(0, max_concurrent_per_service - concurrent_workers)
-        for _, effective_info, worker in running_to_adopt[:available]:
+        for identity, effective_info, worker in running_to_adopt[:available]:
             if not continue_guard():
                 raise RuntimeError('Serve teardown ownership was lost '
                                    'during RUNNING adoption.')
+            if worker is None:
+                worker = make_worker(effective_info)
+                pending[identity] = (pending[identity][0], worker)
             try:
                 worker.start()
             except BaseException as error:  # pylint: disable=broad-except
@@ -4494,6 +4510,9 @@ def run_bounded_serve_teardown_threads(
                             'Serve teardown reservation changed exact replica '
                             f'identity {identity!r}.')
                     effective_infos[identity] = reserved_info
+                    if worker is None:
+                        worker = make_worker(reserved_info)
+                        pending[identity] = (pending[identity][0], worker)
                     try:
                         worker.start()
                     except BaseException as error:  # pylint: disable=broad-except
@@ -4515,6 +4534,7 @@ def run_bounded_serve_teardown_threads(
                                         'exact replica identity '
                                         f'{identity!r}.') from error
                                 effective_infos[identity] = restored
+                                pending[identity] = (pending[identity][0], None)
                         if worker.ident is not None:
                             logger.warning(
                                 'Serve teardown worker returned a start '
@@ -5423,12 +5443,17 @@ def _terminate_failed_services_locked(
             with ownership_guard_lock:
                 return _still_owns()
 
+        cleanup_target_by_identity = {
+            (info.replica_id, info.replica_record_id):
+                (cleanup_fence, cleanup_context)
+            for info, cleanup_fence, cleanup_context in cleanup_targets
+        }
+
         def _terminate_replica_cluster(
-            cleanup_target: tuple['replica_managers.ReplicaInfo', Any,
-                                  Any | None]
-        ) -> None:
+                info: 'replica_managers.ReplicaInfo') -> None:
             # Reuse the canonical direct core.down path with retries.
-            info, cleanup_fence, cleanup_context = cleanup_target
+            cleanup_fence, cleanup_context = cleanup_target_by_identity[(
+                info.replica_id, info.replica_record_id)]
             identity = teardown_identities[info.replica_id]
             terminate_kwargs: dict[str, Any] = {
                 'continue_guard': _worker_still_owns,
@@ -5503,7 +5528,7 @@ def _terminate_failed_services_locked(
                     expected_lifecycle_epoch=lifecycle_epoch,
                     expected_controller_owner=cleanup_owner))
 
-        cleanup_work: list[tuple[Any, thread_utils.SafeThread]] = []
+        cleanup_work: list[Any] = []
         for target in cleanup_targets:
             info = target[0]
             if (info.status_property.sky_down_status
@@ -5511,13 +5536,12 @@ def _terminate_failed_services_locked(
                 info.status_property.sky_down_status = (
                     common_utils.ProcessStatus.SCHEDULED)
             _persist_cleanup(info)
-            cleanup_work.append(
-                (info,
-                 thread_utils.SafeThread(target=_terminate_replica_cluster,
-                                         args=(target,))))
+            cleanup_work.append(info)
         try:
             run_bounded_serve_teardown_threads(
                 cleanup_work,
+                make_worker=lambda info: thread_utils.SafeThread(
+                    target=_terminate_replica_cluster, args=(info,)),
                 pool=pool,
                 reserve_running=_reserve_failed_cleanup,
                 restore_never_started=_restore_failed_cleanup,
@@ -5792,20 +5816,24 @@ def _terminate_orphaned_service_children_impl(
                     info.replica_record_id,
                     expected_lifecycle_epoch=lifecycle_epoch))
 
-        orphan_cleanup_work: list[tuple[Any, thread_utils.SafeThread]] = []
+        cleanup_fence_by_identity: dict[tuple[int, str], Any] = {}
+        orphan_cleanup_work: list[Any] = []
         for info, cleanup_fence in to_terminate:
             if (info.status_property.sky_down_status
                     != common_utils.ProcessStatus.RUNNING):
                 info.status_property.sky_down_status = (
                     common_utils.ProcessStatus.SCHEDULED)
             _persist_orphan_cleanup(info)
-            orphan_cleanup_work.append(
-                (info,
-                 thread_utils.SafeThread(target=_terminate_orphan,
-                                         args=(info, cleanup_fence))))
+            cleanup_fence_by_identity[(info.replica_id,
+                                       info.replica_record_id)] = cleanup_fence
+            orphan_cleanup_work.append(info)
         try:
             run_bounded_serve_teardown_threads(
                 orphan_cleanup_work,
+                make_worker=lambda info: thread_utils.SafeThread(
+                    target=_terminate_orphan,
+                    args=(info, cleanup_fence_by_identity[
+                        (info.replica_id, info.replica_record_id)])),
                 pool=expected_pool,
                 reserve_running=_reserve_orphan_cleanup,
                 restore_never_started=_restore_orphan_cleanup,

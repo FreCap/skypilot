@@ -2191,9 +2191,7 @@ def test_bounded_teardown_empty_admission_fails_closed_without_hanging():
         replica_record_id='00000000-0000-4000-8000-000000000001',
         status_property=types.SimpleNamespace(
             sky_down_status=common_utils.ProcessStatus.SCHEDULED))
-    worker = mock.Mock(spec=thread_utils.SafeThread)
-    worker.is_alive.return_value = False
-    worker.ident = None
+    make_worker = mock.Mock()
     reserve = mock.Mock(return_value={})
     restore = mock.Mock()
     succeeded = mock.Mock()
@@ -2201,7 +2199,8 @@ def test_bounded_teardown_empty_admission_fails_closed_without_hanging():
 
     with pytest.raises(RuntimeError, match='made no progress'):
         serve_utils.run_bounded_serve_teardown_threads(
-            [(info, worker)],
+            [info],
+            make_worker=make_worker,
             pool=False,
             reserve_running=reserve,
             restore_never_started=restore,
@@ -2213,32 +2212,48 @@ def test_bounded_teardown_empty_admission_fails_closed_without_hanging():
             max_no_progress_polls=2)
 
     assert reserve.call_count == 2
-    worker.start.assert_not_called()
+    make_worker.assert_not_called()
     restore.assert_not_called()
     succeeded.assert_not_called()
     failed.assert_not_called()
 
 
-def test_bounded_teardown_drains_large_backlog_in_memory_safe_waves():
+def test_bounded_teardown_lazily_constructs_large_backlog_in_bounded_waves():
     infos = []
-    workers = []
-    for replica_id in range(100):
+    for replica_id in range(1000):
         info = types.SimpleNamespace(
             replica_id=replica_id,
             replica_record_id=str(uuid.UUID(int=replica_id + 1)),
             status_property=types.SimpleNamespace(
                 sky_down_status=common_utils.ProcessStatus.SCHEDULED))
+        infos.append(info)
+
+    constructed = 0
+    resident = 0
+    peak_resident = 0
+    workers = []
+
+    def _make_worker(_info):
+        nonlocal constructed, resident, peak_resident
+        constructed += 1
+        resident += 1
+        peak_resident = max(peak_resident, resident)
         worker = mock.Mock(spec=thread_utils.SafeThread)
         worker.is_alive.return_value = False
         worker.ident = None
 
-        def _start(worker=worker):
-            worker.ident = 1
+        def _start():
+            worker.ident = constructed
+
+        def _join():
+            nonlocal resident
+            resident -= 1
 
         worker.start.side_effect = _start
+        worker.join.side_effect = _join
         worker.format_exc = None
-        infos.append(info)
         workers.append(worker)
+        return worker
 
     reserved_batches = []
 
@@ -2254,7 +2269,8 @@ def test_bounded_teardown_drains_large_backlog_in_memory_safe_waves():
     failed = mock.Mock()
     with mock.patch.object(serve_utils.time, 'sleep'):
         serve_utils.run_bounded_serve_teardown_threads(
-            list(zip(infos, workers)),
+            infos,
+            make_worker=_make_worker,
             pool=False,
             reserve_running=_reserve_running,
             restore_never_started=restore,
@@ -2266,8 +2282,11 @@ def test_bounded_teardown_drains_large_backlog_in_memory_safe_waves():
 
     assert max(map(len, reserved_batches)) <= 4
     assert [replica_id for batch in reserved_batches for replica_id in batch
-           ] == list(range(100))
-    assert succeeded == list(range(100))
+           ] == list(range(1000))
+    assert succeeded == list(range(1000))
+    assert constructed == 1000
+    assert peak_resident <= 4
+    assert resident == 0
     for worker in workers:
         worker.start.assert_called_once_with()
         worker.join.assert_called_once_with()

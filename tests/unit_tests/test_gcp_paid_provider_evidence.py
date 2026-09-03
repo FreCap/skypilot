@@ -380,3 +380,50 @@ def test_terminate_managed_boot_disks_waits_for_every_delete(
         mock.call(operations[0], 'boltz-498512', zone='us-east4-a'),
         mock.call(operations[1], 'boltz-498512', zone='us-east4-a'),
     ]
+
+
+@pytest.mark.parametrize(('resource_kind', 'names'), [
+    ('instance', [
+        'svc-abc-head-1234abcd-compute',
+        'svc-abc-worker-8765dcba-compute',
+    ]),
+    ('disk', [
+        'svc-abc-head-1234abcd-compute',
+        'svc-abc-worker-8765dcba-compute',
+    ]),
+])
+def test_submit_exact_compute_terminations_never_waits_for_operations(
+        monkeypatch: pytest.MonkeyPatch, resource_kind: str,
+        names: list[str]) -> None:
+    compute = mock.Mock()
+    collection = (compute.instances.return_value if resource_kind == 'instance'
+                  else compute.disks.return_value)
+    collection.delete.return_value.execute.side_effect = [{
+        'name': f'delete-{index}'
+    } for index, _ in enumerate(names)]
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'load_resource',
+                        lambda: compute)
+    wait = mock.Mock(side_effect=AssertionError('submission must not poll'))
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'wait_for_operation',
+                        wait)
+    provider_config = {
+        'project_id': 'boltz-498512',
+        'availability_zone': 'us-east4-a',
+    }
+
+    if resource_kind == 'instance':
+        instance.submit_terminate_exact_instances(names, provider_config)
+    else:
+        instance.submit_terminate_exact_managed_boot_disks(
+            names, provider_config)
+
+    expected_keyword = 'instance' if resource_kind == 'instance' else 'disk'
+    assert collection.delete.call_args_list == [
+        mock.call(project='boltz-498512',
+                  zone='us-east4-a',
+                  **{expected_keyword: name}) for name in names
+    ]
+    assert collection.delete.return_value.execute.call_args_list == [
+        mock.call(num_retries=instance_utils.GCP_MAX_RETRIES) for _ in names
+    ]
+    wait.assert_not_called()

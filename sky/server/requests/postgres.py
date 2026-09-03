@@ -5677,6 +5677,72 @@ def bound_non_pool_provider_present_cleanup_is_authorized(
         return False
 
 
+def _transition_bound_non_pool_provider_teardown_phase(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    *,
+    expected: ordinary_launch_binding_lib.ProviderPresentTeardownPhase,
+    target: ordinary_launch_binding_lib.ProviderPresentTeardownPhase,
+) -> replica_managers.ReplicaInfo:
+    """Move one exact paid cleanup phase while retaining every debit."""
+    if not ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            context.profile.kind):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Split provider teardown requires a paid provider profile.')
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Split provider teardown requires PostgreSQL.')
+    with engine.begin() as connection:
+        association, _, locked_info = (
+            _lock_bound_non_pool_provider_present_cleanup(
+                connection, context, authority))
+        if ordinary_launch_binding.provider_present_teardown_phase(
+                locked_info) is not expected:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Split provider teardown found a stale persisted phase.')
+        persisted = serve_state.transition_bound_provider_cleanup_phase_in_transaction(
+            connection,
+            context.service_name,
+            context.replica_id,
+            str(context.replica_record_id),
+            context.association_id,
+            expected=expected,
+            target=target)
+        if not _paid_capacity_claim_is_exact(connection, association):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Split provider teardown changed paid-capacity identity.')
+        return persisted
+
+
+def mark_bound_non_pool_provider_teardown_observation_pending(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> replica_managers.ReplicaInfo:
+    """Release D after submission while retaining claim, pin, and pointer."""
+    return _transition_bound_non_pool_provider_teardown_phase(
+        context,
+        authority,
+        expected=(ordinary_launch_binding.ProviderPresentTeardownPhase.
+                  SUBMISSION_RUNNING),
+        target=(ordinary_launch_binding.ProviderPresentTeardownPhase.
+                ABSENCE_OBSERVATION_PENDING))
+
+
+def requeue_bound_non_pool_provider_teardown_submission(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> replica_managers.ReplicaInfo:
+    """Requeue a still-PRESENT allocation for an idempotent delete."""
+    return _transition_bound_non_pool_provider_teardown_phase(
+        context,
+        authority,
+        expected=(ordinary_launch_binding.ProviderPresentTeardownPhase.
+                  ABSENCE_OBSERVATION_PENDING),
+        target=(ordinary_launch_binding.ProviderPresentTeardownPhase.
+                SUBMISSION_SCHEDULED))
+
+
 def project_bound_non_pool_provider_absence(
     context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
     authority: ordinary_launch_binding_lib.ControllerBindingAuthority,

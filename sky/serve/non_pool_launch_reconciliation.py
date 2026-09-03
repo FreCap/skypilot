@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from collections.abc import Mapping
 import dataclasses
+import enum
 import time
 import typing
 from typing import Any, cast
@@ -26,8 +27,10 @@ from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
 from sky.serve import reserved_capacity
 from sky.utils import common_utils
+from sky.utils import thread_utils
 
 if typing.TYPE_CHECKING:
+    from sky.serve import resource_actions as resource_actions_types
     from sky.server.requests import postgres as request_postgres_types
 
 request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
@@ -36,13 +39,10 @@ provision = adaptors_common.LazyImport('sky.provision')
 gcp_provision = adaptors_common.LazyImport('sky.provision.gcp')
 gcp_cloud = adaptors_common.LazyImport('sky.clouds.gcp')
 aws_adaptor = adaptors_common.LazyImport('sky.adaptors.aws')
+resource_actions = adaptors_common.LazyImport('sky.serve.resource_actions')
 
 _AWS_EMPTY_CENSUS_INTERVAL_SECONDS = 2.0
-_AWS_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS = 420.0
-_AWS_POST_TEARDOWN_ABSENCE_POLL_SECONDS = 2.0
 _GCP_EMPTY_CENSUS_INTERVAL_SECONDS = 2.0
-_GCP_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS = 420.0
-_GCP_POST_TEARDOWN_ABSENCE_POLL_SECONDS = 2.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -51,6 +51,99 @@ class ProviderObservation:
 
     evidence: ordinary_launch_binding.ProviderEvidence
     payload: dict[str, Any]
+
+
+class PaidTeardownObservationDisposition(str, enum.Enum):
+    """One canonical next action after a paid teardown observation."""
+
+    SETTLED_ABSENT = 'SETTLED_ABSENT'
+    RESUBMIT_PRESENT = 'RESUBMIT_PRESENT'
+    RETRY_UNKNOWN = 'RETRY_UNKNOWN'
+
+
+@dataclasses.dataclass(frozen=True)
+class PaidTeardownObservationStep:
+    """Result of one observation and its database transition."""
+
+    disposition: PaidTeardownObservationDisposition
+    observation: ProviderObservation
+    scheduled_replica_info: Any | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class OneShotProviderObservationCompletion:
+    """Finished work returned by the bounded one-shot observer lane."""
+
+    key: tuple[int, str]
+    result: Any | None
+    error: BaseException | None
+    formatted_error: str | None
+
+
+class OneShotProviderObservationLane:
+    """Bounded lazy one-shot lane shared by live and service teardown."""
+
+    MAX_CONCURRENT = 16
+
+    def __init__(self) -> None:
+        self._workers: dict[tuple[int, str], thread_utils.SafeThread] = {}
+        self._results: thread_utils.ThreadSafeDict[tuple[int, str], Any] = (
+            thread_utils.ThreadSafeDict())
+
+    def schedule(self, key: tuple[int, str], operation: Callable[[],
+                                                                 Any]) -> bool:
+        """Start one operation when its exact key and a lane slot are free."""
+        if key in self._workers or len(self._workers) >= self.MAX_CONCURRENT:
+            return False
+
+        def _run() -> None:
+            self._results[key] = operation()
+
+        worker = thread_utils.SafeThread(
+            target=_run,
+            name=f'replica-{key[0]}-teardown-observation',
+            daemon=True)
+        self._workers[key] = worker
+        try:
+            worker.start()
+        except BaseException:
+            del self._workers[key]
+            # A custom/instrumented Thread.start() can fail after invoking the
+            # target.  Never let that ambiguous start leave a result which a
+            # later retry with the same exact key could consume.
+            self._results.pop(key)
+            raise
+        return True
+
+    def take_completed(
+        self,
+        key: tuple[int, str] | None = None,
+    ) -> tuple[OneShotProviderObservationCompletion, ...]:
+        """Join and remove completed one-shot work without blocking on live work."""
+        completed = []
+        for worker_key, worker in list(self._workers.items()):
+            if ((key is not None and worker_key != key) or worker.is_alive()):
+                continue
+            worker.join()
+            del self._workers[worker_key]
+            result = self._results.pop(worker_key)
+            completed.append(
+                OneShotProviderObservationCompletion(
+                    key=worker_key,
+                    result=result,
+                    error=worker.exception,
+                    formatted_error=worker.format_exc))
+        return tuple(completed)
+
+    @property
+    def available_slots(self) -> int:
+        return self.MAX_CONCURRENT - len(self._workers)
+
+    def contains(self, key: tuple[int, str]) -> bool:
+        return key in self._workers
+
+    def has_work(self) -> bool:
+        return bool(self._workers)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -124,6 +217,7 @@ def apply_exact_provider_absence_replica_projection(
     paid_outcome = None
     explicit_paid_cancel = False
     reserved_absence = False
+    paid_teardown_observation_pending = False
     if (context.profile.kind ==
             ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
         if pool_key is not None:
@@ -131,6 +225,12 @@ def apply_exact_provider_absence_replica_projection(
         reserved_absence = True
     elif ordinary_launch_binding.is_paid_provider_reconciliation_profile(
             context.profile.kind):
+        paid_teardown_observation_pending = bool(
+            ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+                info) and
+            ordinary_launch_binding.provider_present_teardown_phase(info)
+            is ordinary_launch_binding.ProviderPresentTeardownPhase.
+            ABSENCE_OBSERVATION_PENDING)
         request = getattr(projection, 'request', None)
         decoded_error = decoded_request_error(getattr(request, 'error', None))
         evidence_payload = getattr(projection, 'provider_evidence_payload',
@@ -270,6 +370,13 @@ def apply_exact_provider_absence_replica_projection(
     elif (info.status_property.sky_launch_status
           != common_utils.ProcessStatus.INTERRUPTED):
         info.status_property.sky_launch_status = common_utils.ProcessStatus.FAILED
+    if paid_teardown_observation_pending:
+        ordinary_launch_binding.transition_provider_present_teardown_phase(
+            info,
+            expected=(ordinary_launch_binding.ProviderPresentTeardownPhase.
+                      ABSENCE_OBSERVATION_PENDING),
+            target=(ordinary_launch_binding.ProviderPresentTeardownPhase.
+                    CLEANUP_SUCCEEDED))
     return ProviderAbsenceReplicaProjection(paid_capacity_pool_key=pool_key,
                                             paid_capacity_outcome=paid_outcome)
 
@@ -779,15 +886,33 @@ def _reduce_observation(
             context, authority, project_replica_result=project_replica_result)
 
 
-def terminate_gcp_paid_provider_allocation(
+def _provider_teardown_submission(
+    disposition: resource_actions_types.ProviderSubmissionDisposition,
+    error: Exception | SystemExit | KeyboardInterrupt | None = None,
+) -> resource_actions_types.ProviderSubmissionV1:
+    """Build bounded normalized evidence for one teardown submission."""
+    normalized_error = None
+    if error is not None:
+        normalized_error = resource_actions.ProviderErrorV1(
+            category=resource_actions.ProviderErrorCategory.UNKNOWN,
+            provider_code=None,
+            retry_after_seconds=None,
+            normalized_message=common_utils.format_exception(error))
+    return resource_actions.ProviderSubmissionV1(
+        disposition=disposition,
+        provider_operation_id=None,
+        normalized_response_sha256=None,
+        normalized_error=normalized_error)
+
+
+def submit_gcp_paid_provider_teardown(
     context: ordinary_launch_binding.BoundNonPoolLaunchContext,
     replica_info: Any,
     authority: ordinary_launch_binding.ControllerBindingAuthority,
-    project_replica_result: Callable[..., bool],
     *,
     continue_guard: Callable[[], bool] | None = None,
-) -> ProviderObservation:
-    """Delete one exact GCP allocation and require fresh provider absence."""
+) -> resource_actions_types.ProviderSubmissionV1:
+    """Submit at most one exact GCP delete without waiting for absence."""
     if (not ordinary_launch_binding.is_paid_provider_reconciliation_profile(
             context.profile.kind) or not request_postgres.
             bound_non_pool_provider_present_cleanup_is_authorized(
@@ -802,63 +927,46 @@ def terminate_gcp_paid_provider_allocation(
     if continue_guard is not None and not continue_guard():
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'GCP provider cleanup lost controller authority before teardown.')
-    deadline = (time.monotonic() + _GCP_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS)
     provider_config = {
         'availability_zone': identity['zone'],
         'project_id': identity['project_id'],
     }
-    last_cleanup_error: BaseException | None = None
-    while True:
-        if time.monotonic() >= deadline:
-            timeout_error = ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                'GCP provider cleanup has no fresh exact VM, disk, and create-'
-                'operation ABSENT observation.')
-            if last_cleanup_error is not None:
-                raise timeout_error from last_cleanup_error
-            raise timeout_error
-        if continue_guard is not None and not continue_guard():
-            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                'GCP provider cleanup lost authority while deleting the exact '
-                'allocation.')
-        try:
-            instance_ids, _, create_targets = _query_gcp_paid_provider_census(
-                replica_info, identity)
-            if instance_ids or create_targets['inflight']:
-                # Standard SkyPilot down does not wait for VM disappearance and
-                # its cluster row can disappear first. Repeat this exact native
-                # delete idempotently until the frozen provider census is empty.
-                provision.terminate_instances(
-                    provider_name='gcp',
-                    cluster_name_on_cloud=identity['cluster_name_on_cloud'],
-                    provider_config=provider_config)
-                time.sleep(_GCP_POST_TEARDOWN_ABSENCE_POLL_SECONDS)
-                continue
-            # Boot disks can remain attached while a just-deleted VM drains.
-            # Retry resource-in-use/deleting failures under the same deadline.
-            gcp_provision.terminate_managed_boot_disks(
-                identity['cluster_name_on_cloud'], provider_config)
-            last_cleanup_error = None
-        except Exception as error:  # pylint: disable=broad-except
-            last_cleanup_error = error
-        observation = _observe_gcp_paid_provider(context, replica_info,
-                                                 authority)
-        if (observation.evidence
-                is ordinary_launch_binding.ProviderEvidence.ABSENT):
-            break
-        time.sleep(_GCP_POST_TEARDOWN_ABSENCE_POLL_SECONDS)
-    _reduce_observation(context, authority, project_replica_result, observation)
-    return observation
+    try:
+        instance_ids, disks, create_targets = _query_gcp_paid_provider_census(
+            replica_info, identity)
+    except Exception as error:  # pylint: disable=broad-except
+        return _provider_teardown_submission(
+            resource_actions.ProviderSubmissionDisposition.NOT_SUBMITTED, error)
+    if continue_guard is not None and not continue_guard():
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'GCP provider cleanup lost controller authority before provider '
+            'submission.')
+    try:
+        exact_instance_targets = sorted(
+            set(instance_ids + create_targets['inflight'] +
+                create_targets['succeeded']))
+        if exact_instance_targets:
+            gcp_provision.submit_terminate_exact_instances(
+                exact_instance_targets, provider_config)
+        elif disks:
+            gcp_provision.submit_terminate_exact_managed_boot_disks(
+                disks, provider_config)
+    except Exception as error:  # pylint: disable=broad-except
+        return _provider_teardown_submission(
+            resource_actions.ProviderSubmissionDisposition.AMBIGUOUS, error)
+    return _provider_teardown_submission(
+        resource_actions.ProviderSubmissionDisposition.ACCEPTED)
 
 
-def terminate_aws_paid_provider_allocation(
+def submit_aws_paid_provider_teardown(
     context: ordinary_launch_binding.BoundNonPoolLaunchContext,
     replica_info: Any,
     authority: ordinary_launch_binding.ControllerBindingAuthority,
-    project_replica_result: Callable[..., bool],
     *,
     continue_guard: Callable[[], bool] | None = None,
-) -> ProviderObservation:
-    """Terminate exact client-token EC2 instances and prove fresh absence."""
+) -> resource_actions_types.ProviderSubmissionV1:
+    """Submit at most one exact AWS terminate call without polling."""
+    del replica_info
     if (not ordinary_launch_binding.is_paid_provider_reconciliation_profile(
             context.profile.kind) or not request_postgres.
             bound_non_pool_provider_present_cleanup_is_authorized(
@@ -870,55 +978,65 @@ def terminate_aws_paid_provider_allocation(
     if scope is None:
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'AWS provider cleanup lost immutable identity or access.')
+    try:
+        instances = _query_aws_paid_provider_census(scope)
+    except Exception as error:  # pylint: disable=broad-except
+        return _provider_teardown_submission(
+            resource_actions.ProviderSubmissionDisposition.NOT_SUBMITTED, error)
+    live_ids = [
+        instance['instance_id']
+        for instance in instances
+        if instance['state'] != 'terminated'
+    ]
+    if continue_guard is not None and not continue_guard():
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'AWS provider cleanup lost controller authority before provider '
+            'submission.')
+    if not live_ids:
+        return _provider_teardown_submission(
+            resource_actions.ProviderSubmissionDisposition.ACCEPTED)
     identity = scope.provider_identity
-    deadline = time.monotonic() + _AWS_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS
-    last_cleanup_error: BaseException | None = None
-    observation: ProviderObservation | None = None
-    while True:
-        if time.monotonic() >= deadline:
-            timeout_error = ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                'AWS provider cleanup has no fresh exact client-token ABSENT '
-                'observation.')
-            if last_cleanup_error is not None:
-                raise timeout_error from last_cleanup_error
-            raise timeout_error
-        if continue_guard is not None and not continue_guard():
-            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                'AWS provider cleanup lost authority while deleting the exact '
-                'allocation.')
-        try:
-            instances = _query_aws_paid_provider_census(scope)
-            live_ids = [
-                instance['instance_id']
-                for instance in instances
-                if instance['state'] != 'terminated'
-            ]
-            if live_ids:
-                session = aws_adaptor.session(profile=scope.credential_profile)
-                account = session.client(
-                    'sts',
-                    region_name=identity['region']).get_caller_identity()
-                if account.get('Account') != identity['aws_account_id']:
-                    raise ValueError(
-                        'AWS cleanup credentials resolved to another account.')
-                session.client(
-                    'ec2', region_name=identity['region']).terminate_instances(
-                        InstanceIds=live_ids)
-                last_cleanup_error = None
-                time.sleep(_AWS_POST_TEARDOWN_ABSENCE_POLL_SECONDS)
-                continue
-            observation = _observe_aws_paid_provider(context, replica_info,
-                                                     authority)
-            if (observation.evidence
-                    is ordinary_launch_binding.ProviderEvidence.ABSENT):
-                break
-            last_cleanup_error = None
-        except Exception as error:  # pylint: disable=broad-except
-            last_cleanup_error = error
-        time.sleep(_AWS_POST_TEARDOWN_ABSENCE_POLL_SECONDS)
-    assert observation is not None
-    _reduce_observation(context, authority, project_replica_result, observation)
-    return observation
+    try:
+        session = aws_adaptor.session(profile=scope.credential_profile)
+        account = session.client(
+            'sts', region_name=identity['region']).get_caller_identity()
+        if account.get('Account') != identity['aws_account_id']:
+            raise ValueError(
+                'AWS cleanup credentials resolved to another account.')
+        session.client('ec2',
+                       region_name=identity['region']).terminate_instances(
+                           InstanceIds=live_ids)
+    except Exception as error:  # pylint: disable=broad-except
+        return _provider_teardown_submission(
+            resource_actions.ProviderSubmissionDisposition.AMBIGUOUS, error)
+    return _provider_teardown_submission(
+        resource_actions.ProviderSubmissionDisposition.ACCEPTED)
+
+
+def submit_paid_provider_teardown(
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext,
+    replica_info: Any,
+    authority: ordinary_launch_binding.ControllerBindingAuthority,
+    *,
+    continue_guard: Callable[[], bool] | None = None,
+) -> resource_actions_types.ProviderSubmissionV1:
+    """Submit one exact paid delete and durably hand off to observation."""
+    pool_identity = paid_capacity.pool_key_payload(
+        str(replica_info.paid_capacity_pool_key))
+    cloud = (pool_identity.get('cloud')
+             if isinstance(pool_identity, Mapping) else None)
+    if cloud == 'aws':
+        submission = submit_aws_paid_provider_teardown(
+            context, replica_info, authority, continue_guard=continue_guard)
+    elif cloud == 'gcp':
+        submission = submit_gcp_paid_provider_teardown(
+            context, replica_info, authority, continue_guard=continue_guard)
+    else:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Paid provider cleanup lost its immutable pool cloud.')
+    request_postgres.mark_bound_non_pool_provider_teardown_observation_pending(
+        context, authority)
+    return submission
 
 
 def reconcile_post_teardown_absence(
@@ -947,6 +1065,7 @@ def reconcile(
     project_replica_result: Callable[..., bool],
     *,
     force_provider_read: bool = False,
+    before_absence_projection: Callable[[], None] | None = None,
 ) -> ProviderObservation:
     """Observe outside locks, then reduce exact absence or authorize cleanup."""
     if not request_postgres.bound_non_pool_provider_reconciliation_ready(
@@ -960,6 +1079,8 @@ def reconcile(
         # ABSENT is immutable exact evidence. Project it before another
         # provider read: a later transient UNKNOWN observation must not strand
         # a row whose absence was already proven after executor quiescence.
+        if before_absence_projection is not None:
+            before_absence_projection()
         request_postgres.project_bound_non_pool_provider_absence(
             context, authority, project_replica_result=project_replica_result)
         return ProviderObservation(
@@ -969,6 +1090,14 @@ def reconcile(
                 'source': 'durable-provider-evidence',
             })
     observation = None
+    paid_teardown_observation_pending = bool(
+        ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            context.profile.kind) and
+        ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+            replica_info) and
+        ordinary_launch_binding.provider_present_teardown_phase(replica_info)
+        is ordinary_launch_binding.ProviderPresentTeardownPhase.
+        ABSENCE_OBSERVATION_PENDING)
     if (context.profile.kind ==
             ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
         paid_payload = (
@@ -979,5 +1108,49 @@ def reconcile(
                 ordinary_launch_binding.ProviderEvidence.ABSENT, paid_payload)
     if observation is None:
         observation = observe_provider(context, replica_info, authority)
+    if (observation.evidence == ordinary_launch_binding.ProviderEvidence.ABSENT
+            and before_absence_projection is not None):
+        before_absence_projection()
+    if (paid_teardown_observation_pending and observation.evidence
+            != ordinary_launch_binding.ProviderEvidence.ABSENT):
+        # UNKNOWN cannot erase the last exact PRESENT cleanup authority, and
+        # PRESENT needs only to hand the row back to the submission phase.
+        # Only ABSENT is settlement evidence for this split teardown phase.
+        return observation
     _reduce_observation(context, authority, project_replica_result, observation)
     return observation
+
+
+def advance_paid_teardown_observation(
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext,
+    replica_info: Any,
+    authority: ordinary_launch_binding.ControllerBindingAuthority,
+    project_replica_result: Callable[..., bool],
+    *,
+    before_absence_projection: Callable[[], None] | None = None,
+) -> PaidTeardownObservationStep:
+    """Observe once and perform the only legal paid teardown transition."""
+    if (not ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            context.profile.kind) or
+            ordinary_launch_binding.provider_present_teardown_phase(
+                replica_info) is not ordinary_launch_binding.
+            ProviderPresentTeardownPhase.ABSENCE_OBSERVATION_PENDING):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Paid teardown observation requires its durable pending phase.')
+    observation = reconcile(context,
+                            replica_info,
+                            authority,
+                            project_replica_result,
+                            before_absence_projection=before_absence_projection)
+    if observation.evidence is ordinary_launch_binding.ProviderEvidence.ABSENT:
+        return PaidTeardownObservationStep(
+            PaidTeardownObservationDisposition.SETTLED_ABSENT, observation)
+    if observation.evidence is ordinary_launch_binding.ProviderEvidence.PRESENT:
+        scheduled = request_postgres.requeue_bound_non_pool_provider_teardown_submission(
+            context, authority)
+        return PaidTeardownObservationStep(
+            PaidTeardownObservationDisposition.RESUBMIT_PRESENT,
+            observation,
+            scheduled_replica_info=scheduled)
+    return PaidTeardownObservationStep(
+        PaidTeardownObservationDisposition.RETRY_UNKNOWN, observation)

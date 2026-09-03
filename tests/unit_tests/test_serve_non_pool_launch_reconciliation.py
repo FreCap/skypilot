@@ -2,6 +2,7 @@
 # pylint: disable=protected-access
 
 import json
+import threading
 import types
 from unittest import mock
 import uuid
@@ -17,6 +18,57 @@ from sky.serve import paid_capacity
 from sky.serve import replica_info
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
+from sky.serve import resource_actions
+
+
+def test_one_shot_provider_observation_lane_is_bounded() -> None:
+    lane = reconciliation.OneShotProviderObservationLane()
+    release = threading.Event()
+    all_started = threading.Event()
+    started = 0
+    started_lock = threading.Lock()
+
+    def _observe() -> str:
+        nonlocal started
+        with started_lock:
+            started += 1
+            if started == lane.MAX_CONCURRENT:
+                all_started.set()
+        assert release.wait(timeout=5)
+        return 'observed'
+
+    for replica_id in range(lane.MAX_CONCURRENT):
+        assert lane.schedule((replica_id, f'record-{replica_id}'), _observe)
+    assert all_started.wait(timeout=5)
+    assert lane.available_slots == 0
+    assert not lane.schedule((lane.MAX_CONCURRENT, 'overflow'), _observe)
+
+    release.set()
+    for worker in tuple(lane._workers.values()):
+        worker.join(timeout=5)
+    completions = lane.take_completed()
+    assert len(completions) == lane.MAX_CONCURRENT
+    assert all(completion.result == 'observed' for completion in completions)
+    assert all(completion.error is None for completion in completions)
+    assert not lane.has_work()
+
+
+def test_one_shot_provider_observation_lane_reports_worker_exception() -> None:
+    lane = reconciliation.OneShotProviderObservationLane()
+    key = (3, 'record-3')
+
+    def _fail() -> None:
+        raise RuntimeError('provider read failed')
+
+    assert lane.schedule(key, _fail)
+    lane._workers[key].join(timeout=5)
+
+    (completion,) = lane.take_completed()
+    assert completion.key == key
+    assert completion.result is None
+    assert isinstance(completion.error, RuntimeError)
+    assert completion.formatted_error == 'RuntimeError: provider read failed'
+    assert not lane.has_work()
 
 
 def _context(
@@ -93,6 +145,70 @@ def _paid_replica(cloud: str) -> types.SimpleNamespace:
                                      payload,
                                      sort_keys=True,
                                      separators=(',', ':')))
+
+
+def _paid_cleanup_replica(down_status,) -> types.SimpleNamespace:
+    replica = _paid_replica('aws')
+    replica.replica_id = 3
+    replica.replica_record_id = '22222222-2222-4222-8222-222222222222'
+    replica.reserved_fill = False
+    replica.is_zero_cost = False
+    replica.is_spot = True
+    replica.service_job_id = None
+    replica.zero_cost_materialization_sequence = None
+    replica.status_property = types.SimpleNamespace(
+        sky_launch_status=reconciliation.common_utils.ProcessStatus.INTERRUPTED,
+        sky_down_status=down_status,
+        service_ready_now=False,
+        is_scale_down=True,
+        preempted=False,
+        purged=False,
+        failed_spot_availability=False,
+        wait_for_idle_before_termination=False,
+        drain_cap_seconds=0,
+        drain_started_at=None,
+        logical_retirement_version=None,
+        logical_retirement_controller_epoch=None,
+        logical_retirement_generation=None,
+        logical_retirement_target_capacity=None,
+        logical_retirement_confirmed_generation=None,
+        logical_retirement_bounded_deadline=False,
+        logical_retirement_committed=False)
+    return replica
+
+
+def test_paid_teardown_phase_adapter_uses_n_minus_one_safe_failed_encoding(
+) -> None:
+    info = _paid_cleanup_replica(
+        reconciliation.common_utils.ProcessStatus.RUNNING)
+
+    assert ordinary_launch_binding.provider_present_teardown_phase(info) is (
+        ordinary_launch_binding.ProviderPresentTeardownPhase.SUBMISSION_RUNNING)
+    ordinary_launch_binding.transition_provider_present_teardown_phase(
+        info,
+        expected=(ordinary_launch_binding.ProviderPresentTeardownPhase.
+                  SUBMISSION_RUNNING),
+        target=(ordinary_launch_binding.ProviderPresentTeardownPhase.
+                ABSENCE_OBSERVATION_PENDING))
+
+    assert ordinary_launch_binding.provider_present_teardown_phase(info) is (
+        ordinary_launch_binding.ProviderPresentTeardownPhase.
+        ABSENCE_OBSERVATION_PENDING)
+    assert info.status_property.sky_down_status is (
+        reconciliation.common_utils.ProcessStatus.FAILED)
+    # FAILED was already a provider-present cleanup marker in the previous
+    # writer, so rollback redrives exact cleanup rather than retiring the row.
+    assert ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+        info)
+
+    ordinary_launch_binding.transition_provider_present_teardown_phase(
+        info,
+        expected=(ordinary_launch_binding.ProviderPresentTeardownPhase.
+                  ABSENCE_OBSERVATION_PENDING),
+        target=(ordinary_launch_binding.ProviderPresentTeardownPhase.
+                SUBMISSION_SCHEDULED))
+    assert info.status_property.sky_down_status is (
+        reconciliation.common_utils.ProcessStatus.SCHEDULED)
 
 
 def _association_for_context(
@@ -625,7 +741,7 @@ def test_aws_client_token_absence_evidence_is_canonical() -> None:
     ordinary_launch_binding.NonPoolLaunchProfileKind.
     UNKNOWN_CAPACITY_REPLACEMENT
 ])
-def test_aws_paid_present_cleanup_terminates_only_exact_instance_ids(
+def test_aws_paid_teardown_submits_only_exact_instance_ids_without_waiting(
         monkeypatch: pytest.MonkeyPatch,
         profile_kind: ordinary_launch_binding.NonPoolLaunchProfileKind) -> None:
     context = _context(profile_kind)
@@ -640,7 +756,6 @@ def test_aws_paid_present_cleanup_terminates_only_exact_instance_ids(
         'state': 'running',
     }
     events = []
-    censuses = iter([[live], []])
     monkeypatch.setattr(
         reconciliation.request_postgres,
         'bound_non_pool_provider_present_cleanup_is_authorized',
@@ -648,9 +763,8 @@ def test_aws_paid_present_cleanup_terminates_only_exact_instance_ids(
     monkeypatch.setattr(reconciliation.request_postgres,
                         'bound_non_pool_aws_provider_census_scope',
                         lambda *_args: scope)
-    monkeypatch.setattr(
-        reconciliation, '_query_aws_paid_provider_census',
-        lambda *_args: events.append('census') or next(censuses))
+    monkeypatch.setattr(reconciliation, '_query_aws_paid_provider_census',
+                        lambda *_args: events.append('census') or [live])
 
     class _Client:
 
@@ -667,27 +781,12 @@ def test_aws_paid_present_cleanup_terminates_only_exact_instance_ids(
 
     monkeypatch.setattr(reconciliation.aws_adaptor, 'session',
                         lambda **_kwargs: _Session())
-    absent = reconciliation.ProviderObservation(
-        ordinary_launch_binding.ProviderEvidence.ABSENT, {'instances': []})
-    monkeypatch.setattr(reconciliation, '_observe_aws_paid_provider',
-                        lambda *_args: events.append('observe') or absent)
-    monkeypatch.setattr(reconciliation, '_reduce_observation',
-                        lambda *_args: events.append('reduce'))
-    monkeypatch.setattr(reconciliation.time, 'sleep',
-                        lambda _seconds: events.append('sleep'))
+    submission = reconciliation.submit_aws_paid_provider_teardown(
+        context, _paid_replica('aws'), object(), continue_guard=lambda: True)
 
-    observed = reconciliation.terminate_aws_paid_provider_allocation(
-        context,
-        _paid_replica('aws'),
-        object(),
-        lambda *_args: True,
-        continue_guard=lambda: True)
-
-    assert observed is absent
-    assert events == [
-        'census', ('terminate', [live['instance_id']]), 'sleep', 'census',
-        'observe', 'reduce'
-    ]
+    assert submission.disposition is (
+        resource_actions.ProviderSubmissionDisposition.ACCEPTED)
+    assert events == ['census', ('terminate', [live['instance_id']])]
 
 
 @pytest.mark.parametrize(
@@ -872,7 +971,7 @@ def test_gcp_paid_observation_fails_closed_without_frozen_project(
     ordinary_launch_binding.NonPoolLaunchProfileKind.
     UNKNOWN_CAPACITY_REPLACEMENT
 ])
-def test_gcp_paid_present_cleanup_deletes_disks_and_waits_for_combined_absence(
+def test_gcp_paid_teardown_submits_vm_then_disk_without_waiting_for_absence(
         monkeypatch: pytest.MonkeyPatch,
         profile_kind: ordinary_launch_binding.NonPoolLaunchProfileKind) -> None:
     context = _context(profile_kind)
@@ -905,41 +1004,27 @@ def test_gcp_paid_present_cleanup_deletes_disks_and_waits_for_combined_absence(
     monkeypatch.setattr(
         reconciliation, '_query_gcp_paid_provider_census',
         lambda *_args: events.append('census') or next(censuses))
-    monkeypatch.setattr(reconciliation.provision, 'terminate_instances',
-                        lambda **_kwargs: events.append('terminate-instances'))
     monkeypatch.setattr(reconciliation.gcp_provision,
-                        'terminate_managed_boot_disks',
+                        'submit_terminate_exact_instances',
+                        lambda *_args: events.append('terminate-instances'))
+    monkeypatch.setattr(reconciliation.gcp_provision,
+                        'submit_terminate_exact_managed_boot_disks',
                         lambda *_args: events.append('terminate-disks'))
-    observations = iter([
-        reconciliation.ProviderObservation(
-            ordinary_launch_binding.ProviderEvidence.ABSENT, {
-                'instance_ids': [],
-                'disk_ids': [],
-            }),
-    ])
-    monkeypatch.setattr(
-        reconciliation, '_observe_gcp_paid_provider',
-        lambda *_args: events.append('observe') or next(observations))
-    monkeypatch.setattr(reconciliation, '_reduce_observation',
-                        lambda *_args: events.append('reduce'))
-    monkeypatch.setattr(reconciliation.time, 'sleep',
-                        lambda _seconds: events.append('sleep'))
+    vm_submission = reconciliation.submit_gcp_paid_provider_teardown(
+        context, replica, object(), continue_guard=lambda: True)
+    disk_submission = reconciliation.submit_gcp_paid_provider_teardown(
+        context, replica, object(), continue_guard=lambda: True)
 
-    observed = reconciliation.terminate_gcp_paid_provider_allocation(
-        context,
-        replica,
-        object(),
-        lambda *_args: True,
-        continue_guard=lambda: True)
-
-    assert observed.evidence is ordinary_launch_binding.ProviderEvidence.ABSENT
+    assert vm_submission.disposition is (
+        resource_actions.ProviderSubmissionDisposition.ACCEPTED)
+    assert disk_submission.disposition is (
+        resource_actions.ProviderSubmissionDisposition.ACCEPTED)
     assert events == [
-        'census', 'terminate-instances', 'sleep', 'census', 'terminate-disks',
-        'observe', 'reduce'
+        'census', 'terminate-instances', 'census', 'terminate-disks'
     ]
 
 
-def test_gcp_paid_cleanup_retries_disk_detach_failure(
+def test_gcp_paid_teardown_reports_ambiguous_disk_submission_without_polling(
         monkeypatch: pytest.MonkeyPatch) -> None:
     context = _context(
         ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
@@ -973,24 +1058,18 @@ def test_gcp_paid_cleanup_retries_disk_detach_failure(
             raise error
 
     monkeypatch.setattr(reconciliation.gcp_provision,
-                        'terminate_managed_boot_disks', _terminate_disks)
-    observations = iter([
-        reconciliation.ProviderObservation(
-            ordinary_launch_binding.ProviderEvidence.PRESENT, {}),
-        reconciliation.ProviderObservation(
-            ordinary_launch_binding.ProviderEvidence.ABSENT, {}),
-    ])
-    monkeypatch.setattr(reconciliation, '_observe_gcp_paid_provider',
-                        lambda *_args: next(observations))
-    monkeypatch.setattr(reconciliation, '_reduce_observation',
-                        lambda *_args: events.append('reduce'))
-    monkeypatch.setattr(reconciliation.time, 'sleep', lambda _seconds: None)
+                        'submit_terminate_exact_managed_boot_disks',
+                        _terminate_disks)
+    first = reconciliation.submit_gcp_paid_provider_teardown(
+        context, replica, object())
+    second = reconciliation.submit_gcp_paid_provider_teardown(
+        context, replica, object())
 
-    observed = reconciliation.terminate_gcp_paid_provider_allocation(
-        context, replica, object(), lambda *_args: True)
-
-    assert observed.evidence is ordinary_launch_binding.ProviderEvidence.ABSENT
-    assert events == ['terminate-disks', 'terminate-disks', 'reduce']
+    assert first.disposition is (
+        resource_actions.ProviderSubmissionDisposition.AMBIGUOUS)
+    assert second.disposition is (
+        resource_actions.ProviderSubmissionDisposition.ACCEPTED)
+    assert events == ['terminate-disks', 'terminate-disks']
 
 
 @pytest.mark.parametrize(('code', 'expected'), [
@@ -1183,6 +1262,45 @@ def test_cancelled_gcp_exact_absence_is_neutral_cleanup() -> None:
     assert not ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
         'CANCELLED', 'explicit_cancel',
         aws_pool_key.replace('123456789012', 'unknown'))
+
+
+def test_paid_pending_teardown_becomes_succeeded_only_after_exact_absence(
+) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    info = _paid_cleanup_replica(
+        reconciliation.common_utils.ProcessStatus.FAILED)
+    info.paid_capacity_pool_key = _paid_replica('gcp').paid_capacity_pool_key
+    projection = types.SimpleNamespace(
+        provider_evidence=ordinary_launch_binding.ProviderEvidence.ABSENT,
+        provider_evidence_payload={
+            'probe_contract': 'gcp-vm-disk-operation-presence-v1',
+            'result': 'ABSENT',
+            'instance_ids': [],
+            'disk_ids': [],
+            'create_operation_targets': {
+                'failed': [],
+                'inflight': [],
+                'succeeded': [],
+            },
+        },
+        context=context,
+        pre_effect_terminal=False,
+        service_job_id=None,
+        locked_replica_info=info,
+        paid_capacity_pool_key=info.paid_capacity_pool_key,
+        request=types.SimpleNamespace(error=None),
+        status=types.SimpleNamespace(value='CANCELLED'),
+        cause=types.SimpleNamespace(value='explicit_cancel'))
+
+    result = reconciliation.apply_exact_provider_absence_replica_projection(
+        projection)
+
+    assert result is not None
+    assert ordinary_launch_binding.provider_present_teardown_phase(info) is (
+        ordinary_launch_binding.ProviderPresentTeardownPhase.CLEANUP_SUCCEEDED)
+    assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+        info)
 
 
 @pytest.mark.parametrize('status', ordinary_launch_binding.TerminalStatus)
@@ -1381,15 +1499,137 @@ def test_reconcile_projects_recorded_absence_without_provider_reread(
                         'project_bound_non_pool_provider_absence',
                         lambda *_args, **_kwargs: calls.append('project'))
 
-    observed = reconciliation.reconcile(context, _reserved_replica(), authority,
-                                        lambda *_args: True)
+    observed = reconciliation.reconcile(
+        context,
+        _reserved_replica(),
+        authority,
+        lambda *_args: True,
+        before_absence_projection=lambda: calls.append('local-cleanup'))
 
     assert observed == reconciliation.ProviderObservation(
         ordinary_launch_binding.ProviderEvidence.ABSENT, {
             'result': 'ABSENT',
             'source': 'durable-provider-evidence',
         })
-    assert calls == ['project']
+    assert calls == ['local-cleanup', 'project']
+
+
+def test_reconcile_cleans_local_state_before_fresh_absence_settlement(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    authority = object()
+    observation = reconciliation.ProviderObservation(
+        ordinary_launch_binding.ProviderEvidence.ABSENT, {'result': 'ABSENT'})
+    calls = []
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_reconciliation_ready',
+                        lambda *_args: True)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_absence_is_recorded',
+                        lambda *_args: False)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_terminal_provider_absence_payload',
+                        lambda *_args: None)
+    monkeypatch.setattr(reconciliation, 'observe_provider',
+                        lambda *_args: calls.append('observe') or observation)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'record_bound_non_pool_provider_evidence',
+                        lambda *_args: calls.append('record'))
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'project_bound_non_pool_provider_absence',
+                        lambda *_args, **_kwargs: calls.append('project'))
+
+    assert reconciliation.reconcile(
+        context,
+        _paid_replica('aws'),
+        authority,
+        lambda *_args: True,
+        before_absence_projection=lambda: calls.append('local-cleanup')) == (
+            observation)
+    assert calls == ['observe', 'local-cleanup', 'record', 'project']
+
+
+@pytest.mark.parametrize('evidence', [
+    ordinary_launch_binding.ProviderEvidence.PRESENT,
+    ordinary_launch_binding.ProviderEvidence.UNKNOWN,
+])
+def test_pending_paid_teardown_retains_present_authority_until_absent(
+        monkeypatch: pytest.MonkeyPatch,
+        evidence: ordinary_launch_binding.ProviderEvidence) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    authority = object()
+    info = _paid_cleanup_replica(
+        reconciliation.common_utils.ProcessStatus.FAILED)
+    observation = reconciliation.ProviderObservation(evidence, {
+        'result': evidence.value,
+    })
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_reconciliation_ready',
+                        lambda *_args: True)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_absence_is_recorded',
+                        lambda *_args: False)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_terminal_provider_absence_payload',
+                        lambda *_args: None)
+    monkeypatch.setattr(reconciliation, 'observe_provider',
+                        lambda *_args: observation)
+    monkeypatch.setattr(
+        reconciliation.request_postgres,
+        'record_bound_non_pool_provider_evidence', lambda *_args: pytest.fail(
+            'non-ABSENT observation must retain cleanup authority'))
+    monkeypatch.setattr(
+        reconciliation.request_postgres,
+        'project_bound_non_pool_provider_absence', lambda *_args, **_kwargs:
+        pytest.fail('non-ABSENT observation must not settle'))
+
+    assert reconciliation.reconcile(
+        context,
+        info,
+        authority,
+        lambda *_args: True,
+        before_absence_projection=lambda: pytest.fail(
+            'non-ABSENT observation must not clean local state')) == observation
+
+
+@pytest.mark.parametrize(('evidence', 'expected'), [
+    (ordinary_launch_binding.ProviderEvidence.ABSENT,
+     reconciliation.PaidTeardownObservationDisposition.SETTLED_ABSENT),
+    (ordinary_launch_binding.ProviderEvidence.PRESENT,
+     reconciliation.PaidTeardownObservationDisposition.RESUBMIT_PRESENT),
+    (ordinary_launch_binding.ProviderEvidence.UNKNOWN,
+     reconciliation.PaidTeardownObservationDisposition.RETRY_UNKNOWN),
+])
+def test_paid_teardown_observation_has_one_closed_next_action(
+        monkeypatch: pytest.MonkeyPatch,
+        evidence: ordinary_launch_binding.ProviderEvidence,
+        expected: reconciliation.PaidTeardownObservationDisposition) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    info = _paid_cleanup_replica(
+        reconciliation.common_utils.ProcessStatus.FAILED)
+    observation = reconciliation.ProviderObservation(evidence,
+                                                     {'result': evidence.value})
+    scheduled = object()
+    requeue = mock.Mock(return_value=scheduled)
+    monkeypatch.setattr(reconciliation, 'reconcile',
+                        mock.Mock(return_value=observation))
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'requeue_bound_non_pool_provider_teardown_submission',
+                        requeue)
+
+    step = reconciliation.advance_paid_teardown_observation(
+        context, info, object(), lambda *_args: True)
+
+    assert step.disposition is expected
+    if evidence is ordinary_launch_binding.ProviderEvidence.PRESENT:
+        requeue.assert_called_once_with(context, mock.ANY)
+        assert step.scheduled_replica_info is scheduled
+    else:
+        requeue.assert_not_called()
+        assert step.scheduled_replica_info is None
 
 
 def test_forced_reconcile_rereads_provider_before_absence_projection(

@@ -19,6 +19,36 @@ to zero without manual row deletion. The first joined AWS/GCP/PostgreSQL exact
 zero sample arrived after about 749.4 seconds and the third after about 799.1
 seconds.
 
+A source-complete follow-up removes the remaining teardown convoy exposed by
+that campaign. The per-service `D=4` mutation lane now performs only one exact
+AWS/GCP native delete submission and atomically changes the replica from
+`SUBMISSION_RUNNING` to `ABSENCE_OBSERVATION_PENDING`. That transaction releases
+the mutation slot but retains the paid claim, capacity debit, association,
+replica pointer, and request-retention pin. One shared lazy, bounded 16-worker
+lane performs one provider observation per work item for both ordinary
+reconciliation and whole-service teardown. `PRESENT` atomically requeues the
+same exact submission, `UNKNOWN` remains pending, and only exact `ABSENT` runs
+UUID-fenced local cluster cleanup and atomically settles the economic graph.
+A pending observation uses the existing persisted `FAILED` down-state encoding,
+which the N-1 writer already recognizes as provider-present cleanup authority;
+rollback therefore safely redrives exact idempotent cleanup instead of treating
+the missing local cluster row as provider absence.
+A replacement controller resumes solely from the persisted phase, including a
+crash after native submission but before its process-local acknowledgement.
+No relational migration, EFS, Kueue, platform, infrastructure, or provider
+configuration change is involved. This follow-up is not deployed or
+production-proven yet.
+
+The deterministic gates for this split prove that eight AWS cleanup rows cross
+the `D=4` lane before the first absence read, a 1,000-row backlog constructs at
+most four resident mutation workers, the observation lane never exceeds 16,
+an observation exception is isolated, and an observation-pending restart does
+not resubmit. The real-PostgreSQL gate proves the pending transition reduces
+the charged teardown count while retaining the claim, pointer, and pin;
+`PRESENT` and `UNKNOWN` cannot settle or release any of them. AWS submission is
+one exact client-token census plus one `TerminateInstances` call; GCP submits
+exact VM or disk deletes without waiting for the returned operations.
+
 That run isolated a separate successor-wave liveness defect. A target of 800
 is intentionally admitted in PostgreSQL transactions of at most 100 members,
 but no second transaction committed. Two optimistic controller preconditions

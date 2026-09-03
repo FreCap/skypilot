@@ -4968,6 +4968,33 @@ def read_replica_for_bound_ordinary_launch_in_transaction(
     return info
 
 
+def transition_bound_provider_cleanup_phase_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+    association_id: uuid.UUID,
+    *,
+    expected: 'ordinary_launch_binding.ProviderPresentTeardownPhase',
+    target: 'ordinary_launch_binding.ProviderPresentTeardownPhase',
+) -> 'replica_managers.ReplicaInfo':
+    """Persist one exact cleanup phase without settling economic identity."""
+    info = read_replica_for_bound_ordinary_launch_in_transaction(
+        connection, service_name, replica_id, replica_record_id, association_id)
+    ordinary_launch_binding.transition_provider_present_teardown_phase(
+        info, expected=expected, target=target)
+    if not _update_exact_locked_replica_in_session(
+            connection,
+            service_name,
+            replica_id,
+            replica_record_id,
+            info,
+            association_id=association_id):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider cleanup phase transition lost its exact replica CAS.')
+    return info
+
+
 def _upsert_replica_rows_in_session(
     session: orm.Session,
     engine: sqlalchemy.engine.Engine,

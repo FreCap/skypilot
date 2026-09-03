@@ -435,7 +435,6 @@ _POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS = 90
 _POST_TEARDOWN_ABSENCE_POLL_SECONDS = 1
 _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS = 30
 _NON_POOL_RECONCILIATION_RETRY_MAX_SECONDS = 15 * 60
-_MAX_CONCURRENT_NON_POOL_RECONCILIATIONS_PER_SERVICE = 16
 # A service can queue an arbitrarily large durable teardown wave. Keep the
 # queued intent, but bound live provider workers conservatively: core.down()
 # initializes enough per-call cloud and request state that a 64-worker wave
@@ -2689,49 +2688,19 @@ def terminate_bound_non_pool_provider_present_cluster(
     replica_drain_delay_seconds: int = 0,
     **terminate_kwargs: Any,
 ) -> None:
-    """Down one exact PRESENT allocation, then project fresh ABSENT proof."""
+    """Submit exact teardown; paid absence is observed in a separate phase."""
     if ordinary_launch_binding.is_paid_provider_reconciliation_profile(
             binding_context.profile.kind):
-        pool_identity = paid_capacity.pool_key_payload(
-            str(replica_info.paid_capacity_pool_key))
-        cloud = (pool_identity.get('cloud')
-                 if isinstance(pool_identity, dict) else None)
-        if cloud not in ('aws', 'gcp'):
+        if terminate_kwargs.get('cleanup_fence') is not None:
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                'Paid provider cleanup lost its immutable pool cloud.')
-        expected_cluster_record_uuid = terminate_kwargs.get(
-            'expected_cluster_record_uuid')
-        if expected_cluster_record_uuid is None:
-            if terminate_kwargs.get('cleanup_fence') is not None:
-                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                    'Paid cleanup acquired a reserved-fill fence.')
-            cleanup = (non_pool_launch_reconciliation.
-                       terminate_aws_paid_provider_allocation
-                       if cloud == 'aws' else non_pool_launch_reconciliation.
-                       terminate_gcp_paid_provider_allocation)
-            cleanup(binding_context,
-                    replica_info,
-                    authority,
-                    project_replica_result,
-                    continue_guard=terminate_kwargs.get('continue_guard'))
-            return
-        # A live exact SkyPilot cluster row retains the complete backend
-        # teardown context. Use it to remove the provider object and cluster
-        # metadata, then independently prove the frozen identity is absent.
-        terminate_cluster(cluster_name, replica_drain_delay_seconds,
-                          **terminate_kwargs)
-        cleanup = (non_pool_launch_reconciliation.
-                   terminate_aws_paid_provider_allocation
-                   if cloud == 'aws' else non_pool_launch_reconciliation.
-                   terminate_gcp_paid_provider_allocation)
-        observation = cleanup(
+                'Paid cleanup acquired a reserved-fill fence.')
+        submission = non_pool_launch_reconciliation.submit_paid_provider_teardown(
             binding_context,
             replica_info,
             authority,
-            project_replica_result,
             continue_guard=terminate_kwargs.get('continue_guard'))
-        assert (observation.evidence
-                is ordinary_launch_binding.ProviderEvidence.ABSENT)
+        logger.info('Paid provider teardown submission for replica %s is %s.',
+                    replica_info.replica_id, submission.disposition.value)
         return
     absence_receipt = terminate_cluster(cluster_name,
                                         replica_drain_delay_seconds,
@@ -2743,6 +2712,45 @@ def terminate_bound_non_pool_provider_present_cluster(
     non_pool_launch_reconciliation.reconcile_post_teardown_absence(
         binding_context, replica_info, authority, project_replica_result,
         absence_receipt)
+
+
+def cleanup_exact_paid_cluster_record_after_provider_absence(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+    cluster_name: str,
+) -> None:
+    """Clean exact local/cloud auxiliaries after native VM absence."""
+    exact_replica = serve_state.get_replica_info_with_resource_action_identity(
+        service_name, replica_id)
+    if exact_replica is None:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-absent cleanup lost its exact replica row.')
+    info, identity = exact_replica
+    if (info.replica_record_id != replica_record_id or
+            info.cluster_name != cluster_name):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-absent cleanup found a replaced replica row.')
+    if identity is None:
+        if global_user_state.cluster_with_name_exists(cluster_name):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider-absent cleanup found an unfenced cluster row.')
+        return
+    snapshot = global_user_state.get_cluster_record_identity_snapshot(
+        cluster_name, identity.sky_cluster_record_uuid)
+    if snapshot is None:
+        return
+    handle = snapshot.handle
+    if not isinstance(handle, cloud_vm_ray_backend.CloudVmRayResourceHandle):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-absent cleanup found a non-VM cluster handle.')
+    # This runs only in the bounded observation lane, after the exact native
+    # allocation is ABSENT.  It removes ports, networks, SSH/config state, and
+    # the exact UUID-fenced cluster row without consuming a mutation slot.
+    backends.CloudVmRayBackend().post_teardown_cleanup(
+        handle,
+        terminate=True,
+        expected_cluster_record_uuid=str(identity.sky_cluster_record_uuid))
 
 
 def terminate_cluster_with_kueue_absence_receipt(
@@ -3962,10 +3970,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._tick_version_spec_cache: dict[int,
                                             service_spec.SkyServiceSpec] = {}
         self._provider_identity_uncertain_ids: set[int] = set()
-        self._non_pool_reconciliation_threads: thread_utils.ThreadSafeDict[
-            int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
-        self._non_pool_reconciliation_attempts: dict[int, int] = {}
-        self._non_pool_reconciliation_retry_at: dict[int, float] = {}
+        self._non_pool_reconciliation_lane = (
+            non_pool_launch_reconciliation.OneShotProviderObservationLane())
+        self._non_pool_reconciliation_attempts: dict[tuple[int, str], int] = {}
+        self._non_pool_reconciliation_retry_at: dict[tuple[int, str],
+                                                     float] = {}
         self._paid_phase_a_recovery_lock = threading.Lock()
         self._paid_phase_a_recoveries: dict[_PaidPhaseARecoveryIdentity,
                                             _PaidPhaseARecovery] = {}
@@ -5541,50 +5550,37 @@ class SkyPilotReplicaManager(ReplicaManager):
         if (authority is None or
                 not authority.retained_non_pool_settlement_allowed):
             return
-        replica_id = info.replica_id
-        existing = self._non_pool_reconciliation_threads.get(replica_id)
-        if existing is not None:
-            if existing.is_alive():
-                return
-            self._non_pool_reconciliation_threads.pop(replica_id)
-            if existing.exception is None:
-                self._non_pool_reconciliation_attempts.pop(replica_id, None)
-                self._non_pool_reconciliation_retry_at[replica_id] = (
-                    time.monotonic() +
-                    _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS)
-                return
-            else:
-                attempt = self._non_pool_reconciliation_attempts.get(
-                    replica_id, 0) + 1
-                self._non_pool_reconciliation_attempts[replica_id] = attempt
-                delay = min(
-                    _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS *
-                    2**min(attempt - 1, 30),
-                    _NON_POOL_RECONCILIATION_RETRY_MAX_SECONDS)
-                self._non_pool_reconciliation_retry_at[
-                    replica_id] = time.monotonic() + delay
-                logger.warning(
-                    'Provider reconciliation for replica %s failed; retrying '
-                    'in %.1f seconds: %s', replica_id, delay,
-                    existing.format_exc or repr(existing.exception))
-                return
+        key = (info.replica_id, info.replica_record_id)
         if time.monotonic() < self._non_pool_reconciliation_retry_at.get(
-                replica_id, 0):
+                key, 0):
             return
-        active_workers = sum(
-            worker.is_alive()
-            for worker in self._non_pool_reconciliation_threads.values())
-        if active_workers >= (
-                _MAX_CONCURRENT_NON_POOL_RECONCILIATIONS_PER_SERVICE):
+        paid = ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            binding_context.profile.kind)
+        if (paid and self._provider_present_cleanup_marker_shape(info) and
+                ordinary_launch_binding.provider_present_teardown_phase(info)
+                is not ordinary_launch_binding.ProviderPresentTeardownPhase.
+                ABSENCE_OBSERVATION_PENDING):
             return
-        worker = thread_utils.SafeThread(
-            target=non_pool_launch_reconciliation.reconcile,
-            name=f'replica-{replica_id}-provider-reconciliation',
-            daemon=True,
-            args=(binding_context, info, authority,
-                  functools.partial(self._project_bound_ordinary_launch, None)))
-        self._non_pool_reconciliation_threads[replica_id] = worker
-        worker.start()
+
+        def _observe_once() -> Any:
+            before_absence_projection = None
+            if paid:
+                before_absence_projection = functools.partial(
+                    cleanup_exact_paid_cluster_record_after_provider_absence,
+                    self._service_name, info.replica_id, info.replica_record_id,
+                    info.cluster_name)
+            operation = (
+                non_pool_launch_reconciliation.advance_paid_teardown_observation
+                if paid and self._provider_present_cleanup_marker_shape(info)
+                else non_pool_launch_reconciliation.reconcile)
+            return operation(
+                binding_context,
+                info,
+                authority,
+                functools.partial(self._project_bound_ordinary_launch, None),
+                before_absence_projection=before_absence_projection)
+
+        self._non_pool_reconciliation_lane.schedule(key, _observe_once)
 
     def _finalize_projected_provider_absence_cleanup(self,
                                                      replica_id: int) -> bool:
@@ -5683,24 +5679,91 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'Unable to list bound non-pool provider reconciliations: %s',
                 common_utils.format_exception(error))
             return
-        active_ids = {
-            binding_context.replica_id for binding_context in contexts
-        }
         infos = {
             (info.replica_id, info.replica_record_id): info
             for info in replica_infos
         }
+        context_keys = {(binding_context.replica_id,
+                         str(binding_context.replica_record_id))
+                        for binding_context in contexts}
+        now = time.monotonic()
+        settled_keys: set[tuple[int, str]] = set()
+        for completion in self._non_pool_reconciliation_lane.take_completed():
+            key = completion.key
+            context_info = infos.get(key)
+            if key not in context_keys or context_info is None:
+                self._non_pool_reconciliation_attempts.pop(key, None)
+                self._non_pool_reconciliation_retry_at.pop(key, None)
+                continue
+            if completion.error is not None or completion.result is None:
+                attempt = self._non_pool_reconciliation_attempts.get(key, 0) + 1
+                self._non_pool_reconciliation_attempts[key] = attempt
+                delay = min(
+                    _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS *
+                    2**min(attempt - 1, 30),
+                    _NON_POOL_RECONCILIATION_RETRY_MAX_SECONDS)
+                self._non_pool_reconciliation_retry_at[key] = now + delay
+                logger.warning(
+                    'Provider reconciliation for replica %s failed; retrying '
+                    'in %.1f seconds: %s', key[0], delay,
+                    completion.formatted_error or repr(completion.error))
+                continue
+            self._non_pool_reconciliation_attempts.pop(key, None)
+            result = completion.result
+            if isinstance(
+                    result,
+                    non_pool_launch_reconciliation.PaidTeardownObservationStep):
+                if result.disposition is (
+                        non_pool_launch_reconciliation.
+                        PaidTeardownObservationDisposition.RESUBMIT_PRESENT):
+                    try:
+                        self._terminate_replica(key[0],
+                                                replica_drain_delay_seconds=0,
+                                                is_scale_down=True,
+                                                in_flight_drain_cap_seconds=0)
+                    except Exception as error:  # pylint: disable=broad-except
+                        logger.warning(
+                            'Could not schedule paid teardown resubmission '
+                            'for replica %s: %s', key[0],
+                            common_utils.format_exception(error))
+                    self._non_pool_reconciliation_retry_at[key] = (
+                        now + _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS)
+                    continue
+                if result.disposition is (
+                        non_pool_launch_reconciliation.
+                        PaidTeardownObservationDisposition.RETRY_UNKNOWN):
+                    self._non_pool_reconciliation_retry_at[key] = (
+                        now + _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS)
+                    continue
+                self._non_pool_reconciliation_retry_at.pop(key, None)
+                settled_keys.add(key)
+                self._notify_scale_reconciliation()
+                continue
+            self._non_pool_reconciliation_retry_at[key] = (
+                now + _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS)
         for binding_context in contexts:
             if (binding_context.replica_id in runtime.launch_thread_pool or
                     binding_context.replica_id in runtime.down_thread_pool):
                 # Finished launch workers already own the established
                 # scheduling path, including its retry and logging behavior.
                 continue
-            context_info = infos.get((binding_context.replica_id,
-                                      str(binding_context.replica_record_id)))
+            context_key = (binding_context.replica_id,
+                           str(binding_context.replica_record_id))
+            context_info = infos.get(context_key)
             if context_info is None:
                 continue
-            if (self._provider_present_cleanup_marker_shape(context_info) and
+            if context_key in settled_keys:
+                continue
+            marker_present = self._provider_present_cleanup_marker_shape(
+                context_info)
+            paid_observation_pending = bool(
+                marker_present and
+                ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+                    binding_context.profile.kind) and
+                ordinary_launch_binding.provider_present_teardown_phase(
+                    context_info) is ordinary_launch_binding.
+                ProviderPresentTeardownPhase.ABSENCE_OBSERVATION_PENDING)
+            if (marker_present and not paid_observation_pending and
                     global_user_state.cluster_with_name_exists(
                         context_info.cluster_name) and not request_postgres.
                     bound_non_pool_provider_absence_is_recorded(
@@ -5715,17 +5778,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._schedule_non_pool_provider_reconciliation(
                 context_info, binding_context)
 
-        # A successful projection clears the replica pointer, so the context
-        # disappears from the next query. Retire its completed process-local
-        # bookkeeping without disturbing a worker still finishing that
-        # transaction.
-        for replica_id, worker in list(
-                self._non_pool_reconciliation_threads.items()):
-            if replica_id in active_ids or worker.is_alive():
-                continue
-            self._non_pool_reconciliation_threads.pop(replica_id)
-            self._non_pool_reconciliation_attempts.pop(replica_id, None)
-            self._non_pool_reconciliation_retry_at.pop(replica_id, None)
+        # Completed work whose projection removed its pointer is discarded by
+        # the next pump above using the exact key, never a recycled numeric ID.
 
     def _redrive_bound_ordinary_launch_after_pre_effect(
             self, info: ReplicaInfo) -> bool:
@@ -11740,6 +11794,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                         legacy_runtime.launch_completion_event.set()
                         return
 
+        if (provider_present_cleanup_context is not None and
+                ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+                    provider_present_cleanup_context.profile.kind) and
+                ordinary_launch_binding.provider_present_teardown_phase(info)
+                is ordinary_launch_binding.ProviderPresentTeardownPhase.
+                ABSENCE_OBSERVATION_PENDING):
+            self._schedule_non_pool_provider_reconciliation(
+                info, provider_present_cleanup_context)
+            return
+
         if replica_id in legacy_runtime.down_thread_pool:
             logger.warning(f'Terminate thread for replica {replica_id} '
                            'already exists. Skipping.')
@@ -11933,6 +11997,16 @@ class SkyPilotReplicaManager(ReplicaManager):
         now = time.monotonic()
         _, retry_at_by_replica = self._failed_cleanup_retry_state()
         for info in sorted(replica_infos, key=_provider_cleanup_phase_order):
+            if (info.reserved_fill is False and info.is_zero_cost is False and
+                    info.is_spot is True and
+                    self._provider_present_cleanup_marker_shape(info) and
+                    ordinary_launch_binding.provider_present_teardown_phase(
+                        info) is ordinary_launch_binding.
+                    ProviderPresentTeardownPhase.ABSENCE_OBSERVATION_PENDING):
+                # The bounded observer lane owns this durable phase.  A fresh
+                # controller must not rewrite it to SCHEDULED before reading
+                # exact provider state.
+                continue
             # A crash after the ABSENT transaction but before local down-result
             # handling loses every process-local worker. Consume that exact
             # durable history before process-local worker status.  The
@@ -11945,17 +12019,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 try:
                     if self._finalize_projected_provider_absence_cleanup(
                             info.replica_id):
-                        reconciliation_threads = getattr(
-                            self, '_non_pool_reconciliation_threads', None)
-                        if reconciliation_threads is not None:
-                            try:
-                                reconciliation_threads.pop(info.replica_id)
-                            except KeyError:
-                                pass
-                        getattr(self, '_non_pool_reconciliation_attempts',
-                                {}).pop(info.replica_id, None)
-                        getattr(self, '_non_pool_reconciliation_retry_at',
-                                {}).pop(info.replica_id, None)
+                        key = (info.replica_id, info.replica_record_id)
+                        self._non_pool_reconciliation_attempts.pop(key, None)
+                        self._non_pool_reconciliation_retry_at.pop(key, None)
                         continue
                 except Exception as error:  # pylint: disable=broad-except
                     logger.warning(
@@ -15347,6 +15413,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                     legacy_runtime.down_thread_pool.pop(replica_id)
                 continue
             if not self._service_is_cleanup_authorized():
+                continue
+            paid_observation_pending = bool(
+                info.reserved_fill is False and info.is_zero_cost is False and
+                info.is_spot is True and
+                self._provider_present_cleanup_marker_shape(info) and
+                ordinary_launch_binding.provider_present_teardown_phase(info)
+                is ordinary_launch_binding.ProviderPresentTeardownPhase.
+                ABSENCE_OBSERVATION_PENDING)
+            if paid_observation_pending:
+                # The mutation worker has finished and released D.  Drop only
+                # its process-local handle; the shared observer lane below
+                # resumes from the durable pending phase.
+                if legacy_runtime.down_thread_pool.get(replica_id) is t:
+                    legacy_runtime.down_thread_pool.pop(replica_id)
                 continue
             if (info.status_property.sky_down_status ==
                     common_utils.ProcessStatus.SCHEDULED):

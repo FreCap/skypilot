@@ -437,6 +437,16 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
 
 ### Async Poller and Freshness Safety
 
+- Model provider mutation submission and provider-state observation as separate
+  phases with separate bounded capacity. A scarce mutation slot may cover the
+  exact native submit call, but must never remain occupied while polling for
+  eventual absence or readiness.
+- Persist the handoff between those phases before releasing mutation capacity.
+  On restart, resume only the persisted phase: never infer that submission did
+  or did not occur from a missing thread, local result, timeout, or exception.
+- Releasing a mutation slot is not permission to release economic identity.
+  Retain claims, debits, associations, pointers, and request-retention pins
+  until exact provider evidence authorizes their atomic settlement.
 - Never run synchronous database, provider, filesystem, subprocess, or DNS I/O
   on an event loop that owns request liveness, leases, deadlines, cancellation,
   or safety heartbeats. Move it behind one bounded single-flight interface and

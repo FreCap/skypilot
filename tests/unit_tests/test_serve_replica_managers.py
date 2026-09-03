@@ -247,23 +247,27 @@ def test_non_pool_provider_reconciliation_is_scheduled_without_inline_io():
                                    binding_epoch=2,
                                    generic=True)
     manager._ordinary_launch_binding_authority = authority
-    info = types.SimpleNamespace(replica_id=3)
     context = _bound_non_pool_context()
+    info = types.SimpleNamespace(replica_id=context.replica_id,
+                                 replica_record_id=str(
+                                     context.replica_record_id))
     worker = mock.Mock()
 
     with mock.patch.object(replica_managers.thread_utils,
                            'SafeThread',
-                           return_value=worker) as thread_constructor:
+                           return_value=worker) as thread_constructor, \
+         mock.patch.object(
+             replica_managers.non_pool_launch_reconciliation,
+             'reconcile') as reconcile:
         manager._schedule_non_pool_provider_reconciliation(info, context)
 
     thread_constructor.assert_called_once()
     worker_args = thread_constructor.call_args.kwargs
-    assert worker_args['target'] is (
-        replica_managers.non_pool_launch_reconciliation.reconcile)
-    assert worker_args['name'] == 'replica-3-provider-reconciliation'
+    assert callable(worker_args['target'])
+    assert worker_args['name'] == 'replica-3-teardown-observation'
     assert worker_args['daemon'] is True
-    assert worker_args['args'][:3] == (context, info, authority)
-    assert callable(worker_args['args'][3])
+    assert 'args' not in worker_args
+    reconcile.assert_not_called()
     worker.start.assert_called_once_with()
 
 
@@ -281,7 +285,9 @@ def test_previous_cohort_reconciliation_is_cleanup_only():
         capability_cohort_epoch=(
             ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH - 1))
     manager._ordinary_launch_binding_authority = authority
-    info = types.SimpleNamespace(replica_id=3)
+    info = types.SimpleNamespace(replica_id=context.replica_id,
+                                 replica_record_id=str(
+                                     context.replica_record_id))
     worker = mock.Mock()
 
     assert not authority.generic_launches_required
@@ -289,14 +295,18 @@ def test_previous_cohort_reconciliation_is_cleanup_only():
     with mock.patch.object(replica_managers.thread_utils,
                            'SafeThread',
                            return_value=worker) as thread_constructor, \
-         mock.patch.object(manager, '_launch_replica') as launch:
+         mock.patch.object(manager, '_launch_replica') as launch, \
+         mock.patch.object(
+             replica_managers.non_pool_launch_reconciliation,
+             'reconcile') as reconcile:
         manager._schedule_non_pool_provider_reconciliation(info, context)
 
     thread_constructor.assert_called_once()
-    assert thread_constructor.call_args.kwargs['args'][:3] == (context, info,
-                                                               authority)
+    assert callable(thread_constructor.call_args.kwargs['target'])
+    assert 'args' not in thread_constructor.call_args.kwargs
     worker.start.assert_called_once_with()
     launch.assert_not_called()
+    reconcile.assert_not_called()
 
 
 def test_unowned_ambiguous_non_pool_launch_schedules_provider_reconciliation(
@@ -313,7 +323,6 @@ def test_unowned_ambiguous_non_pool_launch_schedules_provider_reconciliation(
         replica_record_id=str(context.replica_record_id))
     runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
     manager._ordinary_launch_binding_authority = authority
-    manager._non_pool_reconciliation_threads = {}
     manager._non_pool_reconciliation_attempts = {}
     manager._non_pool_reconciliation_retry_at = {}
     manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
@@ -321,6 +330,44 @@ def test_unowned_ambiguous_non_pool_launch_schedules_provider_reconciliation(
     monkeypatch.setattr(ordinary_launch_binding,
                         'list_provider_reconciliation_contexts',
                         lambda actual: [context] if actual is authority else [])
+
+    manager._reconcile_unowned_bound_non_pool_launches([info])
+
+    manager._schedule_non_pool_provider_reconciliation.assert_called_once_with(
+        info, context)
+
+
+def test_fresh_controller_observes_pending_paid_teardown_before_resubmit(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    authority = _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    context = _bound_non_pool_context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    info = _fake_replica_info(
+        context.replica_id,
+        replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+    info.replica_record_id = str(context.replica_record_id)
+    info.is_spot = True
+    info.paid_capacity_pool_key = _canonical_paid_pool_key()
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+    info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+    info.status_property.is_scale_down = True
+    info.status_property.drain_cap_seconds = 0
+    runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
+    manager._ordinary_launch_binding_authority = authority
+    manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
+    manager._schedule_non_pool_provider_reconciliation = mock.Mock()
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'list_provider_reconciliation_contexts',
+                        lambda actual: [context] if actual is authority else [])
+    monkeypatch.setattr(replica_managers.global_user_state,
+                        'cluster_with_name_exists', lambda _name: True)
+    monkeypatch.setattr(replica_managers.request_postgres,
+                        'bound_non_pool_provider_absence_is_recorded',
+                        lambda *_args: False)
 
     manager._reconcile_unowned_bound_non_pool_launches([info])
 
@@ -343,7 +390,6 @@ def test_live_reconciliation_retires_pointerless_pre_effect_fill(monkeypatch):
         ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
     manager._service_name = 'svc'
     manager._ordinary_launch_binding_authority = authority
-    manager._non_pool_reconciliation_threads = {}
     manager._non_pool_reconciliation_attempts = {}
     manager._non_pool_reconciliation_retry_at = {}
     manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
@@ -387,7 +433,6 @@ def test_live_reconciliation_adopts_association_race(monkeypatch):
         ordinary_launch_binding.PreAdmissionRetirementDisposition.ASSOCIATED)
     manager._service_name = 'svc'
     manager._ordinary_launch_binding_authority = authority
-    manager._non_pool_reconciliation_threads = {}
     manager._non_pool_reconciliation_attempts = {}
     manager._non_pool_reconciliation_retry_at = {}
     manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
@@ -441,7 +486,6 @@ def test_unowned_recorded_absence_projects_despite_stale_cluster_record(
     status.drain_cap_seconds = 0
     runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
     manager._ordinary_launch_binding_authority = authority
-    manager._non_pool_reconciliation_threads = {}
     manager._non_pool_reconciliation_attempts = {}
     manager._non_pool_reconciliation_retry_at = {}
     manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
@@ -485,18 +529,28 @@ def test_completed_provider_reconciliation_defers_absence_finalization(
     status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
     status.is_scale_down = True
     status.drain_cap_seconds = 0
-    worker = mock.Mock()
-    worker.is_alive.return_value = False
-    worker.exception = None
+    key = (info.replica_id, info.replica_record_id)
+    observation = (
+        replica_managers.non_pool_launch_reconciliation.ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.ABSENT, {}))
+    completion = (replica_managers.non_pool_launch_reconciliation.
+                  OneShotProviderObservationCompletion(key=key,
+                                                       result=observation,
+                                                       error=None,
+                                                       formatted_error=None))
+    lane = mock.Mock()
+    lane.take_completed.return_value = (completion,)
+    lane.contains.return_value = False
     runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
     manager._ordinary_launch_binding_authority = authority
-    manager._non_pool_reconciliation_threads = {info.replica_id: worker}
-    manager._non_pool_reconciliation_attempts = {info.replica_id: 1}
-    manager._non_pool_reconciliation_retry_at = {info.replica_id: 1.0}
+    manager._non_pool_reconciliation_lane = lane
+    manager._non_pool_reconciliation_attempts = {key: 1}
+    manager._non_pool_reconciliation_retry_at = {key: 1.0}
     manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
     manager._failed_cleanup_retry_state = mock.Mock(return_value=({}, {}))
     manager._finalize_projected_provider_absence_cleanup = mock.Mock(
         return_value=True)
+    manager._schedule_non_pool_provider_reconciliation = mock.Mock()
     manager._terminate_replica = mock.Mock()
     monkeypatch.setattr(ordinary_launch_binding,
                         'list_provider_reconciliation_contexts',
@@ -504,9 +558,8 @@ def test_completed_provider_reconciliation_defers_absence_finalization(
 
     manager._reconcile_unowned_bound_non_pool_launches([info])
 
-    assert not manager._non_pool_reconciliation_threads
     assert not manager._non_pool_reconciliation_attempts
-    assert info.replica_id in manager._non_pool_reconciliation_retry_at
+    assert key in manager._non_pool_reconciliation_retry_at
     manager._finalize_projected_provider_absence_cleanup.assert_not_called()
 
     # The same pre-removal snapshot is passed to the cleanup reconciler in a
@@ -518,6 +571,120 @@ def test_completed_provider_reconciliation_defers_absence_finalization(
         info.replica_id)
     manager._terminate_replica.assert_not_called()
     assert not manager._non_pool_reconciliation_retry_at
+
+
+def test_settled_paid_observation_is_not_rescheduled_from_stale_tick_snapshot(
+        monkeypatch):
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    authority = _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    context = _bound_non_pool_context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    info = _fake_replica_info(context.replica_id,
+                              replica_managers.serve_state.ReplicaStatus.READY)
+    info.replica_record_id = str(context.replica_record_id)
+    info.reserved_fill = False
+    info.is_zero_cost = False
+    info.is_spot = True
+    info.paid_capacity_pool_key = _canonical_paid_pool_key()
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+    info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+    info.status_property.is_scale_down = True
+    info.status_property.drain_cap_seconds = 0
+    key = (info.replica_id, info.replica_record_id)
+    observation = (
+        replica_managers.non_pool_launch_reconciliation.ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.ABSENT, {}))
+    step = (replica_managers.non_pool_launch_reconciliation.
+            PaidTeardownObservationStep(
+                replica_managers.non_pool_launch_reconciliation.
+                PaidTeardownObservationDisposition.SETTLED_ABSENT, observation))
+    completion = (replica_managers.non_pool_launch_reconciliation.
+                  OneShotProviderObservationCompletion(key=key,
+                                                       result=step,
+                                                       error=None,
+                                                       formatted_error=None))
+    lane = mock.Mock()
+    lane.take_completed.return_value = (completion,)
+    runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
+    manager._ordinary_launch_binding_authority = authority
+    manager._non_pool_reconciliation_lane = lane
+    manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
+    manager._schedule_non_pool_provider_reconciliation = mock.Mock()
+    manager._notify_scale_reconciliation = mock.Mock()
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'list_provider_reconciliation_contexts',
+                        lambda actual: [context] if actual is authority else [])
+
+    manager._reconcile_unowned_bound_non_pool_launches([info])
+
+    manager._notify_scale_reconciliation.assert_called_once_with()
+    manager._schedule_non_pool_provider_reconciliation.assert_not_called()
+
+
+def test_present_paid_observation_resubmits_once_then_backs_off(monkeypatch):
+    """Recovery cannot turn a PRESENT result into a provider-delete hot loop."""
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    authority = _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    context = _bound_non_pool_context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    info = _fake_replica_info(context.replica_id,
+                              replica_managers.serve_state.ReplicaStatus.READY)
+    info.replica_record_id = str(context.replica_record_id)
+    info.reserved_fill = False
+    info.is_zero_cost = False
+    info.is_spot = True
+    info.paid_capacity_pool_key = _canonical_paid_pool_key()
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+    info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+    info.status_property.is_scale_down = True
+    info.status_property.drain_cap_seconds = 0
+    key = (info.replica_id, info.replica_record_id)
+    observation = (
+        replica_managers.non_pool_launch_reconciliation.ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.PRESENT, {}))
+    step = (replica_managers.non_pool_launch_reconciliation.
+            PaidTeardownObservationStep(
+                replica_managers.non_pool_launch_reconciliation.
+                PaidTeardownObservationDisposition.RESUBMIT_PRESENT,
+                observation,
+                scheduled_replica_info=info))
+    completion = (replica_managers.non_pool_launch_reconciliation.
+                  OneShotProviderObservationCompletion(key=key,
+                                                       result=step,
+                                                       error=None,
+                                                       formatted_error=None))
+    lane = mock.Mock()
+    lane.take_completed.return_value = (completion,)
+    runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
+    manager._service_name = 'svc'
+    manager._ordinary_launch_binding_authority = authority
+    manager._non_pool_reconciliation_lane = lane
+    manager._non_pool_reconciliation_attempts = {}
+    manager._non_pool_reconciliation_retry_at = {}
+    manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
+    manager._terminate_replica = mock.Mock()
+    manager._notify_scale_reconciliation = mock.Mock()
+    monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: 1000.0)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'list_provider_reconciliation_contexts',
+                        lambda actual: [context] if actual is authority else [])
+
+    manager._reconcile_unowned_bound_non_pool_launches([info])
+
+    manager._terminate_replica.assert_called_once_with(
+        info.replica_id,
+        replica_drain_delay_seconds=0,
+        is_scale_down=True,
+        in_flight_drain_cap_seconds=0)
+    assert manager._non_pool_reconciliation_retry_at[key] == 1030.0
+    lane.schedule.assert_not_called()
+    manager._notify_scale_reconciliation.assert_not_called()
 
 
 def test_provider_present_down_requires_fresh_post_down_absence():
@@ -579,6 +746,50 @@ def test_provider_present_down_quarantines_missing_absence_receipt():
             'svc-3',
         )
     reconcile.assert_not_called()
+
+
+def test_paid_provider_teardown_with_live_cluster_submits_without_core_down():
+    context = _bound_non_pool_context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    authority = _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    status = types.SimpleNamespace(
+        sky_down_status=common_utils.ProcessStatus.RUNNING)
+    info = types.SimpleNamespace(
+        replica_id=context.replica_id,
+        paid_capacity_pool_key=(_canonical_paid_pool_key()),
+        status_property=status)
+    submission = types.SimpleNamespace(disposition=types.SimpleNamespace(
+        value='accepted'))
+
+    def _submit(*_args, **_kwargs):
+        status.sky_down_status = common_utils.ProcessStatus.FAILED
+        return submission
+
+    with mock.patch.object(replica_managers, 'terminate_cluster') as down, \
+         mock.patch.object(
+             replica_managers.non_pool_launch_reconciliation,
+             'submit_paid_provider_teardown',
+             side_effect=_submit) as submit:
+        replica_managers.terminate_bound_non_pool_provider_present_cluster(
+            context,
+            info,
+            authority,
+            mock.Mock(),
+            'svc-3',
+            expected_cluster_record_uuid=(
+                '00000000-0000-4000-8000-000000000003'),
+            continue_guard=lambda: True)
+
+    down.assert_not_called()
+    submit.assert_called_once_with(context,
+                                   info,
+                                   authority,
+                                   continue_guard=mock.ANY)
+    assert ordinary_launch_binding.provider_present_teardown_phase(info) is (
+        ordinary_launch_binding.ProviderPresentTeardownPhase.
+        ABSENCE_OBSERVATION_PENDING)
 
 
 def test_kueue_absence_projection_runs_only_after_fenced_down():
