@@ -2562,6 +2562,7 @@ def _project_newer_server_incarnation_quiescence(
     generation = int(request_row['execution_generation'])
     claim_token = request_row['claim_token']
     worker_instance_id = request_row['worker_instance_id']
+    execution_pid = request_row['pid']
     execution_start_ticks = request_row['execution_process_start_time_ticks']
     if (status not in requests_lib.RequestStatus.finished_status() or
             not request_row['execution_quiescence_required'] or
@@ -2569,6 +2570,8 @@ def _project_newer_server_incarnation_quiescence(
             request_row['execution_quiesced_at'] is not None or
             not isinstance(claim_token, uuid.UUID) or
             not isinstance(worker_instance_id, uuid.UUID) or
+            isinstance(execution_pid, bool) or
+            not isinstance(execution_pid, int) or execution_pid <= 0 or
             isinstance(execution_start_ticks, bool) or
             not isinstance(execution_start_ticks, int) or
             execution_start_ticks <= 0):
@@ -2594,6 +2597,7 @@ def _project_newer_server_incarnation_quiescence(
             REQUESTS.c.execution_generation == generation,
             REQUESTS.c.claim_token == claim_token,
             REQUESTS.c.worker_instance_id == worker_instance_id,
+            REQUESTS.c.pid == execution_pid,
             REQUESTS.c.execution_process_start_time_ticks ==
             execution_start_ticks, REQUESTS.c.execution_quiescence_required,
             REQUESTS.c.execution_quiesced_generation.is_(None),

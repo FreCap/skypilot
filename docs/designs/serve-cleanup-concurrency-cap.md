@@ -30,8 +30,9 @@ resource.
 - Eligible workers above the cap remain durably `SCHEDULED` and stay in the
   local pool without starting an operating-system thread.
 - Each later refresh tick fills newly available slots from the queued workers.
-- Launch admission remains ahead of teardown admission and continues to share
-  the existing cross-service weighted budget.
+- Teardown admission and worker start remain ahead of launch worker start, as
+  in the existing mutation loop. Launch and teardown continue to use their
+  independent PostgreSQL cross-service budgets.
 - Logical-retirement ownership and load-balancer fencing run before admission
   exactly as they do today.
 - Cleanup retries remain indefinite. This cap changes concurrency, not retry or
@@ -45,11 +46,13 @@ threads from the same snapshot used to classify completed and scheduled work.
 After launch admission, stop admitting down workers when the local running
 count reaches the cap. Increment the local count only after a worker starts.
 
-The cap is intentionally local to a service manager. Putting it in the global
-budget helper would couple unrelated services and would not protect one
-controller process when the global budget is high. Making it a user-facing
-configuration knob would enlarge the service API without evidence that
-operators need to tune it.
+The cap is intentionally local to a service manager. It protects the observed
+single-service large-wave failure without coupling unrelated services or
+adding a user-facing configuration knob. The existing PostgreSQL termination
+budget remains the aggregate cross-service bound. Its configured production
+value is not a measured cgroup-memory bound, so simultaneous large teardown
+waves from several services remain an explicit follow-up load test rather than
+a property claimed by this change.
 
 The value is four. `core.down()` is not a lightweight HTTP call: each worker
 may initialize cloud SDK, credential, request, cluster-state, and subprocess

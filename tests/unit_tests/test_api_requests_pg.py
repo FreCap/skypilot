@@ -9666,18 +9666,20 @@ def test_managed_job_recovery_retains_tombstone_across_two_successors(
     assert successor_generations == [1, 2]
 
 
-@pytest.mark.parametrize(('new_process_start_ticks', 'same_pod_uid',
-                          'worker_matches_origin', 'expect_quiesced'), [
-                              (1001, True, True, True),
-                              (1001, True, False, True),
-                              (1000, True, True, False),
-                              (999, True, True, False),
-                              (1001, False, True, False),
-                              (None, True, True, False),
-                          ])
+@pytest.mark.parametrize(
+    ('new_process_start_ticks', 'same_pod_uid', 'worker_matches_origin',
+     'retain_pid', 'expect_quiesced'), [
+         (1001, True, True, True, True),
+         (1001, True, False, True, True),
+         (1000, True, True, True, False),
+         (999, True, True, True, False),
+         (1001, False, True, True, False),
+         (None, True, True, True, False),
+         (1001, True, True, False, False),
+     ])
 def test_managed_job_cutover_uses_strict_newer_container_incarnation(
         request_database, monkeypatch, new_process_start_ticks, same_pod_uid,
-        worker_matches_origin, expect_quiesced):
+        worker_matches_origin, retain_pid, expect_quiesced):
     """Same-Pod restart proof is strict; heartbeat and PID absence are not."""
     engine, backend = request_database
     old_leader = _controller_leader(engine, monkeypatch, backend.instance_id)
@@ -9714,12 +9716,17 @@ def test_managed_job_cutover_uses_strict_newer_container_incarnation(
                                         item.execution_generation,
                                         item.claim_token,
                                         old_execution_start_ticks)
-        if not worker_matches_origin:
+        if not worker_matches_origin or not retain_pid:
             with engine.begin() as connection:
+                values = {}
+                if not worker_matches_origin:
+                    values['worker_instance_id'] = uuid.UUID(worker_id)
+                if not retain_pid:
+                    values['pid'] = None
                 connection.execute(
                     sqlalchemy.update(request_postgres.REQUESTS).where(
-                        request_postgres.REQUESTS.c.request_id == request_id
-                    ).values(worker_instance_id=uuid.UUID(worker_id)))
+                        request_postgres.REQUESTS.c.request_id ==
+                        request_id).values(**values))
 
         old_leader.release()
         monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR,
