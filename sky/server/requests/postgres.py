@@ -110,6 +110,8 @@ _INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 5
 # Public because operational safety checks outside the request backend must
 # use the same freshness boundary as the instance registry itself.
 INSTANCE_STALE_AFTER_SECONDS = 20
+_ROLE_SUPERVISOR_START_TIME_TICKS_HEALTH_KEY = (
+    'role_supervisor_start_time_ticks')
 
 
 class _RequestPoolLane(enum.Enum):
@@ -776,6 +778,19 @@ class ServerInstanceLease:
         self._heartbeat_lock = threading.Lock()
         self._pod_identity = (pod_identity or
                               ServerPodIdentity.from_environment())
+        try:
+            supervisor_start_time_ticks = (
+                request_storage.read_linux_process_start_time_ticks(
+                    os.getpid()))
+            if (isinstance(supervisor_start_time_ticks, bool) or
+                    not isinstance(supervisor_start_time_ticks, int) or
+                    supervisor_start_time_ticks <= 0):
+                raise ValueError('Process start ticks must be positive.')
+        except (OSError, ValueError) as e:
+            logger.warning('Server instance cannot publish its Linux process '
+                           f'birth identity: {e}')
+            supervisor_start_time_ticks = None
+        self._supervisor_start_time_ticks = supervisor_start_time_ticks
 
     @property
     def pod_identity(self) -> ServerPodIdentity:
@@ -804,6 +819,13 @@ class ServerInstanceLease:
             draining = True
             ready = False
             health_detail = {'phase': 'draining'}
+        # This key belongs to the lease, not readiness callers.  A process
+        # that cannot read its own Linux birth identity must never retain a
+        # caller-supplied or prior-incarnation value.
+        health_detail.pop(_ROLE_SUPERVISOR_START_TIME_TICKS_HEALTH_KEY, None)
+        if self._supervisor_start_time_ticks is not None:
+            health_detail[_ROLE_SUPERVISOR_START_TIME_TICKS_HEALTH_KEY] = (
+                self._supervisor_start_time_ticks)
         values: dict[str, Any] = {
             'instance_id': uuid.UUID(self.instance_id),
             'role': self.role,
@@ -2516,6 +2538,70 @@ def _terminalize_stale_managed_job_request(
             'status_msg': 'Managed-job controller attempt is no longer current.',
             'interrupted_reason': _MANAGED_JOB_QUIESCE_REASON,
         })
+
+
+def _project_newer_server_incarnation_quiescence(
+    connection: sqlalchemy.engine.Connection,
+    request_row: Mapping[str, Any],
+    locked_worker: Mapping[str, Any] | None,
+) -> bool:
+    """Use a same-Pod, strictly newer container as exact stop proof.
+
+    Kubernetes may restart a role container without replacing its Pod UID.
+    The new server process and an old execution guardian then share a durable
+    worker identity even though the old container (and every process in it)
+    is gone.  Linux process birth ticks are comparable within that unchanged
+    Pod's node: only a new server born strictly after the old guardian proves
+    that this execution generation cannot survive.  Missing, equal, or older
+    identity, PID absence, and heartbeat age all fail closed.
+
+    The caller holds shared ownership of ``locked_worker`` and exclusive
+    ownership of ``request_row`` for the full projection transaction.
+    """
+    status = requests_lib.RequestStatus(str(request_row['status']))
+    generation = int(request_row['execution_generation'])
+    claim_token = request_row['claim_token']
+    worker_instance_id = request_row['worker_instance_id']
+    execution_start_ticks = request_row['execution_process_start_time_ticks']
+    if (status not in requests_lib.RequestStatus.finished_status() or
+            not request_row['execution_quiescence_required'] or
+            request_row['execution_quiesced_generation'] is not None or
+            request_row['execution_quiesced_at'] is not None or
+            not isinstance(claim_token, uuid.UUID) or
+            not isinstance(worker_instance_id, uuid.UUID) or
+            isinstance(execution_start_ticks, bool) or
+            not isinstance(execution_start_ticks, int) or
+            execution_start_ticks <= 0):
+        return False
+    if (locked_worker is None or
+            locked_worker['instance_id'] != worker_instance_id or
+            locked_worker['role'] not in ('all', 'controller') or
+            locked_worker['pod_uid'] != str(worker_instance_id)):
+        return False
+    health_detail = locked_worker['health_detail']
+    if not isinstance(health_detail, dict):
+        return False
+    supervisor_start_ticks = health_detail.get(
+        _ROLE_SUPERVISOR_START_TIME_TICKS_HEALTH_KEY)
+    if (isinstance(supervisor_start_ticks, bool) or
+            not isinstance(supervisor_start_ticks, int) or
+            supervisor_start_ticks <= execution_start_ticks):
+        return False
+    result = connection.execute(
+        sqlalchemy.update(REQUESTS).where(
+            REQUESTS.c.request_id == request_row['request_id'],
+            REQUESTS.c.status == status.value,
+            REQUESTS.c.execution_generation == generation,
+            REQUESTS.c.claim_token == claim_token,
+            REQUESTS.c.worker_instance_id == worker_instance_id,
+            REQUESTS.c.execution_process_start_time_ticks ==
+            execution_start_ticks, REQUESTS.c.execution_quiescence_required,
+            REQUESTS.c.execution_quiesced_generation.is_(None),
+            REQUESTS.c.execution_quiesced_at.is_(None)).values(
+                execution_quiesced_generation=generation,
+                execution_quiesced_at=sqlalchemy.func.clock_timestamp(),
+                updated_at=sqlalchemy.func.clock_timestamp()))
+    return result.rowcount == 1
 
 
 def _insert_request_and_queue(
@@ -7463,15 +7549,35 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                         raise request_storage.ManagedJobRequestQuiescenceError(
                             'Managed-job ownership changed while closing '
                             'nested request admission.')
+                origin_predicates = (
+                    REQUESTS.c.managed_job_controller_instance_id ==
+                    instance_id,
+                    REQUESTS.c.managed_job_controller_generation == generation,
+                    REQUESTS.c.managed_job_controller_slot_id == slot_id,
+                    REQUESTS.c.managed_job_controller_slot_attempt == attempt,
+                )
+                # SERVER_INSTANCES precedes REQUESTS in the cross-path lock
+                # order used by record_executor_termination_evidence().  Read
+                # candidate owners first, then lock their rows in deterministic
+                # order before locking requests.  A claim that changes between
+                # this hint and the request lock has no locked worker proof and
+                # therefore fails closed until the next poll.
+                worker_instance_ids = connection.execute(
+                    sqlalchemy.select(REQUESTS.c.worker_instance_id).where(
+                        *origin_predicates,
+                        REQUESTS.c.worker_instance_id.is_not(
+                            None)).distinct()).scalars().all()
+                locked_workers: dict[uuid.UUID, Mapping[str, Any]] = {}
+                for worker_instance_id in sorted(worker_instance_ids, key=str):
+                    worker = connection.execute(
+                        sqlalchemy.select(SERVER_INSTANCES).where(
+                            SERVER_INSTANCES.c.instance_id == worker_instance_id
+                        ).with_for_update(read=True)).mappings().one_or_none()
+                    if worker is not None:
+                        locked_workers[worker_instance_id] = worker
                 rows = connection.execute(
                     sqlalchemy.select(REQUESTS).where(
-                        REQUESTS.c.managed_job_controller_instance_id ==
-                        instance_id,
-                        REQUESTS.c.managed_job_controller_generation ==
-                        generation,
-                        REQUESTS.c.managed_job_controller_slot_id == slot_id,
-                        REQUESTS.c.managed_job_controller_slot_attempt ==
-                        attempt).order_by(REQUESTS.c.request_id).
+                        *origin_predicates).order_by(REQUESTS.c.request_id).
                     with_for_update()).mappings().all()
                 for row in rows:
                     request_id = str(row['request_id'])
@@ -7482,6 +7588,11 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                                     row['execution_quiesced_generation']
                                     == generation_id and
                                     row['execution_quiesced_at'] is not None)
+                    if (not quiesced and
+                            _project_newer_server_incarnation_quiescence(
+                                connection, row,
+                                locked_workers.get(row['worker_instance_id']))):
+                        quiesced = True
                     if quiesced:
                         connection.execute(
                             sqlalchemy.delete(QUEUE).where(
