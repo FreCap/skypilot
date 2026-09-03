@@ -1170,6 +1170,8 @@ def record_request_activity(
                 type(coverage_authority.applied_generation) is int and
                 coverage_authority.applied_generation >= 1)
             if authority_valid:
+                assert isinstance(coverage_authority,
+                                  RequestHistoryCoverageAuthority)
                 services = serve_state.services_table
                 current_service = connection.execute(
                     sqlalchemy.select(services.c.name).where(

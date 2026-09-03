@@ -4143,8 +4143,6 @@ def _receipt_from_headers(
     response: aiohttp.ClientResponse,
     *,
     service_hash: str,
-    expected_state: str,
-    prior: ExactAsyncReceipt | None = None,
 ) -> ExactAsyncReceipt:
     if (_single_response_header(
             response, serve_constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER) != str(
@@ -4170,10 +4168,7 @@ def _receipt_from_headers(
             'Exact async response has malformed receipt identity.') from error
     state = _single_response_header(
         response, serve_constants.LB_ASYNC_LEDGER_STATE_HEADER)
-    if (attempt_no < 1 or revision < 1 or state != expected_state or
-        (prior is not None and
-         (attempt_id != prior.attempt_id or attempt_no != prior.attempt_no or
-          revision <= prior.revision))):
+    if attempt_no < 1 or revision < 1:
         raise QualificationError(
             'Exact async response has a conflicting receipt transition.')
     return ExactAsyncReceipt(attempt_id=attempt_id,
@@ -4182,24 +4177,42 @@ def _receipt_from_headers(
                              revision=revision)
 
 
-def _validate_retry_attempt_transition(
-    previous_rejection: ExactAsyncReceipt,
+def _validate_submission_receipt(
     current: ExactAsyncReceipt,
     *,
-    accepted: bool,
+    previous_rejection: ExactAsyncReceipt | None,
+    accepted_response: bool,
 ) -> None:
-    """Validate the only attempt identities allowed after a typed rejection."""
-    same_rejected_attempt = (
-        not accepted and current.attempt_id == previous_rejection.attempt_id and
-        current.attempt_no == previous_rejection.attempt_no and
-        current.revision >= previous_rejection.revision)
-    successor_attempt = (current.attempt_id != previous_rejection.attempt_id and
-                         current.attempt_no
-                         == previous_rejection.attempt_no + 1)
-    if ((accepted and (not successor_attempt or current.revision < 2)) or
-        (not accepted and not (same_rejected_attempt or successor_attempt))):
+    """Validate one public response against reachable ledger transitions."""
+    valid_state = (current.state in ('ACCEPTED', 'SUCCEEDED') and
+                   current.revision >= 2 if accepted_response else current.state
+                   == 'REJECTED_PRE_DISPATCH')
+    valid_attempt = True
+    if previous_rejection is not None:
+        same_rejection = (
+            not accepted_response and
+            current.attempt_id == previous_rejection.attempt_id and
+            current.attempt_no == previous_rejection.attempt_no and
+            current.revision == previous_rejection.revision)
+        later_attempt = (current.attempt_id != previous_rejection.attempt_id and
+                         current.attempt_no > previous_rejection.attempt_no and
+                         current.revision >= 2)
+        valid_attempt = later_attempt if accepted_response else (
+            same_rejection or later_attempt)
+    if not valid_state or not valid_attempt:
         raise QualificationError(
-            'Exact async retry did not return the required successor attempt.')
+            'Exact async response has a conflicting receipt transition.')
+
+
+def _validate_completion_receipt(accepted: ExactAsyncReceipt,
+                                 current: ExactAsyncReceipt) -> None:
+    """Require the exact accepted attempt to advance to terminal success."""
+    if (current.state != 'SUCCEEDED' or
+            current.attempt_id != accepted.attempt_id or
+            current.attempt_no != accepted.attempt_no or
+            current.revision <= accepted.revision):
+        raise QualificationError(
+            'Exact async response has a conflicting receipt transition.')
 
 
 def _canonical_exact_request(request_id: str,
@@ -4273,12 +4286,11 @@ async def _submit_exact_async_request(
                 response_body = await response.read()
                 if response.status == 202:
                     receipt = _receipt_from_headers(response,
-                                                    service_hash=service_hash,
-                                                    expected_state='ACCEPTED')
-                    if previous_rejection is not None:
-                        _validate_retry_attempt_transition(previous_rejection,
-                                                           receipt,
-                                                           accepted=True)
+                                                    service_hash=service_hash)
+                    _validate_submission_receipt(
+                        receipt,
+                        previous_rejection=previous_rejection,
+                        accepted_response=True)
                     try:
                         result = json.loads(response_body)
                     except (UnicodeDecodeError, ValueError) as error:
@@ -4294,14 +4306,12 @@ async def _submit_exact_async_request(
                 if response.status not in (429, 503):
                     raise QualificationError(
                         f'{request_id} returned HTTP {response.status}.')
-                rejection = _receipt_from_headers(
-                    response,
-                    service_hash=service_hash,
-                    expected_state='REJECTED_PRE_DISPATCH')
-                if previous_rejection is not None:
-                    _validate_retry_attempt_transition(previous_rejection,
-                                                       rejection,
-                                                       accepted=False)
+                rejection = _receipt_from_headers(response,
+                                                  service_hash=service_hash)
+                _validate_submission_receipt(
+                    rejection,
+                    previous_rejection=previous_rejection,
+                    accepted_response=False)
                 previous_rejection = rejection
                 retry_after = response.headers.get('Retry-After', '1')
         except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as error:
@@ -4357,10 +4367,9 @@ async def _complete_exact_async_request(
                                     json=payload) as response:
                 await response.read()
                 if response.status == 204:
-                    _receipt_from_headers(response,
-                                          service_hash=service_hash,
-                                          expected_state='SUCCEEDED',
-                                          prior=accepted)
+                    completion = _receipt_from_headers(
+                        response, service_hash=service_hash)
+                    _validate_completion_receipt(accepted, completion)
                     return
                 if (response.status not in _RETRYABLE_STATUSES and
                         response.status != 409):

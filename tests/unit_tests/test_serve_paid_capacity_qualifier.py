@@ -4219,6 +4219,114 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
                                               request_id='execution-2'))
 
 
+@pytest.mark.parametrize(
+    ('previous', 'current', 'accepted_response', 'valid'), [
+        (None, ('accepted', 1, 'ACCEPTED', 2), True, True),
+        (None, ('accepted', 1, 'SUCCEEDED', 2), True, True),
+        (None, ('accepted', 1, 'ACCEPTED', 1), True, False),
+        (None, ('rejected', 1, 'REJECTED_PRE_DISPATCH', 1), False, True),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('rejected', 1, 'REJECTED_PRE_DISPATCH', 1), False, True),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('rejected', 1, 'REJECTED_PRE_DISPATCH', 2), False, False),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 2, 'REJECTED_PRE_DISPATCH', 1), False, False),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 2, 'REJECTED_PRE_DISPATCH', 2), False, True),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 3, 'ACCEPTED', 2), True, True),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('successor', 4, 'SUCCEEDED', 3), True, True),
+        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
+         ('rejected', 1, 'ACCEPTED', 2), True, False),
+        (None, ('accepted', 1, 'FAILED', 2), True, False),
+    ])
+def test_exact_async_submission_receipt_state_machine(previous, current,
+                                                      accepted_response, valid):
+    """Only ledger-reachable submission receipts qualify the campaign."""
+
+    def receipt(fields):
+        if fields is None:
+            return None
+        attempt_id, attempt_no, state, revision = fields
+        attempt_ids = {
+            'rejected': '11111111-1111-4111-8111-111111111111',
+            'accepted': '22222222-2222-4222-8222-222222222222',
+            'successor': '33333333-3333-4333-8333-333333333333',
+        }
+        return qualifier.ExactAsyncReceipt(attempt_id=attempt_ids[attempt_id],
+                                           attempt_no=attempt_no,
+                                           state=state,
+                                           revision=revision)
+
+    previous_receipt = receipt(previous)
+    current_receipt = receipt(current)
+    assert current_receipt is not None
+    if valid:
+        qualifier._validate_submission_receipt(
+            current_receipt,
+            previous_rejection=previous_receipt,
+            accepted_response=accepted_response)
+    else:
+        with pytest.raises(qualifier.QualificationError,
+                           match='conflicting receipt transition'):
+            qualifier._validate_submission_receipt(
+                current_receipt,
+                previous_rejection=previous_receipt,
+                accepted_response=accepted_response)
+
+
+def test_exact_async_request_accepts_terminal_success_race():
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+
+    class Response:
+
+        status = 202
+        headers = {
+            'X-SkyServe-Async-Ledger-Protocol': '1',
+            'X-SkyServe-Service-Incarnation': 'incarnation-a',
+            'X-SkyServe-Async-Attempt-Id': attempt_id,
+            'X-SkyServe-Async-Attempt-No': '1',
+            'X-SkyServe-Async-Ledger-Revision': '2',
+            'X-SkyServe-Async-Ledger-State': 'SUCCEEDED',
+        }
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        @staticmethod
+        async def read():
+            return json.dumps({
+                'request_id': 'execution-1',
+                'status': 'accepted',
+            }).encode()
+
+    class Session:
+
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, _url, **_kwargs):
+            self.calls += 1
+            return Response()
+
+    session = Session()
+    asyncio.run(
+        qualifier._one_exact_async_request(session,
+                                           endpoint='https://service.test',
+                                           token='secret',
+                                           service_hash='incarnation-a',
+                                           request_id='execution-1',
+                                           stable_job_id='job-1',
+                                           duration_seconds=0,
+                                           deadline=qualifier.time.monotonic() +
+                                           2))
+    assert session.calls == 1
+
+
 def test_exact_async_request_rejects_non_successor_after_typed_rejection(
         monkeypatch):
     attempt_id = '11111111-1111-4111-8111-111111111111'
@@ -4268,7 +4376,8 @@ def test_exact_async_request_rejects_non_successor_after_typed_rejection(
         return None
 
     monkeypatch.setattr(qualifier.asyncio, 'sleep', fake_sleep)
-    with pytest.raises(qualifier.QualificationError, match='successor attempt'):
+    with pytest.raises(qualifier.QualificationError,
+                       match='conflicting receipt transition'):
         asyncio.run(
             qualifier._submit_exact_async_request(
                 Session(),
@@ -4410,7 +4519,7 @@ def test_exact_async_completion_gate_holds_real_http_requests_until_release():
                 status=202,
                 headers=receipt_headers(request_id,
                                         state='ACCEPTED',
-                                        revision=1))
+                                        revision=2))
         finally:
             active_requests -= 1
 
@@ -4423,7 +4532,7 @@ def test_exact_async_completion_gate_holds_real_http_requests_until_release():
         return aiohttp.web.Response(status=204,
                                     headers=receipt_headers(request_id,
                                                             state='SUCCEEDED',
-                                                            revision=2))
+                                                            revision=3))
 
     async def exercise():
         app = aiohttp.web.Application()
@@ -4505,7 +4614,7 @@ def test_exact_async_tail_batches_use_bounded_real_http_concurrency():
                 status=202,
                 headers=receipt_headers(request_id,
                                         state='ACCEPTED',
-                                        revision=1))
+                                        revision=2))
         finally:
             active_requests -= 1
 
@@ -4522,7 +4631,7 @@ def test_exact_async_tail_batches_use_bounded_real_http_concurrency():
                                         headers=receipt_headers(
                                             request_id,
                                             state='SUCCEEDED',
-                                            revision=2))
+                                            revision=3))
         finally:
             active_requests -= 1
 

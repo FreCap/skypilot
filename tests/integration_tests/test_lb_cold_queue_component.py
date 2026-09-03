@@ -7,13 +7,13 @@ load-balancer internals:
 * 10,000 HTTP requests enter the public inference route, remain queued with
   zero ready replicas, and are then cancelled through their client connections.
 * One exact async request waits behind a busy worker, reaches a short
-  priority-specific queue deadline, receives a durable pre-dispatch rejection,
+  priority-specific queue deadline, receives a typed pre-dispatch rejection,
   and retries the byte-identical request successfully after capacity returns.
 
 These are not unpaid provider-interface E2Es: they deliberately replace the
 controller and worker and do not run PostgreSQL, planning, reconciliation, or a
 provider facet.  Their contracts are the public load-balancer HTTP interface,
-queue event-loop responsiveness, exact demand accounting, and durable retry
+queue event-loop responsiveness, exact demand accounting, and typed retry wire
 semantics.
 
 Run as the dedicated resource-heavy regression (it opens 10,000 local
@@ -152,8 +152,13 @@ def _run_deadline_worker(worker_port: int) -> None:
             for name, value in request.headers.items()
             if name.lower() in {
                 constants.LB_JOB_ID_HEADER.lower(),
+                constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER.lower(),
+                constants.LB_ASYNC_SERVICE_INCARNATION_HEADER.lower(),
                 constants.LB_ASYNC_INTENT_SHA256_HEADER.lower(),
                 constants.LB_ASYNC_EXECUTION_REQUEST_ID_HEADER.lower(),
+                constants.LB_ASYNC_ATTEMPT_ID_HEADER.lower(),
+                constants.LB_ASYNC_ATTEMPT_NO_HEADER.lower(),
+                constants.LB_ASYNC_LEDGER_REVISION_HEADER.lower(),
             }
         })
         payload = json.loads(body)
@@ -553,6 +558,8 @@ async def _run_exact_deadline_test(controller_port: int, worker_port: int,
             constants.LB_ASYNC_ATTEMPT_ID_HEADER) == _REJECTED_ATTEMPT_ID
         assert _one_header(rejected_headers,
                            constants.LB_ASYNC_ATTEMPT_NO_HEADER) == '1'
+        assert _one_header(rejected_headers,
+                           constants.LB_ASYNC_LEDGER_REVISION_HEADER) == '1'
         assert _one_header(rejected_headers, 'Retry-After') == str(
             constants.LB_503_RETRY_AFTER_SECONDS)
         rejected_payload = json.loads(rejected_body)
@@ -574,7 +581,7 @@ async def _run_exact_deadline_test(controller_port: int, worker_port: int,
         blocker_status, _, _ = await blocker
         assert blocker_status == 200
 
-        # This is the supported retry boundary: only the typed durable
+        # This is the supported retry boundary: only the typed
         # pre-dispatch receipt above permits replay, and the exact same bytes,
         # stable job identity, execution identity, and intent digest are used.
         status, accepted_body, accepted_headers = await _post_bytes(
@@ -595,6 +602,8 @@ async def _run_exact_deadline_test(controller_port: int, worker_port: int,
             constants.LB_ASYNC_ATTEMPT_ID_HEADER) == _ACCEPTED_ATTEMPT_ID
         assert _one_header(accepted_headers,
                            constants.LB_ASYNC_ATTEMPT_NO_HEADER) == '2'
+        assert _one_header(accepted_headers,
+                           constants.LB_ASYNC_LEDGER_REVISION_HEADER) == '2'
 
         worker_state = await _wait_for_json_value(
             session, f'{worker_base}/_test/state',
@@ -602,8 +611,14 @@ async def _run_exact_deadline_test(controller_port: int, worker_port: int,
         assert worker_state['exact_bodies'] == [body.decode('utf-8')]
         assert worker_state['exact_headers'] == [{
             constants.LB_JOB_ID_HEADER.lower(): stable_job_id,
+            constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER.lower(): str(
+                constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION),
+            constants.LB_ASYNC_SERVICE_INCARNATION_HEADER.lower(): _SERVICE_HASH,
             constants.LB_ASYNC_INTENT_SHA256_HEADER.lower(): intent_sha256,
             constants.LB_ASYNC_EXECUTION_REQUEST_ID_HEADER.lower(): request_id,
+            constants.LB_ASYNC_ATTEMPT_ID_HEADER.lower(): _ACCEPTED_ATTEMPT_ID,
+            constants.LB_ASYNC_ATTEMPT_NO_HEADER.lower(): '2',
+            constants.LB_ASYNC_LEDGER_REVISION_HEADER.lower(): '1',
         }]
 
         ledger_state = await _wait_for_json_value(
@@ -668,7 +683,7 @@ def test_ten_thousand_cold_requests_keep_public_surfaces_responsive() -> None:
 
 
 @pytest.mark.component
-def test_exact_queue_deadline_retries_only_after_durable_rejection() -> None:
+def test_exact_queue_deadline_retries_only_after_typed_rejection() -> None:
     """A public retry is byte-stable and follows a typed timeout receipt."""
     context = multiprocessing.get_context('spawn')
     controller_port = _unused_local_port()
@@ -699,5 +714,5 @@ def test_exact_queue_deadline_retries_only_after_durable_rejection() -> None:
 
 if __name__ == '__main__':
     test_ten_thousand_cold_requests_keep_public_surfaces_responsive()
-    test_exact_queue_deadline_retries_only_after_durable_rejection()
+    test_exact_queue_deadline_retries_only_after_typed_rejection()
     sys.exit(0)
