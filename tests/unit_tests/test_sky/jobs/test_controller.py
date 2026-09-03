@@ -12,6 +12,7 @@ and file mount cleanup in task_cleanup().
 # pylint: disable=protected-access,redefined-outer-name,reimported
 # pylint: disable=unused-argument,unused-variable
 import asyncio
+import concurrent.futures
 import contextlib
 import os
 import pathlib
@@ -173,12 +174,20 @@ class TestFileMountsBlobIdSnapshot:
     @pytest.mark.asyncio
     async def test_chain_executor_uses_async_snapshot(self):
         controller = self._make_controller()
+        manager = _make_controller_manager()
         task = MagicMock()
         task.name = 'task'
         task.run = 'echo hello'
         task.metadata = {}
         task.resources = []
         task.envs = {constants.TASK_ID_ENV_VAR: 'managed-task-id'}
+        cluster_name = 'job-cluster-chain'
+        termination_state = managed_job_utils.ClusterTerminationState()
+        manager._cluster_termination_states[(42,
+                                             cluster_name)] = termination_state
+        termination_state_resolver = MagicMock(return_value=termination_state)
+        controller._cluster_termination_state_resolver = (
+            termination_state_resolver)
 
         class ExpectedStop(Exception):
             pass
@@ -189,6 +198,9 @@ class TestFileMountsBlobIdSnapshot:
                        0, managed_job_state.ManagedJobStatus.PENDING))), \
              patch('sky.jobs.state.get_file_mounts_blob_id_async',
                    new=get_blob_id), \
+             patch('sky.jobs.controller.managed_job_utils.'
+                   'generate_managed_job_cluster_name',
+                   return_value=cluster_name), \
              patch('sky.jobs.recovery_strategy.StrategyExecutor.make',
                    side_effect=ExpectedStop) as make, \
              pytest.raises(ExpectedStop):
@@ -196,10 +208,14 @@ class TestFileMountsBlobIdSnapshot:
 
         get_blob_id.assert_awaited_once_with(42)
         assert make.call_args.kwargs['file_mounts_blob_id'] == 'blob-chain'
+        termination_state_resolver.assert_called_once_with(cluster_name)
+        assert make.call_args.kwargs.get(
+            'cluster_termination_state') is termination_state
 
     @pytest.mark.asyncio
     async def test_job_group_executors_reuse_snapshot(self):
         controller = self._make_controller()
+        manager = _make_controller_manager()
         tasks = []
         for task_id in range(20):
             task = MagicMock()
@@ -215,9 +231,25 @@ class TestFileMountsBlobIdSnapshot:
         executor.recover_on_exit_codes = []
         executor.task_specs.return_value = {}
         get_blob_id = AsyncMock(return_value='blob-group')
+        cluster_names = [f'job-cluster-task-{i}' for i in range(len(tasks))]
+        termination_states = {
+            cluster_name: managed_job_utils.ClusterTerminationState()
+            for cluster_name in cluster_names
+        }
+        manager._cluster_termination_states.update({
+            (42, cluster_name): termination_state
+            for cluster_name, termination_state in termination_states.items()
+        })
+        termination_state_resolver = MagicMock(
+            side_effect=termination_states.__getitem__)
+        controller._cluster_termination_state_resolver = (
+            termination_state_resolver)
 
         with patch('sky.jobs.state.get_file_mounts_blob_id_async',
                    new=get_blob_id), \
+             patch('sky.jobs.controller.managed_job_utils.'
+                   'generate_managed_job_cluster_name',
+                   side_effect=cluster_names), \
              patch('sky.jobs.controller.job_group_networking.'
                    'generate_wait_for_networking_script', return_value=''), \
              patch('sky.jobs.controller.job_group_networking.'
@@ -234,6 +266,13 @@ class TestFileMountsBlobIdSnapshot:
         assert make.call_count == len(tasks)
         assert all(call.kwargs['file_mounts_blob_id'] == 'blob-group'
                    for call in make.call_args_list)
+        assert termination_state_resolver.call_args_list == [
+            call(cluster_name) for cluster_name in cluster_names
+        ]
+        assert all(
+            make_call.kwargs.get('cluster_termination_state') is
+            termination_states[cluster_name] for make_call, cluster_name in zip(
+                make.call_args_list, cluster_names))
 
 
 class TestNormalJobRecovery:
@@ -1946,7 +1985,6 @@ class TestTaskCleanup:
         dag = MagicMock()
         dag.tasks = [task]
 
-        from sky.jobs.controller import ControllerManager
         manager = _make_controller_manager()
         with patch('sky.jobs.controller._get_dag', return_value=dag):
             await manager._cleanup(job_id=1)
@@ -1972,7 +2010,6 @@ class TestTaskCleanup:
         dag = MagicMock()
         dag.tasks = [task]
 
-        from sky.jobs.controller import ControllerManager
         manager = _make_controller_manager()
         with patch('sky.jobs.controller._get_dag', return_value=dag):
             await manager._cleanup(job_id=1)
@@ -3822,6 +3859,57 @@ class TestRunJobLoopOwnershipCleanup:
         job_done.assert_awaited_once_with(3)
 
     @pytest.mark.asyncio
+    async def test_job_controller_receives_manager_termination_state_resolver(
+            self):
+        manager = _make_controller_manager()
+        manager.starting.add(3)
+        manager._cleanup = AsyncMock()
+        manager._cleanup_api_server_access_token = MagicMock()
+
+        ctx = MagicMock()
+        controller = MagicMock()
+        constructor_kwargs = {}
+        state_seen_during_run = None
+
+        async def run_controller():
+            nonlocal state_seen_during_run
+            resolver = constructor_kwargs.get(
+                'cluster_termination_state_resolver')
+            assert resolver is not None, (
+                'ControllerManager must inject its job-bound cluster '
+                'termination state resolver into JobController.')
+            state_seen_during_run = resolver('job-cluster-a')
+            assert manager._cluster_termination_states[(
+                3, 'job-cluster-a')] is state_seen_during_run
+            return True
+
+        controller.run = AsyncMock(side_effect=run_controller)
+
+        def construct_controller(*args, **kwargs):
+            del args
+            constructor_kwargs.update(kwargs)
+            return controller
+
+        with patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'get_job_env_content', return_value=''), \
+                patch('sky.jobs.controller.usage_lib.'
+                      'install_fresh_messages_for_current_context'), \
+                patch('sky.jobs.controller.JobController',
+                      side_effect=construct_controller), \
+                patch('sky.jobs.controller.managed_job_state.get_status_async',
+                      new_callable=AsyncMock,
+                      return_value=(
+                          managed_job_state.ManagedJobStatus.SUCCEEDED)), \
+                patch('sky.jobs.controller.scheduler.job_done_async',
+                      new_callable=AsyncMock):
+            await manager.run_job_loop(3, '/dev/null')
+
+        assert state_seen_during_run is not None
+        # Durable finalization releases the manager-owned request identity.
+        assert manager._cluster_termination_states == {}
+
+    @pytest.mark.asyncio
     async def test_cleanup_failure_preserves_terminal_job_status(self, caplog):
         manager = _make_controller_manager()
         manager.starting.add(3)
@@ -3951,6 +4039,111 @@ class TestTerminalCleanupAdoption:
         assert seen_states[0] is seen_states[1]
         assert manager._cluster_termination_states == {
             (3, 'job-cluster-a'): seen_states[0]
+        }
+
+    @pytest.mark.asyncio
+    async def test_job_controller_pending_down_flows_into_final_cleanup(self):
+        manager = _make_controller_manager()
+        cluster_name = 'job-cluster-a'
+        termination_state = managed_job_utils.ClusterTerminationState()
+        manager._cluster_termination_states[(3,
+                                             cluster_name)] = termination_state
+
+        job_controller = JobController.__new__(JobController)
+        job_controller._job_id = 3
+        job_controller._pool = None
+        job_controller._cluster_termination_state_resolver = (
+            lambda name: manager._cluster_termination_states[(3, name)])
+
+        task = MagicMock()
+        task.name = 'task-a'
+        task.metadata = {}
+        task.storage_mounts = {}
+        task.file_mounts = {}
+        seen_states = []
+
+        def terminate(_cluster_name, **kwargs):
+            request_state = kwargs.get('request_state')
+            assert request_state is termination_state, (
+                'JobController cleanup and ControllerManager final cleanup '
+                'must share one termination state.')
+            seen_states.append(request_state)
+            if len(seen_states) == 1:
+                request_state.request_id = 'down-request-1'
+                raise controller_lib.exceptions.RequestResultUnavailableError(
+                    'down-request-1', 'lost result acknowledgement')
+            assert request_state.request_id == 'down-request-1'
+            request_state.completed = True
+
+        with patch('sky.jobs.controller.managed_job_state.'
+                   'remove_ha_recovery_script_async', new_callable=AsyncMock), \
+                patch('sky.jobs.controller._get_dag',
+                      return_value=SimpleNamespace(tasks=[task])), \
+                patch('sky.jobs.controller.managed_job_utils.'
+                      'generate_managed_job_cluster_name',
+                      return_value=cluster_name), \
+                patch('sky.jobs.controller.managed_job_utils.'
+                      'terminate_cluster', side_effect=terminate) as down, \
+                patch('sky.jobs.controller.sdk.status',
+                      return_value='status-request'), \
+                patch('sky.jobs.controller.sdk.get', return_value=[]), \
+                patch('sky.jobs.controller.managed_job_utils.'
+                      'is_consolidation_mode', return_value=True):
+            with pytest.raises(
+                    controller_lib.exceptions.RequestResultUnavailableError):
+                await job_controller._cleanup_cluster(cluster_name)
+
+            assert termination_state.request_id == 'down-request-1'
+            await manager._cleanup(3)
+
+        assert down.call_count == 2
+        assert seen_states == [termination_state, termination_state]
+        assert termination_state.completed
+
+    def test_termination_state_lookup_waits_for_concurrent_release(self):
+        """Lookup and release must not mutate the shared map concurrently."""
+        manager = _make_controller_manager()
+        iteration_started = threading.Event()
+        release_iteration = threading.Event()
+        lookup_started = threading.Event()
+        lookup_finished = threading.Event()
+
+        class BlockingIterationDict(dict):
+
+            def __iter__(self):
+                iteration_started.set()
+                assert release_iteration.wait(timeout=5)
+                return super().__iter__()
+
+        retained_state = managed_job_utils.ClusterTerminationState()
+        manager._cluster_termination_states = BlockingIterationDict({
+            (3, 'job-cluster-a'): managed_job_utils.ClusterTerminationState(),
+            (4, 'job-cluster-b'): retained_state,
+        })
+
+        def lookup_state():
+            lookup_started.set()
+            try:
+                return manager._get_or_create_cluster_termination_state(
+                    4, 'job-cluster-b')
+            finally:
+                lookup_finished.set()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            release = executor.submit(
+                manager._release_cluster_termination_states, 3)
+            assert iteration_started.wait(timeout=5)
+            lookup = executor.submit(lookup_state)
+            assert lookup_started.wait(timeout=5)
+            try:
+                assert not lookup_finished.wait(timeout=0.5)
+            finally:
+                release_iteration.set()
+            release.result(timeout=5)
+            assert lookup.result(timeout=5) is retained_state
+
+        assert manager._cluster_termination_states == {
+            (4, 'job-cluster-b'): retained_state
         }
 
     @pytest.mark.asyncio

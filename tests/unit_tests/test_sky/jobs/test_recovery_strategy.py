@@ -137,6 +137,101 @@ async def test_launch_persists_recovery_generation_in_inner_context(
     }
 
 
+def _make_non_pool_launch_executor(monkeypatch, termination_state, launch):
+    executor = recovery_strategy.StrategyExecutor.__new__(
+        recovery_strategy.StrategyExecutor)
+    executor.job_id = 42
+    executor.task_id = 0
+    executor.pool = None
+    executor.cluster_name = 'job-cluster'
+    executor.file_mounts_blob_id = None
+    executor.dag = mock.sentinel.dag
+    executor.starting = set()
+    executor.starting_lock = mock.sentinel.lock
+    executor.starting_signal = mock.sentinel.signal
+    executor.cluster_termination_state = termination_state
+    executor.extra_launch_context = mock.Mock(return_value={})
+    executor._refresh_priority_from_persisted_dag = mock.Mock()
+    executor._launch_in_workspace = launch
+    executor._wait_until_job_starts_on_cluster = mock.AsyncMock(
+        return_value=123.0)
+
+    @contextlib.asynccontextmanager
+    async def scheduled_launch(*args, **kwargs):
+        del args, kwargs
+        yield
+
+    monkeypatch.setattr(recovery_strategy.scheduler, 'scheduled_launch',
+                        scheduled_launch)
+    monkeypatch.setattr(recovery_strategy.state,
+                        'get_image_recovery_generation_async',
+                        mock.AsyncMock(return_value=3))
+    monkeypatch.setattr(recovery_strategy.sdk, 'api_start', mock.Mock())
+    monkeypatch.setattr(recovery_strategy.sdk, 'stream_and_get', mock.Mock())
+    monkeypatch.setattr(recovery_strategy.global_user_state,
+                        'get_handle_from_cluster_name',
+                        mock.Mock(return_value=None))
+    monkeypatch.setattr(recovery_strategy.usage_lib.messages.usage,
+                        'set_internal', mock.Mock())
+    monkeypatch.setattr(recovery_strategy.logger, 'debug', mock.Mock())
+    monkeypatch.setattr(recovery_strategy, 'ENV_VARS_TO_CLEAR', ())
+    return executor
+
+
+@pytest.mark.asyncio
+async def test_relaunch_resets_completed_termination_state_before_mutation(
+        monkeypatch):
+    termination_state = managed_job_utils.ClusterTerminationState(
+        request_id='down-request-1', completed=True)
+    state_at_launch = []
+
+    def launch(*args, **kwargs):
+        del args, kwargs
+        state_at_launch.append(
+            (termination_state.request_id, termination_state.completed))
+        return 'launch-request'
+
+    executor = _make_non_pool_launch_executor(monkeypatch, termination_state,
+                                              launch)
+
+    assert await executor._launch(max_retry=1, recovery=True) == 123.0
+    assert state_at_launch == [(None, False)]
+
+
+@pytest.mark.asyncio
+async def test_relaunch_fails_closed_while_termination_result_is_pending(
+        monkeypatch):
+    termination_state = managed_job_utils.ClusterTerminationState(
+        request_id='down-request-1', completed=False)
+    launch = mock.Mock(return_value='launch-request')
+    executor = _make_non_pool_launch_executor(monkeypatch, termination_state,
+                                              launch)
+
+    with pytest.raises(RuntimeError):
+        await executor._launch(max_retry=1, recovery=True)
+
+    launch.assert_not_called()
+    assert termination_state.request_id == 'down-request-1'
+    assert not termination_state.completed
+
+
+def test_cleanup_cluster_reuses_bound_termination_state(monkeypatch):
+    executor = recovery_strategy.StrategyExecutor.__new__(
+        recovery_strategy.StrategyExecutor)
+    executor.cluster_name = 'job-cluster'
+    executor.pool = None
+    termination_state = managed_job_utils.ClusterTerminationState(
+        request_id='down-request-1')
+    executor.cluster_termination_state = termination_state
+    terminate = mock.Mock()
+    monkeypatch.setattr(managed_job_utils, 'terminate_cluster', terminate)
+
+    executor._cleanup_cluster()
+
+    terminate.assert_called_once_with('job-cluster',
+                                      request_state=termination_state)
+
+
 def test_is_oom_failure_detects_oomkilled():
     exc = RuntimeError(
         'Failed to run setup commands on an instance. (exit code 1). '
@@ -240,7 +335,8 @@ class TestPoolRecoveryCancellation:
             all=True,
             _try_cancel_if_cluster_is_init=True,
         )
-        terminate_cluster.assert_called_once_with('pool-cluster')
+        terminate_cluster.assert_called_once_with(
+            'pool-cluster', request_state=executor.cluster_termination_state)
 
 
 class TestSubmittedTimestampHandleSnapshot:

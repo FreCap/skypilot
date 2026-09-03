@@ -10,6 +10,7 @@ from datetime import datetime
 import os
 import pathlib
 import re
+import threading
 import time
 import traceback
 import typing
@@ -162,12 +163,28 @@ def _sleep_log_follow_wait(seconds: float) -> None:
     context_utils.sleep_with_cancellation(seconds)
 
 
+class ClusterTerminationPendingError(RuntimeError):
+    """Raised when a replacement launch would race an unresolved down."""
+
+
 @dataclasses.dataclass
 class ClusterTerminationState:
     """Process-local reconciliation state for one managed-job cluster."""
 
     request_id: 'server_common.RequestId[None] | None' = None
     completed: bool = False
+    _operation_lock: typing.Any = dataclasses.field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False)
+
+    def prepare_for_launch(self) -> None:
+        """Rotate a completed termination state for a new cluster incarnation."""
+        with self._operation_lock:
+            if self.request_id is not None and not self.completed:
+                raise ClusterTerminationPendingError(
+                    'Cannot launch a replacement cluster while its previous '
+                    f'termination request {self.request_id!r} is unresolved.')
+            self.request_id = None
+            self.completed = False
 
 
 def terminate_cluster(
@@ -186,6 +203,23 @@ def terminate_cluster(
     """
     if request_state is None:
         request_state = ClusterTerminationState()
+    # asyncio.to_thread() keeps running after its awaiter is cancelled.  A
+    # successor cleanup phase can therefore reach the same process-local state
+    # while the first worker is still reconciling it.  Serialize the complete
+    # operation so request_id/completed always describe one observation path.
+    with request_state._operation_lock:  # pylint: disable=protected-access
+        _terminate_cluster(cluster_name, max_retry, graceful, graceful_timeout,
+                           request_state)
+
+
+def _terminate_cluster(
+    cluster_name: str,
+    max_retry: int,
+    graceful: bool,
+    graceful_timeout: int | None,
+    request_state: ClusterTerminationState,
+) -> None:
+    """Implementation of terminate_cluster() under the state's lock."""
     if request_state.completed:
         return
     retry_cnt = 0
@@ -253,7 +287,10 @@ def terminate_cluster(
             f'Failed to terminate the cluster {cluster_name}. Retrying.'
             f'Details: {common_utils.format_exception(error)}')
         with ux_utils.enable_traceback():
-            logger.error(f'  Traceback: {traceback.format_exc()}')
+            formatted_traceback = ''.join(
+                traceback.format_exception(type(error), error,
+                                           error.__traceback__))
+            logger.error(f'  Traceback: {formatted_traceback}')
         context_utils.sleep_with_cancellation(backoff.current_backoff())
 
 

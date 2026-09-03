@@ -4,9 +4,11 @@
 # pylint: disable=import-outside-toplevel,use-implicit-booleaness-not-comparison
 
 import asyncio
+import concurrent.futures
 import os
 import pathlib
 import tempfile
+import threading
 import time
 from unittest import mock
 
@@ -117,7 +119,7 @@ def test_terminate_cluster_handles_concurrent_cluster_removal(
 
 def test_terminate_cluster_rejects_mismatched_application_error_provenance(
 ) -> None:
-    state = utils.ClusterTerminationState(request_id='request-1')
+    termination_state = utils.ClusterTerminationState(request_id='request-1')
     mismatched = exceptions.RequestResultApplicationError(
         'different-request', ClusterDoesNotExist('test-cluster'))
 
@@ -128,12 +130,12 @@ def test_terminate_cluster_rejects_mismatched_application_error_provenance(
         with pytest.raises(RuntimeError, match='Failed to terminate'):
             utils.terminate_cluster('test-cluster',
                                     max_retry=1,
-                                    request_state=state)
+                                    request_state=termination_state)
 
     down.assert_not_called()
     get_result.assert_called_once_with('request-1')
-    assert state.request_id == 'request-1'
-    assert not state.completed
+    assert termination_state.request_id == 'request-1'
+    assert not termination_state.completed
 
 
 def test_terminate_cluster_reconciles_lost_ack_without_duplicate_down() -> None:
@@ -195,7 +197,7 @@ def test_terminate_cluster_reconciles_lost_ack_without_duplicate_down() -> None:
 
 def test_terminate_cluster_exhaustion_fails_closed_with_pending_request_id(
 ) -> None:
-    state = utils.ClusterTerminationState()
+    termination_state = utils.ClusterTerminationState()
     unavailable = exceptions.RequestResultUnavailableError(
         'request-1', 'result endpoint remained unreachable')
 
@@ -209,15 +211,36 @@ def test_terminate_cluster_exhaustion_fails_closed_with_pending_request_id(
         with pytest.raises(RuntimeError, match='Failed to terminate'):
             utils.terminate_cluster('test-cluster',
                                     max_retry=2,
-                                    request_state=state)
+                                    request_state=termination_state)
 
     down.assert_called_once()
     assert get_result.call_args_list == [
         mock.call('request-1'),
         mock.call('request-1'),
     ]
-    assert state.request_id == 'request-1'
-    assert not state.completed
+    assert termination_state.request_id == 'request-1'
+    assert not termination_state.completed
+
+
+def test_terminate_cluster_retry_log_preserves_caught_traceback() -> None:
+    unavailable = exceptions.RequestResultUnavailableError(
+        'request-1', 'lost result acknowledgement')
+
+    with mock.patch('sky.jobs.utils.sdk.down',
+                    return_value='request-1'), mock.patch(
+                        'sky.jobs.utils.sdk.'
+                        '_get_request_result_for_reconciliation',
+                        side_effect=unavailable), mock.patch(
+                            'sky.jobs.utils.context_utils.'
+                            'sleep_with_cancellation'), mock.patch(
+                                'sky.jobs.utils.logger.error') as log_error:
+        with pytest.raises(RuntimeError, match='Failed to terminate'):
+            utils.terminate_cluster('test-cluster', max_retry=2)
+
+    messages = [str(call.args[0]) for call in log_error.call_args_list]
+    assert any('RequestResultUnavailableError' in message and
+               'lost result acknowledgement' in message for message in messages)
+    assert all('NoneType: None' not in message for message in messages)
 
 
 def test_terminate_cluster_authoritative_retry_submits_one_new_down() -> None:
@@ -280,19 +303,64 @@ def test_terminate_cluster_cancellation_during_backoff_never_replays_down(
 
 
 def test_terminate_cluster_completed_state_is_idempotent() -> None:
-    state = utils.ClusterTerminationState()
+    termination_state = utils.ClusterTerminationState()
 
     with mock.patch('sky.jobs.utils.sdk.down',
                     return_value='request-1') as down, mock.patch(
                         'sky.jobs.utils.sdk.'
                         '_get_request_result_for_reconciliation',
                         return_value=None) as get_result:
-        utils.terminate_cluster('test-cluster', request_state=state)
-        utils.terminate_cluster('test-cluster', request_state=state)
+        utils.terminate_cluster('test-cluster', request_state=termination_state)
+        utils.terminate_cluster('test-cluster', request_state=termination_state)
 
     down.assert_called_once()
     get_result.assert_called_once_with('request-1')
-    assert state.completed
+    assert termination_state.completed
+
+
+def test_terminate_cluster_serializes_reconciliation_for_shared_state() -> None:
+    """Concurrent cleanup owners must not race on one request state."""
+    termination_state = utils.ClusterTerminationState()
+    first_result_read_started = threading.Event()
+    release_first_result_read = threading.Event()
+    second_result_read_started = threading.Event()
+    result_read_count = 0
+    result_read_count_lock = threading.Lock()
+
+    def get_result(_request_id):
+        nonlocal result_read_count
+        with result_read_count_lock:
+            result_read_count += 1
+            call_number = result_read_count
+        if call_number == 1:
+            first_result_read_started.set()
+            assert release_first_result_read.wait(timeout=5)
+        else:
+            second_result_read_started.set()
+
+    with mock.patch('sky.jobs.utils.sdk.down',
+                    return_value='request-1') as down, mock.patch(
+                        'sky.jobs.utils.sdk.'
+                        '_get_request_result_for_reconciliation',
+                        side_effect=get_result) as get_result_mock:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(utils.terminate_cluster,
+                                    'test-cluster',
+                                    request_state=termination_state)
+            assert first_result_read_started.wait(timeout=5)
+            second = executor.submit(utils.terminate_cluster,
+                                     'test-cluster',
+                                     request_state=termination_state)
+            try:
+                assert not second_result_read_started.wait(timeout=0.5)
+            finally:
+                release_first_result_read.set()
+            first.result(timeout=5)
+            second.result(timeout=5)
+
+    down.assert_called_once()
+    get_result_mock.assert_called_once_with('request-1')
+    assert termination_state.completed
 
 
 @pytest.mark.asyncio
@@ -545,8 +613,6 @@ def test_cancel_signal_file_no_graceful():
 
 
 def test_cancel_pending_wrong_workspace_is_not_mutated():
-    snapshot = state.JobCancellationState(state.ManagedJobStatus.PENDING,
-                                          'team-b')
     initial_info = _make_cancel_status_check_info(
         42, state.ManagedJobStatus.PENDING, workspace='team-b')
     with mock.patch('sky.jobs.state.get_jobs_status_check_info',
@@ -562,8 +628,6 @@ def test_cancel_pending_wrong_workspace_is_not_mutated():
 
 
 def test_cancel_skips_job_that_finishes_during_status_refresh(tmp_path):
-    running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                         'default')
     succeeded = state.JobCancellationState(state.ManagedJobStatus.SUCCEEDED,
                                            'default')
     initial_info = _make_cancel_status_check_info(
@@ -586,8 +650,6 @@ def test_cancel_skips_job_that_finishes_during_status_refresh(tmp_path):
 
 
 def test_cancel_refreshed_pending_job_reuses_atomic_finalizer(tmp_path):
-    running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                         'default')
     pending = state.JobCancellationState(state.ManagedJobStatus.PENDING,
                                          'default')
     initial_info = _make_cancel_status_check_info(
@@ -614,8 +676,6 @@ def test_cancel_refreshed_pending_job_reuses_atomic_finalizer(tmp_path):
 
 
 def test_cancel_refreshed_pending_job_still_signals_after_claim_race(tmp_path):
-    running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                         'default')
     pending = state.JobCancellationState(state.ManagedJobStatus.PENDING,
                                          'default')
     initial_info = _make_cancel_status_check_info(

@@ -1,6 +1,7 @@
 """Controller: handles scheduling and the life cycle of a managed job.
 """
 import asyncio
+import functools
 import io
 import json
 import os
@@ -366,6 +367,8 @@ class JobController:
         starting_signal: asyncio.Condition,
         pool: str | None = None,
         rank: int | None = None,
+        cluster_termination_state_resolver: typing.Callable[
+            [str], managed_job_utils.ClusterTerminationState] | None = None,
     ) -> None:
         """Initialize a ``JobsController``.
 
@@ -382,11 +385,17 @@ class JobController:
                 cluster.
             rank: Optional rank of the job that can be used to partition
                 workloads.
+            cluster_termination_state_resolver: Returns the manager-owned
+                reconciliation state for a deterministic cluster name.
         """
 
         self.starting = starting
         self.starting_lock = starting_lock
         self.starting_signal = starting_signal
+        self._cluster_termination_state_resolver = (
+            cluster_termination_state_resolver)
+        self._local_cluster_termination_states: dict[
+            str, managed_job_utils.ClusterTerminationState] = {}
 
         logger.info('Initializing JobsController for job_id=%s', job_id)
 
@@ -512,12 +521,32 @@ class JobController:
 
         logger.info(f'\n== End of logs (ID: {self._job_id}) ==')
 
+    def _get_or_create_cluster_termination_state(
+            self,
+            cluster_name: str) -> managed_job_utils.ClusterTerminationState:
+        """Return one cleanup request identity for this cluster incarnation."""
+        resolver = getattr(self, '_cluster_termination_state_resolver', None)
+        if resolver is not None:
+            return resolver(cluster_name)
+        # Standalone JobController construction is retained for tests and
+        # compatibility with internal embedders; production injects the
+        # ControllerManager-owned resolver.
+        states = getattr(self, '_local_cluster_termination_states', None)
+        if states is None:
+            states = {}
+            self._local_cluster_termination_states = states
+        return states.setdefault(cluster_name,
+                                 managed_job_utils.ClusterTerminationState())
+
     async def _cleanup_cluster(self, cluster_name: str | None) -> None:
         if cluster_name is None:
             return
         if self._pool is None:
+            termination_state = (
+                self._get_or_create_cluster_termination_state(cluster_name))
             await asyncio.to_thread(managed_job_utils.terminate_cluster,
-                                    cluster_name)
+                                    cluster_name,
+                                    request_state=termination_state)
 
     async def _get_cluster_job_exit_codes(
             self, job_id: int | None,
@@ -676,7 +705,10 @@ class JobController:
             self.starting,
             self.starting_lock,
             self.starting_signal,
-            file_mounts_blob_id=await self._get_file_mounts_blob_id())
+            file_mounts_blob_id=await self._get_file_mounts_blob_id(),
+            cluster_termination_state=(
+                self._get_or_create_cluster_termination_state(cluster_name)
+                if cluster_name is not None else None))
         if not is_resume:
             submitted_at = time.time()
             if task_id == 0:
@@ -1502,7 +1534,9 @@ class JobController:
             self.starting,
             self.starting_lock,
             self.starting_signal,
-            file_mounts_blob_id=await self._get_file_mounts_blob_id())
+            file_mounts_blob_id=await self._get_file_mounts_blob_id(),
+            cluster_termination_state=(
+                self._get_or_create_cluster_termination_state(cluster_name)))
 
         callback_func = managed_job_utils.event_callback_func(
             job_id=self._job_id, task_id=task_id, task=task)
@@ -2303,6 +2337,7 @@ class ControllerManager:
         # a second down in this manager process.
         self._cluster_termination_states: dict[tuple[
             int, str], managed_job_utils.ClusterTerminationState] = {}
+        self._cluster_termination_states_lock = threading.Lock()
 
         self._pid = os.getpid()
         self._pid_started_at = psutil.Process(self._pid).create_time()
@@ -2482,13 +2517,26 @@ class ControllerManager:
             logger.info('Revoked controller API access token for job %s',
                         job_id)
 
+    def _get_or_create_cluster_termination_state(
+        self,
+        job_id: int,
+        cluster_name: str,
+    ) -> managed_job_utils.ClusterTerminationState:
+        """Return the manager-owned state for one job cluster incarnation."""
+        key = (job_id, cluster_name)
+        with self._cluster_termination_states_lock:
+            return self._cluster_termination_states.setdefault(
+                key, managed_job_utils.ClusterTerminationState())
+
     def _release_cluster_termination_states(self, job_id: int) -> None:
         """Forget process-local request identities after durable completion."""
-        keys = [
-            key for key in self._cluster_termination_states if key[0] == job_id
-        ]
-        for key in keys:
-            self._cluster_termination_states.pop(key, None)
+        with self._cluster_termination_states_lock:
+            keys = [
+                key for key in self._cluster_termination_states
+                if key[0] == job_id
+            ]
+            for key in keys:
+                self._cluster_termination_states.pop(key, None)
 
     async def _cleanup(self,
                        job_id: int,
@@ -2526,10 +2574,9 @@ class ControllerManager:
                     cluster_name = (
                         managed_job_utils.generate_managed_job_cluster_name(
                             task.name, job_id))
-                    termination_state_key = (job_id, cluster_name)
-                    termination_state = self._cluster_termination_states.setdefault(
-                        termination_state_key,
-                        managed_job_utils.ClusterTerminationState())
+                    termination_state = (
+                        self._get_or_create_cluster_termination_state(
+                            job_id, cluster_name))
                     managed_job_utils.terminate_cluster(
                         cluster_name,
                         graceful=graceful,
@@ -2912,9 +2959,15 @@ class ControllerManager:
         dag = None
         try:
             self._start_controller_api_access(job_id)
-            controller = JobController(job_id, self.starting,
-                                       self._job_tasks_lock,
-                                       self._starting_signal, pool, job_rank)
+            controller = JobController(
+                job_id,
+                self.starting,
+                self._job_tasks_lock,
+                self._starting_signal,
+                pool,
+                job_rank,
+                cluster_termination_state_resolver=functools.partial(
+                    self._get_or_create_cluster_termination_state, job_id))
 
             async with self._job_tasks_lock:
                 if job_id in self.job_tasks:
