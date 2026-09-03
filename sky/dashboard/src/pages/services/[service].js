@@ -3162,7 +3162,7 @@ export function ServiceDetailCard({
     );
   }
   if (serviceData.rejectedRequests != null) {
-    addRequestActivityDetail(
+    requestDetails.push(
       `${lastReportedPrefix}${serviceData.rejectedRequests} rejected`
     );
   }
@@ -3316,8 +3316,23 @@ export function ServiceDetailCard({
         serviceData.requestQueueDepth != null
           ? 'complete reporter-set snapshot'
           : 'queue completeness unavailable',
-        'unassigned, selecting, or retry-backoff work',
+        'waiting for admission',
         ...requestActivityDetails,
+        ...requestFreshnessDetails,
+      ],
+    },
+    {
+      label: 'Rejected recently',
+      value:
+        serviceData.recentRejectedRequests != null
+          ? `${lastReportedPrefix}${serviceData.recentRejectedRequests.toLocaleString()} rejected in 60s`
+          : unavailableRequestMetric,
+      details: [
+        serviceData.rejectedRequests != null
+          ? `${lastReportedPrefix}${serviceData.rejectedRequests.toLocaleString()} retained rejections in 6m`
+          : 'retained rejection telemetry unavailable',
+        'terminal load-balancer 503s; requests still waiting for admission are not rejected',
+        'stable job IDs are deduplicated within each load-balancer window; headerless attempts are counted separately',
         ...requestFreshnessDetails,
       ],
     },

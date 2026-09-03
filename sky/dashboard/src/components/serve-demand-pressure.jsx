@@ -39,12 +39,6 @@ export function buildDemandPressureView(history, range) {
     (sample) => sample.peakInFlight !== null || sample.peakQueueDepth !== null
   );
   const rejectionSupported = history.rejectionHistoryAvailable === true;
-  const selectedRequestSamples = (history.requestSamples || []).filter(
-    (sample) => sample.timestamp >= range.start && sample.timestamp <= range.end
-  );
-  const rejectionHistoryComplete =
-    rejectionSupported &&
-    selectedRequestSamples.every((sample) => sample.rejectedCount !== null);
   const supported = gaugeSupported || rejectionSupported;
   if (!supported) {
     return {
@@ -71,14 +65,16 @@ export function buildDemandPressureView(history, range) {
     const requestSample = requestSamples.get(timestamp);
     inFlight.push(autoscalerSample?.peakInFlight ?? null);
     queued.push(autoscalerSample?.peakQueueDepth ?? null);
+    // Sparse history has no per-minute coverage heartbeat. A missing row is
+    // therefore unknown, not proof that the load balancer rejected nothing.
     rejected.push(
-      rejectionSupported
-        ? requestSample
-          ? requestSample.rejectedCount
-          : 0
-        : null
+      rejectionSupported ? (requestSample?.rejectedCount ?? null) : null
     );
   }
+  const rejectionHistoryComplete =
+    rejectionSupported &&
+    rejected.length > 0 &&
+    rejected.every((value) => value !== null);
   const rejectedObserved = rejected.filter((value) => value !== null);
   return {
     supported,
@@ -162,7 +158,8 @@ export function DemandPressureCard({
         <div>
           <h3 className="text-lg font-semibold">Demand pressure</h3>
           <div className="text-sm text-gray-500">
-            Peak concurrent demand and exact load-balancer rejections
+            Peak concurrent demand and recorded load-balancer rejections; gaps
+            mean coverage is unknown
           </div>
         </div>
         {loading && <CircularProgress size={16} />}
