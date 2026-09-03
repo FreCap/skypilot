@@ -900,10 +900,10 @@ class CapacityPlanInput:
 class CapacityPlanDecision:
     """Pure planner output for one locked current demand/supply snapshot.
 
-    The repository owns every durable identity and inventory field.  A planner
-    may return only the exact-card target plus the three derived autoscaler
-    fields that are intentionally embedded in ``normalized_demand`` for later
-    claim verification.
+    The repository owns every durable identity and inventory field.  The
+    optional locked-replica fingerprint binds the returned envelope to the
+    projection that the callback derived from that repository-locked supply;
+    it is never an optimistic pre-lock census.
     """
 
     capacity_target_by_accelerator: Mapping[str, int]
@@ -916,6 +916,7 @@ class CapacityPlanDecision:
         dataclasses.field(default_factory=dict))
     paid_launch_priority_by_accelerator: Mapping[str, int] = (dataclasses.field(
         default_factory=dict))
+    locked_replica_projection_sha256: str | None = None
     planner_payload: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
     def paid_launch_priority(self, accelerator: str) -> int:
@@ -933,6 +934,11 @@ class CapacityPlanDecision:
         return _decode_planner_payload(self.planner_payload)
 
     def canonical_target(self, accounting_cards: set[str]) -> dict[str, int]:
+        if (self.locked_replica_projection_sha256 is not None and
+                _SHA256_RE.fullmatch(
+                    self.locked_replica_projection_sha256) is None):
+            raise ValueError(
+                'Locked replica projection fingerprint is malformed.')
         target = _canonical_counts(self.capacity_target_by_accelerator,
                                    'capacity_target_by_accelerator')
         if set(target) != accounting_cards:
@@ -6018,6 +6024,16 @@ class CapacityAdmissionRepository:
             elif (any(reservation_commitment.values()) or
                   any(static_fill_target.values())):
                 raise ValueError('A non-fill planner committed reservations.')
+            planner_input_fingerprint = (
+                decision.locked_replica_projection_sha256)
+            if (expected_planner_input_fingerprint is not None and
+                    planner_input_fingerprint is not None and
+                    expected_planner_input_fingerprint
+                    != planner_input_fingerprint):
+                raise CapacityAdmissionConflict(
+                    'Prepared and locked planner input fingerprints differ.')
+            if planner_input_fingerprint is None:
+                planner_input_fingerprint = (expected_planner_input_fingerprint)
             _validate_planner_against_locked_supply(
                 planner_snapshot=planner_snapshot,
                 candidate=candidate,
@@ -6027,8 +6043,7 @@ class CapacityAdmissionRepository:
                 reservation_commitment=reservation_commitment,
                 static_fill_target=static_fill_target,
                 supply_projection=supply_projection,
-                expected_planner_input_fingerprint=(
-                    expected_planner_input_fingerprint))
+                expected_planner_input_fingerprint=(planner_input_fingerprint))
             statically_incompatible_cards = None
             if (sequenced_reserved_fill and positive_target and
                     candidate.reservation_demand_relation is capacity_planning.

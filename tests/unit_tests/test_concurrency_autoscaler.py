@@ -2108,6 +2108,91 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                             decision_inputs=bound)
         self.assertIsNotNone(result)
 
+    def test_locked_capacity_inputs_survive_successor_wave_churn(self):
+        """Successor paid waves plan from locked rows, not a stale census."""
+        autoscaler = _durable_autoscaler(max_replicas=300)
+        prepared = autoscalers.ScalingDecisionInputs(
+            gpu_shape_handles={},
+            historical_scaling_values={},
+            cold_paid_accelerator_order=('L4',),
+            prospective_paid_accelerator_order=('L4',))
+        first_wave = {
+            replica_id: _replica(replica_id,
+                                 status=serve_state.ReplicaStatus.PROVISIONING)
+            for replica_id in range(1, 101)
+        }
+
+        # A reducer removes one failed member while each successor is being
+        # prepared.  The transaction's locked graph remains authoritative:
+        # neither successor waits for the preceding provider wave to become
+        # READY, and both retain a positive residual toward the 300 target.
+        committed = dict(first_wave)
+        next_replica_id = 101
+        for removed_replica_id in (100, 99):
+            committed.pop(removed_replica_id)
+            locked = list(committed.values())
+            bound = autoscalers.bind_locked_capacity_planning_inputs(
+                prepared, locked,
+                kueue_lane_capacity.KueueReplicaCapacitySnapshot({}))
+            result = self._plan(
+                autoscaler,
+                queue_depth=300,
+                replicas=locked,
+                reservation=_durable_reservation(existing_paid=len(locked)),
+                decision_inputs=bound)
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(bound.replica_ids, tuple(sorted(committed)))
+            self.assertGreater(
+                result.envelope.candidate.paid_launch_target.total(), 0)
+
+            for _ in range(100):
+                committed[next_replica_id] = _replica(
+                    next_replica_id,
+                    status=serve_state.ReplicaStatus.PROVISIONING)
+                next_replica_id += 1
+
+        self.assertEqual(next_replica_id, 301)
+
+    def test_locked_capacity_inputs_reject_mutable_preload(self):
+        """The durable binder has no compatibility path for a stale census."""
+        replica = _replica(1, status=serve_state.ReplicaStatus.PROVISIONING)
+        preloaded = autoscalers.ScalingDecisionInputs(
+            replica_bindings=autoscalers.build_replica_planning_bindings(
+                (replica,), {1: ('l4', 1)}),
+            gpu_shape_handles={},
+            gpu_shapes_by_replica_id={1: ('l4', 1)},
+            historical_scaling_values={})
+
+        with self.assertRaisesRegex(ValueError, 'mutable replica preload'):
+            autoscalers.bind_locked_capacity_planning_inputs(
+                preloaded, [replica],
+                kueue_lane_capacity.KueueReplicaCapacitySnapshot({}))
+
+    def test_locked_capacity_preload_does_not_enumerate_version_history(self):
+        """Single-version durable planning is independent of stale history."""
+        autoscaler = _durable_autoscaler(max_replicas=300)
+        with mock.patch.object(
+                serve_state,
+                'get_service_versions',
+                side_effect=AssertionError('must not enumerate history')) as \
+                get_versions, mock.patch.object(
+                    serve_state,
+                    'get_specs',
+                    side_effect=AssertionError('no historical specs')) as \
+                    get_specs:
+            prepared = (
+                autoscalers.prepare_controller_capacity_planning_preflight(
+                    autoscaler))
+
+        self.assertIsNotNone(prepared)
+        assert prepared is not None
+        self.assertEqual(prepared.replica_bindings, ())
+        self.assertEqual(prepared.historical_scaling_values, {})
+        get_versions.assert_not_called()
+        get_specs.assert_not_called()
+
     def test_locked_kueue_snapshot_rejects_every_structural_binding_drift(self):
 
         def change_durable_shape(info):

@@ -49,26 +49,55 @@ the charged teardown count while retaining the claim, pointer, and pin;
 one exact client-token census plus one `TerminateInstances` call; GCP submits
 exact VM or disk deletes without waiting for the returned operations.
 
-That run isolated a separate successor-wave liveness defect. A target of 800
-is intentionally admitted in PostgreSQL transactions of at most 100 members,
-but no second transaction committed. Two optimistic controller preconditions
-were stronger than the facts actually consumed under the repository lock:
-each load-balancer notification invalidated paid-spec preparation, and a
-whole-replica JSON fingerprint treated probe/lifecycle bookkeeping as a
-structural change. The steady-state correction makes the PostgreSQL-locked
-demand and supply graph authoritative, adopts the current notification
-generation at that boundary, and binds prepared external inputs only to a
-frozen, replica-id-sorted tuple of record UUID, version, cluster identity,
-physical GPU shape, and logical planned capacity. Numeric-id reuse is fenced
-by the record UUID. Probe timestamps, readiness, recovery, and other lifecycle
-fields are consumed fresh from the locked rows rather than used as optimistic
-transaction preconditions. Identity, version, shape, and row-set drift still
-fail closed and request a fresh preload.
+The later ``paid-e2e-1660a`` run isolated a remaining successor-wave liveness
+defect. Its target of 800 was intentionally split into PostgreSQL transactions
+of at most 100 members. IDs 1--100 committed between 21:19:44.831 and
+21:19:51.349 UTC, but IDs 101--200 did not commit until 21:28:20.154--
+21:28:29.690: an 8 minute 29 second tail-to-head gap. Successor planning was
+already eligible before the first provider wave became ready. One attempt
+expired its planning authority while preparing 100 envelopes; four later
+attempts failed because ordinary terminal reduction removed first-wave rows
+between controller preload and the repository lock. This is not a provider or
+executor scale limit.
 
-The promoted repository accepts only that structural planner-input
-fingerprint. The former whole-replica planning fingerprint remains solely as
-the legacy, non-promoted controller's pre-planning fence and cannot select a
-second repository validation path.
+The older correction had removed notification-generation and whole-row JSON
+preconditions, but it still made a frozen replica membership/identity tuple a
+precondition for a later transaction. That boundary is wrong: current replica
+membership, record UUID, service version, cluster identity, physical GPU shape,
+logical planned capacity, lifecycle state, and Kueue class are all one mutable
+supply graph and must be sampled together under the repository lock. The
+controller may preload only bounded replica-independent facts and immutable
+future paid-launch templates. The locked binder derives the complete replica
+projection and its fingerprint from the exact rows that the planner consumes;
+there is no expected pre-lock replica fingerprint. Malformed or internally
+inconsistent locked rows still fail closed, but legitimate addition, terminal
+transition, or removal before the lock is simply part of the current plan.
+Because promoted logical services are single-version, this preload also never
+enumerates historical service versions or lets orphan version metadata grow
+reconciliation work.
+
+## Capacity-planning authority boundary
+
+This boundary is normative. A fact that ordinary supported writers can change
+must not be observed optimistically and then compared with the authoritative
+transaction as a condition for progress. It is either sampled under its owning
+lock or treated only as disposable telemetry for a later reconciliation.
+
+| Fact | Authoritative observation | Pre-transaction use |
+|---|---|---|
+| Demand, route, lifecycle, cap, prior plan and service generation | PostgreSQL transaction under the declared lock union | None; an earlier observation grants no launch authority |
+| Existing replica membership, record UUID, service version, cluster identity, lifecycle, exact GPU shape and logical width | The repository-locked replica rows decoded into one supply projection | None; additions, transitions and removals before the lock are current supply |
+| Reserved intents and Kueue admission/capacity class | The repository-locked intent and lane projection paired with those exact replica rows | None; there is no independently refreshed scheduler snapshot |
+| Service-time evidence, provider identity, catalog offerings and deterministic paid ordering | Bounded immutable input token | May be prepared before the transaction, but cannot name current replicas or grant authority |
+| Future paid-launch specifications | Immutable candidate templates | May be prepared before the transaction; the locked planner clips them and the repository atomically binds only accepted members |
+| Provider ``RUNNING``/application ``READY`` feedback | A later provider/replica observation | Never a prerequisite for committing a successor transaction when locked residual and headroom remain |
+
+The practical review rule is ownership completeness: every field needed to
+classify one current replica must come from the same locked supply projection.
+A fingerprint can prove that the planner consumed that projection, but it must
+not turn a stale pre-lock census into a transaction precondition. The
+100-member transaction bound limits lock/write volume; it is not a readiness
+barrier or a reason to delay the next eligible wave.
 
 Release ``1.1.1657`` exposed a separate PostgreSQL liveness coupling during a
 successor paid wave. Routine capacity admission held ``FOR UPDATE`` locks on
@@ -585,6 +614,18 @@ optional best-effort history projection may use a second transaction on the
 same checkout. These are qualification inputs, not a scheduler-policy change
 or authorization to raise the long-lived production paid cap.
 
+Successor-wave liveness is a correctness invariant, not a provider performance
+optimization. Whenever the locked plan still has positive paid residual and
+the locked cap/pool graph has headroom, one eligible reconciliation commits the
+next bounded subset without waiting for an earlier subset to become provider
+``RUNNING`` or ``READY``. Additions, terminal transitions, and removals that
+finish before the lock are current supply, not retry conflicts. Deterministic
+qualification holds the first 100 replicas in ``PENDING``, removes one of them
+after each later controller preload, and requires IDs 101--200 and 201--300 to
+commit in the next two reconciliations. A conflict is permitted only for a fact
+that changes after its owning lock or for malformed/incomplete locked evidence;
+repeated pre-lock churn must not starve progress.
+
 The ``spot-e2e-0902a`` current-writer attempt committed all 100 members of its
 first atomic paid wave at 05:11:12.596 UTC, about 15.6 seconds after traffic
 began. The active load balancer recorded all 10,000 unique identities, but its
@@ -940,14 +981,17 @@ samples the DB clock; finalizes policy state from the accepted subset; writes
 the new plan/head and exact replica/claim wave; then resamples the DB clock and
 revalidates every TTL before committing them together.
 Only after commit may workers be constructed or a provider mutation/launch
-effect begin. Bounded read-only identity, catalog, and ranking preflight may run
-before the transaction, but it freezes only scalar inputs and grants no launch
-authority. The pure planner and transaction consume only those frozen values;
-before exact-token ``RunInstances`` the postcommit path rechecks that the live
-AWS account equals the committed account identity. A report committed before
-the service-row lock is included in planning; a report arriving after the lock
-is causally after the committed wave. Fresh zero therefore prevents every
-uncommitted provider effect without racing a separately published plan.
+effect begin. Bounded read-only identity, catalog, ranking, service-time, and
+future-candidate preparation may run before the transaction, but it contains no
+current replica membership, shape, scheduler class, or lifecycle projection and
+grants no launch authority. The transaction derives every such mutable fact
+from its locked supply rows. The pure planner consumes that locked projection
+plus only the frozen replica-independent values. Before exact-token
+``RunInstances`` the postcommit path rechecks that the live AWS account equals
+the committed account identity. A report committed before the service-row lock
+is included in planning; a report arriving after the lock is causally after the
+committed wave. Fresh zero therefore prevents every uncommitted provider effect
+without racing a separately published plan.
 
 Format 6 is an envelope-format cutover, not a relational migration or a new
 authority protocol: it adds no
@@ -1360,8 +1404,8 @@ longer ahead of publication, but also exposed that shape/Kueue decision-input
 preparation itself remained on the demand side of the boundary. That
 preparation resolves durable replica handles and lane capacity and may outlive
 an LB report interval; rising queue/in-flight telemetry therefore still
-advanced before the now-immediate publication. The canonical boundary includes
-all immutable decision preparation: ``project supply -> load replica/runtime
+advanced before the now-immediate publication. The then-proposed boundary
+included all decision preparation: ``project supply -> load replica/runtime
 and shape/Kueue inputs -> capture demand -> compute target -> publish``. A
 durable planning fingerprint captured with the prepared replica snapshot is
 rechecked after demand, while the publication transaction independently
@@ -1394,6 +1438,13 @@ but it still published the plan/head before the separate paid-claim Phase A.
 Release ``1.1.1575`` proved that this remaining split can race the next demand
 generation. It is superseded by the combined plan-and-accepted-wave transaction
 defined below.
+
+The word "immutable" in that predecessor description applied only to the
+prepared Python token, not to the underlying replica/Kueue facts. The
+``paid-e2e-1660a`` successor race proved that treating those facts as a frozen
+precondition was still incorrect. The normative ownership table above
+supersedes that historical boundary: current replica and scheduler state is
+derived only from the repository-locked graph.
 
 In the steady state, the routing epoch is still acquired before SQL and no
 manager or actuation lock is held while entering SQL. One repository-wide total
@@ -1436,7 +1487,7 @@ advances ``xmin`` without changing any input consumed by the autoscaler. With
 345 reserved replicas, those physical no-op rewrites repeatedly rejected the
 otherwise current locked graph as ``Prepared planning state changed``.
 
-The fingerprint contract is semantic, not physical. It covers the service
+The then-current fingerprint contract was semantic, not physical. It covered the service
 runtime fields and a database-side SHA-256 of each canonical JSONB replica
 document consumed by planning, including row identity and state version, but
 excludes PostgreSQL tuple revisions and timestamps that are not part of those
@@ -1444,8 +1495,10 @@ documents. This keeps the fingerprint compact while a byte-equivalent/no-op
 rewrite cannot starve publication. Any replica addition/removal or normalized
 state change still changes the fingerprint and fails closed before the
 callback. The transaction continues to lock and plan from the complete current
-rows; this correction changes neither demand, supply, Kueue, cap, nor provider
-authority.
+rows; this correction changed neither demand, supply, Kueue, cap, nor provider
+authority. It removed no-op-write starvation, but the later
+``paid-e2e-1660a`` evidence showed that even a semantic pre-lock membership
+fingerprint is too strong. The current writer no longer uses one.
 
 PR #1757 merged the semantic fingerprint as
 ``fa97e7673719cb6721c73051e2185fe3086da31b``. Release ``1.1.1526`` deployed it
@@ -1621,12 +1674,15 @@ state.  This is a controller modeling defect, not Kueue rejection, GPU
 scarcity, or a reason to let padding create paid demand.
 
 The steady-state correction is one deterministic capacity-planning pipeline.
-An impure adapter snapshots live controller state exactly once into a deeply
-immutable, keyword-only ``CapacityPlanningSnapshot``. One pure
-``plan_capacity`` call returns one typed ``CapacityPlanCandidate`` with
-distinct named projections; its closed ``CapacityPlanningEnvelope`` is
-persisted, and only the exact committed candidate becomes a
-``CommittedCapacityPlan``:
+The controller adapter preloads bounded replica-independent service-time and
+paid-cost facts plus immutable future launch templates. Inside the correctness
+transaction, the repository locks demand and the complete mutable supply graph,
+then combines those sources into one deeply immutable, keyword-only
+``CapacityPlanningSnapshot``. It does not compare that locked graph with an
+earlier replica census. One pure ``plan_capacity`` call returns one typed
+``CapacityPlanCandidate`` with distinct named projections; its closed
+``CapacityPlanningEnvelope`` is persisted, and only the exact committed
+candidate becomes a ``CommittedCapacityPlan``:
 
 - traffic/economic demand and its compatibility attribution;
 - compatible reserved capacity committed to that demand;
@@ -2285,14 +2341,14 @@ it has merged or been deployed.
 | Replica observation persistence | **Merged and deployed; final scale receipt remains.** One frozen `ReplicaObserverOwnerFence` carries service/hash/lifecycle plus PID/IP/incarnation/owner epoch from controller claim through manager construction. Readiness and exact-status reducers commit only their owned fields in deterministic replica-ID windows of at most 256 rows, atomically revoke ineligible routes, and complete each accepted window's postcommit work before opening the next. Real PostgreSQL rejects same-PID/IP successor writers across all singleton operations, isolates every observation-field drift without overwriting launch/recovery state, bounds locks/statements, and proves reversed 257-row input commits the same first 256 rows before a second-window failure. There is no ownerless production fallback or process-local feature flag. |
 | Paid qualifier lifecycle | **Merged in PR #1875; the real current-writer campaign remains.** One runner owns service creation, qualification, normal down, lost-acknowledgement scope recovery, provider-native cleanup, and immutable receipts. AWS census covers its bounded region set concurrently on a monotonic cadence, GCP and AWS evidence join into one exact provider projection, and every Sky CLI command can pin the exact `mt_hybrid` workspace rather than inheriting the API Pod's `default` workspace. |
 | Fixed paid pacing | **Deployed since `1.1.1578`; final fast-scale qualification remains.** Durable logical services use one configured fixed wave and PostgreSQL owns the accepted paid-window cursor across takeover. Campaign `spot-e2e-0901k` proved that the bounded 120-unit service window no longer truncates the target; its delayed second wave identified terminal-only provider feedback as the remaining latency source. |
-| Atomic plan and paid admission | **Atomic executable-request binding and its first current-writer wave are production-proven; successor-wave requalification remains open.** Release `1.1.1643` committed the exact 800-L4 plan and all 100 complete launch graphs in 8.4 seconds. Ninety reached provider `RUNNING`; the other ten ended in exact AWS capacity failures. Continuous notification and nonstructural replica churn then starved the second bounded transaction. The source correction retains one PostgreSQL planner/admission path, replaces the whole-row optimistic precondition with a typed structural binding, and keeps identity/version/shape/capacity drift fail-closed. No freshness comparator or TTL is relaxed. |
+| Atomic plan and paid admission | **Atomic executable-request binding and its first current-writer wave are production-proven; the locked-supply successor correction is source-tested and production requalification remains open.** Release `1.1.1643` committed the exact 800-L4 plan and all 100 complete launch graphs in 8.4 seconds. Ninety reached provider `RUNNING`; the other ten ended in exact AWS capacity failures. `paid-e2e-1660a` then committed IDs 1--100 and 101--200 with an 8 minute 29 second inter-wave gap: four successor transactions rejected because a terminal reducer removed rows after the controller's structural preload but before the repository lock. The correction retains one PostgreSQL planner/admission path, preloads no mutable replica census or unbounded service-version history, and derives membership, identity, shape, planned capacity and Kueue class from the repository-locked supply graph. A real PostgreSQL/controller regression commits 100/100/100 members across two such removals while every provider state remains `PENDING`. No freshness comparator, TTL, wave limit, or provider window is relaxed. |
 | Paid restart replay and frozen cleanup | **The replay correction, historical repair, and final row settlement are production-complete; the temporary repair is ready for removal.** Recovery supplied priority 0 to an adoption UPSERT that rewrote nine existing priority-20 claims after their profiles were frozen. Release `1.1.1583` made existing claim replay/adoption validation-only and deployed a cleanup-only transition accepting solely a current priority of 0 whose historical-priority reconstruction exactly matches the frozen profile. Production released all nine claims. Release `1.1.1584` then consumed each exact same-record irreversible `COMMITTED` receipt atomically with its replica; supported cleanup also settled the two older `ACTIVE` rows. The affected PostgreSQL graph reached exact zero and stayed provider/cleanup-clean for 372 seconds, satisfying the strict-removal gate. |
 | Provider-native paid E2E | **Current-writer launch and automatic exact teardown are proven; multi-wave count, timing, and exact-ledger gates remain open.** `paid-e2e-1643a` committed 100 launch graphs, reached 90 provider-`RUNNING` AWS Spot L4 VMs, classified ten exact AWS capacity failures, and reconciled 13 late successes to three joined exact-zero samples without manual deletion. Release `1.1.1650` then recovered the interrupted `paid-e2e-1648a` graph through `21 claims / 21 debit units / 21 instances / 21 disks`, `4 / 6 / 17 / 17`, and `0 / 0 / 2 / 1` to three joined exact-zero AWS/GCP/PostgreSQL observations, again without manual deletion. Historical `spot-e2e-0901k` remains the at-least-100 count proof at 113. The remaining gate is one fresh current-writer campaign: reach at least 100 AWS/GCP Spot L4 VMs within the 15-minute correctness window, retain the five-minute diagnostic, complete 10,000 authenticated async identities, and naturally return to three joined exact-zero samples. |
 | Format-4 activation | **Superseded cleanly.** No older capacity plan, claim, or provider effect crossed the strict-current decoder boundary before format 6 activation. There was no row rewrite, compatibility decoder, storage migration, or infrastructure change. |
 | Format-6 activation | **Complete from an exact-zero service recreation and current through `1.1.1650`.** Current writers strictly reject formats 1--5; lifecycle 152 and later campaigns committed schema-6 heads and paid waves. The service is now absent, so the next clean fleet creation requires no retained service-version migration. |
 | Lifecycle-137 evidence | Release `1.1.1554` reached exactly 100 provider-`RUNNING` GCP Spot one-L4 workers with zero ordinary on-demand and zero wrong-shape capacity. All 10,000 authenticated warm requests returned first-attempt HTTP 200. Normal down converged service, replica, claim, waiter, VM, and disk state to exact zero before the schema-3 cutover. |
 | Lifecycle-136 evidence | Run `9462207b-e026-4c5e-b610-acaba61e9b0a` on `1.1.1550` reached exactly 100 provider-`RUNNING` GCP Spot L4 VMs, with zero on-demand and zero non-L4 VMs. It accepted the 10,000-ID continuation and subsequent 5,000-ID extension. Normal teardown reached provider zero in about 3 minutes 16 seconds and full PostgreSQL/provider/disk zero in about 3 minutes 45 seconds. The immutable bundle records SHA-256 `audit.jsonl` `51807331f170d1352e9001324bd2e66f169a8a04867b7ca9bf94d8c4b953a8d7`, `arm.json` `92542d925ad50f0916cd8dcdc3977d27aa7f6a5e27b269445e03b70eadc36e70`, and `guard.json` `54a503e1f83eaa4899bce38bcc254591f885587ba87e81241fe3332a4188a649`. |
-| Cold-scale timing | **The executor-budget correction is deployed and the first 100 graphs commit promptly; multi-wave timing proof remains open.** `paid-e2e-1643a` committed 100 launches in 8.4 seconds and reached 90 AWS Spot VMs before ten exact capacity failures. The next wave was blocked by controller optimistic-precondition starvation, not provider or executor concurrency. Deterministic tests reproduce that starvation on every reconciliation and prove the structural-binding correction admits successors during continuous notifications while rejecting structural drift. The next campaign must prove the resulting provider wall time. Five minutes remains the recorded performance benchmark; the 15-minute bound is the correctness timeout. |
+| Cold-scale timing | **The executor-budget correction is deployed and the first 100 graphs commit promptly; multi-wave timing proof remains open.** `paid-e2e-1643a` committed 100 launches in 8.4 seconds and reached 90 AWS Spot VMs before ten exact capacity failures. The next wave was blocked by controller optimistic-precondition starvation, not provider or executor concurrency. Deterministic tests now reproduce terminal/removal churn at the controller-to-PostgreSQL boundary and prove two successor 100-member transactions commit on their next reconciliations without provider readiness. The next campaign must prove the resulting provider wall time. Five minutes remains the recorded performance benchmark; the 15-minute bound is the correctness timeout. |
 | Telemetry | PR #1783 is deployed in the current source lineage. The current demand endpoint is controller-independent and, after lifecycle-141 drain, reported two fresh complete HA reporters with exact queued, async-processing, HTTP-in-flight, and total-in-flight values all zero. The deployed successor projects each finalized `CommittedCapacityPlan` into the existing minute autoscaler history immediately after its authoritative commit. The existing history read requires the projection generation, digest, and validity horizon to match the current plan head and service version/hash, returns the PostgreSQL clock, and lets the dashboard reject expiry against that clock; no new endpoint or table is added. Current-writer nonzero production proof remains open. Request history retained the classified successful request. The prior qualification client did not create protocol-covered async-ledger rows, so a current-schema nonzero exact terminal-ledger/UI capture remains a full-design acceptance gate. Telemetry is not provider billing or launch authority. |
 | Writer protocol | Public API 94, worker projection 10, deployed non-pool capability cohort 15, and async request-ledger protocol 1. The release-`1.1.1650` post-rollout projection contains exactly two fresh Ready API, two controller, and seven executor participants on one image; the ordinary, non-pool binding, and ordered-capacity-admission fleet predicates remain homogeneous. Fresh ordinary-paid and `UNKNOWN_CAPACITY_REPLACEMENT` GCP effects require this cohort-15 fleet; older cohorts are settlement/cleanup only. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. The historical schema-3 cutover rewrote no schema. Deployed Serve068 is forward-only additive constraint/guard DDL, with no table or service-data rewrite. |

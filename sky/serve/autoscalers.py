@@ -73,13 +73,15 @@ class PreparedReplicaPlanningBinding:
 
 @dataclasses.dataclass(frozen=True)
 class ScalingDecisionInputs:
-    """Blocking inputs prepared for one exact autoscaler replica snapshot.
+    """Provider-free inputs for one autoscaler planning invocation.
 
     Controller routing publication must never wait on provider or database
     I/O. Shape-aware autoscalers therefore resolve durable cluster handles and
     historical capacity metadata before the controller enters its
     routing-epoch lock, then consume this token without another state-store
-    read inside that lock.
+    read inside that lock. Durable PostgreSQL capacity admission uses an empty
+    replica projection here and derives membership, shapes, and scheduler
+    classes from the repository-locked supply graph instead.
     """
 
     replica_bindings: tuple[PreparedReplicaPlanningBinding, ...] = ()
@@ -371,6 +373,44 @@ def bind_locked_kueue_capacity_snapshot(
         kueue_blocked_retirement_shapes=frozenset(blocked_shapes),
         kueue_transition_replica_ids=frozenset(transition_ids),
         kueue_ready_paid_replacement_replica_ids=frozenset(ready_paid_ids))
+
+
+def bind_locked_capacity_planning_inputs(
+    prepared_inputs: ScalingDecisionInputs,
+    replica_infos: list['replica_managers.ReplicaInfo'],
+    snapshot: kueue_lane_capacity.KueueReplicaCapacitySnapshot,
+) -> ScalingDecisionInputs:
+    """Build mutable replica projections from one locked PostgreSQL graph.
+
+    ``prepared_inputs`` may contain only replica-independent facts.  Exact
+    durable shapes and ABA-safe record identities are derived after the
+    repository has locked the authoritative replica rows, so normal terminal
+    reduction cannot invalidate or starve a successor paid wave.
+    """
+    if not isinstance(prepared_inputs, ScalingDecisionInputs):
+        raise TypeError('Locked capacity planning inputs are malformed.')
+    if (prepared_inputs.replica_bindings or
+            prepared_inputs.gpu_shape_handles not in (None, {}) or
+            prepared_inputs.gpu_shapes_by_replica_id or
+            prepared_inputs.kueue_capacity_by_replica_id or
+            prepared_inputs.kueue_blocked_retirement_shapes or
+            prepared_inputs.kueue_transition_replica_ids or
+            prepared_inputs.kueue_ready_paid_replacement_replica_ids):
+        raise ValueError('Locked capacity planning received a mutable replica '
+                         'preload.')
+    exact_shapes: dict[int, tuple[str, int]] = {}
+    for info in replica_infos:
+        shape = _durable_exact_gpu_shape(info)
+        if shape is not None:
+            exact_shapes[info.replica_id] = shape
+    locked_inputs = dataclasses.replace(
+        prepared_inputs,
+        replica_bindings=build_replica_planning_bindings(
+            replica_infos, exact_shapes),
+        gpu_shape_handles={},
+        gpu_shapes_by_replica_id=exact_shapes)
+    return bind_locked_kueue_capacity_snapshot(locked_inputs, replica_infos,
+                                               snapshot)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -4411,17 +4451,15 @@ class _GpuShapeResolverMixin:
     def _supports_exact_fill_shape_resolution(self) -> bool:
         return True
 
-    def _prepare_scaling_decision_inputs(
-        self, replica_infos: list['replica_managers.ReplicaInfo']
-    ) -> ScalingDecisionInputs:
-        """Resolve every durable input before routing serialization."""
-        for info in replica_infos:
-            self._bind_replica_cache_identity(info)
-        historical_versions = {
-            info.version
-            for info in replica_infos
-            if not info.is_terminal and info.version != self.latest_version
-        }
+    def _prepare_replica_independent_scaling_inputs(
+            self, historical_versions: Iterable[int]) -> ScalingDecisionInputs:
+        """Resolve bounded replica-independent facts without a census."""
+        historical_versions = set(historical_versions)
+        if (any(
+                type(version) is not int or version < 1
+                for version in historical_versions) or
+                self.latest_version in historical_versions):
+            raise ValueError('Historical service versions are malformed.')
         if historical_versions:
             historical_versions.difference_update(
                 self._cached_historical_scaling_versions())
@@ -4448,6 +4486,47 @@ class _GpuShapeResolverMixin:
                         'version %s; using the latest-version fallback for '
                         'this decision tick.', version)
                 historical_values[version] = value
+        service_time_estimates = self._prepare_service_time_estimates()
+        cold_paid_order: tuple[str, ...] = ()
+        prospective_paid_order: tuple[str, ...] = ()
+        if isinstance(self, ConcurrencyAutoscaler):
+            configured_cards = self._configured_cards_from_profiles()
+            with self._cold_paid_cost_snapshot_for_tick():
+                cold_paid_order = tuple(
+                    self._cold_paid_card_order(configured_cards))
+                prospective_paid_order = tuple(
+                    self._prospective_paid_card_order(configured_cards))
+        return ScalingDecisionInputs(
+            gpu_shape_handles={},
+            historical_scaling_values=historical_values,
+            service_time_estimates_by_accelerator=service_time_estimates,
+            cold_paid_accelerator_order=cold_paid_order,
+            prospective_paid_accelerator_order=prospective_paid_order)
+
+    def _prepare_capacity_planning_preflight(self) -> ScalingDecisionInputs:
+        """Prepare only replica-independent facts for locked PG planning."""
+        # PostgreSQL-authoritative logical services are deliberately
+        # single-version: in-place updates are rejected by the controller.
+        # Loading every retained version here would make each reconcile grow
+        # with service history and, worse, turn unrelated orphan metadata into
+        # a planning input.  The locked replica graph below is the only
+        # membership authority; an impossible old-version row fails closed in
+        # the durable planner instead of selecting another spec-preload path.
+        return self._prepare_replica_independent_scaling_inputs(())
+
+    def _prepare_scaling_decision_inputs(
+        self, replica_infos: list['replica_managers.ReplicaInfo']
+    ) -> ScalingDecisionInputs:
+        """Resolve every legacy/local input before routing serialization."""
+        for info in replica_infos:
+            self._bind_replica_cache_identity(info)
+        historical_versions = {
+            info.version
+            for info in replica_infos
+            if not info.is_terminal and info.version != self.latest_version
+        }
+        base_inputs = self._prepare_replica_independent_scaling_inputs(
+            historical_versions)
         try:
             kueue_snapshot = (
                 kueue_lane_capacity.snapshot_replica_capacity_classes(
@@ -4470,23 +4549,9 @@ class _GpuShapeResolverMixin:
                 common_utils.format_exception(error))
             kueue_snapshot = kueue_lane_capacity.KueueReplicaCapacitySnapshot(
                 unknown)
-        service_time_estimates = self._prepare_service_time_estimates()
-        cold_paid_order: tuple[str, ...] = ()
-        prospective_paid_order: tuple[str, ...] = ()
-        if isinstance(self, ConcurrencyAutoscaler):
-            configured_cards = self._configured_cards_from_profiles()
-            with self._cold_paid_cost_snapshot_for_tick():
-                cold_paid_order = tuple(
-                    self._cold_paid_card_order(configured_cards))
-                prospective_paid_order = tuple(
-                    self._prospective_paid_card_order(configured_cards))
         gpu_shape_handles = self._resolve_gpu_shape_handles(replica_infos)
-        base_inputs = ScalingDecisionInputs(
-            gpu_shape_handles=gpu_shape_handles,
-            historical_scaling_values=historical_values,
-            service_time_estimates_by_accelerator=service_time_estimates,
-            cold_paid_accelerator_order=cold_paid_order,
-            prospective_paid_accelerator_order=prospective_paid_order)
+        base_inputs = dataclasses.replace(base_inputs,
+                                          gpu_shape_handles=gpu_shape_handles)
         exact_shapes: dict[int, tuple[str, int]] = {}
         for info in replica_infos:
             cached = self._gpu_shape_cache.get(info.replica_id)
@@ -6563,12 +6628,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         """Build and run the one durable logical planner without mutation.
 
         Demand comes from the PostgreSQL-locked report, reservation and paid
-        inventory comes from the repository-locked projection, and replica
-        readiness comes from the exact controller-prepared census.  In
-        particular, this method never reconstructs economic inventory by
-        filtering replica rows: cleanup-unproven retiring paid rows remain in
-        ``reservation_input.existing_paid_capacity`` until the repository
-        proves provider teardown.
+        inventory and replica state come from the same repository-locked
+        projection.  In particular, this method never reconstructs economic
+        inventory by filtering replica rows: cleanup-unproven retiring paid
+        rows remain in ``reservation_input.existing_paid_capacity`` until the
+        repository proves provider teardown.
         """
         infos = list(replica_infos)
         try:
@@ -12532,6 +12596,14 @@ def prepare_controller_scaling_decision_inputs(
     if _prepared_scaling_implementation(autoscaler) is None:
         return None
     return autoscaler._prepare_scaling_decision_inputs(replica_infos)  # pylint: disable=protected-access
+
+
+def prepare_controller_capacity_planning_preflight(
+        autoscaler: Any) -> ScalingDecisionInputs | None:
+    """Resolve only replica-independent facts for durable PG admission."""
+    if _prepared_scaling_implementation(autoscaler) is None:
+        return None
+    return autoscaler._prepare_capacity_planning_preflight()  # pylint: disable=protected-access
 
 
 def controller_prepares_scaling_decision_inputs(autoscaler: Any) -> bool:

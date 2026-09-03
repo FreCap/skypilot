@@ -6002,22 +6002,34 @@ def test_current_planner_callback_failure_rolls_back(capacity_database):
         ).scalar_one() == 0
 
 
-@pytest.mark.parametrize(
-    'successor_mutation',
-    ('probe_bookkeeping', 'replica_set_identity', 'version', 'shape'))
-def test_controller_successor_admission_tolerates_only_nonstructural_churn(
-        capacity_database, successor_mutation):
-    """A paid successor ignores probe churn but rejects structural drift."""
+def test_controller_successor_waves_plan_from_locked_supply_during_reduction(
+        capacity_database, monkeypatch):
+    """Two successor waves commit despite pre-lock wave-one removals."""
     engine, incarnation, _ = capacity_database
+    service_target = 300
+    members_per_pool = 25
+    pool_count = 12
     _enable_durable_intent(engine,
                            incarnation,
                            reserved_fill_enabled=False,
-                           max_replicas=120,
+                           max_replicas=service_target,
                            replica_unit='logical',
-                           max_live_paid_gpu_units=120,
+                           max_live_paid_gpu_units=service_target,
                            max_scale_up_rate_percentage=100,
-                           scale_up_rate_min_replicas=8,
+                           scale_up_rate_min_replicas=service_target,
                            scale_up_rate_period_seconds=60)
+    ranks = _install_paid_wave_catalog(engine, pool_count=pool_count)
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: members_per_pool)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: service_target)
+    monkeypatch.setattr(paid_capacity, 'service_limit', lambda: service_target)
+    monkeypatch.setattr(paid_capacity, 'max_service_limit',
+                        lambda **_: service_target)
+    monkeypatch.setattr(paid_capacity, 'exploration_frontier',
+                        lambda: pool_count)
+    monkeypatch.setattr(paid_capacity, 'max_exploration_frontier',
+                        lambda: pool_count)
+    monkeypatch.setattr(paid_capacity, 'max_service_exploration_frontier',
+                        lambda **_: pool_count)
 
     route_response = _route_response()
     route_response.update(replica_info={}, num_ready_replicas=0)
@@ -6048,36 +6060,45 @@ def test_controller_successor_admission_tolerates_only_nonstructural_churn(
                       occupancy_sampled_urls=[],
                       total_slots_by_url={},
                       routing_urls=[],
-                      queue_depth=100,
-                      queue_depth_by_priority={'50': 100},
+                      queue_depth=service_target,
+                      queue_depth_by_priority={'50': service_target},
                       queued_requests_by_compatibility=[{
                           'priority': 50,
                           'compatible_accelerators': ['L4'],
-                          'count': 100,
+                          'count': service_target,
                       }],
                       queued_request_deadline_buckets=[{
                           'priority': 50,
                           'compatible_accelerators': ['L4'],
                           'remaining_seconds': 600,
-                          'count': 100,
+                          'count': service_target,
                       }],
                       configured_accelerators=['L4'])
         return report
 
-    demand_state.ingest_report('svc', 'svc-hash', _queued_report(2))
     spec = serve_state.get_spec('svc', 1)
     assert spec is not None
     autoscaler = autoscalers.Autoscaler.from_spec('svc', spec, version=1)
     assert isinstance(autoscaler, autoscalers.ConcurrencyAutoscaler)
     autoscaler.set_configured_accelerator_shapes({'L4': 1})
-    first_spec = _paid_launch_spec(engine, 0, 101)
-    second_spec = _paid_launch_spec(engine, 0, 102)
-    manager = types.SimpleNamespace(
-        max_live_paid_gpu_units=120,
-        workspace='workspace-a',
-        spot_placer=None,
-        prepare_paid_launch_specs=mock.Mock(side_effect=((first_spec,),
-                                                         (second_spec,))))
+    waves = (
+        _paid_wave_specs(engine,
+                         ranks[:4],
+                         members_per_pool=members_per_pool,
+                         first_replica_id=1),
+        _paid_wave_specs(engine,
+                         ranks[4:8],
+                         members_per_pool=members_per_pool,
+                         first_replica_id=101),
+        _paid_wave_specs(engine,
+                         ranks[8:12],
+                         members_per_pool=members_per_pool,
+                         first_replica_id=201),
+    )
+    assert [len(wave) for wave in waves] == [100, 100, 100]
+    manager = types.SimpleNamespace(max_live_paid_gpu_units=service_target,
+                                    workspace='workspace-a',
+                                    spot_placer=None)
     ctrl = _current_capacity_controller(incarnation, autoscaler, manager)
     installed = []
     install_projection = autoscaler.install_committed_capacity_projection
@@ -6088,20 +6109,32 @@ def test_controller_successor_admission_tolerates_only_nonstructural_churn(
 
     autoscaler.install_committed_capacity_projection = _install
 
-    def _admit(replica_infos, mutate_after_prepare=None):
-        planning_fingerprint = (
-            serve_state.get_scale_planning_state_fingerprint(
-                'svc', require_version=True))
-        assert planning_fingerprint is not None
+    def _admit(sequence, prepared_specs, remove_replica_id=None):
+        demand_state.ingest_report('svc', 'svc-hash', _queued_report(sequence))
         prepared_inputs = (
-            autoscalers.prepare_controller_scaling_decision_inputs(
-                autoscaler, replica_infos))
-        prepared_specs = manager.prepare_paid_launch_specs()
-        if mutate_after_prepare is not None:
-            mutate_after_prepare()
-            assert (serve_state.get_scale_planning_state_fingerprint(
-                'svc', require_version=True) != planning_fingerprint)
-        result = ctrl._plan_and_admit_current_capacity(
+            autoscalers.prepare_controller_capacity_planning_preflight(
+                autoscaler))
+        assert prepared_inputs is not None
+        assert prepared_inputs.replica_bindings == ()
+        if remove_replica_id is not None:
+            # This is the exact race from the billable run: the reducer
+            # removes a failed member after the controller has prepared the
+            # successor but before the repository locks supply.  Provider
+            # readiness never advances; every retained member remains PENDING.
+            current = {
+                info.replica_id: info
+                for info in serve_state.get_replica_infos('svc')
+            }
+            removed = current[remove_replica_id]
+            assert removed.status is serve_state.ReplicaStatus.PENDING
+            assert serve_state.remove_replica(
+                'svc',
+                remove_replica_id,
+                expected_service_hash='svc-hash',
+                expected_lifecycle_epoch=3,
+                expected_controller_owner=(123, '10.0.0.5'),
+                expected_replica_record_id=str(removed.replica_record_id))
+        return ctrl._plan_and_admit_current_capacity(
             autoscaler,
             1,
             0,
@@ -6109,89 +6142,29 @@ def test_controller_successor_admission_tolerates_only_nonstructural_churn(
             prepared_inputs,
             sequenced_reserved_fill=False,
             prepared_paid_launch_specs=prepared_specs)
-        return result
 
-    first_result = _admit([])
+    first_result = _admit(2, waves[0])
+    second_result = _admit(3, waves[1], remove_replica_id=1)
+    third_result = _admit(4, waves[2], remove_replica_id=2)
     assert first_result is not None
-    first, first_local, first_prepared = first_result
-    pre_finalized = capacity_planning.plan_capacity(first.planner_snapshot)
-
-    assert first_prepared == (first_spec,)
-    assert [member.replica_id for member in first.paid_launch_receipt.members
-           ] == [101]
-    assert first.candidate.paid_launch_target.total() > 1
-    assert first.candidate.next_policy_state is not None
-    assert pre_finalized.next_policy_state is not None
-    assert pre_finalized.next_policy_state.paid_window_started_db_epoch is None
-    assert (first.candidate.next_policy_state.paid_window_started_db_epoch
-            is not None)
-    assert (first.candidate.next_policy_state.paid_window_ceiling_by_accelerator
-            == first.candidate.paid_launch_target)
-    assert dataclasses.replace(
-        first.candidate,
-        next_policy_state=pre_finalized.next_policy_state) == pre_finalized
-    assert first_local.capacity_plan_candidate == first.candidate
-    assert installed == [first.candidate]
-
-    demand_state.ingest_report('svc', 'svc-hash', _queued_report(3))
-    replica_infos = serve_state.get_replica_infos('svc')
-    assert [info.replica_id for info in replica_infos] == [101]
-
-    def _mutate_successor_source():
-        with engine.begin() as connection:
-            replicas = serve_state_schema.replicas_table
-            row = connection.execute(
-                sqlalchemy.select(replicas).where(
-                    replicas.c.service_name == 'svc',
-                    replicas.c.replica_id == 101)).mappings().one()
-            state = copy.deepcopy(row['replica_state'])
-            updates = {}
-            if successor_mutation == 'probe_bookkeeping':
-                # A failed-probe clock changes no identity, version, shape,
-                # lifecycle status, paid debit, or usable capacity.
-                state['first_consecutive_failure_time'] = time.time()
-            elif successor_mutation == 'replica_set_identity':
-                connection.execute(
-                    sqlalchemy.insert(replicas).values(
-                        **_replica_values(103, zero_cost=False)))
-                return
-            elif successor_mutation == 'version':
-                state['version'] = 2
-                updates['version'] = 2
-            else:
-                assert successor_mutation == 'shape'
-                wide = _paid_launch_spec(engine, 0, 999, accelerator_count=8)
-                resources = json.loads(wide.resources_override)
-                state['location'] = copy.deepcopy(resources)
-                state['resources_override'] = copy.deepcopy(resources)
-                state['planned_capacity'] = 8
-                state['paid_capacity_pool_key'] = wide.pool_key
-                updates['paid_capacity_pool_key'] = wide.pool_key
-            connection.execute(
-                sqlalchemy.update(replicas).where(
-                    replicas.c.service_name == 'svc',
-                    replicas.c.replica_id == 101).values(replica_state=state,
-                                                         **updates))
-
-    successor_result = _admit(replica_infos, _mutate_successor_source)
-    if successor_mutation != 'probe_bookkeeping':
-        assert successor_result is None
-        replica_ids = {
-            info.replica_id for info in serve_state.get_replica_infos('svc')
-        }
-        assert replica_ids == ({101, 103} if successor_mutation
-                               == 'replica_set_identity' else {101})
-        assert 102 not in replica_ids
-        assert installed == [first.candidate]
-        return
-
-    assert successor_result is not None
-    successor, successor_local, successor_prepared = successor_result
-
-    assert successor_prepared == (second_spec,)
-    assert successor.authority.generation == first.authority.generation + 1
-    assert successor_local.capacity_plan_candidate == successor.candidate
-    assert installed == [first.candidate, successor.candidate]
+    assert second_result is not None
+    assert third_result is not None
+    committed = (first_result[0], second_result[0], third_result[0])
+    assert [item.authority.generation for item in committed] == [1, 2, 3]
+    assert [[member.replica_id
+             for member in item.paid_launch_receipt.members]
+            for item in committed] == [
+                list(range(1, 101)),
+                list(range(101, 201)),
+                list(range(201, 301)),
+            ]
+    assert [item.candidate.paid_launch_target.total() for item in committed
+           ] == [300, 201, 102]
+    assert len(installed) == 3
+    retained = serve_state.get_replica_infos('svc')
+    assert {info.replica_id for info in retained} == (set(range(3, 301)))
+    assert all(
+        info.status is serve_state.ReplicaStatus.PENDING for info in retained)
 
 
 def test_controller_suppresses_actuation_on_committed_candidate_drift(
@@ -6285,8 +6258,9 @@ def test_controller_suppresses_actuation_on_committed_candidate_drift(
 
     monkeypatch.setattr(capacity_admission.CapacityAdmissionRepository,
                         'plan_and_admit_current', _drifted_plan_and_admit)
-    prepared_inputs = autoscalers.prepare_controller_scaling_decision_inputs(
-        autoscaler, [])
+    prepared_inputs = (
+        autoscalers.prepare_controller_capacity_planning_preflight(autoscaler))
+    assert prepared_inputs is not None
     result = ctrl._plan_and_admit_current_capacity(
         autoscaler,
         1,

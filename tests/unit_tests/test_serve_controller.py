@@ -5051,20 +5051,9 @@ class TestAutoscalerRuntimeSnapshot:
                  return_value=True), \
              mock.patch.object(
                  autoscalers,
-                 'prepare_controller_scaling_decision_inputs',
+                 'prepare_controller_capacity_planning_preflight',
                  return_value=autoscalers.ScalingDecisionInputs(
-                     replica_bindings=(
-                         autoscalers.build_replica_planning_bindings(
-                             replica_infos, {
-                                 info.replica_id:
-                                     ('l4', info.planned_capacity)
-                                 for info in replica_infos
-                             })),
                      gpu_shape_handles={},
-                     gpu_shapes_by_replica_id={
-                         info.replica_id: ('l4', info.planned_capacity)
-                         for info in replica_infos
-                     },
                      historical_scaling_values={})), \
              mock.patch.object(
                  autoscalers,
@@ -5535,7 +5524,7 @@ class TestAutoscalerRuntimeSnapshot:
                  return_value=True), \
              mock.patch.object(
                  autoscalers,
-                 'prepare_controller_scaling_decision_inputs',
+                 'prepare_controller_capacity_planning_preflight',
                  return_value=autoscalers.ScalingDecisionInputs(
                      gpu_shape_handles={},
                      historical_scaling_values={})), \
@@ -5604,7 +5593,7 @@ class TestAutoscalerRuntimeSnapshot:
                  return_value=True), \
              mock.patch.object(
                  autoscalers,
-                 'prepare_controller_scaling_decision_inputs',
+                 'prepare_controller_capacity_planning_preflight',
                  return_value=autoscalers.ScalingDecisionInputs(
                      gpu_shape_handles={},
                      historical_scaling_values={})), \
@@ -6784,7 +6773,7 @@ class TestAutoscalerRuntimeSnapshot:
                  return_value=True), \
              mock.patch.object(
                  autoscalers,
-                 'prepare_controller_scaling_decision_inputs',
+                 'prepare_controller_capacity_planning_preflight',
                  return_value=autoscalers.ScalingDecisionInputs(
                      gpu_shape_handles={},
                      historical_scaling_values={})), \
@@ -6896,7 +6885,7 @@ class TestAutoscalerRuntimeSnapshot:
                  return_value=True), \
              mock.patch.object(
                  controller.autoscalers,
-                 'prepare_controller_scaling_decision_inputs',
+                 'prepare_controller_capacity_planning_preflight',
                  side_effect=_prepare), \
              mock.patch.object(
                  controller.serve_state,
@@ -7075,7 +7064,7 @@ class TestAutoscalerRuntimeSnapshot:
         repository.plan_and_admit_current.side_effect = _plan_current
         with mock.patch.object(
                 autoscalers,
-                'prepare_controller_scaling_decision_inputs',
+                'prepare_controller_capacity_planning_preflight',
                 return_value=prepared_inputs), \
              mock.patch.object(capacity_planning,
                                'plan_capacity',
@@ -8068,14 +8057,7 @@ class TestAutoscalerRuntimeSnapshot:
             economic_kueue_capacity=locked_kueue)
         supply = self._bind_policy_history(supply, scaler)
         prepared = autoscalers.ScalingDecisionInputs(
-            replica_bindings=autoscalers.build_replica_planning_bindings(
-                (info,), {7: ('l4', 1)}),
-            gpu_shape_handles={},
-            gpu_shapes_by_replica_id={7: ('l4', 1)},
-            historical_scaling_values={},
-            kueue_capacity_by_replica_id={
-                7: kueue_lane_capacity.KueueReplicaCapacityClass.FRESH_WAITING,
-            })
+            gpu_shape_handles={}, historical_scaling_values={})
         repository = mock.Mock()
         observed = []
 

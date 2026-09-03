@@ -6621,17 +6621,6 @@ class SkyServeController:
             logger.warning('Suppressing promoted capacity planning because '
                            'its prepared paid launch set is malformed.')
             return None
-        try:
-            prepared_input_fingerprint = (
-                autoscalers.replica_planning_binding_fingerprint(
-                    prepared_decision_inputs))
-        except (TypeError, ValueError) as error:
-            logger.warning(
-                'Suppressing promoted capacity planning because '
-                'its prepared replica binding is malformed: %s',
-                common_utils.format_exception(error))
-            return None
-
         planned: _LinearizedScalePlan | None = None
         durable_plan: autoscalers.DurableCapacityReconcilePlan | None = None
 
@@ -6670,18 +6659,23 @@ class SkyServeController:
             locked_replica_infos = list(supply.economic_replica_infos)
             try:
                 locked_decision_inputs = (
-                    autoscalers.bind_locked_kueue_capacity_snapshot(
+                    autoscalers.bind_locked_capacity_planning_inputs(
                         prepared_decision_inputs, locked_replica_infos,
                         supply.economic_kueue_capacity))
+                locked_planner_input_fingerprint = (
+                    autoscalers.replica_planning_binding_fingerprint(
+                        locked_decision_inputs))
                 locked_source_fingerprint = (
                     capacity_admission.locked_planning_source_fingerprint(
-                        autoscalers.replica_planning_binding_fingerprint(
-                            locked_decision_inputs),
+                        locked_planner_input_fingerprint,
                         supply.economic_capacity_graph_sha256))
             except autoscalers.PreparedReplicaSnapshotChanged as error:
-                raise capacity_admission.CapacityAdmissionRetryableConflict(
-                    'Prepared replica planning inputs changed before their '
-                    'rows were locked.') from error
+                # Both projections above were derived from the same locked
+                # tuple.  A mismatch is an internal decoding/binding defect,
+                # not pre-lock churn that a retry could repair.
+                raise capacity_admission.CapacityAdmissionConflict(
+                    'Repository-locked replica projections disagree.') from (
+                        error)
             except (TypeError, ValueError) as error:
                 raise capacity_admission.CapacityAdmissionConflict(
                     'Locked scheduler capacity could not bind the local '
@@ -6838,6 +6832,8 @@ class SkyServeController:
                     paid_launch_priority_by_accelerator=(
                         paid_launch_priorities),
                     static_reserved_fill_target_by_accelerator={},
+                    locked_replica_projection_sha256=(
+                        locked_planner_input_fingerprint),
                     planner_payload=envelope.canonical_payload())
 
             if next_policy_state is None:
@@ -6940,6 +6936,8 @@ class SkyServeController:
                 paid_launch_priority_by_accelerator=paid_launch_priorities,
                 static_reserved_fill_target_by_accelerator=(
                     candidate.static_prefill_target.as_dict()),
+                locked_replica_projection_sha256=(
+                    locked_planner_input_fingerprint),
                 planner_payload=envelope.canonical_payload())
 
         # Service-version transitions already use routing-epoch -> PostgreSQL
@@ -6979,9 +6977,7 @@ class SkyServeController:
                     backend_num_nodes=backend_num_nodes,
                     sequenced_reserved_fill=sequenced_reserved_fill,
                     planner=_planner,
-                    prepared_paid_launch_specs=(prepared_paid_launch_specs),
-                    expected_planner_input_fingerprint=(
-                        prepared_input_fingerprint)))
+                    prepared_paid_launch_specs=(prepared_paid_launch_specs)))
             except (capacity_admission.CapacityAdmissionError,
                     ValueError) as error:
                 if isinstance(
@@ -7135,9 +7131,15 @@ class SkyServeController:
                     'No service record found for '
                     f'{self._service_name}')
                 active_versions = runtime_snapshot['active_versions']
-                decision_inputs = (
-                    autoscalers.prepare_controller_scaling_decision_inputs(
-                        decision_autoscaler, replica_infos))
+                if durable_demand_promoted:
+                    decision_inputs = (
+                        autoscalers.
+                        prepare_controller_capacity_planning_preflight(
+                            decision_autoscaler))
+                else:
+                    decision_inputs = (
+                        autoscalers.prepare_controller_scaling_decision_inputs(
+                            decision_autoscaler, replica_infos))
                 planning_state_fingerprint = planning_fingerprint_before
                 if prepares_inputs and not durable_demand_promoted:
                     planning_state_fingerprint = (
