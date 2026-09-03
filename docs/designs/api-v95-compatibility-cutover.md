@@ -2,8 +2,9 @@
 
 - **Status:** In progress
 - **Last updated:** 2026-09-03
-- **Transition PR:** To be assigned; raises the supported peer floor and
-  updates the bundled dashboard and compatibility test baseline.
+- **Transition PR:** [boltz-bio/skypilot#1930](https://github.com/boltz-bio/skypilot/pull/1930);
+  raises the supported peer floor and updates the bundled dashboard and
+  compatibility test baseline.
 - **Cleanup PR:** [boltz-bio/skypilot#1920](https://github.com/boltz-bio/skypilot/pull/1920)
 - **Protocol PR:** [boltz-bio/skypilot#1917](https://github.com/boltz-bio/skypilot/pull/1917)
 
