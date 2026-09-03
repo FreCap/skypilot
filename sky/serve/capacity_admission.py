@@ -3666,7 +3666,7 @@ def _inert_recreated_service_association(
 
 @dataclasses.dataclass(frozen=True)
 class _LockedAssociationAuthorityGraph:
-    """Bounded association authority locked for one planning transaction."""
+    """Locked association frontier plus any nonlocking exhaustive suffix read."""
 
     association_rows: tuple[Mapping[str, Any], ...]
     active_association_rows: tuple[Mapping[str, Any], ...]
@@ -3700,12 +3700,92 @@ class FinalDeletionProviderCleanGraph:
 
 
 @dataclasses.dataclass(frozen=True)
-class _LockedRequestRetentionRoots:
-    """Complete request-layer roots for one locked association set."""
+class _RequestRetentionRoots:
+    """Complete request-layer roots for one association set."""
 
     request_rows: tuple[Mapping[str, Any], ...]
     queue_rows: tuple[Mapping[str, Any], ...]
     pin_rows: tuple[Mapping[str, Any], ...]
+
+
+def _collect_request_retention_roots(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    association_rows: Sequence[Mapping[str, Any]],
+    tables: FinalDeletionAuthorityTables,
+    lock_rows: bool,
+) -> _RequestRetentionRoots:
+    """Collect roots for the explicit read-only or final-deletion wrapper."""
+    association_ids = tuple(row['association_id'] for row in association_rows)
+    association_request_ids = tuple(
+        sorted({str(row['request_id']) for row in association_rows}))
+    if not association_ids:
+        return _RequestRetentionRoots((), (), ())
+
+    request_predicate = sqlalchemy.or_(
+        tables.requests.c.request_id.in_(association_request_ids),
+        tables.requests.c.ordinary_launch_association_id.in_(association_ids))
+    request_statement = sqlalchemy.select(
+        tables.requests.c.request_id,
+        tables.requests.c.ordinary_launch_association_id,
+        tables.requests.c.handler_name, tables.requests.c.status,
+        tables.requests.c.terminal_cause, tables.requests.c.finished_at,
+        tables.requests.c.execution_generation,
+        tables.requests.c.execution_quiescence_required,
+        tables.requests.c.execution_quiesced_generation,
+        tables.requests.c.execution_quiesced_at,
+        tables.requests.c.resource_action_id,
+        tables.requests.c.resource_action_attempt,
+        tables.requests.c.binding_protocol_version,
+        tables.requests.c.profile_kind, tables.requests.c.profile_version,
+        tables.requests.c.profile_digest,
+        tables.requests.c.capability_cohort_epoch,
+        tables.requests.c.capability_profile_set_digest,
+        tables.requests.c.receipt_protocol_version).where(
+            request_predicate).order_by(tables.requests.c.request_id)
+    if lock_rows:
+        request_statement = request_statement.with_for_update()
+    request_rows = tuple(connection.execute(request_statement).mappings())
+    discovered_request_ids = tuple(
+        sorted(
+            set(association_request_ids) |
+            {str(row['request_id']) for row in request_rows}))
+    queue_statement = sqlalchemy.select(tables.queue.c.request_id).where(
+        tables.queue.c.request_id.in_(discovered_request_ids)).order_by(
+            tables.queue.c.request_id)
+    if lock_rows:
+        queue_statement = queue_statement.with_for_update()
+    queue_rows = tuple(connection.execute(queue_statement).mappings())
+    pin_statement = sqlalchemy.select(
+        tables.pins.c.pin_kind, tables.pins.c.pin_id,
+        tables.pins.c.request_id).where(
+            sqlalchemy.or_(tables.pins.c.request_id.in_(discovered_request_ids),
+                           tables.pins.c.pin_id.in_(association_ids))).order_by(
+                               tables.pins.c.pin_kind, tables.pins.c.pin_id)
+    if lock_rows:
+        pin_statement = pin_statement.with_for_update()
+    pin_rows = tuple(connection.execute(pin_statement).mappings())
+    return _RequestRetentionRoots(request_rows, queue_rows, pin_rows)
+
+
+def _read_request_retention_roots_conservatively(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    association_rows: Sequence[Mapping[str, Any]],
+    tables: FinalDeletionAuthorityTables,
+) -> _RequestRetentionRoots:
+    """Read routine-planning roots without blocking request liveness.
+
+    The caller holds the service and complete association frontier. An
+    unsettled association is itself blocking; roots of an ignorable settled
+    association can only disappear under supported writers. A mixed read may
+    therefore reject clean genesis conservatively but cannot authorize genesis
+    beside a live effect.
+    """
+    return _collect_request_retention_roots(connection,
+                                            association_rows=association_rows,
+                                            tables=tables,
+                                            lock_rows=False)
 
 
 def _lock_request_retention_roots(
@@ -3713,59 +3793,12 @@ def _lock_request_retention_roots(
     *,
     association_rows: Sequence[Mapping[str, Any]],
     tables: FinalDeletionAuthorityTables,
-) -> _LockedRequestRetentionRoots:
-    """Lock every request, queue and pin root reachable from associations."""
-    association_ids = tuple(row['association_id'] for row in association_rows)
-    association_request_ids = tuple(
-        sorted({str(row['request_id']) for row in association_rows}))
-    if not association_ids:
-        return _LockedRequestRetentionRoots((), (), ())
-
-    request_predicate = sqlalchemy.or_(
-        tables.requests.c.request_id.in_(association_request_ids),
-        tables.requests.c.ordinary_launch_association_id.in_(association_ids))
-    request_rows = tuple(
-        connection.execute(
-            sqlalchemy.select(
-                tables.requests.c.request_id,
-                tables.requests.c.ordinary_launch_association_id,
-                tables.requests.c.handler_name, tables.requests.c.status,
-                tables.requests.c.terminal_cause, tables.requests.c.finished_at,
-                tables.requests.c.execution_generation,
-                tables.requests.c.execution_quiescence_required,
-                tables.requests.c.execution_quiesced_generation,
-                tables.requests.c.execution_quiesced_at,
-                tables.requests.c.resource_action_id,
-                tables.requests.c.resource_action_attempt,
-                tables.requests.c.binding_protocol_version,
-                tables.requests.c.profile_kind,
-                tables.requests.c.profile_version,
-                tables.requests.c.profile_digest,
-                tables.requests.c.capability_cohort_epoch,
-                tables.requests.c.capability_profile_set_digest,
-                tables.requests.c.receipt_protocol_version).
-            where(request_predicate).order_by(
-                tables.requests.c.request_id).with_for_update()).mappings())
-    discovered_request_ids = tuple(
-        sorted(
-            set(association_request_ids) |
-            {str(row['request_id']) for row in request_rows}))
-    queue_rows = tuple(
-        connection.execute(
-            sqlalchemy.select(tables.queue.c.request_id).where(
-                tables.queue.c.request_id.in_(discovered_request_ids)).order_by(
-                    tables.queue.c.request_id).with_for_update()).mappings())
-    pin_rows = tuple(
-        connection.execute(
-            sqlalchemy.select(
-                tables.pins.c.pin_kind, tables.pins.c.pin_id,
-                tables.pins.c.request_id).where(
-                    sqlalchemy.or_(
-                        tables.pins.c.request_id.in_(discovered_request_ids),
-                        tables.pins.c.pin_id.in_(association_ids))).order_by(
-                            tables.pins.c.pin_kind,
-                            tables.pins.c.pin_id).with_for_update()).mappings())
-    return _LockedRequestRetentionRoots(request_rows, queue_rows, pin_rows)
+) -> _RequestRetentionRoots:
+    """Lock every request-layer root for destructive final deletion."""
+    return _collect_request_retention_roots(connection,
+                                            association_rows=association_rows,
+                                            tables=tables,
+                                            lock_rows=True)
 
 
 def _lock_association_authority_graph(
@@ -3790,6 +3823,14 @@ def _lock_association_authority_graph(
     Association resolution is monotonic and supported writers serialize on the
     already-held service row, so later ticks need only lock unresolved rows,
     current attachment pointers, and exact prepared-candidate collisions.
+
+    A bounded successor deliberately does not lock mutable API request, queue,
+    or retention-pin rows.  Those rows add no authority beyond its
+    conservatively retained association frontier, while locking them across
+    planning and fused binding would prevent active request executions from
+    renewing their leases.
+    Genesis or an invalid-head fallback reads and classifies the complete
+    request-root graph conservatively without locking it.
     """
     replica_records = {(replica_id, str(record_id)) for replica_id, record_id in
                        locked_capacity.provider_present_replica_record_ids}
@@ -3896,12 +3937,15 @@ def _lock_association_authority_graph(
             association_statement.order_by(
                 ordinary_associations.c.association_id).with_for_update(
                     of=ordinary_associations)).mappings())
-    roots = _lock_request_retention_roots(connection,
-                                          association_rows=association_rows,
-                                          tables=FinalDeletionAuthorityTables(
-                                              requests=request_rows_table,
-                                              queue=request_queue_table,
-                                              pins=request_pins_table))
+    if exhaustive_history_census:
+        roots = _read_request_retention_roots_conservatively(
+            connection,
+            association_rows=association_rows,
+            tables=FinalDeletionAuthorityTables(requests=request_rows_table,
+                                                queue=request_queue_table,
+                                                pins=request_pins_table))
+    else:
+        roots = _RequestRetentionRoots((), (), ())
     request_rows = roots.request_rows
     queue_rows = roots.queue_rows
     pin_rows = roots.pin_rows
@@ -4537,9 +4581,10 @@ def _resolve_validated_format_6_head(
            capacity_planning.CapacityPlanCandidate] | None:
     """Strict-decode the trust anchor before using a bounded history scope.
 
-    Authority counts are inputs only to headless genesis.  This wrapper enters
-    the prior-head branch exclusively, making it impossible for a placeholder
-    zero count to authorize genesis or bypass its exhaustive census.
+    Exhaustive authority counts are needed only for genesis or an invalid-head
+    fallback.  This wrapper enters the strict prior-head branch exclusively,
+    making it impossible for a placeholder zero count to authorize genesis or
+    bypass its exhaustive census.
     """
     previous = history.previous
     if previous is None:

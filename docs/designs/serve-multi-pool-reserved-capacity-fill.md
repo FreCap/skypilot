@@ -40,6 +40,17 @@ fingerprint. The former whole-replica planning fingerprint remains solely as
 the legacy, non-promoted controller's pre-planning fence and cannot select a
 second repository validation path.
 
+Release ``1.1.1657`` exposed a separate PostgreSQL liveness coupling during a
+successor paid wave. Routine capacity admission held ``FOR UPDATE`` locks on
+every retained API request, queue row, and retention pin across planning and
+fused binding. A transaction exceeding the 30-second execution lease therefore
+prevented 51 already-running launch handlers from renewing, and their local
+futures were subsequently cancelled. The source correction removes those
+mutable execution-liveness rows from routine planning locks while retaining the
+service and association creation fence described below. It is not yet deployed
+or production-requalified; another multi-wave scale/drain campaign remains an
+open gate.
+
 An earlier release-``1.1.1638`` down removed every provider VM, disk, and
 in-flight provider operation, but retained 13 exact claims/debits at the
 qualifier's 30-minute cleanup deadline. Their cleanup workers had correctly
@@ -2882,8 +2893,19 @@ not merely paths that happen to touch both plan and pool state:
 9. capacity-plan head, then its referenced current plan;
 10. every paid-pool row in sorted ``pool_key`` order for the union of retained
     claims and all staged candidates; and
-11. existing paid claims, waiters, candidate replica identities and every
-    dependent row in stable identity order.
+11. existing paid claims, waiters, candidate replica identities and association
+    authority rows in stable identity order.
+
+API request, queue, and retention-pin rows are the mutable execution-liveness
+suffix, not routine capacity-admission locks. A strict format-6 successor does
+not read that suffix because its locked association frontier conservatively
+retains every unresolved effect. Genesis or an invalid-head exhaustive fallback
+reads the complete suffix without ``FOR UPDATE`` and may only reject a clean
+genesis conservatively. The locked service and association frontier prevents a
+new supported graph from appearing, while supported request transitions are
+one-way toward terminal/quiesced state and reference removal. Only the
+destructive final-deletion barrier locks the suffix before permitting service
+name reuse.
 
 Missing paid-pool rows are inserted with conflict-safe semantics in sorted
 order, then selected in that same order. Provider discovery and prepared
@@ -2988,16 +3010,18 @@ malformed envelope or live reference remains blocking. Final deletion and
 headless genesis consume this same classifier; neither rewrites the retained
 audit row.
 
-The barrier is one exhaustive same-name relationship census, not
-independent best-effort probes. It locks requests reached by either the
-association's immutable request ID or a request's association pointer, and it
-locks every retention pin reached by either request ID or association ID. A
-divergent reverse pointer, any pin kind, or any queue row fails closed. The
-census applies to every PostgreSQL non-pool service and cannot be bypassed by
-changing its mutable ordinary-launch binding-mode field. A missing lifecycle
-fence or noncanonical pool discriminator fails closed. The barrier uses the
-same terminal request-root classifier as clean genesis so teardown and
-recreation cannot disagree about whether retained history is inert.
+The destructive final-deletion barrier is one exhaustive same-name
+relationship census, not independent best-effort probes. It locks requests
+reached by either the association's immutable request ID or a request's
+association pointer, and it locks every retention pin reached by either request
+ID or association ID. A divergent reverse pointer, any pin kind, or any queue
+row fails closed. The census applies to every PostgreSQL non-pool service and
+cannot be bypassed by changing its mutable ordinary-launch binding-mode field.
+A missing lifecycle fence or noncanonical pool discriminator fails closed. The
+barrier uses the same terminal request-root classifier as clean genesis, but
+genesis uses its nonlocking conservative read rather than this destructive lock
+boundary, so teardown and recreation cannot disagree about whether retained
+history is inert.
 
 Teardown first locks the complete same-name intent domain once in immutable
 intent-key order. It terminalizes only exact-current, provider-free pending
@@ -3016,8 +3040,9 @@ provider effect is absent. Such a row requires independent evidence-backed
 provider adjudication; it is never reclassified as safe from age or request
 status alone.
 
-That exhaustive cross-incarnation census occurs until a strict-valid format-6
-head exists. Each strict-valid current head is an inductive durable receipt:
+That exhaustive cross-incarnation association census and conservative
+request-suffix read occur until a strict-valid format-6 head exists. Each
+strict-valid current head is an inductive durable receipt:
 genesis performed the census, and every supported successor writer validated
 its predecessor under the same service/head locks before replacing it. The
 current receipt is trusted only after the strict service/hash/lifecycle/version/

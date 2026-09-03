@@ -5076,17 +5076,52 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
         while time.monotonic() < deadline:
             observation_started_at = time.time()
             observation_started_monotonic = time.monotonic()
-            reads = []
-            if gcp is not None:
-                reads.append(asyncio.to_thread(gcp.census))
-            if aws is not None:
-                reads.append(asyncio.to_thread(aws.census))
-            censuses = await asyncio.gather(*reads)
+            try:
+                reads = []
+                if gcp is not None:
+                    reads.append(asyncio.to_thread(gcp.census))
+                if aws is not None:
+                    reads.append(asyncio.to_thread(aws.census))
+                census_results = await asyncio.gather(*reads,
+                                                      return_exceptions=True)
+                for result in census_results:
+                    if isinstance(result, BaseException):
+                        raise result
+            except GuardViolation:
+                raise
+            except Exception as error:  # pylint: disable=broad-except
+                # An unavailable observer proves neither zero nor nonzero. Keep
+                # only its safe type, break any partial zero streak, and retry
+                # until the original cleanup deadline. Persistent loss still
+                # reaches the fail-closed timeout below.
+                consecutive_zero = 0
+                observation_finished_at = time.time()
+                observation_finished_monotonic = time.monotonic()
+                sample = {
+                    'observation_started_at': observation_started_at,
+                    'observation_finished_at': observation_finished_at,
+                    'observation_duration_seconds':
+                        (observation_finished_monotonic -
+                         observation_started_monotonic),
+                    'observed_at': observation_finished_at,
+                    'observation_error_type': type(error).__name__,
+                    'exact_zero': False,
+                    'zero_samples': consecutive_zero,
+                }
+                samples.append(sample)
+                print(json.dumps(sample, sort_keys=True), flush=True)
+                await asyncio.sleep(
+                    max(
+                        0, observation_started_monotonic + args.poll_seconds -
+                        time.monotonic()))
+                continue
+            censuses = typing.cast(list[ProviderCensus | AwsProviderCensus],
+                                   census_results)
             census_index = 0
             if gcp is None:
                 gcp_state = empty_provider_state('gcp')
             else:
-                gcp_census = censuses[census_index]
+                gcp_census = typing.cast(ProviderCensus, censuses[census_index])
                 census_index += 1
                 gcp_state = parse_gcp_cleanup_state(
                     service_name=args.service_name,
@@ -5096,7 +5131,8 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
             if aws is None:
                 aws_state = empty_provider_state('aws')
             else:
-                aws_census = censuses[census_index]
+                aws_census = typing.cast(AwsProviderCensus,
+                                         censuses[census_index])
                 aws_state = parse_aws_cleanup_state(
                     service_instances=aws_census.service_instances,
                     service_volumes=aws_census.service_volumes)

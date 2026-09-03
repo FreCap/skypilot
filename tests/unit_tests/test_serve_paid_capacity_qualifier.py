@@ -2304,8 +2304,12 @@ def test_cleanup_census_counts_instance_after_cluster_label_loss():
     assert state.running_count == 1
 
 
-def test_wait_cleanup_writes_identity_bound_sustained_zero_receipt(
-        monkeypatch, tmp_path):
+def _cleanup_wait_fixture(monkeypatch,
+                          tmp_path,
+                          census,
+                          *,
+                          timeout_seconds=2,
+                          poll_seconds=0):
     base = _provider_scope()
     scope = dataclasses.replace(
         base,
@@ -2344,29 +2348,38 @@ def test_wait_cleanup_writes_identity_bound_sustained_zero_receipt(
         def close():
             pass
 
+    census_fn = census
+
     class Gcp:
-        """Exact-zero provider observer double."""
 
         @staticmethod
         def census():
-            return qualifier.ProviderCensus(instances=[],
-                                            disks=[],
-                                            operations=[])
+            return census_fn()
 
     monkeypatch.setenv('TEST_DATABASE_URL', 'postgresql://unused')
     monkeypatch.setattr(qualifier, 'PostgresObserver', Postgres)
     monkeypatch.setattr(qualifier, '_provider_observers', lambda **_kwargs:
                         (Gcp(), None))
-    args = type(
-        'Args', (), {
-            'postgres_url_env': 'TEST_DATABASE_URL',
-            'service_name': 'paid-e2e',
-            'scope': str(scope_path),
-            'receipt': str(qualification_path),
-            'output': str(output_path),
-            'timeout_seconds': 2,
-            'poll_seconds': 0,
-        })()
+    args = types.SimpleNamespace(
+        postgres_url_env='TEST_DATABASE_URL',
+        service_name='paid-e2e',
+        scope=str(scope_path),
+        receipt=str(qualification_path),
+        output=str(output_path),
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+    )
+    return args, output_path, qualification_path, scope
+
+
+def _empty_gcp_census():
+    return qualifier.ProviderCensus(instances=[], disks=[], operations=[])
+
+
+def test_wait_cleanup_writes_identity_bound_sustained_zero_receipt(
+        monkeypatch, tmp_path):
+    args, output_path, qualification_path, scope = _cleanup_wait_fixture(
+        monkeypatch, tmp_path, _empty_gcp_census)
 
     asyncio.run(qualifier.wait_for_cleanup(args))
 
@@ -2379,6 +2392,69 @@ def test_wait_cleanup_writes_identity_bound_sustained_zero_receipt(
            ] == [True, True, True]
     assert payload['qualification_receipt_sha256'] == hashlib.sha256(
         qualification_path.read_bytes()).hexdigest()
+
+
+def test_wait_cleanup_retries_provider_miss_and_restarts_zero_streak(
+        monkeypatch, tmp_path):
+    outcomes = [
+        None, None,
+        RuntimeError('credential material'), None, None, None
+    ]
+
+    def census():
+        outcome = outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+        return _empty_gcp_census()
+
+    args, output_path, _, _ = _cleanup_wait_fixture(monkeypatch, tmp_path,
+                                                    census)
+
+    asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload_text = output_path.read_text(encoding='utf-8')
+    payload = json.loads(payload_text)
+    assert payload['outcome'] == 'passed'
+    assert payload['zero_samples'] == 3
+    assert len(payload['samples']) == 6
+    assert [sample['exact_zero'] for sample in payload['samples']
+           ] == [True, True, False, True, True, True]
+    miss = payload['samples'][2]
+    assert miss['observation_error_type'] == 'RuntimeError'
+    assert miss['zero_samples'] == 0
+    assert 'credential material' not in payload_text
+
+
+def test_wait_cleanup_persistent_provider_miss_fails_at_deadline(
+        monkeypatch, tmp_path):
+    attempts = []
+
+    def census():
+        attempts.append(None)
+        raise RuntimeError('credential material')
+
+    args, output_path, _, _ = _cleanup_wait_fixture(monkeypatch,
+                                                    tmp_path,
+                                                    census,
+                                                    timeout_seconds=0.2,
+                                                    poll_seconds=0.01)
+
+    with pytest.raises(
+            qualifier.QualificationError,
+            match='Teardown left paid database debits or scoped provider'):
+        asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload_text = output_path.read_text(encoding='utf-8')
+    payload = json.loads(payload_text)
+    assert payload['outcome'] == 'failed'
+    assert payload['error_type'] == 'QualificationError'
+    assert payload['zero_samples'] == 0
+    assert len(attempts) >= 2
+    assert len(payload['samples']) == len(attempts)
+    assert all(sample['observation_error_type'] == 'RuntimeError'
+               for sample in payload['samples'])
+    assert all(sample['exact_zero'] is False for sample in payload['samples'])
+    assert 'credential material' not in payload_text
 
 
 @pytest.mark.parametrize('child_status', ('RUNNING', 'DONE'))
