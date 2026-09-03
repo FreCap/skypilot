@@ -2574,8 +2574,10 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
                                 profile=qualifier.PROFILES['small'])
     receipt.sample('scale', observation)
 
-    assert receipt._payload['schema_version'] == 9
+    assert receipt._payload['schema_version'] == 10
     assert receipt._payload['request_priority'] == 50
+    assert receipt._payload['scale_slo_seconds'] == 300
+    assert receipt._payload['scale_timeout_seconds'] == 900
     sample = receipt._payload['samples'][0]
     assert sample['phase'] == 'scale'
     assert sample['observation_started_at'] == 999.5
@@ -3311,7 +3313,7 @@ def test_route_authority_must_be_fresh_and_match_lifecycle():
         })
 
 
-def test_progress_requires_scale_slo_and_sustained_exact_zero():
+def test_progress_records_scale_slo_and_sustained_exact_zero():
     profile = qualifier.PROFILES['small']
     gcp_name = _provider_cluster_names('gcp', 1)[0]
     aws_name = _provider_cluster_names('aws', 1)[0]
@@ -3329,6 +3331,7 @@ def test_progress_requires_scale_slo_and_sustained_exact_zero():
     progress = qualifier.Progress(scale_started_monotonic=900)
     progress.observe(scaled, profile)
     assert progress.scale_reached_monotonic == 1000
+    assert progress.scale_slo_met is True
 
     zero = _observation(observed_at=1100)
     for observed_at in (1100, 1105, 1461):
@@ -3337,14 +3340,14 @@ def test_progress_requires_scale_slo_and_sustained_exact_zero():
         progress.observe_zero(zero)
     assert progress.drain_complete(zero, profile)
 
-    # Wall-clock movement cannot make the elapsed-time gate pass or fail.
-    too_slow = dataclasses.replace(scaled,
-                                   observed_at=800,
-                                   observed_monotonic=2000)
-    with pytest.raises(qualifier.QualificationError,
-                       match='physical RUNNING L4 Spot VMs took'):
-        qualifier.Progress(scale_started_monotonic=1000).observe(
-            too_slow, profile)
+    # Wall-clock movement cannot change the monotonic diagnostic result. A
+    # provider that converges after the benchmark is still correct before the
+    # broader timeout; the receipt records the missed benchmark.
+    late = dataclasses.replace(scaled, observed_at=800, observed_monotonic=1600)
+    late_progress = qualifier.Progress(scale_started_monotonic=1000)
+    late_progress.observe(late, profile)
+    assert late_progress.scale_reached_monotonic == 1600
+    assert late_progress.scale_slo_met is False
 
 
 def test_progress_scale_counts_physical_vms_not_logical_gpu_units():
@@ -3773,7 +3776,67 @@ def test_scale_and_positive_gate_failure_cancels_sibling_without_release():
     asyncio.run(exercise())
 
 
-def test_scale_wait_stops_at_absolute_physical_slo(tmp_path):
+def test_scale_wait_accepts_provider_convergence_after_diagnostic_slo(tmp_path):
+    profile = dataclasses.replace(qualifier.PROFILES['scale'],
+                                  exact_requests=100,
+                                  request_concurrency=100,
+                                  poll_seconds=0,
+                                  scale_slo_seconds=1,
+                                  scale_timeout_seconds=10)
+    gcp_names = _provider_cluster_names('gcp', 100)
+    started_monotonic = time.monotonic() - 2
+    observation = _observation(
+        observed_at=time.time(),
+        observed_monotonic=time.monotonic(),
+        database=_database_state(
+            paid_debit_units=100,
+            demand_units=100,
+            bound_cluster_zones=tuple(
+                (name, 'us-central1-a') for name in gcp_names)),
+        provider=_cross_cloud_provider_state(gcp_running_count=100,
+                                             aws_running_count=0),
+        load_balancer=_load_balancer_state(demand_units=100,
+                                           unique_job_arrivals_60s=100,
+                                           unique_job_arrivals_300s=100))
+
+    class Observer:
+
+        def __init__(self):
+            self.telemetry_reads = 0
+
+        async def request_telemetry(self):
+            self.telemetry_reads += 1
+            return _request_telemetry(queue_depth=100)
+
+        @staticmethod
+        async def snapshot(**_kwargs):
+            return observation
+
+    async def exercise():
+        observer = Observer()
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            progress = qualifier.Progress(
+                scale_started_monotonic=started_monotonic)
+            await qualifier._wait_for_scale(observer=observer,
+                                            profile=profile,
+                                            progress=progress,
+                                            receipt=qualifier.Receipt(
+                                                path=tmp_path / 'receipt.json',
+                                                service_name='paid-e2e',
+                                                profile=profile),
+                                            traffic=traffic,
+                                            baseline=_request_telemetry())
+            assert observer.telemetry_reads == 1
+            assert progress.scale_slo_met is False
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+def test_scale_wait_stops_at_absolute_qualification_timeout(tmp_path):
     profile = dataclasses.replace(qualifier.PROFILES['scale'],
                                   poll_seconds=1,
                                   scale_slo_seconds=300,
@@ -3786,7 +3849,7 @@ def test_scale_wait_stops_at_absolute_physical_slo(tmp_path):
 
         async def request_telemetry(self):
             self.telemetry_reads += 1
-            raise AssertionError('polled after the physical scale SLO')
+            raise AssertionError('polled after the qualification timeout')
 
     async def exercise():
         observer = Observer()
@@ -3798,7 +3861,7 @@ def test_scale_wait_stops_at_absolute_physical_slo(tmp_path):
                     observer=observer,
                     profile=profile,
                     progress=qualifier.Progress(
-                        scale_started_monotonic=time.monotonic() - 301),
+                        scale_started_monotonic=time.monotonic() - 901),
                     receipt=qualifier.Receipt(path=tmp_path / 'receipt.json',
                                               service_name='paid-e2e',
                                               profile=profile),
@@ -4596,7 +4659,7 @@ def _write_aggregate_qualification(path,
         'lb_offered_arrival_tracking_saturated': False,
     }
     payload = {
-        'schema_version': 9,
+        'schema_version': 10,
         'service_name': service_name,
         'service_hash': f'{service_name}-hash',
         'lifecycle_epoch': 1,
@@ -4626,6 +4689,10 @@ def _write_aggregate_qualification(path,
             cloud: peaks.get(cloud, 0) for cloud in ('aws', 'gcp')
         },
         'scale_started_at': scale_started_at,
+        'scale_slo_seconds': profile.scale_slo_seconds,
+        'scale_timeout_seconds': profile.scale_timeout_seconds,
+        'scale_slo_met': (scale_observed_at - scale_started_at
+                          <= profile.scale_slo_seconds),
         'scale_qualified_observed_at': scale_observed_at,
         'scale_qualified_iteration_id': 1,
         'baseline_qualified_iteration_id': 3,
@@ -4811,10 +4878,11 @@ def test_aggregate_accepts_economic_aws_plus_absent_gcp_canary(tmp_path):
     assert payload['outcome'] == 'passed'
     assert payload['positive_provider_union'] == ['aws', 'gcp']
     assert payload['economic_exact_request_count'] == 10_000
+    assert payload['economic_scale_slo_met'] is True
 
 
 @pytest.mark.parametrize('positive_observed_at', [200.0, 251.0])
-def test_schema_nine_accepts_positive_before_or_after_physical_scale(
+def test_schema_ten_accepts_positive_before_or_after_physical_scale(
         tmp_path, positive_observed_at):
     args = _aggregate_args(tmp_path)
     receipt = pathlib.Path(args.economic_receipt)
@@ -4828,9 +4896,51 @@ def test_schema_nine_accepts_positive_before_or_after_physical_scale(
         receipt, qualifier.ExpectationKind.ECONOMIC)
 
     assert evidence.scale_elapsed_seconds == 246.0
+    assert evidence.scale_slo_met is True
 
 
-def test_schema_nine_accepts_positive_after_queue_fully_dispatches(tmp_path):
+def test_schema_ten_accepts_late_provider_convergence_and_records_slo_miss(
+        tmp_path):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    provider_scale = next(
+        sample for sample in payload['samples'] if sample['phase'] == 'scale')
+    request_scale = next(
+        sample for sample in payload['request_telemetry_samples']
+        if sample['phase'] == 'scale')
+    provider_scale['observed_at'] = 350.0
+    request_scale['observed_at'] = 349.0
+    payload['scale_qualified_observed_at'] = 350.0
+    payload['scale_slo_met'] = False
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    evidence = qualifier._read_qualification_evidence(
+        receipt, qualifier.ExpectationKind.ECONOMIC)
+
+    assert evidence.scale_elapsed_seconds == 346.0
+    assert evidence.scale_slo_met is False
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('scale_slo_seconds', '300'),
+    ('scale_timeout_seconds', None),
+    ('scale_slo_met', 1),
+])
+def test_schema_ten_rejects_untyped_scale_timing_policy(tmp_path, field, value):
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    payload[field] = value
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='invalid scale timing policy'):
+        qualifier._read_qualification_evidence(
+            receipt, qualifier.ExpectationKind.ECONOMIC)
+
+
+def test_schema_ten_accepts_positive_after_queue_fully_dispatches(tmp_path):
     args = _aggregate_args(tmp_path)
     receipt = pathlib.Path(args.economic_receipt)
     payload = json.loads(receipt.read_text(encoding='utf-8'))
@@ -4853,7 +4963,7 @@ def test_schema_nine_accepts_positive_after_queue_fully_dispatches(tmp_path):
     ('positive_observed_at', 'final_observed_at'),
     [(4.5, 500.0), (595.0, 700.0), (501.0, 500.0)],
 )
-def test_schema_nine_rejects_positive_outside_stimulus_queue_and_final_bounds(
+def test_schema_ten_rejects_positive_outside_stimulus_queue_and_final_bounds(
         tmp_path, positive_observed_at, final_observed_at):
     args = _aggregate_args(tmp_path)
     receipt = pathlib.Path(args.economic_receipt)
@@ -5326,25 +5436,39 @@ def test_aggregate_rejects_canary_above_one_physical_instance(tmp_path):
         qualifier.aggregate_evidence(args)
 
 
-@pytest.mark.parametrize('mutation', ['slow', 'nan', 'unbound'])
+@pytest.mark.parametrize('mutation',
+                         ['diagnostic', 'timeout', 'nan', 'unbound'])
 def test_aggregate_derives_scale_elapsed_from_bound_sample(tmp_path, mutation):
     args = _aggregate_args(tmp_path)
     receipt = pathlib.Path(args.economic_receipt)
     payload = json.loads(receipt.read_text(encoding='utf-8'))
     scale = next(
         sample for sample in payload['samples'] if sample['phase'] == 'scale')
-    if mutation == 'slow':
+    if mutation == 'diagnostic':
         scale['observed_at'] = payload['scale_started_at'] + 301
         payload['scale_qualified_observed_at'] = scale['observed_at']
-        payload['scale_elapsed_seconds'] = 0
+        payload['scale_slo_met'] = True
+    elif mutation == 'timeout':
+        scale['observed_at'] = (payload['scale_started_at'] +
+                                payload['scale_timeout_seconds'] + 1)
+        payload['scale_qualified_observed_at'] = scale['observed_at']
+        payload['scale_slo_met'] = False
+        request_scale = next(
+            sample for sample in payload['request_telemetry_samples']
+            if sample['phase'] == 'scale')
+        request_scale['observed_at'] = scale['observed_at'] - 1
+        final = next(sample for sample in payload['request_telemetry_samples']
+                     if sample['phase'] == 'final')
+        final['observed_at'] = scale['observed_at'] + 1
     elif mutation == 'nan':
         payload['scale_started_at'] = float('nan')
     else:
         payload['scale_qualified_observed_at'] += 1
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
-    with pytest.raises(qualifier.QualificationError,
-                       match='timestamp|provider scale evidence'):
+    with pytest.raises(
+            qualifier.QualificationError,
+            match='timestamp|provider scale evidence|typed evidence'):
         qualifier.aggregate_evidence(args)
 
 
