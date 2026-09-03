@@ -1,7 +1,7 @@
 # SkyServe centralized placement catalog
 
 _Status: implementation and local verification complete; pull request and
-production deployment pending. Created: 2026-07-24. Last updated: 2026-08-28._
+production deployment pending. Created: 2026-07-24. Last updated: 2026-09-03._
 
 ## Decision summary
 
@@ -324,6 +324,17 @@ found and corrected four additional gaps:
    as image availability; and
 4. the regionless container-backed test installs all catalog mocks before task
    parsing, so it is hermetic and cannot download hosted catalogs.
+
+The 2026-09-02 post-merge audit of that change found and corrected two
+gaps:
+
+1. the forced-refresh frame had been bound to the module-level image catalog,
+   so after one miss every later API request re-downloaded the image catalog
+   on its first lookup, hit or miss; the module catalog now keeps its regular
+   pull cadence and only the miss path consults the per-request refresh; and
+2. `is_image_tag_valid` had been routed through the single-image lookup, which
+   asserts on the several regional rows of a region-agnostic tag; a
+   region-agnostic `skypilot:` tag is valid again when any region has an AMI.
 
 No unresolved source/design divergence remains. Live AMI qualification and
 hosted publication remain explicit operational gates.

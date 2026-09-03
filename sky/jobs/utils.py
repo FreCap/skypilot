@@ -340,7 +340,16 @@ def ha_recovery_for_consolidation_mode() -> None:
     # Refers to sky/templates/kubernetes-ray.yml.j2 for more details.
     stale_owner_count = (
         managed_job_state.reset_stale_jobs_for_current_controller())
-    terminal_cleanup_count = requeue_terminal_done_jobs_with_live_clusters()
+    terminal_cleanup_count = 0
+    try:
+        terminal_cleanup_count = (
+            requeue_terminal_done_jobs_with_live_clusters())
+    except Exception as e:  # pylint: disable=broad-except
+        # The orphan repair only re-admits leaked cleanup work; it must never
+        # hold the recovery gate closed.  One undecodable legacy row would
+        # otherwise block every managed-job controller slot on this leader.
+        logger.error('Terminal managed job cleanup requeue failed; continuing '
+                     f'recovery without it: {common_utils.format_exception(e)}')
     with open(constants.HA_PERSISTENT_RECOVERY_LOG_PATH.format('jobs_'),
               'a',
               encoding='utf-8') as f:

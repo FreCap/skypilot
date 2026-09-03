@@ -767,6 +767,30 @@ def test_recovery_only_fences_stale_jobs(tmp_path, monkeypatch):
     assert order == ['reset-stale', 'requeue-terminal-cleanup']
 
 
+def test_recovery_completes_when_terminal_cleanup_requeue_fails(
+        tmp_path, monkeypatch):
+    """A failing orphan repair must not hold the recovery gate closed."""
+    order: list[str] = []
+    monkeypatch.setattr(mjrt.constants, 'HA_PERSISTENT_RECOVERY_LOG_PATH',
+                        str(tmp_path / '{}recovery.log'))
+    monkeypatch.setattr(mjrt.managed_job_state,
+                        'reset_stale_jobs_for_current_controller',
+                        lambda: order.append('reset-stale') or 1)
+
+    def requeue_terminal_done_jobs_with_live_clusters() -> int:
+        order.append('requeue-terminal-cleanup')
+        raise ValueError('None is not a valid ManagedJobStatus')
+
+    monkeypatch.setattr(mjrt.managed_job_utils,
+                        'requeue_terminal_done_jobs_with_live_clusters',
+                        requeue_terminal_done_jobs_with_live_clusters)
+
+    mjrt.managed_job_utils.ha_recovery_for_consolidation_mode()
+
+    assert order == ['reset-stale', 'requeue-terminal-cleanup']
+    assert (tmp_path / 'jobs_recovery.log').exists()
+
+
 class TestStart:
     """`start_managed_job_refresh_daemon` honors consolidation mode."""
 

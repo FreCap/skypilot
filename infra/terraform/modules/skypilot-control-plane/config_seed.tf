@@ -147,11 +147,19 @@ resource "terraform_data" "reconcile_api_server" {
       set -euo pipefail
       KUBECONFIG_TMP="$(mktemp)"
       trap 'rm -f "$KUBECONFIG_TMP"' EXIT
-      proxy_args=()
+      # Bash 3.2 treats an empty array expansion as unbound under `set -u`.
+      # Build the complete command in a non-empty array so the default direct
+      # path remains portable to macOS Terraform runners.
+      update_kubeconfig_args=(
+        eks update-kubeconfig
+        --name ${var.host_cluster_name}
+        --region ${var.aws_region}
+        --kubeconfig "$KUBECONFIG_TMP"
+      )
       if [[ -n "$${KUBE_PROXY_URL:-}" ]]; then
-        proxy_args=(--proxy-url "$KUBE_PROXY_URL")
+        update_kubeconfig_args+=(--proxy-url "$KUBE_PROXY_URL")
       fi
-      aws eks update-kubeconfig --name ${var.host_cluster_name} --region ${var.aws_region} --kubeconfig "$KUBECONFIG_TMP" "$${proxy_args[@]}" >/dev/null
+      aws "$${update_kubeconfig_args[@]}" >/dev/null
       deployment_suffixes=(api-server)
       if [[ "$${SKYPILOT_HIGH_AVAILABILITY_ENABLED:-false}" == "true" ]]; then
         deployment_suffixes+=(executor controller)

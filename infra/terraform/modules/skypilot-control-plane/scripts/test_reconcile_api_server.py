@@ -47,6 +47,14 @@ def _reconcile_command() -> str:
 
 class ReconcileApiServerTest(unittest.TestCase):
 
+    def test_unset_proxy_avoids_bash32_empty_array_expansion(self) -> None:
+        # Linux CI uses Bash 5, which accepts this Bash 3.2 nounset failure.
+        command = _reconcile_command()
+        self.assertNotRegex(
+            command,
+            re.compile(r'(?ms)^\s*proxy_args=\(\)\s*$.*?\$\{proxy_args\[@\]\}'),
+        )
+
     def setUp(self) -> None:
         self._tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self._tempdir.cleanup)
@@ -100,6 +108,10 @@ class ReconcileApiServerTest(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(
+            self._aws_args_path.exists(),
+            'reconciliation exited before invoking aws update-kubeconfig',
+        )
         args = [
             arg.decode()
             for arg in self._aws_args_path.read_bytes().split(b'\0')

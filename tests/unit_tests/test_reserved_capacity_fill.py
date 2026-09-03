@@ -2698,6 +2698,70 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
         self.assertEqual(set(autoscaler.info()['fill_by_pool']),
                          {edge['pool_key'] for edge in edges})
 
+    def test_blind_cycle_publishes_boot_hold_free_witness_state(self):
+        east = spot_placer.Location.from_pickleable(
+            dict(_K8S_KEY, region='east-context'))
+        placer = mock.Mock()
+        placer.active_locations.return_value = [east]
+        autoscaler = _make_autoscaler(min_replicas=1, max_replicas=10)
+        autoscaler.reserved_fill_utilization_gate = True
+        demand_sample = mock.Mock()
+        demand_sample.demonstrated_need.return_value = None
+        demand_sample.boot_hold.return_value = True
+        autoscaler.fill_demand_sample = mock.Mock(return_value=demand_sample)
+        allocation = reserved_capacity_broker.Allocation(
+            grant=1,
+            feed=1,
+            round_id=1,
+            epoch=3,
+            snapshot_time=time.time(),
+            protocol_version=2,
+            service_generation=1,
+            observed_free_slots=4,
+            observed_free_slots_by_accelerator={'a100': 4},
+            observed_at=time.time())
+
+        with mock.patch.object(reserved_capacity,
+                               'get_kubernetes_physical_cluster_uid',
+                               return_value='east-uid'), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_replica_infos', return_value=[]), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_reserved_fill_service_claim_set',
+                               return_value=None), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_reserved_fill_round', return_value=None), \
+             mock.patch.object(reserved_capacity_broker,
+                               'replace_claim_set', return_value=1) as replace, \
+             mock.patch.object(reserved_capacity_broker,
+                               'run_round_if_stale',
+                               return_value=allocation), \
+             mock.patch.object(
+                 reserved_capacity.provider_phase,
+                 'provider_phase',
+                 side_effect=lambda _mode: contextlib.nullcontext()), \
+             mock.patch.object(reserved_capacity,
+                               '_record_allocation_observation'):
+            reserved_capacity._broker_cycle_v2(autoscaler, placer, 'svc',
+                                               [east], 'service-hash',
+                                               (123, 'controller-ip'))
+
+        utilization_state = replace.call_args.kwargs['utilization_state']
+        self.assertTrue(utilization_state['blind'])
+        self.assertIsNone(utilization_state['demonstrated_need'])
+        self.assertFalse(utilization_state['boot_hold'])
+        # The allocation publisher must authenticate the state this
+        # heartbeat wrote instead of rejecting it as corruption.
+        decoded = (reserved_capacity.reserved_fill_allocation.
+                   _claim_utilization_authority({
+                       'utilization_ceiling':
+                           replace.call_args.kwargs['utilization_ceiling'],
+                       'global_headroom':
+                           replace.call_args.kwargs['global_headroom'],
+                       'utilization_state': json.dumps(utilization_state),
+                   }))
+        self.assertEqual(decoded[:2], (True, None))
+
     def test_cycle_reads_replicas_and_utilization_once_and_partitions_budget(
             self):
         east = spot_placer.Location.from_pickleable(
@@ -6866,6 +6930,21 @@ class TestQueryFreeSlots(unittest.TestCase):
             reservation_acquisition_classes=classes,
             semantic_sha256='c' * 64,
             refreshed_at=datetime.datetime.now(datetime.timezone.utc))
+
+    def test_reader_shaped_zero_target_witness_is_proven_zero(self):
+        # read_current_fill_demand_witness publishes classes=None together
+        # with target_capacity=0 whenever the committed plan has no
+        # reservation-compatible demand (zero or paid-only demand).  That is
+        # a proven zero for the release governor, not blind telemetry.
+        authority = reserved_capacity.demand_scoped_fill_pool_authority(
+            self._fill_witness(None, target_capacity=0))
+
+        self.assertIs(authority.mode,
+                      reserved_capacity.FillPoolBudgetMode.HOLDINGS_ONLY)
+        self.assertEqual(authority.demand_target_capacity, 0)
+        self.assertEqual(authority.demonstrated_need, 0)
+        self.assertIsNone(authority.demand_witness_sha256)
+        self.assertIsNone(authority.acquisition_classes)
 
     def test_missing_classes_cannot_settle_or_unlock_paid_residual(self):
         authority = reserved_capacity.demand_scoped_fill_pool_authority(
