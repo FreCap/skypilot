@@ -23,6 +23,7 @@ pytestmark = pytest.mark.xdist_group(name="backward_compat")
 
 class TestBackwardCompatibility:
     # Constants
+    BASE_GIT_REPOSITORY = 'https://github.com/boltz-bio/skypilot.git'
     MANAGED_JOB_PREFIX = 'test-back-compat'
     SERVE_PREFIX = 'test-back-compat'
     TEST_TIMEOUT = 1800  # 30 minutes
@@ -129,8 +130,7 @@ class TestBackwardCompatibility:
             if self._is_git_sha(base_branch):
                 # For git SHA, clone first, fetch the specific commit, then checkout
                 self._run_cmd(
-                    f'git clone https://github.com/skypilot-org/skypilot.git {self.BASE_SKY_DIR}'
-                )
+                    f'git clone {self.BASE_GIT_REPOSITORY} {self.BASE_SKY_DIR}')
                 self._run_cmd(
                     f'cd {self.BASE_SKY_DIR} && '
                     f'git fetch -v --prune -- origin {base_branch} && '
@@ -139,8 +139,7 @@ class TestBackwardCompatibility:
                 # For branch names, use -b flag
                 self._run_cmd(
                     f'git clone -b {base_branch} '
-                    f'https://github.com/skypilot-org/skypilot.git {self.BASE_SKY_DIR}',
-                )
+                    f'{self.BASE_GIT_REPOSITORY} {self.BASE_SKY_DIR}',)
 
         # Create and set up virtual environments using uv
         for env_dir in [self.BASE_ENV_DIR, self.CURRENT_ENV_DIR]:
@@ -628,17 +627,16 @@ class TestBackwardCompatibility:
                 pytest.skip(
                     f'Current API version: {self.CURRENT_API_VERSION} is too old, the enforce compatibility is supported after 24(release 0.11.0)'
                 )
-            # This test runs against the master branch or the latest release
-            # version, which must enforce compatibility in this test based on
-            # our new version strategy that adjacent minor versions must be
-            # compatible.
+            # By default this harness targets the explicitly supported Boltz
+            # compatibility floor. A configured base outside the declared
+            # compatibility window is a test configuration error, not an
+            # expected downgrade path.
             pytest.fail(
                 f'Base API version: {self.BASE_API_VERSION} and current API '
                 f'version: {self.CURRENT_API_VERSION} are not compatible:\n'
                 f'- Base minimal compatible API version: {self.BASE_MIN_COMPATIBLE_API_VERSION}\n'
                 f'- Current minimal compatible API version: {self.CURRENT_MIN_COMPATIBLE_API_VERSION}\n'
-                'Change is rejected since it breaks the compatibility between adjacent versions'
-            )
+                'Configured base is outside the declared compatibility window')
         cluster_name = smoke_tests_utils.get_cluster_name()
         job_name = f"{cluster_name}-job"
         commands = [
@@ -727,17 +725,16 @@ class TestBackwardCompatibility:
                 pytest.skip(
                     f'Current API version: {self.CURRENT_API_VERSION} is too old, the enforce compatibility is supported after 24(release 0.11.0)'
                 )
-            # This test runs against the master branch or the latest release
-            # version, which must enforce compatibility in this test based on
-            # our new version strategy that adjacent minor versions must be
-            # compatible.
+            # By default this harness targets the explicitly supported Boltz
+            # compatibility floor. A configured base outside the declared
+            # compatibility window is a test configuration error, not an
+            # expected downgrade path.
             pytest.fail(
                 f'Base API version: {self.BASE_API_VERSION} and current API '
                 f'version: {self.CURRENT_API_VERSION} are not compatible:\n'
                 f'- Base minimal compatible API version: {self.BASE_MIN_COMPATIBLE_API_VERSION}\n'
                 f'- Current minimal compatible API version: {self.CURRENT_MIN_COMPATIBLE_API_VERSION}\n'
-                'Change is rejected since it breaks the compatibility between adjacent versions'
-            )
+                'Configured base is outside the declared compatibility window')
         cluster_name = smoke_tests_utils.get_cluster_name()
         job_name = f"{cluster_name}-job"
         commands = [

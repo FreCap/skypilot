@@ -52,10 +52,10 @@ export const WS_API_URL = API_URL.replace(/^http/, 'ws');
 // is bundled with the server release, so its API contract level is fixed at
 // build time; tracking the server's runtime API_VERSION instead would let
 // a cached old dashboard mis-report support for features it lacks.
-// Keep in sync with sky/server/constants.py:API_VERSION when (and only
-// when) this dashboard adds new server-side feature support that older
-// dashboard builds cannot handle.
-export const CLIENT_API_VERSION = '84';
+// Keep this at or above sky/server/constants.py:MIN_COMPATIBLE_API_VERSION.
+// Advance it to API_VERSION when the dashboard adds new server-side feature
+// support or when the server compatibility floor is raised.
+export const CLIENT_API_VERSION = '95';
 export const SERVE_DASHBOARD_DIRECT_READS_API_VERSION = 66;
 export const SERVE_DASHBOARD_REPLICA_READS_API_VERSION = 67;
 export const SERVE_DASHBOARD_PRICING_READS_API_VERSION = 71;

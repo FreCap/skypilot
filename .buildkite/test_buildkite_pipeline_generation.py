@@ -12,6 +12,7 @@ pytest -n 0 --dist no .buildkite/test_buildkite_pipeline_generation.py
 
 """
 
+import importlib.util
 import os
 import pathlib
 import re
@@ -19,6 +20,40 @@ import subprocess
 
 import pytest
 import yaml
+
+
+def test_quick_tests_core_default_preserves_current_tests_and_uses_floor(
+        monkeypatch):
+    """The default quick pipeline pairs current tests with the Boltz floor."""
+    script_path = pathlib.Path('.buildkite/generate_pipeline.py')
+    spec = importlib.util.spec_from_file_location('generate_pipeline',
+                                                  script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+
+    generated = []
+
+    def fake_generate(test_file, args):
+        generated.append((test_file, args))
+        return {'steps': []}
+
+    monkeypatch.setattr(generator, '_generate_pipeline', fake_generate)
+    monkeypatch.setattr(generator, '_dump_pipeline_to_file',
+                        lambda *args, **kwargs: len(args[1]))
+
+    quick_test = 'tests/smoke_tests/test_quick_tests_core.py'
+    compatibility_test = (
+        'tests/smoke_tests/backward_compat/test_backward_compat.py')
+    result = generator._convert_quick_tests_core(
+        [quick_test, compatibility_test], '', '/quicktest-core')
+
+    assert result == 2
+    assert generated == [
+        (quick_test, ''),
+        (compatibility_test, '--base-branch v1.1.1653'),
+    ]
 
 
 def _insert_test_tracers(content):

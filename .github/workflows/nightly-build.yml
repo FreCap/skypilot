@@ -156,9 +156,9 @@ jobs:
     with:
       commit: ${{ github.sha }}
       branch: ${{ github.ref_name }}
-      message: "nightly-build-pypi backward compatibility test --base-branch pypi/skypilot-nightly"
+      message: "nightly-build-pypi backward compatibility test --base-branch v1.1.1653"
       pipeline: "quicktest-core"
-      build_env_vars: '{"ARGS": "--kubernetes --base-branch pypi/skypilot-nightly"}'
+      build_env_vars: '{"ARGS": "--kubernetes --base-branch v1.1.1653"}'
       timeout_minutes: 240  # p50 104m / p95 ~227m; old 60m timed out 18/28 nights
     secrets:
       BUILDKITE_TOKEN: ${{ secrets.BUILDKITE_TOKEN }}
@@ -170,9 +170,9 @@ jobs:
     with:
       commit: ${{ github.sha }}
       branch: ${{ github.ref_name }}
-      message: "nightly-build-pypi backward compatibility test --base-branch pypi/skypilot"
+      message: "nightly-build-pypi backward compatibility test --base-branch v1.1.1653"
       pipeline: "quicktest-core"
-      build_env_vars: '{"ARGS": "--base-branch pypi/skypilot"}'
+      build_env_vars: '{"ARGS": "--base-branch v1.1.1653"}'
       timeout_minutes: 90  # p50 48m / p95 67m over 28 nights
     secrets:
       BUILDKITE_TOKEN: ${{ secrets.BUILDKITE_TOKEN }}

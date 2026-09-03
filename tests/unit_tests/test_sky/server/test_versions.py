@@ -1,5 +1,7 @@
 """Tests for sky.server.versions module."""
 
+import pathlib
+import re
 from unittest import mock
 
 import pytest
@@ -7,6 +9,47 @@ import pytest
 from sky import exceptions
 from sky.server import constants
 from sky.server import versions
+
+
+def test_api_95_compatibility_cutover_contract():
+    """The exact-result marker release is the supported protocol floor."""
+    assert constants.MIN_COMPATIBLE_API_VERSION == 95
+    assert constants.MIN_COMPATIBLE_VERSION == '1.1.1653'
+
+    for checker in (versions.check_compatibility_at_server,
+                    versions.check_compatibility_at_client):
+        rejected = checker({
+            constants.API_VERSION_HEADER: '94',
+            constants.VERSION_HEADER: '1.1.1652',
+        })
+        assert rejected is not None
+        assert rejected.error is not None
+
+        accepted = checker({
+            constants.API_VERSION_HEADER: '95',
+            constants.VERSION_HEADER: '1.1.1653',
+        })
+        assert accepted is not None
+        assert accepted.error is None
+
+        # This cutover is a protocol support floor, not a network firewall.
+        # Route-aware enforcement for probes and other headerless callers is
+        # intentionally a separate change.
+        assert checker({constants.API_VERSION_HEADER: '94'}) is None
+        assert checker({constants.VERSION_HEADER: '1.1.1652'}) is None
+
+
+def test_dashboard_client_satisfies_compatibility_floor():
+    """The dashboard bundled with the server must remain an accepted peer."""
+    dashboard_constants = (pathlib.Path(__file__).parents[4] / 'sky' /
+                           'dashboard' / 'src' / 'data' / 'connectors' /
+                           'constants.jsx')
+    match = re.search(r"^export const CLIENT_API_VERSION = '(\d+)';$",
+                      dashboard_constants.read_text(encoding='utf-8'), re.M)
+    assert match is not None
+    dashboard_api_version = int(match.group(1))
+    assert dashboard_api_version == 95
+    assert dashboard_api_version >= constants.MIN_COMPATIBLE_API_VERSION
 
 
 def test_check_version_compatibility_compatible_versions():
@@ -78,8 +121,7 @@ def test_check_version_compatibility_incompatible_client():
          mock.patch.object(constants, 'MIN_COMPATIBLE_VERSION', '1.0.0'), \
          mock.patch('sky.server.versions.get_local_readable_version',
                     return_value='1.0.0'), \
-         mock.patch('sky.server.versions.install_version_command',
-                    return_value='pip install skypilot==0.9.0'):
+         mock.patch('sky.__commit__', 'abc123'):
 
         result = versions.check_compatibility_at_server(headers)
 
@@ -88,6 +130,9 @@ def test_check_version_compatibility_incompatible_client():
     assert result.version == '0.9.0'
     assert result.error is not None
     assert 'client version is too old' in result.error
+    assert ('pip install -U "git+https://github.com/boltz-bio/'
+            'skypilot.git@abc123"') in result.error
+    assert 'pip install skypilot==' not in result.error
 
 
 def test_check_version_compatibility_incompatible_server():
@@ -100,11 +145,7 @@ def test_check_version_compatibility_incompatible_server():
     with mock.patch.object(constants, 'MIN_COMPATIBLE_API_VERSION', 2), \
          mock.patch.object(constants, 'MIN_COMPATIBLE_VERSION', '1.0.0'), \
          mock.patch('sky.server.versions.get_local_readable_version',
-                    return_value='1.0.0'), \
-         mock.patch('sky.server.versions.parse_readable_version',
-                    return_value=('0.9.0', None)), \
-         mock.patch('sky.server.versions.install_version_command',
-                    return_value='pip install skypilot==0.9.0'):
+                    return_value='1.0.0'):
 
         result = versions.check_compatibility_at_client(headers)
 
@@ -113,6 +154,8 @@ def test_check_version_compatibility_incompatible_server():
     assert result.version == '0.9.0'
     assert result.error is not None
     assert 'server version is too old' in result.error
+    assert 'this fleet is fix-forward' in result.error
+    assert 'pip install' not in result.error
 
 
 def test_get_local_readable_version_dev():

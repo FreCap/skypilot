@@ -24,7 +24,8 @@ CLIENT_TOO_OLD_ERROR = (
     f'{colorama.Style.RESET_ALL}'
     'The server is running on {local_version} and the minimum compatible '
     'version is {min_version}.\n'
-    f'Upgrade your client with:\n{colorama.Fore.YELLOW}'
+    'Upgrade to the Boltz SkyPilot client matching this server with:\n'
+    f'{colorama.Fore.YELLOW}'
     '{command}'
     f'{colorama.Style.RESET_ALL}')
 SERVER_TOO_OLD_ERROR = (
@@ -33,10 +34,8 @@ SERVER_TOO_OLD_ERROR = (
     f'{colorama.Style.RESET_ALL}'
     'The client is running on {local_version} and the minimum compatible '
     'version is {min_version}.\n'
-    'Contact your administrator to upgrade the remote API server or downgrade '
-    f'your client with:\n{colorama.Fore.YELLOW}'
-    '{command}'
-    f'{colorama.Style.RESET_ALL}')
+    'Contact your administrator to deploy a Boltz SkyPilot server compatible '
+    'with this client; this fleet is fix-forward.')
 
 # SkyPilot dev version.
 DEV_VERSION = '1.0.0-dev0'
@@ -148,12 +147,12 @@ def _check_version_compatibility(
 
     if api_version < constants.MIN_COMPATIBLE_API_VERSION:
         if remote_type == 'server':
-            # Hint the user to downgrade to client to the remote server server.
-            server_version, server_commit = parse_readable_version(version)
-            command = install_version_command(server_version, server_commit)
+            command = ''
         else:
-            # Hint the client to upgrade to upgrade the server version
-            command = install_version_command(sky.__version__, sky.__commit__)
+            # Boltz patch versions are not published as public PyPI releases.
+            # Pinning the server's source commit gives the rejected client an
+            # exact, protocol-identical upgrade target.
+            command = _boltz_install_commit_command(sky.__commit__)
         return VersionInfo(api_version=api_version,
                            version=version,
                            error=_REMOTE_TO_ERROR[remote_type].format(
@@ -215,6 +214,15 @@ def install_version_command(version: str, commit: str | None = None) -> str:
     elif 'dev' in version:
         return f'pip install -U "skypilot-nightly=={version}"'
     return f'pip install -U "skypilot=={version}"'
+
+
+def _boltz_install_commit_command(commit: str | None) -> str:
+    """Return an exact install command for the Boltz source distribution."""
+    if commit is None:
+        return ('Install an organization-approved Boltz SkyPilot client at '
+                f'version {constants.MIN_COMPATIBLE_VERSION} or newer.')
+    return ('pip install -U "git+https://github.com/boltz-bio/'
+            f'skypilot.git@{commit}"')
 
 
 def _remind_minor_version_upgrade(remote_version: str) -> None:

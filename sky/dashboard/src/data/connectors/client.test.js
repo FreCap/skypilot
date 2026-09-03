@@ -17,8 +17,8 @@ import {
 import { TextDecoder as NodeTextDecoder, TextEncoder } from 'util';
 
 describe('dashboard API contract', () => {
-  it('advertises durable demand and operational priority support', () => {
-    expect(CLIENT_API_VERSION).toBe('84');
+  it('advertises API 95 before the server compatibility cutover', () => {
+    expect(CLIENT_API_VERSION).toBe('95');
   });
 });
 

@@ -672,20 +672,31 @@ async def test_get_rejects_untrusted_or_non_exact_retry_marker(version, marker):
 
 
 @pytest.mark.asyncio
-async def test_get_accepts_exact_v94_legacy_retry_detail():
+async def test_get_rejects_exact_v94_legacy_retry_detail_after_marker_cutover():
     response = _FakeGetResponse(503,
                                 {'detail': "Request 'req-1' should be retried"},
                                 headers={
                                     server_constants.API_VERSION_HEADER: '94',
                                 })
+    response.json = mock.AsyncMock(wraps=response.json)
+    fetch = mock.AsyncMock(return_value=response)
+    sleep = mock.AsyncMock()
 
     with mock.patch('sky.client.sdk_async.server_common.'
                     'make_authenticated_request_async',
-                    new=mock.AsyncMock(return_value=response)), \
+                    new=fetch), \
             mock.patch('sky.client.sdk_async.server_common.'
-                       'check_server_healthy_or_start_fn'):
-        with pytest.raises(exceptions.RequestResultShouldRetryError):
+                       'check_server_healthy_or_start_fn'), \
+            mock.patch('sky.client.sdk_async.asyncio.sleep', new=sleep):
+        with pytest.raises(exceptions.RequestResultUnavailableError) as exc:
             await sdk_async.get('req-1')
+
+    assert exc.value.request_id == 'req-1'
+    assert fetch.await_count == 3
+    assert sleep.await_count == 2
+    # Transitional characterization: the floor rejects v94, but the legacy
+    # parser remains until the stacked cleanup PR removes it.
+    assert response.json.await_count == 3
 
 
 @pytest.mark.asyncio

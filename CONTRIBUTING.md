@@ -468,11 +468,11 @@ If the refactoring is happen to be simple (e.g. just change the response payload
 
 #### Removing compatibility code
 
-To reduce the maintenance burden, the SkyPilot CI pipeline automatically updates the `MIN_COMPATIBLE_API_VERSION` field in `sky/server/constants.py` when a new minor version is released.
-The SkyPilot CLI/SDK or API server will raise an error if the remote peer runs in an API version lower than `MIN_COMPATIBLE_API_VERSION`.
-Therefore, compatible code below this version can be safely removed in our codebase.
+Upstream SkyPilot's release pipeline updates the `MIN_COMPATIBLE_API_VERSION` field in `sky/server/constants.py` when a new minor version is released.  The Boltz integration branch instead advances it only in an explicit compatibility-cutover PR; publishing a Helm/image patch release does not change the floor.
+The SkyPilot CLI/SDK or API server will raise an error if the remote peer supplies both standard version headers and runs an API version lower than `MIN_COMPATIBLE_API_VERSION`.
+Therefore, a compatibility branch can be removed when its only reachable callers are versioned peers below this floor.  Audit headerless HTTP and internal call paths separately before deletion.
 
-For example, if we have added the example changes metioned in [Refactoring existing APIs](#refactoring-existing-apis) and now the `MIN_COMPATIBLE_API_VERSION` is bumped to 13 by the CI pipeline (which means we can drop compatibility for API version 12), then the following codes can be removed:
+For example, if we have added the example changes metioned in [Refactoring existing APIs](#refactoring-existing-apis) and now the `MIN_COMPATIBLE_API_VERSION` is bumped to 13 by the release process (which means we can drop compatibility for API version 12), then the following codes can be removed:
 
 ```diff
 # sdk.py
