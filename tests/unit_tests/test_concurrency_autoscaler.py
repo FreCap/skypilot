@@ -146,6 +146,7 @@ def _replica(replica_id,
              reserved_fill=False):
     info = mock.Mock()
     info.replica_id = replica_id
+    info.replica_record_id = (f'00000000-0000-4000-8000-{replica_id:012d}')
     info.version = version
     info.status = status
     info.is_terminal = status in serve_state.ReplicaStatus.terminal_statuses()
@@ -164,6 +165,7 @@ def _replica(replica_id,
     info.status_property.first_ready_time = None
     info.status_property.is_scale_down = False
     info.status_property.unrecoverable_failure.return_value = False
+    info.location = {'accelerators': {card: gpu_count}}
     info.resources_override = {'accelerators': {card: gpu_count}}
     info.handle.return_value.launched_resources.accelerators = {card: gpu_count}
     return info
@@ -315,9 +317,21 @@ def _durable_reservation(
 
 
 def _durable_inputs(replicas=()):
+    shapes = {
+        info.replica_id: autoscalers._durable_exact_gpu_shape(
+            info)  # pylint: disable=protected-access
+        for info in replicas
+    }
+    shapes = {
+        replica_id: shape
+        for replica_id, shape in shapes.items()
+        if shape is not None
+    }
     return autoscalers.ScalingDecisionInputs(
-        replica_ids=tuple(info.replica_id for info in replicas),
+        replica_bindings=autoscalers.build_replica_planning_bindings(
+            replicas, shapes),
         gpu_shape_handles={},
+        gpu_shapes_by_replica_id=shapes,
         historical_scaling_values={},
         cold_paid_accelerator_order=('L4',),
         prospective_paid_accelerator_order=('L4',))
@@ -2078,7 +2092,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         prepared = dataclasses.replace(_durable_inputs((second, first)),
                                        gpu_shapes_by_replica_id={
                                            2: ('l4', 1),
-                                           1: ('h200', 1),
+                                           1: ('l4', 1),
                                        })
         locked = kueue_lane_capacity.KueueReplicaCapacitySnapshot({})
 
@@ -2088,6 +2102,69 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         self.assertEqual(bound.replica_ids, (1, 2))
         self.assertEqual(bound.gpu_shapes_by_replica_id,
                          prepared.gpu_shapes_by_replica_id)
+
+        result = self._plan(_durable_autoscaler(),
+                            replicas=(second, first),
+                            decision_inputs=bound)
+        self.assertIsNotNone(result)
+
+    def test_locked_kueue_snapshot_rejects_every_structural_binding_drift(self):
+
+        def change_durable_shape(info):
+            info.location = {'accelerators': {'L4': 8}}
+            info.resources_override = {'accelerators': {'L4': 8}}
+
+        def remove_durable_shape(info):
+            info.location = None
+            info.resources_override = None
+
+        mutations = {
+            'record identity': lambda info: setattr(
+                info, 'replica_record_id',
+                '00000000-0000-4000-8000-000000000002'),
+            'service version': lambda info: setattr(info, 'version', 2),
+            'cluster identity': lambda info: setattr(info, 'cluster_name',
+                                                     'replacement-cluster'),
+            'physical shape': change_durable_shape,
+            'durable shape removal': remove_durable_shape,
+            'logical capacity': lambda info: setattr(info, 'planned_capacity', 8
+                                                    ),
+        }
+        for name, mutate in mutations.items():
+            prepared_info = _replica(1)
+            prepared = _durable_inputs((prepared_info,))
+            locked_info = _replica(1)
+            mutate(locked_info)
+
+            with self.subTest(name=name), self.assertRaises(
+                    autoscalers.PreparedReplicaSnapshotChanged):
+                autoscalers.bind_locked_kueue_capacity_snapshot(
+                    prepared, [locked_info],
+                    kueue_lane_capacity.KueueReplicaCapacitySnapshot({}))
+
+    def test_locked_kueue_snapshot_rejects_persisted_location_shape_drift(self):
+        prepared_info = _replica(1)
+        prepared_info.resources_override = None
+        prepared_shapes = {1: ('l4', 1)}
+        prepared = autoscalers.ScalingDecisionInputs(
+            replica_bindings=autoscalers.build_replica_planning_bindings(
+                [prepared_info], prepared_shapes),
+            gpu_shapes_by_replica_id=prepared_shapes)
+        locked_info = _replica(1, card='A100', gpu_count=8, planned_capacity=1)
+        locked_info.resources_override = None
+
+        with self.assertRaises(autoscalers.PreparedReplicaSnapshotChanged):
+            autoscalers.bind_locked_kueue_capacity_snapshot(
+                prepared, [locked_info],
+                kueue_lane_capacity.KueueReplicaCapacitySnapshot({}))
+
+    def test_durable_shape_rejects_location_override_disagreement(self):
+        info = _replica(1)
+        info.resources_override = {'accelerators': {'A100': 8}}
+
+        with self.assertRaisesRegex(ValueError, 'disagree'):
+            autoscalers._durable_exact_gpu_shape(  # pylint: disable=protected-access
+                info)
 
     def test_locked_kueue_snapshot_rejects_different_replica_ids(self):
         first = _replica(1)
@@ -2296,6 +2373,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                                 card='H200',
                                 status=serve_state.ReplicaStatus.PROVISIONING)
         provisioning.is_zero_cost = True
+        provisioning.location = None
         provisioning.resources_override = None
         provisioning.status_property.sky_launch_status = (
             common_utils.ProcessStatus.RUNNING)
@@ -2838,8 +2916,7 @@ class TestColdPaidCardOrdering(unittest.TestCase):
             ])
             return []
 
-        inputs = autoscalers.ScalingDecisionInputs(replica_ids=(),
-                                                   gpu_shape_handles={},
+        inputs = autoscalers.ScalingDecisionInputs(gpu_shape_handles={},
                                                    historical_scaling_values={})
         with mock.patch.object(autoscaler,
                                '_generate_scaling_decisions_locked',
@@ -2876,8 +2953,7 @@ class TestColdPaidCardOrdering(unittest.TestCase):
                 autoscaler._cold_paid_card_order(['L4', 'A100']))
             return []
 
-        inputs = autoscalers.ScalingDecisionInputs(replica_ids=(),
-                                                   gpu_shape_handles={},
+        inputs = autoscalers.ScalingDecisionInputs(gpu_shape_handles={},
                                                    historical_scaling_values={})
         with mock.patch.object(autoscaler,
                                '_generate_scaling_decisions_locked',

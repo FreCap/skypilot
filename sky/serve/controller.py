@@ -6577,7 +6577,6 @@ class SkyServeController:
         decision_version: int,
         actuation_generation: int,
         notification_generation: int,
-        planning_state_fingerprint: str | None,
         prepared_decision_inputs: autoscalers.ScalingDecisionInputs,
         *,
         sequenced_reserved_fill: bool,
@@ -6592,10 +6591,8 @@ class SkyServeController:
         binding = self._ordinary_launch_binding_authority
         service_hash = self._service_hash
         if (binding is None or not isinstance(service_hash, str) or
-                not service_hash or
-                not isinstance(planning_state_fingerprint, str)):
+                not service_hash):
             return None
-        assert planning_state_fingerprint is not None
         if (not isinstance(decision_autoscaler,
                            autoscalers.ConcurrencyAutoscaler) or
                 decision_autoscaler.replica_unit != 'logical'):
@@ -6623,6 +6620,16 @@ class SkyServeController:
                     for spec in prepared_paid_launch_specs)):
             logger.warning('Suppressing promoted capacity planning because '
                            'its prepared paid launch set is malformed.')
+            return None
+        try:
+            prepared_input_fingerprint = (
+                autoscalers.replica_planning_binding_fingerprint(
+                    prepared_decision_inputs))
+        except (TypeError, ValueError) as error:
+            logger.warning(
+                'Suppressing promoted capacity planning because '
+                'its prepared replica binding is malformed: %s',
+                common_utils.format_exception(error))
             return None
 
         planned: _LinearizedScalePlan | None = None
@@ -6668,8 +6675,13 @@ class SkyServeController:
                         supply.economic_kueue_capacity))
                 locked_source_fingerprint = (
                     capacity_admission.locked_planning_source_fingerprint(
-                        planning_state_fingerprint,
+                        autoscalers.replica_planning_binding_fingerprint(
+                            locked_decision_inputs),
                         supply.economic_capacity_graph_sha256))
+            except autoscalers.PreparedReplicaSnapshotChanged as error:
+                raise capacity_admission.CapacityAdmissionRetryableConflict(
+                    'Prepared replica planning inputs changed before their '
+                    'rows were locked.') from error
             except (TypeError, ValueError) as error:
                 raise capacity_admission.CapacityAdmissionConflict(
                     'Locked scheduler capacity could not bind the local '
@@ -6938,11 +6950,20 @@ class SkyServeController:
         # checked here before the transaction and again before every provider
         # effect in _reconcile_scale_once().
         with self._routing_state_lock:
-            if (not self._scale_actuation_is_current(
-                    actuation_generation, decision_autoscaler, decision_version)
-                    or self._scale_reconcile_coordinator.generation
-                    != notification_generation):
+            if not self._scale_actuation_is_current(actuation_generation,
+                                                    decision_autoscaler,
+                                                    decision_version):
                 return None
+            # Paid-spec preparation may take long enough for another demand
+            # or replica notification to arrive.  The PostgreSQL repository
+            # locks and plans from the newest durable demand/supply graph, so
+            # treating that notification as an optimistic precondition can
+            # starve every successor wave under continuous traffic.  Adopt
+            # the current notification generation at the linearization
+            # boundary; a still-later notification will fence only the local
+            # projection and schedule another reconciliation.
+            notification_generation = (
+                self._scale_reconcile_coordinator.generation)
             try:
                 committed = (capacity_admission.CapacityAdmissionRepository(
                 ).plan_and_admit_current(
@@ -6959,8 +6980,8 @@ class SkyServeController:
                     sequenced_reserved_fill=sequenced_reserved_fill,
                     planner=_planner,
                     prepared_paid_launch_specs=(prepared_paid_launch_specs),
-                    expected_planning_state_fingerprint=(
-                        planning_state_fingerprint)))
+                    expected_planner_input_fingerprint=(
+                        prepared_input_fingerprint)))
             except (capacity_admission.CapacityAdmissionError,
                     ValueError) as error:
                 if isinstance(
@@ -7020,7 +7041,6 @@ class SkyServeController:
         decision_version: int,
         actuation_generation: int,
         notification_generation: int,
-        planning_state_fingerprint: str | None,
         prepared_decision_inputs: autoscalers.ScalingDecisionInputs,
         replica_infos: list[replica_managers.ReplicaInfo],
         *,
@@ -7042,7 +7062,6 @@ class SkyServeController:
             decision_version,
             actuation_generation,
             notification_generation,
-            planning_state_fingerprint,
             prepared_decision_inputs,
             sequenced_reserved_fill=sequenced_reserved_fill,
             prepared_paid_launch_specs=prepared_specs)
@@ -7101,7 +7120,7 @@ class SkyServeController:
                     self._replica_manager.invalidate_logical_reconcile_state()
                     return
                 planning_fingerprint_before = None
-                if prepares_inputs:
+                if prepares_inputs and not durable_demand_promoted:
                     planning_fingerprint_before = (
                         serve_state.get_scale_planning_state_fingerprint(
                             self._service_name, require_version=True))
@@ -7120,7 +7139,7 @@ class SkyServeController:
                     autoscalers.prepare_controller_scaling_decision_inputs(
                         decision_autoscaler, replica_infos))
                 planning_state_fingerprint = planning_fingerprint_before
-                if prepares_inputs:
+                if prepares_inputs and not durable_demand_promoted:
                     planning_state_fingerprint = (
                         serve_state.get_scale_planning_state_fingerprint(
                             self._service_name, require_version=True))
@@ -7150,7 +7169,6 @@ class SkyServeController:
                             decision_version,
                             actuation_generation,
                             notification_generation,
-                            planning_state_fingerprint,
                             decision_inputs,
                             replica_infos,
                             sequenced_reserved_fill=sequenced_reserved_fill))

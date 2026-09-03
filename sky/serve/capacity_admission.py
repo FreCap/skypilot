@@ -1603,7 +1603,7 @@ def _validate_planner_against_locked_supply(
     reservation_commitment: Mapping[str, int],
     static_fill_target: Mapping[str, int],
     supply_projection: ReservedSupplyProjection | None,
-    expected_planning_state_fingerprint: str | None,
+    expected_planner_input_fingerprint: str | None,
 ) -> None:
     """Bind a pure planner envelope to the PostgreSQL-locked supply facts."""
     configured_cards = {
@@ -1613,10 +1613,10 @@ def _validate_planner_against_locked_supply(
             configured_cards != accounting_cards):
         raise CapacityAdmissionConflict(
             'Planner snapshot names a different service version or card set.')
-    expected_source_fingerprint = expected_planning_state_fingerprint
+    expected_source_fingerprint = expected_planner_input_fingerprint
     if supply_projection is not None:
         expected_source_fingerprint = locked_planning_source_fingerprint(
-            expected_planning_state_fingerprint,
+            expected_source_fingerprint,
             supply_projection.economic_capacity_graph_sha256)
     if (expected_source_fingerprint is not None and
             planner_snapshot.source_fingerprint != expected_source_fingerprint):
@@ -2362,15 +2362,14 @@ def _require_postgres(connection: sqlalchemy.engine.Connection) -> None:
 
 
 def _replica_card(state: Mapping[str, Any]) -> str | None:
-    for field in ('location', 'resources_override'):
-        resource = state.get(field)
-        accelerators = (resource.get('accelerators') if isinstance(
-            resource, Mapping) else None)
-        if isinstance(accelerators, Mapping) and len(accelerators) == 1:
-            raw_card = next(iter(accelerators))
-            if isinstance(raw_card, str) and raw_card:
-                return raw_card.casefold()
-    return None
+    try:
+        shape = spot_placer.durable_exact_accelerator_shape(
+            state.get('location'), state.get('resources_override'))
+    except ValueError as error:
+        raise CapacityAdmissionConflict(
+            'Committed replica durable accelerator shapes disagree or are '
+            'malformed.') from error
+    return None if shape is None else shape[0]
 
 
 def _validated_replica_attribution(
@@ -2517,34 +2516,6 @@ def _lock_capacity_rows(
         capacity_unit_by_intent_key=capacity_unit_by_intent_key,
         all_service_nonterminal_intent_rows=tuple(
             all_service_nonterminal_intent_rows))
-
-
-def _locked_planning_state_fingerprint(service: Mapping[str, Any],
-                                       locked: _LockedCapacityRows) -> str:
-    """Match the controller's semantic fingerprint from locked rows."""
-    active_versions = service['active_versions']
-    if isinstance(active_versions, str):
-        active_versions = json.loads(active_versions) if active_versions else []
-    material = {
-        'runtime': {
-            'hash': service['hash'],
-            'status': service['status'],
-            'current_version': service['current_version'],
-            'controller_pid': service['controller_pid'],
-            'controller_ip': service['controller_ip'],
-            'controller_incarnation':
-                (None if service['controller_incarnation'] is None else str(
-                    service['controller_incarnation'])),
-            'controller_owner_epoch': service['controller_owner_epoch'],
-            'active_versions': active_versions or [],
-        },
-        'replicas': [(int(row['replica_id']), row['replica_state_version'],
-                      row['_replica_state_sha256'])
-                     for row in locked.replica_rows],
-    }
-    encoded = json.dumps(material, sort_keys=True,
-                         separators=(',', ':')).encode('utf-8')
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _lock_kueue_projection(
@@ -5442,7 +5413,7 @@ class CapacityAdmissionRepository:
         ], CapacityPlanDecision],
         prepared_paid_launch_specs: Sequence[
             serve_paid_capacity.PaidLaunchSpec] = (),
-        expected_planning_state_fingerprint: str | None = None,
+        expected_planner_input_fingerprint: str | None = None,
         ttl_seconds: int = constants.CAPACITY_PLAN_TTL_SECONDS,
     ) -> CommittedCapacityPlan:
         """Plan and atomically admit from one PostgreSQL-linearized graph.
@@ -5473,9 +5444,9 @@ class CapacityAdmissionRepository:
             raise ValueError('Expected controller authority is malformed.')
         if not callable(planner):
             raise ValueError('planner must be callable.')
-        if (expected_planning_state_fingerprint is not None and
-                not _SHA256_RE.fullmatch(expected_planning_state_fingerprint)):
-            raise ValueError('expected_planning_state_fingerprint must be a '
+        if (expected_planner_input_fingerprint is not None and
+                not _SHA256_RE.fullmatch(expected_planner_input_fingerprint)):
+            raise ValueError('expected_planner_input_fingerprint must be a '
                              'lowercase SHA-256 digest.')
         if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
             raise ValueError('ttl_seconds must be positive.')
@@ -5704,12 +5675,6 @@ class CapacityAdmissionRepository:
                                                   service_name=service_name,
                                                   service_hash=service_hash,
                                                   now=now)
-            if (expected_planning_state_fingerprint is not None and
-                    _locked_planning_state_fingerprint(service, locked_capacity)
-                    != expected_planning_state_fingerprint):
-                raise CapacityAdmissionRetryableConflict(
-                    'Prepared planning state changed before its rows were '
-                    'locked.')
             lane_projection = _lock_kueue_projection(
                 connection,
                 service_name=service_name,
@@ -6017,8 +5982,8 @@ class CapacityAdmissionRepository:
                 reservation_commitment=reservation_commitment,
                 static_fill_target=static_fill_target,
                 supply_projection=supply_projection,
-                expected_planning_state_fingerprint=(
-                    expected_planning_state_fingerprint))
+                expected_planner_input_fingerprint=(
+                    expected_planner_input_fingerprint))
             statically_incompatible_cards = None
             if (sequenced_reserved_fill and positive_target and
                     candidate.reservation_demand_relation is capacity_planning.
