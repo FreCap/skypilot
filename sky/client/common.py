@@ -64,6 +64,10 @@ _FILE_UPLOAD_LOCK_DIR = '~/.sky/locks/file_uploads'
 
 # Connection timeout when sending requests to the API server.
 API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS = 5
+# A request result can legitimately take a long time to become terminal, but
+# each network read must remain bounded so cancellation and reconciliation can
+# regain control after a lost acknowledgement.
+API_SERVER_REQUEST_RESULT_READ_TIMEOUT_SECONDS = 600
 # Per-operation timeout for file-upload reads, writes, and pool waits. This is
 # not a total upload deadline: active large transfers can still run longer.
 FILE_UPLOAD_HTTP_TIMEOUT_SECONDS = 180

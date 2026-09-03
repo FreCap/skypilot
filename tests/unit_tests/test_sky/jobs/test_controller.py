@@ -3900,7 +3900,90 @@ class TestRunJobLoopOwnershipCleanup:
 
 
 class TestTerminalCleanupAdoption:
-    """A replacement manager adopts terminal work without running it."""
+    """A live manager retains result identity through durable finalization."""
+
+    @pytest.mark.asyncio
+    async def test_cleanup_reuses_pending_down_result_state_across_attempts(
+            self):
+        manager = _make_controller_manager()
+        task = MagicMock()
+        task.name = 'task-a'
+        task.metadata = {}
+        task.storage_mounts = {}
+        task.file_mounts = {}
+        seen_states = []
+
+        def terminate(_cluster_name, **kwargs):
+            request_state = kwargs['request_state']
+            seen_states.append(request_state)
+            if len(seen_states) == 1:
+                assert request_state.request_id is None
+                request_state.request_id = 'down-request-1'
+                raise controller_lib.exceptions.RequestResultUnavailableError(
+                    'down-request-1', 'lost result acknowledgement')
+            assert request_state is seen_states[0]
+            assert request_state.request_id == 'down-request-1'
+            request_state.completed = True
+
+        with patch('sky.jobs.controller.managed_job_state.'
+                   'remove_ha_recovery_script_async', new_callable=AsyncMock), \
+                patch('sky.jobs.controller._get_dag',
+                      return_value=SimpleNamespace(tasks=[task])), \
+                patch('sky.jobs.controller.managed_job_utils.'
+                      'generate_managed_job_cluster_name',
+                      return_value='job-cluster-a'), \
+                patch('sky.jobs.controller.managed_job_utils.'
+                      'terminate_cluster', side_effect=terminate) as down, \
+                patch('sky.jobs.controller.sdk.status',
+                      return_value='status-request'), \
+                patch('sky.jobs.controller.sdk.get', return_value=[]), \
+                patch('sky.jobs.controller.managed_job_utils.'
+                      'is_consolidation_mode', return_value=True):
+            with pytest.raises(
+                    controller_lib.exceptions.RequestResultUnavailableError):
+                await manager._cleanup(3)
+
+            assert manager._cluster_termination_states[(
+                3, 'job-cluster-a')].request_id == 'down-request-1'
+            await manager._cleanup(3)
+
+        assert down.call_count == 2
+        assert seen_states[0] is seen_states[1]
+        assert manager._cluster_termination_states == {
+            (3, 'job-cluster-a'): seen_states[0]
+        }
+
+    @pytest.mark.asyncio
+    async def test_cleanup_state_clears_only_after_durable_finalization(self):
+        manager = _make_controller_manager()
+        manager.job_tasks[3] = asyncio.current_task()
+        manager._cleanup_only_job_ids.add(3)
+        manager._initialize_job_context = MagicMock(return_value=None)
+        manager._cleanup = AsyncMock()
+        manager._cleanup_api_server_access_token = MagicMock()
+        state_key = (3, 'job-cluster-a')
+        termination_state = managed_job_utils.ClusterTerminationState(
+            request_id='down-request-1', completed=True)
+        manager._cluster_termination_states[state_key] = termination_state
+        states_seen_by_finalizer = []
+
+        async def finalize(_job_id):
+            states_seen_by_finalizer.append(
+                dict(manager._cluster_termination_states))
+            if len(states_seen_by_finalizer) == 1:
+                raise RuntimeError('scheduler write unavailable')
+
+        with patch('sky.jobs.controller.asyncio.sleep',
+                   new_callable=AsyncMock), patch(
+                       'sky.jobs.controller.managed_job_state.'
+                       'scheduler_set_cleanup_done_async',
+                       side_effect=finalize) as cleanup_done:
+            await ControllerManager.run_cleanup_loop.__wrapped__(
+                manager, 3, '/tmp/controller.log', None)
+
+        assert cleanup_done.await_count == 2
+        assert states_seen_by_finalizer == [{state_key: termination_state}] * 2
+        assert manager._cluster_termination_states == {}
 
     @pytest.mark.asyncio
     async def test_start_cleanup_job_tracks_the_background_owner(

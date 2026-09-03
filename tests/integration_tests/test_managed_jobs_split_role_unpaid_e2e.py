@@ -117,16 +117,16 @@ def _free_ports(count: int) -> list[int]:
             listener.close()
 
 
-def _read_fault_state(path: pathlib.Path) -> dict[str, int]:
+def _read_fault_state(path: pathlib.Path) -> dict[str, typing.Any]:
     with path.open('r', encoding='utf-8') as state_file:
         fcntl.flock(state_file, fcntl.LOCK_SH)
-        return typing.cast(dict[str, int], json.load(state_file))
+        return typing.cast(dict[str, typing.Any], json.load(state_file))
 
 
-def _update_fault_state(path: pathlib.Path, **updates: int) -> None:
+def _update_fault_state(path: pathlib.Path, **updates: typing.Any) -> None:
     with path.open('r+', encoding='utf-8') as state_file:
         fcntl.flock(state_file, fcntl.LOCK_EX)
-        state = typing.cast(dict[str, int], json.load(state_file))
+        state = typing.cast(dict[str, typing.Any], json.load(state_file))
         state.update(updates)
         state_file.seek(0)
         state_file.truncate()
@@ -337,6 +337,12 @@ def test_managed_job_nested_requests_survive_two_controller_successors(
         'recovery_paused': 0,
         'nonloopback_auth_installed': 0,
         'controller_executor_provision_guard_installed': 0,
+        'result_fault_controller_instance_id': _C1_ID,
+        'c1_down_request_id': '',
+        'c1_last_down_handler_request_id': '',
+        'c1_down_handler_entries': 0,
+        'result_observation_fault_request_id': '',
+        'result_observation_faults_emitted': 0,
     }),
                            encoding='utf-8')
     plugin_config = tmp_path / 'plugins.yaml'
@@ -473,6 +479,25 @@ def test_managed_job_nested_requests_survive_two_controller_successors(
                               'nested request completion receipts')
         assert {'sky.core:user_initiated_down', 'sky.core:status'
                } <= {row['handler_name'] for row in c1_nested}
+        c1_down_requests = [
+            row for row in c1_nested
+            if row['handler_name'] == 'sky.core:user_initiated_down'
+        ]
+        assert len(c1_down_requests) == 1
+        assert c1_down_requests[0]['execution_generation'] == 1
+        reconciled_fault_state = _read_fault_state(fault_state)
+        c1_down_request_id = c1_down_requests[0]['request_id']
+        assert reconciled_fault_state['c1_down_request_id'] == (
+            c1_down_request_id)
+        assert reconciled_fault_state['c1_last_down_handler_request_id'] == (
+            c1_down_request_id)
+        assert reconciled_fault_state[
+            'result_observation_fault_request_id'] == c1_down_request_id
+        assert reconciled_fault_state['result_observation_faults_emitted'] == 4
+        # This proves same-ID result reconciliation did not execute a second
+        # C1 handler.  The unpaid harness intentionally does not claim
+        # provider-level or cross-process exactly-once effects.
+        assert reconciled_fault_state['c1_down_handler_entries'] == 1
         for row in c1_nested:
             assert row['execution_class'] == 'normal'
             assert row['status'] in _TERMINAL_REQUEST_STATUSES

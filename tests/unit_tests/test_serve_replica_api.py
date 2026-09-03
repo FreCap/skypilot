@@ -130,7 +130,8 @@ def test_replica_reads_have_a_distinct_api_capability_version():
         server_constants.MIN_SERVE_OFFERED_ARRIVAL_TELEMETRY_API_VERSION)
     assert offered_arrival_version == 94
     assert exact_request_summary_version < offered_arrival_version
-    assert server_constants.API_VERSION == offered_arrival_version
+    assert server_constants.API_VERSION == 95
+    assert offered_arrival_version < server_constants.API_VERSION
 
 
 def test_current_demand_reads_database_without_controller():

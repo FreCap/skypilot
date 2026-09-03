@@ -2297,6 +2297,12 @@ class ControllerManager:
         self._cancel_info_lock = asyncio.Lock()
         self._controller_api_access_leases: dict[
             int, _ControllerApiAccessLease] = {}
+        # A cleanup phase can be retried independently of its provider request.
+        # Keep exact result-observation state until durable job finalization
+        # succeeds, so a later status/storage/scheduler failure cannot submit
+        # a second down in this manager process.
+        self._cluster_termination_states: dict[tuple[
+            int, str], managed_job_utils.ClusterTerminationState] = {}
 
         self._pid = os.getpid()
         self._pid_started_at = psutil.Process(self._pid).create_time()
@@ -2476,6 +2482,14 @@ class ControllerManager:
             logger.info('Revoked controller API access token for job %s',
                         job_id)
 
+    def _release_cluster_termination_states(self, job_id: int) -> None:
+        """Forget process-local request identities after durable completion."""
+        keys = [
+            key for key in self._cluster_termination_states if key[0] == job_id
+        ]
+        for key in keys:
+            self._cluster_termination_states.pop(key, None)
+
     async def _cleanup(self,
                        job_id: int,
                        pool: str | None = None,
@@ -2512,10 +2526,15 @@ class ControllerManager:
                     cluster_name = (
                         managed_job_utils.generate_managed_job_cluster_name(
                             task.name, job_id))
+                    termination_state_key = (job_id, cluster_name)
+                    termination_state = self._cluster_termination_states.setdefault(
+                        termination_state_key,
+                        managed_job_utils.ClusterTerminationState())
                     managed_job_utils.terminate_cluster(
                         cluster_name,
                         graceful=graceful,
-                        graceful_timeout=graceful_timeout)
+                        graceful_timeout=graceful_timeout,
+                        request_state=termination_state)
                     status_request_id = sdk.status(cluster_names=[cluster_name],
                                                    all_users=True)
                     status = sdk.get(status_request_id)
@@ -3050,6 +3069,7 @@ class ControllerManager:
 
                 if cleanup_succeeded or pool is not None:
                     await scheduler.job_done_async(job_id)
+                    self._release_cluster_termination_states(job_id)
                 else:
                     # Keep the job visible to the status reconciler until
                     # provider cleanup succeeds. Marking it DONE here would
@@ -3088,6 +3108,7 @@ class ControllerManager:
                         self._cleanup_api_server_access_token, job_id)
                     await managed_job_state.scheduler_set_cleanup_done_async(
                         job_id)
+                    self._release_cluster_termination_states(job_id)
                     logger.info('Cleanup-only managed job %s is DONE.', job_id)
                     return
                 except asyncio.CancelledError:

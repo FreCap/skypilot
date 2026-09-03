@@ -106,6 +106,16 @@ _HTML_TITLE_RE = re.compile(r'<title[^>]*>(.*?)</title>',
                             re.IGNORECASE | re.DOTALL)
 
 
+def is_transient_error(error: Exception) -> bool:
+    """Whether a synchronous request failure is safe to observe again."""
+    if isinstance(error, requests.exceptions.HTTPError):
+        # Only server errors are considered transient.
+        return (error.response is not None and
+                error.response.status_code >= 500)
+    return any(
+        isinstance(error, error_type) for error_type in _transient_errors)
+
+
 @contextlib.contextmanager
 def _retry_in_context():
     context = RetryContext()
@@ -133,15 +143,6 @@ def retry_transient_errors(max_retries: int = 3,
         initial_backoff: Initial backoff time in seconds
         max_backoff_factor: Maximum backoff factor for exponential backoff
     """
-
-    def is_transient_error(e: Exception) -> bool:
-        if isinstance(e, requests.exceptions.HTTPError):
-            # Only server error is considered as transient.
-            return e.response.status_code >= 500
-        for error in _transient_errors:
-            if isinstance(e, error):
-                return True
-        return False
 
     def decorator(func: F) -> F:
 
@@ -437,9 +438,14 @@ async def request_async(session: 'aiohttp.ClientSession', method: str, url: str,
     raise last_exception
 
 
-async def request_without_retry_async(session: 'aiohttp.ClientSession',
-                                      method: str, url: str,
-                                      **kwargs) -> 'aiohttp.ClientResponse':
+async def request_without_retry_async(
+    session: 'aiohttp.ClientSession',
+    method: str,
+    url: str,
+    *,
+    raise_for_server_unavailable: bool = True,
+    **kwargs,
+) -> 'aiohttp.ClientResponse':
     """Send an async request to the API server without retry."""
     # Add API version headers for compatibility (like sync version does)
     if 'headers' not in kwargs:
@@ -451,8 +457,9 @@ async def request_without_retry_async(session: 'aiohttp.ClientSession',
     try:
         response = await session.request(method, url, **kwargs)
 
-        # Handle server unavailability (503 status) - same as sync version
-        await handle_server_unavailable_async(response)
+        # Result reconciliation owns its more specific 503 classification.
+        if raise_for_server_unavailable:
+            await handle_server_unavailable_async(response)
 
         # Set remote API version and version from headers - same as sync version
         remote_api_version = response.headers.get(constants.API_VERSION_HEADER)

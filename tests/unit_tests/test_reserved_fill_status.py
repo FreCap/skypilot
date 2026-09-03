@@ -38,7 +38,7 @@ def test_status_contract_has_distinct_api_capability_version() -> None:
     assert server_constants.MIN_SERVE_EXACT_REQUEST_SUMMARY_API_VERSION == 92
     assert (
         server_constants.MIN_SERVE_OFFERED_ARRIVAL_TELEMETRY_API_VERSION == 94)
-    assert server_constants.API_VERSION == 94
+    assert server_constants.API_VERSION == 95
 
 
 def _allocation(

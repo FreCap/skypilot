@@ -643,6 +643,14 @@ def test_all_current_skypilot_exceptions_round_trip_exactly():
                 'proof paused', 'waiting for renewal', 3),
         exceptions.ServerTemporarilyUnavailableError:
             lambda: exceptions.ServerTemporarilyUnavailableError('maintenance'),
+        exceptions.RequestResultUnavailableError:
+            lambda: exceptions.RequestResultUnavailableError(
+                'request-1', 'result endpoint unavailable'),
+        exceptions.RequestResultApplicationError:
+            lambda: exceptions.RequestResultApplicationError(
+                'request-1', ValueError('provider rejected request')),
+        exceptions.RequestResultShouldRetryError:
+            lambda: exceptions.RequestResultShouldRetryError('request-1'),
     }
     exception_classes = {
         value for value in vars(exceptions).values()

@@ -698,3 +698,25 @@ class TestRestRequestFunctions:
                                                      'http://test.com/stream',
                                                      stream=True,
                                                      timeout=(5, None))
+
+
+@pytest.mark.asyncio
+async def test_async_request_can_delegate_503_result_classification():
+    """Result polling must inspect a 503 before generic handling consumes it."""
+    response = mock.Mock(status=503, headers={})
+    session = mock.Mock()
+    session.request = mock.AsyncMock(return_value=response)
+
+    with mock.patch.object(rest,
+                           'handle_server_unavailable_async',
+                           new=mock.AsyncMock()) as handle_unavailable:
+        result = await rest.request_without_retry_async(
+            session,
+            'GET',
+            'http://test.com/api/get?request_id=request-1',
+            raise_for_server_unavailable=False)
+
+    assert result is response
+    handle_unavailable.assert_not_awaited()
+    session.request.assert_awaited_once()
+    assert 'raise_for_server_unavailable' not in session.request.await_args.kwargs
