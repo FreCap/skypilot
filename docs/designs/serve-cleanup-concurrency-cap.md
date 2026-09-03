@@ -1,5 +1,9 @@
 # SkyServe per-service cleanup concurrency cap
 
+**Status:** Implemented; production re-verification pending
+
+**Last updated:** 2026-09-03
+
 ## Problem
 
 SkyServe uses durable replica rows to queue launch and teardown work. The
@@ -13,9 +17,15 @@ and triggered the controller watchdog.
 The durable retirement queue is correct. The unsafe behavior is starting every
 eligible worker at once.
 
+The initial 64-worker cap was also too large. A later 68-replica paid-service
+shutdown admitted 64 provider workers together and the 8 GiB controller was
+OOM-killed before it could reconcile the durable cleanup rows. The provider
+terminations themselves were progressing; controller memory was the limiting
+resource.
+
 ## Behavior contract
 
-- A service may run at most 64 teardown workers concurrently.
+- A service may run at most four teardown workers concurrently.
 - Already-running teardown workers count toward the cap.
 - Eligible workers above the cap remain durably `SCHEDULED` and stay in the
   local pool without starting an operating-system thread.
@@ -41,9 +51,14 @@ controller process when the global budget is high. Making it a user-facing
 configuration knob would enlarge the service API without evidence that
 operators need to tune it.
 
-The initial value is 64. It reduces the observed 270-worker wave by more than
-four times while allowing large cleanup backlogs to make material progress.
-The global budget may lower the actual concurrency further.
+The value is four. `core.down()` is not a lightweight HTTP call: each worker
+may initialize cloud SDK, credential, request, cluster-state, and subprocess
+state. The former value of 64 still exhausted an 8 GiB controller, and the
+stable controller already uses about 4.3 GiB before a teardown wave. Four
+matches the established per-service launch quantum, keeps independent provider
+terminations parallel, and leaves headroom for controller reconciliation. The
+durable queue preserves the remainder for later waves, and the global budget
+may lower actual concurrency further.
 
 ## Alternatives considered
 

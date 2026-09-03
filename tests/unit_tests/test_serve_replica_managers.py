@@ -19312,6 +19312,121 @@ class TestFailedCleanupReconciliation:
 
         assert manager._down_thread_pool[1] is down_thread
 
+    def test_large_teardown_backlog_reconciles_in_bounded_exact_waves(self):
+        manager = _make_manager()
+        manager._is_pool = False
+        manager._resource_scope = None
+        manager._launch_thread_pool = thread_utils.ThreadSafeDict()
+        manager._down_thread_pool = thread_utils.ThreadSafeDict()
+        manager._replica_to_request_id = thread_utils.ThreadSafeDict()
+        durable = {}
+        gates = {}
+        workers = {}
+        for replica_id in range(100):
+            info = self._info(replica_id)
+            info.status_property.is_scale_down = True
+            info.status_property.sky_down_status = (
+                common_utils.ProcessStatus.SCHEDULED)
+            gate = threading.Event()
+            worker = replica_managers._ReplicaDownThread(
+                target=gate.wait,
+                replica_id=replica_id,
+                replica_record_id=info.replica_record_id,
+                service_hash=manager._service_hash,
+                controller_owner=manager._controller_owner)
+            durable[replica_id] = info
+            gates[replica_id] = gate
+            workers[replica_id] = worker
+            manager._down_thread_pool[replica_id] = worker
+
+        reserved_batches = []
+        removed = []
+
+        def _read_many(_service_name, replica_ids):
+            return {
+                replica_id: durable[replica_id]
+                for replica_id in replica_ids
+                if replica_id in durable
+            }
+
+        def _reserve(_service_name, candidates, **_kwargs):
+            reserved_batches.append(
+                [replica_id for replica_id, _ in candidates])
+            return _admit_teardowns_from(durable)(_service_name, candidates)
+
+        def _remove(replica_id, replica_record_id, **_kwargs):
+            info = durable.pop(replica_id)
+            assert info.replica_record_id == replica_record_id
+            removed.append((replica_id, replica_record_id))
+
+        try:
+            with mock.patch.object(
+                    manager, '_prune_superseded_failed_replicas'), \
+                 mock.patch.object(
+                     manager, '_reconcile_ambiguous_logical_retirement_commits'), \
+                 mock.patch.object(
+                     manager, '_reconcile_legacy_uncertain_logical_retirements'), \
+                 mock.patch.object(
+                     manager, '_reconcile_recovering_logical_retirements'), \
+                 mock.patch.object(manager, '_refresh_wait_for_idle'), \
+                 mock.patch.object(
+                     manager, '_clear_known_unknown_capacity_replacements'), \
+                 mock.patch.object(
+                     manager, '_reconcile_unowned_bound_non_pool_launches'), \
+                 mock.patch.object(manager, '_reconcile_failed_cleanup'), \
+                 mock.patch.object(
+                     manager, '_service_is_cleanup_authorized', return_value=True), \
+                 mock.patch.object(
+                     replica_managers.serve_state,
+                     'get_replica_infos_from_ids', side_effect=_read_many), \
+                 mock.patch.object(
+                     replica_managers.serve_state,
+                     'get_replica_info_from_id',
+                     side_effect=lambda _service, replica_id:
+                     durable.get(replica_id)), \
+                 mock.patch.object(
+                     replica_managers.serve_state,
+                     'get_replica_infos',
+                     side_effect=lambda _service: list(durable.values())), \
+                 mock.patch.object(
+                     replica_managers.serve_state,
+                     'reserve_replica_teardowns_running_if_capacity',
+                     side_effect=_reserve), \
+                 mock.patch.object(manager, '_remove_replica', side_effect=_remove):
+                while len(removed) < 100:
+                    manager._refresh_thread_pool()
+                    if len(removed) == 100:
+                        break
+                    running = [
+                        replica_id for replica_id, worker in workers.items()
+                        if worker.is_alive()
+                    ]
+                    assert 0 < len(running) <= (
+                        replica_managers.MAX_CONCURRENT_DOWNS_PER_SERVICE)
+                    scheduled = set(durable) - set(running)
+                    assert all(
+                        durable[replica_id].status_property.sky_down_status ==
+                        common_utils.ProcessStatus.SCHEDULED
+                        for replica_id in scheduled)
+                    for replica_id in running:
+                        gates[replica_id].set()
+                    for replica_id in running:
+                        workers[replica_id].join()
+        finally:
+            for gate in gates.values():
+                gate.set()
+            for worker in workers.values():
+                if worker.ident is not None:
+                    worker.join()
+
+        assert [len(batch) for batch in reserved_batches] == [4] * 25
+        assert [
+            replica_id for batch in reserved_batches for replica_id in batch
+        ] == list(range(100))
+        assert [replica_id for replica_id, _ in removed] == list(range(100))
+        assert len({record_id for _, record_id in removed}) == 100
+        assert not manager._down_thread_pool
+
     @pytest.mark.parametrize('server_committed', [False, True])
     def test_ambiguous_down_admission_write_retries_original_worker(
             self, tmp_path, server_committed):

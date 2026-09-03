@@ -437,9 +437,11 @@ _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS = 30
 _NON_POOL_RECONCILIATION_RETRY_MAX_SECONDS = 15 * 60
 _MAX_CONCURRENT_NON_POOL_RECONCILIATIONS_PER_SERVICE = 16
 # A service can queue an arbitrarily large durable teardown wave. Keep the
-# queued intent, but bound live worker threads so one controller process cannot
-# exhaust its memory or refresh-loop CPU while the global budget is spacious.
-MAX_CONCURRENT_DOWNS_PER_SERVICE = 64
+# queued intent, but bound live provider workers conservatively: core.down()
+# initializes enough per-call cloud and request state that a 64-worker wave
+# exhausted an 8 GiB controller. Four matches the established per-service
+# launch quantum while leaving the durable SCHEDULED backlog for later waves.
+MAX_CONCURRENT_DOWNS_PER_SERVICE = 4
 # An autoscaler tick can place a full wave before any sky.launch result benches
 # an unavailable location. Without a bound, a zero-cost-first placer can pin
 # hundreds of replicas to one full Kubernetes pool. Demand placement consumes
