@@ -3,9 +3,10 @@
 - **Status:** In progress
 - **Last updated:** 2026-09-03
 - **Transition PR:** [boltz-bio/skypilot#1930](https://github.com/boltz-bio/skypilot/pull/1930);
-  raises the supported peer floor and updates the bundled dashboard and
-  compatibility test baseline.
-- **Cleanup PR:** [boltz-bio/skypilot#1920](https://github.com/boltz-bio/skypilot/pull/1920)
+  merged as `c114eff9fc9fcc5e50553bd13a21920bc1a08feb` without a
+  production rollout.
+- **Cleanup PR:** [boltz-bio/skypilot#1920](https://github.com/boltz-bio/skypilot/pull/1920);
+  rebased on the transition merge, with exact-head CI pending.
 - **Protocol PR:** [boltz-bio/skypilot#1917](https://github.com/boltz-bio/skypilot/pull/1917)
 
 ## Context
@@ -19,8 +20,10 @@ source compatibility floor remained at API v24, inherited from SkyPilot's
 
 The Boltz artifact publisher creates an immutable patch release for each merge.
 It does not advance `MIN_COMPATIBLE_API_VERSION`; that value is a deliberate
-peer-support policy, not a record of the last Helm deployment.  The bundled
-dashboard is also a versioned peer and currently advertises API v84.
+peer-support policy, not a record of the last Helm deployment.  Transition PR
+#1930 has now raised the source floor and bundled dashboard to API v95.
+Production still runs `v1.1.1660`, whose bundled dashboard advertises API v84,
+until the one combined rollout below.
 
 The operating decision for this cutover is one fix-forward production rollout.
 The floor/dashboard transition is merged first as a source prerequisite, then
@@ -77,13 +80,11 @@ has no authority over the application Helm release and is outside this rollout.
 2. The bundled dashboard API version must be at least
    `MIN_COMPATIBLE_API_VERSION`; a source-level test guards this cross-language
    invariant.
-3. The transition commit changes the compatibility decision first but retains
-   the legacy detail parser.  Its pre-v95 authorization branch is unreachable
-   because v94 is below the new floor, although sync and async result clients
-   still redundantly decode each 503 body before checking the floor.  The
-   cleanup PR proves that no 503 body is JSON-decoded or parsed for replay
-   authorization before deleting that decoder.  Async transport draining via
-   `response.read()` remains part of lost-body/ACK detection.
+3. The cleanup removes the legacy detail parser from both synchronous and
+   asynchronous result clients.  No 503 body is JSON-decoded or parsed for
+   replay authorization; tests assert that the synchronous JSON method is not
+   called and the asynchronous JSON method is not awaited.  Async transport
+   draining via `response.read()` remains part of lost-body/ACK detection.
 4. Production has no live pre-v95 control-plane pod before deployment.  During
    the final rolling update, old v95 Python peers accept new v95 peers and new
    peers accept old v95 Python peers.
@@ -94,10 +95,16 @@ has no authority over the application Helm release and is outside this rollout.
 6. API, controller, and executor image values move together to the same digest.
 7. PostgreSQL remains the central request store.  The rollout does not add a
    SQLite compatibility path.
+8. The direct single-rollout procedure assumes controlled ingress has no
+   unsupported pre-v95 or unknown/headerless mutating writer during the final
+   inventory and rolling update.  The point-in-time PostgreSQL query detects
+   existing work but cannot itself freeze a new headerless submission.  If
+   that operational assumption cannot be established, the rollout is blocked
+   pending an explicit admission-maintenance window.
 
 ## Implementation phases
 
-### 1. Source transition
+### 1. Source transition (complete)
 
 - Set `MIN_COMPATIBLE_API_VERSION` from 24 to 95.
 - Set `MIN_COMPATIBLE_VERSION` to `1.1.1653`.
@@ -114,16 +121,18 @@ has no authority over the application Helm release and is outside this rollout.
   `v1.1.1653` as its default supported baseline.
 - Replace scheduled public-PyPI compatibility inputs with the Boltz v95 floor;
   public API v56 and earlier are intentionally outside this contract.
-- Merge this phase into `improvements` without deploying it by itself.
+- Merged into `improvements` as
+  `c114eff9fc9fcc5e50553bd13a21920bc1a08feb`; it was not deployed by itself.
 
-### 2. Cleanup
+### 2. Cleanup (implementation complete, exact-head CI pending)
 
-- Rebase PR #1920 on the merged transition.
-- Remove legacy sync/async response-detail parsing and the obsolete function
+- Rebased PR #1920 on the merged transition.
+- Removed legacy sync/async response-detail parsing and the obsolete function
   parameter.
-- Assert that v94 503 bodies are never decoded and cannot authorize replay.
-- Run exact-head focused tests, formatting/static checks, required CI, and the
-  PostgreSQL Managed Jobs Unpaid E2E before merge.
+- Asserted that v94 503 bodies are never decoded and cannot authorize replay.
+- Completed local focused tests plus formatting/static checks.  Run required
+  CI and the PostgreSQL Managed Jobs Unpaid E2E on the exact published head
+  before merge.
 
 ### 3. One production rollout
 
@@ -146,11 +155,12 @@ Production application runtime is owned by direct Helm.  The pre-cutover
 baseline is Helm revision 765, artifact `v1.1.1660`, commit
 `9a13d9189ac09087adea5452ff03e44eb10d2bfa`, and image digest
 `sha256:391ae1ee680abddd45e97be8527911c0e6cca832cf6d5e0bad3e14c9f6d78d5f`.
-The captured user-values SHA-256 is
-`2938564beec86e2225b17de5f07d57598cf82ec49b7649006681f0f4f64fab4b` and
-the rendered-manifest SHA-256 is
-`15a417287243d1bbb38df7e7032d075dc72d75bcf66f26ba95bea74c7c53bb5b`.
-Both are re-captured and compared immediately before mutation.
+The canonical JSON user-values SHA-256 (`helm get values -o json | jq -S -c`)
+is `ecb316107998d30ae9f02c822eb2d5112444723bb2b5352c21f89aeaaff76e93`;
+the raw stored-manifest SHA-256 (`helm get manifest`) is
+`54e60d69fd805d16d12ad4b8d3eb175d8e4226630a104f38d8c2c29d4465b270`.
+Both are re-captured with the same commands and compared immediately before
+mutation.
 
 The normal recovery path is another fix-forward Helm revision.  `--atomic` and
 an unqualified native Helm rollback are not used because production database
@@ -166,6 +176,13 @@ uses a newly published schema-compatible fix.
 - TDD green: 33 version-contract tests, 76 sync/async request-result tests, and
   15 dashboard client tests pass locally.  The two mismatch-remediation tests
   were also observed failing before the Boltz-specific messages were added.
+- Cleanup RED/GREEN: on the transition tree, the two new v94 no-JSON
+  expectations fail because the legacy parser calls/awaits JSON three times.
+  On the cleanup tree, all 109 focused sync/async/version tests pass; the same
+  responses exhaust three same-ID observations and never call/await JSON.
+- The cleanup tree passes `format.sh` (YAPF, isort, mypy over 995 files,
+  Pylint 10/10, dashboard ESLint/Prettier), the exact pinned async-lifecycle
+  baseline, and `basedpyright` in an isolated Python 3.14 environment.
 - The generator regression test passes.  A real Kubernetes-filtered generation
   contains two current quick-core steps plus twelve backward-compatibility
   steps; only the latter carry `--base-branch v1.1.1653`.
@@ -180,17 +197,22 @@ uses a newly published schema-compatible fix.
   API-v84 `sky.jobs.queue_v2` polls.  Active mutations were three API-v95
   managed-job launches.  This is evidence, not a substitute for repeating the
   gate immediately before Helm.
+- At 22:51 UTC, the paid E2E lifecycle and service had no active process,
+  service, replica, claim, waiter, controller, cluster, queued request, managed
+  job, Kubernetes object, EC2 instance, Spot request, EBS volume, ENI, or EIP.
+  Three unattached non-billable security groups and database audit/history rows
+  remain intentionally; they are not active resource blockers.
 
 ## Open gates
 
 - [x] Transition focused unit and dashboard tests are green locally.
 - [x] Backward-compatibility generator/harness selects the Boltz v95 baseline.
-- [ ] Transition PR required CI is green and merged without a production
+- [x] Transition PR required CI is green and merged without a production
       rollout.
-- [ ] PR #1920 is rebased and its no-body-decode TDD proof is green.
+- [x] PR #1920 is rebased and its no-body-decode TDD proof is green locally.
 - [ ] PR #1920 required CI and Managed Jobs Unpaid E2E are green on exact head.
 - [ ] Final image provenance and digest are verified.
-- [ ] The active paid-capacity E2E exits and its service teardown is verified;
+- [x] The active paid-capacity E2E exits and its service teardown is verified;
       do not interrupt the lifecycle process by rolling its API pod.
 - [ ] The immediate pre-Helm request/controller inventory has no nonterminal
       pre-v95 or unknown/headerless mutator or controller.
