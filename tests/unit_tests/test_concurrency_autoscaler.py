@@ -2196,9 +2196,14 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         first = _replica(1)
         second = _replica(2)
         locked = kueue_lane_capacity.KueueReplicaCapacitySnapshot({})
+        prepared = _durable_inputs((first, second))
+        duplicate_prepared = dataclasses.replace(
+            prepared,
+            replica_bindings=(*prepared.replica_bindings,
+                              prepared.replica_bindings[-1]))
         cases = (
-            (_durable_inputs((first, second, second)), [first, second]),
-            (_durable_inputs((first, second)), [first, second, second]),
+            (duplicate_prepared, [first, second]),
+            (prepared, [first, second, second]),
         )
         for prepared, replica_infos in cases:
             with self.subTest(
@@ -2211,14 +2216,29 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
     def test_locked_kueue_snapshot_rejects_malformed_replica_ids(self):
         first = _replica(1)
         second = _replica(2)
-        zero = _replica(0)
-        missing = _replica(None)
+        prepared = _durable_inputs((first, second))
+        zero = _replica(2)
+        zero.replica_id = 0
+        missing = _replica(2)
+        missing.replica_id = None
         locked = kueue_lane_capacity.KueueReplicaCapacitySnapshot({})
         cases = (
-            (dataclasses.replace(_durable_inputs((first, second)),
-                                 replica_ids=[1, 2]), [first, second]),
-            (_durable_inputs((zero, first)), [zero, first]),
-            (_durable_inputs((first, missing)), [first, missing]),
+            (dataclasses.replace(prepared,
+                                 replica_bindings=list(
+                                     prepared.replica_bindings)),
+             [first, second]),
+            (dataclasses.replace(
+                prepared,
+                replica_bindings=(prepared.replica_bindings[0],
+                                  dataclasses.replace(
+                                      prepared.replica_bindings[1],
+                                      replica_id=0))), [first, zero]),
+            (dataclasses.replace(
+                prepared,
+                replica_bindings=(prepared.replica_bindings[0],
+                                  dataclasses.replace(
+                                      prepared.replica_bindings[1],
+                                      replica_id=None))), [first, missing]),
         )
         for prepared, replica_infos in cases:
             with self.subTest(prepared=prepared.replica_ids):
