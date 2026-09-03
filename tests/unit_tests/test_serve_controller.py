@@ -8853,11 +8853,10 @@ class TestAuthoritativeLbReportIngestion:
             'service-hash',
             f"lb-a:{'a' * 32}",
             report['request_history'],
-            coverage_authority=(
-                serve_history.RequestHistoryCoverageAuthority(
-                    reporter_slot=lb_ha.LbSlot.A,
-                    applied_role=lb_ha.LbRole.ACTIVE,
-                    applied_generation=7)),
+            coverage_authority=(serve_history.RequestHistoryCoverageAuthority(
+                reporter_slot=lb_ha.LbSlot.A,
+                applied_role=lb_ha.LbRole.ACTIVE,
+                applied_generation=7)),
         )
 
     def test_response_time_history_uses_separate_persistence_contract(self):

@@ -16179,7 +16179,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 continue
             with_recovery = disposition is (
                 system_recovery_state.SystemRecoveryDisposition.CAPABLE)
-            job_ids: list[int] | None
+            job_ids: list[int] | None = None
             if not with_recovery:
                 status_source = backend.serve_replica_job_status_source(handle)
                 if status_source is (backends.ServeReplicaJobStatusSource.
@@ -16204,10 +16204,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 handle=handle,
                                 cleanup_fence=cleanup_fence))
                     continue
-                else:
-                    # Unknown/malformed backend contracts retain the legacy
-                    # fail-closed full job-table read.
-                    job_ids = None
             if cleanup_fence is not None:
                 # Register only rows that still require exact remote evidence.
                 # Invalid recovery rows may schedule teardown, so their

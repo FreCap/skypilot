@@ -221,6 +221,117 @@ def _typed_error_with_provider_negative_ack(
     return error
 
 
+def test_paid_aws_create_authority_configures_exact_builtin_scope(monkeypatch):
+    launch_context = {
+        ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY: 2,
+    }
+    paid_context = types.SimpleNamespace(
+        profile=types.SimpleNamespace(kind=ordinary_launch_binding.
+                                      NonPoolLaunchProfileKind.ORDINARY_PAID),
+        capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH))
+    receipt = _provider_negative_ack(cluster_name='test-cluster',
+                                     requested_count=1)
+    monkeypatch.setattr(ordinary_launch_binding, 'has_bound_launch_context',
+                        lambda *_: True)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'parse_bound_non_pool_launch_context',
+                        lambda *_: paid_context)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'ordinary_paid_aws_client_token',
+                        lambda *_: receipt['client_token'])
+    monkeypatch.setattr(ordinary_launch_binding, 'ordinary_paid_aws_account_id',
+                        lambda *_: receipt['aws_account_id'])
+    bulk_provision = mock.Mock()
+    kwargs = {'num_nodes': 1}
+
+    authority = backend._configure_paid_aws_create_authority(
+        cloud=clouds.AWS(),
+        launch_context=launch_context,
+        cloud_user_identity=['principal', receipt['aws_account_id']],
+        bulk_provision_fn=bulk_provision,
+        builtin_bulk_provision_fn=bulk_provision,
+        bulk_provision_kwargs=kwargs)
+
+    assert authority == backend._PaidAwsCreateAuthority(
+        receipt['client_token'], receipt['aws_account_id'])
+    assert kwargs == {
+        'num_nodes': 1,
+        'provider_create_idempotency_token': receipt['client_token'],
+        'provider_create_account_id': receipt['aws_account_id'],
+    }
+
+
+@pytest.mark.parametrize('failure', ['account-mismatch', 'opaque-provisioner'])
+def test_paid_aws_create_authority_fails_before_mutating_kwargs(
+        monkeypatch, failure):
+    launch_context = {
+        ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY: 2,
+    }
+    paid_context = types.SimpleNamespace(
+        profile=types.SimpleNamespace(kind=ordinary_launch_binding.
+                                      NonPoolLaunchProfileKind.ORDINARY_PAID),
+        capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH))
+    receipt = _provider_negative_ack()
+    monkeypatch.setattr(ordinary_launch_binding, 'has_bound_launch_context',
+                        lambda *_: True)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'parse_bound_non_pool_launch_context',
+                        lambda *_: paid_context)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'ordinary_paid_aws_client_token',
+                        lambda *_: receipt['client_token'])
+    monkeypatch.setattr(ordinary_launch_binding, 'ordinary_paid_aws_account_id',
+                        lambda *_: receipt['aws_account_id'])
+    bulk_provision = mock.Mock()
+    builtin_bulk_provision = (bulk_provision
+                              if failure == 'account-mismatch' else mock.Mock())
+    active_account_id = ('210987654321' if failure == 'account-mismatch' else
+                         receipt['aws_account_id'])
+    kwargs = {'num_nodes': 1}
+
+    with pytest.raises(exceptions.ServeReplicaLaunchFenceError):
+        backend._configure_paid_aws_create_authority(
+            cloud=clouds.AWS(),
+            launch_context=launch_context,
+            cloud_user_identity=['principal', active_account_id],
+            bulk_provision_fn=bulk_provision,
+            builtin_bulk_provision_fn=builtin_bulk_provision,
+            bulk_provision_kwargs=kwargs)
+
+    assert kwargs == {'num_nodes': 1}
+
+
+@pytest.mark.parametrize('valid_receipt', [True, False])
+def test_provider_create_failure_projection_controls_cleanup_proof(
+        valid_receipt):
+    receipt = _provider_negative_ack(cluster_name='test-cluster',
+                                     requested_count=1)
+    if not valid_receipt:
+        receipt['aws_account_id'] = '210987654321'
+    error = _typed_error_with_provider_negative_ack(receipt)
+    authority = backend._PaidAwsCreateAuthority(client_token='a' * 64,
+                                                account_id='123456789012')
+
+    projection = backend._project_provider_create_failure(
+        error,
+        authority=authority,
+        cluster_name_on_cloud='test-cluster',
+        requested_count=1)
+
+    assert type(projection.failover_record) is provision_common.ProvisionerError
+    if valid_receipt:
+        assert projection.provider_negative_ack == receipt
+        assert projection.provider_negative_ack is not receipt
+        assert projection.failover_record.provider_negative_ack == receipt
+        assert (projection.failover_record.provider_negative_ack
+                is not projection.provider_negative_ack)
+    else:
+        assert projection.provider_negative_ack is None
+        assert not hasattr(projection.failover_record, 'provider_negative_ack')
+
+
 def _gcp_launchable_resources() -> resources_lib.Resources:
     return resources_lib.Resources(
         cloud=clouds.GCP(),
@@ -3294,6 +3405,40 @@ def _provision_record(*, created, resumed=(), zone='us-east-1a'):
         resumed_instance_ids=list(resumed),
         created_instance_ids=list(created),
     )
+
+
+def test_full_fresh_create_clears_exact_capacity_and_quota_entries(monkeypatch):
+    to_provision = _to_provision()
+    region = clouds.Region('us-east-1')
+    record = _provision_record(created=['i-head'])
+    account = '123456789012'
+    capacity_key = backend._capacity_cache_key(to_provision, region,
+                                               [clouds.Zone('us-east-1a')], 1,
+                                               account)
+    quota_key = backend._quota_cooldown_key(to_provision, region, 1, account)
+    clear_capacity = mock.Mock()
+    clear_quota = mock.Mock()
+    metric = mock.Mock()
+    monkeypatch.setattr(backend.capacity_cache, 'clear', clear_capacity)
+    monkeypatch.setattr(backend.capacity_cache, 'clear_quota_cooldown',
+                        clear_quota)
+    monkeypatch.setattr(backend, '_record_capacity_metric', metric)
+
+    backend._clear_satisfied_capacity_cache_entries(
+        to_provision=to_provision,
+        region=region,
+        provision_record=record,
+        requested_num_nodes=1,
+        cluster_existed=False,
+        capacity_cache_account=account,
+        quota_cooldown_key=quota_key)
+
+    clear_capacity.assert_called_once_with(capacity_key)
+    clear_quota.assert_called_once_with(quota_key)
+    assert metric.call_args_list == [
+        mock.call('capacity', 'clear'),
+        mock.call('quota', 'clear'),
+    ]
 
 
 @pytest.mark.parametrize(

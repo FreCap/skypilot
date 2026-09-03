@@ -178,6 +178,181 @@ def _provider_create_rejection_failover_record(
     return failure
 
 
+@dataclasses.dataclass(frozen=True)
+class _PaidAwsCreateAuthority:
+    """Exact provider scope for one idempotent paid-AWS create."""
+
+    client_token: str
+    account_id: str
+
+
+def _configure_paid_aws_create_authority(
+    *,
+    cloud: clouds.Cloud,
+    launch_context: Mapping[str, Any],
+    cloud_user_identity: list[str] | None,
+    bulk_provision_fn: typing.Callable[..., Any],
+    builtin_bulk_provision_fn: typing.Callable[..., Any] | None,
+    bulk_provision_kwargs: dict[str, Any],
+) -> _PaidAwsCreateAuthority | None:
+    """Validate and bind the exact paid-AWS provider create authority."""
+    if (not isinstance(cloud, clouds.AWS) or
+            not ordinary_launch_binding.has_bound_launch_context(launch_context)
+            or ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY
+            not in launch_context):
+        return None
+
+    paid_context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+        launch_context)
+    paid_profile = paid_context.profile.kind
+    replacement_profile = (ordinary_launch_binding.NonPoolLaunchProfileKind.
+                           UNKNOWN_CAPACITY_REPLACEMENT)
+    if (paid_profile is replacement_profile and
+            paid_context.capability_cohort_epoch < ordinary_launch_binding.
+            ORDINARY_PAID_AWS_REPLACEMENT_CREATE_COHORT_FLOOR):
+        raise exceptions.ServeReplicaLaunchFenceError(
+            'Paid AWS replacement predates immutable create identity; '
+            'refusing a new provider effect.')
+    token_capable = (
+        paid_profile
+        is ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID and
+        paid_context.capability_cohort_epoch
+        >= ordinary_launch_binding.ORDINARY_PAID_AWS_CLIENT_TOKEN_COHORT_FLOOR
+        or paid_profile is replacement_profile and
+        paid_context.capability_cohort_epoch >= ordinary_launch_binding.
+        ORDINARY_PAID_AWS_REPLACEMENT_CREATE_COHORT_FLOOR)
+    if not token_capable:
+        return None
+
+    authority = _PaidAwsCreateAuthority(
+        client_token=ordinary_launch_binding.ordinary_paid_aws_client_token(
+            paid_context),
+        account_id=ordinary_launch_binding.ordinary_paid_aws_account_id(
+            paid_context))
+    active_account_id = (cloud_user_identity[1]
+                         if isinstance(cloud_user_identity, (list, tuple)) and
+                         len(cloud_user_identity) >= 2 else None)
+    if active_account_id != authority.account_id:
+        raise exceptions.ServeReplicaLaunchFenceError(
+            'Ordinary-paid AWS account changed after atomic capacity '
+            'admission.')
+    if (builtin_bulk_provision_fn is None or
+            bulk_provision_fn is not builtin_bulk_provision_fn):
+        raise exceptions.ServeReplicaLaunchFenceError(
+            'Ordinary-paid AWS requires the in-tree idempotent provisioner '
+            'boundary.')
+    bulk_provision_kwargs.update({
+        'provider_create_idempotency_token': authority.client_token,
+        'provider_create_account_id': authority.account_id,
+    })
+    return authority
+
+
+def _validate_paid_gcp_create_authority(
+        cloud: clouds.Cloud, launch_context: Mapping[str, Any]) -> None:
+    """Fence a paid-GCP create when its durable project scope has drifted."""
+    if (not isinstance(cloud, clouds.GCP) or
+            not ordinary_launch_binding.has_bound_launch_context(launch_context)
+            or ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY
+            not in launch_context):
+        return
+    try:
+        paid_context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+            launch_context)
+        expected_project_id = None
+        if paid_context.profile.kind in (
+                ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+                ordinary_launch_binding.NonPoolLaunchProfileKind.
+                UNKNOWN_CAPACITY_REPLACEMENT):
+            expected_project_id = (ordinary_launch_binding.
+                                   ordinary_paid_gcp_project_id(paid_context))
+    except ordinary_launch_binding.OrdinaryLaunchBindingConflict as error:
+        # A malformed or historical-cohort paid GCP context is a terminal
+        # correctness fence, never a provider failure to clean up or fail over.
+        raise exceptions.ServeReplicaLaunchFenceError(
+            'Ordinary-paid GCP launch has no current project authority.'
+        ) from error
+    if expected_project_id is None:
+        return
+    active_project_id = cloud.get_project_id()
+    if active_project_id != expected_project_id:
+        raise exceptions.ServeReplicaLaunchFenceError(
+            'Ordinary-paid GCP project changed after atomic capacity '
+            'admission.')
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProviderCreateFailureProjection:
+    """Stable failover leaf plus validated provider-absence evidence."""
+
+    failover_record: Exception
+    provider_negative_ack: dict[str, Any] | None
+
+
+def _project_provider_create_failure(
+    error: Exception,
+    *,
+    authority: _PaidAwsCreateAuthority | None,
+    cluster_name_on_cloud: str,
+    requested_count: int,
+) -> _ProviderCreateFailureProjection:
+    """Validate and project a provider create rejection for failover."""
+    if (not isinstance(error, provision_common.ProviderCreateRejectedError) or
+            authority is None):
+        return _ProviderCreateFailureProjection(error, None)
+    provider_negative_ack = validate_provider_negative_ack(
+        getattr(error, 'provider_negative_ack', None),
+        cluster_name=cluster_name_on_cloud,
+        requested_count=requested_count,
+        client_token=authority.client_token,
+        expected_aws_account_id=authority.account_id)
+    if provider_negative_ack is not None:
+        error.provider_negative_ack = provider_negative_ack
+    return _ProviderCreateFailureProjection(
+        _provider_create_rejection_failover_record(error,
+                                                   provider_negative_ack),
+        provider_negative_ack)
+
+
+def _clear_satisfied_capacity_cache_entries(
+    *,
+    to_provision: resources_lib.Resources,
+    region: clouds.Region,
+    provision_record: provision_common.ProvisionRecord,
+    requested_num_nodes: int,
+    cluster_existed: bool,
+    capacity_cache_account: str | None,
+    quota_cooldown_key: capacity_cache.QuotaCooldownKey | None,
+) -> None:
+    """Clear stale capacity failures after one proven full fresh create."""
+    if (capacity_cache_account is None or not _fully_created_fresh_demand(
+            provision_record, requested_num_nodes, cluster_existed)):
+        return
+    succeeded_zones = None
+    if provision_record.zone is not None:
+        succeeded_zones = [clouds.Zone(provision_record.zone)]
+    success_capacity_key = _capacity_cache_key(to_provision, region,
+                                               succeeded_zones,
+                                               requested_num_nodes,
+                                               capacity_cache_account)
+    if success_capacity_key is not None:
+        try:
+            capacity_cache.clear(success_capacity_key)
+            _record_capacity_metric('capacity', 'clear')
+        except Exception as cache_error:  # pylint: disable=broad-except
+            _record_capacity_metric('capacity', 'cache_error')
+            logger.debug('Capacity-cache clear failed: '
+                         f'{common_utils.format_exception(cache_error)}')
+    if quota_cooldown_key is not None:
+        try:
+            capacity_cache.clear_quota_cooldown(quota_cooldown_key)
+            _record_capacity_metric('quota', 'clear')
+        except Exception as cache_error:  # pylint: disable=broad-except
+            _record_capacity_metric('quota', 'cache_error')
+            logger.debug('Quota-cooldown clear failed: '
+                         f'{common_utils.format_exception(cache_error)}')
+
+
 def _resolve_container_image_for_placement(
     resources: resources_lib.Resources,
     *,
@@ -1950,10 +2125,10 @@ class RetryingVmProvisioner:
                         <= clouds.OpenPortsVersion.LAUNCH_ONLY else None)
                     reserved_fill_pod_materialized = False
                     # The broad provisioning handler below can run before the
-                    # paid binding is parsed. Keep provider-identity locals
-                    # total so a pre-parse failure cannot mask its real cause.
-                    paid_aws_client_token: str | None = None
-                    paid_aws_account_id: str | None = None
+                    # paid binding is parsed. Keep provider authority total so
+                    # a pre-parse failure cannot mask its real cause.
+                    paid_aws_create_authority: _PaidAwsCreateAuthority | None = (
+                        None)
                     try:
                         controller = controller_utils.Controllers.from_name(
                             cluster_name)
@@ -1992,70 +2167,15 @@ class RetryingVmProvisioner:
                             assert self._active_cluster_hash is not None
                             bulk_provision_kwargs['cluster_incarnation'] = (
                                 self._active_cluster_hash)
-                        if (isinstance(to_provision.cloud, clouds.AWS) and
-                                ordinary_launch_binding.
-                                has_bound_launch_context(
-                                    self._extra_launch_context) and
-                                ordinary_launch_binding.
-                                BINDING_PROTOCOL_VERSION_KEY
-                                in self._extra_launch_context):
-                            paid_context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
-                                self._extra_launch_context)
-                            paid_profile = paid_context.profile.kind
-                            if (paid_profile is ordinary_launch_binding.
-                                    NonPoolLaunchProfileKind.
-                                    UNKNOWN_CAPACITY_REPLACEMENT and
-                                    paid_context.capability_cohort_epoch
-                                    < ordinary_launch_binding.
-                                    ORDINARY_PAID_AWS_REPLACEMENT_CREATE_COHORT_FLOOR
-                               ):
-                                raise exceptions.ServeReplicaLaunchFenceError(
-                                    'Paid AWS replacement predates immutable '
-                                    'create identity; refusing a new provider '
-                                    'effect.')
-                            token_capable = bool(
-                                paid_profile is ordinary_launch_binding.
-                                NonPoolLaunchProfileKind.ORDINARY_PAID and
-                                paid_context.capability_cohort_epoch
-                                >= ordinary_launch_binding.
-                                ORDINARY_PAID_AWS_CLIENT_TOKEN_COHORT_FLOOR or
-                                paid_profile is ordinary_launch_binding.
-                                NonPoolLaunchProfileKind.
-                                UNKNOWN_CAPACITY_REPLACEMENT and
-                                paid_context.capability_cohort_epoch
-                                >= ordinary_launch_binding.
-                                ORDINARY_PAID_AWS_REPLACEMENT_CREATE_COHORT_FLOOR
-                            )
-                            if token_capable:
-                                paid_aws_client_token = (
-                                    ordinary_launch_binding.
-                                    ordinary_paid_aws_client_token(paid_context)
-                                )
-                                paid_aws_account_id = (
-                                    ordinary_launch_binding.
-                                    ordinary_paid_aws_account_id(paid_context))
-                                active_account_id = (
-                                    cloud_user_identity[1]
-                                    if isinstance(cloud_user_identity,
-                                                  (list, tuple)) and
-                                    len(cloud_user_identity) >= 2 else None)
-                                if active_account_id != paid_aws_account_id:
-                                    raise exceptions.ServeReplicaLaunchFenceError(
-                                        'Ordinary-paid AWS account changed '
-                                        'after atomic capacity admission.')
-                        if paid_aws_client_token is not None:
-                            if (builtin_bulk_provision_fn is None or
-                                    bulk_provision_fn
-                                    is not builtin_bulk_provision_fn):
-                                raise exceptions.ServeReplicaLaunchFenceError(
-                                    'Ordinary-paid AWS requires the in-tree '
-                                    'idempotent provisioner boundary.')
-                            bulk_provision_kwargs[
-                                'provider_create_idempotency_token'] = (
-                                    paid_aws_client_token)
-                            bulk_provision_kwargs[
-                                'provider_create_account_id'] = (
-                                    paid_aws_account_id)
+                        paid_aws_create_authority = (
+                            _configure_paid_aws_create_authority(
+                                cloud=to_provision.cloud,
+                                launch_context=self._extra_launch_context,
+                                cloud_user_identity=cloud_user_identity,
+                                bulk_provision_fn=bulk_provision_fn,
+                                builtin_bulk_provision_fn=(
+                                    builtin_bulk_provision_fn),
+                                bulk_provision_kwargs=bulk_provision_kwargs))
                         reserved_fill_fence = (
                             reserved_capacity.parse_protocol_v2_launch_fence(
                                 self._extra_launch_context))
@@ -2086,43 +2206,8 @@ class RetryingVmProvisioner:
                                 bulk_provision_kwargs[
                                     'kueue_admission_runtime'] = (
                                         self._kueue_admission_runtime)
-                        if (isinstance(to_provision.cloud, clouds.GCP) and
-                                ordinary_launch_binding.
-                                has_bound_launch_context(
-                                    self._extra_launch_context) and
-                                ordinary_launch_binding.
-                                BINDING_PROTOCOL_VERSION_KEY
-                                in self._extra_launch_context):
-                            try:
-                                paid_gcp_context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
-                                    self._extra_launch_context)
-                                expected_project_id = None
-                                if paid_gcp_context.profile.kind in (
-                                        ordinary_launch_binding.
-                                        NonPoolLaunchProfileKind.ORDINARY_PAID,
-                                        ordinary_launch_binding.
-                                        NonPoolLaunchProfileKind.
-                                        UNKNOWN_CAPACITY_REPLACEMENT):
-                                    expected_project_id = (
-                                        ordinary_launch_binding.
-                                        ordinary_paid_gcp_project_id(
-                                            paid_gcp_context))
-                            except (ordinary_launch_binding.
-                                    OrdinaryLaunchBindingConflict) as error:
-                                # A malformed or historical-cohort paid GCP
-                                # context is a terminal correctness fence,
-                                # never a provider failure to clean up or
-                                # fail over from.
-                                raise exceptions.ServeReplicaLaunchFenceError(
-                                    'Ordinary-paid GCP launch has no current '
-                                    'project authority.') from error
-                            if expected_project_id is not None:
-                                active_project_id = (
-                                    to_provision.cloud.get_project_id())
-                                if active_project_id != expected_project_id:
-                                    raise exceptions.ServeReplicaLaunchFenceError(
-                                        'Ordinary-paid GCP project changed '
-                                        'after atomic capacity admission.')
+                        _validate_paid_gcp_create_authority(
+                            to_provision.cloud, self._extra_launch_context)
                         # Recheck at the terminal provider boundary as well as
                         # at each outer retry iteration. This protects against
                         # future in-attempt planning changes being inserted
@@ -2206,41 +2291,14 @@ class RetryingVmProvisioner:
                         # launch now. Reusing orphaned/resumed nodes, or only
                         # creating the missing subset, proves neither the
                         # original num_nodes capacity nor current quota.
-                        if (capacity_cache_account is not None and
-                                _fully_created_fresh_demand(
-                                    provision_record, num_nodes,
-                                    cluster_exists)):
-                            succeeded_zones = None
-                            if provision_record.zone is not None:
-                                succeeded_zones = [
-                                    clouds.Zone(provision_record.zone)
-                                ]
-                            success_capacity_key = _capacity_cache_key(
-                                to_provision, region, succeeded_zones,
-                                num_nodes, capacity_cache_account)
-                            if success_capacity_key is not None:
-                                try:
-                                    capacity_cache.clear(success_capacity_key)
-                                    _record_capacity_metric('capacity', 'clear')
-                                except Exception as cache_error:  # pylint: disable=broad-except
-                                    _record_capacity_metric(
-                                        'capacity', 'cache_error')
-                                    logger.debug(
-                                        'Capacity-cache clear failed: '
-                                        f'{common_utils.format_exception(cache_error)}'
-                                    )
-                            if quota_cooldown_key is not None:
-                                try:
-                                    capacity_cache.clear_quota_cooldown(
-                                        quota_cooldown_key)
-                                    _record_capacity_metric('quota', 'clear')
-                                except Exception as cache_error:  # pylint: disable=broad-except
-                                    _record_capacity_metric(
-                                        'quota', 'cache_error')
-                                    logger.debug(
-                                        'Quota-cooldown clear failed: '
-                                        f'{common_utils.format_exception(cache_error)}'
-                                    )
+                        _clear_satisfied_capacity_cache_entries(
+                            to_provision=to_provision,
+                            region=region,
+                            provision_record=provision_record,
+                            requested_num_nodes=num_nodes,
+                            cluster_existed=cluster_exists,
+                            capacity_cache_account=capacity_cache_account,
+                            quota_cooldown_key=quota_cooldown_key)
                         _record_service_placement_event(
                             task=task,
                             cluster_name=cluster_name,
@@ -2336,26 +2394,13 @@ class RetryingVmProvisioner:
                         if reserved_fill_pod_materialized:
                             reserved_capacity.raise_protocol_v2_materialized_launch_error(
                                 e, phase='post-create provisioning')
-                        provider_negative_ack = None
-                        if (isinstance(
-                                e, provision_common.ProviderCreateRejectedError)
-                                and paid_aws_client_token is not None and
-                                paid_aws_account_id is not None):
-                            provider_negative_ack = (
-                                validate_provider_negative_ack(
-                                    getattr(e, 'provider_negative_ack', None),
-                                    cluster_name=(handle.cluster_name_on_cloud),
-                                    requested_count=num_nodes,
-                                    client_token=paid_aws_client_token,
-                                    expected_aws_account_id=(
-                                        paid_aws_account_id)))
-                            if provider_negative_ack is not None:
-                                e.provider_negative_ack = provider_negative_ack
-                            provision_failures.append(
-                                _provider_create_rejection_failover_record(
-                                    e, provider_negative_ack))
-                        else:
-                            provision_failures.append(e)
+                        failure_projection = _project_provider_create_failure(
+                            e,
+                            authority=paid_aws_create_authority,
+                            cluster_name_on_cloud=handle.cluster_name_on_cloud,
+                            requested_count=num_nodes)
+                        provision_failures.append(
+                            failure_projection.failover_record)
                         capacity_reason = _classify_capacity_error(
                             to_provision.cloud, e)
                         if _is_quota_error(e):
@@ -2415,7 +2460,7 @@ class RetryingVmProvisioner:
                         # NOTE: We try to cleanup the cluster even if the previous
                         # cluster does not exist. Also we are fast at
                         # cleaning up clusters now if there is no existing node..
-                        if provider_negative_ack is None:
+                        if failure_projection.provider_negative_ack is None:
                             CloudVmRayBackend().post_teardown_cleanup(
                                 handle,
                                 terminate=not prev_cluster_ever_up,

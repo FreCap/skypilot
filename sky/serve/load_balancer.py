@@ -3030,15 +3030,12 @@ class SkyServeLoadBalancer:
             'processing_time_us': processing_time_us,
         }
         try:
-            compatibility_conflict = None
             try:
                 receipt = await self._post_async_ledger(ledger_payload)
+                validation_minimum_revision = payload['expected_revision']
             except async_request_ledger_client.AsyncLedgerTransportError as error:
                 if error.status_code != 409:
                     raise
-                compatibility_conflict = error
-            validation_minimum_revision = payload['expected_revision']
-            if compatibility_conflict is not None:
                 # A mixed-version API server may still require the exact current
                 # revision.  Resolve and retry once only on its conflict; the
                 # current server treats expected_revision as a minimum and keeps
@@ -3046,7 +3043,7 @@ class SkyServeLoadBalancer:
                 current = await self._lookup_async_ledger_receipt(
                     payload['request_id'], payload['intent_sha256'])
                 if current is None:
-                    raise compatibility_conflict
+                    raise error
                 current = (async_request_ledger_client.
                            validate_terminal_lookup_receipt(
                                payload['request_id'], payload['attempt_id'],
