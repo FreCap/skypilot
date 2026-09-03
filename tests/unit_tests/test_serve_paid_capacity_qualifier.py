@@ -4124,12 +4124,20 @@ def test_exact_async_request_never_replays_ambiguous_submission():
 
 def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
         monkeypatch):
-    attempt_id = '11111111-1111-4111-8111-111111111111'
+    rejected_attempt_id = '11111111-1111-4111-8111-111111111111'
+    accepted_attempt_id = '22222222-2222-4222-8222-222222222222'
 
     class Response:
         """One exact async admission response."""
 
-        def __init__(self, status, state, revision, body=b'{}'):
+        def __init__(self,
+                     status,
+                     state,
+                     revision,
+                     body=b'{}',
+                     *,
+                     attempt_id=rejected_attempt_id,
+                     attempt_no=1):
             self.status = status
             self._body = body
             self.headers = {
@@ -4137,7 +4145,7 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
                 'X-SkyServe-Async-Ledger-Protocol': '1',
                 'X-SkyServe-Service-Incarnation': 'incarnation-a',
                 'X-SkyServe-Async-Attempt-Id': attempt_id,
-                'X-SkyServe-Async-Attempt-No': '1',
+                'X-SkyServe-Async-Attempt-No': str(attempt_no),
                 'X-SkyServe-Async-Ledger-Revision': str(revision),
                 'X-SkyServe-Async-Ledger-State': state,
             }
@@ -4162,7 +4170,12 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
             self.responses = [
                 Response(429, 'REJECTED_PRE_DISPATCH', 1),
                 Response(503, 'REJECTED_PRE_DISPATCH', 1),
-                Response(202, 'ACCEPTED', 2, accepted),
+                Response(202,
+                         'ACCEPTED',
+                         2,
+                         accepted,
+                         attempt_id=accepted_attempt_id,
+                         attempt_no=2),
             ]
             self.calls = []
 
@@ -4177,7 +4190,7 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
 
     monkeypatch.setattr(qualifier.asyncio, 'sleep', fake_sleep)
     session = Session()
-    asyncio.run(
+    receipt, _ = asyncio.run(
         qualifier._submit_exact_async_request(
             session,
             endpoint='https://service.test',
@@ -4188,6 +4201,8 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
             duration_seconds=0,
             deadline=qualifier.time.monotonic() + 2))
 
+    assert receipt.attempt_id == accepted_attempt_id
+    assert receipt.attempt_no == 2
     assert len(session.calls) == 3
     assert len({call[1]['data'] for call in session.calls}) == 1
     assert {call[1]['headers']['X-SkyServe-Job-Id'] for call in session.calls
@@ -4202,6 +4217,68 @@ def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
             != qualifier._bounded_retry_delay('1',
                                               attempt=0,
                                               request_id='execution-2'))
+
+
+def test_exact_async_request_rejects_non_successor_after_typed_rejection(
+        monkeypatch):
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+
+    class Response:
+
+        def __init__(self, status, state, revision, body=b'{}'):
+            self.status = status
+            self._body = body
+            self.headers = {
+                'Retry-After': '0.1',
+                'X-SkyServe-Async-Ledger-Protocol': '1',
+                'X-SkyServe-Service-Incarnation': 'incarnation-a',
+                'X-SkyServe-Async-Attempt-Id': attempt_id,
+                'X-SkyServe-Async-Attempt-No': '1',
+                'X-SkyServe-Async-Ledger-Revision': str(revision),
+                'X-SkyServe-Async-Ledger-State': state,
+            }
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def read(self):
+            return self._body
+
+    class Session:
+
+        def __init__(self):
+            accepted = json.dumps({
+                'request_id': 'execution-1',
+                'status': 'accepted',
+            }).encode()
+            self.responses = [
+                Response(503, 'REJECTED_PRE_DISPATCH', 1),
+                # A rejected attempt cannot itself become accepted. The
+                # ledger must authorize a distinct successor attempt.
+                Response(202, 'ACCEPTED', 2, accepted),
+            ]
+
+        def post(self, _url, **_kwargs):
+            return self.responses.pop(0)
+
+    async def fake_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', fake_sleep)
+    with pytest.raises(qualifier.QualificationError, match='successor attempt'):
+        asyncio.run(
+            qualifier._submit_exact_async_request(
+                Session(),
+                endpoint='https://service.test',
+                token='secret',
+                service_hash='incarnation-a',
+                request_id='execution-1',
+                stable_job_id='job-1',
+                duration_seconds=0,
+                deadline=qualifier.time.monotonic() + 2))
 
 
 def test_exact_completion_retries_with_stable_exponential_jitter(monkeypatch):

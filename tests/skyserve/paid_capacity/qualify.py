@@ -4182,6 +4182,26 @@ def _receipt_from_headers(
                              revision=revision)
 
 
+def _validate_retry_attempt_transition(
+    previous_rejection: ExactAsyncReceipt,
+    current: ExactAsyncReceipt,
+    *,
+    accepted: bool,
+) -> None:
+    """Validate the only attempt identities allowed after a typed rejection."""
+    same_rejected_attempt = (
+        not accepted and current.attempt_id == previous_rejection.attempt_id and
+        current.attempt_no == previous_rejection.attempt_no and
+        current.revision >= previous_rejection.revision)
+    successor_attempt = (current.attempt_id != previous_rejection.attempt_id and
+                         current.attempt_no
+                         == previous_rejection.attempt_no + 1)
+    if ((accepted and (not successor_attempt or current.revision < 2)) or
+        (not accepted and not (same_rejected_attempt or successor_attempt))):
+        raise QualificationError(
+            'Exact async retry did not return the required successor attempt.')
+
+
 def _canonical_exact_request(request_id: str,
                              duration_seconds: float) -> tuple[bytes, str]:
     body = rfc8785.dumps({
@@ -4245,6 +4265,7 @@ async def _submit_exact_async_request(
                                      stable_job_id=stable_job_id,
                                      intent_sha256=intent_sha256)
     retry_attempt = 0
+    previous_rejection: ExactAsyncReceipt | None = None
     while time.monotonic() < deadline:
         try:
             async with session.post(url, headers=headers,
@@ -4254,6 +4275,10 @@ async def _submit_exact_async_request(
                     receipt = _receipt_from_headers(response,
                                                     service_hash=service_hash,
                                                     expected_state='ACCEPTED')
+                    if previous_rejection is not None:
+                        _validate_retry_attempt_transition(previous_rejection,
+                                                           receipt,
+                                                           accepted=True)
                     try:
                         result = json.loads(response_body)
                     except (UnicodeDecodeError, ValueError) as error:
@@ -4269,9 +4294,15 @@ async def _submit_exact_async_request(
                 if response.status not in (429, 503):
                     raise QualificationError(
                         f'{request_id} returned HTTP {response.status}.')
-                _receipt_from_headers(response,
-                                      service_hash=service_hash,
-                                      expected_state='REJECTED_PRE_DISPATCH')
+                rejection = _receipt_from_headers(
+                    response,
+                    service_hash=service_hash,
+                    expected_state='REJECTED_PRE_DISPATCH')
+                if previous_rejection is not None:
+                    _validate_retry_attempt_transition(previous_rejection,
+                                                       rejection,
+                                                       accepted=False)
+                previous_rejection = rejection
                 retry_after = response.headers.get('Retry-After', '1')
         except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as error:
             # A lost submission response is dispatch-ambiguous. This
