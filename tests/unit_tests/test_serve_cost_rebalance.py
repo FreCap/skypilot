@@ -65,6 +65,7 @@ class _Replica:
                  status=serve_state.ReplicaStatus.READY,
                  replacement_for=None):
         self.replica_id = replica_id
+        self.replica_record_id = _replica_record_id(replica_id)
         self.cluster_name = f'cluster-{replica_id}'
         self.version = 1
         self.status = status
@@ -127,6 +128,19 @@ def _report(scaler, replicas):
 
 def _decisions(scaler, replicas):
     return scaler.generate_scaling_decisions(replicas, [1])
+
+
+def test_scalar_cost_cache_is_bound_to_replica_record_identity():
+    """A reused numeric id cannot inherit its predecessor's hourly cost."""
+    spec = _spec(target_qps_per_replica=1.0,
+                 target_concurrency_per_replica=None)
+    scaler = autoscalers.RequestRateAutoscaler('svc', spec, version=1)
+    location = make_location('paid', accelerators={'L4': 1}, use_spot=True)
+    predecessor = _Replica(1, location, 1.0)
+    replacement = _Replica(1, location, 2.0)
+    replacement.replica_record_id = ('00000000-0000-4000-8000-000000000002')
+    assert scaler._get_hourly_cost_from_replica_info(predecessor) == 1.0
+    assert scaler._get_hourly_cost_from_replica_info(replacement) == 2.0
 
 
 def _status_property(
@@ -404,6 +418,35 @@ class TestEconomicDecisions:
             if d.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
         ]) == 1
 
+    def test_stabilization_timer_does_not_cross_replica_record_aba(
+            self, monkeypatch):
+        """A replacement row cannot inherit its predecessor's elapsed time."""
+        now = [100.0]
+        monkeypatch.setattr(autoscalers.time, 'time', lambda: now[0])
+        spec = _spec(min_replicas=1,
+                     max_replicas=1,
+                     cost_rebalance_stabilization_seconds=300.0)
+        scaler = _autoscaler(spec)
+        placer, paid, _, replicas = self._fleet()
+        scaler.set_spot_placer(placer)
+        predecessor = replicas[0]
+        _report(scaler, [predecessor])
+        assert not _decisions(scaler, [predecessor])
+
+        successor = _Replica(predecessor.replica_id, paid, 1.0)
+        successor.replica_record_id = _replica_record_id(999)
+        now[0] = 400.0
+        _report(scaler, [successor])
+        assert not _decisions(scaler, [successor])
+
+        now[0] = 699.0
+        assert not _decisions(scaler, [successor])
+        now[0] = 700.0
+        assert len([
+            decision for decision in _decisions(scaler, [successor]) if
+            decision.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
+        ]) == 1
+
     def test_stabilization_survives_restart(self, monkeypatch):
         paid = spot_placer.Location(cloud=clouds.AWS(),
                                     region='us-east-1',
@@ -437,6 +480,41 @@ class TestEconomicDecisions:
         now[0] = 400.0
         assert len([
             decision for decision in _decisions(restored, replicas) if
+            decision.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
+        ]) == 1
+
+    def test_restored_stabilization_timer_does_not_cross_replica_record_aba(
+            self, monkeypatch):
+        """Restart state names the durable row identity, not its reusable id."""
+        now = [100.0]
+        monkeypatch.setattr(autoscalers.time, 'time', lambda: now[0])
+        spec = _spec(min_replicas=1,
+                     max_replicas=1,
+                     cost_rebalance_stabilization_seconds=300.0)
+        scaler = _autoscaler(spec)
+        placer, paid, _, replicas = self._fleet()
+        scaler.set_spot_placer(placer)
+        predecessor = replicas[0]
+        _report(scaler, [predecessor])
+        assert not _decisions(scaler, [predecessor])
+        state = scaler.dump_cost_rebalance_state()
+        assert state['candidates'][0]['replica_record_id'] == (
+            predecessor.replica_record_id)
+        assert 'replica_id' not in state['candidates'][0]
+
+        successor = _Replica(predecessor.replica_id, paid, 1.0)
+        successor.replica_record_id = _replica_record_id(999)
+        now[0] = 399.0
+        restored = _autoscaler(spec)
+        restored.load_cost_rebalance_state(state)
+        restored.set_spot_placer(placer)
+        _report(restored, [successor])
+        assert not _decisions(restored, [successor])
+        now[0] = 400.0
+        assert not _decisions(restored, [successor])
+        now[0] = 699.0
+        assert len([
+            decision for decision in _decisions(restored, [successor]) if
             decision.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
         ]) == 1
 

@@ -2510,9 +2510,7 @@ def test_current_planner_uses_demand_committed_before_service_lock(
         'svc', 'svc-hash',
         _demand_report(time.time(), route_receipt, sequence=2, request_count=2))
     observed = []
-    planning_fingerprint = (
-        serve_state.get_scale_planning_state_fingerprint('svc'))
-    assert planning_fingerprint is not None
+    planner_input_fingerprint = 'f' * 64
 
     def _planner(snapshot, supply):
         observed.append(snapshot)
@@ -2520,7 +2518,7 @@ def test_current_planner_uses_demand_committed_before_service_lock(
         return _current_decision(snapshot,
                                  supply,
                                  2,
-                                 source_fingerprint=planning_fingerprint)
+                                 source_fingerprint=(planner_input_fingerprint))
 
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
@@ -2533,7 +2531,7 @@ def test_current_planner_uses_demand_committed_before_service_lock(
             backend_num_nodes=1,
             sequenced_reserved_fill=False,
             planner=_planner,
-            expected_planning_state_fingerprint=planning_fingerprint))
+            expected_planner_input_fingerprint=planner_input_fingerprint))
     authority = committed.authority
     snapshot = committed.demand_snapshot
 
@@ -5382,9 +5380,7 @@ def test_current_planner_admits_exact_card_saturated_demand(capacity_database):
         offered_arrival_tracking_saturated=True,
     )
     demand_state.ingest_report('svc', 'svc-hash', report)
-    planning_fingerprint = (
-        serve_state.get_scale_planning_state_fingerprint('svc'))
-    assert planning_fingerprint is not None
+    planner_input_fingerprint = 'f' * 64
 
     def _planner(snapshot, supply):
         assert snapshot.request_information[
@@ -5420,7 +5416,7 @@ def test_current_planner_admits_exact_card_saturated_demand(capacity_database):
         return _current_decision(snapshot,
                                  supply,
                                  1,
-                                 source_fingerprint=planning_fingerprint)
+                                 source_fingerprint=(planner_input_fingerprint))
 
     committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_admit_current(
@@ -5433,7 +5429,7 @@ def test_current_planner_admits_exact_card_saturated_demand(capacity_database):
             backend_num_nodes=1,
             sequenced_reserved_fill=False,
             planner=_planner,
-            expected_planning_state_fingerprint=planning_fingerprint))
+            expected_planner_input_fingerprint=planner_input_fingerprint))
 
     assert committed.demand_snapshot.demand_feed_generation == 2
     assert committed.authority.remaining_launch_capacity() == {'l4': 1}
@@ -5461,25 +5457,20 @@ def test_current_planner_rejects_saturated_partial_compatibility(
                       rejected_in_window_by_priority={'50': 1},
                       rejected_in_recent_window_by_priority={'50': 1})
     demand_state.ingest_report('svc', 'svc-hash', report)
-    planning_fingerprint = (
-        serve_state.get_scale_planning_state_fingerprint('svc'))
-    assert planning_fingerprint is not None
     planner = mock.Mock()
 
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
                        match='Current durable demand'):
         (capacity_admission.CapacityAdmissionRepository(
-            engine).plan_and_admit_current(
-                **_current_owner_kwargs(engine),
-                service_name='svc',
-                service_hash='svc-hash',
-                service_lifecycle_epoch=3,
-                service_version=1,
-                accounting_cards={'l4': 1},
-                backend_num_nodes=1,
-                sequenced_reserved_fill=False,
-                planner=planner,
-                expected_planning_state_fingerprint=planning_fingerprint))
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner))
 
     planner.assert_not_called()
     with engine.connect() as connection:
@@ -5519,104 +5510,30 @@ def test_current_planner_never_persists_paid_authority_for_reservation_only_card
     assert payload['paid_residual_by_accelerator'] == {}
 
 
-def test_current_planner_rejects_stale_prepared_fingerprint(capacity_database):
-    engine, incarnation, _ = capacity_database
-    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
-    planning_fingerprint = (
-        serve_state.get_scale_planning_state_fingerprint('svc'))
-    assert planning_fingerprint is not None
-    with engine.begin() as connection:
-        connection.execute(
-            sqlalchemy.insert(serve_state_schema.replicas_table).values(
-                **_replica_values(101, zero_cost=False)))
-    planner = mock.Mock(side_effect=lambda snapshot, supply: _current_decision(
-        snapshot, supply, 1, source_fingerprint=planning_fingerprint))
-
-    with pytest.raises(capacity_admission.CapacityAdmissionRetryableConflict,
-                       match='Prepared planning state changed'):
-        (capacity_admission.CapacityAdmissionRepository(
-            engine).plan_and_admit_current(
-                **_current_owner_kwargs(engine),
-                service_name='svc',
-                service_hash='svc-hash',
-                service_lifecycle_epoch=3,
-                service_version=1,
-                accounting_cards={'l4': 1},
-                backend_num_nodes=1,
-                sequenced_reserved_fill=False,
-                planner=planner,
-                expected_planning_state_fingerprint=planning_fingerprint))
-
-    planner.assert_not_called()
-
-
-def test_current_planner_accepts_semantic_noop_replica_rewrite(
+def test_current_planner_rejects_mismatched_structural_fingerprint(
         capacity_database):
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
-    initial = capacity_admission.CapacityAdmissionRepository(
-        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
-                                       service_name='svc',
-                                       service_hash='svc-hash',
-                                       service_lifecycle_epoch=3,
-                                       service_version=1,
-                                       accounting_cards={'l4': 1},
-                                       backend_num_nodes=1,
-                                       sequenced_reserved_fill=False,
-                                       planner=lambda snapshot, supply:
-                                       _current_decision(snapshot, supply, 1),
-                                       prepared_paid_launch_specs=(
-                                           _paid_launch_spec(engine, 0, 101),))
-    assert [
-        member.replica_id for member in initial.paid_launch_receipt.members
-    ] == [101]
-    planning_fingerprint = (
-        serve_state.get_scale_planning_state_fingerprint('svc'))
-    assert planning_fingerprint is not None
-    revision = sqlalchemy.literal_column('xmin::text').label('revision')
-    with engine.connect() as connection:
-        before_revision = connection.execute(
-            sqlalchemy.select(revision).select_from(
-                serve_state_schema.replicas_table).where(
-                    serve_state_schema.replicas_table.c.service_name == 'svc',
-                    serve_state_schema.replicas_table.c.replica_id ==
-                    101)).scalar_one()
-    with engine.begin() as connection:
-        connection.execute(
-            sqlalchemy.update(serve_state_schema.replicas_table).where(
-                serve_state_schema.replicas_table.c.service_name == 'svc',
-                serve_state_schema.replicas_table.c.replica_id == 101).values(
-                    replica_state=(
-                        serve_state_schema.replicas_table.c.replica_state)))
-    with engine.connect() as connection:
-        after_revision = connection.execute(
-            sqlalchemy.select(revision).select_from(
-                serve_state_schema.replicas_table).where(
-                    serve_state_schema.replicas_table.c.service_name == 'svc',
-                    serve_state_schema.replicas_table.c.replica_id ==
-                    101)).scalar_one()
-    assert after_revision != before_revision
-    assert (serve_state.get_scale_planning_state_fingerprint('svc') ==
-            planning_fingerprint)
+    expected_planner_input_fingerprint = 'f' * 64
     planner = mock.Mock(side_effect=lambda snapshot, supply: _current_decision(
-        snapshot, supply, 1, source_fingerprint=planning_fingerprint))
+        snapshot, supply, 1, source_fingerprint='e' * 64))
 
-    committed = (capacity_admission.CapacityAdmissionRepository(
-        engine).plan_and_admit_current(
-            **_current_owner_kwargs(engine),
-            service_name='svc',
-            service_hash='svc-hash',
-            service_lifecycle_epoch=3,
-            service_version=1,
-            accounting_cards={'l4': 1},
-            backend_num_nodes=1,
-            sequenced_reserved_fill=False,
-            planner=planner,
-            expected_planning_state_fingerprint=planning_fingerprint))
-    authority = committed.authority
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='different locked planning'):
+        (capacity_admission.CapacityAdmissionRepository(engine).
+         plan_and_admit_current(**_current_owner_kwargs(engine),
+                                service_name='svc',
+                                service_hash='svc-hash',
+                                service_lifecycle_epoch=3,
+                                service_version=1,
+                                accounting_cards={'l4': 1},
+                                backend_num_nodes=1,
+                                sequenced_reserved_fill=False,
+                                planner=planner,
+                                expected_planner_input_fingerprint=(
+                                    expected_planner_input_fingerprint)))
 
     planner.assert_called_once()
-    assert not authority.remaining_launch_capacity()
 
 
 def test_current_planner_rejects_paid_wave_above_atomic_bound(
@@ -5734,9 +5651,12 @@ def test_current_planner_callback_failure_rolls_back(capacity_database):
         ).scalar_one() == 0
 
 
-def test_controller_installs_finalized_partial_paid_wave_and_successor(
-        capacity_database):
-    """The controller consumes the repository-finalized paid policy state."""
+@pytest.mark.parametrize(
+    'successor_mutation',
+    ('probe_bookkeeping', 'replica_set_identity', 'version', 'shape'))
+def test_controller_successor_admission_tolerates_only_nonstructural_churn(
+        capacity_database, successor_mutation):
+    """A paid successor ignores probe churn but rejects structural drift."""
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine,
                            incarnation,
@@ -5817,7 +5737,7 @@ def test_controller_installs_finalized_partial_paid_wave_and_successor(
 
     autoscaler.install_committed_capacity_projection = _install
 
-    def _admit(replica_infos):
+    def _admit(replica_infos, mutate_after_prepare=None):
         planning_fingerprint = (
             serve_state.get_scale_planning_state_fingerprint(
                 'svc', require_version=True))
@@ -5826,19 +5746,23 @@ def test_controller_installs_finalized_partial_paid_wave_and_successor(
             autoscalers.prepare_controller_scaling_decision_inputs(
                 autoscaler, replica_infos))
         prepared_specs = manager.prepare_paid_launch_specs()
+        if mutate_after_prepare is not None:
+            mutate_after_prepare()
+            assert (serve_state.get_scale_planning_state_fingerprint(
+                'svc', require_version=True) != planning_fingerprint)
         result = ctrl._plan_and_admit_current_capacity(
             autoscaler,
             1,
             0,
             0,
-            planning_fingerprint,
             prepared_inputs,
             sequenced_reserved_fill=False,
             prepared_paid_launch_specs=prepared_specs)
-        assert result is not None
         return result
 
-    first, first_local, first_prepared = _admit([])
+    first_result = _admit([])
+    assert first_result is not None
+    first, first_local, first_prepared = first_result
     pre_finalized = capacity_planning.plan_capacity(first.planner_snapshot)
 
     assert first_prepared == (first_spec,)
@@ -5861,7 +5785,57 @@ def test_controller_installs_finalized_partial_paid_wave_and_successor(
     demand_state.ingest_report('svc', 'svc-hash', _queued_report(3))
     replica_infos = serve_state.get_replica_infos('svc')
     assert [info.replica_id for info in replica_infos] == [101]
-    successor, successor_local, successor_prepared = _admit(replica_infos)
+
+    def _mutate_successor_source():
+        with engine.begin() as connection:
+            replicas = serve_state_schema.replicas_table
+            row = connection.execute(
+                sqlalchemy.select(replicas).where(
+                    replicas.c.service_name == 'svc',
+                    replicas.c.replica_id == 101)).mappings().one()
+            state = copy.deepcopy(row['replica_state'])
+            updates = {}
+            if successor_mutation == 'probe_bookkeeping':
+                # A failed-probe clock changes no identity, version, shape,
+                # lifecycle status, paid debit, or usable capacity.
+                state['first_consecutive_failure_time'] = time.time()
+            elif successor_mutation == 'replica_set_identity':
+                connection.execute(
+                    sqlalchemy.insert(replicas).values(
+                        **_replica_values(103, zero_cost=False)))
+                return
+            elif successor_mutation == 'version':
+                state['version'] = 2
+                updates['version'] = 2
+            else:
+                assert successor_mutation == 'shape'
+                wide = _paid_launch_spec(engine, 0, 999, accelerator_count=8)
+                resources = json.loads(wide.resources_override)
+                state['location'] = copy.deepcopy(resources)
+                state['resources_override'] = copy.deepcopy(resources)
+                state['planned_capacity'] = 8
+                state['paid_capacity_pool_key'] = wide.pool_key
+                updates['paid_capacity_pool_key'] = wide.pool_key
+            connection.execute(
+                sqlalchemy.update(replicas).where(
+                    replicas.c.service_name == 'svc',
+                    replicas.c.replica_id == 101).values(replica_state=state,
+                                                         **updates))
+
+    successor_result = _admit(replica_infos, _mutate_successor_source)
+    if successor_mutation != 'probe_bookkeeping':
+        assert successor_result is None
+        replica_ids = {
+            info.replica_id for info in serve_state.get_replica_infos('svc')
+        }
+        assert replica_ids == ({101, 103} if successor_mutation
+                               == 'replica_set_identity' else {101})
+        assert 102 not in replica_ids
+        assert installed == [first.candidate]
+        return
+
+    assert successor_result is not None
+    successor, successor_local, successor_prepared = successor_result
 
     assert successor_prepared == (second_spec,)
     assert successor.authority.generation == first.authority.generation + 1
@@ -5960,9 +5934,6 @@ def test_controller_suppresses_actuation_on_committed_candidate_drift(
 
     monkeypatch.setattr(capacity_admission.CapacityAdmissionRepository,
                         'plan_and_admit_current', _drifted_plan_and_admit)
-    planning_fingerprint = serve_state.get_scale_planning_state_fingerprint(
-        'svc', require_version=True)
-    assert planning_fingerprint is not None
     prepared_inputs = autoscalers.prepare_controller_scaling_decision_inputs(
         autoscaler, [])
     result = ctrl._plan_and_admit_current_capacity(
@@ -5970,7 +5941,6 @@ def test_controller_suppresses_actuation_on_committed_candidate_drift(
         1,
         0,
         0,
-        planning_fingerprint,
         prepared_inputs,
         sequenced_reserved_fill=False,
         prepared_paid_launch_specs=manager.prepare_paid_launch_specs())
@@ -6082,7 +6052,6 @@ def test_fresh_zero_multi_pool_admission_accepts_yaml_card_casing(
         'H200': 1,
     })
     prepared_inputs = autoscalers.ScalingDecisionInputs(
-        replica_ids=(),
         gpu_shape_handles={},
         historical_scaling_values={},
         cold_paid_accelerator_order=('L4',),
@@ -6096,17 +6065,12 @@ def test_fresh_zero_multi_pool_admission_accepts_yaml_card_casing(
     ctrl = _current_capacity_controller(incarnation, autoscaler, manager)
 
     def _admit():
-        planning_fingerprint = (
-            serve_state.get_scale_planning_state_fingerprint(
-                'svc', require_version=True))
-        assert planning_fingerprint is not None
         prepared_specs = manager.prepare_paid_launch_specs()
         result = ctrl._plan_and_admit_current_capacity(
             autoscaler,
             1,
             0,
             0,
-            planning_fingerprint,
             prepared_inputs,
             sequenced_reserved_fill=True,
             prepared_paid_launch_specs=prepared_specs)

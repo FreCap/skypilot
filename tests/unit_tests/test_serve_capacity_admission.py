@@ -2,6 +2,7 @@
 
 import copy
 import dataclasses
+import inspect
 import threading
 import time
 
@@ -15,6 +16,15 @@ from sky.serve import capacity_planning
 from sky.serve import kueue_lane_capacity
 from sky.serve import reserved_fill_planner
 from sky.serve import serve_state_schema
+
+
+def test_current_admission_has_one_structural_planner_precondition() -> None:
+    parameters = inspect.signature(
+        capacity_admission.CapacityAdmissionRepository.plan_and_admit_current
+    ).parameters
+
+    assert 'expected_planner_input_fingerprint' in parameters
+    assert 'expected_planning_state_fingerprint' not in parameters
 
 
 def _input(**overrides) -> capacity_admission.CapacityPlanInput:
@@ -50,6 +60,26 @@ def _input(**overrides) -> capacity_admission.CapacityPlanInput:
     if 'paid_launch_target' not in overrides:
         values['paid_launch_target'] = values['paid_residual']
     return capacity_admission.CapacityPlanInput(**values)
+
+
+def test_replica_card_rejects_location_override_shape_disagreement() -> None:
+    state = {
+        'location': {
+            'accelerators': {
+                'L4': 1,
+            },
+        },
+        'resources_override': {
+            'accelerators': {
+                'A100': 8,
+            },
+        },
+    }
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='disagree'):
+        capacity_admission._replica_card(  # pylint: disable=protected-access
+            state)
 
 
 def _allocation_identity(
@@ -672,7 +702,7 @@ def test_planner_reservation_evidence_must_match_locked_supply():
         reservation_commitment={'l4': 2},
         static_fill_target={'l4': 0},
         supply_projection=supply,
-        expected_planning_state_fingerprint='f' * 64)
+        expected_planner_input_fingerprint='f' * 64)
     changed = capacity_admission.ReservedSupplyProjection(**{
         **supply.__dict__,
         'reservation_evidence_sha256': '9' * 64,
@@ -688,7 +718,7 @@ def test_planner_reservation_evidence_must_match_locked_supply():
             reservation_commitment={'l4': 2},
             static_fill_target={'l4': 0},
             supply_projection=changed,
-            expected_planning_state_fingerprint='f' * 64)
+            expected_planner_input_fingerprint='f' * 64)
 
 
 @pytest.mark.parametrize(
