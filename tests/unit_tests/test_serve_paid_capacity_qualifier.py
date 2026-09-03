@@ -3840,6 +3840,87 @@ def test_scale_wait_rejects_arrivals_increasing_after_commit(tmp_path):
     asyncio.run(exercise())
 
 
+def test_scale_wait_retries_transient_request_projection_skew(tmp_path):
+    """LB demand and exact-ledger publications need not become visible together."""
+    profile = dataclasses.replace(qualifier.PROFILES['scale'],
+                                  exact_requests=8,
+                                  request_concurrency=8,
+                                  max_replicas=8,
+                                  max_units=8,
+                                  minimum_running=8,
+                                  poll_seconds=0,
+                                  scale_timeout_seconds=10)
+    started_monotonic = time.monotonic()
+    started_at = time.time()
+    cluster_names = _provider_cluster_names('gcp', 8)
+    observation = _observation(
+        observed_at=started_at + 3,
+        observed_monotonic=started_monotonic + 3,
+        database=_database_state(
+            paid_debit_units=8,
+            demand_units=8,
+            bound_cluster_zones=tuple(
+                (name, 'us-central1-a') for name in cluster_names)),
+        provider=_cross_cloud_provider_state(gcp_running_count=8,
+                                             aws_running_count=0),
+        load_balancer=_load_balancer_state(demand_units=8,
+                                           unique_job_arrivals_60s=8,
+                                           unique_job_arrivals_300s=8))
+    telemetry = [
+        # The ledger bind committed after the last LB demand report.
+        _request_telemetry(queue_depth=8,
+                           state_counts={'DISPATCH_MAY_HAVE_OCCURRED': 1}),
+        # The next LB report captured in-flight work before its ledger bind.
+        _request_telemetry(queue_depth=7, in_flight=1, processing=0),
+        # Eventual exact evidence is the only sample paired to provider state.
+        _request_telemetry(queue_depth=7,
+                           in_flight=1,
+                           processing=1,
+                           state_counts={'ACCEPTED': 1}),
+    ]
+
+    class Observer:
+
+        def __init__(self):
+            self.provider_reads = 0
+
+        async def request_telemetry(self):
+            return telemetry.pop(0)
+
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
+            self.provider_reads += 1
+            return observation
+
+    async def exercise():
+        observer = Observer()
+        receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                    service_name='paid-e2e',
+                                    profile=profile)
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            progress = qualifier.Progress(
+                scale_started_monotonic=started_monotonic,
+                scale_started_at=started_at)
+            await qualifier._wait_for_scale(observer=observer,
+                                            profile=profile,
+                                            progress=progress,
+                                            receipt=receipt,
+                                            traffic=traffic,
+                                            baseline=_request_telemetry())
+            return observer, receipt
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+
+    observer, receipt = asyncio.run(exercise())
+    assert observer.provider_reads == 1
+    assert telemetry == []
+    assert len(receipt._payload['request_telemetry_samples']) == 1
+    assert receipt._payload['request_telemetry_samples'][0][
+        'scale_iteration_id'] == 1
+
+
 def test_scale_and_positive_gates_accept_fully_dispatched_cohort_concurrently(
         tmp_path):
     """Positive telemetry must not wait for the physical provider gate."""
@@ -4300,8 +4381,10 @@ def test_aggregate_rejects_positive_outside_post_scale_queue_window(
         qualifier.aggregate_evidence(args)
 
 
-def test_scale_rejects_unattributed_mixed_demand(tmp_path):
-    profile = dataclasses.replace(qualifier.PROFILES['small'], poll_seconds=0)
+def test_scale_never_accepts_unattributed_mixed_demand(tmp_path):
+    profile = dataclasses.replace(qualifier.PROFILES['small'],
+                                  poll_seconds=0,
+                                  scale_timeout_seconds=0.01)
 
     class Observer:
         """Expose demand that cannot belong solely to the campaign."""
@@ -4322,7 +4405,7 @@ def test_scale_rejects_unattributed_mixed_demand(tmp_path):
         traffic = asyncio.create_task(asyncio.Event().wait())
         try:
             with pytest.raises(qualifier.QualificationError,
-                               match='not exactly attributable'):
+                               match='Provider did not reach'):
                 await qualifier._wait_for_scale(
                     observer=Observer(),
                     profile=profile,

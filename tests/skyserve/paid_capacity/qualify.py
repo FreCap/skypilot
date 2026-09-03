@@ -4985,18 +4985,22 @@ async def _wait_for_scale(
         except Exception:  # pylint: disable=broad-except
             await asyncio.sleep(profile.poll_seconds)
             continue
-        if not _has_exact_campaign_demand(telemetry, baseline):
-            raise QualificationError(
-                'Scale demand is not exactly attributable to the campaign '
-                'ledger identities.')
         active_delta = telemetry.ledger_active - baseline.ledger_active
+        if active_delta < 0 or active_delta > expectation.exact_request_count:
+            raise QualificationError(
+                'Scale demand has contradictory exact dispatched identities.')
+        if not _has_exact_campaign_demand(telemetry, baseline):
+            # The LB demand report and request ledger are independent durable
+            # publications.  A queue-to-dispatch handoff can therefore be
+            # visible in either projection first.  Such a sample proves
+            # nothing, but it is not evidence of corruption; only eventual
+            # exact samples are paired with provider observations below.
+            await asyncio.sleep(profile.poll_seconds)
+            continue
         if (profile.name == 'scale' and _resident_campaign_size(telemetry)
                 != scale_stimulus_count(profile)):
             raise QualificationError(
                 'Scale demand no longer contains the exact bounded stimulus.')
-        if active_delta < 0 or active_delta > expectation.exact_request_count:
-            raise QualificationError(
-                'Scale demand has contradictory exact dispatched identities.')
         scale_iteration_id += 1
         receipt.request_telemetry('scale',
                                   telemetry,
