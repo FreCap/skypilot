@@ -281,9 +281,10 @@ consolidated Serve controllers before plugins or database state initialize.
 An unexpected role maps to `unknown` instead of becoming a label.
 
 Engine namespaces are normalized to `shared`, `api-requests-control`,
-`advisory-lock`, or `other`. Sync and async are the only mode values. The
-complete Cartesian bound is therefore 7 process roles times 4 namespaces times
-2 modes, or at most 56 labeled combinations.
+`api-requests-liveness`, `advisory-lock`, `reserved-fill-reclaim-proof`, or
+`other`. Sync and async are the only mode values. The complete Cartesian bound
+is therefore 7 process roles times 6 namespaces times 2 modes, or at most 84
+labeled combinations.
 The production multiprocess collector exports one `_total` series for each
 combination. A non-multiprocess local registry may also expose Prometheus
 client's `_created` companion series. Database URLs, users, process IDs, job
@@ -387,7 +388,8 @@ created in both cache-miss branches:
 - the dedicated advisory-lock engine in `get_postgres_lock_engine()`.
 
 Do not attach on cache hits or SQLite engines. Normalize a missing default
-namespace to `shared`, preserve `api-requests-control`, assign
+namespace to `shared`, preserve `api-requests-control`,
+`api-requests-liveness`, and `reserved-fill-reclaim-proof`, assign
 `advisory-lock` to the lock engine, and map every other namespace to `other`.
 Attach async events to `AsyncEngine.sync_engine` and label them `async`; all
 other paths are `sync`.
