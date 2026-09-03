@@ -2911,30 +2911,41 @@ class TestBoundOrdinaryLaunchManagerIntegration:
                                          status=status, error=error))
 
     @staticmethod
-    def _callback_fixture():
+    def _callback_fixture(profile_kind: ordinary_launch_binding.
+                          NonPoolLaunchProfileKind = ordinary_launch_binding.
+                          NonPoolLaunchProfileKind.RESERVED_FILL,):
         manager = _make_manager()
         authority = _binding_authority(
             ordinary_launch_binding.BindingMode.BOUND, generic=True)
         manager._ordinary_launch_binding_authority = authority
-        context = _bound_non_pool_context(
-            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+        context = _bound_non_pool_context(profile_kind)
         info = _fake_replica_info(
             context.replica_id,
             replica_managers.serve_state.ReplicaStatus.PROVISIONING)
         info.replica_record_id = str(context.replica_record_id)
+        if profile_kind is ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID:
+            info.is_spot = True
+            info.paid_capacity_pool_key = _canonical_paid_pool_key()
         return manager, authority, context, info
 
     @staticmethod
     def _active_snapshot_row(context, authority):
         profile = context.profile
+        reserved_fill = (
+            profile.kind
+            is ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+        paid_pool_key = (None if reserved_fill else _canonical_paid_pool_key())
         info = _fake_replica_info(
             context.replica_id,
             replica_managers.serve_state.ReplicaStatus.PROVISIONING)
         info.replica_record_id = str(context.replica_record_id)
-        info.reserved_fill = True
-        info.is_zero_cost = True
-        info.zero_cost_admission_sequence = 1
-        info.zero_cost_materialization_sequence = 1
+        info.reserved_fill = reserved_fill
+        info.is_zero_cost = reserved_fill
+        info.is_spot = not reserved_fill
+        info.paid_capacity_pool_key = paid_pool_key
+        if reserved_fill:
+            info.zero_cost_admission_sequence = 1
+            info.zero_cost_materialization_sequence = 1
         reserved_values = {
             'reserved_fill_pool_key': 'pool-a',
             'reserved_fill_service_generation': 1,
@@ -2952,8 +2963,9 @@ class TestBoundOrdinaryLaunchManagerIntegration:
             'reserved_fill_observation_sequence': 0,
             'reserved_fill_intent_idempotency_key': 'e' * 64,
         }
-        for field, value in reserved_values.items():
-            setattr(info, field, value)
+        if reserved_fill:
+            for field, value in reserved_values.items():
+                setattr(info, field, value)
         return {
             'association_id': context.association_id,
             'request_id': context.request_id,
@@ -2984,6 +2996,7 @@ class TestBoundOrdinaryLaunchManagerIntegration:
             'authorization_reference': profile.authorization_reference,
             'authorization_generation': profile.authorization_generation,
             'authorization_digest': profile.authorization_digest,
+            'paid_capacity_pool_key': paid_pool_key,
             'service_job_id': None,
             'cancel_reason': None,
             '_fence_epoch': authority.service_lifecycle_epoch,
@@ -3012,7 +3025,7 @@ class TestBoundOrdinaryLaunchManagerIntegration:
             '_replica_status': 'PROVISIONING',
             '_replica_version': 1,
             '_replica_cluster_name': 'svc-3',
-            '_replica_paid_pool_key': None,
+            '_replica_paid_pool_key': paid_pool_key,
             '_request_status': 'PENDING',
             '_request_generation': 0,
             '_request_claim_token': None,
@@ -3036,9 +3049,8 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         with mock.patch.object(request_postgres,
                                'initialize_and_get_db',
                                return_value=engine):
-            snapshot = (
-                request_postgres.read_bound_reserved_fill_active_snapshot(
-                    context, authority))
+            snapshot = (request_postgres.read_bound_non_pool_active_snapshot(
+                context, authority))
 
         assert snapshot is not None
         assert snapshot.disposition is (
@@ -3077,9 +3089,8 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         with mock.patch.object(request_postgres,
                                'initialize_and_get_db',
                                return_value=engine):
-            snapshot = (
-                request_postgres.read_bound_reserved_fill_active_snapshot(
-                    context, authority))
+            snapshot = (request_postgres.read_bound_non_pool_active_snapshot(
+                context, authority))
 
         assert snapshot is not None
         assert snapshot.request.status is api_requests.RequestStatus.RUNNING
@@ -3089,19 +3100,146 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         assert snapshot.request.claim_active
         assert not snapshot.request.quiescent
 
-    def test_non_reserved_active_snapshot_does_not_query(self):
+    def test_unsupported_active_snapshot_does_not_query(self):
         authority = _binding_authority(
             ordinary_launch_binding.BindingMode.BOUND, generic=True)
         context = _bound_non_pool_context(
-            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+            ordinary_launch_binding.NonPoolLaunchProfileKind.COST_REBALANCE)
         with mock.patch.object(request_postgres,
                                'initialize_and_get_db') as initialize:
-            assert (request_postgres.read_bound_reserved_fill_active_snapshot(
+            assert (request_postgres.read_bound_non_pool_active_snapshot(
                 context, authority)) is None
         initialize.assert_not_called()
 
-    def test_stale_authority_rejects_active_snapshot(self):
-        _, authority, context, _ = self._callback_fixture()
+    def test_paid_active_snapshot_requires_correlated_claim_and_pool(self):
+        _, authority, context, _ = self._callback_fixture(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+        connection = mock.MagicMock()
+        connection.execute.return_value.mappings.return_value.one_or_none.return_value = (
+            self._active_snapshot_row(context, authority))
+        engine = mock.MagicMock()
+        engine.dialect.name = 'postgresql'
+        engine.connect.return_value.__enter__.return_value = connection
+
+        with mock.patch.object(request_postgres,
+                               'initialize_and_get_db',
+                               return_value=engine):
+            snapshot = request_postgres.read_bound_non_pool_active_snapshot(
+                context, authority)
+
+        assert snapshot is not None
+        connection.execute.assert_called_once()
+        sql = str(connection.execute.call_args.args[0]).upper()
+        assert 'JOIN PAID_CAPACITY_CLAIMS' not in sql
+        assert 'JOIN PAID_CAPACITY_POOLS' not in sql
+        assert 'PAID_CAPACITY_POOL_KEY IS NOT NULL' in sql
+        assert ('REPLICAS.PAID_CAPACITY_POOL_KEY = '
+                'SERVE_ORDINARY_LAUNCH_ASSOCIATIONS.'
+                'PAID_CAPACITY_POOL_KEY') in sql
+        assert sql.count('EXISTS (SELECT') >= 3
+        assert ('PAID_CAPACITY_CLAIMS.SERVICE_NAME = '
+                'SERVE_ORDINARY_LAUNCH_ASSOCIATIONS.SERVICE_NAME') in sql
+        assert ('PAID_CAPACITY_CLAIMS.SERVICE_HASH = '
+                'SERVE_ORDINARY_LAUNCH_ASSOCIATIONS.SERVICE_HASH') in sql
+        assert ('PAID_CAPACITY_CLAIMS.REPLICA_ID = '
+                'SERVE_ORDINARY_LAUNCH_ASSOCIATIONS.REPLICA_ID') in sql
+        assert ('PAID_CAPACITY_CLAIMS.POOL_KEY = '
+                'SERVE_ORDINARY_LAUNCH_ASSOCIATIONS.'
+                'PAID_CAPACITY_POOL_KEY') in sql
+        assert ('PAID_CAPACITY_CLAIMS.SERVICE_HASH != '
+                'SERVE_ORDINARY_LAUNCH_ASSOCIATIONS.SERVICE_HASH') in sql
+        assert ('PAID_CAPACITY_CLAIMS.POOL_KEY != '
+                'SERVE_ORDINARY_LAUNCH_ASSOCIATIONS.'
+                'PAID_CAPACITY_POOL_KEY') in sql
+        assert ('PAID_CAPACITY_POOLS.POOL_KEY = '
+                'SERVE_ORDINARY_LAUNCH_ASSOCIATIONS.'
+                'PAID_CAPACITY_POOL_KEY') in sql
+        assert sql.count('FROM PAID_CAPACITY_CLAIMS') == 2
+        assert sql.count('FROM PAID_CAPACITY_POOLS') == 1
+        assert 'RESERVED_FILL_ACTUATION_MODE' not in sql
+        assert 'OWNER_USER_ID' not in sql
+        assert 'FOR UPDATE' not in sql
+        assert 'PG_ADVISORY' not in sql
+
+    def test_paid_active_snapshot_rejects_replica_pool_mismatch(self):
+        _, authority, context, _ = self._callback_fixture(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+        row = self._active_snapshot_row(context, authority)
+        row['_replica_paid_pool_key'] = _canonical_gcp_paid_pool_key()
+        replica_state = dict(row['_replica_state'])
+        replica_state['paid_capacity_pool_key'] = row['_replica_paid_pool_key']
+        row['_replica_state'] = replica_state
+        connection = mock.MagicMock()
+        connection.execute.return_value.mappings.return_value.one_or_none.return_value = row
+        engine = mock.MagicMock()
+        engine.dialect.name = 'postgresql'
+        engine.connect.return_value.__enter__.return_value = connection
+
+        with mock.patch.object(request_postgres,
+                               'initialize_and_get_db',
+                               return_value=engine):
+            assert request_postgres.read_bound_non_pool_active_snapshot(
+                context, authority) is None
+
+    def test_paid_active_snapshot_rejects_missing_association_pool(self):
+        _, authority, context, _ = self._callback_fixture(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+        row = self._active_snapshot_row(context, authority)
+        row['paid_capacity_pool_key'] = None
+        row['_replica_paid_pool_key'] = None
+        replica_state = dict(row['_replica_state'])
+        replica_state['paid_capacity_pool_key'] = None
+        row['_replica_state'] = replica_state
+        connection = mock.MagicMock()
+        connection.execute.return_value.mappings.return_value.one_or_none.return_value = row
+        engine = mock.MagicMock()
+        engine.dialect.name = 'postgresql'
+        engine.connect.return_value.__enter__.return_value = connection
+
+        with mock.patch.object(request_postgres,
+                               'initialize_and_get_db',
+                               return_value=engine):
+            assert request_postgres.read_bound_non_pool_active_snapshot(
+                context, authority) is None
+
+    @pytest.mark.parametrize('profile_kind', [
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+    ])
+    def test_non_postgres_active_snapshot_fails_closed(self, profile_kind):
+        _, authority, context, _ = self._callback_fixture(profile_kind)
+        engine = mock.MagicMock()
+        engine.dialect.name = 'sqlite'
+
+        with mock.patch.object(request_postgres,
+                               'initialize_and_get_db',
+                               return_value=engine):
+            assert request_postgres.read_bound_non_pool_active_snapshot(
+                context, authority) is None
+
+        engine.connect.assert_not_called()
+
+    def test_paid_active_snapshot_read_error_fails_closed(self):
+        _, authority, context, _ = self._callback_fixture(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+        connection = mock.MagicMock()
+        connection.execute.side_effect = RuntimeError('read failed')
+        engine = mock.MagicMock()
+        engine.dialect.name = 'postgresql'
+        engine.connect.return_value.__enter__.return_value = connection
+
+        with mock.patch.object(request_postgres,
+                               'initialize_and_get_db',
+                               return_value=engine):
+            assert request_postgres.read_bound_non_pool_active_snapshot(
+                context, authority) is None
+
+    @pytest.mark.parametrize('profile_kind', [
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+    ])
+    def test_stale_authority_rejects_active_snapshot(self, profile_kind):
+        _, authority, context, _ = self._callback_fixture(profile_kind)
         stale = dataclasses.replace(authority, controller_owner_epoch=8)
         connection = mock.MagicMock()
         result = connection.execute.return_value
@@ -3114,11 +3252,16 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         with mock.patch.object(request_postgres,
                                'initialize_and_get_db',
                                return_value=engine):
-            assert (request_postgres.read_bound_reserved_fill_active_snapshot(
+            assert (request_postgres.read_bound_non_pool_active_snapshot(
                 context, stale)) is None
 
-    def test_active_bound_poll_uses_non_authorizing_snapshot(self):
-        manager, _, context, info = self._callback_fixture()
+    @pytest.mark.parametrize('profile_kind', [
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+    ])
+    def test_active_bound_poll_uses_non_authorizing_snapshot(
+            self, profile_kind):
+        manager, _, context, info = self._callback_fixture(profile_kind)
         active = self._projection('ADOPT_ACTIVE',
                                   status='RUNNING',
                                   projected=False)
@@ -3130,7 +3273,7 @@ class TestBoundOrdinaryLaunchManagerIntegration:
                 return_value=active) as inspect, \
              mock.patch.object(
                  replica_managers.request_postgres,
-                 'read_bound_reserved_fill_active_snapshot',
+                 'read_bound_non_pool_active_snapshot',
                  return_value=active) as active_snapshot, \
              mock.patch.object(
                  replica_managers.request_postgres,
@@ -3144,8 +3287,12 @@ class TestBoundOrdinaryLaunchManagerIntegration:
             context, manager._ordinary_launch_binding_authority)
         locked_reduce.assert_not_called()
 
-    def test_inactive_snapshot_enters_locked_reducer(self):
-        manager, authority, context, info = self._callback_fixture()
+    @pytest.mark.parametrize('profile_kind', [
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+    ])
+    def test_inactive_snapshot_enters_locked_reducer(self, profile_kind):
+        manager, authority, context, info = self._callback_fixture(profile_kind)
         active = self._projection('ADOPT_ACTIVE',
                                   status='RUNNING',
                                   projected=False)
@@ -3158,7 +3305,7 @@ class TestBoundOrdinaryLaunchManagerIntegration:
                 return_value=active) as inspect, \
              mock.patch.object(
                  replica_managers.request_postgres,
-                 'read_bound_reserved_fill_active_snapshot',
+                 'read_bound_non_pool_active_snapshot',
                  return_value=None) as active_snapshot, \
              mock.patch.object(
                  replica_managers.request_postgres,
@@ -3183,7 +3330,7 @@ class TestBoundOrdinaryLaunchManagerIntegration:
 
         with mock.patch.object(
                 replica_managers.request_postgres,
-                'read_bound_reserved_fill_active_snapshot',
+                'read_bound_non_pool_active_snapshot',
                 side_effect=RuntimeError('read failed')), \
              mock.patch.object(
                  replica_managers.request_postgres,
