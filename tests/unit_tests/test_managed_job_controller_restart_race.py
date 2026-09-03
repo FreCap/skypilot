@@ -38,23 +38,6 @@ def _make_status_check_info():
     }
 
 
-def _make_job_status_check_state(schedule_state,
-                                 pid=123,
-                                 started_at=None,
-                                 all_tasks_terminal=False):
-    return {
-        'schedule_state': schedule_state,
-        'controller_pid': pid,
-        'controller_pid_started_at': started_at,
-        'controller_instance_id': None,
-        'controller_generation': None,
-        'controller_slot_id': None,
-        'controller_slot_attempt': None,
-        'controller_slot_quiescing': False,
-        'all_tasks_terminal': all_tasks_terminal,
-    }
-
-
 def _unexpected(label):
 
     def _raise(*args, **kwargs):
@@ -263,7 +246,6 @@ def test_complete_fixed_slot_row_is_observational_only(monkeypatch,
 
 def _wire_legacy_dead_controller(monkeypatch,
                                  set_failed_calls,
-                                 fresh_state=None,
                                  set_failed_return=managed_job_state.
                                  ControllerFailureDecision.TERMINALIZED):
     _forbid_split_snapshot_helpers(monkeypatch)
@@ -272,11 +254,6 @@ def _wire_legacy_dead_controller(monkeypatch,
     monkeypatch.setattr(managed_job_state,
                         'get_jobs_to_check_status_summary',
                         lambda job_ids=None: _make_status_check_info())
-    if fresh_state is None:
-        fresh_state = _make_job_status_check_state(
-            managed_job_state.ManagedJobScheduleState.ALIVE)
-    monkeypatch.setattr(managed_job_state, 'get_job_status_check_state',
-                        lambda job_id: fresh_state)
     monkeypatch.setattr(utils, 'controller_process_alive', lambda record: False)
 
     def _set_failed(*args, **kwargs):
@@ -345,14 +322,13 @@ def test_legacy_terminal_tasks_wait_for_cleanup_adoption(monkeypatch):
 
 
 def test_defers_when_legacy_job_reset_for_recovery_midcycle(monkeypatch):
-    """A declined legacy CAS rechecks state and performs no provider action."""
+    """A declined legacy CAS performs no provider action or point reread."""
     set_failed_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-    _wire_legacy_dead_controller(
-        monkeypatch,
-        set_failed_calls,
-        fresh_state=_make_job_status_check_state(
-            managed_job_state.ManagedJobScheduleState.WAITING, pid=None),
-        set_failed_return=False)
+    _wire_legacy_dead_controller(monkeypatch,
+                                 set_failed_calls,
+                                 set_failed_return=False)
+    monkeypatch.setattr(managed_job_state, 'get_job_status_check_state',
+                        _unexpected('declined-CAS point reread'))
     monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
 
     utils.update_managed_jobs_statuses(job_ids=[1])

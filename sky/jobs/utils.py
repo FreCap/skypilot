@@ -704,24 +704,6 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
                 snapshot.get('controller_slot_quiescing'),
         }
 
-    def _snapshot_is_unchanged(info: dict[str, Any],
-                               fresh_info: dict[str, Any] | None) -> bool:
-        return (fresh_info is not None and
-                fresh_info['schedule_state'] == info['schedule_state'] and
-                fresh_info['controller_pid'] == info['controller_pid'] and
-                fresh_info['controller_pid_started_at']
-                == info['controller_pid_started_at'] and
-                fresh_info.get('controller_instance_id')
-                == info.get('controller_instance_id') and
-                fresh_info.get('controller_generation')
-                == info.get('controller_generation') and
-                fresh_info.get('controller_slot_id')
-                == info.get('controller_slot_id') and
-                fresh_info.get('controller_slot_attempt')
-                == info.get('controller_slot_attempt') and
-                fresh_info.get('controller_slot_quiescing')
-                == info.get('controller_slot_quiescing'))
-
     controller_liveness_cache: dict[managed_job_state.ControllerPidRecord,
                                     bool] = {}
 
@@ -903,28 +885,11 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
             continue
 
         # The atomic FAILED_CONTROLLER write already locked and rechecked the
-        # exact snapshot. Only the declined-CAS path pays for a fresh point
-        # read so the common dead-controller case stays on one exact DB write.
-        fresh_info = managed_job_state.get_job_status_check_state(job_id)
-        if (fresh_info is not None and fresh_info['schedule_state']
-                == managed_job_state.ManagedJobScheduleState.DONE):
-            # The controller marked the job done and exited between the batched
-            # snapshot and the destructive path. This is fine.
-            continue
-        if not _snapshot_is_unchanged(info, fresh_info):
-            logger.info(f'Job {job_id} schedule state or controller pid '
-                        'changed since the status snapshot was taken; '
-                        'deferring to the next status update cycle.')
-            continue
-        assert fresh_info is not None
-
-        # The controller can also die AFTER all tasks are already terminal but
-        # BEFORE it flips schedule_state to DONE, e.g. during log streaming or
-        # cluster teardown. Preserve the terminal task outcome and only
-        # finalize scheduler state; rewriting the job to FAILED_CONTROLLER here
-        # would clobber a real SUCCEEDED/FAILED result with a cleanup crash.
-        logger.info(f'Job {job_id} changed before FAILED_CONTROLLER could '
-                    'be committed; deferring cleanup.')
+        # exact snapshot. A declined CAS already proves the original summary
+        # snapshot is stale or gone, so paying a second point reread here
+        # cannot justify a stronger lifecycle decision.
+        logger.info(f'Job {job_id} changed before FAILED_CONTROLLER could be '
+                    'committed; deferring to the next status update cycle.')
 
 
 def get_job_timestamp(backend: 'backends.CloudVmRayBackend',
