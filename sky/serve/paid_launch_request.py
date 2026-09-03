@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 import copy
 import dataclasses
+import json
 import os
 from typing import Any, TYPE_CHECKING
 
@@ -15,6 +16,32 @@ from sky.utils import config_utils
 
 if TYPE_CHECKING:
     from sky.serve import service_spec
+
+_REPLICA_ID_TEMPLATE_TOKEN = '__SKYPILOT_PAID_REPLICA_ID_TEMPLATE__'
+_CLUSTER_NAME_TEMPLATE = 'sky-paid-launch-template'
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PaidLaunchBodyTemplate:
+    """Canonical identity-free launch body for one exact provider location."""
+
+    submitted_bytes: bytes
+
+    def __post_init__(self) -> None:
+        prepared = sdk.PreparedLaunchRequest(self.submitted_bytes)
+        body = prepared.body
+        if (body.cluster_name != _CLUSTER_NAME_TEMPLATE or
+                body.extra_launch_context or
+                body.task.count(_REPLICA_ID_TEMPLATE_TOKEN) != 1):
+            raise ValueError('Paid launch body template is malformed.')
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(value,
+                      sort_keys=True,
+                      separators=(',', ':'),
+                      ensure_ascii=False,
+                      allow_nan=False).encode('utf-8')
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -96,7 +123,7 @@ def inject_replica_tls_material(task: task_lib.Task,
 
 def build_replica_launch_task(
     yaml_content: str,
-    replica_id: int,
+    replica_id: int | str,
     resources_override: dict[str, Any] | None,
     *,
     exact_resources_override: bool,
@@ -132,7 +159,7 @@ def prepare_paid_launch_request(
     authoritative_service_spec: 'service_spec.SkyServiceSpec',
     frozen_controller_config: config_utils.Config,
     resources_override: dict[str, Any],
-    replica_id: int,
+    replica_id: int | str,
     cluster_name: str,
     workspace: str,
     service_name: str,
@@ -158,3 +185,57 @@ def prepare_paid_launch_request(
             workspace=workspace,
             retry_until_up=False,
             extra_launch_context=dict(launch_fence))
+
+
+def prepare_paid_launch_body_template(
+    *,
+    yaml_content: str,
+    authoritative_service_spec: 'service_spec.SkyServiceSpec',
+    frozen_controller_config: config_utils.Config,
+    resources_override: dict[str, Any],
+    workspace: str,
+    service_name: str,
+    runtime: ReplicaLaunchRuntime,
+    task_template: task_lib.Task | None = None,
+) -> PaidLaunchBodyTemplate:
+    """Build one provider-specific request body without member identity."""
+    prepared = prepare_paid_launch_request(
+        yaml_content=yaml_content,
+        authoritative_service_spec=authoritative_service_spec,
+        frozen_controller_config=frozen_controller_config,
+        resources_override=resources_override,
+        replica_id=_REPLICA_ID_TEMPLATE_TOKEN,
+        cluster_name=_CLUSTER_NAME_TEMPLATE,
+        workspace=workspace,
+        service_name=service_name,
+        launch_fence={},
+        runtime=runtime,
+        task_template=task_template)
+    return PaidLaunchBodyTemplate(submitted_bytes=prepared.submitted_bytes)
+
+
+def materialize_paid_launch_request(
+    template: PaidLaunchBodyTemplate,
+    *,
+    replica_id: int,
+    cluster_name: str,
+    launch_fence: Mapping[str, Any],
+) -> sdk.PreparedLaunchRequest:
+    """Bind one locked member identity into a canonical body template."""
+    if (not isinstance(template, PaidLaunchBodyTemplate) or
+            type(replica_id) is not int or replica_id < 1 or
+            not isinstance(cluster_name, str) or not cluster_name or
+            not isinstance(launch_fence, Mapping)):
+        raise ValueError('Paid launch body materialization is malformed.')
+    payload = json.loads(template.submitted_bytes)
+    task = payload.get('task')
+    if (not isinstance(task, str) or
+            task.count(_REPLICA_ID_TEMPLATE_TOKEN) != 1 or
+            payload.get('cluster_name') != _CLUSTER_NAME_TEMPLATE or
+            payload.get('extra_launch_context') != {}):
+        raise ValueError('Paid launch body template changed before binding.')
+    payload['task'] = task.replace(_REPLICA_ID_TEMPLATE_TOKEN, str(replica_id))
+    payload['cluster_name'] = cluster_name
+    payload['extra_launch_context'] = dict(launch_fence)
+    return sdk.PreparedLaunchRequest(
+        submitted_bytes=_canonical_json_bytes(payload))

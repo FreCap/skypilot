@@ -18,13 +18,15 @@ from sky.serve import reserved_fill_planner
 from sky.serve import serve_state_schema
 
 
-def test_current_admission_has_one_structural_planner_precondition() -> None:
+def test_current_admission_owns_locked_planner_precondition() -> None:
     parameters = inspect.signature(
         capacity_admission.CapacityAdmissionRepository.plan_and_admit_current
     ).parameters
 
-    assert 'expected_planner_input_fingerprint' in parameters
+    assert 'expected_planner_input_fingerprint' not in parameters
     assert 'expected_planning_state_fingerprint' not in parameters
+    assert 'prepared_paid_launch_templates' in parameters
+    assert 'prepared_paid_launch_specs' not in parameters
 
 
 def _input(**overrides) -> capacity_admission.CapacityPlanInput:
@@ -671,6 +673,7 @@ def test_planner_reservation_evidence_must_match_locked_supply():
         economic_kueue_capacity=(
             kueue_lane_capacity.KueueReplicaCapacitySnapshot({})),
         economic_capacity_graph_sha256='d' * 64,
+        planner_replica_projection_sha256='f' * 64,
         existing_zero_cost_capacity_by_accelerator={'L4': 0},
         existing_paid_capacity_by_accelerator={'L4': 0},
         authenticated_capacity_by_accelerator={'L4': 2},
@@ -689,7 +692,8 @@ def test_planner_reservation_evidence_must_match_locked_supply():
         allocation_map=object(),
         allocation_bound=True)
     source_fingerprint = (capacity_admission.locked_planning_source_fingerprint(
-        'f' * 64, supply.economic_capacity_graph_sha256))
+        supply.planner_replica_projection_sha256,
+        supply.economic_capacity_graph_sha256))
     decision = _planner_decision(source_fingerprint=source_fingerprint)
     snapshot, candidate = decision.decode_planner()
 
@@ -701,8 +705,7 @@ def test_planner_reservation_evidence_must_match_locked_supply():
         capacity_target={'l4': 5},
         reservation_commitment={'l4': 2},
         static_fill_target={'l4': 0},
-        supply_projection=supply,
-        expected_planner_input_fingerprint='f' * 64)
+        supply_projection=supply)
     changed = capacity_admission.ReservedSupplyProjection(**{
         **supply.__dict__,
         'reservation_evidence_sha256': '9' * 64,
@@ -717,8 +720,7 @@ def test_planner_reservation_evidence_must_match_locked_supply():
             capacity_target={'l4': 5},
             reservation_commitment={'l4': 2},
             static_fill_target={'l4': 0},
-            supply_projection=changed,
-            expected_planner_input_fingerprint='f' * 64)
+            supply_projection=changed)
 
 
 @pytest.mark.parametrize(
@@ -789,6 +791,7 @@ def test_disabled_reservation_projection_keeps_committed_inventory():
         economic_kueue_capacity=(
             kueue_lane_capacity.KueueReplicaCapacitySnapshot({})),
         economic_capacity_graph_sha256='6' * 64,
+        planner_replica_projection_sha256='7' * 64,
         existing_zero_cost_capacity_by_accelerator={'l4': 1},
         existing_paid_capacity_by_accelerator={'l4': 2},
         charged_paid_gpu_units=2,

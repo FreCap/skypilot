@@ -1133,7 +1133,9 @@ def _current_decision(
         evidence_fingerprint = supply.reservation_evidence_sha256
         planner_source_fingerprint = (
             capacity_admission.locked_planning_source_fingerprint(
-                source_fingerprint, supply.economic_capacity_graph_sha256))
+                (supply.planner_replica_projection_sha256
+                 if source_fingerprint is None else source_fingerprint),
+                supply.economic_capacity_graph_sha256))
     reservation = capacity_planning.ReservationPlanningInput(
         gate_policy=policy,
         evidence_state=evidence,
@@ -1510,6 +1512,91 @@ def _paid_wave_specs(
     return tuple(specs)
 
 
+def _paid_launch_template_from_spec(
+        spec: paid_capacity.PaidLaunchSpec) -> paid_capacity.PaidLaunchTemplate:
+    """Project post-lock spec evidence into its identity-free input type."""
+    evidence = spec.catalog_evidence
+    authority = evidence.version_authority
+    launch_spec = pickle.loads(authority.service_spec)
+    worker = paid_capacity.thaw_paid_launch_payload(spec.worker_construction)
+    stored_override = paid_capacity.thaw_paid_launch_payload(
+        spec.resources_override)
+    location = spot_placer.Location.from_resources_override(
+        spot_placer.decode_resources_override(stored_override))
+    assert location is not None
+    frozen_controller_config = (
+        serve_utils.parse_and_validate_version_controller_config(
+            authority.controller_config, spec.workspace,
+            'test paid launch body template'))
+    body_template = paid_launch_request.prepare_paid_launch_body_template(
+        yaml_content=worker['launch_yaml_content'],
+        authoritative_service_spec=launch_spec,
+        frozen_controller_config=frozen_controller_config,
+        resources_override=location.to_dict(),
+        workspace=spec.workspace,
+        service_name=spec.service_name,
+        runtime=paid_launch_request.capture_replica_launch_runtime(),
+        task_template=serve_utils.load_task_with_service_spec(
+            worker['launch_yaml_content'], launch_spec))
+    return paid_capacity.PaidLaunchTemplate(
+        service_name=spec.service_name,
+        service_hash=spec.service_hash,
+        service_lifecycle_epoch=spec.service_lifecycle_epoch,
+        service_version=spec.service_version,
+        provider_account=spec.provider_account,
+        provider_project_id=spec.provider_project_id,
+        cloud=spec.cloud,
+        workspace=spec.workspace,
+        region=spec.region,
+        zone=spec.zone,
+        instance_type=spec.instance_type,
+        pool_key=spec.pool_key,
+        frontier_key=spec.frontier_key,
+        accelerator=spec.accelerator,
+        gpu_units_per_node=spec.gpu_units_per_node,
+        num_nodes=spec.num_nodes,
+        resources_override=spec.resources_override,
+        prepared_launch_body_template=body_template.submitted_bytes,
+        placement_catalog_sha256=evidence.placement_catalog_sha256,
+        catalog_rank=evidence.catalog_rank,
+        version_authority=evidence.version_authority)
+
+
+def _paid_launch_templates_from_specs(
+    specs: tuple[paid_capacity.PaidLaunchSpec, ...]
+) -> tuple[paid_capacity.PaidLaunchTemplate, ...]:
+    """Return the ordered unique pool catalog represented by test specs."""
+    templates = []
+    seen_pool_keys = set()
+    for spec in specs:
+        if spec.pool_key in seen_pool_keys:
+            continue
+        seen_pool_keys.add(spec.pool_key)
+        templates.append(_paid_launch_template_from_spec(spec))
+    return tuple(templates)
+
+
+def _paid_launch_template(
+    engine: sqlalchemy.engine.Engine,
+    *,
+    pool_rank: int,
+) -> paid_capacity.PaidLaunchTemplate:
+    spec = _paid_launch_spec(engine,
+                             0,
+                             1,
+                             pool_rank=pool_rank,
+                             pool_occurrence=0)
+    return _paid_launch_template_from_spec(spec)
+
+
+def _paid_catalog_templates(
+    engine: sqlalchemy.engine.Engine,
+    ranks: tuple[int, ...],
+) -> tuple[paid_capacity.PaidLaunchTemplate, ...]:
+    return tuple(
+        _paid_launch_template(engine, pool_rank=rank) for rank in ranks)
+
+
 def _validate_prepared_paid_specs(
     engine: sqlalchemy.engine.Engine,
     specs: tuple[paid_capacity.PaidLaunchSpec, ...],
@@ -1552,6 +1639,7 @@ def _validate_prepared_paid_specs(
         controller_config_digest=version['controller_config_digest'],
         controller_config_snapshot_id=(
             version['controller_config_snapshot_id']))
+    templates = _paid_launch_templates_from_specs(specs)
     return capacity_admission._canonical_prepared_paid_launch_specs(
         specs,
         service=service,
@@ -1562,7 +1650,11 @@ def _validate_prepared_paid_specs(
         accounting_cards=accounting_cards,
         backend_num_nodes=1,
         locked_version=locked_version,
-        launch_runtime=paid_launch_request.capture_replica_launch_runtime())
+        launch_body_templates_by_pool_key={
+            template.pool_key: paid_launch_request.PaidLaunchBodyTemplate(
+                submitted_bytes=template.prepared_launch_body_template
+            ) for template in templates
+        })
 
 
 def _replica_values(replica_id: int,
@@ -2574,7 +2666,9 @@ def test_current_planner_atomically_commits_sparse_multi_node_paid_wave(
                                        backend_num_nodes=2,
                                        sequenced_reserved_fill=False,
                                        planner=planner,
-                                       prepared_paid_launch_specs=specs)
+                                       prepared_paid_launch_templates=(
+                                           _paid_launch_templates_from_specs(
+                                               specs)))
 
     planner.assert_called_once()
     receipt = committed.paid_launch_receipt
@@ -2630,7 +2724,9 @@ def test_current_planner_clips_folded_paid_spec_to_display_card(
                                        backend_num_nodes=1,
                                        sequenced_reserved_fill=False,
                                        planner=planner,
-                                       prepared_paid_launch_specs=(prepared,))
+                                       prepared_paid_launch_templates=(
+                                           _paid_launch_templates_from_specs(
+                                               (prepared,))))
 
     planner.assert_called_once()
     assert committed.candidate.paid_launch_target.as_dict() == {'L4': 1}
@@ -2680,7 +2776,9 @@ def test_current_planner_commits_regionless_image_paid_authority(
                                        sequenced_reserved_fill=False,
                                        planner=lambda snapshot, supply:
                                        _current_decision(snapshot, supply, 1),
-                                       prepared_paid_launch_specs=(spec,))
+                                       prepared_paid_launch_templates=(
+                                           _paid_launch_templates_from_specs(
+                                               (spec,))))
 
     assert [
         member.replica_id for member in committed.paid_launch_receipt.members
@@ -2784,8 +2882,78 @@ def test_current_planner_paid_authority_mutation_rolls_back_every_write(
                 sequenced_reserved_fill=False,
                 planner=lambda snapshot, supply: _current_decision(
                     snapshot, supply, 1),
-                prepared_paid_launch_specs=(spec,))
+                prepared_paid_launch_templates=(
+                    _paid_launch_templates_from_specs((spec,))))
 
+    assert _paid_write_counts(engine) == before
+
+
+def test_current_planner_rejects_paid_body_template_for_another_location(
+        capacity_database):
+    """Exact-pool body bytes cannot be rebound to a different catalog pool."""
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    template = _paid_launch_template(engine, pool_rank=0)
+    payload = json.loads(template.prepared_launch_body_template)
+    task = payload['task']
+    assert isinstance(task, str) and 'us-central1' in task
+    payload['task'] = task.replace('us-central1', 'us-east1', 1)
+    tampered = dataclasses.replace(template,
+                                   prepared_launch_body_template=json.dumps(
+                                       payload,
+                                       sort_keys=True,
+                                       separators=(',', ':'),
+                                       ensure_ascii=False,
+                                       allow_nan=False).encode('utf-8'))
+    planner = mock.Mock()
+    before = _paid_write_counts(engine)
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='disagrees with the elected version'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner,
+                                           prepared_paid_launch_templates=(
+                                               tampered,))
+
+    planner.assert_not_called()
+    assert _paid_write_counts(engine) == before
+
+
+def test_current_planner_rejects_duplicate_paid_catalog_rank(capacity_database):
+    """A catalog rank cannot silently bind another exact pool's authority."""
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    ranks = _install_paid_wave_catalog(engine, pool_count=2)
+    templates = _paid_catalog_templates(engine, ranks)
+    duplicate_rank = dataclasses.replace(templates[1],
+                                         catalog_rank=templates[0].catalog_rank)
+    planner = mock.Mock()
+    before = _paid_write_counts(engine)
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='stale or noncanonical'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner,
+                                           prepared_paid_launch_templates=(
+                                               templates[0], duplicate_rank))
+
+    planner.assert_not_called()
     assert _paid_write_counts(engine) == before
 
 
@@ -2815,7 +2983,8 @@ def test_current_planner_shutting_down_service_rolls_back_every_write(
                 sequenced_reserved_fill=False,
                 planner=lambda snapshot, supply: _current_decision(
                     snapshot, supply, 1),
-                prepared_paid_launch_specs=(spec,))
+                prepared_paid_launch_templates=(
+                    _paid_launch_templates_from_specs((spec,))))
 
     assert _paid_write_counts(engine) == before
 
@@ -2851,7 +3020,8 @@ def test_current_planner_stale_controller_aba_rolls_back_every_write(
                 sequenced_reserved_fill=False,
                 planner=lambda snapshot, supply: _current_decision(
                     snapshot, supply, 1),
-                prepared_paid_launch_specs=(spec,))
+                prepared_paid_launch_templates=(
+                    _paid_launch_templates_from_specs((spec,))))
 
     assert _paid_write_counts(engine) == before
 
@@ -2911,7 +3081,8 @@ def test_current_planner_rolls_back_tampered_pristine_paid_state(
                 sequenced_reserved_fill=False,
                 planner=lambda snapshot, supply: _current_decision(
                     snapshot, supply, 1),
-                prepared_paid_launch_specs=(spec,))
+                prepared_paid_launch_templates=(
+                    _paid_launch_templates_from_specs((spec,))))
 
     assert _paid_write_counts(engine) == before
 
@@ -2934,7 +3105,8 @@ def test_current_planner_existing_paid_wave_prevents_duplicate_launch(
             sequenced_reserved_fill=False,
             planner=lambda snapshot, supply: _current_decision(
                 snapshot, supply, 2),
-            prepared_paid_launch_specs=specs)
+            prepared_paid_launch_templates=(
+                _paid_launch_templates_from_specs(specs)))
 
     first = _commit(
         tuple(
@@ -2972,7 +3144,8 @@ def test_current_planner_admits_residual_while_terminal_request_awaits_reducer(
         backend_num_nodes=1,
         sequenced_reserved_fill=False,
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 1),
-        prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 180),))
+        prepared_paid_launch_templates=_paid_launch_templates_from_specs(
+            (_paid_launch_spec(engine, 0, 180),)))
     assert [member.replica_id for member in first.paid_launch_receipt.members
            ] == [180]
 
@@ -3026,7 +3199,8 @@ def test_current_planner_admits_residual_while_terminal_request_awaits_reducer(
         backend_num_nodes=1,
         sequenced_reserved_fill=False,
         planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2),
-        prepared_paid_launch_specs=(_paid_launch_spec(engine, 0, 181),))
+        prepared_paid_launch_templates=_paid_launch_templates_from_specs(
+            (_paid_launch_spec(engine, 0, 181),)))
 
     assert [
         member.replica_id for member in successor.paid_launch_receipt.members
@@ -3079,7 +3253,8 @@ def test_current_planner_enforces_exact_multi_gpu_paid_cap(
                 24,
                 capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
                 physical_gpu_width_by_accelerator={'l4': 8}),
-            prepared_paid_launch_specs=specs)
+            prepared_paid_launch_templates=(
+                _paid_launch_templates_from_specs(specs)))
 
     assert [
         member.replica_id for member in committed.paid_launch_receipt.members
@@ -3230,7 +3405,8 @@ def test_manager_prepared_heterogeneous_wave_cannot_starve_a100_at_global_cap(
                 cold_accelerator_order=('a100', 'l4'),
                 capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
                 max_live_paid_gpu_units=4),
-            prepared_paid_launch_specs=prepared)
+            prepared_paid_launch_templates=(
+                _paid_launch_templates_from_specs(prepared)))
 
     assert committed.candidate.paid_launch_target.as_dict() == {'a100': 4}
     assert [
@@ -3310,7 +3486,9 @@ def test_current_planner_scans_third_pool_until_accepted_target(
                                        sequenced_reserved_fill=False,
                                        planner=lambda snapshot, supply:
                                        _current_decision(snapshot, supply, 80),
-                                       prepared_paid_launch_specs=tuple(specs))
+                                       prepared_paid_launch_templates=(
+                                           _paid_launch_templates_from_specs(
+                                               tuple(specs))))
 
     accepted = committed.paid_launch_receipt.members
     assert len(accepted) == 80
@@ -3365,7 +3543,9 @@ def test_current_planner_accepts_equal_cost_pool_interleaving(
                                        sequenced_reserved_fill=False,
                                        planner=lambda snapshot, supply:
                                        _current_decision(snapshot, supply, 3),
-                                       prepared_paid_launch_specs=tuple(specs))
+                                       prepared_paid_launch_templates=(
+                                           _paid_launch_templates_from_specs(
+                                               tuple(specs))))
 
     assert [
         member.pool_key for member in committed.paid_launch_receipt.members
@@ -5861,30 +6041,42 @@ def test_current_planner_never_persists_paid_authority_for_reservation_only_card
     assert payload['paid_residual_by_accelerator'] == {}
 
 
-def test_current_planner_rejects_mismatched_structural_fingerprint(
+def test_repository_rejects_planner_digest_from_omitted_replica_projection(
         capacity_database):
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
-    expected_planner_input_fingerprint = 'f' * 64
+    _plan_and_admit_target(engine, 0)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                **_replica_values(117, zero_cost=True)))
+
+    # Model a planner adapter that omitted the locked replica and therefore
+    # recomputed a different membership digest.  The callback cannot nominate
+    # that digest as its own expected value: the repository owns the complete
+    # locked membership fingerprint independently.
     planner = mock.Mock(side_effect=lambda snapshot, supply: _current_decision(
         snapshot, supply, 1, source_fingerprint='e' * 64))
 
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
                        match='different locked planning'):
-        (capacity_admission.CapacityAdmissionRepository(engine).
-         plan_and_admit_current(**_current_owner_kwargs(engine),
-                                service_name='svc',
-                                service_hash='svc-hash',
-                                service_lifecycle_epoch=3,
-                                service_version=1,
-                                accounting_cards={'l4': 1},
-                                backend_num_nodes=1,
-                                sequenced_reserved_fill=False,
-                                planner=planner,
-                                expected_planner_input_fingerprint=(
-                                    expected_planner_input_fingerprint)))
+        (capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner))
 
     planner.assert_called_once()
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                capacity_admission_schema.serve_capacity_plans_table)
+        ).scalar_one() == 1
 
 
 def test_current_planner_rejects_paid_wave_above_atomic_bound(
@@ -6081,25 +6273,15 @@ def test_controller_successor_waves_plan_from_locked_supply_during_reduction(
     autoscaler = autoscalers.Autoscaler.from_spec('svc', spec, version=1)
     assert isinstance(autoscaler, autoscalers.ConcurrencyAutoscaler)
     autoscaler.set_configured_accelerator_shapes({'L4': 1})
-    waves = (
-        _paid_wave_specs(engine,
-                         ranks[:4],
-                         members_per_pool=members_per_pool,
-                         first_replica_id=1),
-        _paid_wave_specs(engine,
-                         ranks[4:8],
-                         members_per_pool=members_per_pool,
-                         first_replica_id=101),
-        _paid_wave_specs(engine,
-                         ranks[8:12],
-                         members_per_pool=members_per_pool,
-                         first_replica_id=201),
-    )
-    assert [len(wave) for wave in waves] == [100, 100, 100]
+    templates = _paid_catalog_templates(engine, ranks)
+    assert len(templates) == pool_count
     manager = types.SimpleNamespace(max_live_paid_gpu_units=service_target,
                                     workspace='workspace-a',
-                                    spot_placer=None)
+                                    spot_placer=None,
+                                    materialize_paid_launch_receipt=mock.Mock())
     ctrl = _current_capacity_controller(incarnation, autoscaler, manager)
+    monkeypatch.setattr(ctrl, '_prepare_current_paid_launch_handoff_templates',
+                        mock.Mock(return_value=templates))
     installed = []
     install_projection = autoscaler.install_committed_capacity_projection
 
@@ -6109,43 +6291,62 @@ def test_controller_successor_waves_plan_from_locked_supply_during_reduction(
 
     autoscaler.install_committed_capacity_projection = _install
 
-    def _admit(sequence, prepared_specs, remove_replica_id=None):
+    def _admit(sequence, mutate=None):
         demand_state.ingest_report('svc', 'svc-hash', _queued_report(sequence))
         prepared_inputs = (
             autoscalers.prepare_controller_capacity_planning_preflight(
                 autoscaler))
         assert prepared_inputs is not None
         assert prepared_inputs.replica_bindings == ()
-        if remove_replica_id is not None:
-            # This is the exact race from the billable run: the reducer
-            # removes a failed member after the controller has prepared the
-            # successor but before the repository locks supply.  Provider
-            # readiness never advances; every retained member remains PENDING.
-            current = {
-                info.replica_id: info
-                for info in serve_state.get_replica_infos('svc')
-            }
-            removed = current[remove_replica_id]
-            assert removed.status is serve_state.ReplicaStatus.PENDING
-            assert serve_state.remove_replica(
-                'svc',
-                remove_replica_id,
-                expected_service_hash='svc-hash',
-                expected_lifecycle_epoch=3,
-                expected_controller_owner=(123, '10.0.0.5'),
-                expected_replica_record_id=str(removed.replica_record_id))
-        return ctrl._plan_and_admit_current_capacity(
+        if mutate is not None:
+            mutate()
+        return ctrl._plan_admit_and_materialize_current_capacity(
             autoscaler,
             1,
             0,
             0,
             prepared_inputs,
             sequenced_reserved_fill=False,
-            prepared_paid_launch_specs=prepared_specs)
+        )
 
-    first_result = _admit(2, waves[0])
-    second_result = _admit(3, waves[1], remove_replica_id=1)
-    third_result = _admit(4, waves[2], remove_replica_id=2)
+    def _remove(replica_id):
+        current = {
+            info.replica_id: info
+            for info in serve_state.get_replica_infos('svc')
+        }
+        removed = current[replica_id]
+        assert removed.status is serve_state.ReplicaStatus.PENDING
+        assert serve_state.remove_replica(
+            'svc',
+            replica_id,
+            expected_service_hash='svc-hash',
+            expected_lifecycle_epoch=3,
+            expected_controller_owner=(123, '10.0.0.5'),
+            expected_replica_record_id=str(removed.replica_record_id))
+
+    def _insert_zero_cost(replica_id):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                    **_replica_values(replica_id, zero_cost=True)))
+
+    def _wave_two_churn():
+        # Add, delete, and reuse one numeric ID after the production preflight.
+        # The identity-free template cannot collide with any incarnation; the
+        # repository allocates above the replacement row it actually locks.
+        _insert_zero_cost(150)
+        _remove(150)
+        _insert_zero_cost(150)
+
+    def _wave_three_churn():
+        # Remove the replacement before the third lock.  The repository-owned
+        # membership digest consumes that deletion, while its high-water mark
+        # is now advanced by the committed second wave.
+        _remove(150)
+
+    first_result = _admit(2)
+    second_result = _admit(3, _wave_two_churn)
+    third_result = _admit(4, _wave_three_churn)
     assert first_result is not None
     assert second_result is not None
     assert third_result is not None
@@ -6155,14 +6356,15 @@ def test_controller_successor_waves_plan_from_locked_supply_during_reduction(
              for member in item.paid_launch_receipt.members]
             for item in committed] == [
                 list(range(1, 101)),
-                list(range(101, 201)),
-                list(range(201, 301)),
+                list(range(151, 251)),
+                list(range(251, 351)),
             ]
     assert [item.candidate.paid_launch_target.total() for item in committed
-           ] == [300, 201, 102]
+           ] == [300, 199, 100]
     assert len(installed) == 3
     retained = serve_state.get_replica_infos('svc')
-    assert {info.replica_id for info in retained} == (set(range(3, 301)))
+    assert {info.replica_id for info in retained
+           } == (set(range(1, 101)) | set(range(151, 351)))
     assert all(
         info.status is serve_state.ReplicaStatus.PENDING for info in retained)
 
@@ -7474,6 +7676,48 @@ def test_paid_cap_rejects_malformed_physical_width_attribution(
                     1,
                     physical_gpu_width_by_accelerator={'l4': 8},
                     max_live_paid_gpu_units=8))
+
+
+@pytest.mark.parametrize('malformation', ('missing_shape', 'wrong_debit'))
+def test_locked_planner_membership_rejects_inexact_live_capacity(
+        capacity_database, malformation):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           replica_unit='logical')
+    replica = _replica_values(107,
+                              zero_cost=True,
+                              accelerator_count=8,
+                              planned_capacity=8)
+    if malformation == 'missing_shape':
+        replica['replica_state']['resources_override'] = {}
+    else:
+        replica['replica_state']['planned_capacity'] = 1
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.replicas_table).values(**replica))
+    planner = mock.Mock()
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 8},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner)
+
+    planner.assert_not_called()
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                capacity_admission_schema.serve_capacity_plans_table)
+        ).scalar_one() == 0
 
 
 @pytest.mark.parametrize('contradiction',

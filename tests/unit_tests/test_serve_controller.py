@@ -4641,6 +4641,7 @@ class TestAutoscalerRuntimeSnapshot:
         economic_replica_infos=(),
         economic_kueue_capacity=None,
         economic_capacity_graph_sha256='d' * 64,
+        planner_replica_projection_sha256=None,
         demand_witness_scope_sha256=None,
         reserved_accelerators=None,
     ):
@@ -4676,12 +4677,32 @@ class TestAutoscalerRuntimeSnapshot:
         if economic_kueue_capacity is None:
             economic_kueue_capacity = (
                 kueue_lane_capacity.KueueReplicaCapacitySnapshot({}))
+        economic_replica_infos = tuple(economic_replica_infos)
+        if planner_replica_projection_sha256 is None:
+            shapes = {
+                info.replica_id: spot_placer.durable_exact_accelerator_shape(
+                    getattr(info, 'location', None),
+                    getattr(info, 'resources_override',
+                            None)) for info in economic_replica_infos
+            }
+            shapes = {
+                replica_id: shape
+                for replica_id, shape in shapes.items()
+                if shape is not None
+            }
+            planner_replica_projection_sha256 = (
+                autoscalers.replica_planning_binding_fingerprint(
+                    autoscalers.ScalingDecisionInputs(replica_bindings=(
+                        autoscalers.build_replica_planning_bindings(
+                            economic_replica_infos, shapes)))))
         return controller.capacity_admission.ReservedSupplyProjection(
             pending_zero_cost_capacity_by_accelerator=pending,
             allocation_reserved_capacity_by_accelerator=authenticated,
-            economic_replica_infos=tuple(economic_replica_infos),
+            economic_replica_infos=economic_replica_infos,
             economic_kueue_capacity=economic_kueue_capacity,
             economic_capacity_graph_sha256=(economic_capacity_graph_sha256),
+            planner_replica_projection_sha256=(
+                planner_replica_projection_sha256),
             existing_zero_cost_capacity_by_accelerator=dict(
                 existing_zero_cost or {}),
             existing_paid_capacity_by_accelerator=dict(existing_paid or {}),
@@ -6007,7 +6028,7 @@ class TestAutoscalerRuntimeSnapshot:
                 1,
                 0,
                 0,
-                inputs, [],
+                inputs,
                 sequenced_reserved_fill=False)
 
         assert result == current_plan
@@ -6059,7 +6080,7 @@ class TestAutoscalerRuntimeSnapshot:
                     1,
                     0,
                     0,
-                    inputs, [],
+                    inputs,
                     sequenced_reserved_fill=False)
                 assert result is None
             else:
@@ -6071,7 +6092,7 @@ class TestAutoscalerRuntimeSnapshot:
                         1,
                         0,
                         0,
-                        inputs, [],
+                        inputs,
                         sequenced_reserved_fill=False)
 
         if failure in ('invariant', 'no_plan'):
