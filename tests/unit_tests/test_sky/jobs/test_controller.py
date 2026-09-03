@@ -4033,7 +4033,7 @@ class TestRunJobLoopOwnershipCleanup:
         job_done.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_cleanup_failure_hides_controller_log_command_in_guarded_ha(
+    async def test_cleanup_failure_guarded_ha_keeps_raw_failure_reason_without_log_hint(
             self, monkeypatch):
         monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'postgres')
         monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'api')
@@ -4066,8 +4066,10 @@ class TestRunJobLoopOwnershipCleanup:
             await manager.run_job_loop(3, '/dev/null')
 
         _, kwargs = set_failed.await_args
+        assert kwargs['failure_reason'] == (
+            'Failed to clean up: RuntimeError: worker connection timed out')
         assert 'sky jobs logs --controller 3' not in kwargs['failure_reason']
-        assert 'Controller logs are unavailable in PostgreSQL guarded HA' in (
+        assert 'Controller logs are unavailable in PostgreSQL guarded HA' not in (
             kwargs['failure_reason'])
 
 
