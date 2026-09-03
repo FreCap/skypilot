@@ -4324,6 +4324,12 @@ def _validate_recovered_submission_receipt(
     if not (same_attempt or later_attempt):
         raise QualificationError(
             'Exact async response has a conflicting receipt transition.')
+    if (same_attempt and current.state == 'REJECTED_PRE_DISPATCH' and
+            current.revision != 2):
+        # Revision 1 is reserved for a no-route initial rejection. A bound
+        # DISPATCH/r1 attempt can reject only through its r2 transition.
+        raise QualificationError(
+            'Exact async response has a conflicting receipt transition.')
     _validate_submission_receipt(current,
                                  previous_rejection=None,
                                  accepted_response=accepted)

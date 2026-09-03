@@ -4679,29 +4679,40 @@ def test_exact_async_request_accepts_internal_rebinds_after_dispatch(
     assert [call[0] for call in session.calls] == expected_urls
 
 
-@pytest.mark.parametrize(('pending', 'current'), [
-    (qualifier.ExactAsyncReceipt(
-        attempt_id='11111111-1111-4111-8111-111111111111',
-        attempt_no=1,
-        state='DISPATCH_MAY_HAVE_OCCURRED',
-        revision=1),
-     qualifier.ExactAsyncReceipt(
-         attempt_id='11111111-1111-4111-8111-111111111111',
-         attempt_no=1,
-         state='ACCEPTED',
-         revision=3)),
-    (qualifier.ExactAsyncReceipt(
-        attempt_id='22222222-2222-4222-8222-222222222222',
-        attempt_no=2,
-        state='DISPATCH_MAY_HAVE_OCCURRED',
-        revision=1),
-     qualifier.ExactAsyncReceipt(
-         attempt_id='11111111-1111-4111-8111-111111111111',
-         attempt_no=1,
-         state='ACCEPTED',
-         revision=2)),
-],
-                         ids=['same-invalid-revision', 'backwards'])
+@pytest.mark.parametrize(
+    ('pending', 'current'), [
+        (qualifier.ExactAsyncReceipt(
+            attempt_id='11111111-1111-4111-8111-111111111111',
+            attempt_no=1,
+            state='DISPATCH_MAY_HAVE_OCCURRED',
+            revision=1),
+         qualifier.ExactAsyncReceipt(
+             attempt_id='11111111-1111-4111-8111-111111111111',
+             attempt_no=1,
+             state='REJECTED_PRE_DISPATCH',
+             revision=1)),
+        (qualifier.ExactAsyncReceipt(
+            attempt_id='11111111-1111-4111-8111-111111111111',
+            attempt_no=1,
+            state='DISPATCH_MAY_HAVE_OCCURRED',
+            revision=1),
+         qualifier.ExactAsyncReceipt(
+             attempt_id='11111111-1111-4111-8111-111111111111',
+             attempt_no=1,
+             state='ACCEPTED',
+             revision=3)),
+        (qualifier.ExactAsyncReceipt(
+            attempt_id='22222222-2222-4222-8222-222222222222',
+            attempt_no=2,
+            state='DISPATCH_MAY_HAVE_OCCURRED',
+            revision=1),
+         qualifier.ExactAsyncReceipt(
+             attempt_id='11111111-1111-4111-8111-111111111111',
+             attempt_no=1,
+             state='ACCEPTED',
+             revision=2)),
+    ],
+    ids=['same-rejection-revision-one', 'same-invalid-revision', 'backwards'])
 def test_exact_recovery_rejects_invalid_internal_rebind_hop(pending, current):
     """Recovery rejects malformed same-attempt and backwards observations."""
     with pytest.raises(qualifier.QualificationError,
