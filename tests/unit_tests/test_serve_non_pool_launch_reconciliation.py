@@ -9,6 +9,7 @@ import uuid
 import pytest
 
 from sky import exceptions
+from sky.events import api_models as event_api_models
 from sky.provision import common as provision_common
 from sky.serve import non_pool_launch_reconciliation as reconciliation
 from sky.serve import ordinary_launch_binding
@@ -1182,6 +1183,50 @@ def test_cancelled_gcp_exact_absence_is_neutral_cleanup() -> None:
     assert not ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
         'CANCELLED', 'explicit_cancel',
         aws_pool_key.replace('123456789012', 'unknown'))
+
+
+@pytest.mark.parametrize('status', ordinary_launch_binding.TerminalStatus)
+@pytest.mark.parametrize('cause', event_api_models.EventCause)
+def test_exact_v2_provider_cleanup_uses_structural_terminal_evidence(
+        status: ordinary_launch_binding.TerminalStatus,
+        cause: event_api_models.EventCause) -> None:
+    aws_pool_key = _paid_replica('aws').paid_capacity_pool_key
+    legacy_gcp_pool_key = _paid_replica('gcp').paid_capacity_pool_key
+    gcp_pool = json.loads(legacy_gcp_pool_key)
+    gcp_pool['version'] = 2
+    gcp_pool['provider_identity'] = {'gcp_project_id': 'project-a'}
+    gcp_pool_key = json.dumps(gcp_pool, sort_keys=True, separators=(',', ':'))
+
+    assert ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
+        status, cause, aws_pool_key)
+    assert ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
+        status, cause, gcp_pool_key)
+
+
+def test_structural_terminal_cleanup_retains_narrow_legacy_contracts() -> None:
+    aws_pool_key = _paid_replica('aws').paid_capacity_pool_key
+    legacy_gcp_pool_key = _paid_replica('gcp').paid_capacity_pool_key
+    malformed_aws = aws_pool_key.replace('096766144388', 'unknown')
+
+    assert ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
+        'FAILED', 'handler_failed', malformed_aws)
+    assert ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
+        'CANCELLED', 'explicit_cancel', legacy_gcp_pool_key)
+    assert not ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
+        'FAILED', 'dispatcher_submit_failed', malformed_aws)
+    assert not ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
+        'CANCELLED', 'execution_lease_expired', legacy_gcp_pool_key)
+
+
+def test_exact_v2_provider_cleanup_accepts_future_diagnostic_cause() -> None:
+    aws_pool_key = _paid_replica('aws').paid_capacity_pool_key
+
+    assert ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
+        'FAILED', 'future_terminal_cause', aws_pool_key)
+    assert not ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
+        'FAILED', '', aws_pool_key)
+    assert not ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
+        'PENDING', 'future_terminal_cause', aws_pool_key)
 
 
 def test_ordinary_paid_reconcile_prefers_exact_terminal_negative_ack(

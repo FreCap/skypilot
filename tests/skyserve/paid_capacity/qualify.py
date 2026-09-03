@@ -72,9 +72,9 @@ class GuardViolation(QualificationError):
 
 
 _PROVIDER_SCOPE_SCHEMA_VERSION = 6
-_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 9
+_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 10
 _CLEANUP_RECEIPT_SCHEMA_VERSION = 2
-_AGGREGATE_RECEIPT_SCHEMA_VERSION = 2
+_AGGREGATE_RECEIPT_SCHEMA_VERSION = 3
 _CAMPAIGN_LOAD_WINDOW_SECONDS = (
     serve_constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
 _SCALE_TAIL_BATCH_SIZE = 400
@@ -169,7 +169,17 @@ def positive_telemetry_window_seconds(profile: Profile) -> float:
     if profile.name != 'scale':
         return max(2 * 60, 4 * profile.poll_seconds)
     observation_margin = max(1.0, profile.poll_seconds)
-    window = profile.request_queue_timeout_seconds - observation_margin
+    queue_attempt_window = (profile.request_queue_timeout_seconds -
+                            observation_margin)
+    if not math.isfinite(queue_attempt_window) or queue_attempt_window <= 0:
+        raise ValueError(
+            'Request queue timeout has no positive telemetry polling margin.')
+    # Provider convergence and application readiness are independent clocks.
+    # The resident stimulus retries only after the load balancer returns its
+    # typed REJECTED_PRE_DISPATCH receipt, so allow the provider its complete
+    # qualification window followed by one complete queue attempt.  This does
+    # not extend any individual request's configured queue deadline.
+    window = profile.scale_timeout_seconds + queue_attempt_window
     if not math.isfinite(window) or window <= 0:
         raise ValueError(
             'Request queue timeout has no positive telemetry polling margin.')
@@ -3772,6 +3782,7 @@ class Progress:
     scale_reached_monotonic: float | None = None
     scale_qualified_observed_at: float | None = None
     scale_qualified_iteration_id: int | None = None
+    scale_slo_met: bool | None = None
     zero_since_monotonic: float | None = None
     zero_samples: int = 0
 
@@ -3810,13 +3821,14 @@ class Progress:
                     'before the scale timer.')
             elapsed = (observation.observed_monotonic -
                        self.scale_started_monotonic)
-            if elapsed > profile.scale_slo_seconds:
+            if elapsed > profile.scale_timeout_seconds:
                 raise QualificationError(
                     f'Scale-out to {expectation.minimum_physical_running} '
                     f'physical RUNNING L4 Spot VMs took {elapsed:.1f}s; '
-                    'limit is '
-                    f'{profile.scale_slo_seconds:.1f}s.')
+                    'qualification timeout is '
+                    f'{profile.scale_timeout_seconds:.1f}s.')
             self.scale_reached_monotonic = observation.observed_monotonic
+            self.scale_slo_met = elapsed <= profile.scale_slo_seconds
             if (not math.isfinite(observation.observed_at) or
                     observation.observed_at < 0):
                 raise QualificationError(
@@ -3922,6 +3934,8 @@ class Receipt:
             'max_units': profile.max_units,
             'minimum_running': expectation.minimum_physical_running,
             'exact_request_count': expectation.exact_request_count,
+            'scale_slo_seconds': profile.scale_slo_seconds,
+            'scale_timeout_seconds': profile.scale_timeout_seconds,
             'started_at': time.time(),
             'samples': [],
             'request_telemetry_samples': [],
@@ -4030,6 +4044,7 @@ class Receipt:
             'scale_qualified_observed_at': progress.scale_qualified_observed_at,
             'scale_qualified_iteration_id':
                 progress.scale_qualified_iteration_id,
+            'scale_slo_met': progress.scale_slo_met,
             'exact_request_successes': exact_request_successes,
             'aws_retained_volume_ids': dict(aws_volume_ids or {}),
         })
@@ -4707,12 +4722,11 @@ async def _wait_for_scale(
         if progress.scale_started_monotonic is None:
             raise QualificationError(
                 'Provider scale has no absolute start time.')
-        # Do not spend the broader lifecycle timeout after the economic
-        # physical SLO has failed.  A census started before this deadline may
-        # finish, and Progress.observe() still rejects a late qualifying
-        # sample.  Canary/small profiles retain their relative timeout.
+        # The five-minute SLO is diagnostic. Keep the exact pre-demand clock,
+        # but permit correctness qualification until the broader timeout.
+        # Canary/small profiles retain their relative timeout.
         deadline = (progress.scale_started_monotonic +
-                    profile.scale_slo_seconds)
+                    profile.scale_timeout_seconds)
     else:
         deadline = time.monotonic() + profile.scale_timeout_seconds
     scale_iteration_id = 0
@@ -5082,6 +5096,7 @@ class QualificationEvidence:
     positive_providers: frozenset[str]
     peak_running: int
     scale_elapsed_seconds: float
+    scale_slo_met: bool
     exact_request_count: int
 
 
@@ -5252,6 +5267,7 @@ class _ProviderEvidence:
     """Validated provider-side timing derived from physical samples."""
 
     scale_elapsed_seconds: float
+    scale_slo_met: bool
     scale_started_at: float
     first_scale_observed_at: float
     last_scale_observed_at: float
@@ -5566,6 +5582,24 @@ def _validate_provider_scale_samples(
     phase_ranks = {'baseline': 0, 'scale': 1, 'drain': 2}
     scale_started_at = _strict_timestamp(
         {'observed_at': payload.get('scale_started_at')})
+    scale_slo_seconds = payload.get('scale_slo_seconds')
+    scale_timeout_seconds = payload.get('scale_timeout_seconds')
+    scale_slo_met = payload.get('scale_slo_met')
+    if (isinstance(scale_slo_seconds, bool) or
+            not isinstance(scale_slo_seconds, (int, float)) or
+            isinstance(scale_timeout_seconds, bool) or
+            not isinstance(scale_timeout_seconds,
+                           (int, float)) or type(scale_slo_met) is not bool):
+        raise QualificationError(
+            'Qualification receipt has invalid scale timing policy.')
+    scale_slo_seconds = float(scale_slo_seconds)
+    scale_timeout_seconds = float(scale_timeout_seconds)
+    if (not math.isfinite(scale_slo_seconds) or
+            scale_slo_seconds != profile.scale_slo_seconds or
+            not math.isfinite(scale_timeout_seconds) or
+            scale_timeout_seconds != profile.scale_timeout_seconds):
+        raise QualificationError(
+            'Qualification receipt has invalid scale timing policy.')
     bound_qualified_at = _strict_timestamp(
         {'observed_at': payload.get('scale_qualified_observed_at')})
     qualified_at: float | None = None
@@ -5710,7 +5744,8 @@ def _validate_provider_scale_samples(
             payload.get('scale_qualified_iteration_id')
             != qualified_iteration_id or elapsed is None or
             not math.isfinite(elapsed) or elapsed < 0 or
-            elapsed > profile.scale_slo_seconds or
+            elapsed > profile.scale_timeout_seconds or
+            scale_slo_met != (elapsed <= profile.scale_slo_seconds) or
             payload.get('peak_running') != calculated_peak or
             payload.get('peak_running_gpu_units') != calculated_gpu_peak or
             payload.get('peak_running_by_cloud') != calculated_by_cloud or
@@ -5733,6 +5768,7 @@ def _validate_provider_scale_samples(
         raise QualificationError(
             'Provider canary contains economic scale-stimulus evidence.')
     return _ProviderEvidence(scale_elapsed_seconds=elapsed,
+                             scale_slo_met=scale_slo_met,
                              scale_started_at=scale_started_at,
                              first_scale_observed_at=first_scale_observed_at,
                              last_scale_observed_at=last_scale_observed_at,
@@ -5806,8 +5842,8 @@ def _read_qualification_evidence(
     if ((kind is ExpectationKind.ECONOMIC and
          (providers != ('aws', 'gcp') or payload.get('profile') != 'scale' or
           payload.get('minimum_running') != 100 or payload['peak_running'] < 100
-          or payload.get('max_units') != profile.max_units or scale_elapsed
-          > profile.scale_slo_seconds or exact_count != 10_000)) or
+          or payload.get('max_units') != profile.max_units or
+          exact_count != 10_000)) or
         (kind is ExpectationKind.PROVIDER_CANARY and
          (len(providers) != 1 or payload.get('profile') != 'provider-canary' or
           payload.get('minimum_running') != 1 or
@@ -5861,6 +5897,7 @@ def _read_qualification_evidence(
         positive_providers=positive_providers,
         peak_running=payload['peak_running'],
         scale_elapsed_seconds=scale_elapsed,
+        scale_slo_met=provider_evidence.scale_slo_met,
         exact_request_count=exact_count)
 
 
@@ -6024,6 +6061,7 @@ def aggregate_evidence(args: argparse.Namespace) -> None:
         'economic_service_name': economic.service_name,
         'economic_peak_running': economic.peak_running,
         'economic_scale_elapsed_seconds': economic.scale_elapsed_seconds,
+        'economic_scale_slo_met': economic.scale_slo_met,
         'economic_exact_request_count': economic.exact_request_count,
         'qualification_source_sha256': economic.qualification_source_sha256,
         'positive_provider_union': sorted(provider_union),

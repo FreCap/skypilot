@@ -247,7 +247,7 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['067']
+    assert scripts.get_heads() == ['068']
     assert scripts.get_revision('067').down_revision == '066'
     assert scripts.get_revision('065').down_revision == '064'
     assert scripts.get_revision('064').down_revision == '063'
@@ -256,7 +256,7 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
     assert scripts.get_revision('061').down_revision == '060'
     assert scripts.get_revision('060').down_revision == '059'
     assert scripts.get_revision('059').down_revision == '058'
-    assert migration_utils.SERVE_VERSION == '067'
+    assert migration_utils.SERVE_VERSION == '068'
     assert migration_utils.serve_target_version(sqlite) == '037'
     assert (_CURRENT_MIGRATION._ASSOCIATION_PROFILE_SOURCE ==
             _GCP_REPLACEMENT_MIGRATION._ASSOCIATION_PROFILE_REPLACEMENT)

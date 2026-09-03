@@ -3480,9 +3480,13 @@ describe('ServiceDetails route ownership rendering', () => {
       expect(getDetailValue('Endpoint')).toHaveTextContent('Loading...');
       expect(
         screen.getByText(
-          'complete reporter-set snapshot · unassigned, selecting, or retry-backoff work · 0.50 req/s recent · 30 recorded requests in 60s · 0 rejected · activity report 2s old'
+          'complete reporter-set snapshot · waiting for admission · 0.50 req/s recent · 30 recorded requests in 60s · activity report 2s old'
         )
       ).toBeVisible();
+      expect(getDetailValue('Rejected recently')).toHaveTextContent(
+        'Loading...'
+      );
+      expect(screen.getByText(/0 retained rejections in 6m/)).toBeVisible();
       expect(
         getDetailValue('Compatibility terminal observations (last hour)')
       ).toHaveTextContent('3 recorded');
@@ -4383,7 +4387,8 @@ describe('ServiceDetailCard cost and request estimates', () => {
           confirmedInFlightRequests: 3,
           unknownInFlightReplicaCount: 0,
           requestQueueDepth: 4,
-          rejectedRequests: 1,
+          rejectedRequests: 3,
+          recentRejectedRequests: 1,
           offeredArrivalTelemetryAvailable: true,
           uniqueJobArrivals60s: 18,
           uniqueJobArrivals300s: 25,
@@ -4425,6 +4430,9 @@ describe('ServiceDetailCard cost and request estimates', () => {
     expect(getDetailValue('Queued now')).toHaveTextContent(
       '4 queued / unassigned'
     );
+    expect(getDetailValue('Rejected recently')).toHaveTextContent(
+      '1 rejected in 60s'
+    );
     expect(getDetailValue('Offered arrivals (60s)')).toHaveTextContent(
       '20 offered in 60s'
     );
@@ -4451,9 +4459,8 @@ describe('ServiceDetailCard cost and request estimates', () => {
       )
     ).toBeVisible();
     const queueTelemetry = screen.getByText(/complete reporter-set snapshot/);
-    expect(queueTelemetry).toHaveTextContent(
-      'unassigned, selecting, or retry-backoff work'
-    );
+    expect(queueTelemetry).toHaveTextContent('waiting for admission');
+    expect(queueTelemetry).not.toHaveTextContent('selecting or retry-backoff');
     expect(queueTelemetry).toHaveTextContent('activity report 2s old');
     expect(queueTelemetry).toHaveTextContent(
       `observed ${formatFullTimestamp(new Date(observedAt * 1000))}`
@@ -4461,6 +4468,11 @@ describe('ServiceDetailCard cost and request estimates', () => {
     expect(queueTelemetry).toHaveTextContent(
       'source PostgreSQL load-balancer reports'
     );
+    const rejectionTelemetry = screen.getByText(/3 retained rejections in 6m/);
+    expect(rejectionTelemetry).toHaveTextContent(
+      'stable job IDs are deduplicated within each load-balancer window; headerless attempts are counted separately'
+    );
+    expect(rejectionTelemetry).toHaveTextContent('activity report 2s old');
     expect(
       getDetailValue('Succeeded / terminal (exact async)')
     ).toHaveTextContent('5 succeeded / 8 terminal, protocol-covered (partial)');
