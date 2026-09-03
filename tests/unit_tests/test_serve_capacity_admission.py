@@ -52,6 +52,26 @@ def _input(**overrides) -> capacity_admission.CapacityPlanInput:
     return capacity_admission.CapacityPlanInput(**values)
 
 
+def test_replica_card_rejects_location_override_shape_disagreement() -> None:
+    state = {
+        'location': {
+            'accelerators': {
+                'L4': 1,
+            },
+        },
+        'resources_override': {
+            'accelerators': {
+                'A100': 8,
+            },
+        },
+    }
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='disagree'):
+        capacity_admission._replica_card(  # pylint: disable=protected-access
+            state)
+
+
 def _allocation_identity(
 ) -> reserved_fill_planner.ReservedFillAllocationIdentity:
     return reserved_fill_planner.ReservedFillAllocationIdentity(

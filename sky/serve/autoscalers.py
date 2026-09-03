@@ -119,18 +119,9 @@ def _canonical_exact_gpu_shape(raw_shape: Any) -> tuple[str, int] | None:
 
 def _durable_exact_gpu_shape(
     info: 'replica_managers.ReplicaInfo',) -> tuple[str, int] | None:
-    resources_override = getattr(info, 'resources_override', None)
-    if resources_override is None:
-        return None
-    if not isinstance(resources_override, Mapping):
-        raise ValueError('Replica resource override is malformed.')
-    accelerators = resources_override.get('accelerators')
-    if accelerators is None:
-        return None
-    if not isinstance(accelerators, Mapping) or len(accelerators) != 1:
-        raise ValueError('Replica accelerator override is malformed.')
-    raw_card = next(iter(accelerators))
-    return _canonical_exact_gpu_shape((raw_card, accelerators[raw_card]))
+    return spot_placer.durable_exact_accelerator_shape(
+        getattr(info, 'location', None),
+        getattr(info, 'resources_override', None))
 
 
 def build_replica_planning_bindings(

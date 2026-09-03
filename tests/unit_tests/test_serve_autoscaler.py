@@ -532,6 +532,7 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         info.version = 1
         info.cluster_name = f'mock-cluster-{replica_id}'
         info.planned_capacity = count
+        info.location = None
         info.resources_override = None
         info.is_terminal = False
         info.status_property.sky_launch_status = launch_status
@@ -1178,6 +1179,7 @@ class TestInstanceAwareUpdateRolloutSafety(unittest.TestCase):
         info.version = 2
         info.is_terminal = False
         info.planned_capacity = 1
+        info.location = None
         info.resources_override = {'accelerators': {'A100': 1}}
         with mock.patch.object(
                 autoscaler,
@@ -1226,6 +1228,7 @@ class TestInstanceAwareMixedVersionArithmetic(unittest.TestCase):
         info.is_terminal = False
         info.is_ready = is_ready
         info.planned_capacity = 1
+        info.location = None
         info.resources_override = {'accelerators': {gpu_type: 1}}
         info.status_property.sky_launch_status = (
             common_utils.ProcessStatus.SUCCEEDED)
@@ -1511,6 +1514,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         info.is_ready = ready
         info.is_zero_cost = zero_cost
         info.planned_capacity = 1
+        info.location = None
         info.resources_override = {'accelerators': {card: 1}}
         info.status_property.sky_launch_status = (
             common_utils.ProcessStatus.SUCCEEDED if ready else None)

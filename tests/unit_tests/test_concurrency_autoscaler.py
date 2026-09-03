@@ -165,6 +165,7 @@ def _replica(replica_id,
     info.status_property.first_ready_time = None
     info.status_property.is_scale_down = False
     info.status_property.unrecoverable_failure.return_value = False
+    info.location = {'accelerators': {card: gpu_count}}
     info.resources_override = {'accelerators': {card: gpu_count}}
     info.handle.return_value.launched_resources.accelerators = {card: gpu_count}
     return info
@@ -2108,6 +2109,15 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         self.assertIsNotNone(result)
 
     def test_locked_kueue_snapshot_rejects_every_structural_binding_drift(self):
+
+        def change_durable_shape(info):
+            info.location = {'accelerators': {'L4': 8}}
+            info.resources_override = {'accelerators': {'L4': 8}}
+
+        def remove_durable_shape(info):
+            info.location = None
+            info.resources_override = None
+
         mutations = {
             'record identity': lambda info: setattr(
                 info, 'replica_record_id',
@@ -2115,12 +2125,8 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             'service version': lambda info: setattr(info, 'version', 2),
             'cluster identity': lambda info: setattr(info, 'cluster_name',
                                                      'replacement-cluster'),
-            'physical shape': lambda info: setattr(info, 'resources_override',
-                                                   {'accelerators': {
-                                                       'L4': 8
-                                                   }}),
-            'durable shape removal': lambda info: setattr(
-                info, 'resources_override', None),
+            'physical shape': change_durable_shape,
+            'durable shape removal': remove_durable_shape,
             'logical capacity': lambda info: setattr(info, 'planned_capacity', 8
                                                     ),
         }
@@ -2135,6 +2141,30 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                 autoscalers.bind_locked_kueue_capacity_snapshot(
                     prepared, [locked_info],
                     kueue_lane_capacity.KueueReplicaCapacitySnapshot({}))
+
+    def test_locked_kueue_snapshot_rejects_persisted_location_shape_drift(self):
+        prepared_info = _replica(1)
+        prepared_info.resources_override = None
+        prepared_shapes = {1: ('l4', 1)}
+        prepared = autoscalers.ScalingDecisionInputs(
+            replica_bindings=autoscalers.build_replica_planning_bindings(
+                [prepared_info], prepared_shapes),
+            gpu_shapes_by_replica_id=prepared_shapes)
+        locked_info = _replica(1, card='A100', gpu_count=8, planned_capacity=1)
+        locked_info.resources_override = None
+
+        with self.assertRaises(autoscalers.PreparedReplicaSnapshotChanged):
+            autoscalers.bind_locked_kueue_capacity_snapshot(
+                prepared, [locked_info],
+                kueue_lane_capacity.KueueReplicaCapacitySnapshot({}))
+
+    def test_durable_shape_rejects_location_override_disagreement(self):
+        info = _replica(1)
+        info.resources_override = {'accelerators': {'A100': 8}}
+
+        with self.assertRaisesRegex(ValueError, 'disagree'):
+            autoscalers._durable_exact_gpu_shape(  # pylint: disable=protected-access
+                info)
 
     def test_locked_kueue_snapshot_rejects_different_replica_ids(self):
         first = _replica(1)
@@ -2294,6 +2324,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
                                 card='H200',
                                 status=serve_state.ReplicaStatus.PROVISIONING)
         provisioning.is_zero_cost = True
+        provisioning.location = None
         provisioning.resources_override = None
         provisioning.status_property.sky_launch_status = (
             common_utils.ProcessStatus.RUNNING)

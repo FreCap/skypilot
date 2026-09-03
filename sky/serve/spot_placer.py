@@ -115,6 +115,44 @@ def decode_resources_override(
     return decoded
 
 
+def durable_exact_accelerator_shape(
+    location: Mapping[str, Any] | None,
+    resources_override: Mapping[str, Any] | None,
+) -> tuple[str, int] | None:
+    """Return the one exact accelerator shape persisted for a replica.
+
+    Placement location and resources override are independent durable copies
+    of the selected backend.  Either may omit accelerator data, but when both
+    carry a shape they must agree exactly.
+    """
+
+    def _shape(field: str,
+               state: Mapping[str, Any] | None) -> tuple[str, int] | None:
+        if state is None:
+            return None
+        if not isinstance(state, Mapping):
+            raise ValueError(f'Replica {field} is malformed.')
+        accelerators = state.get('accelerators')
+        if accelerators is None:
+            return None
+        if not isinstance(accelerators, Mapping) or len(accelerators) != 1:
+            raise ValueError(f'Replica {field} accelerator shape is malformed.')
+        card, count = next(iter(accelerators.items()))
+        if (not isinstance(card, str) or not card or type(count) is not int or
+                count < 1):
+            raise ValueError(f'Replica {field} accelerator shape is malformed.')
+        return card.casefold(), count
+
+    location_shape = _shape('location', location)
+    override_shape = _shape('resources override', resources_override)
+    if (location_shape is not None and override_shape is not None and
+            location_shape != override_shape):
+        raise ValueError(
+            'Replica location and resources override accelerator shapes '
+            'disagree.')
+    return override_shape if override_shape is not None else location_shape
+
+
 def _normalize_image_id(
         image_id: dict[str | None, str] | None) -> dict[str | None, str] | None:
     """Region-independent form of a single-image dict.

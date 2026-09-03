@@ -6,7 +6,9 @@ capacity ledger one immutable authority tuple to bind into each claim.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable
+from collections.abc import Mapping
+from collections.abc import Sequence
 import contextlib
 import dataclasses
 import datetime
@@ -2363,15 +2365,14 @@ def _require_postgres(connection: sqlalchemy.engine.Connection) -> None:
 
 
 def _replica_card(state: Mapping[str, Any]) -> str | None:
-    for field in ('location', 'resources_override'):
-        resource = state.get(field)
-        accelerators = (resource.get('accelerators') if isinstance(
-            resource, Mapping) else None)
-        if isinstance(accelerators, Mapping) and len(accelerators) == 1:
-            raw_card = next(iter(accelerators))
-            if isinstance(raw_card, str) and raw_card:
-                return raw_card.casefold()
-    return None
+    try:
+        shape = spot_placer.durable_exact_accelerator_shape(
+            state.get('location'), state.get('resources_override'))
+    except ValueError as error:
+        raise CapacityAdmissionConflict(
+            'Committed replica durable accelerator shapes disagree or are '
+            'malformed.') from error
+    return None if shape is None else shape[0]
 
 
 def _validated_replica_attribution(
