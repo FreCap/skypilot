@@ -5,10 +5,12 @@ Last updated: 2026-09-03
 Status: **the PostgreSQL-authoritative reservation-aware planner, exact-card
 compatibility, bounded Spot-only paid admission, historical at-least-100 Spot
 scale, 10,000-request transport, and current-writer provider-native teardown
-are production-proven. Release 1.1.1650 deployed the Serve068 exact-provider
-cleanup correction and ordinary reconciliation recovered the interrupted
-release-1.1.1648 campaign to three joined exact-zero observations. Multi-wave
-current-writer scale, traffic, and drain requalification is still open.**
+are production-proven. Release 1.1.1660 exposed a qualifier-only circular proof
+dependency after the provider reached 93 observed and later at least 100 actual
+running VMs. Receipt schema 11's single sliding campaign and terminal-frontier
+proof are source-qualified but not yet merged, deployed, or paid-proven.
+Multi-wave current-writer scale, traffic, and drain requalification is still
+open.**
 Campaign `paid-e2e-1643a` committed the first 100 complete paid
 launch graphs in 8.4 seconds and produced 90 provider-`RUNNING` AWS Spot VMs;
 the other ten requests ended in exact AWS capacity failures. Thirteen provider
@@ -223,32 +225,62 @@ has no async ledger row before dispatch, so requiring positive
 in-flight/processing evidence before observing physical provider scale made
 ordinary cold-start progress indistinguishable from failure.
 
-Receipt schema 10 keeps the two independent facts independent. Exactly 800
-queued and attributable identities—with zero in-flight requests and zero active
-ledger rows allowed—first establish the scale stimulus. The qualifier then
-runs the at-least-100 physical provider-``RUNNING`` proof and the positive
-request-telemetry proof concurrently against that same held cohort. Positive
-telemetry may precede or follow physical qualification; it requires positive
-in-flight, processing, confirmed occupancy, exact active-ledger attribution,
-and exactly 800 queued plus in-flight identities, but queue depth may already
-be zero after full dispatch. The completion gate opens only after both tasks
-succeed; either failure cancels and awaits its sibling while leaving the gate
-closed. A timed-out queue attempt must return an exact
-``REJECTED_PRE_DISPATCH`` receipt before the same immutable request identity is
-resubmitted. The positive sample therefore has the 900-second provider
-qualification window plus one frozen 600-second queue attempt, minus one
-10-second observation margin: 1,490 seconds from the pre-demand clock. No
-individual request receives a longer queue deadline. The physical proof records
-its independent 300-second
-provider-``RUNNING`` benchmark as ``scale_slo_met`` and continues until its
-900-second correctness timeout. Missing the benchmark is diagnostic evidence,
-not a reason to cancel otherwise healthy convergence. Only then
-does the exact tail run as 23 sequential 400-request batches at concurrency
-128. The 10,000 requests are deliberately not required to be simultaneous;
-every one must still succeed and the final PostgreSQL delta must remain exactly
-10,000 ``SUCCEEDED`` rows. Source tests, merge, and production deployment are
-complete in release ``1.1.1650``; the next billable run remains open. The
-qualifier-only change itself required no additional Helm configuration.
+Release ``1.1.1660`` showed that receipt schema 10 did not actually keep the
+facts independent. The last exact paired sample had 781 queued requests, 19
+real backend-processing requests, and 19 active ledger rows. The synthetic
+20-second backend work then ended naturally, so asynchronous occupancy fell,
+but the qualifier intentionally withheld each terminal callback until provider
+and positive-telemetry observers passed. Active ledger rows consequently
+outlived real processing. The provider verifier required those two projections
+to remain equal and could no longer take another attributable sample. This is
+an acyclic-proof violation in the qualifier, not provider scarcity or a
+production autoscaler defect.
+
+Receipt schema 11 therefore names and keeps three clocks separate:
+
+1. **HTTP admission:** a never-before-offered stable identity enters the load
+   balancer, queues for at most its configured 600 seconds, and receives either
+   an exact accepted receipt or an exact ``REJECTED_PRE_DISPATCH`` transition
+   before any permitted retry.
+2. **Backend processing / asynchronous occupancy:** after dispatch, the worker
+   performs only its declared bounded synthetic work. Production in-flight,
+   processing, and confirmed-occupancy gauges begin and end with that actual
+   work; no verifier can extend them.
+3. **Terminal callback / ledger:** immediately after the declared work ends,
+   the client publishes the idempotent terminal callback and the exact accepted
+   attempt advances to ``SUCCEEDED``. Provider and telemetry observation never
+   delay, release, or otherwise control this transition.
+
+The campaign freezes all 10,000 stable identities once. At most 800 are active
+at a time. The first exact 800-resident observation proves the cold scale
+stimulus, then every natural completion immediately admits the next
+never-before-offered identity while work remains. Thus the member set in the
+active window may advance, but its bound cannot: queued plus in-flight is never
+greater than 800. Every provider-paired sample still requires exact active
+ledger equality with production in-flight occupancy, positive PostgreSQL and
+load-balancer demand, zero headerless arrivals, unsaturated arrival tracking,
+and an offered-identity count bounded by the initial window plus exact
+``SUCCEEDED`` transitions. The stimulus driver owns a lock-consistent typed
+``(offered, succeeded)`` projection: it advances ``offered`` immediately before
+the first POST of a new identity and ``succeeded`` only after that identity's
+terminal 204 receipt. Each paired provider sample persists both counters;
+offline validation rejects counter regression, ``offered > 800 + succeeded``,
+or a rolling load-balancer arrival count greater than ``offered``. The first
+800-resident proof does not block or delay any later completion.
+
+The proof dependency graph is deliberately one-way: the immutable 10,000-ID
+campaign produces a bounded sliding demand window; ordinary admission,
+processing, and terminal publication produce production evidence; the positive
+telemetry and at-least-100 provider observers only consume that evidence. The
+observers neither feed back into request lifetime nor depend on one another.
+They may pass in either order. Missing the independent 300-second provider
+benchmark remains diagnostic, and correctness observation continues to the
+900-second bound while naturally sustained campaign work remains. The final
+gate remains exactly 10,000 new ``SUCCEEDED`` rows followed by natural and
+provider-native exact zero. A deterministic delayed-provider regression must
+reach the provider threshold only after earlier campaign identities have
+naturally finished and been replaced; this prevents reintroducing a static
+completion latch under another name.
 
 The first release-``1.1.1648`` campaign, ``paid-e2e-1648a``, was deliberately
 interrupted when review found that the five-minute provider-``RUNNING``
@@ -553,49 +585,42 @@ at least 100 physical provider-``RUNNING`` workers within the 15-minute
 correctness timeout. The rendered task uses an
 exact one-L4 backend shape without pinning an instance type, so its 800-slot
 target authorizes 800 physical backends and comfortably exceeds the provider
-gate. The campaign first submits 800 immutable async identities and proves that
-exact bounded cohort is resident. An explicit completion gate retains every
-dispatched identity through both independent proofs without turning its
-synthetic worker duration into a five-minute GPU reservation. Every scale
-sample requires exactly those 800 queued plus in-flight identities, active
-ledger rows equal to dispatched in-flight identities (including the valid
-queued-only value zero), exactly 800 stable-job
-arrivals in the 300-second scale window, and zero headerless or saturated
-arrival tracking. The receipt records whether the provider reaches at least 100
+gate. The campaign freezes 10,000 immutable async identities and exposes at
+most 800 of them concurrently. It first proves one exact 800-resident window.
+Each request then finishes its declared backend work and publishes its terminal
+callback immediately, independent of either observer; the next never-before-
+offered identity replaces it while campaign work remains. Every provider-paired
+scale sample requires a refilled exact 800 queued-plus-in-flight window, active
+ledger rows equal to real dispatched in-flight occupancy (including the valid
+queued-only value zero), positive same-observation PostgreSQL and load-balancer
+demand, and zero headerless or saturated arrival tracking. Rolling stable-job
+arrival counts may now advance or age as the window turns over, but cannot
+exceed the 10,000-ID manifest or the number made reachable by exact terminal
+successes. The receipt records whether the provider reaches at least 100
 physical provider-``RUNNING`` Spot VMs within five minutes of the pre-request
 scale clock. Qualification continues until the absolute 15-minute timeout if
 that diagnostic benchmark is missed.
 
 After the resident-stimulus proof, the physical scale gate and request
-telemetry gate run concurrently. The request gate must observe positive
-in-flight, processing, confirmed-occupancy, and active-ledger evidence for the
-same exact stimulus. Queue depth may be zero once all 800 identities dispatch,
-but queued plus in-flight must remain exactly 800. Its absolute deadline allows
-the complete 900-second provider qualification window followed by one frozen
-600-second queue attempt, minus one observation interval. For the current
-contracts, that is 1,490 seconds from the pre-demand clock. A request that
-crosses its own 600-second deadline must first become an exact
-``REJECTED_PRE_DISPATCH`` attempt; only then may the client resubmit its stable
-identity.
-The completion gate opens only after both proofs succeed. Either proof failure
-cancels and awaits the other without opening the gate. The qualifier then sends
-the remaining 9,200 identities in 23 sequential batches of 400,
-each with at most 128 HTTP connections. A batch may queue normally and every
-request in it must succeed before the next batch. The 10,000 requests are not
-simultaneous. The final PostgreSQL reduction must still show exactly 10,000 new
-request rows and exactly 10,000 new ``SUCCEEDED`` rows, so batching does not
-weaken the logical workload proof. It removes the non-production requirement
-that one HTTP/1.1 client keep roughly 10,000 simultaneous sockets open. The
-worker accepts at most 360 seconds of synthetic work and the queue expires at
-600 seconds. The controller
+telemetry gate run concurrently as read-only consumers. The request gate must
+observe positive in-flight, processing, confirmed-occupancy, and matching
+active-ledger evidence for a current exact 800 window. A request that crosses
+its own 600-second queue deadline must first become an exact
+``REJECTED_PRE_DISPATCH`` attempt; only then may the client retry that same
+stable identity. The 10,000 requests are not simultaneous: 800 client workers
+stream the immutable manifest and never begin a new identity before their
+prior accepted attempt has truthfully reached terminal success. The final
+PostgreSQL reduction must still show exactly 10,000 new request rows and exactly
+10,000 new ``SUCCEEDED`` rows. The worker accepts at most 360 seconds of
+synthetic work and the queue expires at 600 seconds. The controller
 Helm throttle remains 420 prepared physical launches; neither that shared
 throttle nor `boltz-l4-fleet`'s paid cap changes. The real-cloud gate requires
 at least 100 provider-running workers within 15 minutes and records the
 five-minute diagnostic result, plus exact request-ledger completion, fresh
 attributed demand telemetry, and natural exact-zero drain.
 The hermetic qualification gate enters through the production durable planner
-adapter with this exact cold-start contract: an 800-request priority-50 L4
-scale stimulus followed by an exact 9,200-request bounded tail,
+adapter with this exact cold-start contract: one immutable 10,000-request
+priority-50 L4 campaign exposed through an 800-request sliding window,
 the 600-second default queue deadline, a ten-second configured service time,
 the 600-second automatic cold-lead seed, an 800-logical-slot service/paid
 ceiling, and the rendered task's exact one-L4 backend shape. The canonical
@@ -4298,26 +4323,26 @@ receipt separately records whether the five-minute diagnostic benchmark was
 met. It never imposes a synthetic requirement that both clouds win. Exactly
 10,000 stable async-ledger
 identities are the sole logical workload for that run. A joined exact-zero
-request/provider baseline immediately precedes traffic. The staged campaign
-first proves exactly 800 resident scale-stimulus identities, with no
-unattributed/headerless arrivals; every provider scale sample must itself
-retain those 800 queued plus in-flight identities, positive PostgreSQL and
-load-balancer demand, and an in-flight gauge equal to active exact-ledger rows.
-Before any replica is ready, both exact values may be zero while all 800
-identities remain queued; that state is valid physical-scale evidence. The
-physical proof and a separate fresh request proof run concurrently after the
-stimulus is established. The request proof requires positive in-flight,
-processing, confirmed occupancy, and active-ledger attribution; queue depth may
-be zero after full dispatch, while queued plus in-flight remains exactly 800.
-It may complete before or after physical qualification and must complete by the
-1,490-second provider-plus-one-queue-attempt deadline. The completion gate opens
-only when both proofs pass.
+request/provider baseline immediately precedes traffic. The campaign first
+proves exactly 800 resident scale-stimulus identities, with no
+unattributed/headerless arrivals. Each natural terminal success then admits the
+next never-before-offered campaign identity, preserving a strict maximum of 800
+active identities without extending backend work or ledger lifetime. Every
+provider scale sample must itself see an exact refilled 800 queued plus
+in-flight window, positive PostgreSQL and load-balancer demand, an in-flight
+gauge equal to active exact-ledger rows, and rolling arrivals bounded by the
+immutable manifest and terminal-success frontier. Before any replica is ready,
+both in-flight and active-ledger values may be zero while all 800 identities
+remain queued; that state is valid physical-scale evidence. The physical proof
+and a separate fresh request proof run concurrently after the stimulus is
+established. The request proof requires positive in-flight, processing,
+confirmed occupancy, and active-ledger attribution. It may complete before or
+after physical qualification, but neither observer controls admission,
+processing, or the terminal callback.
 Its exact one-L4 task shape and 800 logical-slot cap therefore permit the
-at-least-100 physical gate. After that gate, the remaining 9,200 identities run
-in sequential 400-request batches with bounded 128-request HTTP concurrency;
-each batch queues and every request must succeed before the next begins. The
-10,000 requests need not be simultaneous; the exact 10,000-row terminal
-``SUCCEEDED`` delta proves the complete logical campaign. If its
+at-least-100 physical gate. The 10,000 requests need not be simultaneous; the
+exact 10,000-row terminal ``SUCCEEDED`` delta proves the complete logical
+campaign. If its
 completed receipt has no positive ``RUNNING`` evidence for one provider, that
 receipt may authorize exactly one provider-pinned canary rendered from the same
 source YAML. Rendering fails before ``sky serve up`` unless the requested cloud

@@ -223,6 +223,13 @@ path were bypassed. A test that merely executes nearby code, asserts only a
 successful result, or replaces the defective owner itself is coverage, not a
 regression proof.
 
+Verification and observer code must never control, prolong, or falsify the
+production state it observes. Model admission, processing/occupancy, and
+terminal-publication clocks explicitly, and keep the dependency graph from
+stimulus through production effects to proof acyclic. A verifier may consume
+those effects; success or failure of the verifier must not determine when the
+observed work finishes or when its terminal state is published.
+
 Each non-unit test must state its layer in the module docstring and enter
 through the exact public or production scheduling boundary named there. An
 unpaid provider E2E must use PostgreSQL plus the real API server, controller,
