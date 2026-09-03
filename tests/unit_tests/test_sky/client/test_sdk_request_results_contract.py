@@ -229,9 +229,7 @@ def test_v94_exact_legacy_detail_is_rejected_after_marker_cutover():
     assert exc.value.request_id == _REQUEST_ID
     assert fetch.call_count == 3
     assert sleep.call_count == 2
-    # Transitional characterization: the floor rejects v94, but the legacy
-    # parser remains until the stacked cleanup PR removes it.
-    assert response.json.call_count == 3
+    response.json.assert_not_called()
 
 
 def test_malformed_success_is_an_unknown_observation():

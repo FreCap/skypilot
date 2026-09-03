@@ -121,18 +121,8 @@ async def _get_request_response(session: 'aiohttp.ClientSession',
                     attempt == _REQUEST_RESULT_MAX_ATTEMPTS - 1):
                 break
         else:
-            detail = None
-            if response.status == 503:
-                try:
-                    response_payload = await response.json()
-                    if isinstance(response_payload, dict):
-                        value = response_payload.get('detail')
-                        if isinstance(value, str):
-                            detail = value
-                except Exception:  # pylint: disable=broad-except
-                    pass
             if request_results.is_request_result_retry_required(
-                    response.status, response.headers, detail, request_id):
+                    response.status, response.headers, request_id):
                 response.close()
                 raise exceptions.RequestResultShouldRetryError(request_id)
             if response.status not in _TRANSIENT_RESULT_HTTP_STATUSES:

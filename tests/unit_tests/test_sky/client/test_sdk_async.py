@@ -694,9 +694,7 @@ async def test_get_rejects_exact_v94_legacy_retry_detail_after_marker_cutover():
     assert exc.value.request_id == 'req-1'
     assert fetch.await_count == 3
     assert sleep.await_count == 2
-    # Transitional characterization: the floor rejects v94, but the legacy
-    # parser remains until the stacked cleanup PR removes it.
-    assert response.json.await_count == 3
+    response.json.assert_not_awaited()
 
 
 @pytest.mark.asyncio
