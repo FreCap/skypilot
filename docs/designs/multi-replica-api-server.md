@@ -925,6 +925,26 @@ schema work continues through the bounded request-control pool. The
 real-PostgreSQL regression starts from an empty schema, so it covers both this
 fresh-bootstrap ordering and the later heartbeat isolation.
 
+A 2026-09-03 100-launch qualification exposed the next boundary inside the
+request store. Each executor supervisor used the same one-slot
+`api-requests-control` pool for its two dispatchers, role heartbeat, and every
+active execution-claim heartbeat. A checked-out request transaction therefore
+caused 15-second pool timeouts in the supervisor, after which 30-second claims
+expired and provider-effect fences correctly rejected the stale handlers.
+
+Renewable authority now uses one separate, strict, process-local
+`api-requests-liveness` pool. The role lease and execution-claim renewals are
+the only writers on this lane. Claim renewal selects its exact current row with
+`FOR UPDATE SKIP LOCKED`; a briefly locked but still-current claim remains
+valid for the current heartbeat and is retried on the next cadence, while an
+expired or replaced claim still returns the existing definitive revocation.
+This prevents one request-row writer from creating head-of-line blocking among
+unrelated claims without increasing the ordinary or request-control pool,
+changing the 30-second lease, or weakening any execution fence. The gate is a
+real-PostgreSQL test with 64 simultaneous claims, one deliberately locked row,
+concurrent dispatcher progress, and a fresh role heartbeat, all within one
+10-second heartbeat cycle. Production qualification remains open.
+
 Revision 8, with digest
 `sha256:0e9122cac657351dc12eef7ecce05ee1cb8630979b153ee318ee7b7004588a00`,
 proved the role and failure semantics before the pool-isolation correction.

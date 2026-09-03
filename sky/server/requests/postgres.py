@@ -112,6 +112,13 @@ _INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 5
 INSTANCE_STALE_AFTER_SECONDS = 20
 
 
+class _RequestPoolLane(enum.Enum):
+    """Closed process-local pool policy for durable request operations."""
+
+    CONTROL = 'api-requests-control'
+    LIVENESS = 'api-requests-liveness'
+
+
 @dataclasses.dataclass(frozen=True)
 class NonPoolLaunchBindingRuntime:
     """Process-static request capabilities resolved before correctness locks."""
@@ -852,7 +859,7 @@ class ServerInstanceLease:
             self._last_success_monotonic = time.monotonic()
 
     def _register_unlocked(self) -> None:
-        engine = initialize_and_get_db()
+        engine = _initialize_and_get_liveness_db()
         values = self._values(include_started_at=True)
         update_values = dict(values)
         update_values.pop('instance_id')
@@ -876,7 +883,7 @@ class ServerInstanceLease:
         if not acquired:
             return False
         try:
-            engine = initialize_and_get_db()
+            engine = _initialize_and_get_liveness_db()
             values = self._values(include_started_at=False)
             values.pop('instance_id')
             # ``draining_at`` is the start of the exact instance's retirement,
@@ -1466,14 +1473,35 @@ def _initialize_schema(engine: sqlalchemy.engine.Engine) -> None:
         mode=migration_utils.configured_migration_mode())
 
 
-_DB_MANAGER = db_utils.DatabaseManager('api_requests',
-                                       _initialize_schema,
-                                       engine_namespace='api-requests-control')
+def _initialize_liveness_engine(engine: sqlalchemy.engine.Engine) -> None:
+    """Make request-control initialization the sole schema owner."""
+    control_engine = _DB_MANAGER.get_engine()
+    if engine.url != control_engine.url:
+        raise RuntimeError('Request liveness and control pools must address '
+                           'the same PostgreSQL database.')
+
+
+_DB_MANAGER = db_utils.DatabaseManager(
+    'api_requests',
+    _initialize_schema,
+    engine_namespace=(_RequestPoolLane.CONTROL.value))
+_LIVENESS_DB_MANAGER = db_utils.DatabaseManager(
+    'api_requests',
+    _initialize_liveness_engine,
+    engine_namespace=_RequestPoolLane.LIVENESS.value)
 
 
 def initialize_and_get_db() -> sqlalchemy.engine.Engine:
     """Initialize the request schema and return its synchronous engine."""
     return _DB_MANAGER.get_engine()
+
+
+def _initialize_and_get_liveness_db() -> sqlalchemy.engine.Engine:
+    """Return the isolated engine for renewable request-role authority."""
+    # Queue admission and completion can occupy the request-control checkout.
+    # Renewable liveness has a separate, strict process-local pool so those
+    # operations cannot consume its connection budget.
+    return _LIVENESS_DB_MANAGER.get_engine()
 
 
 async def _get_async_engine() -> sqlalchemy_async.AsyncEngine:
@@ -7137,27 +7165,44 @@ class PostgresRequestBackend(request_storage.RequestBackend):
 
     def heartbeat_claim(self, claim: request_storage.ExecutionClaim) -> bool:
         """Extend a lease only for its current generation and owner."""
-        engine = initialize_and_get_db()
+        engine = _initialize_and_get_liveness_db()
         now = sqlalchemy.func.clock_timestamp()
         claimed_delivery = sqlalchemy.exists().where(
             QUEUE.c.request_id == claim.request_id,
             QUEUE.c.delivery_state == 'claimed',
             QUEUE.c.claim_generation == claim.execution_generation)
-        statement = sqlalchemy.update(REQUESTS).where(
-            REQUESTS.c.request_id == claim.request_id,
-            *self._claim_predicates(claim.execution_generation,
-                                    uuid.UUID(claim.claim_token)),
+        claim_predicates = (
+            REQUESTS.c.request_id == claim.request_id, *self._claim_predicates(
+                claim.execution_generation, uuid.UUID(claim.claim_token)),
             REQUESTS.c.status.in_([
                 status.value
                 for status in requests_lib.RequestStatus.active_statuses()
-            ]), claimed_delivery).values(
+            ]), claimed_delivery)
+        # A handler can briefly own this request row while persisting an exact
+        # effect fence. Waiting for that row while holding the sole liveness
+        # checkout would prevent every unrelated claim and the role instance
+        # from renewing. Lock only an immediately available matching row.
+        heartbeat_target = sqlalchemy.select(
+            REQUESTS.c.request_id).where(*claim_predicates).with_for_update(
+                of=REQUESTS, skip_locked=True).cte('heartbeat_target')
+        statement = sqlalchemy.update(REQUESTS).where(
+            REQUESTS.c.request_id == heartbeat_target.c.request_id).values(
                 heartbeat_at=now,
                 lease_expires_at=(
                     now + datetime.timedelta(seconds=_CLAIM_LEASE_SECONDS)),
-                updated_at=now)
+                updated_at=now).returning(REQUESTS.c.request_id)
         with engine.begin() as connection:
-            result = connection.execute(statement)
-        return result.rowcount == 1
+            renewed = connection.execute(statement).scalar_one_or_none()
+            if renewed is not None:
+                return True
+            # SKIP LOCKED returning no row is not proof of revocation. An MVCC
+            # read does not wait for the concurrent writer. Retain authority
+            # only while the exact claim is still durably current; once its
+            # lease expires or its identity changes, return False as before.
+            return bool(
+                connection.execute(
+                    sqlalchemy.select(sqlalchemy.exists().where(
+                        *claim_predicates))).scalar_one())
 
     def interrupt_cancelled_claim(
             self, claim: request_storage.ExecutionClaim) -> bool:

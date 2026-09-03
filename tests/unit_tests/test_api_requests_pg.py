@@ -369,6 +369,8 @@ def request_database(postgres_engine, monkeypatch):
                         postgres_engine)
     monkeypatch.setattr(request_postgres._DB_MANAGER, '_engine_async',
                         async_engine)
+    monkeypatch.setattr(request_postgres._LIVENESS_DB_MANAGER, '_engine',
+                        postgres_engine)
     monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR,
                        str(uuid.uuid4()))
     backend = request_postgres.PostgresRequestBackend()
@@ -7751,12 +7753,20 @@ def test_request_control_pool_survives_saturated_ordinary_pool(
     monkeypatch.setattr(db_utils, '_max_connections', 1)
     monkeypatch.setattr(request_postgres._DB_MANAGER, '_engine', None)
     monkeypatch.setattr(request_postgres._DB_MANAGER, '_engine_async', None)
+    monkeypatch.setattr(request_postgres._LIVENESS_DB_MANAGER, '_engine', None)
+    monkeypatch.setattr(request_postgres._LIVENESS_DB_MANAGER, '_engine_async',
+                        None)
 
     ordinary_engine = db_utils.get_engine('state')
+    # Liveness-first startup still delegates schema ownership to control.
+    liveness_engine = request_postgres._initialize_and_get_liveness_db()
     control_engine = request_postgres.initialize_and_get_db()
     assert ordinary_engine is not control_engine
+    assert liveness_engine is not control_engine
+    assert liveness_engine is not ordinary_engine
     assert ordinary_engine.pool.size() == 1
     assert control_engine.pool.size() == 1
+    assert liveness_engine.pool.size() == 1
 
     request = _request('isolated-control-heartbeat')
     with control_engine.begin() as connection:
@@ -7775,18 +7785,186 @@ def test_request_control_pool_survives_saturated_ordinary_pool(
     lease.set_ready(True, health_detail={'phase': 'claiming'})
 
     ordinary_checkout = ordinary_engine.connect()
+    control_checkout = control_engine.connect()
     try:
         assert ordinary_engine.pool.checkedout() == 1
+        assert control_engine.pool.checkedout() == 1
         assert lease._heartbeat()
         assert backend.heartbeat_claim(claim)
         assert lease.is_locally_ready()
     finally:
+        control_checkout.close()
         ordinary_checkout.close()
         lease.stop()
         for engine in isolated_cache.values():
             engine.dispose()
         for engine in isolated_lock_cache.values():
             engine.dispose()
+
+
+def test_executor_liveness_lane_has_no_claim_head_of_line_blocking(
+        postgres_engine, monkeypatch):
+    """One busy claim cannot starve peer claims, dispatch, or role liveness."""
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+
+    connection_url = postgres_engine.url.render_as_string(hide_password=False)
+    monkeypatch.setenv(constants.ENV_VAR_IS_SKYPILOT_SERVER, 'true')
+    monkeypatch.setenv(constants.ENV_VAR_DB_CONNECTION_URI, connection_url)
+    monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR,
+                       str(uuid.uuid4()))
+    isolated_cache = {}
+    isolated_lock_cache = {}
+    monkeypatch.setattr(db_utils, '_postgres_engine_cache', isolated_cache)
+    monkeypatch.setattr(db_utils, '_postgres_lock_engine_cache',
+                        isolated_lock_cache)
+    monkeypatch.setattr(db_utils, '_max_connections', 1)
+    monkeypatch.setattr(request_postgres._DB_MANAGER, '_engine', None)
+    monkeypatch.setattr(request_postgres._DB_MANAGER, '_engine_async', None)
+    monkeypatch.setattr(request_postgres._LIVENESS_DB_MANAGER, '_engine', None)
+    monkeypatch.setattr(request_postgres._LIVENESS_DB_MANAGER, '_engine_async',
+                        None)
+
+    control_engine = request_postgres.initialize_and_get_db()
+    liveness_engine = request_postgres._initialize_and_get_liveness_db()
+    assert control_engine is not liveness_engine
+    assert control_engine.pool.size() == 1
+    assert liveness_engine.pool.size() == 1
+
+    backend = request_postgres.PostgresRequestBackend()
+    request_ids = [f'concurrent-heartbeat-{index}' for index in range(64)]
+    queued_request_id = 'dispatcher-progress-during-heartbeats'
+    request_rows = [_request(request_id) for request_id in request_ids]
+    queued_request = _request(queued_request_id)
+    all_requests = request_rows + [queued_request]
+    with control_engine.begin() as connection:
+        for request in all_requests:
+            connection.execute(request_postgres.REQUESTS.insert().values(
+                **request_postgres._request_values_for_db(request)))
+            connection.execute(request_postgres.QUEUE.insert().values(
+                **request_postgres._queue_values(request)))
+
+    claims = []
+    queue = request_postgres.PostgresQueueBackend('short')
+    for request_id in request_ids:
+        item = queue.get()
+        assert item is not None
+        assert item.request_id == request_id
+        assert item.claim_token is not None
+        assert backend.try_mark_running(item.request_id, 1234,
+                                        item.execution_generation,
+                                        item.claim_token, 424242)
+        claims.append(
+            storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id))
+
+    lease = request_postgres.ServerInstanceLease('executor',
+                                                 heartbeat_interval_seconds=60)
+    lease.start()
+    lease.set_ready(True, health_detail={'phase': 'claiming'})
+    with control_engine.connect() as connection:
+        initial_locked_heartbeat = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS.c.heartbeat_at).where(
+                request_postgres.REQUESTS.c.request_id ==
+                claims[0].request_id)).scalar_one()
+
+    locker = postgres_engine.connect()
+    lock_transaction = locker.begin()
+    locker.execute(
+        sqlalchemy.select(request_postgres.REQUESTS.c.request_id).where(
+            request_postgres.REQUESTS.c.request_id ==
+            claims[0].request_id).with_for_update()).scalar_one()
+
+    errors = []
+    results = []
+    result_lock = threading.Lock()
+
+    def heartbeat(claim):
+        try:
+            result = backend.heartbeat_claim(claim)
+            with result_lock:
+                results.append((claim.request_id, result))
+        except Exception as error:  # pylint: disable=broad-except
+            with result_lock:
+                errors.append(error)
+
+    locked_thread = threading.Thread(target=heartbeat,
+                                     args=(claims[0],),
+                                     name='locked-claim-heartbeat')
+    locked_statement_started = threading.Event()
+
+    def observe_locked_statement(_connection, _cursor, _statement, _parameters,
+                                 _context, _executemany):
+        if threading.current_thread().name == 'locked-claim-heartbeat':
+            locked_statement_started.set()
+
+    sqlalchemy.event.listen(liveness_engine, 'before_cursor_execute',
+                            observe_locked_statement)
+    peer_threads = [
+        threading.Thread(target=heartbeat,
+                         args=(claim,),
+                         name=f'peer-claim-heartbeat-{index}')
+        for index, claim in enumerate(claims[1:], start=1)
+    ]
+    dispatch_result = []
+    dispatch_thread = threading.Thread(
+        target=lambda: dispatch_result.append(queue.get()),
+        name='request-control-dispatch')
+    instance_result = []
+    instance_thread = threading.Thread(
+        target=lambda: instance_result.append(lease._heartbeat()),
+        name='instance-heartbeat')
+    started_at = time.monotonic()
+    try:
+        locked_thread.start()
+        assert locked_statement_started.wait(timeout=2)
+        for thread in peer_threads:
+            thread.start()
+        dispatch_thread.start()
+        instance_thread.start()
+        for thread in (locked_thread, *peer_threads, dispatch_thread,
+                       instance_thread):
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+        elapsed = time.monotonic() - started_at
+
+        assert elapsed < 10
+        assert not errors
+        assert len(results) == len(claims)
+        assert all(result for _, result in results)
+        assert dispatch_result[0] is not None
+        assert dispatch_result[0].request_id == queued_request_id
+        assert instance_result == [True]
+        assert lease.is_locally_ready()
+    finally:
+        sqlalchemy.event.remove(liveness_engine, 'before_cursor_execute',
+                                observe_locked_statement)
+        lock_transaction.rollback()
+        locker.close()
+
+    # The locked claim remained current without pretending that the skipped
+    # write advanced its timestamp. Once the brief writer releases it, the
+    # same exact claim renews normally.
+    with control_engine.connect() as connection:
+        skipped_heartbeat = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS.c.heartbeat_at).where(
+                request_postgres.REQUESTS.c.request_id ==
+                claims[0].request_id)).scalar_one()
+    assert skipped_heartbeat == initial_locked_heartbeat
+    assert backend.heartbeat_claim(claims[0])
+    with control_engine.connect() as connection:
+        renewed_heartbeat = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS.c.heartbeat_at).where(
+                request_postgres.REQUESTS.c.request_id ==
+                claims[0].request_id)).scalar_one()
+    assert renewed_heartbeat > skipped_heartbeat
+
+    lease.stop()
+    for engine in isolated_cache.values():
+        engine.dispose()
+    for engine in isolated_lock_cache.values():
+        engine.dispose()
 
 
 def test_distributed_singleton_lock_session_stays_outside_transaction(

@@ -588,6 +588,7 @@ class TestGetEngine:
         ('namespace', 'expected'),
         [(None, 'shared'), ('', 'shared'),
          ('api-requests-control', 'api-requests-control'),
+         ('api-requests-liveness', 'api-requests-liveness'),
          ('advisory-lock', 'advisory-lock'),
          ('reserved-fill-reclaim-proof', 'reserved-fill-reclaim-proof'),
          ('physical-capacity-evidence', 'other'),
@@ -618,6 +619,7 @@ class TestGetEngine:
             frozenset({
                 'shared',
                 'api-requests-control',
+                'api-requests-liveness',
                 'advisory-lock',
                 'reserved-fill-reclaim-proof',
                 'other',
@@ -626,7 +628,7 @@ class TestGetEngine:
             {'sync', 'async'})
         assert (len(db_utils._POSTGRES_CONNECTION_METRIC_PROCESS_ROLES) *
                 len(db_utils._POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES) *
-                len(db_utils._POSTGRES_CONNECTION_METRIC_MODES) == 70)
+                len(db_utils._POSTGRES_CONNECTION_METRIC_MODES) == 84)
 
     def test_postgres_connection_metric_process_role_is_write_once(
             self, monkeypatch):

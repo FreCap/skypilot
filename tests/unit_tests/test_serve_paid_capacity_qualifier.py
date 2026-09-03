@@ -579,6 +579,83 @@ def test_scale_profile_exceeds_physical_gate_for_rendered_shape():
     assert profile.scale_up_min_replicas == profile.max_units
 
 
+@pytest.mark.parametrize(
+    ('arrivals_60s', 'arrivals_300s', 'require_stimulus_commit', 'expected'),
+    [(800, 800, True, True), (0, 799, True, False), (0, 0, False, True),
+     (801, 801, False, False), (1, 0, False, False)],
+)
+def test_scale_arrival_attribution_has_commit_and_rolling_modes(
+        arrivals_60s, arrivals_300s, require_stimulus_commit, expected):
+    previous = None
+    if not require_stimulus_commit:
+        previous = qualifier._ScaleArrivalAttributionState(
+            unique_job_arrivals_60s=800, unique_job_arrivals_300s=800)
+    state = qualifier._next_scale_arrival_attribution_state(
+        previous=previous,
+        unique_job_arrivals_60s=arrivals_60s,
+        unique_job_arrivals_300s=arrivals_300s,
+        headerless_arrivals_60s=0,
+        headerless_arrivals_300s=0,
+        offered_arrival_tracking_saturated=False,
+        expected_arrivals=800)
+    assert (state is not None) is expected
+
+
+def test_scale_arrival_attribution_rejects_post_commit_increase_and_bools():
+    committed = qualifier._next_scale_arrival_attribution_state(
+        previous=None,
+        unique_job_arrivals_60s=800,
+        unique_job_arrivals_300s=800,
+        headerless_arrivals_60s=0,
+        headerless_arrivals_300s=0,
+        offered_arrival_tracking_saturated=False,
+        expected_arrivals=800)
+    assert committed is not None
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(committed, 'unique_job_arrivals_60s', 1)
+    aged_out = qualifier._next_scale_arrival_attribution_state(
+        previous=committed,
+        unique_job_arrivals_60s=0,
+        unique_job_arrivals_300s=0,
+        headerless_arrivals_60s=0,
+        headerless_arrivals_300s=0,
+        offered_arrival_tracking_saturated=False,
+        expected_arrivals=800)
+    assert aged_out is not None
+    assert qualifier._next_scale_arrival_attribution_state(
+        previous=aged_out,
+        unique_job_arrivals_60s=1,
+        unique_job_arrivals_300s=1,
+        headerless_arrivals_60s=0,
+        headerless_arrivals_300s=0,
+        offered_arrival_tracking_saturated=False,
+        expected_arrivals=800) is None
+    for field, invalid in (('headerless_arrivals_60s',
+                            False), ('headerless_arrivals_300s',
+                                     False), ('headerless_arrivals_60s', 0.0),
+                           ('headerless_arrivals_300s', '0')):
+        fields = {
+            'headerless_arrivals_60s': 0,
+            'headerless_arrivals_300s': 0,
+        }
+        fields[field] = invalid
+        assert qualifier._next_scale_arrival_attribution_state(
+            previous=None,
+            unique_job_arrivals_60s=800,
+            unique_job_arrivals_300s=800,
+            offered_arrival_tracking_saturated=False,
+            expected_arrivals=800,
+            **fields) is None
+    assert qualifier._next_scale_arrival_attribution_state(
+        previous=None,
+        unique_job_arrivals_60s=True,
+        unique_job_arrivals_300s=800,
+        headerless_arrivals_60s=0,
+        headerless_arrivals_300s=0,
+        offered_arrival_tracking_saturated=False,
+        expected_arrivals=800) is None
+
+
 def test_positive_telemetry_deadline_allows_one_retry_after_scale_timeout():
     profile = qualifier.PROFILES['scale']
     small = qualifier.PROFILES['small']
@@ -3480,6 +3557,156 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
            ] == [None, 'QualificationError', None]
 
 
+def test_scale_wait_allows_attributed_arrivals_to_age_out(tmp_path):
+    """The resident stimulus outlives the LB's rolling arrival window."""
+    profile = dataclasses.replace(qualifier.PROFILES['scale'], poll_seconds=0)
+    gcp_names = _provider_cluster_names('gcp', 50)
+    aws_names = _provider_cluster_names('aws', 50)
+    database = _database_state(
+        paid_debit_units=100,
+        demand_units=800,
+        bound_cluster_zones=tuple(
+            (name, 'us-central1-a') for name in gcp_names),
+        aws_provider_identities=tuple(
+            _aws_identity(client_token=f'token-aws-{index}', cluster_name=name)
+            for index, name in enumerate(aws_names)))
+    started_monotonic = time.monotonic()
+    started_at = time.time()
+    observations = [
+        _observation(observed_at=started_at + 1,
+                     observed_monotonic=started_monotonic + 1,
+                     database=database,
+                     provider=_cross_cloud_provider_state(gcp_running_count=49,
+                                                          aws_running_count=50),
+                     load_balancer=_load_balancer_state(
+                         demand_units=800,
+                         unique_job_arrivals_60s=800,
+                         unique_job_arrivals_300s=800)),
+        _observation(observed_at=started_at + 301,
+                     observed_monotonic=started_monotonic + 301,
+                     database=database,
+                     provider=_cross_cloud_provider_state(gcp_running_count=50,
+                                                          aws_running_count=50),
+                     load_balancer=_load_balancer_state(
+                         demand_units=800,
+                         unique_job_arrivals_60s=0,
+                         unique_job_arrivals_300s=0)),
+    ]
+
+    class Observer:
+
+        @staticmethod
+        async def request_telemetry():
+            return _request_telemetry(queue_depth=800)
+
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
+            return observations.pop(0)
+
+    async def exercise():
+        progress = qualifier.Progress(scale_started_monotonic=started_monotonic,
+                                      scale_started_at=started_at)
+        receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                    service_name='paid-e2e',
+                                    profile=profile)
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            await qualifier._wait_for_scale(observer=Observer(),
+                                            profile=profile,
+                                            progress=progress,
+                                            receipt=receipt,
+                                            traffic=traffic,
+                                            baseline=_request_telemetry())
+            return progress, receipt
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+
+    progress, receipt = asyncio.run(exercise())
+    assert progress.scale_reached_monotonic == started_monotonic + 301
+    assert [
+        sample['lb_unique_job_arrivals_300s']
+        for sample in receipt._payload['samples']
+    ] == [800, 0]
+
+
+def test_scale_wait_rejects_arrivals_increasing_after_commit(tmp_path):
+    profile = dataclasses.replace(qualifier.PROFILES['scale'], poll_seconds=0)
+    gcp_names = _provider_cluster_names('gcp', 50)
+    aws_names = _provider_cluster_names('aws', 50)
+    database = _database_state(
+        paid_debit_units=100,
+        demand_units=800,
+        bound_cluster_zones=tuple(
+            (name, 'us-central1-a') for name in gcp_names),
+        aws_provider_identities=tuple(
+            _aws_identity(client_token=f'token-aws-{index}', cluster_name=name)
+            for index, name in enumerate(aws_names)))
+    started_monotonic = time.monotonic()
+    started_at = time.time()
+    observations = [
+        _observation(observed_at=started_at + 1,
+                     observed_monotonic=started_monotonic + 1,
+                     database=database,
+                     provider=_cross_cloud_provider_state(gcp_running_count=49,
+                                                          aws_running_count=50),
+                     load_balancer=_load_balancer_state(
+                         demand_units=800,
+                         unique_job_arrivals_60s=800,
+                         unique_job_arrivals_300s=800)),
+        _observation(observed_at=started_at + 301,
+                     observed_monotonic=started_monotonic + 301,
+                     database=database,
+                     provider=_cross_cloud_provider_state(gcp_running_count=49,
+                                                          aws_running_count=50),
+                     load_balancer=_load_balancer_state(
+                         demand_units=800,
+                         unique_job_arrivals_60s=0,
+                         unique_job_arrivals_300s=0)),
+        _observation(observed_at=started_at + 302,
+                     observed_monotonic=started_monotonic + 302,
+                     database=database,
+                     provider=_cross_cloud_provider_state(gcp_running_count=50,
+                                                          aws_running_count=50),
+                     load_balancer=_load_balancer_state(
+                         demand_units=800,
+                         unique_job_arrivals_60s=1,
+                         unique_job_arrivals_300s=1)),
+    ]
+
+    class Observer:
+
+        @staticmethod
+        async def request_telemetry():
+            return _request_telemetry(queue_depth=800)
+
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
+            return observations.pop(0)
+
+    async def exercise():
+        progress = qualifier.Progress(scale_started_monotonic=started_monotonic,
+                                      scale_started_at=started_at)
+        receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                    service_name='paid-e2e',
+                                    profile=profile)
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='unattributed offered arrivals'):
+                await qualifier._wait_for_scale(observer=Observer(),
+                                                profile=profile,
+                                                progress=progress,
+                                                receipt=receipt,
+                                                traffic=traffic,
+                                                baseline=_request_telemetry())
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
 def test_scale_and_positive_gates_accept_fully_dispatched_cohort_concurrently(
         tmp_path):
     """Positive telemetry must not wait for the physical provider gate."""
@@ -5608,6 +5835,145 @@ def test_aggregate_rejects_unattributed_scale_stimulus_arrivals(tmp_path):
     scale = next(
         sample for sample in payload['samples'] if sample['phase'] == 'scale')
     scale['lb_unique_job_arrivals_300s'] = 799
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='unattributed offered arrivals'):
+        qualifier.aggregate_evidence(args)
+
+
+def test_aggregate_accepts_arrivals_aged_out_after_stimulus_commit(tmp_path):
+    args = _aggregate_args(tmp_path,
+                           with_canary=False,
+                           economic_peaks={
+                               'aws': 50,
+                               'gcp': 50,
+                           })
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    first_scale = next(
+        sample for sample in payload['samples'] if sample['phase'] == 'scale')
+    qualified_scale = copy.deepcopy(first_scale)
+    qualified_scale.update({
+        'scale_iteration_id': 2,
+        'observation_started_at': 349.5,
+        'observation_finished_at': 350.0,
+        'observed_at': 350.0,
+        'lb_unique_job_arrivals_60s': 0,
+        'lb_unique_job_arrivals_300s': 0,
+    })
+    first_scale['provider_running'] = 99
+    first_scale['provider_running_gpu_units'] = 99
+    first_gcp = first_scale['provider_by_cloud']['gcp']
+    first_gcp['running'] = 49
+    first_gcp['running_gpu_units'] = 49
+    first_gcp['shapes'][0]['running_count'] = 49
+    first_gcp['shapes'][0]['running_gpu_units'] = 49
+    first_index = payload['samples'].index(first_scale)
+    payload['samples'].insert(first_index + 1, qualified_scale)
+
+    first_request_scale = next(
+        sample for sample in payload['request_telemetry_samples']
+        if sample['phase'] == 'scale')
+    qualified_request_scale = copy.deepcopy(first_request_scale)
+    qualified_request_scale.update({
+        'scale_iteration_id': 2,
+        'observed_at': 349.0,
+    })
+    final_index = next(
+        index
+        for index, sample in enumerate(payload['request_telemetry_samples'])
+        if sample['phase'] == 'final')
+    payload['request_telemetry_samples'].insert(final_index,
+                                                qualified_request_scale)
+    payload.update({
+        'scale_qualified_observed_at': 350.0,
+        'scale_qualified_iteration_id': 2,
+        'scale_slo_met': False,
+    })
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+    _write_aggregate_cleanup(pathlib.Path(args.economic_cleanup_receipt),
+                             receipt,
+                             service_name='economic',
+                             providers=['aws', 'gcp'])
+
+    qualifier.aggregate_evidence(args)
+
+    aggregate = json.loads(
+        pathlib.Path(args.output).read_text(encoding='utf-8'))
+    assert aggregate['outcome'] == 'passed'
+    assert aggregate['economic_scale_slo_met'] is False
+
+
+def test_aggregate_rejects_arrivals_increasing_after_stimulus_commit(tmp_path):
+    args = _aggregate_args(tmp_path,
+                           with_canary=False,
+                           economic_peaks={
+                               'aws': 50,
+                               'gcp': 50,
+                           })
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    first_scale = next(
+        sample for sample in payload['samples'] if sample['phase'] == 'scale')
+    first_scale['provider_running'] = 99
+    first_scale['provider_running_gpu_units'] = 99
+    first_gcp = first_scale['provider_by_cloud']['gcp']
+    first_gcp['running'] = 49
+    first_gcp['running_gpu_units'] = 49
+    first_gcp['shapes'][0]['running_count'] = 49
+    first_gcp['shapes'][0]['running_gpu_units'] = 49
+    aged_scale = copy.deepcopy(first_scale)
+    aged_scale.update({
+        'scale_iteration_id': 2,
+        'observation_started_at': 349.5,
+        'observation_finished_at': 350.0,
+        'observed_at': 350.0,
+        'lb_unique_job_arrivals_60s': 0,
+        'lb_unique_job_arrivals_300s': 0,
+    })
+    increased_scale = copy.deepcopy(aged_scale)
+    increased_scale.update({
+        'scale_iteration_id': 3,
+        'observation_started_at': 350.5,
+        'observation_finished_at': 351.0,
+        'observed_at': 351.0,
+        'lb_unique_job_arrivals_60s': 1,
+        'lb_unique_job_arrivals_300s': 1,
+        'provider_running': 100,
+        'provider_running_gpu_units': 100,
+    })
+    increased_gcp = increased_scale['provider_by_cloud']['gcp']
+    increased_gcp['running'] = 50
+    increased_gcp['running_gpu_units'] = 50
+    increased_gcp['shapes'][0]['running_count'] = 50
+    increased_gcp['shapes'][0]['running_gpu_units'] = 50
+    first_index = payload['samples'].index(first_scale)
+    payload['samples'][first_index + 1:first_index +
+                       1] = [aged_scale, increased_scale]
+
+    first_request_scale = next(
+        sample for sample in payload['request_telemetry_samples']
+        if sample['phase'] == 'scale')
+    extra_request_scales = []
+    for iteration_id, observed_at in ((2, 349.0), (3, 350.0)):
+        request_scale = copy.deepcopy(first_request_scale)
+        request_scale.update({
+            'scale_iteration_id': iteration_id,
+            'observed_at': observed_at,
+        })
+        extra_request_scales.append(request_scale)
+    final_index = next(
+        index
+        for index, sample in enumerate(payload['request_telemetry_samples'])
+        if sample['phase'] == 'final')
+    payload['request_telemetry_samples'][final_index:final_index] = (
+        extra_request_scales)
+    payload.update({
+        'scale_qualified_observed_at': 351.0,
+        'scale_qualified_iteration_id': 3,
+        'scale_slo_met': False,
+    })
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
     with pytest.raises(qualifier.QualificationError,

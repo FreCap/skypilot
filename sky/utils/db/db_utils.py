@@ -85,6 +85,7 @@ _POSTGRES_CONNECTION_METRIC_BASE_PROCESS_ROLES = frozenset({
 _POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES = frozenset({
     'shared',
     'api-requests-control',
+    'api-requests-liveness',
     'advisory-lock',
     'reserved-fill-reclaim-proof',
     'other',
