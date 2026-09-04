@@ -7,7 +7,8 @@ import dataclasses
 import enum
 import json
 import time
-from typing import Any, cast, Iterator, TypeAlias
+from collections.abc import Iterator
+from typing import Any, cast, TypeAlias
 
 import sqlalchemy
 from sqlalchemy import orm
