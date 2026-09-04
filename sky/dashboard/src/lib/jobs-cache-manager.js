@@ -144,6 +144,31 @@ class JobsCacheManager {
   }
 
   /**
+   * Project the normalized filter shape shared by cache keys and write fences.
+   */
+  _getFilterOptions(options = {}) {
+    const {
+      allUsers = true,
+      jobIdMatch,
+      nameMatch,
+      userMatch,
+      workspaceMatch,
+      poolMatch,
+      statuses,
+    } = options;
+
+    return {
+      allUsers,
+      jobIdMatch,
+      nameMatch,
+      userMatch,
+      workspaceMatch,
+      poolMatch,
+      statuses,
+    };
+  }
+
+  /**
    * Check if a cache entry is valid (exists and not expired)
    */
   _isCacheValid(cacheEntry) {
@@ -176,13 +201,8 @@ class JobsCacheManager {
    * This fetches only the requested page, not the full dataset
    */
   async _populateCacheDefaultPathSinglePage(options) {
-    const {
-      page = 1,
-      limit = 10,
-      sortBy,
-      sortOrder,
-      ...filterOptions
-    } = options;
+    const { page = 1, limit = 10, sortBy, sortOrder } = options;
+    const filterOptions = this._getFilterOptions(options);
     const cacheKey = this._generateCacheKey(options);
     const filterKey = this._generateFilterKey(filterOptions);
     const writeFence = this._snapshotWriteFence(filterKey);
@@ -258,13 +278,8 @@ class JobsCacheManager {
    * This is called in the background after the initial page load
    */
   async _loadFullDatasetAndCacheAllPages(options) {
-    const {
-      page = 1,
-      limit = 10,
-      sortBy,
-      sortOrder,
-      ...filterOptions
-    } = options;
+    const { page = 1, limit = 10, sortBy, sortOrder } = options;
+    const filterOptions = this._getFilterOptions(options);
     const filterKey = this._generateFilterKey(filterOptions);
     const writeFence = this._snapshotWriteFence(filterKey);
 
@@ -344,8 +359,8 @@ class JobsCacheManager {
       sortBy = 'submitted_at',
       sortOrder = 'desc',
       statuses,
-      ...filterOptions
     } = options;
+    const filterOptions = this._getFilterOptions(options);
     const cacheKey = this._generateCacheKey(options);
     const filterKey = this._generateFilterKey(filterOptions);
     const writeFence = this._snapshotWriteFence(filterKey);
