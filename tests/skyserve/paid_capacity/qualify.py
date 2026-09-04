@@ -24,6 +24,7 @@ required in the API-server image.
 
 import argparse
 import asyncio
+import base64
 import collections.abc
 import concurrent.futures
 import copy
@@ -3690,12 +3691,13 @@ class PostgresObserver:
             raise GuardViolation('Provider scope changed after it was frozen.')
         self._provider_scope = scope
 
-    def provider_scope(self) -> ProviderScope:
-        """Freeze provider scope from the current committed service version."""
+    def provider_scope_authority(self) -> dict[str, Any]:
+        """Read immutable version facts without crossing into provider I/O."""
         with self._engine.connect() as connection:
             row = connection.execute(
                 sqlalchemy.text('''
-                    SELECT s.hash AS service_hash,
+                    SELECT s.name AS service_name,
+                           s.hash AS service_hash,
                            s.resource_scope,
                            s.lifecycle_epoch AS service_lifecycle_epoch,
                            s.current_version,
@@ -3719,9 +3721,7 @@ class PostgresObserver:
         if row is None:
             raise GuardViolation(
                 'Service has no current committed provider-scope authority.')
-        scope = provider_scope_from_controller_config(row)
-        self._provider_scope = scope
-        return scope
+        return dict(row)
 
     def _retained_launch_rows(
         self,
@@ -4382,6 +4382,7 @@ _MAX_CLEANUP_CLUSTER_IDENTITIES = 4096
 class IsolatedObservationKind(str, enum.Enum):
     PROVIDER_CENSUS = 'provider-census'
     FREEZE_SCOPE = 'freeze-scope'
+    SCOPE_AUTHORITY = 'scope-authority'
     POSTGRES = 'postgres'
 
 
@@ -4394,9 +4395,69 @@ class IsolatedObservationDomain(str, enum.Enum):
 
 def _observation_domain(
         kind: IsolatedObservationKind) -> IsolatedObservationDomain:
-    if kind is IsolatedObservationKind.PROVIDER_CENSUS:
+    if kind in (IsolatedObservationKind.PROVIDER_CENSUS,
+                IsolatedObservationKind.FREEZE_SCOPE):
         return IsolatedObservationDomain.PROVIDER
-    return IsolatedObservationDomain.POSTGRES
+    if kind in (IsolatedObservationKind.SCOPE_AUTHORITY,
+                IsolatedObservationKind.POSTGRES):
+        return IsolatedObservationDomain.POSTGRES
+    typing.assert_never(kind)
+
+
+_PROVIDER_SCOPE_AUTHORITY_FIELDS = (
+    'service_name',
+    'service_hash',
+    'resource_scope',
+    'service_lifecycle_epoch',
+    'current_version',
+    'workspace',
+    'controller_config_digest',
+    'controller_config_snapshot_id',
+    'placement_catalog',
+    'yaml_content',
+)
+
+
+def _provider_scope_authority_process_payload(
+    authority: collections.abc.Mapping[str, Any],) -> dict[str, Any]:
+    """Encode only immutable version facts for the provider-only child."""
+    config_bytes = authority.get('controller_config')
+    if isinstance(config_bytes, memoryview):
+        config_bytes = config_bytes.tobytes()
+    if not isinstance(config_bytes, bytes):
+        raise GuardViolation('Committed provider-scope authority is malformed.')
+    try:
+        values = {
+            field: authority[field] for field in _PROVIDER_SCOPE_AUTHORITY_FIELDS
+        }
+    except KeyError as error:
+        raise GuardViolation(
+            'Committed provider-scope authority is malformed.') from error
+    values['controller_config_base64'] = base64.b64encode(config_bytes).decode(
+        'ascii')
+    return values
+
+
+def _provider_scope_authority_from_process_payload(
+    payload: object,) -> dict[str, Any]:
+    """Decode the exact PostgreSQL-to-provider authority handoff."""
+    expected = {*_PROVIDER_SCOPE_AUTHORITY_FIELDS, 'controller_config_base64'}
+    if not isinstance(payload,
+                      collections.abc.Mapping) or set(payload) != expected:
+        raise GuardViolation('Isolated provider-scope authority is malformed.')
+    encoded_config = payload['controller_config_base64']
+    if not isinstance(encoded_config, str):
+        raise GuardViolation('Isolated provider-scope authority is malformed.')
+    try:
+        config_bytes = base64.b64decode(encoded_config, validate=True)
+    except (ValueError, TypeError) as error:
+        raise GuardViolation(
+            'Isolated provider-scope authority is malformed.') from error
+    return {
+        field: payload[field] for field in _PROVIDER_SCOPE_AUTHORITY_FIELDS
+    } | {
+        'controller_config': config_bytes
+    }
 
 
 def _scope_process_payload(scope: ProviderScope) -> dict[str, Any]:
@@ -4615,14 +4676,25 @@ class _IsolatedObserverChildRuntime:
         if not isinstance(service_name, str) or not service_name:
             raise QualificationError(
                 'Isolated observation lacks a service name.')
+        if kind is IsolatedObservationKind.FREEZE_SCOPE:
+            authority = _provider_scope_authority_from_process_payload(
+                values.get('authority'))
+            if authority['service_name'] != service_name:
+                raise GuardViolation(
+                    'Isolated provider-scope authority names another service.')
+            scope = provider_scope_from_controller_config(authority)
+            return {'scope': _scope_process_payload(scope)}
         scope_payload = values.get('scope')
         scope = (None if scope_payload is None else
                  _scope_from_process_payload(scope_payload))
         if kind is IsolatedObservationKind.PROVIDER_CENSUS:
             return self._provider_payload(values, service_name, scope)
         postgres = self._bind_postgres(values.get('database_url'), service_name)
-        if kind is IsolatedObservationKind.FREEZE_SCOPE:
-            return {'scope': _scope_process_payload(postgres.provider_scope())}
+        if kind is IsolatedObservationKind.SCOPE_AUTHORITY:
+            return {
+                'authority': _provider_scope_authority_process_payload(
+                    postgres.provider_scope_authority())
+            }
         if scope is None:
             raise QualificationError('PostgreSQL observation lacks scope.')
         postgres.bind_provider_scope(scope)
@@ -5103,12 +5175,22 @@ class IsolatedObserverSession:
 
 
 async def _read_isolated_provider_scope(
-        *, postgres_session: IsolatedObserverSession, database_url: str,
+        *, postgres_session: IsolatedObserverSession,
+        provider_session: IsolatedObserverSession, database_url: str,
         service_name: str, deadline_monotonic: float) -> ProviderScope:
-    result = await postgres_session.request(
-        IsolatedObservationKind.FREEZE_SCOPE, {
+    authority_result = await postgres_session.request(
+        IsolatedObservationKind.SCOPE_AUTHORITY, {
             'service_name': service_name,
             'database_url': database_url,
+        }, deadline_monotonic)
+    authority = authority_result.get('authority')
+    if not isinstance(authority, dict):
+        raise QualificationError(
+            'Isolated provider-scope authority is malformed.')
+    result = await provider_session.request(
+        IsolatedObservationKind.FREEZE_SCOPE, {
+            'service_name': service_name,
+            'authority': authority,
         }, deadline_monotonic)
     payload = result.get('scope')
     if not isinstance(payload, dict):
@@ -6621,11 +6703,14 @@ async def freeze_provider_scope(args: argparse.Namespace) -> None:
     scope: ProviderScope | None = None
     postgres_session = IsolatedObserverSession(
         IsolatedObservationDomain.POSTGRES)
+    provider_session = IsolatedObserverSession(
+        IsolatedObservationDomain.PROVIDER)
     try:
         while True:
             try:
                 scope = await _read_isolated_provider_scope(
                     postgres_session=postgres_session,
+                    provider_session=provider_session,
                     database_url=database_url,
                     service_name=args.service_name,
                     deadline_monotonic=deadline)
@@ -6639,7 +6724,8 @@ async def freeze_provider_scope(args: argparse.Namespace) -> None:
                         from error
                 await AbsoluteDeadline.at(deadline).sleep(args.poll_seconds)
     finally:
-        await postgres_session.aclose()
+        await asyncio.gather(postgres_session.aclose(),
+                             provider_session.aclose())
     if scope is None:
         raise QualificationError('Provider scope was not frozen.')
     print(
@@ -8251,6 +8337,7 @@ async def _qualify_with_sessions(
             'Economic qualification does not accept an economic receipt.')
     provider_scope = await _read_isolated_provider_scope(
         postgres_session=postgres_session,
+        provider_session=provider_session,
         database_url=database_url,
         service_name=args.service_name,
         deadline_monotonic=time.monotonic() + 5 * 60)

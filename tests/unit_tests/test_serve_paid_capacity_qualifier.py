@@ -1060,6 +1060,7 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
     persisted_service['_user_specified_yaml'] = user_service_yaml
     service_yaml = yaml.safe_dump(persisted_service, sort_keys=False)
     authority = {
+        'service_name': 'paid-e2e',
         'service_hash': 'incarnation',
         'resource_scope': 'resource-scope',
         'service_lifecycle_epoch': 7,
@@ -1078,6 +1079,177 @@ def test_provider_scope_comes_from_durable_version_not_ambient(
     receipt = tmp_path / 'scope.json'
     qualifier.write_provider_scope(receipt, 'paid-e2e', scope)
     assert qualifier.read_provider_scope(receipt, 'paid-e2e') == scope
+
+
+def test_provider_scope_authority_wire_is_exact_and_round_trips_bytes():
+    authority = {
+        'service_name': 'paid-e2e',
+        'service_hash': 'incarnation',
+        'resource_scope': 'resource-scope',
+        'service_lifecycle_epoch': 7,
+        'current_version': 11,
+        'workspace': 'workspace-a',
+        'controller_config': memoryview(b'controller-config'),
+        'controller_config_digest': 'a' * 64,
+        'controller_config_snapshot_id': 'b' * 64,
+        'placement_catalog': {
+            'entries': []
+        },
+        'yaml_content': 'service: {}',
+    }
+
+    payload = qualifier._provider_scope_authority_process_payload(authority)
+
+    assert qualifier._provider_scope_authority_from_process_payload(
+        payload) == {
+            **authority,
+            'controller_config': b'controller-config',
+        }
+    with pytest.raises(qualifier.GuardViolation,
+                       match='provider-scope authority'):
+        qualifier._provider_scope_authority_from_process_payload({
+            **payload,
+            'unexpected': True,
+        })
+
+
+def test_isolated_scope_pipeline_resolves_provider_only_in_provider_domain(
+        monkeypatch):
+    authority = {
+        'service_name': 'paid-e2e',
+        'service_hash': 'incarnation',
+        'resource_scope': 'resource-scope',
+        'service_lifecycle_epoch': 7,
+        'current_version': 11,
+        'workspace': 'workspace-a',
+        'controller_config': b'controller-config',
+        'controller_config_digest': 'a' * 64,
+        'controller_config_snapshot_id': 'b' * 64,
+        'placement_catalog': {
+            'entries': []
+        },
+        'yaml_content': 'service: {}',
+    }
+    scope = _provider_scope()
+    provider_calls = []
+
+    class Postgres:
+
+        @staticmethod
+        def provider_scope_authority():
+            return authority
+
+    postgres_runtime = qualifier._IsolatedObserverChildRuntime(
+        qualifier.IsolatedObservationDomain.POSTGRES)
+    monkeypatch.setattr(postgres_runtime, '_bind_postgres',
+                        lambda *_args: Postgres())
+    monkeypatch.setattr(qualifier, 'provider_scope_from_controller_config',
+                        lambda value: provider_calls.append(value) or scope)
+
+    authority_result = postgres_runtime.execute(
+        qualifier.IsolatedObservationKind.SCOPE_AUTHORITY, {
+            'service_name': 'paid-e2e',
+            'database_url': 'postgresql://secret',
+        })
+
+    assert provider_calls == []
+    provider_runtime = qualifier._IsolatedObserverChildRuntime(
+        qualifier.IsolatedObservationDomain.PROVIDER)
+    monkeypatch.setattr(
+        provider_runtime, '_bind_postgres',
+        lambda *_args: pytest.fail('provider child opened PostgreSQL'))
+    scope_result = provider_runtime.execute(
+        qualifier.IsolatedObservationKind.FREEZE_SCOPE, {
+            'service_name': 'paid-e2e',
+            'authority': authority_result['authority'],
+        })
+
+    assert provider_calls == [{
+        **authority,
+        'controller_config': b'controller-config',
+    }]
+    assert qualifier._scope_from_process_payload(scope_result['scope']) == scope
+
+    with pytest.raises(qualifier.GuardViolation, match='names another service'):
+        provider_runtime.execute(
+            qualifier.IsolatedObservationKind.FREEZE_SCOPE, {
+                'service_name': 'another-service',
+                'authority': authority_result['authority'],
+            })
+
+
+def test_isolated_observation_domain_mapping_is_exhaustive():
+    expected = {
+        qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
+            qualifier.IsolatedObservationDomain.PROVIDER,
+        qualifier.IsolatedObservationKind.FREEZE_SCOPE:
+            qualifier.IsolatedObservationDomain.PROVIDER,
+        qualifier.IsolatedObservationKind.SCOPE_AUTHORITY:
+            qualifier.IsolatedObservationDomain.POSTGRES,
+        qualifier.IsolatedObservationKind.POSTGRES:
+            qualifier.IsolatedObservationDomain.POSTGRES,
+    }
+
+    assert set(expected) == set(qualifier.IsolatedObservationKind)
+    assert {
+        kind: qualifier._observation_domain(kind) for kind in expected
+    } == expected
+
+
+def test_production_scale_scope_authority_fits_protocol_budget():
+    # The paid qualification catalog currently contains 552 locations. Keep
+    # the transport contract exercised at that cardinality with the complete
+    # persisted location shape, rather than a compact derived projection.
+    placement_catalog = {
+        'schema_version': 1,
+        'num_nodes': 1,
+        'entries': [{
+            'location': {
+                'cloud': 'AWS' if index % 2 else 'GCP',
+                'region': f'production-region-{index:03d}',
+                'zone': f'production-region-{index:03d}-a',
+                'accelerators': {
+                    'L4': 8,
+                },
+                'use_spot': True,
+                'instance_type': 'production-l4-instance-type',
+                'image_id': None,
+                'disk_tier': None,
+                'ephemeral_storage': None,
+                'container_image': None,
+            },
+            'hourly_cost': 0.44,
+        } for index in range(552)],
+    }
+    authority = {
+        'service_name': 'paid-e2e-scale',
+        'service_hash': 'incarnation',
+        'resource_scope': 'resource-scope',
+        'service_lifecycle_epoch': 1,
+        'current_version': 1,
+        'workspace': 'mt_hybrid',
+        'controller_config': b'workspaces:\n' + b' ' * 16_384,
+        'controller_config_digest': 'a' * 64,
+        'controller_config_snapshot_id': 'b' * 64,
+        'placement_catalog': placement_catalog,
+        'yaml_content':
+            (_FIXTURE_DIR / 'service.yaml').read_text(encoding='utf-8'),
+    }
+    payload = qualifier._provider_scope_authority_process_payload(authority)
+    frame = (json.dumps(
+        {
+            'protocol_version': qualifier._ISOLATED_OBSERVER_PROTOCOL_VERSION,
+            'request_id': str(uuid.uuid4()),
+            'kind': qualifier.IsolatedObservationKind.FREEZE_SCOPE.value,
+            'arguments': {
+                'service_name': authority['service_name'],
+                'authority': payload,
+            },
+        },
+        sort_keys=True) + '\n').encode('utf-8')
+
+    assert len(frame) > 100_000
+    assert len(frame) < qualifier._ISOLATED_OBSERVER_MAX_FRAME_BYTES
 
 
 @pytest.mark.parametrize('provider', ['aws', 'gcp'])
@@ -3469,13 +3641,24 @@ def test_wait_cleanup_rejects_zero_poll_interval(monkeypatch, tmp_path):
         asyncio.run(qualifier.wait_for_cleanup(args))
 
 
-def test_freeze_scope_owns_and_closes_one_postgres_session(
+def test_freeze_scope_keeps_database_and_provider_authority_isolated(
         monkeypatch, tmp_path):
     scope = _provider_scope()
+    authority = {'committed_version_authority': 'opaque'}
 
     async def request(kind, arguments, _deadline):
-        assert kind is qualifier.IsolatedObservationKind.FREEZE_SCOPE
         assert arguments['service_name'] == 'paid-e2e'
+        if kind is qualifier.IsolatedObservationKind.SCOPE_AUTHORITY:
+            assert arguments == {
+                'service_name': 'paid-e2e',
+                'database_url': 'postgresql://unused',
+            }
+            return {'authority': authority}
+        assert kind is qualifier.IsolatedObservationKind.FREEZE_SCOPE
+        assert arguments == {
+            'service_name': 'paid-e2e',
+            'authority': authority,
+        }
         return {'scope': qualifier._scope_process_payload(scope)}
 
     sessions = _install_fake_isolated_sessions(monkeypatch, request)
@@ -3488,9 +3671,11 @@ def test_freeze_scope_owns_and_closes_one_postgres_session(
 
     asyncio.run(qualifier.freeze_provider_scope(args))
 
-    assert len(sessions) == 1
-    assert sessions[0].domain is qualifier.IsolatedObservationDomain.POSTGRES
-    assert sessions[0].requests == sessions[0].closed == 1
+    assert [session.domain for session in sessions] == [
+        qualifier.IsolatedObservationDomain.POSTGRES,
+        qualifier.IsolatedObservationDomain.PROVIDER,
+    ]
+    assert all(session.requests == session.closed == 1 for session in sessions)
 
 
 def test_pre_down_freeze_persists_identity_before_association_can_disappear(
@@ -5113,6 +5298,45 @@ def _write_immediate_observer_child(path: pathlib.Path) -> None:
                     encoding='utf-8')
 
 
+def _write_scope_boundary_observer_child(path: pathlib.Path,
+                                         scope: dict[str, Any]) -> None:
+    scope_json = json.dumps(scope, sort_keys=True)
+    path.write_text(textwrap.dedent(f'''\
+            import json
+            import os
+            import sys
+
+            scope = json.loads({scope_json!r})
+            domain = sys.argv[2]
+            print(json.dumps({{
+                'protocol_version': 1,
+                'ready': True,
+                'domain': domain,
+            }}), flush=True)
+            request = json.loads(sys.stdin.readline())
+            arguments = request['arguments']
+            if domain == 'postgres':
+                assert request['kind'] == 'scope-authority'
+                assert 'AWS_SECRET_ACCESS_KEY' not in os.environ
+                assert os.environ['SKYPILOT_DB_CONNECTION_URI'] == 'db-secret'
+                result = {{'authority': {{'scope': scope}}}}
+            else:
+                assert domain == 'provider'
+                assert request['kind'] == 'freeze-scope'
+                assert os.environ['AWS_SECRET_ACCESS_KEY'] == 'cloud-secret'
+                assert 'SKYPILOT_DB_CONNECTION_URI' not in os.environ
+                assert 'database_url' not in arguments
+                result = {{'scope': arguments['authority']['scope']}}
+            print(json.dumps({{
+                'protocol_version': 1,
+                'request_id': request['request_id'],
+                'ok': True,
+                'result': result,
+            }}), flush=True)
+        '''),
+                    encoding='utf-8')
+
+
 def _write_timeout_then_success_observer_child(path: pathlib.Path) -> None:
     path.write_text(textwrap.dedent('''\
             import json
@@ -5460,6 +5684,33 @@ def test_persistent_observer_reuses_one_spawn_and_scopes_authority(
     assert 'SKYPILOT_DB_CONNECTION_URI' not in calls[0][1]['env']
     assert calls[0][1]['env']['AWS_SECRET_ACCESS_KEY'] == 'cloud-secret'
     assert 'AWS_SECRET_ACCESS_KEY' not in calls[1][1]['env']
+
+
+def test_scope_freeze_real_process_preserves_credential_domains(
+        monkeypatch, tmp_path):
+    child = tmp_path / 'scope_boundary.py'
+    scope = _provider_scope()
+    _write_scope_boundary_observer_child(
+        child, qualifier._scope_process_payload(scope))
+    monkeypatch.setenv('SKYPILOT_DB_CONNECTION_URI', 'db-secret')
+    monkeypatch.setenv('AWS_SECRET_ACCESS_KEY', 'cloud-secret')
+
+    async def exercise():
+        postgres = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.POSTGRES, child_program=child)
+        provider = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        try:
+            return await qualifier._read_isolated_provider_scope(
+                postgres_session=postgres,
+                provider_session=provider,
+                database_url='postgresql://secret',
+                service_name='paid-e2e',
+                deadline_monotonic=time.monotonic() + 5)
+        finally:
+            await asyncio.gather(postgres.aclose(), provider.aclose())
+
+    assert asyncio.run(exercise()) == scope
 
 
 def test_persistent_observer_waiter_deadline_does_not_kill_inflight_owner(
