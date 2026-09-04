@@ -7,7 +7,7 @@ import dataclasses
 import enum
 import json
 import time
-from typing import Any, cast, TypeAlias
+from typing import Any, cast, Iterator, TypeAlias
 
 import sqlalchemy
 from sqlalchemy import orm
@@ -99,6 +99,34 @@ def get_current_controller_slot_identity() -> ControllerSlotIdentity | None:
     return controller_fencing.get_current_slot_identity()
 
 
+def _job_id_chunks(job_ids: list[int]) -> Iterator[list[int]]:
+    """Yield stable job-id chunks bounded by the shared status batch size."""
+    for offset in range(0, len(job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+        yield job_ids[offset:offset + _STATUS_CHECK_JOB_ID_CHUNK]
+
+
+def _set_controller_slot_quiescing(
+    session: orm.Session,
+    job_ids: list[int],
+    *conditions: Any,
+    require_exact_rowcount: bool = False,
+    mismatch_error: str | None = None,
+) -> None:
+    """Mark the selected jobs as quiescing with bounded UPDATE batches."""
+    for chunk in _job_id_chunks(job_ids):
+        result = session.execute(
+            sqlalchemy.update(job_info_table).where(
+                job_info_table.c.spot_job_id.in_(chunk),
+                *conditions,
+            ).values(controller_slot_quiescing=True))
+        if require_exact_rowcount and result.rowcount != len(chunk):
+            session.rollback()
+            raise ControllerLeadershipLostError(
+                mismatch_error or
+                'Managed-job ownership changed while closing request '
+                'admission.')
+
+
 def controller_job_attempt_is_current(job_id: int,
                                       identity: ControllerSlotIdentity |
                                       None = None) -> bool:
@@ -148,19 +176,16 @@ def begin_controller_request_quiescence(
             ).order_by(job_info_table.c.spot_job_id)).all()
         job_ids = [int(row.spot_job_id) for row in rows]
         if job_ids:
-            result = session.execute(
-                sqlalchemy.update(job_info_table).where(
-                    job_info_table.c.spot_job_id.in_(job_ids),
-                    job_info_table.c.controller_instance_id == identity[0],
-                    job_info_table.c.controller_generation == identity[1],
-                    job_info_table.c.controller_slot_id == identity[2],
-                    job_info_table.c.controller_slot_attempt == identity[3],
-                ).values(controller_slot_quiescing=True))
-            if result.rowcount != len(job_ids):
-                session.rollback()
-                raise ControllerLeadershipLostError(
-                    'Managed-job ownership changed while closing nested '
-                    'request admission.')
+            _set_controller_slot_quiescing(
+                session,
+                job_ids,
+                job_info_table.c.controller_instance_id == identity[0],
+                job_info_table.c.controller_generation == identity[1],
+                job_info_table.c.controller_slot_id == identity[2],
+                job_info_table.c.controller_slot_attempt == identity[3],
+                require_exact_rowcount=True,
+                mismatch_error='Managed-job ownership changed while closing '
+                'nested request admission.')
         session.commit()
         return job_ids
 
@@ -203,10 +228,7 @@ def begin_stale_controller_request_quiescence(
             else:
                 identities.add(identity)
         if job_ids:
-            session.execute(
-                sqlalchemy.update(job_info_table).where(
-                    job_info_table.c.spot_job_id.in_(job_ids)).values(
-                        controller_slot_quiescing=True))
+            _set_controller_slot_quiescing(session, job_ids)
         session.commit()
         return StaleControllerRequestQuiescencePlan(
             exact_identities=tuple(sorted(identities)),
