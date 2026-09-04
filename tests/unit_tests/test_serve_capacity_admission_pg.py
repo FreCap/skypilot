@@ -1,5 +1,7 @@
 """PostgreSQL contracts for ordered SkyServe capacity admission."""
-# pylint: disable=not-callable,protected-access,redefined-outer-name,unused-import
+# pylint: disable=contextmanager-generator-missing-cleanup,not-callable
+# pylint: disable=protected-access,redefined-outer-name,unused-import
+# pylint: disable=unused-variable,use-implicit-booleaness-not-comparison
 
 import contextlib
 import copy
@@ -2125,6 +2127,8 @@ def _publish_route_snapshot(
     response: dict,
     identities: dict,
     current_record_ids: set[str],
+    *,
+    ttl_seconds: int = 60,
 ) -> route_projection.RoutePublicationReceipt:
     identity = route_projection.RoutePublisherIdentity(
         service_name='svc',
@@ -2135,7 +2139,12 @@ def _publish_route_snapshot(
         controller_pid=123,
         controller_ip='10.0.0.5')
     return route_projection.RouteProjectionRepository(engine).publish(
-        identity, 1, response, identities, current_record_ids, ttl_seconds=60)
+        identity,
+        1,
+        response,
+        identities,
+        current_record_ids,
+        ttl_seconds=ttl_seconds)
 
 
 def _publish_successor_route(
@@ -4579,10 +4588,57 @@ def test_paid_batch_binding_rejects_mixed_plan_authority(
     assert _fused_paid_graph_counts(engine) == (0,) * 9
 
 
+_CATALOG_SCALE_TEST_AUTHORITY_TTL_SECONDS = 10 * 60
+_CATALOG_SCALE_TEST_WATCHDOG_SECONDS = 2 * 60
+
+
+def _configure_catalog_scale_authority_horizons(monkeypatch) -> None:
+    """Keep unrelated source leases outside maximum-catalog test outcomes."""
+    ttl_seconds = _CATALOG_SCALE_TEST_AUTHORITY_TTL_SECONDS
+    monkeypatch.setattr(constants, 'LB_DEMAND_REPORT_TTL_SECONDS', ttl_seconds)
+    fleet_capable = request_postgres.non_pool_launch_binding_fleet_capable
+
+    def _long_lived_fleet_capable(**kwargs):
+        kwargs['quiescence_seconds'] = ttl_seconds
+        return fleet_capable(**kwargs)
+
+    monkeypatch.setattr(request_postgres,
+                        'non_pool_launch_binding_fleet_capable',
+                        _long_lived_fleet_capable)
+
+
+def _refresh_catalog_scale_authority(
+    engine: sqlalchemy.engine.Engine,
+    incarnation: uuid.UUID,
+    *,
+    sequence: int,
+    request_count: int,
+) -> None:
+    """Renew real route and demand rows for timing-independent scale tests.
+
+    Expiry behavior has dedicated coverage.  These maximum-catalog tests assert
+    relational-work and lock-contention contracts, not shared-runner speed.
+    """
+    ttl_seconds = _CATALOG_SCALE_TEST_AUTHORITY_TTL_SECONDS
+    record_id = _route_record_id(engine)
+    route_receipt = _publish_route_snapshot(engine,
+                                            incarnation,
+                                            _route_response(),
+                                            _route_identities(record_id),
+                                            {record_id},
+                                            ttl_seconds=ttl_seconds)
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(),
+                       route_receipt,
+                       sequence=sequence,
+                       request_count=request_count))
+
+
 def test_paid_catalog_scale_transaction_has_bounded_database_round_trips(
         capacity_database, monkeypatch):
     """A 552-pool catalog and 100-member wave use a fixed SQL budget."""
-    engine, incarnation, route_receipt = capacity_database
+    engine, incarnation, _ = capacity_database
     catalog_size = 552
     member_count = paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS
     _enable_durable_intent(engine,
@@ -4591,10 +4647,11 @@ def test_paid_catalog_scale_transaction_has_bounded_database_round_trips(
                            max_replicas=member_count)
     ranks = _install_paid_wave_catalog(engine, pool_count=catalog_size)
     templates = _paid_catalog_templates(engine, ranks)
-    demand_state.ingest_report(
-        'svc', 'svc-hash', _demand_report(time.time(),
-                                          route_receipt,
-                                          sequence=2))
+    _configure_catalog_scale_authority_horizons(monkeypatch)
+    _refresh_catalog_scale_authority(engine,
+                                     incarnation,
+                                     sequence=2,
+                                     request_count=1)
     monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 1)
     monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 480)
     monkeypatch.setattr(paid_capacity, 'service_limit', lambda: member_count)
@@ -4643,7 +4700,7 @@ def test_bulk_paid_admission_allows_readiness_retry_after_lock_contention(
     quickly, then publish READY after the bulk transaction releases the rows;
     the maximum successor wave must retain a fixed SQL statement budget.
     """
-    engine, incarnation, route_receipt = capacity_database
+    engine, incarnation, _ = capacity_database
     catalog_size = 552
     successor_members = paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS
     total_target = successor_members + 1
@@ -4663,13 +4720,15 @@ def test_bulk_paid_admission_allows_readiness_retry_after_lock_contention(
     monkeypatch.setattr(paid_capacity, 'waiter_ttl_seconds', lambda: 600)
     monkeypatch.setattr(pathlib.Path, 'touch', mock.Mock())
     repository = capacity_admission.CapacityAdmissionRepository(engine)
+    _configure_catalog_scale_authority_horizons(monkeypatch)
 
     # Preparing a production-sized catalog can outlive the fixture report's
     # freshness horizon on a loaded test host.  Refresh the real durable feed
     # immediately before each admission generation.
-    demand_state.ingest_report(
-        'svc', 'svc-hash',
-        _demand_report(time.time(), route_receipt, sequence=2, request_count=1))
+    _refresh_catalog_scale_authority(engine,
+                                     incarnation,
+                                     sequence=2,
+                                     request_count=1)
     initial = repository.plan_and_admit_current(
         **_bounded_paid_wave_call_kwargs(engine, 1),
         prepared_paid_launch_templates=templates)
@@ -4713,12 +4772,10 @@ def test_bulk_paid_admission_allows_readiness_retry_after_lock_contention(
         controller_incarnation=incarnation,
         controller_owner_epoch=4)
 
-    demand_state.ingest_report(
-        'svc', 'svc-hash',
-        _demand_report(time.time(),
-                       route_receipt,
-                       sequence=3,
-                       request_count=total_target))
+    _refresh_catalog_scale_authority(engine,
+                                     incarnation,
+                                     sequence=3,
+                                     request_count=total_target)
     planner_entered = threading.Event()
     release_planner = threading.Event()
     committed = []
@@ -4728,7 +4785,8 @@ def test_bulk_paid_admission_allows_readiness_retry_after_lock_contention(
 
     def _held_planner(snapshot, supply):
         planner_entered.set()
-        if not release_planner.wait(timeout=15):
+        if not release_planner.wait(
+                timeout=_CATALOG_SCALE_TEST_WATCHDOG_SECONDS):
             raise TimeoutError('test did not release the capacity planner')
         return _current_decision(snapshot, supply, total_target)
 
@@ -4768,7 +4826,8 @@ def test_bulk_paid_admission_allows_readiness_retry_after_lock_contention(
                                         daemon=True)
     try:
         admission_thread.start()
-        assert planner_entered.wait(timeout=10)
+        assert planner_entered.wait(
+            timeout=_CATALOG_SCALE_TEST_WATCHDOG_SECONDS), errors
 
         with pytest.raises(serve_state.ReplicaSystemRecoveryMutationRejected,
                            match='PostgreSQL transaction timed out'):
@@ -4781,7 +4840,7 @@ def test_bulk_paid_admission_allows_readiness_retry_after_lock_contention(
         assert not still_not_ready.status_property.service_ready_now
     finally:
         release_planner.set()
-        admission_thread.join(timeout=15)
+        admission_thread.join(timeout=_CATALOG_SCALE_TEST_WATCHDOG_SECONDS)
         sqlalchemy.event.remove(engine, 'before_cursor_execute',
                                 _capture_admission_sql)
 
