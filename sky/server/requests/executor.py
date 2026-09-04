@@ -1486,6 +1486,20 @@ def _verified_managed_job_execution_origin(
         versions.reset_managed_job_origin(token)
 
 
+def _configure_disposable_request_database(
+        parent_process_connection_limit: int) -> None:
+    """Use transaction-scoped connections in a one-request spawned child."""
+    # A DisposableExecutor starts a fresh process that executes exactly one
+    # request. Reusing a process-local QueuePool has no cross-request benefit.
+    # Worse, every engine namespace retains one idle physical connection for
+    # the complete provider call (often minutes), making database connection
+    # cardinality scale with active launches. The parent value remains in the
+    # invocation envelope for call-shape compatibility but is intentionally not
+    # inherited by this lifecycle.
+    del parent_process_connection_limit
+    db_utils.set_max_connections(0)
+
+
 def _request_execution_wrapper(
         request_id: str,
         ignore_return_value: bool,
@@ -1508,7 +1522,7 @@ def _request_execution_wrapper(
     pid = os.getpid()
     proc = psutil.Process(pid)
     rss_begin = proc.memory_info().rss
-    db_utils.set_max_connections(num_db_connections_per_worker)
+    _configure_disposable_request_database(num_db_connections_per_worker)
     # Handle the SIGTERM signal to abort the request processing gracefully.
     # Only set up signal handlers in the main thread, as signal.signal() raises
     # ValueError if called from a non-main thread (e.g., in tests).
