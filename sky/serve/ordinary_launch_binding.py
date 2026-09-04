@@ -5391,7 +5391,8 @@ def _validate_effect_rows(
                 derive_fresh_ordinary_paid_resource_action_identity(
                     replica_id=context.replica_id,
                     replica_record_id=context.replica_record_id,
-                    cluster_name=replica.get('cluster_name')))
+                    cluster_name=_nonempty(replica.get('cluster_name'),
+                                           'cluster_name')))
         except (TypeError, ValueError) as error:
             raise OrdinaryLaunchBindingConflict(
                 'Fresh paid resource-action identity is malformed.') from error

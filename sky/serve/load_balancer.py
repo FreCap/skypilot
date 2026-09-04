@@ -1237,14 +1237,13 @@ class SkyServeLoadBalancer:
                 total_slots = self._replica_total_slots
                 planned_capacity = (
                     self._planned_logical_capacity_by_url_locked(ready_urls))
-                logical_replicas = planned_capacity is not None
                 # The configured per-replica value remains a hard safety cap,
                 # but a heterogeneous replica contributes its actual probed
                 # slots instead of one replica-count unit. Logical mode uses
                 # controller-pinned width for stable queue sizing, while the
                 # effective free-slot sum below remains observation-gated.
-                capacity_by_url = (planned_capacity
-                                   if logical_replicas else total_slots)
+                capacity_by_url = (planned_capacity if planned_capacity
+                                   is not None else total_slots)
                 queue_capacity_units = sum(
                     min(capacity_by_url.get(url, 0),
                         config['max_concurrency_per_replica'])
