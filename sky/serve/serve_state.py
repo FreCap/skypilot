@@ -6563,15 +6563,16 @@ def _lock_paid_capacity_admission_context_in_session(
     if capture_raw_service_census:
         claim_census = session.execute(
             sqlalchemy.select(
-                sqlalchemy.func.count().label('claim_count'),
+                sqlalchemy.func.count(  # pylint: disable=not-callable
+                ).label('claim_count'),
                 sqlalchemy.func.max(
                     paid_capacity_claims_table.c.replica_id).label(
                         'replica_id_highwater'),
-                sqlalchemy.func.count().filter(
-                    paid_capacity_claims_table.c.service_hash !=
-                    upstream.service_hash).label('foreign_count')).where(
-                        paid_capacity_claims_table.c.service_name ==
-                        service_name)).mappings().one()
+                sqlalchemy.func.count(  # pylint: disable=not-callable
+                ).filter(paid_capacity_claims_table.c.service_hash !=
+                         upstream.service_hash).label('foreign_count')).where(
+                             paid_capacity_claims_table.c.service_name ==
+                             service_name)).mappings().one()
         raw_service_claim_count = int(claim_census['claim_count'])
         raw_service_claim_highwater = claim_census['replica_id_highwater']
         if raw_service_claim_highwater is not None:
@@ -6587,12 +6588,13 @@ def _lock_paid_capacity_admission_context_in_session(
     if capture_raw_service_census:
         waiter_census = session.execute(
             sqlalchemy.select(
-                sqlalchemy.func.count().label('waiter_count'),
-                sqlalchemy.func.count().filter(
-                    paid_capacity_waiters_table.c.service_hash !=
-                    upstream.service_hash).label('foreign_count')).where(
-                        paid_capacity_waiters_table.c.service_name ==
-                        service_name)).mappings().one()
+                sqlalchemy.func.count(  # pylint: disable=not-callable
+                ).label('waiter_count'),
+                sqlalchemy.func.count(  # pylint: disable=not-callable
+                ).filter(paid_capacity_waiters_table.c.service_hash !=
+                         upstream.service_hash).label('foreign_count')).where(
+                             paid_capacity_waiters_table.c.service_name ==
+                             service_name)).mappings().one()
         raw_service_waiter_count = int(waiter_census['waiter_count'])
         raw_service_waiter_has_foreign_incarnation = bool(
             waiter_census['foreign_count'])
