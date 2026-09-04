@@ -1581,6 +1581,31 @@ def _paid_launch_templates_from_specs(
     return tuple(templates)
 
 
+def _materialize_paid_launch_specs_from_templates(
+    specs: tuple[paid_capacity.PaidLaunchSpec, ...]
+) -> tuple[paid_capacity.PaidLaunchSpec, ...]:
+    """Materialize test specs through the canonical post-lock path."""
+    templates_by_pool_key = {
+        template.pool_key: template
+        for template in _paid_launch_templates_from_specs(specs)
+    }
+    materialized_specs = []
+    for spec in specs:
+        submitted = json.loads(spec.prepared_launch_request)
+        request = paid_launch_request.materialize_paid_launch_request(
+            paid_launch_request.PaidLaunchBodyTemplate(
+                submitted_bytes=templates_by_pool_key[
+                    spec.pool_key].prepared_launch_body_template),
+            replica_id=spec.replica_id,
+            cluster_name=spec.cluster_name_seed,
+            launch_fence=submitted['extra_launch_context'])
+        assert request.submitted_bytes == spec.prepared_launch_request
+        materialized_specs.append(
+            dataclasses.replace(
+                spec, prepared_launch_request=request.submitted_bytes))
+    return tuple(materialized_specs)
+
+
 def _paid_launch_template(
     engine: sqlalchemy.engine.Engine,
     *,
@@ -5325,21 +5350,23 @@ def test_paid_launch_validator_rejects_inexact_interleaved_rank_occurrence(
                     placement_catalog=catalog.to_dict()))
     ranks = tuple(entry.rank for entry in catalog.ranked_entries(
         _capacity_service_spec(False).placement_contract))
-    specs = (_paid_launch_spec(engine,
-                               0,
-                               1115,
-                               pool_rank=ranks[0],
-                               pool_occurrence=0),
-             _paid_launch_spec(engine,
-                               1,
-                               1116,
-                               pool_rank=ranks[1],
-                               pool_occurrence=0),
-             _paid_launch_spec(engine,
-                               2,
-                               1117,
-                               pool_rank=ranks[0],
-                               pool_occurrence=0))
+    specs = _materialize_paid_launch_specs_from_templates((
+        _paid_launch_spec(engine,
+                          0,
+                          1115,
+                          pool_rank=ranks[0],
+                          pool_occurrence=0),
+        _paid_launch_spec(engine,
+                          1,
+                          1116,
+                          pool_rank=ranks[1],
+                          pool_occurrence=0),
+        _paid_launch_spec(engine,
+                          2,
+                          1117,
+                          pool_rank=ranks[0],
+                          pool_occurrence=0),
+    ))
     before = _paid_write_counts(engine)
 
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
@@ -5394,26 +5421,7 @@ def _equal_cost_shape_specs(
                               pool_rank=rank,
                               pool_occurrence=occurrences[rank]))
         occurrences[rank] += 1
-    raw_specs = tuple(specs)
-    templates = {
-        template.pool_key: template
-        for template in _paid_launch_templates_from_specs(raw_specs)
-    }
-    materialized = []
-    for spec in raw_specs:
-        submitted = json.loads(spec.prepared_launch_request)
-        request = paid_launch_request.materialize_paid_launch_request(
-            paid_launch_request.PaidLaunchBodyTemplate(
-                submitted_bytes=templates[
-                    spec.pool_key].prepared_launch_body_template),
-            replica_id=spec.replica_id,
-            cluster_name=spec.cluster_name_seed,
-            launch_fence=submitted['extra_launch_context'])
-        assert request.submitted_bytes == spec.prepared_launch_request
-        materialized.append(
-            dataclasses.replace(
-                spec, prepared_launch_request=request.submitted_bytes))
-    return tuple(materialized)
+    return _materialize_paid_launch_specs_from_templates(tuple(specs))
 
 
 def test_paid_launch_validator_accepts_canonical_same_cost_tier_blocks(
