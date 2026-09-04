@@ -26,6 +26,7 @@ import uuid
 import pytest
 
 from sky import exceptions
+from sky.serve import kueue_lane_observer
 from sky.serve import non_pool_launch_reconciliation
 from sky.serve import ordinary_launch_binding
 from sky.serve import replica_managers
@@ -171,9 +172,10 @@ def _patch_common(monkeypatch, events, replicas):
     monkeypatch.setattr(serve_state,
                         'reserve_replica_teardowns_running_if_capacity',
                         _reserve)
-    monkeypatch.setattr(replica_managers.kueue_lane_observer,
-                        'project_exact_pod_absence_after_teardown',
+    observer_method = 'project_exact_pod_absence_after_teardown'
+    monkeypatch.setattr(kueue_lane_observer, observer_method,
                         lambda *_args, **_kwargs: False)
+    assert observer_method not in vars(replica_managers.kueue_lane_observer)
     monkeypatch.setattr(serve_state, 'remove_ha_recovery_script',
                         lambda svc: events.append('remove_recovery_script'))
 
