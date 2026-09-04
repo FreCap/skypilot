@@ -11,7 +11,6 @@ import argparse
 import asyncio
 import dataclasses
 import enum
-import hashlib
 import json
 import math
 import os
@@ -338,19 +337,17 @@ class LifecycleReceipt:
 
     def finish(self, *, primary_error: BaseException | None,
                scope_recovery_error: BaseException | None,
+               cleanup_scope_freeze_error: BaseException | None,
                serve_down_error: BaseException | None,
                cleanup_evidence_error: BaseException | None,
-               cleanup_required: bool, cleanup_receipt: pathlib.Path) -> None:
-        cleanup_sha256 = None
-        try:
-            cleanup_sha256 = hashlib.sha256(
-                cleanup_receipt.read_bytes()).hexdigest()
-        except OSError:
-            pass
-        exact_cleanup_proven = (cleanup_evidence_error is None and
-                                cleanup_sha256 is not None
-                                if cleanup_required else None)
-        errors = (primary_error, scope_recovery_error, serve_down_error,
+               cleanup_required: bool, serve_up_acknowledged: bool,
+               validated_cleanup_sha256: str | None) -> None:
+        exact_cleanup_proven = (
+            serve_up_acknowledged and cleanup_scope_freeze_error is None and
+            cleanup_evidence_error is None and
+            validated_cleanup_sha256 is not None if cleanup_required else None)
+        errors = (primary_error, scope_recovery_error,
+                  cleanup_scope_freeze_error, serve_down_error,
                   cleanup_evidence_error)
         non_null_errors = tuple(error for error in errors if error is not None)
         if not non_null_errors:
@@ -370,14 +367,18 @@ class LifecycleReceipt:
             'scope_recovery_error_type':
                 (None if scope_recovery_error is None else
                  type(scope_recovery_error).__name__),
+            'cleanup_scope_freeze_error_type':
+                (None if cleanup_scope_freeze_error is None else
+                 type(cleanup_scope_freeze_error).__name__),
             'serve_down_error_type': (None if serve_down_error is None else
                                       type(serve_down_error).__name__),
             'cleanup_evidence_error_type':
                 (None if cleanup_evidence_error is None else
                  type(cleanup_evidence_error).__name__),
             'cleanup_evidence_required': cleanup_required,
+            'serve_up_acknowledged': serve_up_acknowledged,
             'exact_cleanup_proven': exact_cleanup_proven,
-            'cleanup_receipt_sha256': cleanup_sha256,
+            'cleanup_receipt_sha256': validated_cleanup_sha256,
             'operator_escalation_required': (cleanup_required and
                                              exact_cleanup_proven is not True),
         })
@@ -427,9 +428,19 @@ async def run_lifecycle(args: argparse.Namespace,
     """Run one disposable service and always execute its normal finalizer."""
     timeouts = (args.command_timeout_seconds, args.endpoint_timeout_seconds,
                 args.scope_timeout_seconds, args.down_timeout_seconds,
-                args.cleanup_timeout_seconds, args.poll_seconds)
+                args.cleanup_timeout_seconds, args.cleanup_zero_hold_seconds,
+                args.poll_seconds)
     if any(not math.isfinite(value) or value <= 0 for value in timeouts):
         raise LifecycleError('Lifecycle timeouts must be positive and finite.')
+    profile = qualify.PROFILES.get(args.profile)
+    if profile is None:
+        raise LifecycleError('Qualification profile is invalid.')
+    if args.cleanup_zero_hold_seconds != profile.zero_hold_seconds:
+        raise LifecycleError(
+            'Cleanup hold must equal the qualification profile policy.')
+    if args.cleanup_zero_hold_seconds >= args.cleanup_timeout_seconds:
+        raise LifecycleError(
+            'Cleanup timeout must exceed the exact-zero hold interval.')
     if (args.workspace is not None and
         (not isinstance(args.workspace, str) or not args.workspace)):
         raise LifecycleError('Workspace must be a non-empty string.')
@@ -459,9 +470,12 @@ async def run_lifecycle(args: argparse.Namespace,
     endpoint_resolver = _endpoint_resolver(endpoint_mode, lifecycle)
     primary_error: BaseException | None = None
     scope_recovery_error: BaseException | None = None
+    cleanup_scope_freeze_error: BaseException | None = None
     serve_down_error: BaseException | None = None
     cleanup_evidence_error: BaseException | None = None
+    validated_cleanup_sha256: str | None = None
     lifecycle_owned = False
+    serve_up_acknowledged = False
     scope_args = argparse.Namespace(service_name=args.service_name,
                                     output=str(artifacts.provider_scope),
                                     timeout_seconds=args.scope_timeout_seconds,
@@ -484,6 +498,7 @@ async def run_lifecycle(args: argparse.Namespace,
         await _record_stage(
             receipt, 'serve-up',
             lambda: lifecycle.up(args.service_name, artifacts.rendered_service))
+        serve_up_acknowledged = True
         await _record_stage(receipt, 'freeze-scope',
                             lambda: qualify.freeze_provider_scope(scope_args))
         endpoint_request = EndpointResolutionRequest(
@@ -509,8 +524,10 @@ async def run_lifecycle(args: argparse.Namespace,
 
         async def _finalize_owned_lifecycle() -> None:
             nonlocal scope_recovery_error
+            nonlocal cleanup_scope_freeze_error
             nonlocal serve_down_error
             nonlocal cleanup_evidence_error
+            nonlocal validated_cleanup_sha256
             if lifecycle_owned:
                 # A successful create followed by a lost acknowledgement
                 # reaches this finalizer before the normal freeze stage.
@@ -524,6 +541,21 @@ async def run_lifecycle(args: argparse.Namespace,
                             lambda: qualify.freeze_provider_scope(scope_args))
                     except BaseException as error:  # pylint: disable=broad-exception-caught
                         scope_recovery_error = error
+                if artifacts.provider_scope.exists():
+                    try:
+                        await _record_stage(
+                            receipt, 'freeze-cleanup-scope',
+                            lambda: qualify.freeze_cleanup_scope(
+                                argparse.Namespace(
+                                    service_name=args.service_name,
+                                    scope=str(artifacts.provider_scope),
+                                    receipt=str(artifacts.qualification_receipt
+                                               ),
+                                    timeout_seconds=args.scope_timeout_seconds,
+                                    poll_seconds=args.poll_seconds,
+                                    postgres_url_env=args.postgres_url_env)))
+                    except BaseException as error:  # pylint: disable=broad-exception-caught
+                        cleanup_scope_freeze_error = error
                 try:
                     await _record_stage(
                         receipt, 'serve-down',
@@ -540,14 +572,26 @@ async def run_lifecycle(args: argparse.Namespace,
                                 receipt=str(artifacts.qualification_receipt),
                                 output=str(artifacts.cleanup_receipt),
                                 timeout_seconds=args.cleanup_timeout_seconds,
+                                zero_hold_seconds=(args.
+                                                   cleanup_zero_hold_seconds),
                                 poll_seconds=args.poll_seconds,
                                 postgres_url_env=args.postgres_url_env)))
                 except BaseException as error:  # pylint: disable=broad-exception-caught
                     cleanup_evidence_error = error
-                if (cleanup_evidence_error is None and
-                        not artifacts.cleanup_receipt.is_file()):
-                    cleanup_evidence_error = LifecycleError(
-                        'Cleanup returned without a durable evidence receipt.')
+                if cleanup_evidence_error is None:
+                    try:
+                        validated_cleanup_sha256 = await _record_stage(
+                            receipt, 'validate-cleanup',
+                            lambda: asyncio.to_thread(
+                                qualify.validate_lifecycle_cleanup_evidence,
+                                cleanup_path=artifacts.cleanup_receipt,
+                                qualification_path=(artifacts.
+                                                    qualification_receipt),
+                                provider_scope_path=artifacts.provider_scope,
+                                service_name=args.service_name,
+                                profile_name=args.profile))
+                    except BaseException as error:  # pylint: disable=broad-exception-caught
+                        cleanup_evidence_error = error
 
         _, deferred_cancellation = await _complete_cancellation_resistant(
             _finalize_owned_lifecycle())
@@ -555,10 +599,12 @@ async def run_lifecycle(args: argparse.Namespace,
             primary_error = deferred_cancellation
         receipt.finish(primary_error=primary_error,
                        scope_recovery_error=scope_recovery_error,
+                       cleanup_scope_freeze_error=(cleanup_scope_freeze_error),
                        serve_down_error=serve_down_error,
                        cleanup_evidence_error=cleanup_evidence_error,
                        cleanup_required=lifecycle_owned,
-                       cleanup_receipt=artifacts.cleanup_receipt)
+                       serve_up_acknowledged=serve_up_acknowledged,
+                       validated_cleanup_sha256=validated_cleanup_sha256)
     finalizer_errors: list[BaseException] = []
     if cleanup_evidence_error is not None:
         error = LifecycleError(
@@ -570,6 +616,12 @@ async def run_lifecycle(args: argparse.Namespace,
         error = LifecycleError(
             'Provider scope recovery failed before proven cleanup.')
         error.__cause__ = scope_recovery_error
+        finalizer_errors.append(error)
+    if cleanup_scope_freeze_error is not None:
+        error = LifecycleError(
+            'Pre-down cleanup identity scope was not frozen; explicit '
+            'operator escalation is required.')
+        error.__cause__ = cleanup_scope_freeze_error
         finalizer_errors.append(error)
     if serve_down_error is not None:
         error = LifecycleError(
@@ -621,6 +673,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--cleanup-timeout-seconds',
                         type=float,
                         default=30 * 60)
+    parser.add_argument('--cleanup-zero-hold-seconds',
+                        type=float,
+                        default=6 * 60)
     parser.add_argument('--poll-seconds', type=float, default=10)
     parser.add_argument('--auth-token-env',
                         default='SKYPILOT_SERVE_E2E_AUTH_TOKEN')
