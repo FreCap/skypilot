@@ -37,7 +37,7 @@ sky/serve/serve_state.py:4305:17: ASYNC104 Cancelled (and therefore BaseExceptio
 sky/serve/serve_utils.py:4480:20: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
 sky/serve/serve_utils.py:4518:28: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
 sky/serve/serve_utils.py:4532:37: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/server/requests/executor.py:1893:9: ASYNC120 checkpoint inside except on line 1888 will discard the active exception if cancelled.
+sky/server/requests/executor.py:1907:9: ASYNC120 checkpoint inside except on line 1902 will discard the active exception if cancelled.
 sky/server/requests/process.py:1618:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
 sky/server/requests/reserved_fill_admission.py:324:17: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
 sky/server/requests/reserved_fill_admission.py:327:13: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
