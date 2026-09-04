@@ -1,5 +1,8 @@
 """Tests for controller-origin capability primitives."""
+# pylint: disable=protected-access
 
+import builtins
+import io
 import json
 import os
 import pathlib
@@ -8,6 +11,8 @@ import sys
 
 import pytest
 
+from sky.jobs import constants as managed_job_constants
+from sky.jobs import controller_fencing
 from sky.utils import controller_capability
 
 
@@ -30,8 +35,66 @@ def _authority(instance_id: str, generation: int,
             controller_capability.digest_hex(capability),
         'owner_pid': pid,
         'owner_process_start_time_ticks':
-            controller_capability._read_process_start_time_ticks(pid),
+            controller_capability.read_live_process_start_time_ticks(pid),
     }
+
+
+def _mock_process_state(monkeypatch, pid: int, state: str,
+                        start_time_ticks: int) -> None:
+    fields_after_comm = [state] + ['1'] * 18 + [str(start_time_ticks)]
+    process_stat = f'{pid} (managed job controller) {" ".join(fields_after_comm)}'
+    real_open = builtins.open
+
+    def _open(path, *args, **kwargs):
+        if (isinstance(path, (str, bytes, os.PathLike)) and
+                os.fspath(path) == f'/proc/{pid}/stat'):
+            return io.StringIO(process_stat)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, 'open', _open)
+
+
+@pytest.mark.parametrize('terminal_state', ['Z', 'X', 'x'])
+def test_published_local_owner_rejects_terminal_process_state(
+        monkeypatch, terminal_state):
+    owner = ('96d9d1f6-8ba4-402b-85f5-27db321fd504', 22)
+    pid = os.getpid()
+    start_time_ticks = controller_fencing._read_process_start_time_ticks(pid)
+    monkeypatch.setenv(managed_job_constants.CONTROLLER_OWNER_MODE_ENV_VAR,
+                       controller_fencing.LOCAL_OWNER_MODE)
+    monkeypatch.setenv(
+        managed_job_constants.CONTROLLER_OWNER_INSTANCE_ID_ENV_VAR, owner[0])
+    monkeypatch.setenv(
+        managed_job_constants.CONTROLLER_OWNER_GENERATION_ENV_VAR,
+        str(owner[1]))
+    monkeypatch.setenv(managed_job_constants.CONTROLLER_OWNER_PID_ENV_VAR,
+                       str(pid))
+    monkeypatch.setenv(
+        managed_job_constants.CONTROLLER_OWNER_START_TICKS_ENV_VAR,
+        str(start_time_ticks))
+    _mock_process_state(monkeypatch, pid, terminal_state, start_time_ticks)
+
+    assert not controller_fencing.owner_is_current(owner)
+
+
+@pytest.mark.parametrize('terminal_state', ['Z', 'X', 'x'])
+def test_persisted_local_authority_rejects_terminal_process_state(
+        tmp_path, monkeypatch, terminal_state):
+    instance_id = '96d9d1f6-8ba4-402b-85f5-27db321fd504'
+    capability = controller_capability.generate()
+    monkeypatch.setenv('SKY_RUNTIME_DIR', str(tmp_path))
+    authority_path = pathlib.Path(
+        controller_capability.local_authority_path(instance_id))
+    authority_path.parent.mkdir(parents=True, mode=0o700)
+    authority = _authority(instance_id, 22, capability)
+    authority_path.write_text(json.dumps(authority), encoding='utf-8')
+    authority_path.chmod(0o600)
+    pid = int(authority['owner_pid'])
+    start_time_ticks = int(authority['owner_process_start_time_ticks'])
+    _mock_process_state(monkeypatch, pid, terminal_state, start_time_ticks)
+
+    assert not controller_capability.local_authority_owner_is_current(
+        instance_id, 22)
 
 
 def test_capability_is_canonical_and_hash_only_authority_verifies(tmp_path):

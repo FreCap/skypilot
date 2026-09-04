@@ -22,19 +22,15 @@ logger = sky_logging.init_logger(__name__)
 _LOCK_PROBE_INTERVAL_SECONDS = 5
 _ACQUIRE_RETRY_INTERVAL_SECONDS = 5
 
-# How long to wait after acquiring the consolidation-mode lock before running
-# recovery. During a rolling update the new leader blocks on acquire() while
-# the old API server still holds the lock. The lock is released when the old
-# main process exits, but that pod's job controllers are detached subprocesses
-# (start_new_session=True), so they are not killed until the container itself
-# is torn down a moment later. If recovery ran in that residual window, it would
-# reset jobs that the still-alive (but about-to-die) old controllers can briefly
-# re-claim, stamping their soon-dead PIDs back onto the jobs;
-# update_managed_jobs_statuses would then mark those jobs FAILED_CONTROLLER (a
-# split brain across the upgrade overlap). Waiting here lets the old container
-# finish terminating before we reset and re-adopt its jobs. The recovery signal
-# file stays in place during the wait, so no controllers are started and no job
-# is marked FAILED_CONTROLLER in the meantime.
+# How long to wait after acquiring the consolidation-mode lock when durable rows
+# still show in-flight controller work. During a rolling update, detached job
+# controllers can briefly outlive the old main process. Waiting lets them drain
+# before recovery resets and re-adopts claimed jobs, while the recovery signal
+# file prevents replacement starts and false FAILED_CONTROLLER transitions.
+# Pure INACTIVE/WAITING backlog has no committed claim to drain. PostgreSQL
+# claims lock the exact generation; local claims revalidate their exact parent
+# only after taking SQLite's writer lock. Both orderings therefore make a stale
+# claim roll back or leave durable evidence for successor recovery.
 _RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS = 15
 
 
@@ -217,10 +213,10 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         if self._stop_event.is_set():
             return
 
-        # Wait before recovery only when a nonterminal row still carries
-        # evidence of in-flight or claimed controller work. Pure backlog rows
-        # have no detached controller to outlive the lock handoff, so they do
-        # not justify the fixed failover delay.
+        # Wait only when a nonterminal row still carries evidence of in-flight
+        # or claimed controller work. Pure backlog has no committed claim: the
+        # claim path serializes with PG handoff or revalidates local ownership
+        # while holding SQLite's writer lock before commit.
         if managed_job_state.has_jobs_requiring_recovery_grace_wait():
             logger.info(
                 f'Waiting {_RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS}s after '

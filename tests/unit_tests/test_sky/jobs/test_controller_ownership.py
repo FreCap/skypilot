@@ -160,7 +160,7 @@ class TestManagedJobControllerOwnership:
             'pool': None,
             'cleanup_only': False,
         }
-        assert observed_owners == [owner]
+        assert observed_owners == [owner, owner]
         with state.orm.Session(_mock_managed_jobs_db_conn) as session:
             row = session.execute(
                 sqlalchemy.select(

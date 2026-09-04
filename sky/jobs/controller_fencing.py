@@ -90,18 +90,8 @@ def persisted_job_attempt_identity(
 
 
 def _read_process_start_time_ticks(pid: int) -> int:
-    with open(f'/proc/{pid}/stat', encoding='utf-8') as stream:
-        content = stream.read()
-    comm_end = content.rfind(')')
-    if comm_end < 2 or not content.startswith(f'{pid} ('):
-        raise ValueError(f'Malformed process identity for PID {pid}.')
-    fields_after_comm = content[comm_end + 1:].split()
-    if len(fields_after_comm) <= 19:
-        raise ValueError(f'Malformed process identity for PID {pid}.')
-    ticks = int(fields_after_comm[19])
-    if ticks <= 0:
-        raise ValueError(f'Invalid process identity for PID {pid}.')
-    return ticks
+    """Read through the same live-process proof as local file authority."""
+    return controller_capability.read_live_process_start_time_ticks(pid)
 
 
 def publish_owner(owner: ControllerOwner, *, mode: str) -> None:

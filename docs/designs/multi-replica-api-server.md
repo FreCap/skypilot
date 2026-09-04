@@ -1,8 +1,8 @@
 # Production-Grade Multi-Replica API Server
 
 Status: PostgreSQL request authority and the split API/executor/controller
-topology are live and were revalidated on 2026-08-22 at Helm revision 590 /
-release 1.1.1464 with two API, three executor, and two controller Pods. Guarded
+topology are live and were revalidated on 2026-09-04 at Helm revision 769 /
+release 1.1.1665 with two API, seven executor, and two controller Pods. Guarded
 HA has no PVC or CSI mount. The private durable HA-observer canary and M5
 compatibility cleanup remain independently gated. The former executable
 RWX/EFS migration plan has been removed and is available only in Git history.
@@ -10,7 +10,7 @@ The API rolls with one surge and zero unavailable replicas; controller and
 executor roles roll in place by default so a packed control plane cannot stall
 on an unschedulable temporary Pod.
 
-Last updated: 2026-08-25
+Last updated: 2026-09-04
 
 Canonical owner: this file owns the role split, PostgreSQL request delivery,
 controller leadership, execution fencing, and availability contract. External
@@ -25,7 +25,7 @@ cutover has superseded the former EFS-to-S3 migration design.
 ## Summary
 
 Production now runs the implemented role split: two stateless API replicas,
-three active-active PostgreSQL request executors, and two active-standby
+seven active-active PostgreSQL request executors, and two active-standby
 controller workers under PostgreSQL leadership and fencing. PostgreSQL is the
 request, queue, lease, and controller-ownership authority. Bounded Pod-local
 volumes hold only reconstructible materializations; there is no shared
@@ -356,11 +356,25 @@ operational table, is the 35-day evidence authority.
   lock on the exact live `api_controller_leadership` row, so generation
   advancement either waits for the old claim to commit or fences it before it
   can write. A stale scheduler cannot claim a `WAITING` job after handoff.
-- Before a replacement managed-job scheduler starts, recovery waits for old
-  detached controllers to drain, resets every nonterminal job owned by another
-  generation, and only then launches scheduler processes. Status refresh never
-  interprets a PID from another generation as a local controller failure and
-  therefore cannot terminalize or tear down that job.
+- Local SQLite mode uses the same claim transaction but has no durable
+  leadership row. It therefore validates the exact live parent PID/process
+  birth once before selection and again after its `LAUNCHING` update has
+  acquired SQLite's writer lock, before commit. Zombie and dead procfs states
+  fail closed. Successor recovery either commits first and makes that second
+  validation fail closed, or waits behind the old writer and resets the
+  committed stale claim afterward.
+- Before a replacement managed-job scheduler starts, recovery resets every
+  nonterminal job owned by another generation and only then launches scheduler
+  processes. The bounded post-acquire drain is required only while a row still
+  carries evidence of in-flight controller work: a controller PID, a claim, or
+  a state beyond the pure `INACTIVE`/`WAITING` backlog. A pure backlog row may
+  skip the drain because every claim serializes with recovery: PostgreSQL uses
+  the live controller-generation authority, while local SQLite uses the
+  post-write parent revalidation above. An old claim either commits first and
+  leaves durable evidence for recovery, or recovery commits first and the stale
+  claim fails closed. Status refresh never interprets a PID from another
+  generation as a local controller failure and therefore cannot terminalize or
+  tear down that job.
 - Stopping a scheduler because its outer controller generation was fenced is a
   fail-stop process exit, not managed-job cancellation. The outer controller
   uses non-catchable termination for each entire detached scheduler process
@@ -1098,15 +1112,36 @@ live. Generation advancement takes the conflicting row write lock. Thus an
 old claim either commits before handoff and is identified as stale by the new
 leader, or observes the new generation and fails closed.
 
+Local SQLite mode has no leadership row to lock. Its claim proves that the
+exact parent PID/start-birth identity is still in a nonterminal procfs state
+before selecting work, writes `LAUNCHING`, and then repeats that liveness proof
+before commit while holding SQLite's writer lock. Zombie and dead states fail
+closed. If successor recovery committed first, the second proof rejects and
+rolls back the stale write. If the old write acquired the lock first, recovery
+cannot commit until that transaction finishes and then resets its stale owner.
+A point check before the write alone is not a fence and is not the accepted
+contract.
+
 The managed-job recovery gate remains present from before the inner
-consolidation lock acquisition until recovery is complete. Whenever any
-nonterminal managed job exists, the new leader pays the bounded post-acquire
-drain interval, including when the row happens to be `WAITING` with no PID.
-Recovery then resets stale-generation ownership before it starts any
-replacement scheduler. Detached scheduler processes also probe the exact
-outer generation and exit on mismatch or loss of database proof. The timing
-wait is only a drain aid; correctness comes from the transactional generation
-fence.
+consolidation lock acquisition until recovery is complete. The new leader pays
+the bounded post-acquire drain interval only when a nonterminal row carries a
+PID, a current or stale claim, or a state beyond pure `INACTIVE`/`WAITING`
+backlog. Recovery may proceed immediately for backlog rows with no PID or
+claim, then resets stale-generation ownership before it starts any replacement
+scheduler. Detached scheduler processes also probe the exact outer generation
+and exit on mismatch or loss of database proof. The timing wait is only a drain
+aid; correctness comes from the PostgreSQL generation fence or the local
+post-write proof while holding SQLite's writer lock.
+
+This optimization is the final homogeneous-fleet path, not a mixed-version
+compatibility path. Every supported predecessor PostgreSQL controller must
+already take the shared leadership-row lock before claiming a waiting job, and
+local mode must retain both exact parent PID/start-birth liveness checks around
+its write. Production satisfied its PostgreSQL prerequisite before enabling
+the optimization and uses direct-Helm, forward-only upgrades. Reintroducing or
+rolling back to a controller that can claim without the applicable fence is
+unsupported; such a compatibility window would first require restoring the
+unconditional backlog drain.
 
 Status refresh reads PID, instance, and generation from one snapshot and
 rechecks the same fields immediately before terminalization. For a
@@ -1524,8 +1559,12 @@ by HA mode.
   port, and proves an HTTP `GET /metrics` returns the labeled sample before a
   clean Uvicorn lifespan shutdown.
 - Managed-job PostgreSQL tests prove a stale outer generation cannot claim a
-  waiting job, generation advancement serializes with an in-flight claim, and
+  waiting job, generation advancement serializes with an in-flight claim in
+  both commit orders, pure backlog does not impose the drain after handoff, and
   recovery resets stale ownership before a replacement scheduler starts.
+- Local managed-job tests prove a detached slot whose exact parent-process
+  birth no longer matches cannot claim pure backlog, and that recovery resets
+  stale ownership before the local slot supervisor starts.
 - Managed-job refresh tests prove a stale-generation PID is never interpreted
   as a current local crash and cannot cause cluster teardown or
   `FAILED_CONTROLLER`. They also prove terminalization commits before provider
@@ -1895,6 +1934,10 @@ observation clock.
   an immutable compatible image/chart and the complete retained values. Native
   `helm rollback` to a stored pre-PostgreSQL or incompatible storage revision is
   unsupported.
+- A controller release that predates generation-fenced waiting-job claims is
+  also outside the rollback window. Pure backlog can skip the recovery drain
+  only while every runnable controller image retains the claim-versus-handoff
+  serialization and stale-owner fail-stop contract above.
 - After the fresh PVC-free cutover, guarded HA cannot return to `--role=all`.
   Recovery fixes the split API, executor, and controller topology forward with
   a PostgreSQL/emptyDir-capable image.
@@ -2406,3 +2449,45 @@ so an explicit integer zero and a retained release that lacks the newly added
 map both render deterministically. Focused Helm tests cover defaults, explicit
 zero overrides, null/missing retained values, schema generation, and the
 unchanged API strategy.
+
+### Review 32: generation-fenced backlog handoff
+
+A later failover optimization removed the fixed recovery drain for pure
+`INACTIVE`/`WAITING` backlog rows but initially documented only the absence of a
+PID. That was not a sufficient safety argument: an old scheduler can be paused
+before it writes a PID. The accepted steady-state invariant is instead one
+claim-versus-recovery serialization rule with backend-specific authority.
+PostgreSQL claims take a shared lock on the exact live generation before
+changing `WAITING`; generation advancement takes the conflicting write lock.
+Local SQLite claims repeat the exact live parent PID/start-birth proof after
+their update has taken the writer lock and before commit, rejecting zombie and
+dead procfs states. Therefore a claim that wins first leaves durable controller
+evidence for successor recovery, while a recovery/handoff that wins first makes
+the stale claim fail closed.
+
+The optimization is valid only after pre-fence controller images have left the
+fleet and rollback window. Production uses one forward-only Helm deployment
+authority and already satisfied that prerequisite; API protocol version 95 is
+not itself evidence of the controller fence. A read-only production audit on
+2026-09-04 recorded Helm release `skypilot/skypilot` revision 769, deployed at
+`2026-09-04T04:25:31Z`, with packaged chart version and appVersion `1.1.1665`.
+The corresponding immutable OCI chart digest is
+`sha256:50dad77002e9bf98a4c546e4bf00e8e220f525cdea2422643cb249d08aa571bc`;
+the packaged artifact's revision annotation is Git commit
+`f3f794352b2e151331fa60f52345032f2580c306`. All 2 API, 2 controller, and 7
+executor replicas were Ready with zero restarts and the same pinned image
+digest,
+`sha256:45496c04d23a55495756c87f348f4e0d243c91aa978057451d524fecd68ea18e`.
+Git tag `v1.1.1665` resolves to that same commit, which contains the PostgreSQL
+waiting-job claim fence introduced by
+`4b0c488dd8f959ac983ac2bb15ee5c84ab336c77`. Retained earlier Helm revisions
+are evidence history, not authorized rollback targets, under the direct-Helm
+forward-only contract.
+
+Real-PostgreSQL tests cover both commit orders and the recovery reset before
+successor admission. Local-mode tests cover exact live parent PID/start-birth
+rejection (including zombie/dead states), parent loss after initial validation,
+rollback after successor recovery, and recovery-before-supervisor ordering.
+The split-role unpaid E2E must pass deterministically on the exact release head.
+If compatibility with a pre-fence controller is ever restored, the
+unconditional backlog drain must be restored before that image can run.

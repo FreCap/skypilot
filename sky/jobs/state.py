@@ -1910,11 +1910,11 @@ def _latest_task_status_query_from_scope(
 def has_jobs_requiring_recovery_grace_wait() -> bool:
     """Whether HA leader handoff should pause before managed-job recovery.
 
-    The bounded drain only protects rows that can still represent in-flight
-    controller work from the previous leader. A pure backlog row
-    (``INACTIVE``/``WAITING`` with no controller PID) has no detached
-    controller to outlive the lock handoff, so delaying recovery for it only
-    adds a fixed startup penalty to backlog-only failover.
+    A pure backlog row (``INACTIVE``/``WAITING`` with no controller PID) has no
+    committed controller work to drain. PostgreSQL claims serialize with
+    generation handoff on the leadership row. Local claims revalidate the
+    exact parent after acquiring SQLite's writer lock, so successor recovery
+    cannot complete between that validation and the claim commit.
     """
     engine = _db_manager.get_engine()
     query = sqlalchemy.select(sqlalchemy.literal(True)).where(
@@ -2503,6 +2503,14 @@ async def get_waiting_job_async(
             # Update failed, rollback and return None
             await session.rollback()
             return None
+
+        # Local owner proof is point-in-time rather than a database row lock.
+        # Revalidate only after the UPDATE has acquired SQLite's writer lock:
+        # successor recovery either committed first (and this stale owner now
+        # rolls back) or must wait for this transaction, then resets any claim
+        # that commits before handoff. PostgreSQL repeats its already-held
+        # leadership-row proof here to keep one canonical claim rule.
+        await _lock_current_controller_owner_async(session, owner)
 
         # Commit the transaction
         await session.commit()

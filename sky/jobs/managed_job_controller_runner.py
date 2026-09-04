@@ -38,6 +38,10 @@ _CONTROLLER_CAPABILITY_ENV_VAR = (
 _CONTROLLER_CAPABILITY_AUTHORITY_PATH_ENV_VAR = (
     'SKYPILOT_SERVER_CONTROLLER_ORIGIN_CAPABILITY_AUTHORITY_PATH')
 _CAPABILITY_ENCODED_LENGTH = 43
+# Keep this stdlib-only copy identical to
+# ``controller_capability._TERMINAL_PROCESS_STATES``.  Importing that module
+# would violate this runner's pre-admission ``python -S`` bootstrap boundary.
+_TERMINAL_PROCESS_STATES = frozenset({'Z', 'X', 'x'})
 _PIDFD_SYSCALLS = {
     # pidfd_send_signal, pidfd_open.  These syscall numbers are shared by the
     # Linux x86-64 and asm-generic (including aarch64) tables used by supported
@@ -217,7 +221,15 @@ def _read_process_start_time_ticks(pid: int) -> int:
     fields_after_comm = content[comm_end + 1:].split()
     if len(fields_after_comm) <= 19:
         raise ValueError(f'malformed process stat identity for PID {pid}')
-    return int(fields_after_comm[19])
+    state = fields_after_comm[0]
+    if len(state) != 1:
+        raise ValueError(f'malformed process state for PID {pid}')
+    if state in _TERMINAL_PROCESS_STATES:
+        raise ProcessLookupError(f'process {pid} is no longer live')
+    start_time_ticks = int(fields_after_comm[19])
+    if start_time_ticks <= 0:
+        raise ValueError(f'invalid process start identity for PID {pid}')
+    return start_time_ticks
 
 
 def _runtime_owner_identity_matches(pid: int, started_at_ticks: int) -> bool:
