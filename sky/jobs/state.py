@@ -3,6 +3,7 @@
 # that we can easily switch to a s3-based storage.
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Iterator
 import dataclasses
 import enum
 import json
@@ -99,6 +100,34 @@ def get_current_controller_slot_identity() -> ControllerSlotIdentity | None:
     return controller_fencing.get_current_slot_identity()
 
 
+def _job_id_chunks(job_ids: list[int]) -> Iterator[list[int]]:
+    """Yield stable job-id chunks bounded by the shared status batch size."""
+    for offset in range(0, len(job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+        yield job_ids[offset:offset + _STATUS_CHECK_JOB_ID_CHUNK]
+
+
+def _set_controller_slot_quiescing(
+    session: orm.Session,
+    job_ids: list[int],
+    *conditions: Any,
+    require_exact_rowcount: bool = False,
+    mismatch_error: str | None = None,
+) -> None:
+    """Mark the selected jobs as quiescing with bounded UPDATE batches."""
+    for chunk in _job_id_chunks(job_ids):
+        result = session.execute(
+            sqlalchemy.update(job_info_table).where(
+                job_info_table.c.spot_job_id.in_(chunk),
+                *conditions,
+            ).values(controller_slot_quiescing=True))
+        if require_exact_rowcount and result.rowcount != len(chunk):
+            session.rollback()
+            raise ControllerLeadershipLostError(
+                mismatch_error or
+                'Managed-job ownership changed while closing request '
+                'admission.')
+
+
 def controller_job_attempt_is_current(job_id: int,
                                       identity: ControllerSlotIdentity |
                                       None = None) -> bool:
@@ -148,19 +177,16 @@ def begin_controller_request_quiescence(
             ).order_by(job_info_table.c.spot_job_id)).all()
         job_ids = [int(row.spot_job_id) for row in rows]
         if job_ids:
-            result = session.execute(
-                sqlalchemy.update(job_info_table).where(
-                    job_info_table.c.spot_job_id.in_(job_ids),
-                    job_info_table.c.controller_instance_id == identity[0],
-                    job_info_table.c.controller_generation == identity[1],
-                    job_info_table.c.controller_slot_id == identity[2],
-                    job_info_table.c.controller_slot_attempt == identity[3],
-                ).values(controller_slot_quiescing=True))
-            if result.rowcount != len(job_ids):
-                session.rollback()
-                raise ControllerLeadershipLostError(
-                    'Managed-job ownership changed while closing nested '
-                    'request admission.')
+            _set_controller_slot_quiescing(
+                session,
+                job_ids,
+                job_info_table.c.controller_instance_id == identity[0],
+                job_info_table.c.controller_generation == identity[1],
+                job_info_table.c.controller_slot_id == identity[2],
+                job_info_table.c.controller_slot_attempt == identity[3],
+                require_exact_rowcount=True,
+                mismatch_error='Managed-job ownership changed while closing '
+                'nested request admission.')
         session.commit()
         return job_ids
 
@@ -203,10 +229,7 @@ def begin_stale_controller_request_quiescence(
             else:
                 identities.add(identity)
         if job_ids:
-            session.execute(
-                sqlalchemy.update(job_info_table).where(
-                    job_info_table.c.spot_job_id.in_(job_ids)).values(
-                        controller_slot_quiescing=True))
+            _set_controller_slot_quiescing(session, job_ids)
         session.commit()
         return StaleControllerRequestQuiescencePlan(
             exact_identities=tuple(sorted(identities)),
@@ -1887,11 +1910,11 @@ def _latest_task_status_query_from_scope(
 def has_jobs_requiring_recovery_grace_wait() -> bool:
     """Whether HA leader handoff should pause before managed-job recovery.
 
-    Any nonterminal scheduler row can race a detached controller from the prior
-    image during a mixed-version handoff. In particular, an old scheduler can
-    claim a WAITING row after this query if that image predates durable
-    generation ownership. Keep the bounded drain for every nonterminal job
-    until the compatibility image is outside the rollback window.
+    The bounded drain only protects rows that can still represent in-flight
+    controller work from the previous leader. A pure backlog row
+    (``INACTIVE``/``WAITING`` with no controller PID) has no detached
+    controller to outlive the lock handoff, so delaying recovery for it only
+    adds a fixed startup penalty to backlog-only failover.
     """
     engine = _db_manager.get_engine()
     query = sqlalchemy.select(sqlalchemy.literal(True)).where(
@@ -1899,6 +1922,13 @@ def has_jobs_requiring_recovery_grace_wait() -> bool:
             job_info_table.c.schedule_state.is_not(None),
             job_info_table.c.schedule_state
             != ManagedJobScheduleState.DONE.value,
+            sqlalchemy.or_(
+                job_info_table.c.controller_pid.is_not(None),
+                job_info_table.c.schedule_state.not_in([
+                    ManagedJobScheduleState.INACTIVE.value,
+                    ManagedJobScheduleState.WAITING.value,
+                ]),
+            ),
         )).limit(1)
     with orm.Session(engine) as session:
         return session.execute(query).first() is not None

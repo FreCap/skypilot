@@ -4,6 +4,7 @@
 # Fixture imports are referenced indirectly by pytest, and the fixture names
 # intentionally mirror the shared helpers they exercise.
 
+import pytest
 from test_jobs_state import _mock_managed_jobs_db_conn
 from test_jobs_state import _seed_multi_task_job
 from test_jobs_state import _seed_test_jobs
@@ -116,26 +117,28 @@ class TestHasJobsRequiringRecoveryGraceWait:
 
         assert state.has_jobs_requiring_recovery_grace_wait() is True
 
-    def test_pending_only_backlog_returns_true_during_rollback_window(
-            self, _mock_managed_jobs_db_conn):
-        job_id = state.set_job_info_without_job_id(name='pending-only',
+    @pytest.mark.parametrize('schedule_state', [
+        state.ManagedJobScheduleState.INACTIVE.value,
+        state.ManagedJobScheduleState.WAITING.value,
+    ])
+    def test_pure_backlog_without_controller_claim_returns_false(
+            self, _mock_managed_jobs_db_conn, schedule_state):
+        job_id = state.set_job_info_without_job_id(name='backlog-only',
                                                    workspace='ws1',
                                                    entrypoint='ep',
                                                    pool=None,
                                                    pool_hash=None,
                                                    user_hash='user1')
         state.set_pending(job_id, 0, 'task0', '{}', '{}')
-        state.scheduler_set_waiting([job_id], '/tmp/dag.yaml', '/tmp/user.yaml',
-                                    '/tmp/env', None, 100)
+        if schedule_state == state.ManagedJobScheduleState.WAITING.value:
+            state.scheduler_set_waiting([job_id], '/tmp/dag.yaml',
+                                        '/tmp/user.yaml', '/tmp/env', None, 100)
 
-        # A detached scheduler from an adjacent image may claim this WAITING
-        # row after the snapshot without recording an outer generation. Keep
-        # the bounded drain until that compatibility image is unsupported.
-        assert state.has_jobs_requiring_recovery_grace_wait() is True
+        assert state.has_jobs_requiring_recovery_grace_wait() is False
 
     def test_waiting_job_with_controller_claim_returns_true(
             self, _mock_managed_jobs_db_conn):
-        job_id = state.set_job_info_without_job_id(name='claimed-waiting',
+        job_id = state.set_job_info_without_job_id(name='pending-only',
                                                    workspace='ws1',
                                                    entrypoint='ep',
                                                    pool=None,
@@ -149,6 +152,24 @@ class TestHasJobsRequiringRecoveryGraceWait:
             session.execute(state.job_info_table.update().where(
                 state.job_info_table.c.spot_job_id == job_id).values(
                     controller_pid=1234))
+            session.commit()
+
+        assert state.has_jobs_requiring_recovery_grace_wait() is True
+
+    def test_launching_job_without_pid_still_returns_true(
+            self, _mock_managed_jobs_db_conn):
+        job_id = state.set_job_info_without_job_id(name='launching-no-pid',
+                                                   workspace='ws1',
+                                                   entrypoint='ep',
+                                                   pool=None,
+                                                   pool_hash=None,
+                                                   user_hash='user1')
+        state.set_pending(job_id, 0, 'task0', '{}', '{}')
+
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            session.execute(state.job_info_table.update(
+            ).where(state.job_info_table.c.spot_job_id == job_id).values(
+                schedule_state=state.ManagedJobScheduleState.LAUNCHING.value))
             session.commit()
 
         assert state.has_jobs_requiring_recovery_grace_wait() is True

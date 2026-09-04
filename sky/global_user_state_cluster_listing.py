@@ -7,6 +7,7 @@ from typing import Any
 
 import sqlalchemy
 
+from sky import global_user_state_cluster_name_batches
 from sky.skylet import constants
 from sky.utils import common_utils
 from sky.utils import status_lib
@@ -37,9 +38,11 @@ def get_clusters(
     # user for backwards compatibility.
     current_user_hash = common_utils.get_user_hash()
     engine = engine_getter()
-    deduped_cluster_names = None
+    cluster_name_batches = None
     if cluster_names is not None:
-        deduped_cluster_names = list(dict.fromkeys(cluster_names))
+        cluster_name_batches = (global_user_state_cluster_name_batches.
+                                get_unique_cluster_name_batches(
+                                    cluster_names, cluster_in_query_chunk_size))
     query_fields = [
         cluster_table.c.name,
         cluster_table.c.launched_at,
@@ -85,17 +88,14 @@ def get_clusters(
                 query = query.filter(
                     cluster_table.c.user_hash.in_(user_hashes_filter))
         query = query.order_by(sqlalchemy.desc(cluster_table.c.launched_at))
-        if deduped_cluster_names is None:
+        if cluster_name_batches is None:
             rows = query.all()
-        elif len(deduped_cluster_names) <= cluster_in_query_chunk_size:
+        elif len(cluster_name_batches) == 1:
             rows = query.filter(
-                cluster_table.c.name.in_(deduped_cluster_names)).all()
+                cluster_table.c.name.in_(cluster_name_batches[0])).all()
         else:
             rows = []
-            for offset in range(0, len(deduped_cluster_names),
-                                cluster_in_query_chunk_size):
-                batch = deduped_cluster_names[offset:offset +
-                                              cluster_in_query_chunk_size]
+            for batch in cluster_name_batches:
                 rows.extend(query.filter(cluster_table.c.name.in_(batch)).all())
             rows.sort(key=lambda row: row.launched_at, reverse=True)
 

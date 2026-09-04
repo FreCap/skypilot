@@ -93,6 +93,26 @@ def _record_owner(observed_owners, owner):
     observed_owners.append(owner)
 
 
+@contextlib.contextmanager
+def _capture_quiescing_updates(engine):
+    """Capture bounded quiescing UPDATE statements on ``job_info``."""
+    statements = []
+
+    def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                               executemany):
+        del conn, cursor, parameters, context, executemany
+        sql = statement.lstrip().upper()
+        if (sql.startswith('UPDATE JOB_INFO') and
+                'CONTROLLER_SLOT_QUIESCING' in sql):
+            statements.append(statement)
+
+    event.listen(engine, 'before_cursor_execute', _before_cursor_execute)
+    try:
+        yield statements
+    finally:
+        event.remove(engine, 'before_cursor_execute', _before_cursor_execute)
+
+
 class TestManagedJobControllerOwnership:
     """Outer controller generation must be part of a scheduler claim."""
 
@@ -463,6 +483,106 @@ class TestManagedJobControllerOwnership:
             None,
             False,
         )
+
+    def test_begin_controller_request_quiescence_batches_large_job_sets(
+            self, _mock_managed_jobs_db_conn, monkeypatch):
+        owner = ('96d9d1f6-8ba4-402b-85f5-27db321fd504', 22)
+        identity = (*owner, _SLOT_ID, _SLOT_ATTEMPT)
+        job_ids = [self._seed_waiting_job() for _ in range(5)]
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id.in_(job_ids)).values(
+                    schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+                    controller_pid=111,
+                    controller_pid_started_at=1.0,
+                    controller_instance_id=owner[0],
+                    controller_generation=owner[1],
+                    controller_slot_id=_SLOT_ID,
+                    controller_slot_attempt=_SLOT_ATTEMPT,
+                    controller_slot_quiescing=False))
+            session.commit()
+
+        monkeypatch.setattr(state, '_lock_current_controller_owner',
+                            lambda _session, _owner: None)
+        monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 2)
+
+        with _capture_quiescing_updates(_mock_managed_jobs_db_conn) as updates:
+            quiesced_job_ids = state.begin_controller_request_quiescence(
+                owner, identity)
+
+        assert quiesced_job_ids == sorted(job_ids)
+        assert len(updates) == 3
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            rows = session.execute(
+                sqlalchemy.select(
+                    state.job_info_table.c.spot_job_id,
+                    state.job_info_table.c.controller_slot_quiescing,
+                ).where(
+                    state.job_info_table.c.spot_job_id.in_(job_ids)).order_by(
+                        state.job_info_table.c.spot_job_id)).all()
+        assert rows == [(job_id, True) for job_id in sorted(job_ids)]
+
+    def test_begin_stale_controller_request_quiescence_batches_large_job_sets(
+            self, _mock_managed_jobs_db_conn, monkeypatch):
+        current_owner = ('96d9d1f6-8ba4-402b-85f5-27db321fd504', 22)
+        stale_identity = (_OLD_OWNER_INSTANCE_ID, 21, _SLOT_ID, _SLOT_ATTEMPT)
+        exact_job_ids = [self._seed_waiting_job() for _ in range(3)]
+        legacy_job_ids = [self._seed_waiting_job() for _ in range(2)]
+        done_job_id = self._seed_waiting_job()
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id.in_(exact_job_ids)).values(
+                    schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+                    controller_instance_id=stale_identity[0],
+                    controller_generation=stale_identity[1],
+                    controller_slot_id=stale_identity[2],
+                    controller_slot_attempt=stale_identity[3],
+                    controller_slot_quiescing=False))
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id.in_(legacy_job_ids)).values(
+                    schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+                    controller_instance_id=None,
+                    controller_generation=None,
+                    controller_slot_id=None,
+                    controller_slot_attempt=None,
+                    controller_slot_quiescing=False))
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id == done_job_id).values(
+                    schedule_state=state.ManagedJobScheduleState.DONE.value,
+                    controller_instance_id=stale_identity[0],
+                    controller_generation=stale_identity[1],
+                    controller_slot_id=stale_identity[2],
+                    controller_slot_attempt=stale_identity[3],
+                    controller_slot_quiescing=False))
+            session.commit()
+
+        monkeypatch.setattr(state, '_lock_current_controller_owner',
+                            lambda _session, _owner: None)
+        monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 2)
+
+        with _capture_quiescing_updates(_mock_managed_jobs_db_conn) as updates:
+            plan = state.begin_stale_controller_request_quiescence(
+                current_owner)
+
+        assert plan == state.StaleControllerRequestQuiescencePlan(
+            exact_identities=(stale_identity,),
+            legacy_job_ids=tuple(sorted(legacy_job_ids)))
+        assert len(updates) == 3
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            rows = session.execute(
+                sqlalchemy.select(
+                    state.job_info_table.c.spot_job_id,
+                    state.job_info_table.c.controller_slot_quiescing,
+                ).where(
+                    state.job_info_table.c.spot_job_id.in_(
+                        exact_job_ids + legacy_job_ids +
+                        [done_job_id])).order_by(
+                            state.job_info_table.c.spot_job_id)).all()
+        expected = {job_id: True for job_id in exact_job_ids + legacy_job_ids}
+        expected[done_job_id] = False
+        assert rows == [
+            (job_id, expected[job_id]) for job_id in sorted(expected)
+        ]
 
     def test_done_orphan_is_requeued_only_when_every_task_is_terminal(
             self, _mock_managed_jobs_db_conn):

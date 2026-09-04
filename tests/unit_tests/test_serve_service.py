@@ -2078,6 +2078,15 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination(
                      paid_capacity_pool_key=paid_pool_key,
                      zero_cost_materialization_sequence=None,
                      status_property=status)
+    persisted_status = types.SimpleNamespace(**vars(status))
+    if persist_paid_transition:
+        persisted_status.sky_down_status = (
+            service.common_utils.ProcessStatus.FAILED)
+    persisted_info = mock.Mock(replica_id=3,
+                               replica_record_id=str(record_id),
+                               cluster_name=info.cluster_name,
+                               paid_capacity_pool_key=paid_pool_key,
+                               status_property=persisted_status)
     assert binding.replica_has_provider_present_cleanup_marker(
         info, require_scheduled=True)
     lifecycle_lock = mock.Mock(epoch=31)
@@ -2087,21 +2096,19 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination(
     existing_cluster_names = ({'svc-a-r3'} if cluster_record_present else set())
     expected_owner = (4242, '10.4.7.7')
 
-    def _exact_terminate(*_args, **_kwargs):
+    def _complete_exact_submission(*_args, **_kwargs):
         if not reserved_fill and persist_paid_transition:
-            binding.transition_provider_present_teardown_phase(
-                info,
-                expected=binding.ProviderPresentTeardownPhase.
-                SUBMISSION_RUNNING,
-                target=binding.ProviderPresentTeardownPhase.
-                ABSENCE_OBSERVATION_PENDING)
+            assert binding.provider_present_teardown_phase(info) is (
+                binding.ProviderPresentTeardownPhase.SUBMISSION_RUNNING)
+            assert binding.provider_present_teardown_phase(
+                persisted_info) is (
+                    binding.ProviderPresentTeardownPhase.
+                    ABSENCE_OBSERVATION_PENDING)
 
-    settled_absent = (
-        service.non_pool_launch_reconciliation.PaidTeardownObservationStep(
-            service.non_pool_launch_reconciliation.
-            PaidTeardownObservationDisposition.SETTLED_ABSENT,
-            service.non_pool_launch_reconciliation.ProviderObservation(
-                binding.ProviderEvidence.ABSENT, {})))
+    reconciliation = service.non_pool_launch_reconciliation
+    settled_absent = reconciliation.PaidTeardownObservationStep(
+        reconciliation.PaidTeardownObservationDisposition.SETTLED_ABSENT,
+        reconciliation.ProviderObservation(binding.ProviderEvidence.ABSENT, {}))
 
     with mock.patch.object(serve_state,
                            'get_replica_infos', return_value=[info]), \
@@ -2125,8 +2132,10 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination(
              return_value={3: None}), \
          mock.patch.object(serve_state,
                            'add_or_update_replica', return_value=True), \
-         mock.patch.object(serve_state,
-                           'get_replica_info_from_id', return_value=info), \
+         mock.patch.object(
+             serve_state,
+             'get_replica_info_from_id',
+             return_value=(info if reserved_fill else persisted_info)) as point_read, \
          mock.patch.object(serve_state,
                            'remove_replica', return_value=True) as remove, \
          mock.patch.object(
@@ -2143,11 +2152,11 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination(
              return_value=True), \
          mock.patch.object(service.non_pool_launch_reconciliation,
                            'advance_paid_teardown_observation',
-                           return_value=settled_absent) as observe, \
+                           return_value=settled_absent) as observe_paid, \
          mock.patch.object(
              service.replica_managers,
              'terminate_bound_non_pool_provider_present_cluster',
-             side_effect=_exact_terminate
+             side_effect=_complete_exact_submission
          ) as exact_terminate, \
          mock.patch.object(
              service.replica_managers,
@@ -2172,7 +2181,9 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination(
                     binding.OrdinaryLaunchBindingConflict,
                     match='did not leave one exact observation-pending'):
                 cleanup()
-            observe.assert_not_called()
+            exact_terminate.assert_called_once()
+            point_read.assert_called_once_with('svc', 3)
+            observe_paid.assert_not_called()
             finalize.assert_not_called()
             remove.assert_not_called()
             return
@@ -2186,13 +2197,20 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination(
     assert exact_terminate.call_args.args[4] == info.cluster_name
     if cleanup_fence is None:
         assert 'cleanup_fence' not in exact_terminate.call_args.kwargs
-        observe.assert_called_once()
+        point_read.assert_called_once_with('svc', 3)
+        observe_paid.assert_called_once()
+        assert observe_paid.call_args.args[:3] == (context, persisted_info,
+                                                   authority)
+        assert callable(observe_paid.call_args.args[3])
         finalize.assert_called_once()
         remove.assert_not_called()
+        assert binding.provider_present_teardown_phase(info) is (
+            binding.ProviderPresentTeardownPhase.SUBMISSION_RUNNING)
     else:
         assert (
             exact_terminate.call_args.kwargs['cleanup_fence'] == cleanup_fence)
-        observe.assert_not_called()
+        point_read.assert_not_called()
+        observe_paid.assert_not_called()
         finalize.assert_not_called()
         remove.assert_called_once()
     assert status.sky_launch_status == (

@@ -26,6 +26,7 @@ import { PluginSlot } from '@/plugins/PluginSlot';
 import { usePluginComponents } from '@/plugins/PluginProvider';
 import { useLogLinkExtractor } from '@/utils/externalLinks';
 import { checkGrafanaAvailability } from '@/utils/grafana';
+import { ControllerLogsSection } from '@/components/controller-logs-section';
 import { TelemetrySection } from '@/components/TelemetrySection';
 
 const router = {
@@ -944,30 +945,32 @@ it('retains 100 pending route owners without duplicate downloads', async () => {
   downloadManagedJobLogs.mockImplementation(({ jobId }) => {
     return downloads[jobId - firstJobId].promise;
   });
-  useSingleManagedJob.mockImplementation((jobId) => ({
-    jobData: {
-      jobs: [
-        {
-          ...job,
-          id: Number(jobId),
-          name: `training-${jobId}`,
-        },
-      ],
-    },
-    loading: false,
-    refreshJobData: jest.fn().mockResolvedValue(undefined),
-  }));
+  const controllerProps = {
+    isLoadingControllerLogs: false,
+    handleControllerLogsRefresh: jest.fn(),
+    setIsLoadingControllerLogs: jest.fn(),
+    setIsLoadingLogs: jest.fn(),
+    refreshControllerLogsFlag: 0,
+  };
+  const route = (offset) => {
+    const jobId = firstJobId + offset;
+    return (
+      <ControllerLogsSection
+        {...controllerProps}
+        jobId={String(jobId)}
+        detailJobData={{ ...job, id: jobId, name: `training-${jobId}` }}
+      />
+    );
+  };
 
-  router.query = { job: String(firstJobId) };
-  const { rerender } = render(<JobDetails />);
+  const { rerender } = render(route(0));
   let section = document.querySelector('#controller-logs-section');
   fireEvent.click(
     within(section).getByRole('button', { name: /Controller Logs/ })
   );
 
   for (let offset = 0; offset < routeCount; offset += 1) {
-    router.query = { job: String(firstJobId + offset) };
-    rerender(<JobDetails />);
+    rerender(route(offset));
     section = document.querySelector('#controller-logs-section');
     const [, downloadButton] = within(section).getAllByRole('button');
     expect(downloadButton).toBeEnabled();
@@ -976,8 +979,7 @@ it('retains 100 pending route owners without duplicate downloads', async () => {
   expect(downloadManagedJobLogs).toHaveBeenCalledTimes(routeCount);
 
   for (let offset = routeCount - 1; offset >= 0; offset -= 1) {
-    router.query = { job: String(firstJobId + offset) };
-    rerender(<JobDetails />);
+    rerender(route(offset));
     section = document.querySelector('#controller-logs-section');
     const [, downloadButton] = within(section).getAllByRole('button');
     expect(downloadButton).toBeDisabled();
