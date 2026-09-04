@@ -16,6 +16,7 @@ failures publish ``FAILED_CLEANUP`` and remove the script; typed provider
 uncertainty retains it so a later exact census can finish automatically.
 """
 # pylint: disable=protected-access
+import itertools
 import json
 import threading
 import types
@@ -947,7 +948,9 @@ def test_paid_teardown_observer_uses_one_deadline_and_releases_coordinator(
         'bound_non_pool_provider_present_cleanup_is_authorized',
         lambda *_args, **_kwargs: True)
 
-    clock = iter(range(0, 10_000, 100))
+    # A monotonic clock does not become undefined after a cleanup deadline.
+    # Keep advancing so legitimate bounded worker draining can read it too.
+    clock = itertools.count(0, 100)
     monkeypatch.setattr(service.time, 'monotonic', lambda: next(clock))
 
     def _unknown_observer(*_args, **kwargs):
@@ -960,6 +963,13 @@ def test_paid_teardown_observer_uses_one_deadline_and_releases_coordinator(
             non_pool_launch_reconciliation.ProviderObservation(
                 ordinary_launch_binding.ProviderEvidence.UNKNOWN, {}))
 
+    def _yield_until_observer_started(_seconds):
+        # The production loop yields here. Make that scheduling boundary
+        # deterministic even though this test advances a synthetic clock by a
+        # full retry interval on every read.
+        assert observer_started.wait(timeout=5)
+
+    monkeypatch.setattr(service.time, 'sleep', _yield_until_observer_started)
     monkeypatch.setattr(non_pool_launch_reconciliation,
                         'advance_paid_teardown_observation', _unknown_observer)
     remove_replica = mock.Mock()
