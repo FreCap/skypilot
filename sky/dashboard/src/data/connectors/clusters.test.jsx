@@ -840,40 +840,113 @@ describe('useClusterData request ownership', () => {
     expect(consoleError).toHaveBeenCalledTimes(1);
   });
 
-  it('does not let an old completion clear the new page owner', async () => {
-    jest.useFakeTimers();
-    const firstPage = deferred();
-    const secondPage = deferred();
-    dashboardCache.get
-      .mockImplementationOnce(() => firstPage.promise)
-      .mockImplementationOnce(() => secondPage.promise);
-
-    const { result } = renderHook(() =>
-      useClusterData({ ...stableOptions, refreshInterval: 1000 })
+  it('does not reread client-side data when filters reset the page', async () => {
+    dashboardCache.get.mockResolvedValue(
+      Array.from({ length: 20 }, (_, index) => ({
+        cluster: `cluster-${index}`,
+      }))
     );
+
+    const { result, rerender } = renderHook(
+      ({ filters }) =>
+        useClusterData({
+          ...stableOptions,
+          initialPage: 2,
+          filters,
+        }),
+      { initialProps: { filters: [] } }
+    );
+
+    await waitFor(() => expect(result.current.page).toBe(2));
+    expect(result.current.loading).toBe(false);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+    rerender({
+      filters: [{ property: 'Status', operator: 'contains', value: 'UP' }],
+    });
+
+    await waitFor(() => expect(result.current.page).toBe(1));
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+  });
+
+  it('resets to page 1 before fetching a new server-side filter scope', async () => {
+    window.__skyPaginationFetch = jest.fn();
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        items: [{ cluster: 'page-2' }],
+        total: 30,
+        totalPages: 3,
+        hasNext: true,
+        hasPrev: true,
+      })
+      .mockResolvedValueOnce({
+        items: [{ cluster: 'filtered-page-1' }],
+        total: 1,
+        totalPages: 1,
+        hasNext: false,
+        hasPrev: false,
+      });
+
+    const { result, rerender } = renderHook(
+      ({ filters }) =>
+        useClusterData({
+          ...stableOptions,
+          initialPage: 2,
+          filters,
+        }),
+      { initialProps: { filters: [] } }
+    );
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.page).toBe(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    dashboardCache.get.mockClear();
+
+    rerender({
+      filters: [{ property: 'Status', operator: 'contains', value: 'UP' }],
+    });
+
+    await waitFor(() => expect(result.current.page).toBe(1));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledWith(
+      window.__skyPaginationFetch,
+      [
+        expect.objectContaining({
+          page: 1,
+          filters: [{ property: 'Status', operator: 'contains', value: 'UP' }],
+        }),
+      ]
+    );
+  });
+
+  it('reuses the current client-side source read when the page changes', async () => {
+    const firstPage = deferred();
+    dashboardCache.get.mockImplementationOnce(() => firstPage.promise);
+
+    const { result } = renderHook(() => useClusterData(stableOptions));
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
 
     act(() => result.current.setPage(2));
-    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
 
     await act(async () => {
-      firstPage.resolve([{ cluster: 'stale-page-1' }]);
+      firstPage.resolve(
+        Array.from({ length: 20 }, (_, index) => ({
+          cluster: `cluster-${index}`,
+        }))
+      );
       await firstPage.promise;
     });
 
-    act(() => jest.advanceTimersByTime(1000));
-    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
-
-    await act(async () => {
-      secondPage.resolve([{ cluster: 'fresh-page-2' }]);
-      await secondPage.promise;
+    await waitFor(() => expect(result.current.page).toBe(2));
+    expect(result.current.data).toHaveLength(10);
+    expect(result.current.data[0]).toEqual({
+      cluster: 'cluster-10',
+      isHistorical: false,
     });
-    for (let i = 0; i < 4; i += 1) {
-      await act(async () => {
-        await Promise.resolve();
-      });
-    }
-    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the latest server page and suppresses a stale prefetch', async () => {

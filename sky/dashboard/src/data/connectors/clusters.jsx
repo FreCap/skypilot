@@ -722,8 +722,17 @@ export function useClusterData(options = {}) {
   const [error, setError] = useState(null);
   const [isServerPagination, setIsServerPagination] = useState(false);
   const isInitialMount = useRef(true);
+  const previousFiltersKeyRef = useRef(filtersKey);
   const requestVersionRef = useRef(0);
   const refreshInFlightRef = useRef(null);
+  const paginationPluginAvailable = isPaginationPluginAvailable();
+  const filtersChanged = previousFiltersKeyRef.current !== filtersKey;
+  const fetchEffectPageToken = paginationPluginAvailable ? page : null;
+  const serverFiltersChanged = paginationPluginAvailable
+    ? filtersChanged
+    : false;
+  const shouldDelayServerFetchForPageReset =
+    serverFiltersChanged && fetchEffectPageToken !== 1;
   const serverRequestArgs = useMemo(
     () => ({
       page,
@@ -736,16 +745,30 @@ export function useClusterData(options = {}) {
     }),
     [page, limit, showHistory, historyDays, sortBy, sortOrder, filters]
   );
+  const requestContext = useMemo(
+    () =>
+      paginationPluginAvailable
+        ? JSON.stringify(serverRequestArgs)
+        : JSON.stringify({
+            showHistory,
+            historyDays,
+          }),
+    [historyDays, paginationPluginAvailable, serverRequestArgs, showHistory]
+  );
 
   // Reset to page 1 when filters change, but skip on initial mount
   // so the page number read from the URL isn't overwritten.
   useEffect(() => {
     if (isInitialMount.current) {
       isInitialMount.current = false;
+      previousFiltersKeyRef.current = filtersKey;
       return;
     }
-    setPage(1);
-  }, [filtersKey]);
+    if (filtersChanged) {
+      previousFiltersKeyRef.current = filtersKey;
+      setPage(1);
+    }
+  }, [filtersChanged, filtersKey]);
 
   /**
    * Fetch clusters using server-side pagination (plugin path)
@@ -829,39 +852,40 @@ export function useClusterData(options = {}) {
         return;
       }
 
-      const clientTotal = allClusters.length;
-      const clientTotalPages = Math.ceil(clientTotal / limit) || 1;
-      const startIndex = (page - 1) * limit;
-      const paginatedData = allClusters.slice(startIndex, startIndex + limit);
-
-      setData(paginatedData);
       setFullData(allClusters);
-      setTotal(clientTotal);
-      setTotalPages(clientTotalPages);
-      setHasNext(page < clientTotalPages);
-      setHasPrev(page > 1);
       setIsServerPagination(false);
     },
-    [showHistory, historyDays, page, limit]
+    [showHistory, historyDays]
   );
 
-  // This callback's dependency set covers every request input (including the
-  // client-side subset), so its identity is the stable request context token.
-  const requestContext = fetchServerSide;
-  const invalidateCurrentContext = useCallback(() => {
-    if (isPaginationPluginAvailable()) {
-      const pluginFetch = getPaginationFetch();
-      if (pluginFetch) {
-        dashboardCache.invalidate(pluginFetch, [serverRequestArgs]);
-      }
-      return;
+  const fetchCurrentMode = useMemo(
+    () => (paginationPluginAvailable ? fetchServerSide : fetchClientSide),
+    [fetchClientSide, fetchServerSide, paginationPluginAvailable]
+  );
+  const invalidateServerContext = useCallback(() => {
+    const pluginFetch = getPaginationFetch();
+    if (pluginFetch) {
+      dashboardCache.invalidate(pluginFetch, [serverRequestArgs]);
     }
+  }, [serverRequestArgs]);
+  const invalidateClientContext = useCallback(() => {
     if (showHistory) {
       dashboardCache.invalidate(getClusterHistory, [null, historyDays]);
       return;
     }
     dashboardCache.invalidate(getClusters, []);
-  }, [historyDays, serverRequestArgs, showHistory]);
+  }, [historyDays, showHistory]);
+  const invalidateCurrentContext = useMemo(
+    () =>
+      paginationPluginAvailable
+        ? invalidateServerContext
+        : invalidateClientContext,
+    [
+      invalidateClientContext,
+      invalidateServerContext,
+      paginationPluginAvailable,
+    ]
+  );
 
   const startFetch = useCallback(
     (kind) => {
@@ -878,11 +902,7 @@ export function useClusterData(options = {}) {
       let refreshPromise;
       refreshPromise = (async () => {
         try {
-          if (isPaginationPluginAvailable()) {
-            await fetchServerSide(isCurrentRequest);
-          } else {
-            await fetchClientSide(isCurrentRequest);
-          }
+          await fetchCurrentMode(isCurrentRequest);
         } catch (fetchError) {
           if (isCurrentRequest()) {
             console.error(
@@ -910,7 +930,7 @@ export function useClusterData(options = {}) {
       };
       return refreshPromise;
     },
-    [fetchServerSide, fetchClientSide, invalidateCurrentContext, requestContext]
+    [fetchCurrentMode, invalidateCurrentContext, requestContext]
   );
 
   /**
@@ -940,6 +960,9 @@ export function useClusterData(options = {}) {
 
   // Fetch data on mount and when dependencies change
   useEffect(() => {
+    if (shouldDelayServerFetchForPageReset) {
+      return;
+    }
     fetchData();
     return () => {
       requestVersionRef.current += 1;
@@ -947,7 +970,12 @@ export function useClusterData(options = {}) {
         refreshInFlightRef.current = null;
       }
     };
-  }, [fetchData, requestContext]);
+  }, [
+    fetchData,
+    fetchEffectPageToken,
+    requestContext,
+    shouldDelayServerFetchForPageReset,
+  ]);
 
   const refreshWhenVisible = useCallback(
     (source) => {
@@ -971,19 +999,33 @@ export function useClusterData(options = {}) {
     setPage(1);
   }, []);
 
+  const clientTotalPages = Math.ceil(fullData.length / limit) || 1;
+  const clientPage = Math.min(page, clientTotalPages);
+  const clientStartIndex = (clientPage - 1) * limit;
+  const clientData = fullData.slice(clientStartIndex, clientStartIndex + limit);
+  const visibleClientPage = loading ? page : clientPage;
+
+  useEffect(() => {
+    if (!paginationPluginAvailable && !loading && page !== clientPage) {
+      setPage(clientPage);
+    }
+  }, [clientPage, loading, page, paginationPluginAvailable]);
+
   return {
     // Data - current page slice (paginated)
-    data,
+    data: paginationPluginAvailable ? data : clientData,
     // allData - full dataset for client-side filtering (in server mode, same as data)
     allData: fullData,
-    total,
+    total: paginationPluginAvailable ? total : fullData.length,
 
     // Pagination state
-    page,
+    page: paginationPluginAvailable ? page : visibleClientPage,
     limit,
-    totalPages,
-    hasNext,
-    hasPrev,
+    totalPages: paginationPluginAvailable ? totalPages : clientTotalPages,
+    hasNext: paginationPluginAvailable
+      ? hasNext
+      : visibleClientPage < clientTotalPages,
+    hasPrev: paginationPluginAvailable ? hasPrev : visibleClientPage > 1,
 
     // Pagination actions
     setPage,
@@ -993,6 +1035,6 @@ export function useClusterData(options = {}) {
     loading,
     error,
     refresh: refreshData,
-    isServerPagination,
+    isServerPagination: paginationPluginAvailable,
   };
 }
