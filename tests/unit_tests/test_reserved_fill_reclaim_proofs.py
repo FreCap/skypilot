@@ -2187,27 +2187,44 @@ def test_multiprocess_renewers_share_receipt_and_launch_reads(
 
 
 def test_aged_identical_receipt_refreshes_once_without_revoking_reference(
-        proof_engine):
+        proof_engine, monkeypatch):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    worker_count = 8
+    publication_barrier = threading.Barrier(worker_count)
     calls = 0
     calls_lock = threading.Lock()
+    original_wait = repository._wait_for_published_receipt
 
     def prove():
         nonlocal calls
         with calls_lock:
             calls += 1
-        time.sleep(0.1)
+            call_number = calls
+        # The seed is call one. Hold the refresh owner until every other
+        # contender has lost election and physically entered receipt polling.
+        if call_number == 2:
+            publication_barrier.wait(
+                timeout=reclaim.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
         return _proof_candidate()
+
+    def wait_after_losing_election(**wait_kwargs):
+        publication_barrier.wait(
+            timeout=reclaim.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
+        return original_wait(**wait_kwargs)
+
+    monkeypatch.setattr(repository, '_wait_for_published_receipt',
+                        wait_after_losing_election)
 
     kwargs = {
         'identity': _identity(),
         'gate_generation': _GATE_GENERATION,
         'kubernetes_context': _CONTEXT,
-        'deadline_monotonic': time.monotonic() + 5,
         'prove': prove,
         'validate': _accept_payload,
     }
-    first = repository.renew(**kwargs)
+    first = repository.renew(
+        **kwargs,
+        deadline_monotonic=reclaim.new_provider_proof_operation_deadline())
     assert first.publication_observed
     with proof_engine.begin() as connection:
         connection.execute(
@@ -2222,13 +2239,18 @@ def test_aged_identical_receipt_refreshes_once_without_revoking_reference(
             })
 
     def refresh():
-        return repository.renew(**{
+        return repository.renew(
             **kwargs,
-            'deadline_monotonic': time.monotonic() + 5,
-        })
+            deadline_monotonic=reclaim.new_provider_proof_operation_deadline())
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        refreshed = tuple(executor.map(lambda _: refresh(), range(8)))
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=worker_count) as executor, contextlib.ExitStack(
+            ) as barrier_cleanup:
+        # ExitStack closes before the executor, so a failed assertion cannot
+        # strand workers at the test-only barrier during executor shutdown.
+        barrier_cleanup.callback(publication_barrier.abort)
+        refreshed = tuple(executor.map(lambda _: refresh(),
+                                       range(worker_count)))
     assert calls == 2
     assert any(item.publication_observed for item in refreshed)
     refreshed_nonces = {item.reference.receipt_nonce for item in refreshed}

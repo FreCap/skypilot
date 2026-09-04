@@ -4899,11 +4899,20 @@ class TestZeroCostSelection(unittest.TestCase):
         })
         self.assertEqual(self.placer.zero_cost_locations(), [self.k8s])
 
-    def test_equal_cost_reuses_first_candidate(self):
-        other = _make_location('research-ctx-2', 'free')
-        placer = _make_placer({self.k8s: 0.0, other: 0.0, self.paid: 0.2})
+    def test_equal_cost_uses_canonical_location_order(self):
+        earlier = make_location('research-ctx',
+                                accelerators={'A100': 1},
+                                use_spot=False,
+                                cloud_name='Kubernetes')
+        later = make_location('research-ctx-2',
+                              accelerators={'A100': 1},
+                              use_spot=False,
+                              cloud_name='Kubernetes')
+        # Reverse insertion order: equal-cost selection follows the canonical
+        # location identity, never dictionary or allocator order.
+        placer = _make_placer({later: 0.0, earlier: 0.0, self.paid: 0.2})
         selected = placer.select_next_zero_cost_location()
-        self.assertEqual(selected, self.k8s)
+        self.assertEqual(selected, earlier)
 
 
 class TestProtocolV2DurableLaunchFence(unittest.TestCase):
