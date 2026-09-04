@@ -20,7 +20,6 @@ import pathlib
 import secrets
 import shutil
 import socket
-import sys
 import threading
 import time
 import traceback
@@ -209,9 +208,9 @@ def _handle_signal(service_name: str,
                         # same row-lock transaction; no racy second CAS exists.
                         persisted = True
                 except Exception as e:  # pylint: disable=broad-except
-                    # A DB blip must not escape into _start's destructive
-                    # unexpected-exception finalizer. Keep the signal durable
-                    # and retry the exact-owner CAS on the next tick.
+                    # A DB blip must not consume an uncommitted signal. Keep
+                    # it durable and retry the exact-owner CAS on the next
+                    # tick.
                     logger.warning(f'Failed to persist terminate signal for '
                                    f'{service_name!r}: '
                                    f'{common_utils.format_exception(e)}; '
@@ -1114,7 +1113,8 @@ def _orphan_exit(
         except Exception:  # pylint: disable=broad-except
             logger.warning('Failed to kill children during orphan exit; '
                            'proceeding with os._exit anyway')
-    # os._exit() bypasses the try/finally which would call _cleanup.
+    # os._exit() bypasses the parent supervisor's remaining control flow. An
+    # orphan never owns whole-service cleanup authority.
     os._exit(0)  # pylint: disable=protected-access
 
 
@@ -1258,14 +1258,10 @@ def _bail_on_boot_failure(service_name: str,
                           component: str = 'Controller subprocess') -> None:
     """Retryable exit when a service component cannot finish booting.
 
-    Critical contract: must NOT fall through to `_start`'s outer
-    `try/finally`. That finally runs destructive teardown and may conditionally
-    remove the service row, turning a transient boot failure into permanent
-    data loss for the service.
-
-    Kill the controller subprocess we spawned, then os._exit(1) to
-    bypass everything. The daemon's next ha_recovery iteration sees
-    the (preserved) recovery script and retries with a fresh _start.
+    Kill the controller subprocess we spawned, then os._exit(1). The daemon's
+    next ha_recovery iteration sees the preserved recovery script and retries
+    with a fresh _start. Whole-service cleanup is independently gated on a
+    durable SHUTTING_DOWN owner row.
     """
     logger.error(f'{component} failed to become ready within '
                  f'{timeout_seconds}s for {service_name}: {boot_err}. '
@@ -1290,9 +1286,9 @@ def _bail_on_boot_failure(service_name: str,
             logger.warning(
                 'Failed to kill controller subprocess during boot-failure '
                 'bailout; proceeding with os._exit anyway.')
-    # os._exit() bypasses the outer try/finally. The short-lived port lock was
-    # already released after socket transfer; process exit closes the child's
-    # reserved socket if controller startup did not consume it.
+    # The short-lived port lock was already released after socket transfer;
+    # process exit closes the child's reserved socket if controller startup
+    # did not consume it.
     os._exit(1)  # pylint: disable=protected-access
 
 
@@ -1655,9 +1651,8 @@ def _respawn_controller(
     stale port. controller_pid/ip (the live parent) are unchanged.
 
     Returns (controller_process, controller_port) on success, or None on
-    failure (retry next tick). Never raises into _start's destructive cleanup.
-    The external LB continues serving its last routing view while the proxy
-    reports 503 during the controller gap.
+    failure (retry next tick). The external LB continues serving its last
+    routing view while the proxy reports 503 during the controller gap.
     """
     if maintenance.is_controller_hold_active():
         try:
@@ -3027,12 +3022,10 @@ def _start(service_name: str,
 
     controller_process = None
     external_lb_healthy = not external_lb
-    # Tracks whether we exited the main loop via the user-initiated
-    # SHUTTING_DOWN signal. We can't recover this from sys.exc_info() in
-    # the finally block — Python clears the active exception when the
-    # corresponding `except` clause catches it, so sys.exc_info() in
-    # the finally returns (None, None, None) for the caught path.
-    shutdown_via_user_signal = False
+    # An exception is only an in-process control-flow signal. Whole-service
+    # cleanup additionally requires the exact owner row to retain the durable
+    # SHUTTING_DOWN intent after the local controller child has stopped.
+    teardown_requested = False
     try:
         if not is_recovery:
             try:
@@ -3100,9 +3093,8 @@ def _start(service_name: str,
                     raise RuntimeError(
                         'controller exited during startup publication')
             except RuntimeError as boot_err:
-                # Bail without falling through to the outer try/finally, which
-                # would enter destructive cleanup and possibly remove the
-                # service incarnation. See helper for details.
+                # Exit promptly so HA can retry the preserved service. See the
+                # helper for the boot-failure recovery contract.
                 _bail_on_boot_failure(
                     service_name, controller_process,
                     constants.SERVICE_REGISTER_TIMEOUT_SECONDS, boot_err)
@@ -3193,10 +3185,9 @@ def _start(service_name: str,
         # swap on the preclaimed hash/PID/IP owner tuple so a stale recovery
         # racing a purge + same-name re-up cannot write to the successor's row
         # and prematurely unblock its registration. A
-        # transient DB error must not reach _start's destructive cleanup and
-        # must not starve the NULL case either, so the attempt is retried
-        # from the supervision loop until the CAS resolves (True: written;
-        # False: ownership lost, someone else owns the row now).
+        # transient DB error must not starve the NULL case, so the attempt is
+        # retried from the supervision loop until the CAS resolves (True:
+        # written; False: ownership lost, someone else owns the row now).
         lb_port_republish_pending = is_recovery and external_lb
         if lb_port_republish_pending:
             try:
@@ -3270,8 +3261,8 @@ def _start(service_name: str,
                                   pod_ip, resource_scope):
                 _orphan_exit(controller_process)
             loop_count += 1
-            # Self-heal the external LB objects. Best-effort: a k8s API error
-            # must never reach _start's destructive cleanup.
+            # Self-heal the external LB objects. Best-effort: a Kubernetes API
+            # error must not interrupt controller supervision.
             if (external_lb and
                     loop_count % external_lb_ensure_interval_seconds == 0):
                 if lb_port_republish_pending:
@@ -3396,50 +3387,39 @@ def _start(service_name: str,
                     needs_status_heal = True
             time.sleep(1)
     except exceptions.ServeUserTerminatedError:
-        logger.debug(f'Caught ServeUserTerminatedError for '
-                     f'{service_name}; setting status=SHUTTING_DOWN')
-        shutdown_via_user_signal = True
+        logger.debug(f'Caught ServeUserTerminatedError for {service_name}; '
+                     'checking durable SHUTTING_DOWN authority.')
+        teardown_requested = True
     finally:
-        # Log why we're entering the destructive cleanup path. Finalization
-        # can remove the HA recovery script and the entire service row, so an
-        # audit line (especially with the active exception type if any) is
-        # worth it for future post-mortems.
-        # The path (`_wait_for_controller_ready` timeout) and
-        # `_orphan_exit` both bypass this finally entirely via
-        # os._exit; anything else reaching here is either the user
-        # signal (flag above) or an unexpected propagating exception.
-        exc_type, exc_value, _ = sys.exc_info()
-        if shutdown_via_user_signal:
-            logger.info(f'_start for {service_name} entering cleanup path '
-                        '(user-initiated SHUTTING_DOWN).')
-        elif exc_type is None:
-            # _start's `while True` only exits via exception or
-            # os._exit, so a None exc_type here is unexpected. Log it
-            # at WARN so a future code path that adds a `return`
-            # doesn't silently slip into destructive cleanup unnoticed.
-            logger.warning(
-                f'_start for {service_name} entering cleanup path with '
-                'no exception and no user signal — this is unexpected; '
-                '_cleanup is destructive.')
-        else:
-            logger.warning(
-                f'_start for {service_name} entering cleanup path due to '
-                f'unexpected exception {exc_type.__name__}: {exc_value}. '
-                f'finalization may delete the HA recovery script and service '
-                f'row.')
+        # This is local process cleanup only. It deliberately runs for every
+        # exit and carries no authority to mutate service/provider state.
         if controller_process is not None:
-            subprocess_utils.kill_children_processes(
-                parent_pids=[controller_process.pid], force=True)
+            _kill_process(controller_process)
             controller_process.join()
 
-        # Run cleanup + finalize. _run_cleanup_and_finalize catches any error
-        # from _cleanup and sets FAILED_CLEANUP instead, so the service can
-        # still be terminated later (a crash here would otherwise leave no
-        # process to handle the user signal). Shared with the recovery-resume
-        # path above.
-        _run_cleanup_and_finalize(service_name, service_spec,
-                                  service_dir, job_id, service_incarnation,
-                                  os.getpid(), pod_ip, resource_scope)
+    if not teardown_requested:
+        return
+    teardown_owner = serve_state.get_service_controller_owner(
+        service_name, include_lb_state=True)
+    expected_owner = (os.getpid(), pod_ip)
+    owner_matches = (teardown_owner is not None and
+                     teardown_owner.get('hash') == service_incarnation and
+                     (teardown_owner.get('controller_pid'),
+                      teardown_owner.get('controller_ip')) == expected_owner and
+                     teardown_owner.get('status')
+                     == serve_state.ServiceStatus.SHUTTING_DOWN)
+    if not owner_matches:
+        raise RuntimeError(
+            f'Refusing destructive cleanup for {service_name!r} without '
+            'durable SHUTTING_DOWN authority for the exact controller owner.')
+
+    logger.info(f'_start for {service_name} entering cleanup path under '
+                'durable user-initiated SHUTTING_DOWN authority.')
+    # The recovery-resume path above enters the same finalizer only after
+    # claiming an already-durable teardown row.
+    _run_cleanup_and_finalize(service_name, service_spec,
+                              service_dir, job_id, service_incarnation,
+                              os.getpid(), pod_ip, resource_scope)
 
 
 if __name__ == '__main__':
