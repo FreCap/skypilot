@@ -437,6 +437,19 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
 
 ### Async Poller and Freshness Safety
 
+- Keep qualification and safety proofs acyclic. A producer may create work, a
+  reducer may commit its terminal evidence, and an observer may read that
+  evidence; an observer must never cancel, shorten, complete, resubmit, or
+  otherwise mutate the work whose outcome it is proving.
+- For a multi-actor proof, document an explicit capability matrix and one-way
+  dependency graph. Finalizers consume the frozen ownership scope only after
+  every already-offered item has reached its terminal reducer; an observer
+  verdict is not teardown authority and must not be a prerequisite for item
+  completion.
+- Exercise the production proof coordinator with injected observer failure,
+  timeout, and caller cancellation. These cases must drain all already-offered
+  work, publish terminal evidence, run the scope-fenced finalizer exactly once,
+  and preserve the original proof verdict without leaking provider resources.
 - Model provider mutation submission and provider-state observation as separate
   phases with separate bounded capacity. A scarce mutation slot may cover the
   exact native submit call, but must never remain occupied while polling for
