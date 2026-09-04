@@ -72,10 +72,10 @@ class GuardViolation(QualificationError):
 
 
 _PROVIDER_SCOPE_SCHEMA_VERSION = 6
-_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 12
+_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 13
 _CLEANUP_RECEIPT_SCHEMA_VERSION = 2
 _AGGREGATE_RECEIPT_SCHEMA_VERSION = 3
-_CLEANUP_COMPATIBLE_QUALIFICATION_SCHEMAS = frozenset({10, 11, 12})
+_CLEANUP_COMPATIBLE_QUALIFICATION_SCHEMAS = frozenset({10, 11, 12, 13})
 _CAMPAIGN_LOAD_WINDOW_SECONDS = (
     serve_constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
 _AWS_CENSUS_MAX_WORKERS = 8
@@ -5042,10 +5042,48 @@ def _has_exact_campaign_demand(telemetry: RequestTelemetry,
             telemetry.queue_depth + telemetry.in_flight_requests > 0)
 
 
-def _resident_campaign_size(telemetry: RequestTelemetry) -> int:
-    if (telemetry.queue_depth is None or telemetry.in_flight_requests is None):
-        return -1
-    return telemetry.queue_depth + telemetry.in_flight_requests
+def _attributed_resident_campaign_size(
+        telemetry: RequestTelemetry, baseline: RequestTelemetry) -> int | None:
+    """Return exact resident demand without requiring complete occupancy.
+
+    Queue depth and the PostgreSQL active-ledger delta are closed-world counts
+    for this isolated campaign.  Replica occupancy is a separate projection:
+    when some replica probes are unavailable, its confirmed gauges are only
+    lower bounds and its aggregate gauges must be absent.  Such a sample can
+    prove that demand remains resident while scaling, but cannot prove exact
+    processing or zero; those gates continue to require ``reason=complete``.
+    """
+    if (not baseline.is_exact_zero() or
+            not math.isfinite(telemetry.observed_at) or
+            telemetry.observed_at <= 0 or telemetry.state != 'fresh' or
+            not telemetry.compatibility_complete or
+            telemetry.queue_depth is None or
+            telemetry.confirmed_in_flight_requests is None or
+            telemetry.confirmed_processing_requests is None):
+        return None
+    active_delta = telemetry.ledger_active - baseline.ledger_active
+    if (active_delta < 0 or telemetry.confirmed_processing_requests
+            > telemetry.confirmed_in_flight_requests or
+            telemetry.confirmed_in_flight_requests > active_delta):
+        return None
+    if telemetry.reason == 'complete':
+        if (telemetry.in_flight_requests is None or
+                telemetry.processing_requests is None or
+                telemetry.confirmed_in_flight_requests
+                != telemetry.in_flight_requests or
+                telemetry.confirmed_processing_requests
+                != telemetry.processing_requests or
+                telemetry.processing_requests > telemetry.in_flight_requests or
+                active_delta != telemetry.in_flight_requests):
+            return None
+    elif telemetry.reason == 'in_flight_incomplete':
+        # A partial projection must not masquerade lower bounds as totals.
+        if (telemetry.in_flight_requests is not None or
+                telemetry.processing_requests is not None):
+            return None
+    else:
+        return None
+    return telemetry.queue_depth + active_delta
 
 
 async def _wait_for_scale_stimulus(
@@ -5075,12 +5113,12 @@ async def _wait_for_scale_stimulus(
         except Exception:  # pylint: disable=broad-except
             await asyncio.sleep(profile.poll_seconds)
             continue
-        if (telemetry.is_fresh_complete() and
-                _resident_campaign_size(telemetry) > expected_resident):
+        resident = _attributed_resident_campaign_size(telemetry, baseline)
+        if (_has_exact_campaign_demand(telemetry, baseline) and
+                resident is not None and resident > expected_resident):
             raise QualificationError(
                 'Held campaign prefix contains unattributed demand.')
-        if (_has_exact_campaign_demand(telemetry, baseline) and
-                _resident_campaign_size(telemetry) == expected_resident):
+        if resident == expected_resident:
             receipt.request_telemetry('scale-stimulus', telemetry)
             return telemetry
         await asyncio.sleep(profile.poll_seconds)
@@ -5126,8 +5164,8 @@ async def _wait_for_positive_request_telemetry(
                 telemetry.confirmed_processing_requests > 0 and
                 telemetry.ledger_total > baseline.ledger_total and
                 telemetry.ledger_count('ACCEPTED') > 0 and
-            (profile.name != 'scale' or _resident_campaign_size(telemetry)
-             == scale_stimulus_count(profile))):
+            (profile.name != 'scale' or _attributed_resident_campaign_size(
+                telemetry, baseline) == scale_stimulus_count(profile))):
             receipt.request_telemetry('positive', telemetry)
             return telemetry
         await asyncio.sleep(profile.poll_seconds)
@@ -5242,7 +5280,8 @@ async def _wait_for_scale(
         if active_delta < 0 or active_delta > expectation.exact_request_count:
             raise QualificationError(
                 'Scale demand has contradictory exact dispatched identities.')
-        if not _has_exact_campaign_demand(telemetry, baseline):
+        resident = _attributed_resident_campaign_size(telemetry, baseline)
+        if resident is None:
             # The LB demand report and request ledger are independent durable
             # publications.  A queue-to-dispatch handoff can therefore be
             # visible in either projection first.  Such a sample proves
@@ -5250,19 +5289,19 @@ async def _wait_for_scale(
             # exact samples are paired with provider observations below.
             await asyncio.sleep(profile.poll_seconds)
             continue
-        if profile.name == 'scale':
-            resident = _resident_campaign_size(telemetry)
-            stimulus = scale_stimulus_count(profile)
-            if resident > stimulus:
-                raise QualificationError(
-                    'Scale demand exceeds the bounded sliding window.')
-            if resident < stimulus:
-                # A truthful terminal callback precedes offering the next
-                # immutable identity.  The small refill gap is not a provider
-                # sample; wait for the exact window without delaying either
-                # transition.
-                await asyncio.sleep(profile.poll_seconds)
-                continue
+        stimulus = (scale_stimulus_count(profile)
+                    if profile.name == 'scale' else 1)
+        if (_has_exact_campaign_demand(telemetry, baseline) and
+                resident > stimulus):
+            raise QualificationError(
+                'Scale demand exceeds the bounded sliding window.')
+        if resident < stimulus:
+            # A truthful terminal callback precedes offering the next
+            # immutable identity.  The small refill gap is not a provider
+            # sample; wait for the exact window without delaying either
+            # transition.
+            await asyncio.sleep(profile.poll_seconds)
+            continue
         scale_iteration_id += 1
         receipt.request_telemetry('scale',
                                   telemetry,
@@ -5828,6 +5867,51 @@ def _telemetry_is_exactly_attributed(sample: collections.abc.Mapping[str, Any],
             ledger_active - baseline_active == sample['in_flight_requests'])
 
 
+def _telemetry_attributed_resident_size(sample: collections.abc.Mapping[str,
+                                                                        Any],
+                                        baseline_active: int) -> int | None:
+    """Reduce serialized scale evidence using the production capability rule."""
+    if (sample.get('state') != 'fresh' or
+            sample.get('compatibility_complete') is not True or
+            type(sample.get('queue_depth')) is not int or
+            sample['queue_depth'] < 0 or
+            type(sample.get('confirmed_in_flight_requests')) is not int or
+            sample['confirmed_in_flight_requests'] < 0 or
+            type(sample.get('confirmed_processing_requests')) is not int or
+            sample['confirmed_processing_requests'] < 0):
+        return None
+    counts = _ledger_counts(sample)
+    ledger_active = sum(counts.get(state, 0) for state in _ASYNC_ACTIVE_STATES)
+    ledger_total = sum(counts.values())
+    if (sample.get('ledger_active') != ledger_active or
+            sample.get('ledger_total') != ledger_total or
+            sample.get('ledger_succeeded') != counts.get('SUCCEEDED', 0)):
+        return None
+    active_delta = ledger_active - baseline_active
+    confirmed_in_flight = sample['confirmed_in_flight_requests']
+    confirmed_processing = sample['confirmed_processing_requests']
+    if (active_delta < 0 or confirmed_processing > confirmed_in_flight or
+            confirmed_in_flight > active_delta):
+        return None
+    reason = sample.get('reason')
+    if reason == 'complete':
+        in_flight = sample.get('in_flight_requests')
+        processing = sample.get('processing_requests')
+        if (type(in_flight) is not int or in_flight < 0 or
+                type(processing) is not int or processing < 0 or
+                confirmed_in_flight != in_flight or
+                confirmed_processing != processing or processing > in_flight or
+                active_delta != in_flight):
+            return None
+    elif reason == 'in_flight_incomplete':
+        if (sample.get('in_flight_requests') is not None or
+                sample.get('processing_requests') is not None):
+            return None
+    else:
+        return None
+    return sample['queue_depth'] + active_delta
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class _RequestEvidence:
     """Validated request-side timing and provider-pair authority."""
@@ -5929,8 +6013,7 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
             raise QualificationError(
                 'Qualification receipt lacks exact scale-stimulus evidence.')
         stimulus = scale_stimulus[0]
-        if (not _telemetry_is_exactly_attributed(stimulus, baseline_active) or
-                stimulus['queue_depth'] + stimulus['in_flight_requests']
+        if (_telemetry_attributed_resident_size(stimulus, baseline_active)
                 != scale_stimulus_count(profile)):
             raise QualificationError(
                 'Qualification receipt has an incomplete scale stimulus.')
@@ -5952,10 +6035,10 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
             raise QualificationError(
                 'Qualification receipt scale iterations are not contiguous '
                 'in request evidence order.')
-        if not _telemetry_is_exactly_attributed(sample, baseline_active):
+        resident = _telemetry_attributed_resident_size(sample, baseline_active)
+        if resident is None:
             raise QualificationError(
                 'Qualification receipt contains unattributed scale demand.')
-        resident = sample['queue_depth'] + sample['in_flight_requests']
         if resident != (scale_stimulus_count(profile)
                         if profile.name == 'scale' else 1):
             raise QualificationError(

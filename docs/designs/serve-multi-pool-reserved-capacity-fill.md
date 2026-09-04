@@ -5,13 +5,16 @@ Last updated: 2026-09-04
 Status: **the PostgreSQL-authoritative reservation-aware planner, exact-card
 compatibility, bounded Spot-only paid admission, historical at-least-100 Spot
 scale, 10,000-request transport, and current-writer provider-native teardown
-are production-proven. Release 1.1.1660 exposed a qualifier-only circular proof
-dependency after the provider reached 93 observed and later at least 100 actual
-running VMs. Receipt schema 12's single sliding campaign, terminal-frontier,
-and exact campaign-membership proof are being source-qualified and are not yet
-merged, deployed, or paid-proven.
-Multi-wave current-writer scale, traffic, and drain requalification is still
-open.**
+are production-proven. Receipt schema 12's single sliding campaign,
+terminal-frontier, exact campaign-membership proof, and cancellation-resistant
+lifecycle finalizer are merged and deployed in release 1.1.1664. Its first
+current-writer run reached 172 provider-``RUNNING`` AWS Spot VMs, proving that
+provider scale is healthy, but exposed two independent open gates: provider
+qualification was unreachable while replica occupancy was partially observed,
+and row-by-row paid admission held the service row long enough to starve route
+and demand-report transactions. Schema 13's evidence-capability correction is
+source-qualified but not yet deployed. Multi-wave current-writer traffic,
+drain, and exact-zero requalification therefore remain open.**
 Campaign `paid-e2e-1643a` committed the first 100 complete paid
 launch graphs in 8.4 seconds and produced 90 provider-`RUNNING` AWS Spot VMs;
 the other ten requests ended in exact AWS capacity failures. Thirteen provider
@@ -96,13 +99,18 @@ lock or treated only as disposable telemetry for a later reconciliation.
 | Logical accelerator card and slot unit | Elected placement contract plus task resources | In `whole_gpu_shapes` mode every card has unit width one; YAML counts seed/constrain catalog discovery but do not become the width of every backend |
 | Exact physical paid-backend shape | Elected immutable placement catalog, revalidated from each template and pool key | May be staged as a location template; it never changes logical demand attribution and becomes spend only after locked admission |
 | Provider ``RUNNING``/application ``READY`` feedback | A later provider/replica observation | Never a prerequisite for committing a successor transaction when locked residual and headroom remain |
+| Bulk paid admission effects | One set-based transaction over the locked pool, replica, claim, association, request, queue, and pin relations | Pure bodies and deterministic identities may be prepared before locking; per-pool or per-member database round trips are forbidden while the service row is held |
 
 The practical review rule is ownership completeness: every field needed to
 classify one current replica must come from the same locked supply projection.
 A fingerprint can prove that the planner consumed that projection, but it must
-not turn a stale pre-lock census into a transaction precondition. The
-100-member transaction bound limits lock/write volume; it is not a readiness
-barrier or a reason to delay the next eligible wave.
+not turn a stale pre-lock census into a transaction precondition. The member
+bound limits logical write volume; it does not by itself bound lock time. A
+supported catalog and wave must use a constant number of set-based database
+round trips while the service row is held. It is not a readiness barrier or a
+reason to delay the next eligible wave. Lock duration is a tested contract:
+route publication, replica observation, load-balancer role, and demand-report
+writers must retain time to commit within their unchanged freshness horizons.
 
 Release ``1.1.1657`` exposed a separate PostgreSQL liveness coupling during a
 successor paid wave. Routine capacity admission held ``FOR UPDATE`` locks on
@@ -264,16 +272,30 @@ The verifier ownership boundary is normative:
 | Lifecycle finalizer | Always run scope-fenced provider-native cleanup and absence proof after success, failure, or cancellation. | Expand cleanup beyond frozen ownership or rewrite the qualification verdict. |
 | Receipt verdict | Persist local evidence and derive pass or failure after observation. | Mutate demand, requests, replicas, providers, or any other production state. |
 
+Evidence strength is also normative. Presence and liveness proofs consume the
+weakest sufficient fact; absence proofs require a complete closed-world
+census. This prevents new capacity from making scale harder to prove merely
+because its first occupancy sample has not arrived yet.
+
+| Evidence capability | Construction | Consumers |
+|---|---|---|
+| Attributed resident demand | Fresh compatible queue depth plus the exact PostgreSQL active-ledger delta and immutable campaign frontier; total replica occupancy may be unknown | Initial scale stimulus and provider-``RUNNING`` scale proof |
+| Confirmed positive processing | Positive confirmed in-flight and processing lower bounds from current reporters | Independent processing/UI evidence only; it cannot prove an exact total |
+| Exact occupancy | Complete current reporter census whose in-flight count equals the active-ledger delta | Exact request-total/UI qualification |
+| Exact zero | Exact occupancy with zero queue and active ledger, joined to zero claims, replicas, provider objects, disks, and operations | Natural drain and final cleanup only |
+
 The campaign freezes all 10,000 stable identities once. At most 800 are active
 at a time. The first exact 800-resident observation proves the cold scale
 stimulus, then every natural completion immediately admits the next
 never-before-offered identity while work remains. Thus the member set in the
 active window may advance, but its bound cannot: queued plus in-flight is never
-greater than 800. Every provider-paired sample still requires exact active
-ledger equality with production in-flight occupancy, positive PostgreSQL and
-load-balancer demand, zero headerless arrivals, unsaturated arrival tracking,
-and an offered-identity count bounded by the initial window plus exact
-``SUCCEEDED`` transitions. The stimulus driver owns a lock-consistent typed
+greater than 800. Every provider-paired sample requires queue depth plus the
+exact active-ledger delta to equal the immutable 800-member frontier, positive
+PostgreSQL and load-balancer demand, zero headerless arrivals, unsaturated
+arrival tracking, and an offered-identity count bounded by the initial window
+plus exact ``SUCCEEDED`` transitions. Complete per-replica occupancy is an
+independent telemetry proof and is not a prerequisite for provider census.
+The stimulus driver owns a lock-consistent typed
 ``(offered, succeeded)`` projection: it advances ``offered`` immediately before
 the first POST of a new identity and ``succeeded`` only after that identity's
 terminal 204 receipt. Each paired provider sample persists both counters;
@@ -301,7 +323,7 @@ second failure-path regression must prove an observer failure cannot cancel an
 accepted request. Together they prevent reintroducing a static completion latch
 under another name.
 
-Receipt schema 12 also makes the request driver one shielded cohort. The first
+Receipt schemas 12 and 13 make the request driver one shielded cohort. The first
 worker failure closes admission under the same lock that advances the offered
 frontier, but it does not close the HTTP session or cancel sibling workers.
 Every already-offered member finishes its accepted attempt and terminal
@@ -321,8 +343,8 @@ that key set as current ``SUCCEEDED`` attempts, then records the same membership
 digest. Offline validation recomputes the manifest and requires both digests to
 match, rather than accepting an unrelated equal-sized ledger delta. Cleanup is
 deliberately less strict than qualification: the cleanup-only EBS identity
-reader accepts receipt schemas 10 through 12, while qualification accepts only
-schema 12. This permits a newer teardown observer to clean an older in-flight
+reader accepts receipt schemas 10 through 13, while qualification accepts only
+schema 13. This permits a newer teardown observer to clean an older in-flight
 run without allowing old evidence to qualify the new protocol.
 
 The first release-``1.1.1648`` campaign, ``paid-e2e-1648a``, was deliberately
@@ -637,10 +659,12 @@ most 800 of them concurrently. It first proves one exact 800-resident window.
 Each request then finishes its declared backend work and publishes its terminal
 callback immediately, independent of either observer; the next never-before-
 offered identity replaces it while campaign work remains. Every provider-paired
-scale sample requires a refilled exact 800 queued-plus-in-flight window, active
-ledger rows equal to real dispatched in-flight occupancy (including the valid
-queued-only value zero), positive same-observation PostgreSQL and load-balancer
-demand, and zero headerless or saturated arrival tracking. Rolling stable-job
+scale sample requires a refilled exact 800-member window measured as current
+queue depth plus the exact PostgreSQL active-ledger delta, positive
+same-observation PostgreSQL and load-balancer demand, and zero headerless or
+saturated arrival tracking. Per-replica occupancy may be temporarily partial;
+the independent request/UI proof still requires one complete exact occupancy
+sample. Rolling stable-job
 arrival counts may now advance or age as the window turns over, but cannot
 exceed the 10,000-ID manifest or the number made reachable by exact terminal
 successes. The receipt records whether the provider reaches at least 100
@@ -4494,12 +4518,14 @@ proves exactly 800 resident scale-stimulus identities, with no
 unattributed/headerless arrivals. Each natural terminal success then admits the
 next never-before-offered campaign identity, preserving a strict maximum of 800
 active identities without extending backend work or ledger lifetime. Every
-provider scale sample must itself see an exact refilled 800 queued plus
-in-flight window, positive PostgreSQL and load-balancer demand, an in-flight
-gauge equal to active exact-ledger rows, and rolling arrivals bounded by the
-immutable manifest and terminal-success frontier. Before any replica is ready,
-both in-flight and active-ledger values may be zero while all 800 identities
-remain queued; that state is valid physical-scale evidence. The physical proof
+provider scale sample must itself see an exact refilled 800-member window from
+queue depth plus the PostgreSQL active-ledger delta, positive PostgreSQL and
+load-balancer demand, and rolling arrivals bounded by the immutable manifest
+and terminal-success frontier. Per-replica occupancy may be incomplete during
+scale; its confirmed lower bounds remain visible but are not needed to count
+resident demand. Before any replica is ready, the active-ledger delta may be
+zero while all 800 identities remain queued; that state is valid physical-scale
+evidence. The physical proof
 and a separate fresh request proof run concurrently after the stimulus is
 established. The request proof requires positive in-flight, processing,
 confirmed occupancy, and active-ledger attribution. It may complete before or

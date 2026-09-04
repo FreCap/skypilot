@@ -2915,7 +2915,7 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
                                 profile=qualifier.PROFILES['small'])
     receipt.sample('scale', observation)
 
-    assert receipt._payload['schema_version'] == 12
+    assert receipt._payload['schema_version'] == 13
     assert receipt._payload['request_priority'] == 50
     assert receipt._payload['scale_slo_seconds'] == 300
     assert receipt._payload['scale_timeout_seconds'] == 900
@@ -3877,6 +3877,93 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
     assert samples[2]['provider_free_unbound_replicas'] == 0
     assert [sample.get('observation_error_type') for sample in samples
            ] == [None, 'QualificationError', None]
+
+
+def test_scale_observes_provider_with_incomplete_replica_occupancy(tmp_path):
+    """Replica probe gaps cannot hide exact resident campaign pressure."""
+    profile = dataclasses.replace(qualifier.PROFILES['scale'],
+                                  minimum_running=100,
+                                  poll_seconds=0,
+                                  scale_timeout_seconds=1)
+    started_monotonic = time.monotonic()
+    started_at = time.time()
+    cluster_names = _provider_cluster_names('gcp', 100)
+    observation = _observation(
+        observed_at=started_at + 1,
+        observed_monotonic=started_monotonic + 1,
+        database=_database_state(
+            paid_debit_units=100,
+            demand_units=800,
+            bound_cluster_zones=tuple(
+                (name, 'us-central1-a') for name in cluster_names)),
+        provider=_cross_cloud_provider_state(gcp_running_count=100,
+                                             aws_running_count=0),
+        load_balancer=_load_balancer_state(demand_units=800,
+                                           unique_job_arrivals_60s=800,
+                                           unique_job_arrivals_300s=800))
+    telemetry = qualifier.request_telemetry_from_summary(
+        {
+            'request_telemetry_observed_at': started_at,
+            'request_telemetry_state': 'fresh',
+            'request_telemetry_reason': 'in_flight_incomplete',
+            'request_telemetry_compatibility_complete': True,
+            'request_queue_depth': 762,
+            'in_flight_requests': None,
+            'processing_requests': None,
+            'confirmed_in_flight_requests': 38,
+            'confirmed_processing_requests': 16,
+        }, {
+            'ACCEPTED': 38,
+            'SUCCEEDED': 418,
+        })
+
+    class Observer:
+
+        def __init__(self):
+            self.provider_reads = 0
+
+        @staticmethod
+        async def request_telemetry():
+            return telemetry
+
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
+            self.provider_reads += 1
+            return observation
+
+    async def exercise():
+        observer = Observer()
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            progress = qualifier.Progress(
+                scale_started_monotonic=started_monotonic,
+                scale_started_at=started_at)
+            receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                        service_name='paid-e2e',
+                                        profile=profile)
+            await qualifier._wait_for_scale(observer=observer,
+                                            profile=profile,
+                                            progress=progress,
+                                            receipt=receipt,
+                                            traffic=traffic,
+                                            baseline=_request_telemetry(),
+                                            campaign_progress=await
+                                            _campaign_progress(profile,
+                                                               turnover=418))
+            return observer, progress, receipt
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+
+    observer, progress, receipt = asyncio.run(exercise())
+    assert observer.provider_reads == 1
+    assert progress.peak_running == 100
+    assert progress.scale_reached_monotonic == started_monotonic + 1
+    sample = receipt._payload['request_telemetry_samples'][0]
+    assert sample['reason'] == 'in_flight_incomplete'
+    assert sample['queue_depth'] == 762
+    assert sample['in_flight_requests'] is None
+    assert sample['ledger_active'] == 38
 
 
 def test_scale_wait_allows_attributed_arrivals_to_age_out(tmp_path):
@@ -6520,7 +6607,7 @@ def _write_aggregate_qualification(path,
         } if economic else {}),
     }
     payload = {
-        'schema_version': 12,
+        'schema_version': 13,
         'service_name': service_name,
         'service_hash': f'{service_name}-hash',
         'lifecycle_epoch': 1,
@@ -6824,6 +6911,65 @@ def test_schema_eleven_accepts_positive_after_queue_fully_dispatches(tmp_path):
 
     qualifier._read_qualification_evidence(receipt,
                                            qualifier.ExpectationKind.ECONOMIC)
+
+
+def test_schema_thirteen_accepts_attributed_resident_scale_with_incomplete_occupancy(
+        tmp_path):
+    """Offline verification applies the same partial-observation capability."""
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    scale = next(sample for sample in payload['request_telemetry_samples']
+                 if sample['phase'] == 'scale')
+    scale.update(
+        _request_evidence_sample(phase='scale',
+                                 queue_depth=762,
+                                 in_flight=None,
+                                 processing=None,
+                                 accepted=38,
+                                 observed_at=249.0,
+                                 reason='in_flight_incomplete',
+                                 confirmed_in_flight_requests=38,
+                                 confirmed_processing_requests=16,
+                                 scale_iteration_id=1))
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    evidence = qualifier._read_qualification_evidence(
+        receipt, qualifier.ExpectationKind.ECONOMIC)
+
+    assert evidence.scale_elapsed_seconds == 246.0
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [('confirmed_in_flight_requests', 39),
+     ('confirmed_processing_requests', 39), ('in_flight_requests', 38),
+     ('queue_depth', 761)],
+)
+def test_schema_thirteen_rejects_invalid_incomplete_occupancy_scale_evidence(
+        tmp_path, field, value):
+    args = _aggregate_args(tmp_path)
+    payload = json.loads(
+        pathlib.Path(args.economic_receipt).read_text(encoding='utf-8'))
+    scale = next(sample for sample in payload['request_telemetry_samples']
+                 if sample['phase'] == 'scale')
+    scale.update(
+        _request_evidence_sample(phase='scale',
+                                 queue_depth=762,
+                                 in_flight=None,
+                                 processing=None,
+                                 accepted=38,
+                                 observed_at=249.0,
+                                 reason='in_flight_incomplete',
+                                 confirmed_in_flight_requests=38,
+                                 confirmed_processing_requests=16,
+                                 scale_iteration_id=1))
+    scale[field] = value
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='unattributed scale demand'):
+        qualifier._validate_request_evidence(
+            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
 
 
 @pytest.mark.parametrize(
