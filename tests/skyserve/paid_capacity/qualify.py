@@ -901,8 +901,8 @@ class ProviderCensus:
 class AwsProviderCensus:
     """One frozen-region census of every service-tagged AWS effect."""
 
-    service_instances: object
-    service_volumes: object
+    service_instances: tuple[dict[str, Any], ...]
+    service_volumes: tuple[dict[str, Any], ...]
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -2241,6 +2241,41 @@ _AWS_VOLUME_IDENTITY_FIELDS = (
     'region',
     'volume_id',
 )
+_AWS_PROVIDER_CENSUS_FIELDS = frozenset(
+    ('service_instances', 'service_volumes'))
+_AWS_PROVIDER_INSTANCE_FIELDS = frozenset(
+    (*_AWS_INSTANCE_IDENTITY_FIELDS, 'provider_gpu_units', 'state',
+     'volume_ids'))
+_AWS_PROVIDER_VOLUME_FIELDS = frozenset((*_AWS_VOLUME_IDENTITY_FIELDS, 'state'))
+
+
+def _aws_provider_census_from_process_payload(
+        payload: object) -> AwsProviderCensus:
+    """Restore the exact tuple shape erased by the JSON process boundary."""
+    if (not isinstance(payload, dict) or
+            set(payload) != _AWS_PROVIDER_CENSUS_FIELDS):
+        raise GuardViolation('Isolated AWS provider census is malformed.')
+    raw_instances = payload['service_instances']
+    raw_volumes = payload['service_volumes']
+    if not isinstance(raw_instances, list) or not isinstance(raw_volumes, list):
+        raise GuardViolation('Isolated AWS provider census is malformed.')
+    instances: list[dict[str, Any]] = []
+    for raw_instance in raw_instances:
+        if (not isinstance(raw_instance, dict) or
+                set(raw_instance) != _AWS_PROVIDER_INSTANCE_FIELDS or
+                not isinstance(raw_instance['volume_ids'], list)):
+            raise GuardViolation('Isolated AWS provider census is malformed.')
+        instance = dict(raw_instance)
+        instance['volume_ids'] = tuple(raw_instance['volume_ids'])
+        instances.append(instance)
+    volumes: list[dict[str, Any]] = []
+    for raw_volume in raw_volumes:
+        if (not isinstance(raw_volume, dict) or
+                set(raw_volume) != _AWS_PROVIDER_VOLUME_FIELDS):
+            raise GuardViolation('Isolated AWS provider census is malformed.')
+        volumes.append(dict(raw_volume))
+    return AwsProviderCensus(service_instances=tuple(instances),
+                             service_volumes=tuple(volumes))
 
 
 def _merge_aws_instance_observations(
@@ -5392,8 +5427,8 @@ class Observer:
         aws_payload = provider_result.get('aws_census')
         gcp_census = (None if gcp_payload is None else ProviderCensus(
             **gcp_payload))
-        aws_census = (None if aws_payload is None else AwsProviderCensus(
-            **aws_payload))
+        aws_census = (None if aws_payload is None else
+                      _aws_provider_census_from_process_payload(aws_payload))
         self._accept_retained_volume_ids(
             provider_result.get('retained_volume_ids_by_region'))
         remaining = deadline_monotonic - time.monotonic()
@@ -6880,7 +6915,7 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
                     retained, dict):
                 raise QualificationError(
                     'Isolated AWS cleanup census is malformed.')
-            aws_census = AwsProviderCensus(**aws_payload)
+            aws_census = _aws_provider_census_from_process_payload(aws_payload)
             retained_by_region = _accepted_retained_volume_ids(
                 retained_by_region, retained)
             aws_state = parse_aws_cleanup_state(

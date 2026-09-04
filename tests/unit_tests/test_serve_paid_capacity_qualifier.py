@@ -3852,15 +3852,16 @@ def test_wait_cleanup_holds_exact_aws_zero(monkeypatch, tmp_path):
             arguments['scope']) == scope
         if kind is qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
             provider_calls += 1
-            return {
-                'gcp_census': None,
-                'aws_census': dataclasses.asdict(
-                    qualifier.AwsProviderCensus(service_instances=(),
-                                                service_volumes=())),
-                'retained_volume_ids_by_region': {
-                    'us-east-2': [],
-                },
-            }
+            return json.loads(
+                json.dumps({
+                    'gcp_census': None,
+                    'aws_census': dataclasses.asdict(
+                        qualifier.AwsProviderCensus(service_instances=(),
+                                                    service_volumes=())),
+                    'retained_volume_ids_by_region': {
+                        'us-east-2': [],
+                    },
+                }))
         assert kind is qualifier.IsolatedObservationKind.POSTGRES
         cleanup_scope = qualifier._cleanup_scope_from_process_payload(
             arguments['cleanup_scope'])
@@ -3923,16 +3924,19 @@ def test_wait_cleanup_fails_on_persistent_aws_volume(monkeypatch, tmp_path):
 
     async def isolated_observation(kind, arguments, _deadline, **_kwargs):
         if kind is qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
-            return {
-                'gcp_census': None,
-                'aws_census': dataclasses.asdict(
-                    qualifier.AwsProviderCensus(
-                        service_instances=(),
-                        service_volumes=(_aws_volume(),))),
-                'retained_volume_ids_by_region': {
-                    'us-east-2': ['vol-new'],
-                },
-            }
+            # Exercise the real child-process JSON boundary: both outer
+            # tuples and the instance's nested EBS tuple arrive as lists.
+            return json.loads(
+                json.dumps({
+                    'gcp_census': None,
+                    'aws_census': dataclasses.asdict(
+                        qualifier.AwsProviderCensus(
+                            service_instances=(_aws_instance(),),
+                            service_volumes=(_aws_volume(),))),
+                    'retained_volume_ids_by_region': {
+                        'us-east-2': ['vol-new'],
+                    },
+                }))
         cleanup_scope = qualifier._cleanup_scope_from_process_payload(
             arguments['cleanup_scope'])
         return {
@@ -3960,7 +3964,8 @@ def test_wait_cleanup_fails_on_persistent_aws_volume(monkeypatch, tmp_path):
     assert payload['outcome'] == 'failed'
     assert payload['samples']
     assert all(
-        sample['exact_zero'] is False and sample['cleanup_provider_disks'] == 1
+        sample['exact_zero'] is False and sample['cleanup_provider_instances']
+        == 1 and sample['cleanup_provider_disks'] == 1
         for sample in payload['samples'])
 
 
@@ -4152,15 +4157,16 @@ def test_cleanup_retains_aws_volume_identity_before_postgres_failure(
             # pass its tag query is absent, but retained-ID lookup still finds
             # it. Only later does that exact retained identity disappear.
             volumes = ((_aws_volume(),) if provider_calls <= 2 else ())
-            return {
-                'gcp_census': None,
-                'aws_census': dataclasses.asdict(
-                    qualifier.AwsProviderCensus(service_instances=(),
-                                                service_volumes=volumes)),
-                'retained_volume_ids_by_region': {
-                    'us-east-2': ['vol-new']
-                },
-            }
+            return json.loads(
+                json.dumps({
+                    'gcp_census': None,
+                    'aws_census': dataclasses.asdict(
+                        qualifier.AwsProviderCensus(service_instances=(),
+                                                    service_volumes=volumes)),
+                    'retained_volume_ids_by_region': {
+                        'us-east-2': ['vol-new']
+                    },
+                }))
         assert kind is qualifier.IsolatedObservationKind.POSTGRES
         assert arguments['projection'] == 'cleanup'
         postgres_calls += 1
@@ -5897,6 +5903,85 @@ def test_composite_observer_bounds_load_balancer_and_skips_postgres():
 
     asyncio.run(exercise())
     assert calls == [qualifier.IsolatedObservationKind.PROVIDER_CENSUS]
+
+
+def test_composite_observer_decodes_nonempty_aws_json_census():
+    identity = _aws_identity()
+    provider_wire = json.loads(
+        json.dumps({
+            'gcp_census': None,
+            'aws_census': dataclasses.asdict(
+                qualifier.AwsProviderCensus(
+                    service_instances=(_aws_instance(),),
+                    service_volumes=(_aws_volume(),))),
+            'retained_volume_ids_by_region': {
+                'us-east-2': ['vol-new'],
+            },
+        }))
+    database_wire = json.loads(
+        json.dumps(
+            dataclasses.asdict(
+                _database_state(aws_provider_identities=(identity,)))))
+
+    class ProviderSession:
+
+        @staticmethod
+        async def request(kind, _arguments, _deadline):
+            assert kind is qualifier.IsolatedObservationKind.PROVIDER_CENSUS
+            return provider_wire
+
+    class PostgresSession:
+
+        @staticmethod
+        async def request(kind, _arguments, _deadline):
+            assert kind is qualifier.IsolatedObservationKind.POSTGRES
+            return {'database': database_wire}
+
+    class Http:
+
+        @staticmethod
+        async def snapshot():
+            return _load_balancer_state()
+
+    observer = qualifier.Observer(database_url='postgresql://unused',
+                                  http=Http(),
+                                  service_name='paid-e2e',
+                                  scope=_provider_scope(),
+                                  profile=qualifier.PROFILES['small'],
+                                  provider_session=ProviderSession(),
+                                  postgres_session=PostgresSession())
+
+    observation = asyncio.run(
+        observer.snapshot(deadline_monotonic=time.monotonic() + 1))
+
+    aws = observation.provider.cloud('aws')
+    assert aws.instance_count == aws.running_count == 1
+    assert aws.gpu_units == aws.running_gpu_units == 1
+    assert aws.disk_count == 1
+
+
+def test_aws_provider_census_decoder_rejects_inexact_wire_shapes():
+    valid = json.loads(
+        json.dumps(
+            dataclasses.asdict(
+                qualifier.AwsProviderCensus(
+                    service_instances=(_aws_instance(),),
+                    service_volumes=(_aws_volume(),)))))
+    extra_envelope = {**valid, 'unexpected': True}
+    non_list_collection = {**valid, 'service_instances': ()}
+    missing_instance_field = copy.deepcopy(valid)
+    missing_instance_field['service_instances'][0].pop('state')
+    non_list_volume_ids = copy.deepcopy(valid)
+    non_list_volume_ids['service_instances'][0]['volume_ids'] = ('vol-new',)
+    extra_volume_field = copy.deepcopy(valid)
+    extra_volume_field['service_volumes'][0]['unexpected'] = True
+
+    for payload in (None, extra_envelope, non_list_collection,
+                    missing_instance_field, non_list_volume_ids,
+                    extra_volume_field):
+        with pytest.raises(qualifier.GuardViolation,
+                           match='AWS provider census is malformed'):
+            qualifier._aws_provider_census_from_process_payload(payload)
 
 
 def test_economic_progress_does_not_require_an_artificial_provider_mix():
