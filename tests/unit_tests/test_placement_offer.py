@@ -2332,7 +2332,8 @@ def test_offer_module_has_only_allowed_leaf_imports():
     assert offer.OfferOperationV1.FRESH_CREATE.value == 'fresh_create'
 
     setup_source = (_ROOT / 'setup.py').read_text()
-    assert "requires_python='>=3.10'" in setup_source
+    assert "python_requires='>=3.10'" in setup_source
+    assert 'requires_python=' not in setup_source
     classifiers = set(
         re.findall(r'Programming Language :: Python :: (3\.\d+)', setup_source))
     assert classifiers == {'3.10', '3.11', '3.12', '3.13', '3.14'}

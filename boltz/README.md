@@ -1,21 +1,16 @@
-# boltz overlay image
+# Boltz SkyPilot production image
 
 This fork (`improvements`) carries boltz's SkyPilot serve / control-plane fixes. They reach the
-live control plane as a **full fork wheel** installed onto the pinned upstream
-`berkeleyskypilot/skypilot-nightly` runtime base, plus a **freshly built dashboard**. Replacing the
-whole wheel is deliberate — the base is pinned to an older nightly than the fork's tree (which
-rebases on upstream master), so a changed-files-only overlay would mix old-wheel modules with newer
-fork modules. Installing the wheel keeps source, package metadata, and the runtime version consistent.
-The build context includes the complete tracked `sky/` tree and every source declared by
-`setup.py`'s `py_modules`; the build and reuse checks import the authorization bootstrap so a wheel
-cannot silently omit its pre-import trust boundary.
-The dashboard: the base image's `sky/dashboard/out` bundle is baked at nightly-build time, so the
-script always rebuilds the static export from this fork's `sky/dashboard` source and ships it in the
-overlay (otherwise the deployed dashboard lags the fork's python and fork dashboard changes never
-deploy).
+live control plane through the repository's **canonical `Dockerfile`**, built directly from the
+exact fork commit on Python 3.14. The same Dockerfile installs the complete source distribution,
+the AWS, GCP, and Kubernetes dependencies used by this deployment, the authorization bootstrap,
+and a freshly built dashboard. The Boltz release wrapper adds immutable release metadata and the
+separately reviewed reserved-fill reclaim policy. There is no inherited upstream nightly runtime
+and no second overlay package or Dockerfile that can drift from the source image.
 
-- **Build/verify locally:** `./boltz/build-overlay.sh` (add `PUSH=true TAG=<ref>` to push). Requires
-  **node/npm (Node 20+)** for the dashboard build, e.g. `mise x node@24 -- ./boltz/build-overlay.sh`.
+- **Build/verify locally:** `./boltz/build-overlay.sh` (add `PUSH=true TAG=<ref>` to push). The
+  canonical Docker build installs Node 20 in its build stage; only Docker with BuildKit and a full
+  Git history are required on the caller.
 - **Publish:** `.github/workflows/boltz-overlay-publish.yml` computes the next deterministic patch
   release for every `improvements` merge and publishes the image as that exact version
   (for example, `1.1.1`). The chart publisher follows the successful image run and publishes the
@@ -24,10 +19,22 @@ deploy).
   SkyPilot Helm release. Pin the same digest on the API, controller, and executor roles; no
   `boltz-platform` runtime pin is part of this release path.
 
-The upstream nightly tag is only a runtime dependency. `boltz/release_version.py` derives the
-release patch from every first-parent commit after the recorded `1.1.19` epoch. The publisher
-stamps that version consistently into Python metadata, CLI/API/dashboard output, the image, and the
-chart.
+`boltz/release_version.py` derives the release patch from every first-parent commit after the
+recorded `1.1.19` epoch. The publisher stamps that version plus the exact commit, commit timestamp,
+and monotonic build count into Python and OCI metadata, verifies the running interpreter is Python
+3.14, then verifies both distributions, cloud clients, and dashboard before publishing. The chart
+publisher follows that verified image.
+
+### Python runtime boundary
+
+The Boltz Helm control-plane image and its deployment-only reclaim-policy package run on Python
+3.14. The generic `skypilot` distribution still declares Python 3.10 as its minimum because that
+same wheel is installed on provisioned workers. Those workers currently use Python 3.10 and
+`ray==2.9.3`; Ray 2.9.3 publishes no Python 3.14 wheel. Moving the worker runtime to Python 3.14 is
+a separate coordinated change: upgrade and qualify Ray, rebase the Ray patch set, update VM and
+Kubernetes worker bootstraps and images, then raise the generic wheel floor and its compatibility
+tests together. The production control-plane image does not install Ray and is not blocked by that
+worker-runtime constraint.
 
 ### Reserved-fill reclaim policy
 

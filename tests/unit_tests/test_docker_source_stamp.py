@@ -20,7 +20,10 @@ def _extract_process_source_run(dockerfile: Path) -> str:
     start_marker = 'RUN cd /skypilot && \\\n'
     end_marker = '# Stage 3: Main image'
     start = contents.index(start_marker)
-    end = contents.index(end_marker, start)
+    stage_end = contents.index(end_marker, start)
+    next_instruction = contents.find('\nRUN ', start + len(start_marker))
+    end = (stage_end
+           if next_instruction == -1 else min(stage_end, next_instruction))
     instruction = contents[start + len('RUN '):end]
 
     # Docker removes escaped newlines before invoking the shell. Do the same

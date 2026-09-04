@@ -235,13 +235,13 @@ if __name__ == '__main__':
         long_description=long_description,
         long_description_content_type='text/markdown',
         setup_requires=['wheel'],
-        # Everything we deploy runs Python 3.14, but this floor must stay
-        # 3.10: SkyPilot bootstraps each cluster worker with a
+        # The Boltz Helm/control-plane image runs Python 3.14, but this floor
+        # must stay 3.10: SkyPilot bootstraps each cluster worker with a
         # `uv venv --python 3.10` env (sky/skylet/constants.py) and installs
         # this wheel plus ray==2.9.3 into it, and ray 2.9.3 has no wheels
         # past cp311. Raise this only together with the remote runtime
         # (SKY_REMOTE_RAY_VERSION + the remote --python pin).
-        requires_python='>=3.10',
+        python_requires='>=3.10',
         install_requires=dependencies['install_requires'],
         extras_require=dependencies['extras_require'],
         entry_points={

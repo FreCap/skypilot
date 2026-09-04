@@ -28,6 +28,7 @@ def test_policy_project_declares_exactly_one_entry_point():
     document = tomllib.loads(
         (_PROJECT / 'pyproject.toml').read_text(encoding='utf-8'))
 
+    assert document['project']['requires-python'] == '>=3.14'
     assert document['project']['entry-points'] == {
         _GROUP: {
             'boltz': ('boltz_reserved_fill_reclaim_policy.policy:'
@@ -120,18 +121,84 @@ def test_policy_wheel_contains_bundle_and_only_policy_entry_point(tmp_path):
         assert not any(name.startswith('sky/') for name in names)
 
 
-def test_overlay_builds_and_installs_both_distributions():
-    dockerfile = (_REPO_ROOT / 'boltz' /
-                  'Dockerfile.overlay').read_text(encoding='utf-8')
+def test_production_image_builds_and_installs_both_distributions():
+    dockerfile = (_REPO_ROOT / 'Dockerfile').read_text(encoding='utf-8')
     script = (_REPO_ROOT / 'boltz' /
               'build-overlay.sh').read_text(encoding='utf-8')
 
-    assert '/tmp/reserved-fill-reclaim-policy' in dockerfile
-    assert '--wheel-dir /tmp/policy-wheels' in dockerfile
-    assert '/tmp/policy-wheels/*.whl' in dockerfile
+    assert 'ARG INSTALL_BOLTZ_RECLAIM_POLICY=false' in dockerfile
+    assert '/skypilot/boltz/reserved_fill_reclaim_policy' in dockerfile
+    assert 'INSTALL_BOLTZ_RECLAIM_POLICY=true' in script
     assert "git ls-tree -r --name-only HEAD -- 'boltz/reserved_fill_reclaim_policy'" in script
     assert 'policy.policy_identity().policy_revision' in script
     assert 'boltz_reserved_fill_reclaim_policy.POLICY_REVISION' in script
     assert ("'boltz-reserved-fill-reclaim-policy/' + sky.__version__"
             not in script)
     assert "group='skypilot.reserved_fill_reclaim_policy'" in script
+
+
+def test_boltz_image_uses_the_canonical_python314_dockerfile():
+    dockerfile = (_REPO_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+    script = (_REPO_ROOT / 'boltz' /
+              'build-overlay.sh').read_text(encoding='utf-8')
+
+    assert 'FROM python:3.14.5-slim' in dockerfile
+    assert not (_REPO_ROOT / 'boltz' / 'Dockerfile.overlay').exists()
+    assert not (_REPO_ROOT / 'boltz' / 'overlay_source_manifest.py').exists()
+    assert 'boltz/Dockerfile.overlay' not in script
+    assert 'BASE_IMAGE' not in script
+    assert 'berkeleyskypilot/skypilot-nightly' not in script
+    assert '--file "$repo_root/Dockerfile"' in script
+    assert '--build-arg "SKYPILOT_EXTRAS=aws,gcp,kubernetes"' in script
+    assert '"$repo_root"' in script
+    assert 'COPY . /skypilot' in dockerfile
+    assert 'import skypilot_serve_system_oom_recovery_authorization' in script
+    assert "sys.version_info[:2] >= (3, 14)" in script
+
+
+def test_boltz_image_passes_and_verifies_exact_release_provenance():
+    dockerfile = (_REPO_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+    script = (_REPO_ROOT / 'boltz' /
+              'build-overlay.sh').read_text(encoding='utf-8')
+
+    for name in ('SKYPILOT_VERSION', 'SKYPILOT_COMMIT_SHA',
+                 'SKYPILOT_COMMIT_TIMESTAMP', 'SKYPILOT_COMMIT_COUNT'):
+        assert f'ARG {name}' in dockerfile
+        assert f'--build-arg "{name}=' in script
+    assert 'ARG SKYPILOT_EXTRAS=all' in dockerfile
+    assert '.[${SKYPILOT_EXTRAS}]' in dockerfile
+    assert 'python boltz/stamp_image_release.py' in dockerfile
+    # Source-derived metadata must be materialized before the immutable
+    # release projection.  Reversing these steps lets setup.py overwrite a
+    # clean release SHA with ``-dirty`` after the stamp itself modifies source.
+    assert dockerfile.index('setup.replace_commit_hash()') < dockerfile.index(
+        'python boltz/stamp_image_release.py')
+    assert "importlib.metadata.version('skypilot') == sky.__version__" in script
+
+
+def test_publisher_refuses_to_reuse_a_legacy_python310_image():
+    workflow = (_REPO_ROOT / '.github' / 'workflows' /
+                'boltz-overlay-publish.yml').read_text(encoding='utf-8')
+
+    assert 'actions/setup-node' not in workflow
+    assert 'runs-on: namespace-profile-skypilot-ci-4x8' in workflow
+    # Both immutable-tag reuse and newly published image checks enforce the
+    # canonical runtime and distribution identities.
+    assert workflow.count('sys.version_info[:2] >= (3, 14)') == 2
+    assert workflow.count(
+        'importlib.metadata.version("skypilot") == sky.__version__') == 2
+    assert workflow.count(
+        'importlib.metadata.version("boltz-skypilot-reserved-fill-reclaim-policy") == sky.__version__'
+    ) == 2
+
+
+def test_manual_chart_publisher_refuses_a_legacy_python310_image():
+    workflow = (_REPO_ROOT / '.github' / 'workflows' /
+                'boltz-chart-publish.yml').read_text(encoding='utf-8')
+
+    assert 'sys.version_info[:2] >= (3, 14)' in workflow
+    assert ('importlib.metadata.version("skypilot") == sky.__version__'
+            in workflow)
+    assert ('importlib.metadata.version('
+            '"boltz-skypilot-reserved-fill-reclaim-policy") == '
+            'sky.__version__' in workflow)

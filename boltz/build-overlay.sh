@@ -1,35 +1,20 @@
 #!/usr/bin/env bash
-# Build (and optionally push) the boltz overlay image from THIS fork checkout.
-# Run from anywhere inside the repo; uses the current HEAD.
+# Build, verify, and optionally publish the Boltz SkyPilot control-plane image.
 #
-# Policy: install a wheel containing the FULL fork sky/ tree (every tracked
-# file under sky/**, tests excluded) plus every root module declared by
-# setup.py's py_modules onto the pinned upstream runtime base.
-# This is deliberate, not an optimization opportunity:
-#
-#   The base image is pinned to a June-20 nightly while the fork
-#   tree tracks upstream master via rebases, so the fork's checkout is NEWER
-#   than the base wheel even for files the fork never touched. A partial
-#   package (changed-files-only) would mix old-wheel modules with fork modules
-#   that assume their newer counterparts — a version skew inside one image.
-#   Installing the whole fork wheel keeps both source and Python distribution
-#   metadata internally consistent at exactly the fork's commit.
-#
-# The dashboard is ALWAYS rebuilt from this fork's source (sky/dashboard ->
-# out/, requires node/npm) and shipped in the overlay: the base image's bundle
-# is baked at nightly-build time, so without this the deployed dashboard would
-# be older than the fork's python (stale enums render wrong) and fork dashboard
-# changes would never deploy. out/ is gitignored, hence built here, not tracked.
+# This is intentionally a thin release wrapper around the repository's
+# canonical Dockerfile.  The canonical source image already builds the complete
+# SkyPilot distribution, dashboard, and cloud dependencies on Python 3.14; this
+# wrapper adds immutable release identity and the deployment-only reserved-fill
+# reclaim policy.  There is no second runtime base or overlay package path.
 #
 #   RELEASE_VERSION=1.1.1 PUSH=true \
 #     TAG=<ecr>/skypilot-nightly-boltz:1.1.1 ./boltz/build-overlay.sh
 #
-# Env (all have sensible defaults):
-#   BASE_IMAGE upstream runtime dependency (default is pinned below)
-#   RELEASE_VERSION version stamped into the wheel/image (default: source version)
-#   TAG        full image ref to build/push (default builds a local dev tag)
-#   PUSH       "true" to docker push (default false)
-#   PLATFORM   docker build --platform (default linux/amd64 — control-plane arch)
+# Environment:
+#   RELEASE_VERSION  image/package version (default: source version)
+#   TAG              full image reference (default: local development tag)
+#   PUSH             true to push after successful verification (default: false)
+#   PLATFORM         control-plane target platform (default: linux/amd64)
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
@@ -45,250 +30,90 @@ if [[ ! "$SKYPILOT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "error: release version must be <major>.<minor>.<patch>, got ${SKYPILOT_VERSION}" >&2
   exit 1
 fi
-BASE_IMAGE="${BASE_IMAGE:-berkeleyskypilot/skypilot-nightly:1.0.0.dev20260620}"
+
 PLATFORM="${PLATFORM:-linux/amd64}"
 TAG="${TAG:-skypilot-nightly-boltz:${SKYPILOT_VERSION}-dev}"
 PUSH="${PUSH:-false}"
+if [ "$PUSH" != "true" ] && [ "$PUSH" != "false" ]; then
+  echo "error: PUSH must be true or false, got ${PUSH}" >&2
+  exit 1
+fi
 
-# Fail before pulling the base image or rebuilding the dashboard: the commit
-# count is part of the shipped identity and cannot be computed correctly from
-# a shallow clone.
+# The monotonic build identity requires complete history.  Fail before the
+# expensive image build when a shallow checkout cannot produce it.
 if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
-  echo "error: a full git history is required to compute the overlay build number" >&2
+  echo "error: a full git history is required to compute the image build number" >&2
   echo "       fetch with --unshallow before running this build." >&2
   exit 1
 fi
-overlay_commit="$(git rev-parse HEAD)"
-if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-  overlay_commit="${overlay_commit}-dirty"
+image_commit="$(git rev-parse HEAD)"
+if [ -n "$(git status --porcelain)" ]; then
+  image_commit="${image_commit}-dirty"
 fi
-overlay_commit_timestamp="$(git show -s --format=%cI HEAD)"
-overlay_build="$(git rev-list --count HEAD)"
+image_commit_timestamp="$(git show -s --format=%cI HEAD)"
+image_commit_count="$(git rev-list --count HEAD)"
 
-echo ">> Overlay file set: full fork sky/ tree at HEAD (tests excluded)"
-files=()
-while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(
-  git ls-tree -r --name-only HEAD -- 'sky' | grep -vE '(^|/)tests?/')
-if [ "${#files[@]}" -eq 0 ]; then echo "  none — aborting" >&2; exit 1; fi
-echo "   ${#files[@]} tracked files under sky/"
-
-# Root ``py_modules`` are wheel inputs too.  The overlay context used to copy
-# only sky/**, so setuptools silently omitted a declared top-level module while
-# still producing an otherwise healthy wheel.  Resolve the literal setup.py
-# declaration, fail closed on missing/untracked sources, and project every
-# declared module into the build context below.
-root_module_files=()
-while IFS= read -r f; do
-  [ -n "$f" ] && root_module_files+=("$f")
-done < <(python3 boltz/overlay_source_manifest.py --setup setup.py)
-if [ "${#root_module_files[@]}" -eq 0 ]; then
-  echo "error: setup.py declares no root py_modules" >&2
-  exit 1
-fi
-for f in "${root_module_files[@]}"; do
-  git ls-files --error-unmatch -- "$f" >/dev/null
-done
-echo "   ${#root_module_files[@]} tracked setup.py py_module source(s)"
-
-# The reclaim policy is intentionally a second distribution. The generic
-# SkyPilot wheel must keep zero deployment-policy entry points; the Boltz image
-# composes exactly one reviewed implementation alongside it.
+# The generic SkyPilot distribution intentionally has no deployment policy.
+# Prove that the separately reviewed policy package is committed before the
+# canonical image is asked to compose it into the Boltz distribution.
 policy_files=()
-while IFS= read -r f; do [ -n "$f" ] && policy_files+=("$f"); done < <(
-  git ls-tree -r --name-only HEAD -- 'boltz/reserved_fill_reclaim_policy')
+while IFS= read -r file; do
+  [ -n "$file" ] && policy_files+=("$file")
+done < <(git ls-tree -r --name-only HEAD -- 'boltz/reserved_fill_reclaim_policy')
 if [ "${#policy_files[@]}" -eq 0 ]; then
   echo "error: deployment reclaim-policy package is missing" >&2
   exit 1
 fi
-echo "   ${#policy_files[@]} tracked deployment reclaim-policy source(s)"
 
-# Informational only (does NOT gate the file set): compare the fork tree
-# against the base image's installed sky/ files so the log shows how much of
-# the wheel we shadow and how much the fork adds. Doubles as a sanity check
-# that the base image is runnable before we spend time on npm + docker build.
-# -i is required to feed the heredoc to python's stdin: without it docker runs
-# `python -` against a closed stdin and the listing comes back EMPTY.
-echo ">> Comparing against base image sky/ contents (informational)"
-base_sky_files="$(docker run --rm -i --platform "$PLATFORM" "$BASE_IMAGE" python - <<'PY'
-import os, sky
-root = os.path.dirname(sky.__file__)
-parent = os.path.dirname(root)
-for dirpath, _dirs, names in os.walk(root):
-    for name in names:
-        print(os.path.relpath(os.path.join(dirpath, name), parent))
-PY
-)"
-if [ -z "$base_sky_files" ]; then
-  echo "error: empty sky/ file listing from base image ${BASE_IMAGE} —" >&2
-  echo "       the base image is not runnable or the listing is broken." >&2
-  exit 1
-fi
-shadowed="$(comm -12 <(printf '%s\n' "${files[@]}" | sort) <(sort <<<"$base_sky_files") | wc -l | tr -d ' ')"
-added="$(( ${#files[@]} - shadowed ))"
-echo "   base image sky/ files: $(wc -l <<<"$base_sky_files" | tr -d ' ')"
-echo "   overlay shadows ${shadowed} base file(s); adds ${added} file(s) new vs base"
-
-# Build the dashboard from THIS fork's source, unconditionally: the base
-# image's bundle predates the fork's python (sky/dashboard/out is baked into
-# the nightly at build time and out/ is gitignored here), so shipping anything
-# but a fresh build reintroduces the stale-dashboard bug. Fail loudly —
-# set -e aborts the whole overlay build if npm install/build fails.
-echo ">> Building dashboard (sky/dashboard -> sky/dashboard/out)"
-if ! command -v npm >/dev/null 2>&1; then
-  echo "error: npm not found — the overlay build requires node/npm (Node 20+)" >&2
-  echo "       to build the dashboard. See boltz/README.md." >&2
-  exit 1
-fi
-if [ -f sky/dashboard/package-lock.json ]; then
-  npm --prefix sky/dashboard ci
-else
-  npm --prefix sky/dashboard install
-fi
-npm --prefix sky/dashboard run build
-if [ ! -f sky/dashboard/out/index.html ]; then
-  echo "error: dashboard build did not produce sky/dashboard/out/index.html" >&2
-  exit 1
-fi
-
-ctx="$(mktemp -d)"; trap 'rm -rf "$ctx"' EXIT
-for f in "${files[@]}"; do mkdir -p "$ctx/$(dirname "$f")"; cp "$f" "$ctx/$f"; done
-root_module_context="$ctx/root_py_modules"
-for f in "${root_module_files[@]}"; do
-  mkdir -p "$root_module_context/$(dirname "$f")"
-  cp "$f" "$root_module_context/$f"
-done
-template_files=()
-while IFS= read -r f; do [ -n "$f" ] && template_files+=("$f"); done < <(
-  git ls-tree -r --name-only HEAD -- 'sky_templates')
-for f in "${template_files[@]}"; do
-  mkdir -p "$ctx/$(dirname "$f")"
-  cp "$f" "$ctx/$f"
-done
-for f in "${policy_files[@]}"; do
-  mkdir -p "$ctx/$(dirname "$f")"
-  cp "$f" "$ctx/$f"
-done
-
-# The wheel replaces the base package, so stamp the source-tree placeholders
-# before building it. There is no .git directory in the final image from which
-# the runtime fallback could recover this identity.
-OVERLAY_COMMIT="$overlay_commit" \
-  OVERLAY_COMMIT_TIMESTAMP="$overlay_commit_timestamp" \
-  OVERLAY_BUILD="$overlay_build" \
-  OVERLAY_VERSION="$SKYPILOT_VERSION" \
-  python3 - "$ctx/sky/__init__.py" <<'PY'
-import os
-from pathlib import Path
-import re
-import sys
-
-path = Path(sys.argv[1])
-content = path.read_text(encoding='utf-8')
-for name, value in (
-    ('_SKYPILOT_COMMIT_SHA', os.environ['OVERLAY_COMMIT']),
-    ('_SKYPILOT_COMMIT_TIMESTAMP',
-     os.environ['OVERLAY_COMMIT_TIMESTAMP']),
-    ('_SKYPILOT_COMMIT_COUNT', os.environ['OVERLAY_BUILD']),
-):
-    content, replacements = re.subn(
-        rf'^{name} = [\'\"][^\'\"]*[\'\"]',
-        f"{name} = '{value}'",
-        content,
-        count=1,
-        flags=re.MULTILINE)
-    if replacements != 1:
-        raise RuntimeError(f'could not stamp {name} in {path}')
-content, replacements = re.subn(
-    r'^__version__ = [\'\"][^\'\"]*[\'\"]',
-    f"__version__ = '{os.environ['OVERLAY_VERSION']}'",
-    content,
-    count=1,
-    flags=re.MULTILINE)
-if replacements != 1:
-    raise RuntimeError(f'could not stamp __version__ in {path}')
-path.write_text(content, encoding='utf-8')
-PY
-
-# Stamp only the policy distribution's artifact version.  Its independently
-# reviewed POLICY_REVISION is durable authority and must not rotate merely
-# because unrelated SkyPilot code produced a new overlay release.
-OVERLAY_VERSION="$SKYPILOT_VERSION" \
-  python3 - \
-    "$ctx/boltz/reserved_fill_reclaim_policy/pyproject.toml" \
-    "$ctx/boltz/reserved_fill_reclaim_policy/src/boltz_reserved_fill_reclaim_policy/__init__.py" <<'PY'
-import os
-from pathlib import Path
-import re
-import sys
-
-version = os.environ['OVERLAY_VERSION']
-pyproject = Path(sys.argv[1])
-content = pyproject.read_text(encoding='utf-8')
-content, replacements = re.subn(
-    r'^version = "0\.0\.0"$',
-    f'version = "{version}"',
-    content,
-    count=1,
-    flags=re.MULTILINE)
-if replacements != 1:
-    raise RuntimeError(f'could not stamp policy version in {pyproject}')
-pyproject.write_text(content, encoding='utf-8')
-
-package = Path(sys.argv[2])
-content = package.read_text(encoding='utf-8')
-content, replacements = re.subn(
-    r"^__version__ = '0\.0\.0'$",
-    f"__version__ = '{version}'",
-    content,
-    count=1,
-    flags=re.MULTILINE)
-if replacements != 1:
-    raise RuntimeError(f'could not stamp policy artifact version in {package}')
-package.write_text(content, encoding='utf-8')
-PY
-echo ">> Stamped overlay identity: version ${SKYPILOT_VERSION}, commit ${overlay_commit}, checked in ${overlay_commit_timestamp}, build ${overlay_build}"
-
-# Ship ONLY the static export (out/) — never node_modules/.next; the server
-# serves sky/dashboard/out directly (sky/server/constants.py: DASHBOARD_DIR),
-# so the recursive COPY sky/ in the Dockerfile lands it at
-# site-packages/sky/dashboard/out.
-mkdir -p "$ctx/sky/dashboard"
-cp -R sky/dashboard/out "$ctx/sky/dashboard/out"
-echo ">> Dashboard bundle added to context: $(du -sh "$ctx/sky/dashboard/out" | cut -f1)"
-cp -L setup.py "$ctx/setup.py"
-cp pyproject.toml MANIFEST.in README.md "$ctx/"
-cp boltz/Dockerfile.overlay "$ctx/Dockerfile"
-
-echo ">> Building ${TAG} (${PLATFORM}, base ${BASE_IMAGE})"
-docker build --platform "$PLATFORM" \
-  --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+echo ">> Building ${TAG} from the canonical Dockerfile (${PLATFORM}, Python 3.14)"
+echo ">> Release identity: version ${SKYPILOT_VERSION}, commit ${image_commit}, checked in ${image_commit_timestamp}, build ${image_commit_count}"
+docker build \
+  --file "$repo_root/Dockerfile" \
+  --platform "$PLATFORM" \
+  --build-arg "INSTALL_FROM_SOURCE=true" \
+  --build-arg "INSTALL_BOLTZ_RECLAIM_POLICY=true" \
+  --build-arg "SKYPILOT_EXTRAS=aws,gcp,kubernetes" \
   --build-arg "SKYPILOT_VERSION=${SKYPILOT_VERSION}" \
-  --build-arg "SKYPILOT_COMMIT_SHA=${overlay_commit}" \
-  -t "$TAG" "$ctx"
+  --build-arg "SKYPILOT_COMMIT_SHA=${image_commit}" \
+  --build-arg "SKYPILOT_COMMIT_TIMESTAMP=${image_commit_timestamp}" \
+  --build-arg "SKYPILOT_COMMIT_COUNT=${image_commit_count}" \
+  --tag "$TAG" \
+  "$repo_root"
 
-echo ">> Verifying canonical version + identity + modules + dashboard"
+echo ">> Verifying Python, provenance, distributions, cloud clients, and dashboard"
 docker run --rm --platform "$PLATFORM" \
-  -e "EXPECTED_SKYPILOT_COMMIT=${overlay_commit}" \
-  -e "EXPECTED_SKYPILOT_COMMIT_TIMESTAMP=${overlay_commit_timestamp}" \
-  -e "EXPECTED_SKYPILOT_BUILD=${overlay_build}" \
+  -e "EXPECTED_SKYPILOT_VERSION=${SKYPILOT_VERSION}" \
+  -e "EXPECTED_SKYPILOT_COMMIT=${image_commit}" \
+  -e "EXPECTED_SKYPILOT_COMMIT_TIMESTAMP=${image_commit_timestamp}" \
+  -e "EXPECTED_SKYPILOT_BUILD=${image_commit_count}" \
   "$TAG" python -c "
-import importlib.metadata, os
+import importlib.metadata
+import os
+import sys
+
+import boto3
+import googleapiclient.discovery
+import kubernetes
 import skypilot_serve_system_oom_recovery_authorization
 import boltz_reserved_fill_reclaim_policy
 import sky
-import sky.serve.controller, sky.serve.replica_managers, sky.serve.load_balancer
-from sky.utils import controller_utils
+import sky.serve.controller
+import sky.serve.load_balancer
+import sky.serve.replica_managers
 import sky.server.config
 from sky.server import constants as server_constants
+from sky.utils import controller_utils
+
+assert sys.version_info[:2] >= (3, 14), sys.version
+assert sky.__version__ == os.environ['EXPECTED_SKYPILOT_VERSION']
 assert sky.__commit__ == os.environ['EXPECTED_SKYPILOT_COMMIT']
 assert sky.__commit_timestamp__ == os.environ['EXPECTED_SKYPILOT_COMMIT_TIMESTAMP']
 assert sky.__build__ == os.environ['EXPECTED_SKYPILOT_BUILD']
-assert callable(controller_utils.get_serve_launch_limit)
-assert callable(controller_utils.get_serve_termination_limit)
-assert sky.__version__ == '${SKYPILOT_VERSION}', sky.__version__
-assert importlib.metadata.version('skypilot-nightly') == sky.__version__
+assert importlib.metadata.version('skypilot') == sky.__version__
 assert importlib.metadata.version(
     'boltz-skypilot-reserved-fill-reclaim-policy') == sky.__version__
+assert callable(controller_utils.get_serve_launch_limit)
+assert callable(controller_utils.get_serve_termination_limit)
 entries = tuple(importlib.metadata.entry_points().select(
     group='skypilot.reserved_fill_reclaim_policy'))
 assert len(entries) == 1, entries
@@ -299,7 +124,23 @@ assert policy.policy_identity().policy_revision == (
     boltz_reserved_fill_reclaim_policy.POLICY_REVISION)
 index = os.path.join(server_constants.DASHBOARD_DIR, 'index.html')
 assert os.path.isfile(index), f'dashboard missing from image: {index}'
-print('overlay verify OK')"
+print('Boltz production image verification OK')"
 
-if [ "$PUSH" = "true" ]; then echo ">> Pushing ${TAG}"; docker push "$TAG"; fi
+test "$(docker image inspect --format \
+  '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$TAG")" = \
+  "$SKYPILOT_VERSION"
+test "$(docker image inspect --format \
+  '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$TAG")" = \
+  "$image_commit"
+test "$(docker image inspect --format \
+  '{{ index .Config.Labels "bio.boltz.skypilot.commit-timestamp" }}' "$TAG")" = \
+  "$image_commit_timestamp"
+test "$(docker image inspect --format \
+  '{{ index .Config.Labels "bio.boltz.skypilot.commit-count" }}' "$TAG")" = \
+  "$image_commit_count"
+
+if [ "$PUSH" = "true" ]; then
+  echo ">> Pushing ${TAG}"
+  docker push "$TAG"
+fi
 echo ">> Done: ${TAG}"
