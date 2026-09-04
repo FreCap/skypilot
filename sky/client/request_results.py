@@ -43,37 +43,18 @@ def _response_api_version(headers: Mapping[str, str]) -> int | None:
         return None
 
 
-def _response_detail(response: 'requests.Response') -> str | None:
-    try:
-        payload = response.json()
-    except Exception:  # pylint: disable=broad-except
-        return None
-    if not isinstance(payload, dict):
-        return None
-    detail = payload.get('detail')
-    return detail if isinstance(detail, str) else None
-
-
 def is_request_result_retry_required(status_code: int, headers: Mapping[str,
                                                                         str],
-                                     detail: str | None,
                                      request_id: str) -> bool:
     """Whether one response authoritatively permits replaying an operation."""
     if status_code != 503:
         return False
     response_api_version = _response_api_version(headers)
-    if response_api_version is None:
+    if (response_api_version is None or response_api_version
+            < server_constants.MIN_REQUEST_RESULT_RETRY_MARKER_API_VERSION):
         return False
-    if (response_api_version
-            >= server_constants.MIN_REQUEST_RESULT_RETRY_MARKER_API_VERSION):
-        marker = headers.get(
-            server_constants.REQUEST_RESULT_RETRY_REQUIRED_HEADER)
-        return marker == request_id
-    if response_api_version < server_constants.MIN_COMPATIBLE_API_VERSION:
-        return False
-    # Compatibility with servers predating the versioned exact-ID marker.
-    # Require the complete historical message for this exact full request ID.
-    return detail == f'Request {request_id!r} should be retried'
+    marker = headers.get(server_constants.REQUEST_RESULT_RETRY_REQUIRED_HEADER)
+    return marker == request_id
 
 
 def request_result_protocol_error(http_status_code: int,
@@ -139,7 +120,6 @@ def _get_request_response(
         else:
             if is_request_result_retry_required(response.status_code,
                                                 response.headers,
-                                                _response_detail(response),
                                                 str(request_id)):
                 response.close()
                 raise exceptions.RequestResultShouldRetryError(str(request_id))
