@@ -1710,9 +1710,9 @@ class SkyServeLoadBalancer:
                     per_replica_limit = max(
                         1, int(config.get('max_concurrency_per_replica', 1)))
                     free_by_url = {
-                        url: max(0, per_replica_limit -
-                                 (in_flight or {}).get(url, 0))
-                        for url in ready_urls
+                        url: max(
+                            0, per_replica_limit -
+                            (in_flight or {}).get(url, 0)) for url in ready_urls
                     }
             slots = {accelerator: 0 for accelerator in configured}
             zero_cost_slots = {accelerator: 0 for accelerator in configured}

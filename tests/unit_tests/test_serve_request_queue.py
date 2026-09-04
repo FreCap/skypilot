@@ -414,10 +414,9 @@ def test_synchronous_logical_card_slots_use_planned_gpu_width():
                   max_concurrency_per_replica=8,
                   use_async_occupancy=False)
     lb._apply_routing_spec({
-        'request_queue': _queue_config(
-            min_size=0,
-            max_concurrency_per_replica=8,
-            use_async_occupancy=False),
+        'request_queue': _queue_config(min_size=0,
+                                       max_concurrency_per_replica=8,
+                                       use_async_occupancy=False),
         'request_accelerator_compatibility_version': 1,
         'configured_accelerators': ['L4'],
     })
@@ -430,8 +429,7 @@ def test_synchronous_logical_card_slots_use_planned_gpu_width():
         url: {
             'gpu_type': 'L4',
             'is_zero_cost': 'false',
-        }
-        for url in urls
+        } for url in urls
     }
     lb._capacity_hint = {
         'replica_unit': 'logical_slot',
@@ -452,8 +450,9 @@ def test_synchronous_logical_card_slots_use_planned_gpu_width():
     })
 
     lb._load_balancing_policy.post_execute_hook(one_gpu, _request(),
-                                                 narrow_token)
-    lb._load_balancing_policy.post_execute_hook(four_gpu, _request(), wide_token)
+                                                narrow_token)
+    lb._load_balancing_policy.post_execute_hook(four_gpu, _request(),
+                                                wide_token)
 
 
 def test_synchronous_logical_route_excludes_full_narrow_backend():

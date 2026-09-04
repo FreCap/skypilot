@@ -143,6 +143,7 @@ def _patch_common(monkeypatch, events, replicas):
     monkeypatch.setattr(serve_state, 'add_or_update_replica',
                         lambda *a, **k: None)
     monkeypatch.setattr(serve_state, 'remove_replica', lambda *a, **k: None)
+
     def _finalize_paid(_service_name, replica_id, _record_id, _cluster_name,
                        **_kwargs):
         info = next((replica for replica in replicas

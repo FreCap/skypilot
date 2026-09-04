@@ -337,7 +337,10 @@ def _provider_census_worker_main() -> int:
                 'operations': operations,
             }
         response = {'ok': True, 'result': result}
-    except BaseException as error:  # pylint: disable=broad-except
+    # This synchronous one-shot child translates every Python failure into one
+    # closed protocol response. Its parent owns cancellation and descendant
+    # extinction through bounded process-group termination and reaping.
+    except BaseException as error:  # noqa: ASYNC103  # pylint: disable=broad-except
         response = {
             'ok': False,
             'result': {

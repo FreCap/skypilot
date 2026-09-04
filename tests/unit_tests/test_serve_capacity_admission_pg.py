@@ -4240,8 +4240,7 @@ def test_fused_paid_admission_rejects_preexisting_resource_identity(
 
     monkeypatch.setattr(paid_wave_admission, 'bind_accepted_in_transaction',
                         _poison_replica_identity)
-    expected_error = (sqlalchemy.exc.IntegrityError
-                      if partial else
+    expected_error = (sqlalchemy.exc.IntegrityError if partial else
                       capacity_admission.CapacityAdmissionConflict)
     expected_message = ('ck_replicas_resource_action_identity'
                         if partial else 'resource-action identity')
