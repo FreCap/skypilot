@@ -5,6 +5,8 @@ from typing import Any, TypeVar
 
 import sqlalchemy
 
+from sky import global_user_state_cluster_name_batches
+
 _ManagedSnapshotT = TypeVar('_ManagedSnapshotT')
 _RefreshSnapshotT = TypeVar('_RefreshSnapshotT')
 
@@ -33,8 +35,9 @@ def get_cluster_status_fields(
             return {
                 row.name: (row.status, row.status_updated_at) for row in rows
             }
-        for offset in range(0, len(cluster_names), cluster_in_query_chunk_size):
-            batch = cluster_names[offset:offset + cluster_in_query_chunk_size]
+        for batch in (global_user_state_cluster_name_batches.
+                      get_unique_cluster_name_batches(
+                          cluster_names, cluster_in_query_chunk_size)):
             rows = query.filter(cluster_table.c.name.in_(batch)).all()
             for row in rows:
                 result[row.name] = (row.status, row.status_updated_at)
@@ -64,8 +67,9 @@ def get_cluster_workload_fields(
             cluster_table.c.workload_type,
             cluster_table.c.workload_id,
         )
-        for offset in range(0, len(cluster_names), cluster_in_query_chunk_size):
-            batch = cluster_names[offset:offset + cluster_in_query_chunk_size]
+        for batch in (global_user_state_cluster_name_batches.
+                      get_unique_cluster_name_batches(
+                          cluster_names, cluster_in_query_chunk_size)):
             rows = query.filter(cluster_table.c.name.in_(batch)).all()
             for row in rows:
                 result[row.name] = (row.workload_type, row.workload_id)
