@@ -7,6 +7,7 @@ from typing import Any
 
 import sqlalchemy
 
+from sky import global_user_state_cluster_name_batches
 from sky.utils import status_lib
 
 
@@ -136,11 +137,13 @@ def get_clusters_from_names(
 
     engine = engine_getter()
     query_fields = _query_fields(cluster_table)
+    cluster_name_batches = (
+        global_user_state_cluster_name_batches.get_unique_cluster_name_batches(
+            cluster_names, cluster_in_query_chunk_size))
     with session_factory(engine) as session:
         row_snapshots: list[tuple[Any, str | None]] = []
         effective_user_hashes: set[str] = set()
-        for offset in range(0, len(cluster_names), cluster_in_query_chunk_size):
-            batch = cluster_names[offset:offset + cluster_in_query_chunk_size]
+        for batch in cluster_name_batches:
             rows = session.query(*query_fields).filter(
                 cluster_table.c.name.in_(batch)).all()
             for row in rows:

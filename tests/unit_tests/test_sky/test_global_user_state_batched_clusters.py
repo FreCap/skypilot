@@ -265,6 +265,34 @@ def test_get_clusters_from_names_chunks_large_input(tmp_path, monkeypatch):
     assert result['missing'] is None
 
 
+def test_get_clusters_from_names_dedupes_duplicate_names_before_chunking(
+        tmp_path, monkeypatch):
+    """Repeated names must not be re-read across chunk boundaries."""
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(global_user_state, '_CLUSTER_IN_QUERY_CHUNK_SIZE', 2)
+    _add_cluster('dup')
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        result = global_user_state.get_clusters_from_names(
+            ['dup', 'dup', 'dup', 'missing'])
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert list(result) == ['dup', 'missing']
+    assert result['dup'] is not None
+    assert result['dup']['name'] == 'dup'
+    assert result['missing'] is None
+    assert len(select_statements) == 1
+
+
 def test_get_cluster_status_fields_has_chunk_bounded_query_count(
         tmp_path, monkeypatch):
     """Status snapshots use one SELECT per chunk, never one per name."""
@@ -293,6 +321,32 @@ def test_get_cluster_status_fields_has_chunk_bounded_query_count(
     assert set(result) == set(names)
     assert all(status == 'INIT' for status, _ in result.values())
     assert len(select_statements) == 3
+
+
+def test_get_cluster_status_fields_dedupes_duplicate_names_before_chunking(
+        tmp_path, monkeypatch):
+    """Raw status snapshots must query each named cluster at most once."""
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(global_user_state, '_CLUSTER_IN_QUERY_CHUNK_SIZE', 2)
+    _add_cluster('dup')
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        result = global_user_state.get_cluster_status_fields(
+            ['dup', 'dup', 'dup', 'missing'])
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert set(result) == {'dup'}
+    assert result['dup'][0] == 'INIT'
+    assert len(select_statements) == 1
 
 
 def test_get_cluster_status_fields_all_unmanaged_uses_one_select(
@@ -374,6 +428,31 @@ def test_get_managed_cluster_status_fields_filters_workload_type(
     assert set(result) == {'managed-service'}
     assert result['managed-service'][0] == 'INIT'
     assert result['managed-service'].cluster_hash
+
+
+def test_get_cluster_workload_fields_dedupes_duplicate_names_before_chunking(
+        tmp_path, monkeypatch):
+    """Workload snapshots must also be bounded by unique cluster names."""
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(global_user_state, '_CLUSTER_IN_QUERY_CHUNK_SIZE', 2)
+    _add_cluster('dup', workload_type='service', workload_id='svc-1')
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        result = global_user_state.get_cluster_workload_fields(
+            ['dup', 'dup', 'dup', 'missing'])
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert result == {'dup': ('service', 'svc-1')}
+    assert len(select_statements) == 1
 
 
 def test_get_managed_job_cluster_cleanup_candidates_includes_legacy(
