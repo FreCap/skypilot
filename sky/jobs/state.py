@@ -1887,11 +1887,11 @@ def _latest_task_status_query_from_scope(
 def has_jobs_requiring_recovery_grace_wait() -> bool:
     """Whether HA leader handoff should pause before managed-job recovery.
 
-    Any nonterminal scheduler row can race a detached controller from the prior
-    image during a mixed-version handoff. In particular, an old scheduler can
-    claim a WAITING row after this query if that image predates durable
-    generation ownership. Keep the bounded drain for every nonterminal job
-    until the compatibility image is outside the rollback window.
+    The bounded drain only protects rows that can still represent in-flight
+    controller work from the previous leader. A pure backlog row
+    (``INACTIVE``/``WAITING`` with no controller PID) has no detached
+    controller to outlive the lock handoff, so delaying recovery for it only
+    adds a fixed startup penalty to backlog-only failover.
     """
     engine = _db_manager.get_engine()
     query = sqlalchemy.select(sqlalchemy.literal(True)).where(
@@ -1899,6 +1899,13 @@ def has_jobs_requiring_recovery_grace_wait() -> bool:
             job_info_table.c.schedule_state.is_not(None),
             job_info_table.c.schedule_state
             != ManagedJobScheduleState.DONE.value,
+            sqlalchemy.or_(
+                job_info_table.c.controller_pid.is_not(None),
+                job_info_table.c.schedule_state.not_in([
+                    ManagedJobScheduleState.INACTIVE.value,
+                    ManagedJobScheduleState.WAITING.value,
+                ]),
+            ),
         )).limit(1)
     with orm.Session(engine) as session:
         return session.execute(query).first() is not None
