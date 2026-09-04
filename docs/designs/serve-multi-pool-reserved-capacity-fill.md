@@ -114,11 +114,13 @@ security-group object is not billable compute, but it does consume AWS quota
 and survives service deletion; those facts must remain visible rather than be
 misreported as complete auxiliary-resource cleanup.
 
-Qualification therefore reuses one stable service name, inventories the bounded
-external groups separately, and does not create a new service name per campaign.
-The exact-zero gate covers billable provider objects and their PostgreSQL
-economic authority. A retained external group is an explicit bounded auxiliary,
-not a running instance, open billing interval, or hidden proof success.
+Qualification therefore reuses one stable service name and does not create a
+new service name per campaign. It neither discovers, owns, nor deletes the
+bounded external groups; an independent operator audit may inventory them when
+AWS quota is under investigation. The exact-zero gate covers billable provider
+objects and their PostgreSQL economic authority. A retained external group is
+an explicit bounded auxiliary, not a running instance, open billing interval,
+or hidden proof success.
 
 If exact automatic removal of every auxiliary later becomes a requirement, the
 preferred root fix is smaller: return automatically generated Serve groups to

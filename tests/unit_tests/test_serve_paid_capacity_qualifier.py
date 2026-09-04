@@ -8,10 +8,8 @@ import datetime
 import hashlib
 import importlib.util
 import json
-import os
 import pathlib
 import shlex
-import socket
 import subprocess
 import sys
 import textwrap
@@ -21,8 +19,6 @@ import types
 import typing
 from typing import Any
 from unittest import mock
-import urllib.error
-import urllib.request
 import uuid
 
 import aiohttp.web
@@ -256,22 +252,6 @@ def _aws_volume(*,
 
 
 _SERVICE_INCARNATION = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-
-
-def _aws_security_group_identity(*,
-                                 security_group_id='sg-a1b2c3',
-                                 security_group_name='sky-sg-paid-e2e',
-                                 creator_lifecycle_epoch=6,
-                                 service_incarnation=_SERVICE_INCARNATION):
-    return qualifier.provision_common.AWSServerOwnedSecurityGroupIdentity(
-        aws_account_id='123456789012',
-        region='us-east-2',
-        vpc_id='vpc-a1b2c3',
-        security_group_id=security_group_id,
-        security_group_name=security_group_name,
-        service_name='paid-e2e',
-        service_incarnation=service_incarnation,
-        creator_lifecycle_epoch=creator_lifecycle_epoch)
 
 
 def _database_state(**overrides):
@@ -785,13 +765,15 @@ def test_scale_arrivals_cannot_run_ahead_of_terminal_success_frontier():
         'maximum_arrivals': 10_000,
     }
 
-    assert qualifier._next_scale_arrival_attribution_state(
-        campaign_offered=801, campaign_succeeded=0, **common) is None
+    assert qualifier._next_scale_arrival_attribution_state(campaign_offered=801,
+                                                           campaign_succeeded=0,
+                                                           **common) is None
     assert qualifier._next_scale_arrival_attribution_state(campaign_offered=801,
                                                            campaign_succeeded=1,
                                                            **common) is not None
-    assert qualifier._next_scale_arrival_attribution_state(
-        campaign_offered=802, campaign_succeeded=1, **common) is None
+    assert qualifier._next_scale_arrival_attribution_state(campaign_offered=802,
+                                                           campaign_succeeded=1,
+                                                           **common) is None
     assert qualifier._next_scale_arrival_attribution_state(
         previous=None,
         unique_job_arrivals_60s=799,
@@ -1583,12 +1565,6 @@ def test_provider_child_runtime_reuses_one_executor_per_lifecycle(monkeypatch):
 
         def accept_retained_volume_ids(self, value):
             self.retained = value
-
-        def accept_retained_security_group_identities(self, identities):
-            assert identities == ()
-
-        def retained_security_group_identities(self):
-            return ()
 
         def retained_volume_ids(self):
             return self.retained
@@ -3113,241 +3089,6 @@ def _cleanup_binding(*,
     }
 
 
-def _aws_security_group_projection(identity):
-    payload = identity.canonical_mapping()
-    return {
-        field: payload[field]
-        for field in ('aws_account_id', 'region', 'vpc_id', 'security_group_id',
-                      'security_group_name')
-    }
-
-
-def test_cleanup_scope_retains_shared_aws_security_group_exactly_once():
-    identity = _aws_security_group_identity()
-
-    observed = qualifier.CleanupScope().retain((), (identity, identity))
-
-    assert observed.aws_security_group_identities == (identity,)
-
-
-@pytest.mark.parametrize('identity', [
-    _aws_security_group_identity(creator_lifecycle_epoch=8),
-    _aws_security_group_identity(
-        service_incarnation='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'),
-    dataclasses.replace(_aws_security_group_identity(),
-                        aws_account_id='999999999999'),
-])
-def test_cleanup_scope_rejects_foreign_aws_security_group(identity):
-    scope = _provider_scope(service_hash=_SERVICE_INCARNATION)
-
-    with pytest.raises(qualifier.GuardViolation, match='escaped service scope'):
-        qualifier.AwsObserver(profile=qualifier.PROFILES['small'],
-                              service_name='paid-e2e',
-                              scope=scope,
-                              retained_security_group_identities=(identity,))
-
-
-def test_cleanup_scope_rejects_malformed_or_reused_aws_security_group():
-    first = _aws_security_group_identity(creator_lifecycle_epoch=5)
-    second = dataclasses.replace(first, creator_lifecycle_epoch=6)
-    with pytest.raises(qualifier.GuardViolation,
-                       match='reuse an AWS security-group identity'):
-        qualifier.CleanupScope().retain((), (first, second))
-
-
-def test_aws_cleanup_counts_only_exact_retained_security_groups():
-    identity = _aws_security_group_identity()
-    group = _aws_security_group_projection(identity)
-
-    present = qualifier.parse_aws_cleanup_state(
-        service_instances=(),
-        service_volumes=(),
-        security_group_identities=(identity,),
-        server_owned_security_groups=(group,))
-    absent = qualifier.parse_aws_cleanup_state(
-        service_instances=(),
-        service_volumes=(),
-        security_group_identities=(identity,),
-        server_owned_security_groups=())
-
-    assert present.security_group_count == 1
-    assert present.cloud('aws').security_group_count == 1
-    assert absent.security_group_count == 0
-
-    changed = {**group, 'security_group_name': 'sky-sg-another-service'}
-    with pytest.raises(qualifier.GuardViolation,
-                       match='escaped its retained identity'):
-        qualifier.parse_aws_cleanup_state(
-            service_instances=(),
-            service_volumes=(),
-            security_group_identities=(identity,),
-            server_owned_security_groups=(changed,))
-    with pytest.raises(qualifier.GuardViolation,
-                       match='escaped its retained identity'):
-        qualifier.parse_aws_cleanup_state(service_instances=(),
-                                          service_volumes=(),
-                                          security_group_identities=(identity,),
-                                          server_owned_security_groups=(group,
-                                                                        group))
-
-
-def test_aws_observer_queries_retained_security_groups_by_exact_id(monkeypatch):
-    existing = _aws_security_group_identity(security_group_id='sg-a1b2c3')
-    deleted = _aws_security_group_identity(security_group_id='sg-d4e5f6')
-    calls = []
-
-    class Session:
-        pass
-
-    session = Session()
-
-    def observe(identity, *, session):
-        calls.append((identity, session))
-        if identity == deleted:
-            presence = (
-                qualifier.aws_instance.ServerOwnedSecurityGroupPresence.ABSENT)
-        else:
-            assert identity == existing
-            presence = (
-                qualifier.aws_instance.ServerOwnedSecurityGroupPresence.PRESENT)
-        return qualifier.provision_common.AWSServerOwnedSecurityGroupObservation(
-            identity=identity, presence=presence)
-
-    monkeypatch.setattr(qualifier.aws_adaptor, 'session',
-                        lambda profile: session)
-    monkeypatch.setattr(qualifier.aws_instance,
-                        'observe_exact_server_owned_service_security_group',
-                        observe)
-    observer = qualifier.AwsObserver(
-        profile=qualifier.PROFILES['small'],
-        service_name='paid-e2e',
-        scope=_provider_scope(service_hash=_SERVICE_INCARNATION),
-        retained_security_group_identities=(existing, deleted))
-
-    assert observer._security_group_census() == (
-        _aws_security_group_projection(existing),)
-    assert calls == [(existing, session), (deleted, session)]
-
-
-def test_aws_observer_rejects_mismatched_exact_security_group_receipt(
-        monkeypatch):
-    retained = _aws_security_group_identity(security_group_id='sg-a1b2c3')
-    foreign = dataclasses.replace(retained, security_group_id='sg-d4e5f6')
-
-    monkeypatch.setattr(qualifier.aws_adaptor, 'session',
-                        lambda profile: object())
-    monkeypatch.setattr(
-        qualifier.aws_instance,
-        'observe_exact_server_owned_service_security_group',
-        lambda identity, session: qualifier.provision_common.
-        AWSServerOwnedSecurityGroupObservation(identity=foreign,
-                                               presence=qualifier.aws_instance.
-                                               ServerOwnedSecurityGroupPresence.
-                                               PRESENT))
-    observer = qualifier.AwsObserver(
-        profile=qualifier.PROFILES['small'],
-        service_name='paid-e2e',
-        scope=_provider_scope(service_hash=_SERVICE_INCARNATION),
-        retained_security_group_identities=(retained,))
-
-    with pytest.raises(qualifier.GuardViolation,
-                       match='exact security-group receipt changed identity'):
-        observer._security_group_census()
-
-
-def test_aws_cleanup_census_is_read_only_for_discovered_group(monkeypatch):
-    identity = _aws_security_group_identity()
-    discovery_calls = []
-    observation_calls = []
-    delete_calls = []
-
-    class Session:
-        pass
-
-    session = Session()
-
-    def discover(**kwargs):
-        discovery_calls.append(kwargs)
-        return (identity,)
-
-    def observe(observed_identity, *, session):
-        observation_calls.append((observed_identity, session))
-        return qualifier.provision_common.AWSServerOwnedSecurityGroupObservation(
-            identity=observed_identity,
-            presence=qualifier.aws_instance.ServerOwnedSecurityGroupPresence.
-            PRESENT)
-
-    def delete(*args, **kwargs):
-        delete_calls.append((args, kwargs))
-        raise AssertionError('Read-only qualifier attempted provider cleanup.')
-
-    monkeypatch.setattr(qualifier.aws_adaptor, 'session',
-                        lambda profile: session)
-    monkeypatch.setattr(qualifier.aws_instance,
-                        'discover_server_owned_service_security_groups',
-                        discover)
-    monkeypatch.setattr(qualifier.aws_instance,
-                        'observe_exact_server_owned_service_security_group',
-                        observe)
-    monkeypatch.setattr(qualifier.aws_instance,
-                        'delete_exact_server_owned_service_security_group',
-                        delete)
-    observer = qualifier.AwsObserver(
-        profile=qualifier.PROFILES['small'],
-        service_name='paid-e2e',
-        scope=_provider_scope(service_hash=_SERVICE_INCARNATION),
-        discover_server_owned_security_groups=True)
-
-    assert observer._security_group_census() == (
-        _aws_security_group_projection(identity),)
-    assert observer._security_group_census() == (
-        _aws_security_group_projection(identity),)
-    assert discovery_calls == [{
-        'session': session,
-        'aws_account_id': identity.aws_account_id,
-        'region': identity.region,
-        'service_name': identity.service_name,
-        'service_incarnation': identity.service_incarnation,
-        'service_lifecycle_epoch': 7,
-    }] * 2
-    assert observation_calls == [(identity, session), (identity, session)]
-    assert delete_calls == []
-
-
-def test_aws_cleanup_fails_closed_on_provider_identity_violation(monkeypatch):
-    delete_calls = []
-
-    class Session:
-        pass
-
-    def discover(**kwargs):
-        del kwargs
-        raise ValueError('Provider rejected ownership tags.')
-
-    def delete(*args, **kwargs):
-        delete_calls.append((args, kwargs))
-
-    monkeypatch.setattr(qualifier.aws_adaptor, 'session',
-                        lambda profile: Session())
-    monkeypatch.setattr(qualifier.aws_instance,
-                        'discover_server_owned_service_security_groups',
-                        discover)
-    monkeypatch.setattr(qualifier.aws_instance,
-                        'delete_exact_server_owned_service_security_group',
-                        delete)
-    observer = qualifier.AwsObserver(
-        profile=qualifier.PROFILES['small'],
-        service_name='paid-e2e',
-        scope=_provider_scope(service_hash=_SERVICE_INCARNATION),
-        discover_server_owned_security_groups=True)
-
-    with pytest.raises(qualifier.GuardViolation,
-                       match='escaped its service scope'):
-        observer._security_group_census()
-    assert delete_calls == []
-    assert delete_calls == []
-
-
 def _cleanup_replica(binding, *, sky_down_status='SUCCEEDED'):
     identity = (qualifier.ordinary_launch_binding.
                 derive_fresh_ordinary_paid_resource_action_identity(
@@ -3765,19 +3506,16 @@ def test_pre_down_freeze_persists_identity_before_association_can_disappear(
         'service_name': 'paid-e2e',
         'cleanup_scope': {
             'cluster_identities': [],
-            'aws_security_group_identities': [],
         },
     }),
                             encoding='utf-8')
 
     async def request(kind, arguments, _deadline):
         if kind is qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
-            assert 'delete_server_owned_security_groups' not in arguments
             return {
                 'retained_volume_ids_by_region': {
                     'us-east-2': [],
                 },
-                'retained_aws_security_group_identities': [],
             }
         assert kind is qualifier.IsolatedObservationKind.POSTGRES
         assert arguments['projection'] == 'cleanup'
@@ -3892,8 +3630,7 @@ def test_wait_cleanup_requires_full_hold_and_resets_on_nonzero(
     assert payload['zero_hold_elapsed_seconds'] >= 0.12
 
 
-def test_wait_cleanup_retains_first_discovered_aws_security_group_before_reduce(
-        monkeypatch, tmp_path):
+def test_wait_cleanup_holds_exact_aws_zero(monkeypatch, tmp_path):
     base = _provider_scope(service_hash=_SERVICE_INCARNATION)
     scope = dataclasses.replace(
         base,
@@ -3910,7 +3647,6 @@ def test_wait_cleanup_retains_first_discovered_aws_security_group_before_reduce(
         catalog_shapes=tuple(
             shape for shape in base.catalog_shapes
             if shape.cloud == 'aws' and shape.gpu_units_per_instance == 1))
-    identity = _aws_security_group_identity()
     scope_path = tmp_path / 'scope.json'
     qualification_path = tmp_path / 'qualification.json'
     output_path = tmp_path / 'cleanup.json'
@@ -3920,7 +3656,6 @@ def test_wait_cleanup_retains_first_discovered_aws_security_group_before_reduce(
         'service_name': 'paid-e2e',
         'cleanup_scope': {
             'cluster_identities': [],
-            'aws_security_group_identities': [],
         },
     }),
                                   encoding='utf-8')
@@ -3932,34 +3667,19 @@ def test_wait_cleanup_retains_first_discovered_aws_security_group_before_reduce(
             arguments['scope']) == scope
         if kind is qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
             provider_calls += 1
-            assert 'delete_server_owned_security_groups' not in arguments
-            requested_scope = qualifier._cleanup_scope_from_process_payload(
-                arguments['cleanup_scope'])
-            if provider_calls == 1:
-                assert requested_scope.aws_security_group_identities == ()
-            else:
-                assert requested_scope.aws_security_group_identities == (
-                    identity,)
-            groups = ((_aws_security_group_projection(identity),)
-                      if provider_calls == 1 else ())
             return {
                 'gcp_census': None,
                 'aws_census': dataclasses.asdict(
-                    qualifier.AwsProviderCensus(
-                        service_instances=(),
-                        service_volumes=(),
-                        server_owned_security_groups=groups)),
+                    qualifier.AwsProviderCensus(service_instances=(),
+                                                service_volumes=())),
                 'retained_volume_ids_by_region': {
                     'us-east-2': [],
                 },
-                'retained_aws_security_group_identities': [
-                    identity.canonical_mapping()
-                ],
             }
         assert kind is qualifier.IsolatedObservationKind.POSTGRES
         cleanup_scope = qualifier._cleanup_scope_from_process_payload(
             arguments['cleanup_scope'])
-        assert cleanup_scope.aws_security_group_identities == (identity,)
+        assert cleanup_scope == qualifier.CleanupScope()
         return {
             'cleanup': dataclasses.asdict(_cleanup_database_state()),
             'cleanup_scope':
@@ -3981,15 +3701,12 @@ def test_wait_cleanup_retains_first_discovered_aws_security_group_before_reduce(
 
     payload = json.loads(output_path.read_text(encoding='utf-8'))
     assert [sample['exact_zero'] for sample in payload['samples']
-           ] == [False, True, True, True]
-    assert payload['samples'][0]['cleanup_provider_security_groups'] == 1
+           ] == [True, True, True]
     assert qualifier.read_optional_cleanup_scope_receipt(
-        qualification_path,
-        'paid-e2e').aws_security_group_identities == (identity,)
+        qualification_path, 'paid-e2e') == qualifier.CleanupScope()
 
 
-def test_wait_cleanup_fails_instead_of_deleting_persistent_aws_group(
-        monkeypatch, tmp_path):
+def test_wait_cleanup_fails_on_persistent_aws_volume(monkeypatch, tmp_path):
     base = _provider_scope(service_hash=_SERVICE_INCARNATION)
     scope = dataclasses.replace(
         base,
@@ -4006,7 +3723,6 @@ def test_wait_cleanup_fails_instead_of_deleting_persistent_aws_group(
         catalog_shapes=tuple(
             shape for shape in base.catalog_shapes
             if shape.cloud == 'aws' and shape.gpu_units_per_instance == 1))
-    identity = _aws_security_group_identity()
     scope_path = tmp_path / 'scope.json'
     qualification_path = tmp_path / 'qualification.json'
     output_path = tmp_path / 'cleanup.json'
@@ -4016,28 +3732,21 @@ def test_wait_cleanup_fails_instead_of_deleting_persistent_aws_group(
         'service_name': 'paid-e2e',
         'cleanup_scope': {
             'cluster_identities': [],
-            'aws_security_group_identities': [],
         },
     }),
                                   encoding='utf-8')
 
     async def isolated_observation(kind, arguments, _deadline, **_kwargs):
         if kind is qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
-            assert 'delete_server_owned_security_groups' not in arguments
             return {
                 'gcp_census': None,
                 'aws_census': dataclasses.asdict(
                     qualifier.AwsProviderCensus(
                         service_instances=(),
-                        service_volumes=(),
-                        server_owned_security_groups=(
-                            _aws_security_group_projection(identity),))),
+                        service_volumes=(_aws_volume(),))),
                 'retained_volume_ids_by_region': {
-                    'us-east-2': [],
+                    'us-east-2': ['vol-new'],
                 },
-                'retained_aws_security_group_identities': [
-                    identity.canonical_mapping()
-                ],
             }
         cleanup_scope = qualifier._cleanup_scope_from_process_payload(
             arguments['cleanup_scope'])
@@ -4065,9 +3774,9 @@ def test_wait_cleanup_fails_instead_of_deleting_persistent_aws_group(
     payload = json.loads(output_path.read_text(encoding='utf-8'))
     assert payload['outcome'] == 'failed'
     assert payload['samples']
-    assert all(sample['exact_zero'] is False and
-               sample['cleanup_provider_security_groups'] == 1
-               for sample in payload['samples'])
+    assert all(
+        sample['exact_zero'] is False and sample['cleanup_provider_disks'] == 1
+        for sample in payload['samples'])
 
 
 def test_wait_cleanup_does_not_pass_after_only_paid_debits_settle(
@@ -4237,7 +3946,6 @@ def test_cleanup_retains_aws_volume_identity_before_postgres_failure(
         'service_name': 'paid-e2e',
         'cleanup_scope': {
             'cluster_identities': [],
-            'aws_security_group_identities': [],
         },
     }),
                                   encoding='utf-8')
@@ -4267,7 +3975,6 @@ def test_cleanup_retains_aws_volume_identity_before_postgres_failure(
                 'retained_volume_ids_by_region': {
                     'us-east-2': ['vol-new']
                 },
-                'retained_aws_security_group_identities': [],
             }
         assert kind is qualifier.IsolatedObservationKind.POSTGRES
         assert arguments['projection'] == 'cleanup'
@@ -5889,8 +5596,7 @@ def test_persistent_observer_rejects_oversized_request_before_spawn(
     spawn.assert_not_awaited()
 
 
-def test_composite_observer_bounds_load_balancer_and_skips_postgres(
-        monkeypatch):
+def test_composite_observer_bounds_load_balancer_and_skips_postgres():
     calls = []
     cancelled = asyncio.Event()
 
@@ -7460,7 +7166,6 @@ def _qualification_provider_projection(peaks):
             'gpu_units': count,
             'running_gpu_units': count,
             'disks': count,
-            'security_groups': 0,
             'inflight_operations': 0,
             'shapes': shapes,
         }
@@ -7475,7 +7180,9 @@ def _zero_qualification_sample(observed_at,
         'phase': phase,
         'observed_at': observed_at,
         'exact_zero': True,
-        **{field: 0 for field in qualifier._ZERO_OBSERVATION_FIELDS},
+        **{
+            field: 0 for field in qualifier._ZERO_OBSERVATION_FIELDS
+        },
         'provider_by_cloud': _qualification_provider_projection({}),
         'paid_claim_priority_units': [],
         'lb_offered_arrival_tracking_saturated': False,
@@ -7536,7 +7243,9 @@ def _write_aggregate_qualification(path,
     scale_started_at = 4.0
     scale_observed_at = 250.0 if economic else 130.0
     scale_sample = {
-        **{field: 0 for field in qualifier._ZERO_OBSERVATION_FIELDS},
+        **{
+            field: 0 for field in qualifier._ZERO_OBSERVATION_FIELDS
+        },
         'phase': 'scale',
         'scale_iteration_id': 1,
         'observation_started_at': scale_observed_at - 0.5,
@@ -7604,8 +7313,8 @@ def _write_aggregate_qualification(path,
         'scale_started_at': scale_started_at,
         'scale_slo_seconds': profile.scale_slo_seconds,
         'scale_timeout_seconds': profile.scale_timeout_seconds,
-        'scale_slo_met':
-            (scale_observed_at - scale_started_at <= profile.scale_slo_seconds),
+        'scale_slo_met': (scale_observed_at - scale_started_at
+                          <= profile.scale_slo_seconds),
         'scale_qualified_observed_at': scale_observed_at,
         'scale_qualified_iteration_id': 1,
         'baseline_qualified_iteration_id': 3,
@@ -7669,7 +7378,6 @@ def _write_aggregate_qualification(path,
         'outcome': 'passed',
         'cleanup_scope': {
             'cluster_identities': [],
-            'aws_security_group_identities': [],
         },
     }
     if not economic:
@@ -7702,7 +7410,6 @@ def _write_aggregate_cleanup(path,
             'cleanup_retention_pins': 0,
             'cleanup_provider_disks': 0,
             'cleanup_provider_instances': 0,
-            'cleanup_provider_security_groups': 0,
             'cleanup_provider_operations': 0,
             'cleanup_replicas': 0,
             'cleanup_service_rows': 0,
@@ -7715,7 +7422,6 @@ def _write_aggregate_cleanup(path,
                     'gpu_units': 0,
                     'running_gpu_units': 0,
                     'disk_count': 0,
-                    'security_group_count': 0,
                     'inflight_operation_count': 0,
                     'shapes': [],
                 } for cloud in ('aws', 'gcp')
@@ -7948,7 +7654,7 @@ def test_schema_thirteen_rejects_invalid_incomplete_occupancy_scale_evidence(
     with pytest.raises(qualifier.QualificationError,
                        match='unattributed scale demand'):
         qualifier._validate_request_evidence(
-            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+            payload, profile=qualifier.PROFILES['scale'])
 
 
 def test_schema_thirteen_rejects_partial_scale_without_current_demand(tmp_path):
@@ -7971,7 +7677,7 @@ def test_schema_thirteen_rejects_partial_scale_without_current_demand(tmp_path):
     with pytest.raises(qualifier.QualificationError,
                        match='unattributed scale demand'):
         qualifier._validate_request_evidence(
-            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+            payload, profile=qualifier.PROFILES['scale'])
 
 
 @pytest.mark.parametrize(
@@ -8017,7 +7723,7 @@ def test_request_scale_iteration_ids_are_contiguous_in_receipt_order(
 
     with pytest.raises(qualifier.QualificationError, match='contiguous'):
         qualifier._validate_request_evidence(
-            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+            payload, profile=qualifier.PROFILES['scale'])
 
 
 def test_request_scale_timestamps_are_strictly_increasing(tmp_path):
@@ -8035,7 +7741,7 @@ def test_request_scale_timestamps_are_strictly_increasing(tmp_path):
     with pytest.raises(qualifier.QualificationError,
                        match='scale timestamps.*strictly increasing'):
         qualifier._validate_request_evidence(
-            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+            payload, profile=qualifier.PROFILES['scale'])
 
 
 def test_request_evidence_requires_canonical_phase_order(tmp_path):
@@ -8050,7 +7756,7 @@ def test_request_evidence_requires_canonical_phase_order(tmp_path):
     with pytest.raises(qualifier.QualificationError,
                        match='canonical request phase order'):
         qualifier._validate_request_evidence(
-            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+            payload, profile=qualifier.PROFILES['scale'])
 
 
 @pytest.mark.parametrize(
@@ -8073,7 +7779,7 @@ def test_malformed_request_scale_fields_raise_qualification_error(
     with pytest.raises(qualifier.QualificationError,
                        match='request telemetry|scale demand'):
         qualifier._validate_request_evidence(
-            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+            payload, profile=qualifier.PROFILES['scale'])
 
 
 def test_provider_scale_must_precede_terminal_request_evidence(tmp_path):

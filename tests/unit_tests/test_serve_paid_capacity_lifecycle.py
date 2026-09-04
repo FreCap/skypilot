@@ -125,7 +125,6 @@ def _exact_zero_cleanup_payload(*, service_name, scope, qualification_receipt):
             'cleanup_retention_pins': 0,
             'cleanup_provider_disks': 0,
             'cleanup_provider_instances': 0,
-            'cleanup_provider_security_groups': 0,
             'cleanup_provider_operations': 0,
             'cleanup_replicas': 0,
             'cleanup_service_rows': 0,
@@ -138,7 +137,6 @@ def _exact_zero_cleanup_payload(*, service_name, scope, qualification_receipt):
                     'gpu_units': 0,
                     'running_gpu_units': 0,
                     'disk_count': 0,
-                    'security_group_count': 0,
                     'inflight_operation_count': 0,
                     'shapes': [],
                 } for cloud in ('aws', 'gcp')
@@ -573,7 +571,7 @@ def test_lifecycle_rejects_cleanup_hold_below_profile_before_mutation(
         asyncio.run(lifecycle_module.run_lifecycle(args,
                                                    _FakeLifecycle(events)))
 
-    assert events == []
+    assert not events
 
 
 def test_pre_down_cleanup_scope_failure_cannot_publish_exact_cleanup(
