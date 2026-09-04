@@ -419,9 +419,9 @@ async def _run_test(controller_port: int, lb_port: int) -> None:
                 'count': _QUEUE_SIZE,
             }]
 
-            # Every waiter polls for disconnect once per second. Probe after a
-            # complete poll interval, through the same public liveness route
-            # Kubernetes uses, while all 10,000 requests remain resident.
+            # Keep the queue resident beyond the historical one-second poll
+            # boundary, then use the same public liveness route Kubernetes
+            # uses. Disconnect observation must remain event-driven at 10k.
             await asyncio.sleep(1.1)
             liveness_latencies = []
             for _ in range(20):

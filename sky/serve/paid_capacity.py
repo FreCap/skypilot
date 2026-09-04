@@ -28,6 +28,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.serve import constants
+from sky.serve import placement_policy
 from sky.serve import spot_placer
 from sky.utils import common_utils
 
@@ -136,6 +137,47 @@ class PhysicalBackendShape:
     @property
     def total_gpu_units(self) -> int:
         return self.gpu_units_per_node * self.num_nodes
+
+
+def paid_launch_plan_units(
+    *,
+    contract: placement_policy.PlacementContract,
+    configured_shape: PhysicalBackendShape,
+    candidate_shape: PhysicalBackendShape,
+) -> int:
+    """Map one exact paid backend into the elected service capacity unit.
+
+    Logical services plan in one-GPU slots, so a same-card, single-node paid
+    backend contributes its complete physical GPU width. Physical services
+    plan in whole backends and therefore accept only their configured exact
+    shape as one unit. This is the sole conversion boundary; callers must not
+    infer plan units from a YAML count or a catalog shape independently.
+    """
+    if (not isinstance(contract, placement_policy.PlacementContract) or
+            not isinstance(configured_shape, PhysicalBackendShape) or
+            not isinstance(candidate_shape, PhysicalBackendShape)):
+        raise PaidGPUAttributionError(
+            'Paid backend does not match the placement contract.')
+    if not contract.enabled:
+        raise PaidGPUAttributionError(
+            'Paid backend does not match the placement contract.')
+    if contract.uses_logical_replicas:
+        if (contract.catalog_mode
+                != placement_policy.CATALOG_MODE_WHOLE_GPU_SHAPES or
+                configured_shape.accelerator is None or
+                candidate_shape.accelerator != configured_shape.accelerator or
+                configured_shape.num_nodes != 1 or
+                configured_shape.gpu_units_per_node != 1 or
+                candidate_shape.num_nodes != 1 or
+                candidate_shape.gpu_units_per_node <= 0):
+            raise PaidGPUAttributionError(
+                'Paid backend does not match the placement contract.')
+        return candidate_shape.gpu_units_per_node
+    if (contract.catalog_mode != placement_policy.CATALOG_MODE_CONFIGURED_SHAPES
+            or candidate_shape != configured_shape):
+        raise PaidGPUAttributionError(
+            'Paid backend does not match the placement contract.')
+    return 1
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -249,6 +291,117 @@ class PaidLaunchCatalogEvidence:
                 type(value) is not int or value < 0  # pylint: disable=unidiomatic-typecheck
                 for value in integer_fields):
             raise ValueError('Paid launch catalog ordering is malformed.')
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PaidLaunchTemplate:
+    """Immutable identity-free catalog member for locked paid admission.
+
+    One template represents one exact provider pool.  It intentionally carries
+    no replica number, record UUID, cluster name, executable request, or
+    occurrence cursor.  Its request-body template is exact-pool authority with
+    explicit identity sentinels; member identity and the final executable
+    request are derived only after PostgreSQL has locked the current service
+    capacity and paid-pool graph.
+    """
+
+    service_name: str
+    service_hash: str
+    service_lifecycle_epoch: int
+    service_version: int
+    provider_account: str | None
+    provider_project_id: str | None
+    cloud: str
+    workspace: str
+    region: str
+    zone: str | None
+    instance_type: str | None
+    pool_key: str
+    frontier_key: FrontierKey
+    accelerator: str
+    gpu_units_per_node: int
+    num_nodes: int
+    resources_override: bytes
+    prepared_launch_body_template: bytes
+    placement_catalog_sha256: str
+    catalog_rank: int
+    version_authority: PaidLaunchVersionAuthority
+
+    def __post_init__(self) -> None:
+        nonempty_strings = (self.service_name, self.service_hash, self.cloud,
+                            self.workspace, self.region, self.pool_key,
+                            self.accelerator)
+        if any(
+                type(value) is not str or not value
+                for value in nonempty_strings):
+            raise ValueError(
+                'Paid launch template identities must be nonempty strings.')
+        integer_fields = ((self.service_lifecycle_epoch,
+                           1), (self.service_version,
+                                1), (self.gpu_units_per_node, 1),
+                          (self.num_nodes, 1), (self.catalog_rank, 0))
+        if any(
+                type(value) is not int or value < minimum  # pylint: disable=unidiomatic-typecheck
+                for value, minimum in integer_fields):
+            raise ValueError('Paid launch template integers are malformed.')
+        if self.gpu_units_per_node > (_MAX_EXACT_SHAPE_INTEGER //
+                                      self.num_nodes):
+            raise ValueError('Paid launch template shape is too large.')
+        if (self.zone is not None and
+            (type(self.zone) is not str or not self.zone)):
+            raise ValueError('Paid launch template zone is malformed.')
+        if (self.provider_account is not None and
+            (type(self.provider_account) is not str or
+             not self.provider_account)):
+            raise ValueError('Paid launch template account is malformed.')
+        if (self.provider_project_id is not None and
+            (type(self.provider_project_id) is not str or
+             _GCP_PROJECT_ID_RE.fullmatch(self.provider_project_id) is None)):
+            raise ValueError('Paid launch template project is malformed.')
+        if (self.cloud != self.cloud.casefold() or
+                self.accelerator != self.accelerator.casefold()):
+            raise ValueError('Paid launch template names must be folded.')
+        if (type(self.frontier_key) is not tuple or any(
+                type(card) is not str or not card or card != card.casefold()
+                for card in self.frontier_key) or
+                self.frontier_key != tuple(sorted(set(self.frontier_key)))):
+            raise ValueError('Paid launch template frontier is noncanonical.')
+        thaw_paid_launch_payload(self.resources_override)
+        if (type(self.prepared_launch_body_template) is not bytes or
+                not self.prepared_launch_body_template):
+            raise ValueError('Paid launch body template is malformed.')
+        if (type(self.placement_catalog_sha256) is not str or
+                _SHA256_RE.fullmatch(self.placement_catalog_sha256) is None or
+                not isinstance(self.version_authority,
+                               PaidLaunchVersionAuthority)):
+            raise ValueError('Paid launch template evidence is malformed.')
+        pool = pool_key_payload(self.pool_key)
+        if pool is None or pool.get('use_spot') is not True:
+            raise ValueError('Paid launch template pool must be Spot.')
+        if pool.get('accelerators') != [[
+                self.accelerator, self.gpu_units_per_node
+        ]]:
+            raise ValueError('Paid launch template pool shape disagrees.')
+        if (pool.get('cloud') != self.cloud or
+                pool.get('workspace') != self.workspace or
+                pool.get('region') != self.region or
+                pool.get('zone') != self.zone or
+                pool.get('instance_type') != self.instance_type or
+                pool.get('num_nodes') != self.num_nodes):
+            raise ValueError('Paid launch template pool location disagrees.')
+        provider_identity = pool.get('provider_identity')
+        pool_account = (provider_identity.get('aws_account_id') if isinstance(
+            provider_identity, dict) else None)
+        pool_project_id = (provider_identity.get('gcp_project_id')
+                           if isinstance(provider_identity, dict) else None)
+        if (pool_account != self.provider_account or
+                pool_project_id != self.provider_project_id):
+            raise ValueError(
+                'Paid launch template provider identity disagrees.')
+
+    @property
+    def physical_gpu_units(self) -> int:
+        return self.gpu_units_per_node * self.num_nodes
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -1614,6 +1767,22 @@ def _exact_whole_gpu_shape(
     return card.casefold(), int(count)
 
 
+def physical_backend_shape_from_location(
+    location: spot_placer.Location,
+    *,
+    num_nodes: int,
+) -> PhysicalBackendShape:
+    """Return one catalog location's exact typed physical GPU shape."""
+    if not isinstance(location, spot_placer.Location):
+        raise PaidGPUAttributionError(
+            'Paid backend location is not a catalog location.')
+    card, width = _exact_whole_gpu_shape(location.accelerators,
+                                         field='paid backend catalog location')
+    return PhysicalBackendShape(accelerator=card,
+                                gpu_units_per_node=width,
+                                num_nodes=num_nodes)
+
+
 def active_paid_spot_accelerator_shapes(
     placer: spot_placer.SpotPlacer,) -> frozenset[tuple[str, int]]:
     """Project exact GPU shapes that can consume a paid preparation wave.
@@ -1663,10 +1832,22 @@ def equal_cost_balancing_tier(
     if type(location.use_spot) is not bool:  # pylint: disable=unidiomatic-typecheck
         raise PaidGPUAttributionError(
             'Equal-cost balancing requires an exact purchase market.')
+    try:
+        identity = spot_placer.exact_backend_balancing_identity(location)
+    except ValueError as error:
+        raise PaidGPUAttributionError(
+            'Equal-cost balancing requires an exact catalog location.') \
+            from error
+    if len(identity.accelerator_shape) != 1:
+        raise PaidGPUAttributionError(
+            'Equal-cost balancing requires one exact accelerator shape.')
     card, width = _exact_whole_gpu_shape(location.accelerators,
                                          field='equal-cost balancing location')
+    if identity.accelerator_shape != ((card, width),):
+        raise PaidGPUAttributionError(
+            'Equal-cost balancing requires one exact accelerator shape.')
     return EqualCostBalancingTier(normalized_cost=normalized_cost,
-                                  use_spot=location.use_spot,
+                                  use_spot=identity.use_spot,
                                   physical_backend_shape=PhysicalBackendShape(
                                       accelerator=card,
                                       gpu_units_per_node=width,
@@ -2348,6 +2529,11 @@ def build_launch_budget(
             frontier_ceiling=configured_max_frontier)
         service_remaining = max(0, service_claim_limit - service_claims)
     else:
+        # Deprecated transition-only allocator. Production promoted services
+        # use ``prospective_claims`` plus locked templates and never pass a
+        # PaidLaunchAuthority here. Remove this singular-width branch after
+        # the format-7 provider qualification horizon; it cannot represent a
+        # mixed-width logical catalog and must not regain a production caller.
         try:
             claimed_units = serve_state.get_paid_capacity_plan_claimed_units(
                 paid_launch_authority.service_name,

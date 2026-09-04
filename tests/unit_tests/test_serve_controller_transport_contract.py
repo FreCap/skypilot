@@ -183,12 +183,16 @@ def test_placement_state_pages_a_legacy_controller_response():
         constants.PLACEMENT_STATE_LEGACY_PAGINATION_VERSION)
 
 
-def test_placement_state_accepts_an_exact_bounded_controller_page():
+@pytest.mark.parametrize(
+    'pagination_version',
+    constants.PLACEMENT_STATE_GENERATION_FENCED_PAGINATION_VERSIONS)
+def test_placement_state_accepts_an_exact_generation_fenced_controller_page(
+        pagination_version):
     response = mock.Mock()
     expected = {
         'available': True,
         'enabled': True,
-        'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+        'pagination_version': pagination_version,
         'order_generation': 'a' * 64,
         'page_offset': 100,
         'next_offset': None,
@@ -223,7 +227,7 @@ def test_placement_state_accepts_an_exact_bounded_controller_page():
         timeout=serve_utils._CONTROLLER_HTTP_TIMEOUT_SECONDS)
 
 
-def test_placement_state_accepts_previous_order_during_rolling_upgrade():
+def test_placement_state_accepts_legacy_order_during_rolling_upgrade():
     response = mock.Mock()
     expected = {
         'available': True,
@@ -250,14 +254,17 @@ def test_placement_state_accepts_previous_order_during_rolling_upgrade():
     assert actual is expected
 
 
+@pytest.mark.parametrize(
+    'pagination_version',
+    constants.PLACEMENT_STATE_GENERATION_FENCED_PAGINATION_VERSIONS)
 @pytest.mark.parametrize('order_generation', [None, '', 'a' * 63, 'A' * 64])
-def test_current_placement_page_requires_valid_order_generation(
-        order_generation):
+def test_generation_fenced_placement_page_requires_valid_order_generation(
+        pagination_version, order_generation):
     response = mock.Mock()
     response.json.return_value = {
         'available': True,
         'enabled': True,
-        'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+        'pagination_version': pagination_version,
         'order_generation': order_generation,
         'page_offset': 0,
         'next_offset': None,
@@ -295,12 +302,16 @@ def test_disabled_current_placement_page_needs_no_order_generation():
     assert actual is expected
 
 
-def test_catalog_order_change_response_is_validated_and_preserved():
+@pytest.mark.parametrize(
+    'pagination_version',
+    constants.PLACEMENT_STATE_GENERATION_FENCED_PAGINATION_VERSIONS)
+def test_catalog_order_change_response_is_validated_and_preserved(
+        pagination_version):
     response = mock.Mock()
     expected = {
         'available': False,
         'reason': 'catalog_order_changed',
-        'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+        'pagination_version': pagination_version,
         'order_generation': 'b' * 64,
     }
     response.json.return_value = expected

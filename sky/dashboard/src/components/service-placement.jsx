@@ -284,17 +284,24 @@ function PlacerStateCard({ state, loadingMore, requestPending, onLoadMore }) {
     filters.card !== ALL_FILTER_VALUE ||
     filters.availability !== ALL_FILTER_VALUE ||
     filters.maxPrice !== '';
-  const hasCatalogCostOrder =
+  const hasTieredCatalogCostOrder =
+    state.orderSemantics ===
+    'catalog_normalized_cost_then_exact_backend_market_then_location_identity';
+  const hasPreviousCatalogCostOrder =
     state.orderSemantics === 'catalog_normalized_cost_then_location_identity';
+  const hasCatalogCostOrder =
+    hasTieredCatalogCostOrder || hasPreviousCatalogCostOrder;
 
   return (
     <Card>
       <div className="border-b px-4 py-3">
         <h3 className="font-semibold">Candidate catalog — not launches</h3>
         <p className="mt-1 text-sm text-gray-500">
-          {hasCatalogCostOrder
-            ? 'Catalog sorted by normalized cost; equal-price display order uses location identity. Actual selection applies ACTIVE status, requested accelerator card, zero-cost preference, paid admission, and frontier gates. '
-            : 'This controller version does not report a normalized catalog-cost order. '}
+          {hasTieredCatalogCostOrder
+            ? 'Catalog sorted by normalized cost; equal-price entries are grouped by exact accelerator shape and purchase market, then location identity. Actual selection applies ACTIVE status, requested accelerator card, zero-cost preference, paid admission, and frontier gates. '
+            : hasPreviousCatalogCostOrder
+              ? 'Catalog sorted by normalized cost; equal-price display order uses location identity. Actual selection applies ACTIVE status, requested accelerator card, zero-cost preference, paid admission, and frontier gates. '
+              : 'This controller version does not report a normalized catalog-cost order. '}
           Eligible means the controller may attempt a launch; it does not
           promise live provider inventory. Benched and otherwise ineligible
           candidates remain visible.

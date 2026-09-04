@@ -223,6 +223,23 @@ path were bypassed. A test that merely executes nearby code, asserts only a
 successful result, or replaces the defective owner itself is coverage, not a
 regression proof.
 
+Verification and observer code must never control, prolong, or falsify the
+production state it observes. Model admission, processing/occupancy, and
+terminal-publication clocks explicitly, and keep the dependency graph from
+stimulus through production effects to proof acyclic. A verifier may consume
+those effects; success or failure of the verifier must not determine when the
+observed work finishes or when its terminal state is published. A failed proof
+may stop future, never-offered stimulus, but the driver must drain already-
+offered work through its real terminal-publication path before it exits.
+
+Concurrent stimulus drivers that acquire a terminal-publication obligation
+must use one structured, all-results worker cohort. The first failure closes
+new admission atomically; worker failure or caller cancellation must not close
+shared clients or cancel already-accepted siblings. Shield and drain accepted
+work to a separate bounded terminal deadline, then re-raise the original
+failure. Determine that cleanup ownership from the authoritative protocol
+status and headers before decoding an advisory response body.
+
 Each non-unit test must state its layer in the module docstring and enter
 through the exact public or production scheduling boundary named there. An
 unpaid provider E2E must use PostgreSQL plus the real API server, controller,
@@ -437,6 +454,29 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
 
 ### Async Poller and Freshness Safety
 
+- Keep qualification and safety proofs acyclic. A producer may create work, a
+  reducer may commit its terminal evidence, and an observer may read that
+  evidence; an observer must never cancel, shorten, complete, resubmit, or
+  otherwise mutate the work whose outcome it is proving.
+- For a multi-actor proof, document an explicit capability matrix and one-way
+  dependency graph. Finalizers consume the frozen ownership scope only after
+  every already-offered item has reached its terminal reducer; an observer
+  verdict is not teardown authority and must not be a prerequisite for item
+  completion.
+- Exercise the production proof coordinator with injected observer failure,
+  timeout, and caller cancellation. These cases must drain all already-offered
+  work, publish terminal evidence, run the scope-fenced finalizer exactly once,
+  and preserve the original proof verdict without leaking provider resources.
+- Model provider mutation submission and provider-state observation as separate
+  phases with separate bounded capacity. A scarce mutation slot may cover the
+  exact native submit call, but must never remain occupied while polling for
+  eventual absence or readiness.
+- Persist the handoff between those phases before releasing mutation capacity.
+  On restart, resume only the persisted phase: never infer that submission did
+  or did not occur from a missing thread, local result, timeout, or exception.
+- Releasing a mutation slot is not permission to release economic identity.
+  Retain claims, debits, associations, pointers, and request-retention pins
+  until exact provider evidence authorizes their atomic settlement.
 - Never run synchronous database, provider, filesystem, subprocess, or DNS I/O
   on an event loop that owns request liveness, leases, deadlines, cancellation,
   or safety heartbeats. Move it behind one bounded single-flight interface and

@@ -72,12 +72,12 @@ class GuardViolation(QualificationError):
 
 
 _PROVIDER_SCOPE_SCHEMA_VERSION = 6
-_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 10
+_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 12
 _CLEANUP_RECEIPT_SCHEMA_VERSION = 2
 _AGGREGATE_RECEIPT_SCHEMA_VERSION = 3
+_CLEANUP_COMPATIBLE_QUALIFICATION_SCHEMAS = frozenset({10, 11, 12})
 _CAMPAIGN_LOAD_WINDOW_SECONDS = (
     serve_constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
-_SCALE_TAIL_BATCH_SIZE = 400
 _AWS_CENSUS_MAX_WORKERS = 8
 _AWS_FILTER_MAX_VALUES = 200
 
@@ -93,6 +93,7 @@ class Profile:
     exact_requests: int
     request_concurrency: int
     request_queue_timeout_seconds: int
+    terminal_publication_timeout_seconds: int
     scale_timeout_seconds: float
     scale_slo_seconds: float
     drain_timeout_seconds: float
@@ -110,6 +111,7 @@ PROFILES = {
                      exact_requests=16,
                      request_concurrency=4,
                      request_queue_timeout_seconds=600,
+                     terminal_publication_timeout_seconds=600,
                      scale_timeout_seconds=15 * 60,
                      scale_slo_seconds=5 * 60,
                      drain_timeout_seconds=20 * 60,
@@ -124,6 +126,7 @@ PROFILES = {
                      exact_requests=10_000,
                      request_concurrency=128,
                      request_queue_timeout_seconds=600,
+                     terminal_publication_timeout_seconds=600,
                      scale_timeout_seconds=15 * 60,
                      scale_slo_seconds=5 * 60,
                      drain_timeout_seconds=30 * 60,
@@ -140,6 +143,7 @@ PROFILES = {
                                exact_requests=1,
                                request_concurrency=1,
                                request_queue_timeout_seconds=600,
+                               terminal_publication_timeout_seconds=600,
                                scale_timeout_seconds=15 * 60,
                                scale_slo_seconds=5 * 60,
                                drain_timeout_seconds=20 * 60,
@@ -171,6 +175,168 @@ class _ScaleArrivalAttributionState:
 
     unique_job_arrivals_60s: int
     unique_job_arrivals_300s: int
+    campaign_offered: int
+    campaign_succeeded: int
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ExactRequestCampaignCounters:
+    """One lock-consistent projection of immutable campaign progress."""
+
+    offered: int
+    succeeded: int
+    accepting_offers: bool = True
+
+
+class ExactRequestTrafficEvidence(typing.Protocol):
+    """Read-only traffic completion capability exposed to proof consumers."""
+
+    def done(self) -> bool:
+        ...
+
+    def result(self) -> int:
+        ...
+
+
+class ExactRequestCampaignEvidence(typing.Protocol):
+    """Read-only campaign frontier exposed to proof consumers."""
+
+    async def snapshot(self) -> ExactRequestCampaignCounters:
+        ...
+
+
+@dataclasses.dataclass(kw_only=True)
+class ExactRequestCampaignProgress:
+    """Serialize the sliding window independently of proof observers."""
+
+    total_count: int
+    window_size: int
+    _offered: int = dataclasses.field(default=0, init=False, repr=False)
+    _succeeded: int = dataclasses.field(default=0, init=False, repr=False)
+    _accepting_offers: bool = dataclasses.field(default=True,
+                                                init=False,
+                                                repr=False)
+    _first_error: BaseException | None = dataclasses.field(default=None,
+                                                           init=False,
+                                                           repr=False)
+    _lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock,
+                                            init=False,
+                                            repr=False)
+
+    def __post_init__(self) -> None:
+        if (type(self.total_count) is not int or self.total_count < 1 or
+                type(self.window_size) is not int or self.window_size < 1 or
+                self.window_size > self.total_count):
+            raise ValueError('Exact request campaign progress is invalid.')
+
+    def _record_error_locked(self, error: BaseException) -> None:
+        if self._first_error is None:
+            self._first_error = error
+        self._accepting_offers = False
+
+    async def mark_offered(
+        self,
+        *,
+        admission_deadline: float | None = None,
+    ) -> bool:
+        """Record a never-before-offered ID immediately before its first POST."""
+        async with self._lock:
+            if not self._accepting_offers:
+                return False
+            if (admission_deadline is not None and
+                    time.monotonic() >= admission_deadline):
+                self._record_error_locked(
+                    QualificationError(
+                        'Exact request campaign admission deadline expired '
+                        'before a new identity was offered.'))
+                return False
+            if self._offered >= self.total_count:
+                raise QualificationError(
+                    'Exact request campaign offered too many identities.')
+            if self._offered - self._succeeded >= self.window_size:
+                raise QualificationError(
+                    'Exact request campaign exceeded its active window.')
+            self._offered += 1
+            return True
+
+    async def mark_succeeded(
+        self,
+        *,
+        deferred_error: BaseException | None = None,
+    ) -> None:
+        """Record one exact terminal receipt before the worker takes another ID."""
+        async with self._lock:
+            if self._succeeded >= self._offered:
+                raise QualificationError(
+                    'Exact request campaign terminal order is invalid.')
+            self._succeeded += 1
+            if deferred_error is not None:
+                self._record_error_locked(deferred_error)
+
+    async def record_error(self, error: BaseException) -> None:
+        """Close admission at the first worker error under the offer lock."""
+        async with self._lock:
+            self._record_error_locked(error)
+
+    async def stop_offering(self) -> None:
+        """Stop new IDs while allowing already-offered work to complete."""
+        async with self._lock:
+            self._accepting_offers = False
+
+    async def first_error(self) -> BaseException | None:
+        """Return the first driver error after the worker cohort drains."""
+        async with self._lock:
+            return self._first_error
+
+    async def snapshot(self) -> ExactRequestCampaignCounters:
+        """Return a read-only atomic view for an evidence observer."""
+        async with self._lock:
+            return ExactRequestCampaignCounters(
+                offered=self._offered,
+                succeeded=self._succeeded,
+                accepting_offers=(self._accepting_offers))
+
+
+def _campaign_request_id(prefix: str, index: int) -> str:
+    return f'{prefix}-execution-{index:05d}'
+
+
+def _campaign_request_key_sha256s(prefix: str, count: int) -> tuple[str, ...]:
+    """Return the ledger keys for one immutable ordered campaign manifest."""
+    if (not isinstance(prefix, str) or not prefix or type(count) is not int or
+            count < 1):
+        raise ValueError('Exact request campaign manifest is invalid.')
+    return tuple(
+        hashlib.sha256(_campaign_request_id(prefix, index).encode(
+            'utf-8')).hexdigest() for index in range(count))
+
+
+def _campaign_manifest_sha256(prefix: str, count: int) -> str:
+    """Digest the complete immutable request-key membership."""
+    return hashlib.sha256(
+        rfc8785.dumps({
+            'schema_version': 1,
+            'prefix': prefix,
+            'count': count,
+            'request_key_sha256': _campaign_request_key_sha256s(prefix, count),
+        })).hexdigest()
+
+
+def _validate_campaign_terminal_rows(
+    *,
+    prefix: str,
+    count: int,
+    rows: collections.abc.Sequence[collections.abc.Mapping[str, Any]],
+) -> str:
+    """Require the exact campaign key set as current SUCCEEDED attempts."""
+    expected = frozenset(_campaign_request_key_sha256s(prefix, count))
+    observed = [row.get('request_key_sha256') for row in rows]
+    if (len(rows) != count or len(set(observed)) != count or
+            frozenset(observed) != expected or
+            any(row.get('state') != 'SUCCEEDED' for row in rows)):
+        raise QualificationError(
+            'PostgreSQL lacks exact campaign membership at terminal success.')
+    return _campaign_manifest_sha256(prefix, count)
 
 
 def _next_scale_arrival_attribution_state(
@@ -181,15 +347,22 @@ def _next_scale_arrival_attribution_state(
     headerless_arrivals_60s: object,
     headerless_arrivals_300s: object,
     offered_arrival_tracking_saturated: object,
-    expected_arrivals: int,
+    initial_arrivals: int,
+    maximum_arrivals: int,
+    campaign_offered: object,
+    campaign_succeeded: object,
 ) -> _ScaleArrivalAttributionState | None:
-    """Commit one exact cohort, then admit only its rolling-window decay."""
+    """Bound rolling arrivals by the campaign's exact terminal frontier."""
     if (previous is not None and
             not isinstance(previous, _ScaleArrivalAttributionState)):
         return None
     counters = (unique_job_arrivals_60s, unique_job_arrivals_300s,
                 headerless_arrivals_60s, headerless_arrivals_300s)
-    if (type(expected_arrivals) is not int or expected_arrivals <= 0 or
+    if (type(initial_arrivals) is not int or initial_arrivals <= 0 or
+            type(maximum_arrivals) is not int or
+            maximum_arrivals < initial_arrivals or
+            type(campaign_offered) is not int or
+            type(campaign_succeeded) is not int or
             any(type(value) is not int for value in counters) or
             offered_arrival_tracking_saturated is not False):
         return None
@@ -197,23 +370,30 @@ def _next_scale_arrival_attribution_state(
     assert isinstance(unique_job_arrivals_300s, int)
     assert isinstance(headerless_arrivals_60s, int)
     assert isinstance(headerless_arrivals_300s, int)
-    if (not 0 <= unique_job_arrivals_60s <= unique_job_arrivals_300s <=
-            expected_arrivals or headerless_arrivals_60s != 0 or
+    assert isinstance(campaign_offered, int)
+    assert isinstance(campaign_succeeded, int)
+    terminal_frontier = min(maximum_arrivals,
+                            initial_arrivals + campaign_succeeded)
+    if (not 0 <= campaign_succeeded <= campaign_offered <= terminal_frontier or
+            campaign_offered < initial_arrivals or
+            not 0 <= unique_job_arrivals_60s <= unique_job_arrivals_300s <=
+            campaign_offered or headerless_arrivals_60s != 0 or
             headerless_arrivals_300s != 0):
         return None
-    if previous is None:
-        # The 300-second set is the complete cohort authority.  The shorter
-        # window may already have begun aging while bounded admission finishes.
-        if unique_job_arrivals_300s != expected_arrivals:
-            return None
-    elif (unique_job_arrivals_60s > previous.unique_job_arrivals_60s or
-          unique_job_arrivals_300s > previous.unique_job_arrivals_300s):
-        # No held request is re-offered after the cohort becomes resident, so
-        # either increase proves that another offered identity appeared.
+    if (previous is not None and
+        (campaign_offered < previous.campaign_offered or
+         campaign_succeeded < previous.campaign_succeeded)):
         return None
+    # Later rolling counters may rise when a natural terminal success exposes
+    # the next never-before-offered identity, or fall as old arrivals age out.
+    # The driver-owned terminal frontier—not campaign cardinality alone—is the
+    # hard upper bound. Exact final ledger evidence independently requires all
+    # immutable identities and no others to reach SUCCEEDED.
     return _ScaleArrivalAttributionState(
         unique_job_arrivals_60s=unique_job_arrivals_60s,
-        unique_job_arrivals_300s=unique_job_arrivals_300s)
+        unique_job_arrivals_300s=unique_job_arrivals_300s,
+        campaign_offered=campaign_offered,
+        campaign_succeeded=campaign_succeeded)
 
 
 def positive_telemetry_window_seconds(profile: Profile) -> float:
@@ -246,46 +426,6 @@ def positive_telemetry_deadline_monotonic(
         raise ValueError('Scale start must be a finite monotonic timestamp.')
     return (scale_started_monotonic +
             positive_telemetry_window_seconds(profile))
-
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class ExactRequestBatchPlan:
-    """A bounded network plan for one exact logical request campaign."""
-
-    total_count: int
-    batch_size: int
-    concurrency: int
-
-    def __post_init__(self) -> None:
-        if (type(self.total_count) is not int or self.total_count < 0 or
-                type(self.batch_size) is not int or self.batch_size < 1 or
-                type(self.concurrency) is not int or self.concurrency < 1 or
-                self.concurrency > self.batch_size):
-            raise ValueError('Exact request batch plan is invalid.')
-
-    def batch_counts(self) -> tuple[int, ...]:
-        full_batches, remainder = divmod(self.total_count, self.batch_size)
-        batches = [self.batch_size] * full_batches
-        if remainder:
-            batches.append(remainder)
-        return tuple(batches)
-
-
-class ExactRequestCompletionGate:
-    """Explicitly retain accepted scale work until its scale proof finishes."""
-
-    def __init__(self) -> None:
-        self._event = asyncio.Event()
-
-    @property
-    def released(self) -> bool:
-        return self._event.is_set()
-
-    async def wait(self) -> None:
-        await self._event.wait()
-
-    def release(self) -> None:
-        self._event.set()
 
 
 class ExpectationKind(str, enum.Enum):
@@ -817,8 +957,7 @@ def _profile_projection(profile: Profile) -> dict[str, int]:
     """Return every field the canonical renderer may vary by profile."""
     if profile.name == 'scale':
         request_queue_min_size = scale_stimulus_count(profile)
-        request_queue_max_size = (request_queue_min_size +
-                                  _SCALE_TAIL_BATCH_SIZE)
+        request_queue_max_size = request_queue_min_size
     else:
         request_queue_min_size = profile.request_concurrency
         request_queue_max_size = max(32, profile.request_concurrency)
@@ -3223,6 +3362,35 @@ class PostgresObserver:
                 'Exact async-ledger request summary is unavailable.')
         return request_telemetry_from_summary(summary, ledger['state_counts'])
 
+    def campaign_terminal_membership(self, prefix: str, count: int) -> str:
+        """Prove exact campaign keys are current SUCCEEDED attempts."""
+        scope = self._provider_scope
+        if scope is None:
+            raise QualificationError('Provider scope was not frozen.')
+        request_keys = _campaign_request_key_sha256s(prefix, count)
+        statement = sqlalchemy.text('''
+            SELECT request.request_key_sha256, attempt.state
+            FROM serve_async_requests AS request
+            JOIN serve_async_request_attempts AS attempt
+              ON attempt.service_name = request.service_name
+             AND attempt.service_hash = request.service_hash
+             AND attempt.request_key_sha256 = request.request_key_sha256
+             AND attempt.attempt_id = request.current_attempt_id
+            WHERE request.service_name = :service_name
+              AND request.service_hash = :service_hash
+              AND request.request_key_sha256 IN :request_keys
+        ''').bindparams(sqlalchemy.bindparam('request_keys', expanding=True))
+        with self._engine.connect() as connection:
+            rows = connection.execute(
+                statement, {
+                    'service_name': self._service_name,
+                    'service_hash': scope.service_hash,
+                    'request_keys': request_keys,
+                }).mappings().all()
+        return _validate_campaign_terminal_rows(prefix=prefix,
+                                                count=count,
+                                                rows=rows)
+
     def snapshot(
         self,
         load_balancer: 'LoadBalancerState',
@@ -3770,6 +3938,11 @@ class Observer:
     async def request_telemetry(self) -> RequestTelemetry:
         return await asyncio.to_thread(self._postgres.request_telemetry)
 
+    async def campaign_terminal_membership(self, prefix: str,
+                                           count: int) -> str:
+        return await asyncio.to_thread(
+            self._postgres.campaign_terminal_membership, prefix, count)
+
     async def snapshot(
         self,
         *,
@@ -3989,6 +4162,8 @@ class Receipt:
             'max_units': profile.max_units,
             'minimum_running': expectation.minimum_physical_running,
             'exact_request_count': expectation.exact_request_count,
+            'terminal_publication_timeout_seconds':
+                profile.terminal_publication_timeout_seconds,
             'scale_slo_seconds': profile.scale_slo_seconds,
             'scale_timeout_seconds': profile.scale_timeout_seconds,
             'started_at': time.time(),
@@ -4014,6 +4189,25 @@ class Receipt:
         if authorized_economic_receipt_sha256 is not None:
             self._payload['authorized_economic_receipt_sha256'] = (
                 authorized_economic_receipt_sha256)
+
+    def bind_campaign_manifest(self, prefix: str, count: int) -> None:
+        """Bind the complete immutable request-key manifest once."""
+        if ('campaign_prefix' in self._payload or
+                'campaign_manifest_sha256' in self._payload or
+                count != self._payload['exact_request_count']):
+            raise QualificationError(
+                'Qualification receipt has conflicting campaign identity.')
+        self._payload['campaign_prefix'] = prefix
+        self._payload['campaign_manifest_sha256'] = (_campaign_manifest_sha256(
+            prefix, count))
+
+    def bind_campaign_terminal_membership(self, digest: str) -> None:
+        """Record the PostgreSQL-proven terminal request-key set once."""
+        if ('campaign_terminal_membership_sha256' in self._payload or
+                digest != self._payload.get('campaign_manifest_sha256')):
+            raise QualificationError(
+                'Qualification receipt has conflicting campaign membership.')
+        self._payload['campaign_terminal_membership_sha256'] = digest
 
     def sample(self,
                phase: str,
@@ -4047,6 +4241,22 @@ class Receipt:
         if scale_iteration_id is not None:
             sample['scale_iteration_id'] = scale_iteration_id
         self._payload['samples'].append(sample)
+
+    def bind_scale_campaign_counters(
+            self, *, scale_iteration_id: int,
+            counters: ExactRequestCampaignCounters) -> None:
+        """Bind one atomic driver frontier to its just-recorded scale sample."""
+        if not self._payload['samples']:
+            raise QualificationError(
+                'Scale sample is unavailable for campaign attribution.')
+        sample = self._payload['samples'][-1]
+        if (sample.get('phase') != 'scale' or
+                sample.get('scale_iteration_id') != scale_iteration_id or
+                'campaign_offered' in sample or 'campaign_succeeded' in sample):
+            raise QualificationError(
+                'Scale sample has conflicting campaign attribution.')
+        sample['campaign_offered'] = counters.offered
+        sample['campaign_succeeded'] = counters.succeeded
 
     def request_telemetry(
             self,
@@ -4141,7 +4351,7 @@ def read_aws_volume_ids_receipt(
     raw = (payload.get('aws_retained_volume_ids')
            if isinstance(payload, dict) else None)
     if (not isinstance(payload, dict) or payload.get('schema_version')
-            != _QUALIFICATION_RECEIPT_SCHEMA_VERSION or
+            not in _CLEANUP_COMPATIBLE_QUALIFICATION_SCHEMAS or
             payload.get('service_name') != service_name or
             not isinstance(raw, dict)):
         raise QualificationError('Qualification receipt is malformed.')
@@ -4179,6 +4389,15 @@ class ExactAsyncReceipt:
     attempt_no: int
     state: str
     revision: int
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _ExactAsyncAdmission:
+    """Accepted attempt plus any response-body error deferred to terminal."""
+
+    receipt: ExactAsyncReceipt
+    intent_sha256: str
+    deferred_protocol_error: QualificationError | None = None
 
 
 class _ExactAdmissionRecoveryAction(enum.Enum):
@@ -4402,7 +4621,7 @@ async def _submit_exact_async_request(
     stable_job_id: str,
     duration_seconds: float,
     deadline: float,
-) -> tuple[ExactAsyncReceipt, str]:
+) -> _ExactAsyncAdmission:
     """Submit or read-only recover one immutable exact async request."""
     url = endpoint.rstrip('/') + '/v1/models/model:predict'
     receipt_url = (endpoint.rstrip('/') +
@@ -4469,19 +4688,24 @@ async def _submit_exact_async_request(
                         receipt,
                         previous_rejection=previous_rejection,
                         accepted_response=True)
+                    deferred_protocol_error = None
                     try:
                         response_body = await response.read()
                         result = json.loads(response_body)
-                    except (UnicodeDecodeError, ValueError) as error:
-                        raise QualificationError(
-                            f'{request_id} returned invalid JSON.') from error
-                    if result != {
-                            'request_id': request_id,
-                            'status': 'accepted',
-                    }:
-                        raise QualificationError(
-                            f'{request_id} returned an invalid acceptance.')
-                    return receipt, intent_sha256
+                    except (UnicodeDecodeError, ValueError):
+                        deferred_protocol_error = QualificationError(
+                            f'{request_id} returned invalid JSON.')
+                    else:
+                        if result != {
+                                'request_id': request_id,
+                                'status': 'accepted',
+                        }:
+                            deferred_protocol_error = QualificationError(
+                                f'{request_id} returned an invalid acceptance.')
+                    return _ExactAsyncAdmission(
+                        receipt=receipt,
+                        intent_sha256=intent_sha256,
+                        deferred_protocol_error=deferred_protocol_error)
                 elif (response.status == 409 or
                       response.status in _RETRYABLE_STATUSES):
                     try:
@@ -4510,7 +4734,8 @@ async def _submit_exact_async_request(
                 previous_rejection=previous_rejection,
                 pending_dispatch=pending_dispatch if read_only else None)
             if action is _ExactAdmissionRecoveryAction.RETURN:
-                return observed_receipt, intent_sha256
+                return _ExactAsyncAdmission(receipt=observed_receipt,
+                                            intent_sha256=intent_sha256)
             if action is _ExactAdmissionRecoveryAction.RETRY_SUBMISSION:
                 previous_rejection = observed_receipt
                 pending_dispatch = None
@@ -4594,10 +4819,10 @@ async def _one_exact_async_request(
     request_id: str,
     stable_job_id: str,
     duration_seconds: float,
-    deadline: float,
-    completion_gate: ExactRequestCompletionGate | None = None,
-) -> None:
-    receipt, intent_sha256 = await _submit_exact_async_request(
+    admission_deadline: float,
+    terminal_timeout_seconds: float,
+) -> QualificationError | None:
+    admission = await _submit_exact_async_request(
         session,
         endpoint=endpoint,
         token=token,
@@ -4605,22 +4830,21 @@ async def _one_exact_async_request(
         request_id=request_id,
         stable_job_id=stable_job_id,
         duration_seconds=duration_seconds,
-        deadline=deadline)
-    if receipt.state == 'SUCCEEDED':
-        return
+        deadline=admission_deadline)
+    if admission.receipt.state == 'SUCCEEDED':
+        return admission.deferred_protocol_error
     await asyncio.sleep(duration_seconds)
-    if completion_gate is not None:
-        await completion_gate.wait()
-    await _complete_exact_async_request(session,
-                                        endpoint=endpoint,
-                                        token=token,
-                                        service_hash=service_hash,
-                                        request_id=request_id,
-                                        intent_sha256=intent_sha256,
-                                        accepted=receipt,
-                                        processing_time_us=int(
-                                            duration_seconds * 1_000_000),
-                                        deadline=deadline)
+    await _complete_exact_async_request(
+        session,
+        endpoint=endpoint,
+        token=token,
+        service_hash=service_hash,
+        request_id=request_id,
+        intent_sha256=(admission.intent_sha256),
+        accepted=admission.receipt,
+        processing_time_us=int(duration_seconds * 1_000_000),
+        deadline=(time.monotonic() + terminal_timeout_seconds))
+    return admission.deferred_protocol_error
 
 
 async def send_exact_async_requests(
@@ -4634,84 +4858,105 @@ async def send_exact_async_requests(
     hold_requests: int,
     hold_seconds: float,
     timeout_seconds: float,
-    completion_gate: ExactRequestCompletionGate | None = None,
+    request_queue_timeout_seconds: float,
+    terminal_timeout_seconds: float,
+    campaign_progress: ExactRequestCampaignProgress | None = None,
 ) -> int:
     """Submit and durably complete exact synthetic async requests."""
+    if (not math.isfinite(timeout_seconds) or timeout_seconds <= 0 or
+            not math.isfinite(request_queue_timeout_seconds) or
+            request_queue_timeout_seconds <= 0 or
+            not math.isfinite(terminal_timeout_seconds) or
+            terminal_timeout_seconds <= 0):
+        raise ValueError('Exact request campaign deadlines are invalid.')
+    worker_count = min(count, concurrency)
+    if campaign_progress is None:
+        campaign_progress = ExactRequestCampaignProgress(
+            total_count=count, window_size=worker_count)
+    elif (campaign_progress.total_count != count or
+          campaign_progress.window_size != worker_count):
+        raise ValueError('Exact request campaign progress does not match.')
+    if await campaign_progress.snapshot() != ExactRequestCampaignCounters(
+            offered=0, succeeded=0):
+        raise ValueError('Exact request campaign progress is not fresh.')
     queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
     for index in range(count):
-        queue.put_nowait((index, f'{prefix}-execution-{index:05d}'))
-    deadline = time.monotonic() + timeout_seconds
-    successes = 0
-    lock = asyncio.Lock()
+        queue.put_nowait((index, _campaign_request_id(prefix, index)))
+    admission_deadline = time.monotonic() + timeout_seconds
 
     async def worker() -> None:
-        nonlocal successes
         while True:
             try:
                 index, request_id = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
-            await _one_exact_async_request(
-                session,
-                endpoint=endpoint,
-                token=token,
-                service_hash=service_hash,
-                request_id=request_id,
-                stable_job_id=f'{prefix}-job-{index:05d}',
-                duration_seconds=(hold_seconds if index < hold_requests else 0),
-                deadline=deadline,
-                completion_gate=completion_gate)
-            async with lock:
-                successes += 1
-            queue.task_done()
+            try:
+                if not await campaign_progress.mark_offered(
+                        admission_deadline=admission_deadline):
+                    return
+                deferred_error = await _one_exact_async_request(
+                    session,
+                    endpoint=endpoint,
+                    token=token,
+                    service_hash=service_hash,
+                    request_id=request_id,
+                    stable_job_id=f'{prefix}-job-{index:05d}',
+                    duration_seconds=(hold_seconds
+                                      if index < hold_requests else 0),
+                    admission_deadline=admission_deadline,
+                    terminal_timeout_seconds=terminal_timeout_seconds)
+                await campaign_progress.mark_succeeded(
+                    deferred_error=deferred_error)
+                if deferred_error is not None:
+                    raise deferred_error
+            except BaseException as error:
+                await campaign_progress.record_error(error)
+                raise
+            finally:
+                queue.task_done()
 
     timeout = aiohttp.ClientTimeout(total=11 * 60)
     connector = aiohttp.TCPConnector(limit=concurrency)
     async with aiohttp.ClientSession(timeout=timeout,
                                      connector=connector) as session:
-        await asyncio.gather(*(worker() for _ in range(min(count, concurrency)))
-                            )
-    return successes
-
-
-async def send_exact_async_request_batches(
-    *,
-    endpoint: str,
-    token: str,
-    service_hash: str,
-    prefix: str,
-    count: int,
-    batch_size: int,
-    concurrency: int,
-    timeout_seconds: float,
-) -> int:
-    """Stream one exact campaign through bounded, sequential HTTP batches."""
-    plan = ExactRequestBatchPlan(total_count=count,
-                                 batch_size=batch_size,
-                                 concurrency=concurrency)
-    deadline = time.monotonic() + timeout_seconds
-    successes = 0
-    for batch_index, batch_count in enumerate(plan.batch_counts()):
-        remaining_seconds = deadline - time.monotonic()
-        if remaining_seconds <= 0:
-            raise QualificationError(
-                'Exact request batches exhausted their campaign deadline.')
-        successes += await send_exact_async_requests(
-            endpoint=endpoint,
-            token=token,
-            service_hash=service_hash,
-            prefix=f'{prefix}-batch-{batch_index:03d}',
-            count=batch_count,
-            concurrency=min(plan.concurrency, batch_count),
-            hold_requests=0,
-            hold_seconds=0,
-            timeout_seconds=remaining_seconds)
-    return successes
-
-
-async def _sum_exact_request_tasks(
-        tasks: collections.abc.Sequence[asyncio.Task[int]]) -> int:
-    return sum(await asyncio.gather(*tasks))
+        workers = asyncio.gather(*(worker() for _ in range(worker_count)),
+                                 return_exceptions=True)
+        try:
+            results = await asyncio.shield(workers)
+        except asyncio.CancelledError as cancellation:
+            await campaign_progress.stop_offering()
+            drain_timeout_seconds = (request_queue_timeout_seconds +
+                                     terminal_timeout_seconds +
+                                     max(0.0, hold_seconds))
+            try:
+                async with asyncio.timeout(drain_timeout_seconds):
+                    await asyncio.shield(workers)
+            except (asyncio.CancelledError, TimeoutError) as drain_error:
+                await campaign_progress.record_error(
+                    QualificationError(
+                        'Exact request campaign cancellation drain did not '
+                        'finish within its bounded admission, work, and '
+                        'terminal-publication budget.'))
+                workers.cancel()
+                await asyncio.gather(workers, return_exceptions=True)
+                cancellation.add_note(
+                    f'Campaign drain ended with {type(drain_error).__name__}.')
+            raise cancellation
+    first_error = await campaign_progress.first_error()
+    if first_error is not None:
+        raise first_error
+    unexpected_error = next(
+        (result for result in results if isinstance(result, BaseException)),
+        None)
+    if unexpected_error is not None:
+        raise unexpected_error
+    final = await campaign_progress.snapshot()
+    complete = (final.offered == count and final.succeeded == count)
+    drained_after_stop = (not final.accepting_offers and
+                          final.offered == final.succeeded)
+    if not (complete or drained_after_stop):
+        raise QualificationError('Exact request campaign is incomplete.')
+    return final.succeeded
 
 
 async def _wait_for_joined_baseline(
@@ -4808,7 +5053,7 @@ async def _wait_for_scale_stimulus(
     observer: Observer,
     profile: Profile,
     receipt: Receipt,
-    traffic: asyncio.Task[int],
+    traffic: ExactRequestTrafficEvidence,
     baseline: RequestTelemetry,
     expected_resident: int,
     deadline_monotonic: float,
@@ -4848,7 +5093,7 @@ async def _wait_for_positive_request_telemetry(
     observer: Observer,
     profile: Profile,
     receipt: Receipt,
-    traffic: asyncio.Task[int],
+    traffic: ExactRequestTrafficEvidence,
     baseline: RequestTelemetry,
     deadline_monotonic: float,
 ) -> RequestTelemetry:
@@ -4898,6 +5143,7 @@ async def _wait_for_final_request_telemetry(
     receipt: Receipt,
     baseline: RequestTelemetry,
     expected_succeeded_delta: int,
+    campaign_prefix: str,
 ) -> RequestTelemetry:
     deadline = time.monotonic() + 5 * 60
     while time.monotonic() < deadline:
@@ -4911,6 +5157,12 @@ async def _wait_for_final_request_telemetry(
                 == expected_succeeded_delta and
                 telemetry.ledger_succeeded - baseline.ledger_succeeded
                 == expected_succeeded_delta):
+            terminal_membership_sha256 = (await
+                                          observer.campaign_terminal_membership(
+                                              campaign_prefix,
+                                              expected_succeeded_delta))
+            receipt.bind_campaign_terminal_membership(
+                terminal_membership_sha256)
             receipt.request_telemetry('final', telemetry)
             return telemetry
         await asyncio.sleep(profile.poll_seconds)
@@ -4951,8 +5203,9 @@ async def _wait_for_scale(
         profile: Profile,
         progress: Progress,
         receipt: Receipt,
-        traffic: asyncio.Task[int],
+        traffic: ExactRequestTrafficEvidence,
         baseline: RequestTelemetry,
+        campaign_progress: ExactRequestCampaignEvidence | None = None,
         expectation: ProviderExpectation | None = None) -> None:
     if expectation is None:
         expectation = provider_expectation(profile, None)
@@ -4997,10 +5250,19 @@ async def _wait_for_scale(
             # exact samples are paired with provider observations below.
             await asyncio.sleep(profile.poll_seconds)
             continue
-        if (profile.name == 'scale' and _resident_campaign_size(telemetry)
-                != scale_stimulus_count(profile)):
-            raise QualificationError(
-                'Scale demand no longer contains the exact bounded stimulus.')
+        if profile.name == 'scale':
+            resident = _resident_campaign_size(telemetry)
+            stimulus = scale_stimulus_count(profile)
+            if resident > stimulus:
+                raise QualificationError(
+                    'Scale demand exceeds the bounded sliding window.')
+            if resident < stimulus:
+                # A truthful terminal callback precedes offering the next
+                # immutable identity.  The small refill gap is not a provider
+                # sample; wait for the exact window without delaying either
+                # transition.
+                await asyncio.sleep(profile.poll_seconds)
+                continue
         scale_iteration_id += 1
         receipt.request_telemetry('scale',
                                   telemetry,
@@ -5021,8 +5283,14 @@ async def _wait_for_scale(
             raise QualificationError(
                 'Provider scale sample has no same-observation demand.')
         if profile.name == 'scale':
+            if campaign_progress is None:
+                raise QualificationError(
+                    'Scale campaign has no exact progress projection.')
+            campaign_counters = await campaign_progress.snapshot()
+            receipt.bind_scale_campaign_counters(
+                scale_iteration_id=scale_iteration_id,
+                counters=campaign_counters)
             arrivals = observation.load_balancer
-            expected_arrivals = scale_stimulus_count(profile)
             next_arrival_attribution = _next_scale_arrival_attribution_state(
                 previous=arrival_attribution,
                 unique_job_arrivals_60s=(arrivals.unique_job_arrivals_60s),
@@ -5031,13 +5299,16 @@ async def _wait_for_scale(
                 headerless_arrivals_300s=arrivals.headerless_arrivals_300s,
                 offered_arrival_tracking_saturated=(
                     arrivals.offered_arrival_tracking_saturated),
-                expected_arrivals=expected_arrivals)
+                initial_arrivals=scale_stimulus_count(profile),
+                maximum_arrivals=expectation.exact_request_count,
+                campaign_offered=campaign_counters.offered,
+                campaign_succeeded=campaign_counters.succeeded)
             if next_arrival_attribution is None:
                 raise QualificationError(
                     'Scale stimulus contains unattributed offered arrivals.')
-            # The first complete provider sample commits the exact bounded
-            # stimulus.  Later counters are rolling observations and may age
-            # only downward while the paired request ledger remains resident.
+            # Rolling counters may rise with terminal-gated replacements or
+            # fall as prior arrivals age out; the atomic driver frontier binds
+            # either projection to this immutable campaign.
             arrival_attribution = next_arrival_attribution
         if progress.scale_reached_monotonic is not None:
             if progress.scale_qualified_iteration_id is not None:
@@ -5052,22 +5323,36 @@ async def _wait_for_scale(
         f'providers {expectation.providers}.')
 
 
+async def _stop_new_campaign_work_and_drain(
+    *,
+    traffic: asyncio.Task[int],
+    campaign_progress: ExactRequestCampaignProgress,
+) -> int | None:
+    """Stop new stimulus and drain every identity already offered."""
+    await campaign_progress.stop_offering()
+    result, = await asyncio.gather(traffic, return_exceptions=True)
+    return result if type(result) is int else None
+
+
 async def _join_independent_proofs(
     scale_proof: collections.abc.Awaitable[Any],
     positive_proof: collections.abc.Awaitable[Any],
-    completion_gate: ExactRequestCompletionGate,
+    *,
+    traffic: asyncio.Task[int],
+    campaign_progress: ExactRequestCampaignProgress,
 ) -> None:
-    """Release held work only after both substitutable proof interfaces pass."""
+    """Await two read-only proof consumers without controlling request work."""
     proof_tasks = (asyncio.ensure_future(scale_proof),
                    asyncio.ensure_future(positive_proof))
     try:
         await asyncio.gather(*proof_tasks)
     except BaseException:
+        await campaign_progress.stop_offering()
         for task in proof_tasks:
             task.cancel()
         await asyncio.gather(*proof_tasks, return_exceptions=True)
+        await asyncio.gather(traffic, return_exceptions=True)
         raise
-    completion_gate.release()
 
 
 async def _wait_for_scale_and_positive_request_telemetry(
@@ -5077,12 +5362,12 @@ async def _wait_for_scale_and_positive_request_telemetry(
     progress: Progress,
     receipt: Receipt,
     traffic: asyncio.Task[int],
-    completion_gate: ExactRequestCompletionGate,
     baseline: RequestTelemetry,
+    campaign_progress: ExactRequestCampaignProgress,
     expectation: ProviderExpectation,
     positive_deadline_monotonic: float,
 ) -> None:
-    """Join independent physical and request proofs for one held cohort."""
+    """Join independent physical and request proofs for one sliding cohort."""
     await _join_independent_proofs(
         _wait_for_scale(observer=observer,
                         profile=profile,
@@ -5090,6 +5375,7 @@ async def _wait_for_scale_and_positive_request_telemetry(
                         receipt=receipt,
                         traffic=traffic,
                         baseline=baseline,
+                        campaign_progress=campaign_progress,
                         expectation=expectation),
         _wait_for_positive_request_telemetry(
             observer=observer,
@@ -5097,7 +5383,9 @@ async def _wait_for_scale_and_positive_request_telemetry(
             receipt=receipt,
             traffic=traffic,
             baseline=baseline,
-            deadline_monotonic=positive_deadline_monotonic), completion_gate)
+            deadline_monotonic=positive_deadline_monotonic),
+        traffic=traffic,
+        campaign_progress=campaign_progress)
 
 
 async def _wait_for_drain(
@@ -5386,6 +5674,8 @@ class QualificationEvidence:
     scale_elapsed_seconds: float
     scale_slo_met: bool
     exact_request_count: int
+    campaign_prefix: str
+    campaign_manifest_sha256: str
 
 
 def _read_json_object(path: pathlib.Path,
@@ -5981,7 +6271,6 @@ def _validate_provider_scale_samples(
             raise QualificationError(
                 'Provider scale sample has no same-observation demand.')
         if profile.name == 'scale':
-            expected_arrivals = scale_stimulus_count(profile)
             next_arrival_attribution = _next_scale_arrival_attribution_state(
                 previous=arrival_attribution,
                 unique_job_arrivals_60s=sample.get(
@@ -5994,7 +6283,10 @@ def _validate_provider_scale_samples(
                     'lb_headerless_arrivals_300s'),
                 offered_arrival_tracking_saturated=sample.get(
                     'lb_offered_arrival_tracking_saturated'),
-                expected_arrivals=expected_arrivals)
+                initial_arrivals=scale_stimulus_count(profile),
+                maximum_arrivals=profile.exact_requests,
+                campaign_offered=sample.get('campaign_offered'),
+                campaign_succeeded=sample.get('campaign_succeeded'))
             if next_arrival_attribution is None:
                 raise QualificationError(
                     'Provider scale sample has unattributed offered arrivals.')
@@ -6079,6 +6371,8 @@ def _read_qualification_evidence(
     peaks = payload.get('peak_running_by_cloud')
     exact_count = payload.get('exact_request_count')
     exact_successes = payload.get('exact_request_successes')
+    campaign_prefix = payload.get('campaign_prefix')
+    campaign_manifest_sha256 = payload.get('campaign_manifest_sha256')
     authorized_economic_receipt_sha256 = payload.get(
         'authorized_economic_receipt_sha256')
     try:
@@ -6114,6 +6408,15 @@ def _read_qualification_evidence(
             type(payload.get('peak_running')) is not int or
             payload['peak_running'] < 1 or type(exact_count) is not int or
             exact_count < 1 or exact_successes != exact_count or
+            type(payload.get('terminal_publication_timeout_seconds')) is not int
+            or payload['terminal_publication_timeout_seconds'] < 1 or
+            not isinstance(campaign_prefix, str) or not campaign_prefix or
+            not isinstance(campaign_manifest_sha256, str) or
+            re.fullmatch(r'[0-9a-f]{64}', campaign_manifest_sha256) is None or
+            campaign_manifest_sha256 != _campaign_manifest_sha256(
+                campaign_prefix, exact_count) or
+            payload.get('campaign_terminal_membership_sha256')
+            != campaign_manifest_sha256 or
             payload.get('ledger_request_delta') != exact_count or
             payload.get('ledger_succeeded_delta') != exact_count or
         (kind is ExpectationKind.ECONOMIC and
@@ -6126,6 +6429,10 @@ def _read_qualification_evidence(
     providers = tuple(providers_raw)
     profile = (PROFILES['scale'] if kind is ExpectationKind.ECONOMIC else
                PROFILES['provider-canary'])
+    if (payload['terminal_publication_timeout_seconds']
+            != profile.terminal_publication_timeout_seconds):
+        raise QualificationError(
+            'Qualification receipt has invalid terminal publication policy.')
     request_evidence = _validate_request_evidence(payload,
                                                   profile=profile,
                                                   exact_count=exact_count)
@@ -6194,7 +6501,9 @@ def _read_qualification_evidence(
         peak_running=payload['peak_running'],
         scale_elapsed_seconds=scale_elapsed,
         scale_slo_met=provider_evidence.scale_slo_met,
-        exact_request_count=exact_count)
+        exact_request_count=exact_count,
+        campaign_prefix=campaign_prefix,
+        campaign_manifest_sha256=campaign_manifest_sha256)
 
 
 def _authorize_provider_canary(economic_receipt: object, *, provider: str,
@@ -6440,9 +6749,13 @@ async def qualify(args: argparse.Namespace) -> None:
     ledger_baseline: RequestTelemetry | None = None
     ledger_final: RequestTelemetry | None = None
     failure: BaseException | None = None
-    campaign_tasks: list[asyncio.Task[int]] = []
-    completion_gate: ExactRequestCompletionGate | None = None
+    campaign_progress: ExactRequestCampaignProgress | None = None
+    traffic: asyncio.Task[int] | None = None
     run_id = f'{args.service_name}-{int(time.time())}'
+    campaign_prefix = (f'{run_id}-campaign'
+                       if profile.name == 'scale' else f'{run_id}-exact')
+    receipt.bind_campaign_manifest(campaign_prefix,
+                                   expectation.exact_request_count)
     try:
         await http.prove_authentication()
         ledger_baseline = await _wait_for_joined_baseline(
@@ -6457,75 +6770,73 @@ async def qualify(args: argparse.Namespace) -> None:
             profile, scale_started_monotonic=progress.scale_started_monotonic)
         if profile.name == 'scale':
             stimulus_count = scale_stimulus_count(profile)
-            completion_gate = ExactRequestCompletionGate()
-            held_traffic = asyncio.create_task(
-                send_exact_async_requests(
-                    endpoint=args.endpoint,
-                    token=token,
-                    service_hash=provider_scope.service_hash,
-                    prefix=f'{run_id}-stimulus',
-                    count=stimulus_count,
-                    concurrency=stimulus_count,
-                    hold_requests=stimulus_count,
-                    hold_seconds=request_processing_seconds(profile),
-                    timeout_seconds=(profile.scale_timeout_seconds +
-                                     profile.drain_timeout_seconds),
-                    completion_gate=completion_gate))
-            campaign_tasks.append(held_traffic)
-            stimulus_deadline = (progress.scale_started_monotonic +
-                                 _CAMPAIGN_LOAD_WINDOW_SECONDS)
-            await _wait_for_scale_stimulus(observer=observer,
-                                           profile=profile,
-                                           receipt=receipt,
-                                           traffic=held_traffic,
-                                           baseline=ledger_baseline,
-                                           expected_resident=stimulus_count,
-                                           deadline_monotonic=stimulus_deadline)
-            traffic = held_traffic
-        else:
+            campaign_progress = ExactRequestCampaignProgress(
+                total_count=expectation.exact_request_count,
+                window_size=stimulus_count)
             traffic = asyncio.create_task(
                 send_exact_async_requests(
                     endpoint=args.endpoint,
                     token=token,
                     service_hash=provider_scope.service_hash,
-                    prefix=f'{run_id}-exact',
+                    prefix=campaign_prefix,
+                    count=expectation.exact_request_count,
+                    concurrency=stimulus_count,
+                    hold_requests=expectation.exact_request_count,
+                    hold_seconds=request_processing_seconds(profile),
+                    timeout_seconds=(profile.scale_timeout_seconds +
+                                     profile.drain_timeout_seconds),
+                    request_queue_timeout_seconds=(
+                        profile.request_queue_timeout_seconds),
+                    terminal_timeout_seconds=(
+                        profile.terminal_publication_timeout_seconds),
+                    campaign_progress=campaign_progress))
+            stimulus_deadline = (progress.scale_started_monotonic +
+                                 _CAMPAIGN_LOAD_WINDOW_SECONDS)
+            await _wait_for_scale_stimulus(observer=observer,
+                                           profile=profile,
+                                           receipt=receipt,
+                                           traffic=traffic,
+                                           baseline=ledger_baseline,
+                                           expected_resident=stimulus_count,
+                                           deadline_monotonic=stimulus_deadline)
+        else:
+            worker_count = min(expectation.exact_request_count,
+                               profile.request_concurrency)
+            campaign_progress = ExactRequestCampaignProgress(
+                total_count=expectation.exact_request_count,
+                window_size=worker_count)
+            traffic = asyncio.create_task(
+                send_exact_async_requests(
+                    endpoint=args.endpoint,
+                    token=token,
+                    service_hash=provider_scope.service_hash,
+                    prefix=campaign_prefix,
                     count=expectation.exact_request_count,
                     concurrency=profile.request_concurrency,
                     hold_requests=scale_stimulus_count(profile),
                     hold_seconds=request_processing_seconds(profile),
                     timeout_seconds=(profile.scale_timeout_seconds +
-                                     profile.drain_timeout_seconds)))
-            campaign_tasks.append(traffic)
+                                     profile.drain_timeout_seconds),
+                    request_queue_timeout_seconds=(
+                        profile.request_queue_timeout_seconds),
+                    terminal_timeout_seconds=(
+                        profile.terminal_publication_timeout_seconds),
+                    campaign_progress=campaign_progress))
         try:
             assert ledger_baseline is not None
+            assert traffic is not None
+            assert campaign_progress is not None
             if profile.name == 'scale':
-                assert completion_gate is not None
                 await _wait_for_scale_and_positive_request_telemetry(
                     observer=observer,
                     profile=profile,
                     progress=progress,
                     receipt=receipt,
                     traffic=traffic,
-                    completion_gate=completion_gate,
                     baseline=ledger_baseline,
+                    campaign_progress=campaign_progress,
                     expectation=expectation,
                     positive_deadline_monotonic=positive_deadline)
-                tail_count = (expectation.exact_request_count -
-                              scale_stimulus_count(profile))
-                tail_traffic = asyncio.create_task(
-                    send_exact_async_request_batches(
-                        endpoint=args.endpoint,
-                        token=token,
-                        service_hash=provider_scope.service_hash,
-                        prefix=f'{run_id}-tail',
-                        count=tail_count,
-                        batch_size=_SCALE_TAIL_BATCH_SIZE,
-                        concurrency=request_queue_max_concurrency(profile),
-                        timeout_seconds=(profile.scale_timeout_seconds +
-                                         profile.drain_timeout_seconds)))
-                campaign_tasks.append(tail_traffic)
-                traffic = asyncio.create_task(
-                    _sum_exact_request_tasks(campaign_tasks))
             else:
                 if expectation.requires_full_request_telemetry:
                     await _wait_for_positive_request_telemetry(
@@ -6544,8 +6855,10 @@ async def qualify(args: argparse.Namespace) -> None:
                                       expectation=expectation)
             exact_request_successes = await traffic
         except BaseException:
-            traffic.cancel()
-            await asyncio.gather(traffic, return_exceptions=True)
+            drained_successes = await _stop_new_campaign_work_and_drain(
+                traffic=traffic, campaign_progress=campaign_progress)
+            if drained_successes is not None:
+                exact_request_successes = drained_successes
             raise
         if exact_request_successes != expectation.exact_request_count:
             raise QualificationError('Exact request count is incomplete.')
@@ -6555,16 +6868,20 @@ async def qualify(args: argparse.Namespace) -> None:
             profile=profile,
             receipt=receipt,
             baseline=ledger_baseline,
-            expected_succeeded_delta=expectation.exact_request_count)
+            expected_succeeded_delta=expectation.exact_request_count,
+            campaign_prefix=campaign_prefix)
         await _wait_for_drain(observer=observer,
                               profile=profile,
                               progress=progress,
                               receipt=receipt,
                               expectation=expectation)
     except BaseException as error:
-        for task in campaign_tasks:
-            task.cancel()
-        await asyncio.gather(*campaign_tasks, return_exceptions=True)
+        if (traffic is not None and campaign_progress is not None and
+                not traffic.done()):
+            drained_successes = await _stop_new_campaign_work_and_drain(
+                traffic=traffic, campaign_progress=campaign_progress)
+            if drained_successes is not None:
+                exact_request_successes = drained_successes
         failure = error
         raise
     finally:

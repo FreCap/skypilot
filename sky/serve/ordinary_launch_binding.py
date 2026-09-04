@@ -220,6 +220,74 @@ class ProviderEvidence(str, enum.Enum):
     REPLACED = 'REPLACED'
 
 
+class ProviderPresentTeardownPhase(str, enum.Enum):
+    """Typed view of the persisted immediate provider-cleanup phase.
+
+    ``ProcessStatus.FAILED`` is deliberately reused for observation pending:
+    the prior writer already recognizes it as exact provider-present cleanup
+    authority, so rollback remains safe and merely uses its slower combined
+    submit/poll path.  Callers reason about the protocol through this adapter
+    instead of depending on that compatibility encoding.
+    """
+
+    SUBMISSION_SCHEDULED = 'SUBMISSION_SCHEDULED'
+    SUBMISSION_RUNNING = 'SUBMISSION_RUNNING'
+    ABSENCE_OBSERVATION_PENDING = 'ABSENCE_OBSERVATION_PENDING'
+    CLEANUP_SUCCEEDED = 'CLEANUP_SUCCEEDED'
+
+
+_PROVIDER_PRESENT_TEARDOWN_STATUS_BY_PHASE = {
+    ProviderPresentTeardownPhase.SUBMISSION_SCHEDULED:
+        common_utils.ProcessStatus.SCHEDULED,
+    ProviderPresentTeardownPhase.SUBMISSION_RUNNING:
+        common_utils.ProcessStatus.RUNNING,
+    ProviderPresentTeardownPhase.ABSENCE_OBSERVATION_PENDING:
+        common_utils.ProcessStatus.FAILED,
+    ProviderPresentTeardownPhase.CLEANUP_SUCCEEDED:
+        common_utils.ProcessStatus.SUCCEEDED,
+}
+_PROVIDER_PRESENT_TEARDOWN_PHASE_BY_STATUS = {
+    status: phase
+    for phase, status in _PROVIDER_PRESENT_TEARDOWN_STATUS_BY_PHASE.items()
+}
+
+
+def provider_present_teardown_phase(
+        replica_info: Any) -> ProviderPresentTeardownPhase:
+    """Return the typed teardown phase for one immediate-cleanup row."""
+    status_property = getattr(replica_info, 'status_property', None)
+    down_status = getattr(status_property, 'sky_down_status', None)
+    if not isinstance(down_status, common_utils.ProcessStatus):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup has no recognized teardown phase.')
+    try:
+        return _PROVIDER_PRESENT_TEARDOWN_PHASE_BY_STATUS[down_status]
+    except KeyError as error:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup has no recognized teardown phase.'
+        ) from error
+
+
+def transition_provider_present_teardown_phase(
+    replica_info: Any,
+    *,
+    expected: ProviderPresentTeardownPhase,
+    target: ProviderPresentTeardownPhase,
+) -> None:
+    """Apply one exact in-memory teardown phase transition."""
+    if not isinstance(expected, ProviderPresentTeardownPhase):
+        raise TypeError('Expected teardown phase has an invalid type.')
+    if not isinstance(target, ProviderPresentTeardownPhase):
+        raise TypeError('Target teardown phase has an invalid type.')
+    actual = provider_present_teardown_phase(replica_info)
+    if actual is not expected:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup teardown phase changed: expected '
+            f'{expected.value}, found {actual.value}.')
+    replica_info.status_property.sky_down_status = (
+        _PROVIDER_PRESENT_TEARDOWN_STATUS_BY_PHASE[target])
+
+
 class ProviderAllocationDisposition(str, enum.Enum):
     """Result of one exact paid provider-allocation checkpoint."""
 
@@ -2607,6 +2675,12 @@ def _paid_claim_payload(
         raise OrdinaryLaunchBindingConflict(
             'Non-pool profile lost its exact paid-capacity claim.')
     row = rows[0]
+    if (row['capacity_plan_generation'] is not None and
+        (not isinstance(info.planned_capacity, int) or
+         isinstance(info.planned_capacity, bool) or
+         info.planned_capacity != row['capacity_plan_units'])):
+        raise OrdinaryLaunchBindingConflict(
+            'Paid replica width contradicts its capacity-plan debit.')
     payload = {
         'claimed_at': row['claimed_at'],
         'pool_key': pool_key,

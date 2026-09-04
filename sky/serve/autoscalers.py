@@ -24,6 +24,7 @@ from sky.serve import autoscaler_decisions
 from sky.serve import capacity_planning
 from sky.serve import constants
 from sky.serve import kueue_lane_capacity
+from sky.serve import paid_capacity
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
@@ -73,13 +74,15 @@ class PreparedReplicaPlanningBinding:
 
 @dataclasses.dataclass(frozen=True)
 class ScalingDecisionInputs:
-    """Blocking inputs prepared for one exact autoscaler replica snapshot.
+    """Provider-free inputs for one autoscaler planning invocation.
 
     Controller routing publication must never wait on provider or database
     I/O. Shape-aware autoscalers therefore resolve durable cluster handles and
     historical capacity metadata before the controller enters its
     routing-epoch lock, then consume this token without another state-store
-    read inside that lock.
+    read inside that lock. Durable PostgreSQL capacity admission uses an empty
+    replica projection here and derives membership, shapes, and scheduler
+    classes from the repository-locked supply graph instead.
     """
 
     replica_bindings: tuple[PreparedReplicaPlanningBinding, ...] = ()
@@ -371,6 +374,44 @@ def bind_locked_kueue_capacity_snapshot(
         kueue_blocked_retirement_shapes=frozenset(blocked_shapes),
         kueue_transition_replica_ids=frozenset(transition_ids),
         kueue_ready_paid_replacement_replica_ids=frozenset(ready_paid_ids))
+
+
+def bind_locked_capacity_planning_inputs(
+    prepared_inputs: ScalingDecisionInputs,
+    replica_infos: list['replica_managers.ReplicaInfo'],
+    snapshot: kueue_lane_capacity.KueueReplicaCapacitySnapshot,
+) -> ScalingDecisionInputs:
+    """Build mutable replica projections from one locked PostgreSQL graph.
+
+    ``prepared_inputs`` may contain only replica-independent facts.  Exact
+    durable shapes and ABA-safe record identities are derived after the
+    repository has locked the authoritative replica rows, so normal terminal
+    reduction cannot invalidate or starve a successor paid wave.
+    """
+    if not isinstance(prepared_inputs, ScalingDecisionInputs):
+        raise TypeError('Locked capacity planning inputs are malformed.')
+    if (prepared_inputs.replica_bindings or
+            prepared_inputs.gpu_shape_handles not in (None, {}) or
+            prepared_inputs.gpu_shapes_by_replica_id or
+            prepared_inputs.kueue_capacity_by_replica_id or
+            prepared_inputs.kueue_blocked_retirement_shapes or
+            prepared_inputs.kueue_transition_replica_ids or
+            prepared_inputs.kueue_ready_paid_replacement_replica_ids):
+        raise ValueError('Locked capacity planning received a mutable replica '
+                         'preload.')
+    exact_shapes: dict[int, tuple[str, int]] = {}
+    for info in replica_infos:
+        shape = _durable_exact_gpu_shape(info)
+        if shape is not None:
+            exact_shapes[info.replica_id] = shape
+    locked_inputs = dataclasses.replace(
+        prepared_inputs,
+        replica_bindings=build_replica_planning_bindings(
+            replica_infos, exact_shapes),
+        gpu_shape_handles={},
+        gpu_shapes_by_replica_id=exact_shapes)
+    return bind_locked_kueue_capacity_snapshot(locked_inputs, replica_infos,
+                                               snapshot)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -693,6 +734,38 @@ def _generate_scale_up_decisions(
     ]
 
 
+def _paid_catalog_card(
+    *,
+    location: spot_placer.Location,
+    placer: spot_placer.SpotPlacer,
+    canonical_by_name: Mapping[str, str],
+    configured_gpu_count: typing.Callable[[str], int],
+    location_gpu_shape: typing.Callable[[spot_placer.Location], tuple[str,
+                                                                      int]],
+) -> tuple[str, int] | None:
+    """Validate one physical catalog shape against the placement contract."""
+    try:
+        raw_card, gpu_count = location_gpu_shape(location)
+        card = canonical_by_name.get(raw_card.casefold())
+        if card is None:
+            return None
+        configured_shape = paid_capacity.PhysicalBackendShape(
+            accelerator=card.casefold(),
+            gpu_units_per_node=configured_gpu_count(card),
+            num_nodes=placer.num_nodes)
+        candidate_shape = paid_capacity.PhysicalBackendShape(
+            accelerator=raw_card.casefold(),
+            gpu_units_per_node=gpu_count,
+            num_nodes=placer.num_nodes)
+        paid_capacity.paid_launch_plan_units(contract=placer.placement_contract,
+                                             configured_shape=configured_shape,
+                                             candidate_shape=candidate_shape)
+    except (AttributeError, TypeError, ValueError,
+            paid_capacity.PaidGPUAttributionError):
+        return None
+    return card, gpu_count
+
+
 def _order_cold_paid_cards(
     configured_cards: list[str],
     placer: spot_placer.SpotPlacer | None,
@@ -714,10 +787,14 @@ def _order_cold_paid_cards(
         except Exception:  # pylint: disable=broad-except
             return list(configured_cards)
     for location, raw_cost in known_location_costs.items():
-        raw_card, gpu_count = location_gpu_shape(location)
-        card = canonical_by_name.get(raw_card.casefold())
-        if card is None or gpu_count != configured_gpu_count(card):
+        matched = _paid_catalog_card(location=location,
+                                     placer=placer,
+                                     canonical_by_name=canonical_by_name,
+                                     configured_gpu_count=configured_gpu_count,
+                                     location_gpu_shape=location_gpu_shape)
+        if matched is None:
             continue
+        card, gpu_count = matched
         try:
             hourly_cost = float(raw_cost)
         except Exception:  # pylint: disable=broad-except
@@ -728,7 +805,9 @@ def _order_cold_paid_cards(
         elif hourly_cost == 0:
             zero_cost_cards.add(card)
         else:
-            paid_costs[card] = min(hourly_cost,
+            normalized_cost = placer.placement_contract.normalize_hourly_cost(
+                hourly_cost, gpu_count)
+            paid_costs[card] = min(normalized_cost,
                                    paid_costs.get(card, float('inf')))
 
     # A card is reserved-only only when every inspected location is free and
@@ -783,10 +862,14 @@ def _prospective_paid_cards(
         # later provider guard can only reject after publication.
         if getattr(location, 'use_spot', None) is not True:
             continue
-        raw_card, gpu_count = location_gpu_shape(location)
-        card = canonical_by_name.get(raw_card.casefold())
-        if card is None or gpu_count != configured_gpu_count(card):
+        matched = _paid_catalog_card(location=location,
+                                     placer=placer,
+                                     canonical_by_name=canonical_by_name,
+                                     configured_gpu_count=configured_gpu_count,
+                                     location_gpu_shape=location_gpu_shape)
+        if matched is None:
             continue
+        card, _ = matched
         try:
             hourly_cost = float(raw_cost)
         except Exception:  # pylint: disable=broad-except
@@ -4397,6 +4480,7 @@ class _GpuShapeResolverMixin:
     # created row can never inherit its predecessor's shape or cost.
     _replica_cache_record_ids: dict[int, str]
     configured_accelerator_shapes: dict[str, int]
+    _cost_rebalance_spot_placer: spot_placer.SpotPlacer | None
     latest_version: int
     _service_name: str
     # Immutable per-decision legacy handle snapshot, populated before the
@@ -4411,17 +4495,15 @@ class _GpuShapeResolverMixin:
     def _supports_exact_fill_shape_resolution(self) -> bool:
         return True
 
-    def _prepare_scaling_decision_inputs(
-        self, replica_infos: list['replica_managers.ReplicaInfo']
-    ) -> ScalingDecisionInputs:
-        """Resolve every durable input before routing serialization."""
-        for info in replica_infos:
-            self._bind_replica_cache_identity(info)
-        historical_versions = {
-            info.version
-            for info in replica_infos
-            if not info.is_terminal and info.version != self.latest_version
-        }
+    def _prepare_replica_independent_scaling_inputs(
+            self, historical_versions: Iterable[int]) -> ScalingDecisionInputs:
+        """Resolve bounded replica-independent facts without a census."""
+        historical_versions = set(historical_versions)
+        if (any(
+                type(version) is not int or version < 1
+                for version in historical_versions) or
+                self.latest_version in historical_versions):
+            raise ValueError('Historical service versions are malformed.')
         if historical_versions:
             historical_versions.difference_update(
                 self._cached_historical_scaling_versions())
@@ -4448,6 +4530,47 @@ class _GpuShapeResolverMixin:
                         'version %s; using the latest-version fallback for '
                         'this decision tick.', version)
                 historical_values[version] = value
+        service_time_estimates = self._prepare_service_time_estimates()
+        cold_paid_order: tuple[str, ...] = ()
+        prospective_paid_order: tuple[str, ...] = ()
+        if isinstance(self, ConcurrencyAutoscaler):
+            configured_cards = self._configured_cards_from_profiles()
+            with self._cold_paid_cost_snapshot_for_tick():
+                cold_paid_order = tuple(
+                    self._cold_paid_card_order(configured_cards))
+                prospective_paid_order = tuple(
+                    self._prospective_paid_card_order(configured_cards))
+        return ScalingDecisionInputs(
+            gpu_shape_handles={},
+            historical_scaling_values=historical_values,
+            service_time_estimates_by_accelerator=service_time_estimates,
+            cold_paid_accelerator_order=cold_paid_order,
+            prospective_paid_accelerator_order=prospective_paid_order)
+
+    def _prepare_capacity_planning_preflight(self) -> ScalingDecisionInputs:
+        """Prepare only replica-independent facts for locked PG planning."""
+        # PostgreSQL-authoritative logical services are deliberately
+        # single-version: in-place updates are rejected by the controller.
+        # Loading every retained version here would make each reconcile grow
+        # with service history and, worse, turn unrelated orphan metadata into
+        # a planning input.  The locked replica graph below is the only
+        # membership authority; an impossible old-version row fails closed in
+        # the durable planner instead of selecting another spec-preload path.
+        return self._prepare_replica_independent_scaling_inputs(())
+
+    def _prepare_scaling_decision_inputs(
+        self, replica_infos: list['replica_managers.ReplicaInfo']
+    ) -> ScalingDecisionInputs:
+        """Resolve every legacy/local input before routing serialization."""
+        for info in replica_infos:
+            self._bind_replica_cache_identity(info)
+        historical_versions = {
+            info.version
+            for info in replica_infos
+            if not info.is_terminal and info.version != self.latest_version
+        }
+        base_inputs = self._prepare_replica_independent_scaling_inputs(
+            historical_versions)
         try:
             kueue_snapshot = (
                 kueue_lane_capacity.snapshot_replica_capacity_classes(
@@ -4470,23 +4593,9 @@ class _GpuShapeResolverMixin:
                 common_utils.format_exception(error))
             kueue_snapshot = kueue_lane_capacity.KueueReplicaCapacitySnapshot(
                 unknown)
-        service_time_estimates = self._prepare_service_time_estimates()
-        cold_paid_order: tuple[str, ...] = ()
-        prospective_paid_order: tuple[str, ...] = ()
-        if isinstance(self, ConcurrencyAutoscaler):
-            configured_cards = self._configured_cards_from_profiles()
-            with self._cold_paid_cost_snapshot_for_tick():
-                cold_paid_order = tuple(
-                    self._cold_paid_card_order(configured_cards))
-                prospective_paid_order = tuple(
-                    self._prospective_paid_card_order(configured_cards))
         gpu_shape_handles = self._resolve_gpu_shape_handles(replica_infos)
-        base_inputs = ScalingDecisionInputs(
-            gpu_shape_handles=gpu_shape_handles,
-            historical_scaling_values=historical_values,
-            service_time_estimates_by_accelerator=service_time_estimates,
-            cold_paid_accelerator_order=cold_paid_order,
-            prospective_paid_accelerator_order=prospective_paid_order)
+        base_inputs = dataclasses.replace(base_inputs,
+                                          gpu_shape_handles=gpu_shape_handles)
         exact_shapes: dict[int, tuple[str, int]] = {}
         for info in replica_infos:
             cached = self._gpu_shape_cache.get(info.replica_id)
@@ -4879,6 +4988,9 @@ class _GpuShapeResolverMixin:
         configured_shapes = self.configured_accelerator_shapes
         if not configured_shapes:
             return True
+        placer = self._cost_rebalance_spot_placer
+        if placer is None:
+            return False
         canonical_by_name = {
             card.casefold(): (card, count)
             for card, count in configured_shapes.items()
@@ -4891,9 +5003,30 @@ class _GpuShapeResolverMixin:
         if configured is None:
             return False
         canonical_card, configured_count = configured
-        return (incumbent_card.casefold() == canonical_card.casefold() and
-                incumbent_count == configured_count and
-                candidate_count == configured_count)
+        try:
+            configured_shape = paid_capacity.PhysicalBackendShape(
+                accelerator=canonical_card.casefold(),
+                gpu_units_per_node=configured_count,
+                num_nodes=placer.num_nodes)
+            incumbent_shape = paid_capacity.PhysicalBackendShape(
+                accelerator=incumbent_card.casefold(),
+                gpu_units_per_node=incumbent_count,
+                num_nodes=placer.num_nodes)
+            candidate_shape = paid_capacity.physical_backend_shape_from_location(
+                location, num_nodes=placer.num_nodes)
+            paid_capacity.paid_launch_plan_units(
+                contract=placer.placement_contract,
+                configured_shape=configured_shape,
+                candidate_shape=incumbent_shape)
+            paid_capacity.paid_launch_plan_units(
+                contract=placer.placement_contract,
+                configured_shape=configured_shape,
+                candidate_shape=candidate_shape)
+        except paid_capacity.PaidGPUAttributionError:
+            return False
+        # Rebalancing is one-for-one, so it may cross providers/regions but
+        # cannot silently change the logical capacity of the replica.
+        return incumbent_count == candidate_count
 
 
 class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
@@ -6472,7 +6605,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 next_policy_state.maximum_capacity != self.max_replicas or
                 committed_candidate.capacity_unit
                 is not capacity_planning.CapacityUnit.LOGICAL_GPU or
-                committed_candidate.physical_gpu_width_by_accelerator
+                committed_candidate.planning_capacity_quantum_by_accelerator
                 != expected_widths or
                 committed_candidate.backend_num_nodes != 1):
             raise ValueError('Committed durable capacity plan has a different '
@@ -6563,12 +6696,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         """Build and run the one durable logical planner without mutation.
 
         Demand comes from the PostgreSQL-locked report, reservation and paid
-        inventory comes from the repository-locked projection, and replica
-        readiness comes from the exact controller-prepared census.  In
-        particular, this method never reconstructs economic inventory by
-        filtering replica rows: cleanup-unproven retiring paid rows remain in
-        ``reservation_input.existing_paid_capacity`` until the repository
-        proves provider teardown.
+        inventory and replica state come from the same repository-locked
+        projection.  In particular, this method never reconstructs economic
+        inventory by filtering replica rows: cleanup-unproven retiring paid
+        rows remain in ``reservation_input.existing_paid_capacity`` until the
+        repository proves provider teardown.
         """
         infos = list(replica_infos)
         try:
@@ -6633,7 +6765,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             }
             prior_shapes = {
                 card.casefold(): width for card, width in
-                prior_candidate.physical_gpu_width_by_accelerator.entries
+                prior_candidate.planning_capacity_quantum_by_accelerator.entries
             }
             if (set(canonical) != {
                     card.casefold()
@@ -7589,7 +7721,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 configured_accelerators=configured_cards,
                 capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
                 backend_num_nodes=1,
-                physical_gpu_width_by_accelerator=(
+                planning_capacity_quantum_by_accelerator=(
                     capacity_planning.AcceleratorCapacity.from_mapping(
                         self.configured_accelerator_shapes)),
                 capacity_per_accelerator=(
@@ -9918,7 +10050,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                            capacity_planning.CapacityUnit.PHYSICAL_BACKEND),
             backend_num_nodes=(1 if self.replica_unit == 'logical' else
                                self.backend_num_nodes),
-            physical_gpu_width_by_accelerator=(
+            planning_capacity_quantum_by_accelerator=(
                 capacity_planning.AcceleratorCapacity.from_mapping({
                     card: self._configured_gpu_count(card)
                     for card in configured_cards
@@ -12532,6 +12664,14 @@ def prepare_controller_scaling_decision_inputs(
     if _prepared_scaling_implementation(autoscaler) is None:
         return None
     return autoscaler._prepare_scaling_decision_inputs(replica_infos)  # pylint: disable=protected-access
+
+
+def prepare_controller_capacity_planning_preflight(
+        autoscaler: Any) -> ScalingDecisionInputs | None:
+    """Resolve only replica-independent facts for durable PG admission."""
+    if _prepared_scaling_implementation(autoscaler) is None:
+        return None
+    return autoscaler._prepare_capacity_planning_preflight()  # pylint: disable=protected-access
 
 
 def controller_prepares_scaling_decision_inputs(autoscaler: Any) -> bool:

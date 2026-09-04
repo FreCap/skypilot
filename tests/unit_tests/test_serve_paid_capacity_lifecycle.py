@@ -340,6 +340,121 @@ def test_lifecycle_failure_or_interrupt_still_finalizes(monkeypatch, tmp_path,
     assert stages['wait-cleanup']['outcome'] == 'passed'
 
 
+def test_lifecycle_cleanup_starts_after_qualifier_terminal_drain(
+        monkeypatch, tmp_path):
+    events = []
+    terminal_published = False
+    _install_operations(monkeypatch, events)
+
+    async def qualify_after_terminalizing(_args):
+        nonlocal terminal_published
+        events.append(('accepted',))
+        await asyncio.sleep(0)
+        terminal_published = True
+        events.append(('terminal',))
+        raise lifecycle_module.qualify.QualificationError('observer failed')
+
+    class TerminalAwareLifecycle(_FakeLifecycle):
+
+        async def down(self, service_name):
+            assert terminal_published
+            await super().down(service_name)
+
+    monkeypatch.setattr(lifecycle_module.qualify, 'qualify',
+                        qualify_after_terminalizing)
+
+    with pytest.raises(lifecycle_module.qualify.QualificationError,
+                       match='observer failed'):
+        asyncio.run(
+            lifecycle_module.run_lifecycle(_args(tmp_path),
+                                           TerminalAwareLifecycle(events)))
+
+    names = [event[0] for event in events]
+    assert names.index('accepted') < names.index('terminal') < names.index(
+        'down')
+
+
+def test_repeated_cancellation_cannot_interrupt_owned_finalizer(
+        monkeypatch, tmp_path):
+    events = []
+    _install_operations(monkeypatch, events)
+
+    async def scenario():
+        qualify_started = asyncio.Event()
+        down_started = asyncio.Event()
+        release_down = asyncio.Event()
+
+        async def qualify(args):
+            events.append(('qualify', args.endpoint))
+            pathlib.Path(args.receipt).write_text('{}\n', encoding='utf-8')
+            qualify_started.set()
+            await asyncio.Future()
+
+        class BlockingDownLifecycle(_FakeLifecycle):
+
+            async def down(self, service_name):
+                events.append(('down', service_name))
+                down_started.set()
+                await release_down.wait()
+
+        monkeypatch.setattr(lifecycle_module.qualify, 'qualify', qualify)
+        task = asyncio.create_task(
+            lifecycle_module.run_lifecycle(_args(tmp_path),
+                                           BlockingDownLifecycle(events)))
+        await qualify_started.wait()
+        task.cancel()
+        await down_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release_down.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert [event[0] for event in events][-2:] == ['down', 'cleanup']
+    stages = {stage['name']: stage for stage in _receipt(tmp_path)['stages']}
+    assert stages['serve-down']['outcome'] == 'passed'
+    assert stages['wait-cleanup']['outcome'] == 'passed'
+    assert _receipt(tmp_path)['exact_cleanup_proven'] is True
+
+
+def test_first_cancellation_during_normal_finalizer_is_deferred(
+        monkeypatch, tmp_path):
+    events = []
+    _install_operations(monkeypatch, events)
+
+    async def scenario():
+        down_started = asyncio.Event()
+        release_down = asyncio.Event()
+
+        class BlockingDownLifecycle(_FakeLifecycle):
+
+            async def down(self, service_name):
+                events.append(('down', service_name))
+                down_started.set()
+                await release_down.wait()
+
+        task = asyncio.create_task(
+            lifecycle_module.run_lifecycle(_args(tmp_path),
+                                           BlockingDownLifecycle(events)))
+        await down_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release_down.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert [event[0] for event in events][-2:] == ['down', 'cleanup']
+    stages = {stage['name']: stage for stage in _receipt(tmp_path)['stages']}
+    assert stages['serve-down']['outcome'] == 'passed'
+    assert stages['wait-cleanup']['outcome'] == 'passed'
+    assert _receipt(tmp_path)['exact_cleanup_proven'] is True
+
 def test_lost_up_acknowledgement_still_finalizes(monkeypatch, tmp_path):
     events = []
     _install_operations(monkeypatch, events)

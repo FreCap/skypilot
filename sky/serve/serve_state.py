@@ -1,5 +1,6 @@
 """The database for services information."""
 import collections
+from collections.abc import Iterable
 from collections.abc import Mapping
 import contextlib
 import copy
@@ -4968,6 +4969,33 @@ def read_replica_for_bound_ordinary_launch_in_transaction(
     return info
 
 
+def transition_bound_provider_cleanup_phase_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+    association_id: uuid.UUID,
+    *,
+    expected: 'ordinary_launch_binding.ProviderPresentTeardownPhase',
+    target: 'ordinary_launch_binding.ProviderPresentTeardownPhase',
+) -> 'replica_managers.ReplicaInfo':
+    """Persist one exact cleanup phase without settling economic identity."""
+    info = read_replica_for_bound_ordinary_launch_in_transaction(
+        connection, service_name, replica_id, replica_record_id, association_id)
+    ordinary_launch_binding.transition_provider_present_teardown_phase(
+        info, expected=expected, target=target)
+    if not _update_exact_locked_replica_in_session(
+            connection,
+            service_name,
+            replica_id,
+            replica_record_id,
+            info,
+            association_id=association_id):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider cleanup phase transition lost its exact replica CAS.')
+    return info
+
+
 def _upsert_replica_rows_in_session(
     session: orm.Session,
     engine: sqlalchemy.engine.Engine,
@@ -6434,6 +6462,7 @@ def _lock_paid_capacity_admission_context_in_session(
     service_name: str,
     persistence_specs: list[paid_capacity.PaidClaimPersistenceSpec],
     *,
+    candidate_pool_keys: Iterable[str],
     upstream: _PaidCapacityAdmissionUpstreamContext,
     census: _PaidCapacityAdmissionCensus,
     base_limit: int,
@@ -6457,8 +6486,13 @@ def _lock_paid_capacity_admission_context_in_session(
             sqlalchemy.select(paid_capacity_waiters_table.c.pool_key).where(
                 paid_capacity_waiters_table.c.service_name ==
                 service_name)).scalars())
-    distinct_pool_keys = sorted({spec.pool_key for spec in persistence_specs} |
-                                retained_service_pool_keys |
+    candidate_keys = set(candidate_pool_keys)
+    if any(not isinstance(pool_key, str) or not pool_key
+           for pool_key in candidate_keys):
+        raise ValueError('Paid admission candidate pool keys are malformed.')
+    if {spec.pool_key for spec in persistence_specs} - candidate_keys:
+        raise ValueError('Paid admission spec names an unlocked pool.')
+    distinct_pool_keys = sorted(candidate_keys | retained_service_pool_keys |
                                 retained_waiter_pool_keys)
     for pool_key in distinct_pool_keys:
         _ensure_paid_capacity_pool_in_session(session, engine, pool_key,
@@ -7187,6 +7221,7 @@ def try_add_replicas_with_paid_capacity_claims(
             engine,
             service_name,
             persistence_specs,
+            candidate_pool_keys={spec.pool_key for spec in persistence_specs},
             upstream=upstream,
             census=census,
             base_limit=base_limit,

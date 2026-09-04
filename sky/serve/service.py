@@ -20,7 +20,6 @@ import pathlib
 import secrets
 import shutil
 import socket
-import sys
 import threading
 import time
 import traceback
@@ -74,6 +73,8 @@ kueue_lane_observer = adaptors_common.LazyImport(
     'sky.serve.kueue_lane_observer')
 
 _BOUND_ORDINARY_LAUNCH_SETTLE_INTERVAL_SECONDS = 0.5
+_PAID_PROVIDER_OBSERVATION_RETRY_SECONDS = 2.0
+_PAID_PROVIDER_OBSERVATION_TIMEOUT_SECONDS = 420.0
 
 
 class ServiceOwnershipLostError(RuntimeError):
@@ -209,9 +210,9 @@ def _handle_signal(service_name: str,
                         # same row-lock transaction; no racy second CAS exists.
                         persisted = True
                 except Exception as e:  # pylint: disable=broad-except
-                    # A DB blip must not escape into _start's destructive
-                    # unexpected-exception finalizer. Keep the signal durable
-                    # and retry the exact-owner CAS on the next tick.
+                    # A DB blip must not consume an uncommitted signal. Keep
+                    # it durable and retry the exact-owner CAS on the next
+                    # tick.
                     logger.warning(f'Failed to persist terminate signal for '
                                    f'{service_name!r}: '
                                    f'{common_utils.format_exception(e)}; '
@@ -584,6 +585,12 @@ def _prepare_provider_present_cleanup(
             assert cleanup_context is not None
             if info.cluster_name in existing_cluster_names:
                 continue
+            if ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+                    cleanup_context.profile.kind):
+                # Paid cleanup has a frozen provider-native identity.  Submit
+                # its idempotent delete before any potentially slow absence
+                # observation; a missing local cluster row is not absence.
+                continue
             assert authority is not None
             assert projector is not None
             observation = non_pool_launch_reconciliation.reconcile(
@@ -596,15 +603,6 @@ def _prepare_provider_present_cleanup(
                     ordinary_launch_binding.ProviderEvidence.ABSENT):
                 contexts.pop(key)
                 projected_absence_keys.add(key)
-                continue
-            if (observation.evidence
-                    == ordinary_launch_binding.ProviderEvidence.PRESENT and
-                    ordinary_launch_binding.
-                    is_paid_provider_reconciliation_profile(
-                        cleanup_context.profile.kind)):
-                # Unlike Kubernetes UID-fenced fill, paid AWS/GCP immutable
-                # identities support provider-native cleanup even when the
-                # local cluster row was never committed.
                 continue
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                 'A provider-present cleanup marker lost its SkyPilot cluster '
@@ -936,8 +934,13 @@ def _cleanup(
     # This remains the whole-service teardown owner.  Cleanup intent and exact
     # replica identity are durable; the retired action-authority proposal does
     # not replace this thread loop.
-    info2thr: dict[replica_managers.ReplicaInfo,
-                   thread_utils.SafeThread] = dict()
+    cleanup_infos: list[replica_managers.ReplicaInfo] = []
+    paid_observation_infos: dict[tuple[int, str],
+                                 replica_managers.ReplicaInfo] = {}
+    cleanup_specs: dict[tuple[int, str], tuple[
+        reserved_capacity.ProtocolV2CleanupFence | None,
+        ordinary_launch_binding.BoundNonPoolLaunchContext | None,
+        serve_state.ReplicaResourceActionIdentity | None]] = {}
     for info, cleanup_fence, cleanup_context in cleanup_entries:
         _assert_owner(f'before scheduling replica {info.replica_id} cleanup')
         # Use the durable exact cluster identity from the replica row. New
@@ -945,20 +948,26 @@ def _cleanup(
         # within the 63-character cloud/Kubernetes ceiling, so a prefix query
         # with the full service name can miss a live, billable cluster.
         teardown_identity = teardown_identities[info.replica_id]
-        terminate_kwargs: dict[str, Any] = {
-            'continue_guard': _still_owns,
-            'expected_cluster_record_uuid':
-                (str(teardown_identity.sky_cluster_record_uuid)
-                 if teardown_identity is not None else None),
-        }
-        if cleanup_fence is not None:
-            terminate_kwargs['cleanup_fence'] = cleanup_fence
-        t = thread_utils.SafeThread(
-            target=_terminate_replica_cluster_for_service_cleanup,
-            args=(service_name, info, cleanup_context, binding_authority,
-                  info.cluster_name),
-            kwargs=terminate_kwargs)
-        info2thr[info] = t
+        cleanup_specs[(info.replica_id,
+                       info.replica_record_id)] = (cleanup_fence,
+                                                   cleanup_context,
+                                                   teardown_identity)
+        paid_cleanup = bool(
+            cleanup_context is not None and
+            ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+                cleanup_context.profile.kind))
+        if (paid_cleanup and
+                ordinary_launch_binding.provider_present_teardown_phase(info)
+                is ordinary_launch_binding.ProviderPresentTeardownPhase.
+                ABSENCE_OBSERVATION_PENDING):
+            paid_observation_infos[(info.replica_id,
+                                    info.replica_record_id)] = info
+            logger.info(
+                'Resuming provider absence observation for replica '
+                '%s without consuming teardown submission capacity.',
+                info.replica_id)
+            continue
+        cleanup_infos.append(info)
         # Set replica status to `SHUTTING_DOWN`
         if (cleanup_fence is None and info.status_property.sky_launch_status
                 in (None, common_utils.ProcessStatus.SCHEDULED)):
@@ -981,6 +990,24 @@ def _cleanup(
         logger.info(f'Scheduling to terminate replica {info.replica_id} ...')
 
     def _handle_cleanup_success(info: replica_managers.ReplicaInfo) -> None:
+        cleanup_context = cleanup_specs[(info.replica_id,
+                                         info.replica_record_id)][1]
+        if (cleanup_context is not None and
+                ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+                    cleanup_context.profile.kind)):
+            persisted = serve_state.get_replica_info_from_id(
+                service_name, info.replica_id)
+            if (persisted is None or
+                    persisted.replica_record_id != info.replica_record_id or
+                    ordinary_launch_binding.provider_present_teardown_phase(
+                        persisted) is not ordinary_launch_binding.
+                    ProviderPresentTeardownPhase.ABSENCE_OBSERVATION_PENDING):
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Paid teardown submission did not leave one exact '
+                    'observation-pending replica.')
+            paid_observation_infos[(info.replica_id,
+                                    info.replica_record_id)] = persisted
+            return
         _remove_replica(info)
         logger.info(f'Replica {info.replica_id} terminated successfully.')
 
@@ -1007,16 +1034,170 @@ def _cleanup(
             expected_lifecycle_epoch=lifecycle_epoch,
             expected_controller_owner=expected_owner))
 
-    serve_utils.run_bounded_serve_teardown_threads(
-        list(info2thr.items()),
-        pool=pool,
-        reserve_running=_reserve_cleanup,
-        restore_never_started=_restore_cleanup,
-        handle_success=_handle_cleanup_success,
-        handle_failure=_set_to_failed_cleanup,
-        continue_guard=_still_owns,
-        max_concurrent_per_service=(
-            replica_managers.MAX_CONCURRENT_DOWNS_PER_SERVICE))
+    def _make_cleanup_worker(
+            info: replica_managers.ReplicaInfo) -> thread_utils.SafeThread:
+        cleanup_fence, cleanup_context, teardown_identity = cleanup_specs[(
+            info.replica_id, info.replica_record_id)]
+        terminate_kwargs: dict[str, Any] = {
+            'continue_guard': _still_owns,
+            'expected_cluster_record_uuid':
+                (str(teardown_identity.sky_cluster_record_uuid)
+                 if teardown_identity is not None else None),
+        }
+        if cleanup_fence is not None:
+            terminate_kwargs['cleanup_fence'] = cleanup_fence
+        return thread_utils.SafeThread(
+            target=_terminate_replica_cluster_for_service_cleanup,
+            args=(service_name, info, cleanup_context, binding_authority,
+                  info.cluster_name),
+            kwargs=terminate_kwargs)
+
+    def _run_cleanup_submission_wave(
+            infos: list[replica_managers.ReplicaInfo]) -> None:
+        serve_utils.run_bounded_serve_teardown_threads(
+            infos,
+            make_worker=_make_cleanup_worker,
+            pool=pool,
+            reserve_running=_reserve_cleanup,
+            restore_never_started=_restore_cleanup,
+            handle_success=_handle_cleanup_success,
+            handle_failure=_set_to_failed_cleanup,
+            continue_guard=_still_owns,
+            max_concurrent_per_service=(
+                replica_managers.MAX_CONCURRENT_DOWNS_PER_SERVICE))
+
+    _run_cleanup_submission_wave(cleanup_infos)
+
+    def _ordered_paid_observation_infos() -> list[replica_managers.ReplicaInfo]:
+        """Interleave clouds so one slow provider cannot starve the other."""
+        by_cloud: dict[str, list[replica_managers.ReplicaInfo]] = {
+            'aws': [],
+            'gcp': [],
+        }
+        for key, info in paid_observation_infos.items():
+            context = cleanup_specs[key][1]
+            assert context is not None
+            pool_identity = paid_capacity.pool_key_payload(
+                str(info.paid_capacity_pool_key))
+            cloud = (pool_identity.get('cloud') if isinstance(
+                pool_identity, dict) else None)
+            if cloud not in by_cloud:
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Paid observation lost its immutable provider cloud.')
+            by_cloud[cloud].append(info)
+        ordered: list[replica_managers.ReplicaInfo] = []
+        index = 0
+        while any(index < len(infos) for infos in by_cloud.values()):
+            for cloud in ('aws', 'gcp'):
+                infos = by_cloud[cloud]
+                if index < len(infos):
+                    ordered.append(infos[index])
+            index += 1
+        return ordered
+
+    observation_lane = (
+        non_pool_launch_reconciliation.OneShotProviderObservationLane())
+    retry_at: dict[tuple[int, str], float] = {}
+    deadlines = {
+        key: time.monotonic() + _PAID_PROVIDER_OBSERVATION_TIMEOUT_SECONDS
+        for key in paid_observation_infos
+    }
+    if paid_observation_infos and binding_authority is None:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Paid provider observation has no controller authority.')
+
+    def _observe_paid_provider_once(
+        info: replica_managers.ReplicaInfo,
+    ) -> non_pool_launch_reconciliation.PaidTeardownObservationStep:
+        if binding_authority is None:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Paid provider observation lost controller authority.')
+        key = (info.replica_id, info.replica_record_id)
+        context = cleanup_specs[key][1]
+        assert context is not None
+
+        def _cleanup_local_state() -> None:
+            _assert_owner(f'before paid provider-absence cleanup for replica '
+                          f'{info.replica_id}')
+            replica_managers.cleanup_exact_paid_cluster_record_after_provider_absence(
+                service_name, info.replica_id, info.replica_record_id,
+                info.cluster_name)
+
+        return non_pool_launch_reconciliation.advance_paid_teardown_observation(
+            context,
+            info,
+            binding_authority,
+            functools.partial(_project_bound_ordinary_launch_for_teardown,
+                              binding_authority),
+            before_absence_projection=_cleanup_local_state)
+
+    # Reuse the same one-shot reconciliation function and fixed 16-worker
+    # service budget as the live replica manager.  This is intentionally not a
+    # second executor: each worker performs one observation and exits.
+    while paid_observation_infos:
+        _assert_owner('while observing paid provider teardown')
+        now = time.monotonic()
+        resubmit_infos: list[replica_managers.ReplicaInfo] = []
+        for completion in observation_lane.take_completed():
+            key = completion.key
+            completed_info = paid_observation_infos.get(key)
+            if completed_info is None:
+                continue
+            step = completion.result
+            if (completion.error is not None or not isinstance(
+                    step,
+                    non_pool_launch_reconciliation.PaidTeardownObservationStep)
+               ):
+                retry_at[key] = now + _PAID_PROVIDER_OBSERVATION_RETRY_SECONDS
+                continue
+            if step.disposition is (
+                    non_pool_launch_reconciliation.
+                    PaidTeardownObservationDisposition.SETTLED_ABSENT):
+                _remove_replica(completed_info)
+                del paid_observation_infos[key]
+                retry_at.pop(key, None)
+                logger.info(
+                    'Replica %s removed after exact paid provider '
+                    'absence.', completed_info.replica_id)
+                continue
+            if step.disposition is (
+                    non_pool_launch_reconciliation.
+                    PaidTeardownObservationDisposition.RESUBMIT_PRESENT):
+                scheduled = step.scheduled_replica_info
+                assert isinstance(scheduled, replica_managers.ReplicaInfo)
+                paid_observation_infos.pop(key, None)
+                resubmit_infos.append(scheduled)
+                continue
+            retry_at[key] = now + _PAID_PROVIDER_OBSERVATION_RETRY_SECONDS
+        if resubmit_infos:
+            _run_cleanup_submission_wave(resubmit_infos)
+            for info in resubmit_infos:
+                key = (info.replica_id, info.replica_record_id)
+                deadlines.setdefault(
+                    key,
+                    time.monotonic() +
+                    _PAID_PROVIDER_OBSERVATION_TIMEOUT_SECONDS)
+                retry_at[key] = (time.monotonic() +
+                                 _PAID_PROVIDER_OBSERVATION_RETRY_SECONDS)
+        now = time.monotonic()
+        for key, info in list(paid_observation_infos.items()):
+            if now >= deadlines[key]:
+                _set_to_failed_cleanup(
+                    info, 'exact paid provider absence was not observed '
+                    'within the bounded teardown horizon')
+                del paid_observation_infos[key]
+                continue
+            if observation_lane.contains(key) or now < retry_at.get(key, 0):
+                continue
+        for info in _ordered_paid_observation_infos():
+            key = (info.replica_id, info.replica_record_id)
+            if observation_lane.contains(key) or now < retry_at.get(key, 0):
+                continue
+            if not observation_lane.schedule(
+                    key, functools.partial(_observe_paid_provider_once, info)):
+                break
+        if paid_observation_infos:
+            time.sleep(0.2)
 
     _assert_owner('before scoped storage cleanup')
 
@@ -1114,7 +1295,8 @@ def _orphan_exit(
         except Exception:  # pylint: disable=broad-except
             logger.warning('Failed to kill children during orphan exit; '
                            'proceeding with os._exit anyway')
-    # os._exit() bypasses the try/finally which would call _cleanup.
+    # os._exit() bypasses the parent supervisor's remaining control flow. An
+    # orphan never owns whole-service cleanup authority.
     os._exit(0)  # pylint: disable=protected-access
 
 
@@ -1258,14 +1440,10 @@ def _bail_on_boot_failure(service_name: str,
                           component: str = 'Controller subprocess') -> None:
     """Retryable exit when a service component cannot finish booting.
 
-    Critical contract: must NOT fall through to `_start`'s outer
-    `try/finally`. That finally runs destructive teardown and may conditionally
-    remove the service row, turning a transient boot failure into permanent
-    data loss for the service.
-
-    Kill the controller subprocess we spawned, then os._exit(1) to
-    bypass everything. The daemon's next ha_recovery iteration sees
-    the (preserved) recovery script and retries with a fresh _start.
+    Kill the controller subprocess we spawned, then os._exit(1). The daemon's
+    next ha_recovery iteration sees the preserved recovery script and retries
+    with a fresh _start. Whole-service cleanup is independently gated on a
+    durable SHUTTING_DOWN owner row.
     """
     logger.error(f'{component} failed to become ready within '
                  f'{timeout_seconds}s for {service_name}: {boot_err}. '
@@ -1290,9 +1468,9 @@ def _bail_on_boot_failure(service_name: str,
             logger.warning(
                 'Failed to kill controller subprocess during boot-failure '
                 'bailout; proceeding with os._exit anyway.')
-    # os._exit() bypasses the outer try/finally. The short-lived port lock was
-    # already released after socket transfer; process exit closes the child's
-    # reserved socket if controller startup did not consume it.
+    # The short-lived port lock was already released after socket transfer;
+    # process exit closes the child's reserved socket if controller startup
+    # did not consume it.
     os._exit(1)  # pylint: disable=protected-access
 
 
@@ -1655,9 +1833,8 @@ def _respawn_controller(
     stale port. controller_pid/ip (the live parent) are unchanged.
 
     Returns (controller_process, controller_port) on success, or None on
-    failure (retry next tick). Never raises into _start's destructive cleanup.
-    The external LB continues serving its last routing view while the proxy
-    reports 503 during the controller gap.
+    failure (retry next tick). The external LB continues serving its last
+    routing view while the proxy reports 503 during the controller gap.
     """
     if maintenance.is_controller_hold_active():
         try:
@@ -3027,12 +3204,10 @@ def _start(service_name: str,
 
     controller_process = None
     external_lb_healthy = not external_lb
-    # Tracks whether we exited the main loop via the user-initiated
-    # SHUTTING_DOWN signal. We can't recover this from sys.exc_info() in
-    # the finally block — Python clears the active exception when the
-    # corresponding `except` clause catches it, so sys.exc_info() in
-    # the finally returns (None, None, None) for the caught path.
-    shutdown_via_user_signal = False
+    # An exception is only an in-process control-flow signal. Whole-service
+    # cleanup additionally requires the exact owner row to retain the durable
+    # SHUTTING_DOWN intent after the local controller child has stopped.
+    teardown_requested = False
     try:
         if not is_recovery:
             try:
@@ -3100,9 +3275,8 @@ def _start(service_name: str,
                     raise RuntimeError(
                         'controller exited during startup publication')
             except RuntimeError as boot_err:
-                # Bail without falling through to the outer try/finally, which
-                # would enter destructive cleanup and possibly remove the
-                # service incarnation. See helper for details.
+                # Exit promptly so HA can retry the preserved service. See the
+                # helper for the boot-failure recovery contract.
                 _bail_on_boot_failure(
                     service_name, controller_process,
                     constants.SERVICE_REGISTER_TIMEOUT_SECONDS, boot_err)
@@ -3193,10 +3367,9 @@ def _start(service_name: str,
         # swap on the preclaimed hash/PID/IP owner tuple so a stale recovery
         # racing a purge + same-name re-up cannot write to the successor's row
         # and prematurely unblock its registration. A
-        # transient DB error must not reach _start's destructive cleanup and
-        # must not starve the NULL case either, so the attempt is retried
-        # from the supervision loop until the CAS resolves (True: written;
-        # False: ownership lost, someone else owns the row now).
+        # transient DB error must not starve the NULL case, so the attempt is
+        # retried from the supervision loop until the CAS resolves (True:
+        # written; False: ownership lost, someone else owns the row now).
         lb_port_republish_pending = is_recovery and external_lb
         if lb_port_republish_pending:
             try:
@@ -3270,8 +3443,8 @@ def _start(service_name: str,
                                   pod_ip, resource_scope):
                 _orphan_exit(controller_process)
             loop_count += 1
-            # Self-heal the external LB objects. Best-effort: a k8s API error
-            # must never reach _start's destructive cleanup.
+            # Self-heal the external LB objects. Best-effort: a Kubernetes API
+            # error must not interrupt controller supervision.
             if (external_lb and
                     loop_count % external_lb_ensure_interval_seconds == 0):
                 if lb_port_republish_pending:
@@ -3396,50 +3569,39 @@ def _start(service_name: str,
                     needs_status_heal = True
             time.sleep(1)
     except exceptions.ServeUserTerminatedError:
-        logger.debug(f'Caught ServeUserTerminatedError for '
-                     f'{service_name}; setting status=SHUTTING_DOWN')
-        shutdown_via_user_signal = True
+        logger.debug(f'Caught ServeUserTerminatedError for {service_name}; '
+                     'checking durable SHUTTING_DOWN authority.')
+        teardown_requested = True
     finally:
-        # Log why we're entering the destructive cleanup path. Finalization
-        # can remove the HA recovery script and the entire service row, so an
-        # audit line (especially with the active exception type if any) is
-        # worth it for future post-mortems.
-        # The path (`_wait_for_controller_ready` timeout) and
-        # `_orphan_exit` both bypass this finally entirely via
-        # os._exit; anything else reaching here is either the user
-        # signal (flag above) or an unexpected propagating exception.
-        exc_type, exc_value, _ = sys.exc_info()
-        if shutdown_via_user_signal:
-            logger.info(f'_start for {service_name} entering cleanup path '
-                        '(user-initiated SHUTTING_DOWN).')
-        elif exc_type is None:
-            # _start's `while True` only exits via exception or
-            # os._exit, so a None exc_type here is unexpected. Log it
-            # at WARN so a future code path that adds a `return`
-            # doesn't silently slip into destructive cleanup unnoticed.
-            logger.warning(
-                f'_start for {service_name} entering cleanup path with '
-                'no exception and no user signal — this is unexpected; '
-                '_cleanup is destructive.')
-        else:
-            logger.warning(
-                f'_start for {service_name} entering cleanup path due to '
-                f'unexpected exception {exc_type.__name__}: {exc_value}. '
-                f'finalization may delete the HA recovery script and service '
-                f'row.')
+        # This is local process cleanup only. It deliberately runs for every
+        # exit and carries no authority to mutate service/provider state.
         if controller_process is not None:
-            subprocess_utils.kill_children_processes(
-                parent_pids=[controller_process.pid], force=True)
+            _kill_process(controller_process)
             controller_process.join()
 
-        # Run cleanup + finalize. _run_cleanup_and_finalize catches any error
-        # from _cleanup and sets FAILED_CLEANUP instead, so the service can
-        # still be terminated later (a crash here would otherwise leave no
-        # process to handle the user signal). Shared with the recovery-resume
-        # path above.
-        _run_cleanup_and_finalize(service_name, service_spec,
-                                  service_dir, job_id, service_incarnation,
-                                  os.getpid(), pod_ip, resource_scope)
+    if not teardown_requested:
+        return
+    teardown_owner = serve_state.get_service_controller_owner(
+        service_name, include_lb_state=True)
+    expected_owner = (os.getpid(), pod_ip)
+    owner_matches = (teardown_owner is not None and
+                     teardown_owner.get('hash') == service_incarnation and
+                     (teardown_owner.get('controller_pid'),
+                      teardown_owner.get('controller_ip')) == expected_owner and
+                     teardown_owner.get('status')
+                     == serve_state.ServiceStatus.SHUTTING_DOWN)
+    if not owner_matches:
+        raise RuntimeError(
+            f'Refusing destructive cleanup for {service_name!r} without '
+            'durable SHUTTING_DOWN authority for the exact controller owner.')
+
+    logger.info(f'_start for {service_name} entering cleanup path under '
+                'durable user-initiated SHUTTING_DOWN authority.')
+    # The recovery-resume path above enters the same finalizer only after
+    # claiming an already-durable teardown row.
+    _run_cleanup_and_finalize(service_name, service_spec,
+                              service_dir, job_id, service_incarnation,
+                              os.getpid(), pod_ip, resource_scope)
 
 
 if __name__ == '__main__':

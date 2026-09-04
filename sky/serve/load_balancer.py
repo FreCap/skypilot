@@ -103,12 +103,6 @@ _ASYNC_TERMINAL_OUTCOMES = {
     'CANCELLED': 'failed',
 }
 
-# A queued ASGI request does not receive a task cancellation when its client
-# disconnects. Poll the receive channel while waiting so an abandoned request
-# cannot later consume a replica slot. Request bodies are bounded and cached
-# before admission, so this poll cannot consume an unread body message.
-_REQUEST_QUEUE_DISCONNECT_POLL_SECONDS = 1.0
-
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """Decode one JSON object without silently accepting duplicate members."""
@@ -1386,10 +1380,9 @@ class SkyServeLoadBalancer:
         The exact-card matcher traverses every resident waiter. A fleet whose
         only free slots belong to cards no queued request accepts (a cold pool
         beside a warm one, or a ready replica without a synced identity) would
-        otherwise pay that traversal on every enqueue and on every waiter's
-        one-second disconnect poll. The census is maintained exactly at the
-        two registry mutation points; a registry replaced behind them is
-        recounted once instead of trusted.
+        otherwise pay that traversal on every enqueue and capacity signal.
+        The census is maintained exactly at the two registry mutation points;
+        a registry replaced behind them is recounted once instead of trusted.
         """
         waiters = self._request_queue_waiters_for_instance()
         profiles = self._request_queue_profile_census
@@ -1936,6 +1929,14 @@ class SkyServeLoadBalancer:
             detail=('Client disconnected while waiting in the load balancer '
                     'request queue.'))
 
+    @staticmethod
+    async def _wait_for_request_disconnect(request: fastapi.Request) -> None:
+        """Wait for the terminal ASGI disconnect after the body is cached."""
+        while True:
+            message = await request.receive()
+            if message.get('type') == 'http.disconnect':
+                return
+
     def _retain_background_task(self, task: asyncio.Task) -> None:
         """Own a background task until completion and report failures."""
         self._background_tasks.add(task)
@@ -1993,6 +1994,7 @@ class SkyServeLoadBalancer:
         deadline = time.monotonic() + self._request_queue_timeout(
             config, priority)
         waiter: _RequestQueueWaiter | None = None
+        disconnect_task: asyncio.Task[None] | None = None
         try:
             async with self._request_queue_condition:
                 if self._draining:
@@ -2036,57 +2038,59 @@ class SkyServeLoadBalancer:
                     sequence=sequence,
                     deadline_monotonic=deadline,
                     future=asyncio.get_running_loop().create_future())
+                disconnect_task = asyncio.create_task(
+                    self._wait_for_request_disconnect(request))
                 self._add_request_queue_waiter_locked(waiter)
                 self._dispatch_request_queue_locked()
 
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining > 0:
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.shield(waiter.future),
-                            min(remaining,
-                                _REQUEST_QUEUE_DISCONNECT_POLL_SECONDS))
-                    except asyncio.TimeoutError:
-                        pass
-                disconnected = await request.is_disconnected()
-                async with self._request_queue_condition:
-                    if waiter.terminal_error is not None:
-                        raise waiter.terminal_error
-                    if waiter.granted:
-                        if self._draining:
-                            self._reclaim_request_queue_grant_locked(waiter)
-                            self._dispatch_request_queue_locked()
-                            raise self._draining_request_error()
-                        if not self._accepts_new_requests():
-                            self._reclaim_request_queue_grant_locked(waiter)
-                            self._dispatch_request_queue_locked()
-                            raise self._inactive_role_request_error()
-                        if disconnected:
-                            self._reclaim_request_queue_grant_locked(waiter)
-                            self._dispatch_request_queue_locked()
-                            raise self._queue_disconnect_error()
-                        waiter.consumed = True
-                        return True
+            # The body is fully cached before admission, so the ASGI receive
+            # channel can now block until its terminal disconnect event. One
+            # event-driven wait replaces a timer, CancelScope, and scheduler
+            # lock acquisition per resident request per second. At the 10k
+            # queue limit those synchronized polls can starve liveness even
+            # though each individual dispatch check is O(1).
+            done, _ = await asyncio.wait(
+                (waiter.future, disconnect_task),
+                timeout=max(0.0, deadline - time.monotonic()),
+                return_when=asyncio.FIRST_COMPLETED)
+            disconnected = disconnect_task in done
+            if disconnected:
+                # Propagate an invalid ASGI receive failure rather than
+                # treating it as a real client disconnect.
+                disconnect_task.result()
+            async with self._request_queue_condition:
+                if waiter.terminal_error is not None:
+                    raise waiter.terminal_error
+                if waiter.granted:
+                    if self._draining:
+                        self._reclaim_request_queue_grant_locked(waiter)
+                        self._dispatch_request_queue_locked()
+                        raise self._draining_request_error()
+                    if not self._accepts_new_requests():
+                        self._reclaim_request_queue_grant_locked(waiter)
+                        self._dispatch_request_queue_locked()
+                        raise self._inactive_role_request_error()
                     if disconnected:
-                        self._remove_request_queue_waiter_locked(waiter)
-                        self._resolve_request_queue_waiter_locked(waiter)
+                        self._reclaim_request_queue_grant_locked(waiter)
                         self._dispatch_request_queue_locked()
                         raise self._queue_disconnect_error()
-                    if time.monotonic() >= deadline:
-                        self._remove_request_queue_waiter_locked(waiter)
-                        self._resolve_request_queue_waiter_locked(waiter)
-                        self._record_request_demand_once(request)
-                        self._mark_request_classification_eligible(request)
-                        self._record_rejection(request)
-                        self._dispatch_request_queue_locked()
-                        raise self._queue_timeout_error()
-                    # A missed capacity signal is repaired by the bounded
-                    # disconnect poll without broadcasting to other waiters.
+                    waiter.consumed = True
+                    return True
+                if disconnected:
+                    self._remove_request_queue_waiter_locked(waiter)
+                    self._resolve_request_queue_waiter_locked(waiter)
                     self._dispatch_request_queue_locked()
-                    if waiter.granted:
-                        waiter.consumed = True
-                        return True
+                    raise self._queue_disconnect_error()
+                if time.monotonic() >= deadline:
+                    self._remove_request_queue_waiter_locked(waiter)
+                    self._resolve_request_queue_waiter_locked(waiter)
+                    self._record_request_demand_once(request)
+                    self._mark_request_classification_eligible(request)
+                    self._record_rejection(request)
+                    self._dispatch_request_queue_locked()
+                    raise self._queue_timeout_error()
+                raise RuntimeError('Request queue waiter woke without an '
+                                   'admission outcome.')
         except asyncio.CancelledError:
             if waiter is not None:
                 # Synchronous fencing makes a grant ineligible before cleanup
@@ -2094,14 +2098,23 @@ class SkyServeLoadBalancer:
                 waiter.abandoned = True
             raise
         finally:
-            if waiter is not None and not waiter.consumed:
-                cleanup = asyncio.create_task(
-                    self._cleanup_request_queue_waiter(waiter))
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    self._retain_background_task(cleanup)
-                    raise
+            try:
+                if waiter is not None and not waiter.consumed:
+                    cleanup = asyncio.create_task(
+                        self._cleanup_request_queue_waiter(waiter))
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        self._retain_background_task(cleanup)
+                        raise
+            finally:
+                if disconnect_task is not None:
+                    # Slot ownership may already be transferring to the
+                    # caller. Do not put a cancellable await after marking the
+                    # grant consumed: cancellation in that gap would prevent
+                    # the caller from owning the slot and leak its count.
+                    self._retain_background_task(disconnect_task)
+                    disconnect_task.cancel()
 
     async def _release_request_slot(self,
                                     request: fastapi.Request | None = None

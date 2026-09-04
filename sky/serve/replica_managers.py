@@ -146,6 +146,14 @@ _DEFAULT_LAUNCH_MAX_RETRY = 3
 _DEFAULT_DRAIN_SECONDS = 120
 # Poll cadence for the in-flight-aware drain wait during replica retirement.
 _DRAIN_POLL_SECONDS = 2
+# Paid planning and authenticated request routing share the same exact-card
+# catalog.  One atomic wave may need a different pool for every member, so the
+# largest useful identity-free preflight is one wave per advertised card.
+_MAX_PAID_LAUNCH_TEMPLATE_CARDS = (
+    serve_constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS)
+_MAX_PAID_LAUNCH_TEMPLATES = (
+    _MAX_PAID_LAUNCH_TEMPLATE_CARDS *
+    paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -435,7 +443,6 @@ _POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS = 90
 _POST_TEARDOWN_ABSENCE_POLL_SECONDS = 1
 _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS = 30
 _NON_POOL_RECONCILIATION_RETRY_MAX_SECONDS = 15 * 60
-_MAX_CONCURRENT_NON_POOL_RECONCILIATIONS_PER_SERVICE = 16
 # A service can queue an arbitrarily large durable teardown wave. Keep the
 # queued intent, but bound live provider workers conservatively: core.down()
 # initializes enough per-call cloud and request state that a 64-worker wave
@@ -2689,49 +2696,19 @@ def terminate_bound_non_pool_provider_present_cluster(
     replica_drain_delay_seconds: int = 0,
     **terminate_kwargs: Any,
 ) -> None:
-    """Down one exact PRESENT allocation, then project fresh ABSENT proof."""
+    """Submit exact teardown; paid absence is observed in a separate phase."""
     if ordinary_launch_binding.is_paid_provider_reconciliation_profile(
             binding_context.profile.kind):
-        pool_identity = paid_capacity.pool_key_payload(
-            str(replica_info.paid_capacity_pool_key))
-        cloud = (pool_identity.get('cloud')
-                 if isinstance(pool_identity, dict) else None)
-        if cloud not in ('aws', 'gcp'):
+        if terminate_kwargs.get('cleanup_fence') is not None:
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                'Paid provider cleanup lost its immutable pool cloud.')
-        expected_cluster_record_uuid = terminate_kwargs.get(
-            'expected_cluster_record_uuid')
-        if expected_cluster_record_uuid is None:
-            if terminate_kwargs.get('cleanup_fence') is not None:
-                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                    'Paid cleanup acquired a reserved-fill fence.')
-            cleanup = (non_pool_launch_reconciliation.
-                       terminate_aws_paid_provider_allocation
-                       if cloud == 'aws' else non_pool_launch_reconciliation.
-                       terminate_gcp_paid_provider_allocation)
-            cleanup(binding_context,
-                    replica_info,
-                    authority,
-                    project_replica_result,
-                    continue_guard=terminate_kwargs.get('continue_guard'))
-            return
-        # A live exact SkyPilot cluster row retains the complete backend
-        # teardown context. Use it to remove the provider object and cluster
-        # metadata, then independently prove the frozen identity is absent.
-        terminate_cluster(cluster_name, replica_drain_delay_seconds,
-                          **terminate_kwargs)
-        cleanup = (non_pool_launch_reconciliation.
-                   terminate_aws_paid_provider_allocation
-                   if cloud == 'aws' else non_pool_launch_reconciliation.
-                   terminate_gcp_paid_provider_allocation)
-        observation = cleanup(
+                'Paid cleanup acquired a reserved-fill fence.')
+        submission = non_pool_launch_reconciliation.submit_paid_provider_teardown(
             binding_context,
             replica_info,
             authority,
-            project_replica_result,
             continue_guard=terminate_kwargs.get('continue_guard'))
-        assert (observation.evidence
-                is ordinary_launch_binding.ProviderEvidence.ABSENT)
+        logger.info('Paid provider teardown submission for replica %s is %s.',
+                    replica_info.replica_id, submission.disposition.value)
         return
     absence_receipt = terminate_cluster(cluster_name,
                                         replica_drain_delay_seconds,
@@ -2743,6 +2720,45 @@ def terminate_bound_non_pool_provider_present_cluster(
     non_pool_launch_reconciliation.reconcile_post_teardown_absence(
         binding_context, replica_info, authority, project_replica_result,
         absence_receipt)
+
+
+def cleanup_exact_paid_cluster_record_after_provider_absence(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+    cluster_name: str,
+) -> None:
+    """Clean exact local/cloud auxiliaries after native VM absence."""
+    exact_replica = serve_state.get_replica_info_with_resource_action_identity(
+        service_name, replica_id)
+    if exact_replica is None:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-absent cleanup lost its exact replica row.')
+    info, identity = exact_replica
+    if (info.replica_record_id != replica_record_id or
+            info.cluster_name != cluster_name):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-absent cleanup found a replaced replica row.')
+    if identity is None:
+        if global_user_state.cluster_with_name_exists(cluster_name):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider-absent cleanup found an unfenced cluster row.')
+        return
+    snapshot = global_user_state.get_cluster_record_identity_snapshot(
+        cluster_name, identity.sky_cluster_record_uuid)
+    if snapshot is None:
+        return
+    handle = snapshot.handle
+    if not isinstance(handle, cloud_vm_ray_backend.CloudVmRayResourceHandle):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-absent cleanup found a non-VM cluster handle.')
+    # This runs only in the bounded observation lane, after the exact native
+    # allocation is ABSENT.  It removes ports, networks, SSH/config state, and
+    # the exact UUID-fenced cluster row without consuming a mutation slot.
+    backends.CloudVmRayBackend().post_teardown_cleanup(
+        handle,
+        terminate=True,
+        expected_cluster_record_uuid=str(identity.sky_cluster_record_uuid))
 
 
 def terminate_cluster_with_kueue_absence_receipt(
@@ -2819,13 +2835,12 @@ def validate_service_update_preflight(
     uses_logical_replicas = service_spec.uses_logical_replicas is True
     default_planned_capacity = _uniform_whole_gpu_capacity(task.resources)
     if uses_logical_replicas:
-        exact_accelerator_shapes = exact_accelerator_shapes_from_resources(
+        logical_card_units = logical_accelerator_card_units_from_resources(
             task.resources)
-        if not exact_accelerator_shapes:
+        if not logical_card_units:
             raise ValueError(
-                'Logical replicas require exactly one physical whole-GPU '
-                'width for each configured accelerator. Conflicting widths '
-                'for the same accelerator are not supported.')
+                'Logical replicas require every configured accelerator to '
+                'have an exact whole-GPU catalog seed.')
     candidate_placer = None
     if service_spec.placement_contract.enabled:
         candidate_placer = _load_spot_placer(service_name, version,
@@ -3060,6 +3075,29 @@ def exact_accelerator_shapes_from_resources(
             return {}
         shapes[canonical] = width
     return shapes if saw_resource else {}
+
+
+def logical_accelerator_card_units_from_resources(
+        resources: typing.Iterable[resources_lib.Resources]) -> dict[str, int]:
+    """Return one logical GPU-slot unit for every exact configured card.
+
+    Physical widths remain catalog/provider facts under
+    ``dynamic_fallback_per_gpu``. Multiple whole-GPU widths for the same card
+    therefore collapse to one card identity instead of conflicting.
+    """
+    units: dict[str, int] = {}
+    canonical_by_name: dict[str, str] = {}
+    saw_resource = False
+    for resource in resources:
+        saw_resource = True
+        accelerators = resource.accelerators
+        if (_whole_gpu_capacity(accelerators) is None or accelerators is None):
+            return {}
+        card = str(next(iter(accelerators)))
+        folded = card.casefold()
+        canonical = canonical_by_name.setdefault(folded, card)
+        units[canonical] = 1
+    return units if saw_resource else {}
 
 
 def _validate_logical_capacity_sources(default_capacity: int | None,
@@ -3962,10 +4000,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._tick_version_spec_cache: dict[int,
                                             service_spec.SkyServiceSpec] = {}
         self._provider_identity_uncertain_ids: set[int] = set()
-        self._non_pool_reconciliation_threads: thread_utils.ThreadSafeDict[
-            int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
-        self._non_pool_reconciliation_attempts: dict[int, int] = {}
-        self._non_pool_reconciliation_retry_at: dict[int, float] = {}
+        self._non_pool_reconciliation_lane = (
+            non_pool_launch_reconciliation.OneShotProviderObservationLane())
+        self._non_pool_reconciliation_attempts: dict[tuple[int, str], int] = {}
+        self._non_pool_reconciliation_retry_at: dict[tuple[int, str],
+                                                     float] = {}
         self._paid_phase_a_recovery_lock = threading.Lock()
         self._paid_phase_a_recoveries: dict[_PaidPhaseARecoveryIdentity,
                                             _PaidPhaseARecovery] = {}
@@ -4244,38 +4283,29 @@ class SkyPilotReplicaManager(ReplicaManager):
         return (runtime.launch_completion_queue,
                 runtime.launch_completion_event)
 
-    def prepare_paid_launch_specs(
+    def prepare_paid_launch_templates(
         self,
         *,
         accelerator_shapes: Mapping[str, int],
-        max_gpu_units_by_accelerator: Mapping[str, int],
-        max_candidates: int,
-        occupied_replica_ids: Iterable[int],
         version_authority: paid_capacity.PaidLaunchVersionAuthority,
         paid_location_launch_budget: paid_capacity.LaunchBudget,
-    ) -> tuple[paid_capacity.PaidLaunchSpec, ...]:
-        """Freeze a bounded state-aware Spot cohort without authority I/O.
+    ) -> tuple[paid_capacity.PaidLaunchTemplate, ...]:
+        """Freeze the cheapest bounded identity-free Spot pool prefixes.
 
         The launch budget is an optimistic PostgreSQL observation built before
-        this manager lock.  It selects at most one concrete spec per requested
-        backend.  The fused repository remains the sole authority: it locks
-        and revalidates every selected exact pool before persisting any row.
+        this manager lock.  Its per-pool headroom only bounds how much catalog
+        authority is worth preparing: final capacity, replica IDs, UUIDs, and
+        executable request bytes are all derived later from the
+        repository-locked graph.  Each card keeps the minimum globally
+        cost-ordered pool prefix whose advisory backend headroom covers one
+        maximum atomic wave.
 
         The only mutable inputs consulted under ``self.lock`` are the elected
         manager configuration and its already-materialized placement catalog.
-        Candidate construction and request serialization are CPU-only: no
-        database, provider, HTTP, or launch-worker operation occurs here.
-        Prepared identities do not advance the process allocator; only the
-        committed receipt does.
+        Candidate construction is CPU-only: no database, provider, HTTP, or
+        launch-worker operation occurs here.
         """
-        if (type(max_candidates) is not int or max_candidates < 0 or  # pylint: disable=unidiomatic-typecheck
-                max_candidates
-                > paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS):
-            raise ValueError(
-                'max_candidates is outside the provider-free preparation '
-                'wave bound.')
         shapes: dict[str, int] = {}
-        caps: dict[str, int] = {}
         for raw_card, raw_width in accelerator_shapes.items():
             if not isinstance(raw_card, str):
                 raise ValueError('accelerator_shapes requires string keys.')
@@ -4284,32 +4314,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                     raw_width < 1):
                 raise ValueError('accelerator_shapes is malformed.')
             shapes[card] = raw_width
-        for raw_card, raw_cap in max_gpu_units_by_accelerator.items():
-            if not isinstance(raw_card, str):
-                raise ValueError(
-                    'max_gpu_units_by_accelerator requires string keys.')
-            card = raw_card.casefold()
-            if (card not in shapes or card in caps or
-                    type(raw_cap) is not int or raw_cap < 0):  # pylint: disable=unidiomatic-typecheck
-                raise ValueError('max_gpu_units_by_accelerator is malformed.')
-            caps[card] = raw_cap
-        caps = {card: caps.get(card, 0) for card in shapes}
-        occupied = set(occupied_replica_ids)
-        if any(
-                type(replica_id) is not int or replica_id < 1  # pylint: disable=unidiomatic-typecheck
-                for replica_id in occupied):
-            raise ValueError('occupied_replica_ids is malformed.')
-        if max_candidates == 0 or not any(caps.values()):
+        if not shapes:
             return ()
+        if len(shapes) > _MAX_PAID_LAUNCH_TEMPLATE_CARDS:
+            raise ValueError(
+                'Paid launch templates exceed the eight-card routing catalog.')
         if not isinstance(version_authority,
                           paid_capacity.PaidLaunchVersionAuthority):
             raise ValueError('Paid launch version authority is malformed.')
         if (not isinstance(paid_location_launch_budget,
                            paid_capacity.LaunchBudget) or
-                not paid_location_launch_budget.globally_managed):
+                not paid_location_launch_budget.globally_managed or
+                not isinstance(
+                    paid_location_launch_budget.remaining_by_location, Mapping)
+                or not isinstance(
+                    paid_location_launch_budget.pool_key_by_location, Mapping)):
             raise ValueError('Paid launch budget is malformed.')
         launch_runtime = paid_launch_request.capture_replica_launch_runtime()
-
         with self.lock:
             if self._update_recovery_required or self._is_pool:
                 return ()
@@ -4326,28 +4347,20 @@ class SkyPilotReplicaManager(ReplicaManager):
             version = self.latest_version
             local_launch_spec = self._version_specs.get(version)
             if local_launch_spec is None:
-                # Preparation is deliberately database-free.  A controller
-                # without its elected immutable spec retries after recovery.
                 return ()
             try:
                 launch_spec = pickle.loads(version_authority.service_spec)
+                if type(launch_spec) is not type(local_launch_spec):
+                    return ()
+                launch_yaml_content = self.yaml_content
+                launch_task_template = load_task_with_service_spec(
+                    launch_yaml_content, launch_spec)
+                frozen_controller_config = (
+                    serve_utils.parse_and_validate_version_controller_config(
+                        version_authority.controller_config, self._workspace,
+                        'prepared paid launch controller config'))
             except Exception:  # pylint: disable=broad-except
                 return ()
-            if type(launch_spec) is not type(local_launch_spec):
-                return ()
-            launch_yaml_content = self.yaml_content
-            launch_task_template = load_task_with_service_spec(
-                launch_yaml_content, launch_spec)
-            replica_port = _get_resources_ports(launch_yaml_content,
-                                                launch_spec,
-                                                launch_task_template)
-            frozen_controller_config = (
-                serve_utils.parse_and_validate_version_controller_config(
-                    version_authority.controller_config, self._workspace,
-                    'prepared paid launch controller config'))
-            controller_config_path = (
-                serve_utils.generate_versioned_config_yaml_file_name(
-                    self._service_name, version, self._resource_scope))
             num_nodes = placer.num_nodes
             if (type(num_nodes) is not int or num_nodes < 1):  # pylint: disable=unidiomatic-typecheck
                 return ()
@@ -4357,8 +4370,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             catalog_entries = {
                 entry.location: entry for entry in placer.ranked_catalog_entries
             }
-            ranked_pools = []
+            templates_by_card: dict[str,
+                                    list[paid_capacity.PaidLaunchTemplate]] = {
+                                        card: [] for card in shapes
+                                    }
             seen_pool_keys = set()
+            covered_headroom = {card: 0 for card in shapes}
+            narrow_pool_found = {card: False for card in shapes}
+            logical_contract = placer.placement_contract.uses_logical_replicas
             for location in placer.ranked_active_locations():
                 cloud = str(location.cloud).casefold()
                 accelerators = location.accelerators
@@ -4370,8 +4389,36 @@ class SkyPilotReplicaManager(ReplicaManager):
                     continue
                 raw_card, raw_width = next(iter(accelerators.items()))
                 card = str(raw_card).casefold()
-                if (card not in shapes or type(raw_width) is not int or  # pylint: disable=unidiomatic-typecheck
-                        raw_width != shapes[card]):
+                if card not in shapes or type(raw_width) is not int:  # pylint: disable=unidiomatic-typecheck
+                    continue
+                try:
+                    paid_capacity.paid_launch_plan_units(
+                        contract=placer.placement_contract,
+                        configured_shape=paid_capacity.PhysicalBackendShape(
+                            accelerator=card,
+                            gpu_units_per_node=shapes[card],
+                            num_nodes=num_nodes),
+                        candidate_shape=paid_capacity.PhysicalBackendShape(
+                            accelerator=card,
+                            gpu_units_per_node=raw_width,
+                            num_nodes=num_nodes))
+                except paid_capacity.PaidGPUAttributionError:
+                    continue
+                covered = (
+                    covered_headroom[card]
+                    >= paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS)
+                if covered and (not logical_contract or
+                                narrow_pool_found[card]):
+                    continue
+                if covered and raw_width != 1:
+                    continue
+                advisory_headroom = (
+                    paid_location_launch_budget.remaining_by_location.get(
+                        location, 0))
+                if type(advisory_headroom) is not int:  # pylint: disable=unidiomatic-typecheck
+                    raise ValueError(
+                        'Paid launch advisory headroom is malformed.')
+                if advisory_headroom <= 0:
                     continue
                 catalog_entry = catalog_entries.get(location)
                 if (catalog_entry is None or
@@ -4381,8 +4428,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                         or catalog_entry.normalized_hourly_cost <= 0):
                     # An unpriced or stale catalog member cannot become paid
                     # provider authority.  Keep trying exact priced pools.
-                    continue
-                if caps[card] < raw_width * num_nodes:
                     continue
                 try:
                     exact_pool_key = (paid_location_launch_budget.
@@ -4394,102 +4439,24 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if exact_pool_key in seen_pool_keys:
                     continue
                 seen_pool_keys.add(exact_pool_key)
-                ranked_pools.append((location, cloud, card, raw_width,
-                                     catalog_entry.rank, exact_pool_key))
-            if not ranked_pools:
-                return ()
-            requested_backends = sum(caps[card] // (width * num_nodes)
-                                     for card, width in shapes.items())
-            if requested_backends > max_candidates:
-                logger.warning(
-                    'Suppressing paid launch preparation because %s requested '
-                    'backends exceed the bounded preparation limit %s.',
-                    requested_backends, max_candidates)
-                return ()
-
-            prepared: list[paid_capacity.PaidLaunchSpec] = []
-            remaining = dict(caps)
-            next_replica_id = self._next_replica_id
-            metadata_by_location = {
-                location: (cloud, card, width, catalog_rank, exact_pool_key)
-                for location, cloud, card, width, catalog_rank, exact_pool_key
-                in ranked_pools
-            }
-            occurrence_by_rank: dict[int, int] = {}
-            while len(prepared) < max_candidates:
-                allowed_locations = {
-                    location for location, (_, card, width, _,
-                                            _) in metadata_by_location.items()
-                    if remaining[card] >= width * num_nodes
-                }
-                if not allowed_locations:
-                    break
-                selected_location = paid_capacity.preview_location(
-                    placer,
-                    paid_location_launch_budget,
-                    skip_zero_cost_preference=True,
-                    allowed_locations=allowed_locations)
-                if selected_location is None:
-                    break
-                (cloud, card, width, catalog_rank,
-                 exact_pool_key) = metadata_by_location[selected_location]
-                physical_gpu_units = width * num_nodes
-                occurrence = occurrence_by_rank.get(catalog_rank, 0)
-                occurrence_by_rank[catalog_rank] = occurrence + 1
-                while next_replica_id in occupied:
-                    next_replica_id += 1
-                replica_id = next_replica_id
-                next_replica_id += 1
-                occupied.add(replica_id)
-                replica_record_id = str(uuid.uuid4())
-                cluster_name = serve_utils.generate_replica_cluster_name(
-                    self._service_name, replica_id, self._resource_scope)
-                log_file_name = (
-                    serve_utils.generate_replica_launch_log_file_name(
-                        self._service_name, replica_id, self._resource_scope))
-                runtime_override = selected_location.to_dict()
+                runtime_override = location.to_dict()
                 canonical_storage_override = dict(runtime_override)
                 canonical_storage_override['cloud'] = cloud
                 storage_override = _encode_replica_resource_state(
                     canonical_storage_override)
                 assert storage_override is not None
-                planned_capacity = width if self._uses_logical_replicas else 1
                 frozen_override = paid_capacity.freeze_paid_launch_payload(
                     storage_override)
-                launch_fence = ordinary_launch_binding.build_paid_launch_fence(
-                    service_name=self._service_name,
-                    service_hash=service_hash,
-                    service_version=version,
-                    replica_id=replica_id,
-                    replica_record_id=replica_record_id,
-                    service_lifecycle_epoch=(authority.service_lifecycle_epoch),
-                    binding_epoch=authority.binding_epoch,
-                    controller_incarnation=authority.controller_incarnation,
-                    controller_owner_epoch=authority.controller_owner_epoch,
-                    controller_pid=authority.controller_pid,
-                    controller_ip=authority.controller_ip)
-                prepared_request = (
-                    paid_launch_request.prepare_paid_launch_request(
+                body_template = (
+                    paid_launch_request.prepare_paid_launch_body_template(
                         yaml_content=launch_yaml_content,
                         authoritative_service_spec=launch_spec,
                         frozen_controller_config=frozen_controller_config,
                         resources_override=runtime_override,
-                        replica_id=replica_id,
-                        cluster_name=cluster_name,
                         workspace=self._workspace,
                         service_name=self._service_name,
-                        launch_fence=launch_fence,
                         runtime=launch_runtime,
                         task_template=launch_task_template))
-                worker_construction = paid_capacity.freeze_paid_launch_payload({
-                    'schema_version': 1,
-                    'launch_yaml_content': launch_yaml_content,
-                    'cluster_name': cluster_name,
-                    'log_file_name': log_file_name,
-                    'resources_override': storage_override,
-                    'retry_until_up': False,
-                    'frozen_controller_config_path': controller_config_path,
-                })
                 pool_payload = paid_capacity.pool_key_payload(exact_pool_key)
                 assert pool_payload is not None
                 provider_identity = pool_payload.get('provider_identity')
@@ -4499,50 +4466,60 @@ class SkyPilotReplicaManager(ReplicaManager):
                 provider_project_id = (provider_identity.get('gcp_project_id')
                                        if isinstance(provider_identity, dict)
                                        else None)
-                paid_spec = paid_capacity.PaidLaunchSpec(
-                    ordinal=len(prepared),
-                    service_name=self._service_name,
-                    service_hash=service_hash,
-                    service_lifecycle_epoch=authority.service_lifecycle_epoch,
-                    service_version=version,
-                    replica_id=replica_id,
-                    replica_record_id=replica_record_id,
-                    cluster_name_seed=cluster_name,
-                    worker_construction=worker_construction,
-                    prepared_launch_request=prepared_request.submitted_bytes,
-                    provider_account=provider_account,
-                    provider_project_id=provider_project_id,
-                    cloud=cloud,
-                    workspace=self._workspace,
-                    region=selected_location.region,
-                    zone=selected_location.zone,
-                    instance_type=selected_location.instance_type,
-                    pool_key=exact_pool_key,
-                    frontier_key=paid_capacity.frontier_key(selected_location),
-                    accelerator=card,
-                    gpu_units_per_node=width,
-                    num_nodes=num_nodes,
-                    resources_override=frozen_override,
-                    catalog_evidence=paid_capacity.PaidLaunchCatalogEvidence(
+                templates_by_card[card].append(
+                    paid_capacity.PaidLaunchTemplate(
+                        service_name=self._service_name,
+                        service_hash=service_hash,
+                        service_lifecycle_epoch=(
+                            authority.service_lifecycle_epoch),
+                        service_version=version,
+                        provider_account=provider_account,
+                        provider_project_id=provider_project_id,
+                        cloud=cloud,
+                        workspace=self._workspace,
+                        region=location.region,
+                        zone=location.zone,
+                        instance_type=location.instance_type,
+                        pool_key=exact_pool_key,
+                        frontier_key=paid_capacity.frontier_key(location),
+                        accelerator=card,
+                        gpu_units_per_node=raw_width,
+                        num_nodes=num_nodes,
+                        resources_override=frozen_override,
+                        prepared_launch_body_template=(
+                            body_template.submitted_bytes),
                         placement_catalog_sha256=placement_catalog_sha256,
-                        catalog_rank=catalog_rank,
-                        exploration_round=(occurrence //
-                                           paid_capacity.base_limit()),
-                        slot_within_pool_window=(occurrence %
-                                                 paid_capacity.base_limit()),
+                        catalog_rank=catalog_entry.rank,
                         version_authority=version_authority))
-                # Exercise the same complete row constructor used by
-                # PostgreSQL without giving this seed clock authority.
-                paid_capacity.build_pristine_paid_replica_state(
-                    paid_spec,
-                    replica_port=replica_port,
-                    planned_capacity=planned_capacity,
-                    created_at=None)
-                prepared.append(paid_spec)
-                remaining[card] -= physical_gpu_units
-                paid_capacity.debit(paid_location_launch_budget,
-                                    selected_location)
-            return tuple(prepared)
+                narrow_pool_found[card] |= raw_width == 1
+                covered_headroom[card] = min(
+                    paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS,
+                    covered_headroom[card] + advisory_headroom)
+                if all(headroom >=
+                       paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS and
+                       (not logical_contract or narrow_pool_found[covered_card])
+                       for covered_card, headroom in covered_headroom.items()):
+                    break
+            # One late narrow remainder pool may follow a full 100-pool prefix.
+            # Replace the least-preferred wide member so each card still owns
+            # at most one atomic wave of staged authority.
+            for card, card_templates in templates_by_card.items():
+                if len(card_templates) <= (
+                        paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS):
+                    continue
+                assert logical_contract and narrow_pool_found[card]
+                for index in range(len(card_templates) - 2, -1, -1):
+                    if card_templates[index].gpu_units_per_node != 1:
+                        del card_templates[index]
+                        break
+            templates = sorted(
+                (template for card_templates in templates_by_card.values()
+                 for template in card_templates),
+                key=lambda template: template.catalog_rank)
+            if len(templates) > _MAX_PAID_LAUNCH_TEMPLATES:
+                raise ValueError(
+                    'Paid launch template catalog exceeds its total bound.')
+            return tuple(templates)
 
     def _prepare_paid_launch_adopter_postcommit(
         self,
@@ -5541,50 +5518,37 @@ class SkyPilotReplicaManager(ReplicaManager):
         if (authority is None or
                 not authority.retained_non_pool_settlement_allowed):
             return
-        replica_id = info.replica_id
-        existing = self._non_pool_reconciliation_threads.get(replica_id)
-        if existing is not None:
-            if existing.is_alive():
-                return
-            self._non_pool_reconciliation_threads.pop(replica_id)
-            if existing.exception is None:
-                self._non_pool_reconciliation_attempts.pop(replica_id, None)
-                self._non_pool_reconciliation_retry_at[replica_id] = (
-                    time.monotonic() +
-                    _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS)
-                return
-            else:
-                attempt = self._non_pool_reconciliation_attempts.get(
-                    replica_id, 0) + 1
-                self._non_pool_reconciliation_attempts[replica_id] = attempt
-                delay = min(
-                    _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS *
-                    2**min(attempt - 1, 30),
-                    _NON_POOL_RECONCILIATION_RETRY_MAX_SECONDS)
-                self._non_pool_reconciliation_retry_at[
-                    replica_id] = time.monotonic() + delay
-                logger.warning(
-                    'Provider reconciliation for replica %s failed; retrying '
-                    'in %.1f seconds: %s', replica_id, delay,
-                    existing.format_exc or repr(existing.exception))
-                return
+        key = (info.replica_id, info.replica_record_id)
         if time.monotonic() < self._non_pool_reconciliation_retry_at.get(
-                replica_id, 0):
+                key, 0):
             return
-        active_workers = sum(
-            worker.is_alive()
-            for worker in self._non_pool_reconciliation_threads.values())
-        if active_workers >= (
-                _MAX_CONCURRENT_NON_POOL_RECONCILIATIONS_PER_SERVICE):
+        paid = ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            binding_context.profile.kind)
+        if (paid and self._provider_present_cleanup_marker_shape(info) and
+                ordinary_launch_binding.provider_present_teardown_phase(info)
+                is not ordinary_launch_binding.ProviderPresentTeardownPhase.
+                ABSENCE_OBSERVATION_PENDING):
             return
-        worker = thread_utils.SafeThread(
-            target=non_pool_launch_reconciliation.reconcile,
-            name=f'replica-{replica_id}-provider-reconciliation',
-            daemon=True,
-            args=(binding_context, info, authority,
-                  functools.partial(self._project_bound_ordinary_launch, None)))
-        self._non_pool_reconciliation_threads[replica_id] = worker
-        worker.start()
+
+        def _observe_once() -> Any:
+            before_absence_projection = None
+            if paid:
+                before_absence_projection = functools.partial(
+                    cleanup_exact_paid_cluster_record_after_provider_absence,
+                    self._service_name, info.replica_id, info.replica_record_id,
+                    info.cluster_name)
+            operation = (
+                non_pool_launch_reconciliation.advance_paid_teardown_observation
+                if paid and self._provider_present_cleanup_marker_shape(info)
+                else non_pool_launch_reconciliation.reconcile)
+            return operation(
+                binding_context,
+                info,
+                authority,
+                functools.partial(self._project_bound_ordinary_launch, None),
+                before_absence_projection=before_absence_projection)
+
+        self._non_pool_reconciliation_lane.schedule(key, _observe_once)
 
     def _finalize_projected_provider_absence_cleanup(self,
                                                      replica_id: int) -> bool:
@@ -5683,24 +5647,91 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'Unable to list bound non-pool provider reconciliations: %s',
                 common_utils.format_exception(error))
             return
-        active_ids = {
-            binding_context.replica_id for binding_context in contexts
-        }
         infos = {
             (info.replica_id, info.replica_record_id): info
             for info in replica_infos
         }
+        context_keys = {(binding_context.replica_id,
+                         str(binding_context.replica_record_id))
+                        for binding_context in contexts}
+        now = time.monotonic()
+        settled_keys: set[tuple[int, str]] = set()
+        for completion in self._non_pool_reconciliation_lane.take_completed():
+            key = completion.key
+            context_info = infos.get(key)
+            if key not in context_keys or context_info is None:
+                self._non_pool_reconciliation_attempts.pop(key, None)
+                self._non_pool_reconciliation_retry_at.pop(key, None)
+                continue
+            if completion.error is not None or completion.result is None:
+                attempt = self._non_pool_reconciliation_attempts.get(key, 0) + 1
+                self._non_pool_reconciliation_attempts[key] = attempt
+                delay = min(
+                    _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS *
+                    2**min(attempt - 1, 30),
+                    _NON_POOL_RECONCILIATION_RETRY_MAX_SECONDS)
+                self._non_pool_reconciliation_retry_at[key] = now + delay
+                logger.warning(
+                    'Provider reconciliation for replica %s failed; retrying '
+                    'in %.1f seconds: %s', key[0], delay,
+                    completion.formatted_error or repr(completion.error))
+                continue
+            self._non_pool_reconciliation_attempts.pop(key, None)
+            result = completion.result
+            if isinstance(
+                    result,
+                    non_pool_launch_reconciliation.PaidTeardownObservationStep):
+                if result.disposition is (
+                        non_pool_launch_reconciliation.
+                        PaidTeardownObservationDisposition.RESUBMIT_PRESENT):
+                    try:
+                        self._terminate_replica(key[0],
+                                                replica_drain_delay_seconds=0,
+                                                is_scale_down=True,
+                                                in_flight_drain_cap_seconds=0)
+                    except Exception as error:  # pylint: disable=broad-except
+                        logger.warning(
+                            'Could not schedule paid teardown resubmission '
+                            'for replica %s: %s', key[0],
+                            common_utils.format_exception(error))
+                    self._non_pool_reconciliation_retry_at[key] = (
+                        now + _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS)
+                    continue
+                if result.disposition is (
+                        non_pool_launch_reconciliation.
+                        PaidTeardownObservationDisposition.RETRY_UNKNOWN):
+                    self._non_pool_reconciliation_retry_at[key] = (
+                        now + _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS)
+                    continue
+                self._non_pool_reconciliation_retry_at.pop(key, None)
+                settled_keys.add(key)
+                self._notify_scale_reconciliation()
+                continue
+            self._non_pool_reconciliation_retry_at[key] = (
+                now + _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS)
         for binding_context in contexts:
             if (binding_context.replica_id in runtime.launch_thread_pool or
                     binding_context.replica_id in runtime.down_thread_pool):
                 # Finished launch workers already own the established
                 # scheduling path, including its retry and logging behavior.
                 continue
-            context_info = infos.get((binding_context.replica_id,
-                                      str(binding_context.replica_record_id)))
+            context_key = (binding_context.replica_id,
+                           str(binding_context.replica_record_id))
+            context_info = infos.get(context_key)
             if context_info is None:
                 continue
-            if (self._provider_present_cleanup_marker_shape(context_info) and
+            if context_key in settled_keys:
+                continue
+            marker_present = self._provider_present_cleanup_marker_shape(
+                context_info)
+            paid_observation_pending = bool(
+                marker_present and
+                ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+                    binding_context.profile.kind) and
+                ordinary_launch_binding.provider_present_teardown_phase(
+                    context_info) is ordinary_launch_binding.
+                ProviderPresentTeardownPhase.ABSENCE_OBSERVATION_PENDING)
+            if (marker_present and not paid_observation_pending and
                     global_user_state.cluster_with_name_exists(
                         context_info.cluster_name) and not request_postgres.
                     bound_non_pool_provider_absence_is_recorded(
@@ -5715,17 +5746,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._schedule_non_pool_provider_reconciliation(
                 context_info, binding_context)
 
-        # A successful projection clears the replica pointer, so the context
-        # disappears from the next query. Retire its completed process-local
-        # bookkeeping without disturbing a worker still finishing that
-        # transaction.
-        for replica_id, worker in list(
-                self._non_pool_reconciliation_threads.items()):
-            if replica_id in active_ids or worker.is_alive():
-                continue
-            self._non_pool_reconciliation_threads.pop(replica_id)
-            self._non_pool_reconciliation_attempts.pop(replica_id, None)
-            self._non_pool_reconciliation_retry_at.pop(replica_id, None)
+        # Completed work whose projection removed its pointer is discarded by
+        # the next pump above using the exact key, never a recycled numeric ID.
 
     def _redrive_bound_ordinary_launch_after_pre_effect(
             self, info: ReplicaInfo) -> bool:
@@ -6807,7 +6829,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._default_planned_capacity = _uniform_whole_gpu_capacity(
             task.resources)
         self._logical_exact_accelerator_shapes = (
-            exact_accelerator_shapes_from_resources(task.resources)
+            logical_accelerator_card_units_from_resources(task.resources)
             if self._uses_logical_replicas else {})
         self._spot_placer = _load_spot_placer(service_name, version, spec, task,
                                               self._workspace)
@@ -11740,6 +11762,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                         legacy_runtime.launch_completion_event.set()
                         return
 
+        if (provider_present_cleanup_context is not None and
+                ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+                    provider_present_cleanup_context.profile.kind) and
+                ordinary_launch_binding.provider_present_teardown_phase(info)
+                is ordinary_launch_binding.ProviderPresentTeardownPhase.
+                ABSENCE_OBSERVATION_PENDING):
+            self._schedule_non_pool_provider_reconciliation(
+                info, provider_present_cleanup_context)
+            return
+
         if replica_id in legacy_runtime.down_thread_pool:
             logger.warning(f'Terminate thread for replica {replica_id} '
                            'already exists. Skipping.')
@@ -11933,6 +11965,16 @@ class SkyPilotReplicaManager(ReplicaManager):
         now = time.monotonic()
         _, retry_at_by_replica = self._failed_cleanup_retry_state()
         for info in sorted(replica_infos, key=_provider_cleanup_phase_order):
+            if (info.reserved_fill is False and info.is_zero_cost is False and
+                    info.is_spot is True and
+                    self._provider_present_cleanup_marker_shape(info) and
+                    ordinary_launch_binding.provider_present_teardown_phase(
+                        info) is ordinary_launch_binding.
+                    ProviderPresentTeardownPhase.ABSENCE_OBSERVATION_PENDING):
+                # The bounded observer lane owns this durable phase.  A fresh
+                # controller must not rewrite it to SCHEDULED before reading
+                # exact provider state.
+                continue
             # A crash after the ABSENT transaction but before local down-result
             # handling loses every process-local worker. Consume that exact
             # durable history before process-local worker status.  The
@@ -11945,17 +11987,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 try:
                     if self._finalize_projected_provider_absence_cleanup(
                             info.replica_id):
-                        reconciliation_threads = getattr(
-                            self, '_non_pool_reconciliation_threads', None)
-                        if reconciliation_threads is not None:
-                            try:
-                                reconciliation_threads.pop(info.replica_id)
-                            except KeyError:
-                                pass
-                        getattr(self, '_non_pool_reconciliation_attempts',
-                                {}).pop(info.replica_id, None)
-                        getattr(self, '_non_pool_reconciliation_retry_at',
-                                {}).pop(info.replica_id, None)
+                        key = (info.replica_id, info.replica_record_id)
+                        self._non_pool_reconciliation_attempts.pop(key, None)
+                        self._non_pool_reconciliation_retry_at.pop(key, None)
                         continue
                 except Exception as error:  # pylint: disable=broad-except
                     logger.warning(
@@ -12466,7 +12500,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 planned = int(info.planned_capacity)
             except (TypeError, ValueError):
                 return None
-            if count != configured_count or planned != configured_count:
+            if (configured_count != 1 or count <= 0 or planned != count):
                 return None
         return card
 
@@ -15347,6 +15381,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                     legacy_runtime.down_thread_pool.pop(replica_id)
                 continue
             if not self._service_is_cleanup_authorized():
+                continue
+            paid_observation_pending = bool(
+                info.reserved_fill is False and info.is_zero_cost is False and
+                info.is_spot is True and
+                self._provider_present_cleanup_marker_shape(info) and
+                ordinary_launch_binding.provider_present_teardown_phase(info)
+                is ordinary_launch_binding.ProviderPresentTeardownPhase.
+                ABSENCE_OBSERVATION_PENDING)
+            if paid_observation_pending:
+                # The mutation worker has finished and released D.  Drop only
+                # its process-local handle; the shared observer lane below
+                # resumes from the durable pending phase.
+                if legacy_runtime.down_thread_pool.get(replica_id) is t:
+                    legacy_runtime.down_thread_pool.pop(replica_id)
                 continue
             if (info.status_property.sky_down_status ==
                     common_utils.ProcessStatus.SCHEDULED):
@@ -19276,7 +19324,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             _validate_logical_capacity_sources(new_default_planned_capacity,
                                                None, new_task.num_nodes)
         new_logical_exact_accelerator_shapes = (
-            exact_accelerator_shapes_from_resources(new_task.resources)
+            logical_accelerator_card_units_from_resources(new_task.resources)
             if new_uses_logical_replicas else {})
         # A service update may change the placement policy or any_of shape
         # set. Use the preflight placer when provided; otherwise load the

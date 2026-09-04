@@ -3793,10 +3793,14 @@ class SkyServeController:
             for accelerator, raw_count in (resources.accelerators or
                                            {}).items():
                 normalized = accelerator.casefold()
-                try:
-                    count = int(raw_count)
-                except (TypeError, ValueError):
+                if (isinstance(raw_count, bool) or
+                    (isinstance(raw_count, float) and
+                     (not math.isfinite(raw_count) or
+                      not raw_count.is_integer())) or
+                        not isinstance(raw_count, (int, float))):
                     count = 0
+                else:
+                    count = int(raw_count)
                 counts_by_accelerator.setdefault(normalized, set()).add(count)
                 if normalized in seen:
                     continue
@@ -3871,6 +3875,19 @@ class SkyServeController:
         # unavailable prices preserve the deterministic service fallback.
         if placer is not None:
             configured_by_name = {card.casefold(): card for card in configured}
+            if getattr(service_spec, 'uses_logical_replicas', False) is True:
+                planning_shapes = (
+                    replica_managers.
+                    logical_accelerator_card_units_from_resources(
+                        task.resources))
+            else:
+                planning_shapes = (
+                    replica_managers.exact_accelerator_shapes_from_resources(
+                        task.resources))
+            planning_shapes_by_name = {
+                card.casefold(): width
+                for card, width in planning_shapes.items()
+            }
             paid_costs: dict[str, float] = {}
             unpriced_cards: set[str] = set()
             try:
@@ -3886,6 +3903,20 @@ class SkyServeController:
                 if card is None:
                     continue
                 try:
+                    candidate_shape = (
+                        paid_capacity.physical_backend_shape_from_location(
+                            location, num_nodes=placer.num_nodes))
+                    paid_capacity.paid_launch_plan_units(
+                        contract=placer.placement_contract,
+                        configured_shape=paid_capacity.PhysicalBackendShape(
+                            accelerator=card.casefold(),
+                            gpu_units_per_node=planning_shapes_by_name[
+                                card.casefold()],
+                            num_nodes=placer.num_nodes),
+                        candidate_shape=candidate_shape)
+                except (KeyError, paid_capacity.PaidGPUAttributionError):
+                    continue
+                try:
                     hourly_cost = float(raw_cost)
                 except Exception:  # pylint: disable=broad-except
                     unpriced_cards.add(card)
@@ -3895,7 +3926,10 @@ class SkyServeController:
                     continue
                 if hourly_cost == 0:
                     continue
-                paid_costs[card] = min(hourly_cost,
+                normalized_cost = (
+                    placer.placement_contract.normalize_hourly_cost(
+                        hourly_cost, candidate_shape.gpu_units_per_node))
+                paid_costs[card] = min(normalized_cost,
                                        paid_costs.get(card, float('inf')))
             if (not unpriced_cards and
                     all(card in paid_costs for card in configured)):
@@ -3914,7 +3948,7 @@ class SkyServeController:
 
     def _configured_backend_shape(
             self, service_spec: Any) -> tuple[dict[str, int], int]:
-        """Return the exact per-node GPU catalog and task node count."""
+        """Return per-card planning quantums and task node count."""
         configured = self._configured_accelerators(service_spec)
         if not configured:
             return {}, 1
@@ -3927,8 +3961,14 @@ class SkyServeController:
         if (not isinstance(num_nodes, int) or isinstance(num_nodes, bool) or
                 num_nodes < 1):
             return {}, 1
-        exact_shapes = replica_managers.exact_accelerator_shapes_from_resources(
-            task.resources)
+        if getattr(service_spec, 'uses_logical_replicas', False) is True:
+            exact_shapes = (
+                replica_managers.logical_accelerator_card_units_from_resources(
+                    task.resources))
+        else:
+            exact_shapes = (
+                replica_managers.exact_accelerator_shapes_from_resources(
+                    task.resources))
         exact_shapes_by_name = {
             card.casefold(): width for card, width in exact_shapes.items()
         }
@@ -6337,14 +6377,13 @@ class SkyServeController:
             allocation_demonstrated_need=(supply.allocation_demonstrated_need),
             allocation_ceiling=supply.allocation_ceiling)
 
-    def _prepare_current_paid_launch_specs(
+    def _prepare_current_paid_launch_templates(
         self,
         decision_autoscaler: autoscalers.ConcurrencyAutoscaler,
         decision_version: int,
-        replica_infos: list[replica_managers.ReplicaInfo],
         max_live_paid_gpu_units: int | None,
-    ) -> tuple[paid_capacity.PaidLaunchSpec, ...]:
-        """Prepare one bounded provider-free Spot superset before all locks."""
+    ) -> tuple[paid_capacity.PaidLaunchTemplate, ...]:
+        """Prepare the bounded identity-free paid catalog before all locks."""
         logical_max = decision_autoscaler.max_replicas
         backend_num_nodes = decision_autoscaler.backend_num_nodes
         if (type(logical_max) is not int or logical_max <= 0 or
@@ -6378,51 +6417,33 @@ class SkyServeController:
                 common_utils.format_exception(error))
             return ()
         # A reserved-only configured card must not consume a speculative paid
-        # transaction member.  Successor reconciles can then use the whole
-        # bounded wave for cards that actually have a paid Spot backend.
+        # transaction member. Physical catalog width is a separate dimension
+        # for logical services, so validate it through the placement contract
+        # instead of comparing it with the one-slot planning unit.
+        paid_cards = set()
+        for card, configured_width in shapes.items():
+            configured_shape = paid_capacity.PhysicalBackendShape(
+                accelerator=card,
+                gpu_units_per_node=configured_width,
+                num_nodes=backend_num_nodes)
+            for candidate_card, candidate_width in paid_shapes:
+                try:
+                    paid_capacity.paid_launch_plan_units(
+                        contract=placer.placement_contract,
+                        configured_shape=configured_shape,
+                        candidate_shape=paid_capacity.PhysicalBackendShape(
+                            accelerator=candidate_card,
+                            gpu_units_per_node=candidate_width,
+                            num_nodes=backend_num_nodes))
+                except paid_capacity.PaidGPUAttributionError:
+                    continue
+                paid_cards.add(card)
+                break
         shapes = {
-            card: width
-            for card, width in shapes.items()
-            if (card, width) in paid_shapes
+            card: width for card, width in shapes.items() if card in paid_cards
         }
         if not shapes:
             return ()
-        atomic_wave_limit = (
-            paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS)
-        if len(shapes) > atomic_wave_limit:
-            logger.warning(
-                'Suppressing paid launch preparation because %s '
-                'accounting cards exceed the atomic admission wave bound.',
-                len(shapes))
-            return ()
-        desired_backends: dict[str, int] = {}
-        for card, width in shapes.items():
-            physical_units = width * backend_num_nodes
-            logical_limit = math.ceil(logical_max / width)
-            physical_limit = (logical_limit if max_live_paid_gpu_units is None
-                              else max_live_paid_gpu_units // physical_units)
-            desired_backends[card] = min(logical_limit, physical_limit)
-        backend_limits = {
-            card: 1 for card, desired in desired_backends.items() if desired > 0
-        }
-        remaining_specs = atomic_wave_limit - len(backend_limits)
-        while remaining_specs > 0:
-            made_progress = False
-            for card in shapes:
-                if (desired_backends[card] <= 0 or
-                        backend_limits.get(card, 0) >= desired_backends[card]):
-                    continue
-                backend_limits[card] = backend_limits.get(card, 0) + 1
-                remaining_specs -= 1
-                made_progress = True
-                if remaining_specs == 0:
-                    break
-            if not made_progress:
-                break
-        card_ceilings = {
-            card: backend_limits.get(card, 0) * width * backend_num_nodes
-            for card, width in shapes.items()
-        }
         try:
             version_authority = serve_state.get_paid_launch_version_authority(
                 self._service_name, decision_version)
@@ -6456,21 +6477,22 @@ class SkyServeController:
                     placer.ranked_active_locations(),
                     workspace=self._replica_manager.workspace,
                     frozen_controller_config=frozen_controller_config))
-            # This optimistic read is deliberately before ReplicaManager and
-            # PostgreSQL correctness locks.  The fused admission transaction
-            # revalidates every selected pool and any stale underfill schedules
-            # a fresh reconcile.
+            # This optimistic read resolves only immutable provider/pool
+            # identities.  It cannot size the wave: the fused transaction
+            # expands the catalog against its locked target and pool graph.
             paid_launch_budget = paid_capacity.build_launch_budget(
                 placer,
                 workspace=self._replica_manager.workspace,
-                existing_replica_infos=replica_infos,
+                existing_replica_infos=[],
                 globally_managed=True,
                 service_name=self._service_name,
                 service_hash=self._service_hash,
-                requested_frontier_keys={(card,) for card in backend_limits},
+                requested_frontier_keys={(card,) for card in shapes},
                 max_live_paid_gpu_units=max_live_paid_gpu_units,
                 gcp_project_id_by_location=gcp_project_ids,
-                prospective_backend_claims_by_accelerator=backend_limits)
+                prospective_backend_claims_by_accelerator={
+                    card: 1 for card in shapes
+                })
         except Exception as error:  # pylint: disable=broad-except
             logger.warning(
                 'Suppressing paid candidates because the advisory launch '
@@ -6478,18 +6500,15 @@ class SkyServeController:
                 common_utils.format_exception(error))
             return ()
         try:
-            prepared = self._replica_manager.prepare_paid_launch_specs(
+            prepared = self._replica_manager.prepare_paid_launch_templates(
                 accelerator_shapes=shapes,
-                max_gpu_units_by_accelerator=card_ceilings,
-                max_candidates=sum(backend_limits.values()),
-                occupied_replica_ids=(
-                    info.replica_id for info in replica_infos),
                 version_authority=version_authority,
                 paid_location_launch_budget=paid_launch_budget)
-            if (not isinstance(prepared, tuple) or
-                    any(not isinstance(spec, paid_capacity.PaidLaunchSpec)
-                        for spec in prepared)):
-                raise ValueError('Replica manager returned malformed specs.')
+            if (not isinstance(prepared, tuple) or any(
+                    not isinstance(template, paid_capacity.PaidLaunchTemplate)
+                    for template in prepared)):
+                raise ValueError(
+                    'Replica manager returned malformed templates.')
             return prepared
         except (TypeError, ValueError) as error:
             logger.warning(
@@ -6498,13 +6517,12 @@ class SkyServeController:
                 common_utils.format_exception(error))
             return ()
 
-    def _prepare_current_paid_launch_handoff_specs(
+    def _prepare_current_paid_launch_handoff_templates(
         self,
         decision_autoscaler: autoscalers.ConcurrencyAutoscaler,
         decision_version: int,
-        replica_infos: list[replica_managers.ReplicaInfo],
-    ) -> tuple[paid_capacity.PaidLaunchSpec, ...] | None:
-        """Prepare the exact speculative set fenced around paid admission."""
+    ) -> tuple[paid_capacity.PaidLaunchTemplate, ...] | None:
+        """Prepare the identity-free catalog fenced around paid admission."""
         try:
             max_live_paid_gpu_units = (
                 self._replica_manager.max_live_paid_gpu_units)
@@ -6520,10 +6538,8 @@ class SkyServeController:
             logger.warning('Suppressing promoted capacity planning because '
                            'the active service paid cap is malformed.')
             return None
-        return self._prepare_current_paid_launch_specs(decision_autoscaler,
-                                                       decision_version,
-                                                       replica_infos,
-                                                       max_live_paid_gpu_units)
+        return self._prepare_current_paid_launch_templates(
+            decision_autoscaler, decision_version, max_live_paid_gpu_units)
 
     @staticmethod
     def _install_committed_capacity_plan_projection(
@@ -6540,6 +6556,13 @@ class SkyServeController:
         receipt: paid_capacity.PaidLaunchReceipt,
     ) -> bool:
         """Whether optimistic pool selection left locked paid work unfilled."""
+        # Only a committed partial wave warrants an immediate successor.  An
+        # empty receipt means there was no launch progress (for example, no
+        # eligible template or a saturated provider window); spinning a new
+        # generation cannot change that external condition and can starve the
+        # normal manager publication behind an unbounded reconcile loop.
+        if not receipt.members:
+            return False
         accepted: dict[str, int] = {}
         for member in receipt.members:
             card = member.accelerator.casefold()
@@ -6580,7 +6603,8 @@ class SkyServeController:
         prepared_decision_inputs: autoscalers.ScalingDecisionInputs,
         *,
         sequenced_reserved_fill: bool,
-        prepared_paid_launch_specs: tuple[paid_capacity.PaidLaunchSpec, ...],
+        prepared_paid_launch_templates: tuple[paid_capacity.PaidLaunchTemplate,
+                                              ...],
     ) -> tuple[capacity_admission.CommittedCapacityPlan, _LinearizedScalePlan,
                tuple[paid_capacity.PaidLaunchSpec, ...]] | None:
         """Plan and atomically admit one already-fenced paid wave in PostgreSQL.
@@ -6615,23 +6639,12 @@ class SkyServeController:
         accounting_cards = {
             card.casefold(): width for card, width in configured_shapes.entries
         }
-        if (not isinstance(prepared_paid_launch_specs, tuple) or
-                any(not isinstance(spec, paid_capacity.PaidLaunchSpec)
-                    for spec in prepared_paid_launch_specs)):
+        if (not isinstance(prepared_paid_launch_templates, tuple) or
+                any(not isinstance(template, paid_capacity.PaidLaunchTemplate)
+                    for template in prepared_paid_launch_templates)):
             logger.warning('Suppressing promoted capacity planning because '
-                           'its prepared paid launch set is malformed.')
+                           'its prepared paid catalog is malformed.')
             return None
-        try:
-            prepared_input_fingerprint = (
-                autoscalers.replica_planning_binding_fingerprint(
-                    prepared_decision_inputs))
-        except (TypeError, ValueError) as error:
-            logger.warning(
-                'Suppressing promoted capacity planning because '
-                'its prepared replica binding is malformed: %s',
-                common_utils.format_exception(error))
-            return None
-
         planned: _LinearizedScalePlan | None = None
         durable_plan: autoscalers.DurableCapacityReconcilePlan | None = None
 
@@ -6670,18 +6683,28 @@ class SkyServeController:
             locked_replica_infos = list(supply.economic_replica_infos)
             try:
                 locked_decision_inputs = (
-                    autoscalers.bind_locked_kueue_capacity_snapshot(
+                    autoscalers.bind_locked_capacity_planning_inputs(
                         prepared_decision_inputs, locked_replica_infos,
                         supply.economic_kueue_capacity))
+                locked_planner_input_fingerprint = (
+                    autoscalers.replica_planning_binding_fingerprint(
+                        locked_decision_inputs))
+                if (locked_planner_input_fingerprint
+                        != supply.planner_replica_projection_sha256):
+                    raise capacity_admission.CapacityAdmissionConflict(
+                        'Repository and autoscaler replica projections '
+                        'disagree.')
                 locked_source_fingerprint = (
                     capacity_admission.locked_planning_source_fingerprint(
-                        autoscalers.replica_planning_binding_fingerprint(
-                            locked_decision_inputs),
+                        supply.planner_replica_projection_sha256,
                         supply.economic_capacity_graph_sha256))
             except autoscalers.PreparedReplicaSnapshotChanged as error:
-                raise capacity_admission.CapacityAdmissionRetryableConflict(
-                    'Prepared replica planning inputs changed before their '
-                    'rows were locked.') from error
+                # Both projections above were derived from the same locked
+                # tuple.  A mismatch is an internal decoding/binding defect,
+                # not pre-lock churn that a retry could repair.
+                raise capacity_admission.CapacityAdmissionConflict(
+                    'Repository-locked replica projections disagree.') from (
+                        error)
             except (TypeError, ValueError) as error:
                 raise capacity_admission.CapacityAdmissionConflict(
                     'Locked scheduler capacity could not bind the local '
@@ -6979,9 +7002,8 @@ class SkyServeController:
                     backend_num_nodes=backend_num_nodes,
                     sequenced_reserved_fill=sequenced_reserved_fill,
                     planner=_planner,
-                    prepared_paid_launch_specs=(prepared_paid_launch_specs),
-                    expected_planner_input_fingerprint=(
-                        prepared_input_fingerprint)))
+                    prepared_paid_launch_templates=(
+                        prepared_paid_launch_templates)))
             except (capacity_admission.CapacityAdmissionError,
                     ValueError) as error:
                 if isinstance(
@@ -7033,7 +7055,7 @@ class SkyServeController:
             # PostgreSQL transaction committed the exact demand generation.
             self._reconcile_generation = planned.demand_generation
             self._durable_demand_snapshot = snapshot
-        return committed, planned, prepared_paid_launch_specs
+        return committed, planned, committed.paid_launch_specs
 
     def _plan_admit_and_materialize_current_capacity(
         self,
@@ -7042,7 +7064,6 @@ class SkyServeController:
         actuation_generation: int,
         notification_generation: int,
         prepared_decision_inputs: autoscalers.ScalingDecisionInputs,
-        replica_infos: list[replica_managers.ReplicaInfo],
         *,
         sequenced_reserved_fill: bool,
     ) -> tuple[capacity_admission.CommittedCapacityPlan, _LinearizedScalePlan,
@@ -7053,9 +7074,9 @@ class SkyServeController:
             logger.warning('Suppressing promoted capacity planning because the '
                            'autoscaler has no pure durable logical planner.')
             return None
-        prepared_specs = self._prepare_current_paid_launch_handoff_specs(
-            decision_autoscaler, decision_version, replica_infos)
-        if prepared_specs is None:
+        prepared_templates = self._prepare_current_paid_launch_handoff_templates(
+            decision_autoscaler, decision_version)
+        if prepared_templates is None:
             return None
         current_plan = self._plan_and_admit_current_capacity(
             decision_autoscaler,
@@ -7064,10 +7085,10 @@ class SkyServeController:
             notification_generation,
             prepared_decision_inputs,
             sequenced_reserved_fill=sequenced_reserved_fill,
-            prepared_paid_launch_specs=prepared_specs)
+            prepared_paid_launch_templates=prepared_templates)
         if current_plan is None:
             return None
-        committed, planned, _ = current_plan
+        committed, planned, prepared_specs = current_plan
         if self._paid_launch_receipt_can_materialize(committed, planned):
             self._replica_manager.materialize_paid_launch_receipt(
                 committed.paid_launch_receipt, committed.paid_launch_bindings,
@@ -7135,9 +7156,15 @@ class SkyServeController:
                     'No service record found for '
                     f'{self._service_name}')
                 active_versions = runtime_snapshot['active_versions']
-                decision_inputs = (
-                    autoscalers.prepare_controller_scaling_decision_inputs(
-                        decision_autoscaler, replica_infos))
+                if durable_demand_promoted:
+                    decision_inputs = (
+                        autoscalers.
+                        prepare_controller_capacity_planning_preflight(
+                            decision_autoscaler))
+                else:
+                    decision_inputs = (
+                        autoscalers.prepare_controller_scaling_decision_inputs(
+                            decision_autoscaler, replica_infos))
                 planning_state_fingerprint = planning_fingerprint_before
                 if prepares_inputs and not durable_demand_promoted:
                     planning_state_fingerprint = (
@@ -7170,7 +7197,6 @@ class SkyServeController:
                             actuation_generation,
                             notification_generation,
                             decision_inputs,
-                            replica_infos,
                             sequenced_reserved_fill=sequenced_reserved_fill))
                     if current_plan is None:
                         self._refresh_replica_counts_snapshot()
@@ -7222,14 +7248,11 @@ class SkyServeController:
                         return
                     paid_launch_receipt = (
                         committed_capacity.paid_launch_receipt)
-                    if (paid_launch_receipt.members and
-                            self._paid_launch_receipt_underfills_plan(
-                                committed_capacity_plan, paid_launch_receipt)):
-                        # The optimistic pool-state read raced a locked claim,
-                        # cooldown, or frontier update.  Committed members are
-                        # already safe to launch; immediately rebuild the
-                        # residual from fresh durable state instead of waiting
-                        # for provider feedback that may never arrive.
+                    if self._paid_launch_receipt_underfills_plan(
+                            committed_capacity_plan, paid_launch_receipt):
+                        # A bounded atomic wave or locked pool window may leave
+                        # residual work.  Committed members are already safe;
+                        # immediately derive the successor from durable state.
                         self._notify_scale_reconcile()
                     retirement_changed = False
                     if (fresh_aggregate_zero and

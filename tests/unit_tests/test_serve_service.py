@@ -806,8 +806,7 @@ class TestBailOnBootFailure:
     def test_swallows_kill_failure(self):
         """If kill_children_processes raises (e.g. pid already gone
         between when we read it and when we try to kill it), we still
-        must os._exit. Otherwise the exception bubbles up to the outer
-        try/finally — exactly the cleanup path we are trying to avoid."""
+        must os._exit so HA can promptly retry the preserved service."""
         with mock.patch('os._exit') as mock_exit, \
              mock.patch('sky.serve.service.subprocess_utils.'
                         'kill_children_processes',
@@ -1287,6 +1286,204 @@ def _mock_external_lb_recovery():
              'set_service_load_balancer_port_if_owner',
              return_value=True):
         yield
+
+
+@contextlib.contextmanager
+def _mock_recovered_service_supervision(owner_statuses, signal_error):
+    """Reach one recovered service supervision tick with exact owner states."""
+    persisted = _make_persisted_per_gpu_spec(uses_logical_replicas=True)
+    record = {
+        'hash': 'incarnation-a',
+        'controller_job_id': 1,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.2',
+        'lifecycle_epoch': 8,
+        'workspace': 'default',
+        'resource_scope': 'incarnation-a',
+        'pool': False,
+        'status': serve_state.ServiceStatus.READY,
+        'yaml_content': _CURRENT_PER_GPU_YAML,
+    }
+    process = mock.MagicMock(pid=456)
+    process.is_alive.return_value = True
+    controller_context = mock.MagicMock()
+    controller_context.__enter__.return_value = (process, 20001)
+    statuses = iter(owner_statuses)
+    last_status = owner_statuses[-1]
+
+    def _owner(*_args, **_kwargs):
+        nonlocal last_status
+        last_status = next(statuses, last_status)
+        return {
+            'hash': 'incarnation-a',
+            'controller_pid': service.os.getpid(),
+            'controller_ip': None,
+            'status': last_status,
+        }
+
+    with mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
+         mock.patch.object(service.serve_state,
+                           'get_service_from_name',
+                           return_value=record), \
+         mock.patch.object(service.serve_state,
+                           'get_recovery_version_spec',
+                           return_value=(3, persisted)), \
+         mock.patch.object(service.serve_state,
+                           'get_yaml_content',
+                           return_value=_CURRENT_PER_GPU_YAML), \
+         mock.patch.object(service.serve_state,
+                           'get_placement_catalog',
+                           return_value={'schema_version': 1, 'entries': []}), \
+         mock.patch.object(service.ordinary_launch_binding,
+                           'claim_controller_incarnation',
+                           return_value=None), \
+         _mock_external_lb_recovery(), \
+         mock.patch.object(service.serve_utils,
+                           'generate_remote_service_dir_name',
+                           return_value='/tmp/service'), \
+         mock.patch.object(service.serve_state,
+                           'get_latest_version',
+                           return_value=3), \
+         mock.patch.object(service.serve_state,
+                           'update_service_controller_pid_if_owner',
+                           return_value=True), \
+         mock.patch.object(service,
+                           '_spawn_controller_on_reserved_port',
+                           return_value=controller_context), \
+         mock.patch.object(service, '_wait_for_controller_ready'), \
+         mock.patch.object(
+             service.serve_state,
+             'update_service_controller_pid_ip_and_port',
+             return_value=True), \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_owner',
+                           side_effect=_owner), \
+         mock.patch.object(service,
+                           '_handle_signal',
+                           side_effect=signal_error), \
+         mock.patch.object(service.subprocess_utils,
+                           'kill_children_processes') as kill_children, \
+         mock.patch.object(service,
+                           '_run_cleanup_and_finalize') as cleanup:
+        yield process, kill_children, cleanup
+
+
+def test_unexpected_supervisor_failure_preserves_durable_service():
+    """Stack unwinding may kill the local child, never the whole service."""
+    with _mock_recovered_service_supervision(
+        [serve_state.ServiceStatus.READY], RuntimeError('supervisor failed')) as (
+            process, kill_children, cleanup), \
+         pytest.raises(RuntimeError, match='supervisor failed'):
+        service._start('svc',
+                       '/does/not/matter',
+                       1,
+                       'sky serve up',
+                       requested_incarnation='incarnation-a')
+
+    kill_children.assert_called_once_with(parent_pids=[456], force=True)
+    process.join.assert_called_once_with()
+    cleanup.assert_not_called()
+
+
+def test_terminate_exception_without_durable_intent_preserves_service():
+    """An exception class is not durable whole-service teardown authority."""
+    with _mock_recovered_service_supervision(
+        [serve_state.ServiceStatus.READY],
+        service.exceptions.ServeUserTerminatedError('uncommitted signal')) as (
+            process, kill_children, cleanup), \
+         pytest.raises(RuntimeError, match='durable SHUTTING_DOWN'):
+        service._start('svc',
+                       '/does/not/matter',
+                       1,
+                       'sky serve up',
+                       requested_incarnation='incarnation-a')
+
+    kill_children.assert_called_once_with(parent_pids=[456], force=True)
+    process.join.assert_called_once_with()
+    cleanup.assert_not_called()
+
+
+def test_durable_terminate_signal_runs_whole_service_cleanup():
+    """A committed terminate signal remains an authoritative teardown."""
+    with _mock_recovered_service_supervision([
+            serve_state.ServiceStatus.READY, serve_state.ServiceStatus.READY,
+            serve_state.ServiceStatus.SHUTTING_DOWN
+    ], service.exceptions.ServeUserTerminatedError('committed signal')) as (
+            process, kill_children, cleanup):
+        service._start('svc',
+                       '/does/not/matter',
+                       1,
+                       'sky serve up',
+                       requested_incarnation='incarnation-a')
+
+    kill_children.assert_called_once_with(parent_pids=[456], force=True)
+    process.join.assert_called_once_with()
+    cleanup.assert_called_once()
+
+
+def test_recovery_of_shutting_down_service_resumes_cleanup():
+    """HA recovery preserves a teardown intent committed by the prior owner."""
+    persisted = _make_persisted_per_gpu_spec(uses_logical_replicas=True)
+    record = {
+        'hash': 'incarnation-a',
+        'controller_job_id': 1,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.2',
+        'lifecycle_epoch': 8,
+        'workspace': 'default',
+        'resource_scope': 'incarnation-a',
+        'pool': False,
+        'status': serve_state.ServiceStatus.SHUTTING_DOWN,
+        'yaml_content': _CURRENT_PER_GPU_YAML,
+    }
+    teardown_result = types.SimpleNamespace(disposition=(
+        service.ordinary_launch_binding.ServiceTeardownDisposition.UNSUPPORTED),
+                                            authority=None)
+    with mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
+         mock.patch.object(service.serve_state,
+                           'get_service_from_name',
+                           return_value=record), \
+         mock.patch.object(service.serve_utils,
+                           'resolve_service_workspace',
+                           return_value='default'), \
+         mock.patch.object(service.serve_state,
+                           'get_recovery_version_spec',
+                           return_value=(3, persisted)), \
+         mock.patch.object(service.serve_state,
+                           'get_yaml_content',
+                           return_value=_CURRENT_PER_GPU_YAML), \
+         mock.patch.object(service.serve_state,
+                           'get_version_controller_config',
+                           return_value=None), \
+         mock.patch.object(service.runtime_profile,
+                           'guarded_ha_ephemeral_artifacts_enabled',
+                           return_value=False), \
+         mock.patch.object(service.serve_utils,
+                           'generate_remote_service_dir_name',
+                           return_value='/tmp/service'), \
+         mock.patch.object(
+             service.ordinary_launch_binding,
+             'begin_service_teardown_if_owner',
+             return_value=teardown_result) as begin_teardown, \
+         mock.patch.object(service,
+                           '_claim_teardown_recovery_controller') as claim, \
+         mock.patch.object(service,
+                           '_run_cleanup_and_finalize') as cleanup, \
+         mock.patch.object(service,
+                           '_spawn_controller_on_reserved_port') as spawn:
+        service._start('svc',
+                       '/does/not/matter',
+                       1,
+                       'sky serve up',
+                       requested_incarnation='incarnation-a')
+
+    begin_teardown.assert_called_once_with('svc', 'incarnation-a',
+                                           (123, '10.0.0.2'))
+    claim.assert_called_once()
+    cleanup.assert_called_once_with('svc', persisted,
+                                    '/tmp/service', 1, 'incarnation-a',
+                                    service.os.getpid(), None, 'incarnation-a')
+    spawn.assert_not_called()
 
 
 @pytest.mark.parametrize('persisted_logical,yaml_content', [

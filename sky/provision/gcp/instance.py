@@ -376,6 +376,66 @@ def terminate_managed_boot_disks(
         handler.wait_for_operation(operation, project_id, zone=zone)
 
 
+def _submit_exact_compute_deletes(
+    resource_names: Iterable[str],
+    provider_config: dict[str, Any],
+    *,
+    resource_kind: str,
+) -> tuple[str, ...]:
+    """Submit exact GCE deletes and return without polling operations."""
+    names = tuple(resource_names)
+    if (any(not isinstance(name, str) or not name for name in names) or
+            len(set(names)) != len(names)):
+        raise ValueError('Exact GCE delete targets must be unique names.')
+    if resource_kind not in ('instance', 'disk'):
+        raise ValueError(f'Unsupported exact GCE resource: {resource_kind!r}.')
+    if not names:
+        return ()
+    zone = provider_config['availability_zone']
+    project_id = provider_config['project_id']
+    compute = instance_utils.GCPComputeInstance.load_resource()
+    collection = (compute.instances()
+                  if resource_kind == 'instance' else compute.disks())
+    operation_names: list[str] = []
+    for name in names:
+        try:
+            operation = collection.delete(
+                project=project_id, zone=zone, **{
+                    resource_kind: name
+                }).execute(num_retries=instance_utils.GCP_MAX_RETRIES)
+        except gcp.http_error_exception() as error:
+            status_code = getattr(getattr(error, 'resp', None), 'status', None)
+            if status_code == 404:
+                continue
+            raise
+        operation_name = (operation.get('name') if isinstance(
+            operation, Mapping) else None)
+        if not isinstance(operation_name, str) or not operation_name:
+            raise ValueError('GCE delete returned no operation identity.')
+        operation_names.append(operation_name)
+    return tuple(operation_names)
+
+
+def submit_terminate_exact_instances(
+    instance_names: Iterable[str],
+    provider_config: dict[str, Any],
+) -> tuple[str, ...]:
+    """Submit deletes for exact GCE VMs without waiting for completion."""
+    return _submit_exact_compute_deletes(instance_names,
+                                         provider_config,
+                                         resource_kind='instance')
+
+
+def submit_terminate_exact_managed_boot_disks(
+    disk_names: Iterable[str],
+    provider_config: dict[str, Any],
+) -> tuple[str, ...]:
+    """Submit deletes for exact managed boot disks without polling."""
+    return _submit_exact_compute_deletes(disk_names,
+                                         provider_config,
+                                         resource_kind='disk')
+
+
 def _wait_for_operations(
     handlers_to_operations: dict[type[instance_utils.GCPInstance], list[dict]],
     project_id: str,

@@ -33,6 +33,44 @@ def _logical_contract():
 class TestCentralPlacementCatalog:
     """One immutable complete catalog drives every runtime lookup."""
 
+    def test_equal_cost_exact_backend_tiers_are_contiguous(self):
+        locations = [
+            make_location(region, {'L4': width},
+                          cloud_name='GCP',
+                          instance_type=f'g2-width-{width}')
+            for region, width in (('us-central1-a', 4), ('us-central1-b', 8),
+                                  ('us-central1-c', 4))
+        ]
+        catalog = spot_placer.PlacementCatalog(tuple(
+            (location, float(location.accelerators['L4']))
+            for location in locations),
+                                               num_nodes=1)
+
+        ranked = catalog.ranked_entries(_logical_contract())
+
+        assert [entry.location.accelerators['L4'] for entry in ranked
+               ] == [4, 4, 8]
+        assert [entry.normalized_hourly_cost for entry in ranked] == [1.0] * 3
+
+    def test_normalized_cost_precedes_exact_backend_tier_grouping(self):
+        locations = [
+            make_location(region, {'L4': width},
+                          cloud_name='GCP',
+                          instance_type=f'g2-width-{width}')
+            for region, width in (('us-central1-a', 4), ('us-central1-b', 8),
+                                  ('us-central1-c', 4))
+        ]
+        catalog = spot_placer.PlacementCatalog(
+            ((locations[0], 4.0), (locations[1], 4.0), (locations[2], 4.0)),
+            num_nodes=1)
+
+        ranked = catalog.ranked_entries(_logical_contract())
+
+        assert ranked[0].location is locations[1]
+        assert ranked[0].normalized_hourly_cost == 0.5
+        assert [entry.location.accelerators['L4'] for entry in ranked[1:]
+               ] == [4, 4]
+
     def test_regionless_aws_catalog_requires_region_default_image(
             self, monkeypatch):
         # pylint: disable=import-outside-toplevel
@@ -1005,6 +1043,31 @@ run: echo hi
 
         assert ranked == repeated_selection_order
         assert ranked == [cheapest, first_tie, second_tie]
+
+    def test_runtime_selection_reuses_equal_cost_catalog_tier_order(self):
+        locations = [
+            make_location(region, {'L4': width},
+                          cloud_name='GCP',
+                          instance_type=f'g2-width-{width}')
+            for region, width in (('us-central1-a', 4), ('us-central1-b', 8),
+                                  ('us-central1-c', 4))
+        ]
+        placer = _make_per_gpu_placer({
+            location: float(location.accelerators['L4'])
+            for location in locations
+        })
+        remaining = set(locations)
+        selected = []
+
+        while remaining:
+            location = placer.preview_next_location(allowed_locations=remaining)
+            assert location is not None
+            selected.append(location)
+            remaining.remove(location)
+
+        assert selected == placer.ranked_active_locations()
+        assert [location.accelerators['L4'] for location in selected
+               ] == [4, 4, 8]
 
     def test_ranked_active_locations_reads_construction_order_only(self):
         locations = [

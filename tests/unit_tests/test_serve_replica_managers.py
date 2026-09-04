@@ -45,8 +45,6 @@ from sky import skypilot_config
 from sky.events import api_models as event_api_models
 from sky.provision import capacity_policy
 from sky.provision import common as provision_common
-from sky.serve import capacity_admission
-from sky.serve import capacity_planning
 from sky.serve import non_pool_launch_reconciliation
 from sky.serve import ordinary_launch_binding
 from sky.serve import ordinary_launch_handoff
@@ -247,23 +245,27 @@ def test_non_pool_provider_reconciliation_is_scheduled_without_inline_io():
                                    binding_epoch=2,
                                    generic=True)
     manager._ordinary_launch_binding_authority = authority
-    info = types.SimpleNamespace(replica_id=3)
     context = _bound_non_pool_context()
+    info = types.SimpleNamespace(replica_id=context.replica_id,
+                                 replica_record_id=str(
+                                     context.replica_record_id))
     worker = mock.Mock()
 
     with mock.patch.object(replica_managers.thread_utils,
                            'SafeThread',
-                           return_value=worker) as thread_constructor:
+                           return_value=worker) as thread_constructor, \
+         mock.patch.object(
+             replica_managers.non_pool_launch_reconciliation,
+             'reconcile') as reconcile:
         manager._schedule_non_pool_provider_reconciliation(info, context)
 
     thread_constructor.assert_called_once()
     worker_args = thread_constructor.call_args.kwargs
-    assert worker_args['target'] is (
-        replica_managers.non_pool_launch_reconciliation.reconcile)
-    assert worker_args['name'] == 'replica-3-provider-reconciliation'
+    assert callable(worker_args['target'])
+    assert worker_args['name'] == 'replica-3-teardown-observation'
     assert worker_args['daemon'] is True
-    assert worker_args['args'][:3] == (context, info, authority)
-    assert callable(worker_args['args'][3])
+    assert 'args' not in worker_args
+    reconcile.assert_not_called()
     worker.start.assert_called_once_with()
 
 
@@ -281,7 +283,9 @@ def test_previous_cohort_reconciliation_is_cleanup_only():
         capability_cohort_epoch=(
             ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH - 1))
     manager._ordinary_launch_binding_authority = authority
-    info = types.SimpleNamespace(replica_id=3)
+    info = types.SimpleNamespace(replica_id=context.replica_id,
+                                 replica_record_id=str(
+                                     context.replica_record_id))
     worker = mock.Mock()
 
     assert not authority.generic_launches_required
@@ -289,14 +293,18 @@ def test_previous_cohort_reconciliation_is_cleanup_only():
     with mock.patch.object(replica_managers.thread_utils,
                            'SafeThread',
                            return_value=worker) as thread_constructor, \
-         mock.patch.object(manager, '_launch_replica') as launch:
+         mock.patch.object(manager, '_launch_replica') as launch, \
+         mock.patch.object(
+             replica_managers.non_pool_launch_reconciliation,
+             'reconcile') as reconcile:
         manager._schedule_non_pool_provider_reconciliation(info, context)
 
     thread_constructor.assert_called_once()
-    assert thread_constructor.call_args.kwargs['args'][:3] == (context, info,
-                                                               authority)
+    assert callable(thread_constructor.call_args.kwargs['target'])
+    assert 'args' not in thread_constructor.call_args.kwargs
     worker.start.assert_called_once_with()
     launch.assert_not_called()
+    reconcile.assert_not_called()
 
 
 def test_unowned_ambiguous_non_pool_launch_schedules_provider_reconciliation(
@@ -313,7 +321,6 @@ def test_unowned_ambiguous_non_pool_launch_schedules_provider_reconciliation(
         replica_record_id=str(context.replica_record_id))
     runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
     manager._ordinary_launch_binding_authority = authority
-    manager._non_pool_reconciliation_threads = {}
     manager._non_pool_reconciliation_attempts = {}
     manager._non_pool_reconciliation_retry_at = {}
     manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
@@ -321,6 +328,44 @@ def test_unowned_ambiguous_non_pool_launch_schedules_provider_reconciliation(
     monkeypatch.setattr(ordinary_launch_binding,
                         'list_provider_reconciliation_contexts',
                         lambda actual: [context] if actual is authority else [])
+
+    manager._reconcile_unowned_bound_non_pool_launches([info])
+
+    manager._schedule_non_pool_provider_reconciliation.assert_called_once_with(
+        info, context)
+
+
+def test_fresh_controller_observes_pending_paid_teardown_before_resubmit(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    authority = _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    context = _bound_non_pool_context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    info = _fake_replica_info(
+        context.replica_id,
+        replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+    info.replica_record_id = str(context.replica_record_id)
+    info.is_spot = True
+    info.paid_capacity_pool_key = _canonical_paid_pool_key()
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+    info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+    info.status_property.is_scale_down = True
+    info.status_property.drain_cap_seconds = 0
+    runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
+    manager._ordinary_launch_binding_authority = authority
+    manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
+    manager._schedule_non_pool_provider_reconciliation = mock.Mock()
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'list_provider_reconciliation_contexts',
+                        lambda actual: [context] if actual is authority else [])
+    monkeypatch.setattr(replica_managers.global_user_state,
+                        'cluster_with_name_exists', lambda _name: True)
+    monkeypatch.setattr(replica_managers.request_postgres,
+                        'bound_non_pool_provider_absence_is_recorded',
+                        lambda *_args: False)
 
     manager._reconcile_unowned_bound_non_pool_launches([info])
 
@@ -343,7 +388,6 @@ def test_live_reconciliation_retires_pointerless_pre_effect_fill(monkeypatch):
         ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
     manager._service_name = 'svc'
     manager._ordinary_launch_binding_authority = authority
-    manager._non_pool_reconciliation_threads = {}
     manager._non_pool_reconciliation_attempts = {}
     manager._non_pool_reconciliation_retry_at = {}
     manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
@@ -387,7 +431,6 @@ def test_live_reconciliation_adopts_association_race(monkeypatch):
         ordinary_launch_binding.PreAdmissionRetirementDisposition.ASSOCIATED)
     manager._service_name = 'svc'
     manager._ordinary_launch_binding_authority = authority
-    manager._non_pool_reconciliation_threads = {}
     manager._non_pool_reconciliation_attempts = {}
     manager._non_pool_reconciliation_retry_at = {}
     manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
@@ -441,7 +484,6 @@ def test_unowned_recorded_absence_projects_despite_stale_cluster_record(
     status.drain_cap_seconds = 0
     runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
     manager._ordinary_launch_binding_authority = authority
-    manager._non_pool_reconciliation_threads = {}
     manager._non_pool_reconciliation_attempts = {}
     manager._non_pool_reconciliation_retry_at = {}
     manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
@@ -485,18 +527,28 @@ def test_completed_provider_reconciliation_defers_absence_finalization(
     status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
     status.is_scale_down = True
     status.drain_cap_seconds = 0
-    worker = mock.Mock()
-    worker.is_alive.return_value = False
-    worker.exception = None
+    key = (info.replica_id, info.replica_record_id)
+    observation = (
+        replica_managers.non_pool_launch_reconciliation.ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.ABSENT, {}))
+    completion = (replica_managers.non_pool_launch_reconciliation.
+                  OneShotProviderObservationCompletion(key=key,
+                                                       result=observation,
+                                                       error=None,
+                                                       formatted_error=None))
+    lane = mock.Mock()
+    lane.take_completed.return_value = (completion,)
+    lane.contains.return_value = False
     runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
     manager._ordinary_launch_binding_authority = authority
-    manager._non_pool_reconciliation_threads = {info.replica_id: worker}
-    manager._non_pool_reconciliation_attempts = {info.replica_id: 1}
-    manager._non_pool_reconciliation_retry_at = {info.replica_id: 1.0}
+    manager._non_pool_reconciliation_lane = lane
+    manager._non_pool_reconciliation_attempts = {key: 1}
+    manager._non_pool_reconciliation_retry_at = {key: 1.0}
     manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
     manager._failed_cleanup_retry_state = mock.Mock(return_value=({}, {}))
     manager._finalize_projected_provider_absence_cleanup = mock.Mock(
         return_value=True)
+    manager._schedule_non_pool_provider_reconciliation = mock.Mock()
     manager._terminate_replica = mock.Mock()
     monkeypatch.setattr(ordinary_launch_binding,
                         'list_provider_reconciliation_contexts',
@@ -504,9 +556,8 @@ def test_completed_provider_reconciliation_defers_absence_finalization(
 
     manager._reconcile_unowned_bound_non_pool_launches([info])
 
-    assert not manager._non_pool_reconciliation_threads
     assert not manager._non_pool_reconciliation_attempts
-    assert info.replica_id in manager._non_pool_reconciliation_retry_at
+    assert key in manager._non_pool_reconciliation_retry_at
     manager._finalize_projected_provider_absence_cleanup.assert_not_called()
 
     # The same pre-removal snapshot is passed to the cleanup reconciler in a
@@ -518,6 +569,120 @@ def test_completed_provider_reconciliation_defers_absence_finalization(
         info.replica_id)
     manager._terminate_replica.assert_not_called()
     assert not manager._non_pool_reconciliation_retry_at
+
+
+def test_settled_paid_observation_is_not_rescheduled_from_stale_tick_snapshot(
+        monkeypatch):
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    authority = _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    context = _bound_non_pool_context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    info = _fake_replica_info(context.replica_id,
+                              replica_managers.serve_state.ReplicaStatus.READY)
+    info.replica_record_id = str(context.replica_record_id)
+    info.reserved_fill = False
+    info.is_zero_cost = False
+    info.is_spot = True
+    info.paid_capacity_pool_key = _canonical_paid_pool_key()
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+    info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+    info.status_property.is_scale_down = True
+    info.status_property.drain_cap_seconds = 0
+    key = (info.replica_id, info.replica_record_id)
+    observation = (
+        replica_managers.non_pool_launch_reconciliation.ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.ABSENT, {}))
+    step = (replica_managers.non_pool_launch_reconciliation.
+            PaidTeardownObservationStep(
+                replica_managers.non_pool_launch_reconciliation.
+                PaidTeardownObservationDisposition.SETTLED_ABSENT, observation))
+    completion = (replica_managers.non_pool_launch_reconciliation.
+                  OneShotProviderObservationCompletion(key=key,
+                                                       result=step,
+                                                       error=None,
+                                                       formatted_error=None))
+    lane = mock.Mock()
+    lane.take_completed.return_value = (completion,)
+    runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
+    manager._ordinary_launch_binding_authority = authority
+    manager._non_pool_reconciliation_lane = lane
+    manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
+    manager._schedule_non_pool_provider_reconciliation = mock.Mock()
+    manager._notify_scale_reconciliation = mock.Mock()
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'list_provider_reconciliation_contexts',
+                        lambda actual: [context] if actual is authority else [])
+
+    manager._reconcile_unowned_bound_non_pool_launches([info])
+
+    manager._notify_scale_reconciliation.assert_called_once_with()
+    manager._schedule_non_pool_provider_reconciliation.assert_not_called()
+
+
+def test_present_paid_observation_resubmits_once_then_backs_off(monkeypatch):
+    """Recovery cannot turn a PRESENT result into a provider-delete hot loop."""
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    authority = _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    context = _bound_non_pool_context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    info = _fake_replica_info(context.replica_id,
+                              replica_managers.serve_state.ReplicaStatus.READY)
+    info.replica_record_id = str(context.replica_record_id)
+    info.reserved_fill = False
+    info.is_zero_cost = False
+    info.is_spot = True
+    info.paid_capacity_pool_key = _canonical_paid_pool_key()
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+    info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+    info.status_property.is_scale_down = True
+    info.status_property.drain_cap_seconds = 0
+    key = (info.replica_id, info.replica_record_id)
+    observation = (
+        replica_managers.non_pool_launch_reconciliation.ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.PRESENT, {}))
+    step = (replica_managers.non_pool_launch_reconciliation.
+            PaidTeardownObservationStep(
+                replica_managers.non_pool_launch_reconciliation.
+                PaidTeardownObservationDisposition.RESUBMIT_PRESENT,
+                observation,
+                scheduled_replica_info=info))
+    completion = (replica_managers.non_pool_launch_reconciliation.
+                  OneShotProviderObservationCompletion(key=key,
+                                                       result=step,
+                                                       error=None,
+                                                       formatted_error=None))
+    lane = mock.Mock()
+    lane.take_completed.return_value = (completion,)
+    runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
+    manager._service_name = 'svc'
+    manager._ordinary_launch_binding_authority = authority
+    manager._non_pool_reconciliation_lane = lane
+    manager._non_pool_reconciliation_attempts = {}
+    manager._non_pool_reconciliation_retry_at = {}
+    manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
+    manager._terminate_replica = mock.Mock()
+    manager._notify_scale_reconciliation = mock.Mock()
+    monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: 1000.0)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'list_provider_reconciliation_contexts',
+                        lambda actual: [context] if actual is authority else [])
+
+    manager._reconcile_unowned_bound_non_pool_launches([info])
+
+    manager._terminate_replica.assert_called_once_with(
+        info.replica_id,
+        replica_drain_delay_seconds=0,
+        is_scale_down=True,
+        in_flight_drain_cap_seconds=0)
+    assert manager._non_pool_reconciliation_retry_at[key] == 1030.0
+    lane.schedule.assert_not_called()
+    manager._notify_scale_reconciliation.assert_not_called()
 
 
 def test_provider_present_down_requires_fresh_post_down_absence():
@@ -579,6 +744,50 @@ def test_provider_present_down_quarantines_missing_absence_receipt():
             'svc-3',
         )
     reconcile.assert_not_called()
+
+
+def test_paid_provider_teardown_with_live_cluster_submits_without_core_down():
+    context = _bound_non_pool_context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    authority = _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    status = types.SimpleNamespace(
+        sky_down_status=common_utils.ProcessStatus.RUNNING)
+    info = types.SimpleNamespace(
+        replica_id=context.replica_id,
+        paid_capacity_pool_key=(_canonical_paid_pool_key()),
+        status_property=status)
+    submission = types.SimpleNamespace(disposition=types.SimpleNamespace(
+        value='accepted'))
+
+    def _submit(*_args, **_kwargs):
+        status.sky_down_status = common_utils.ProcessStatus.FAILED
+        return submission
+
+    with mock.patch.object(replica_managers, 'terminate_cluster') as down, \
+         mock.patch.object(
+             replica_managers.non_pool_launch_reconciliation,
+             'submit_paid_provider_teardown',
+             side_effect=_submit) as submit:
+        replica_managers.terminate_bound_non_pool_provider_present_cluster(
+            context,
+            info,
+            authority,
+            mock.Mock(),
+            'svc-3',
+            expected_cluster_record_uuid=(
+                '00000000-0000-4000-8000-000000000003'),
+            continue_guard=lambda: True)
+
+    down.assert_not_called()
+    submit.assert_called_once_with(context,
+                                   info,
+                                   authority,
+                                   continue_guard=mock.ANY)
+    assert ordinary_launch_binding.provider_present_teardown_phase(info) is (
+        ordinary_launch_binding.ProviderPresentTeardownPhase.
+        ABSENCE_OBSERVATION_PENDING)
 
 
 def test_kueue_absence_projection_runs_only_after_fenced_down():
@@ -1879,7 +2088,7 @@ def test_system_recovery_mutation_fence_is_installed_and_has_no_db_io():
     db_read.assert_not_called()
 
 
-def _provider_free_paid_manager(next_replica_id=1):
+def _provider_free_paid_manager(next_replica_id=1, *, logical=False):
     manager = _make_manager(next_replica_id=next_replica_id)
     manager._service_hash = 'hash'
     manager._resource_scope = 'hash'
@@ -1889,29 +2098,39 @@ def _provider_free_paid_manager(next_replica_id=1):
         binding_epoch=2,
         generic=True)
     manager.yaml_content = 'resources: {}'
-    manager._version_specs = {
-        1: service_spec.SkyServiceSpec(readiness_path='/health',
-                                       initial_delay_seconds=0,
-                                       readiness_timeout_seconds=5,
-                                       endpoint_probe_interval_seconds=1,
-                                       lb_stream_timeout_seconds=10,
-                                       min_replicas=0,
-                                       max_replicas=100,
-                                       target_concurrency_per_replica=1,
-                                       spot_placer='dynamic_fallback')
-    }
+    spec = service_spec.SkyServiceSpec(
+        readiness_path='/health',
+        initial_delay_seconds=0,
+        readiness_timeout_seconds=5,
+        endpoint_probe_interval_seconds=1,
+        lb_stream_timeout_seconds=10,
+        min_replicas=0,
+        max_replicas=100,
+        target_concurrency_per_replica=1,
+        graceful_drain_async_occupancy=True if logical else None,
+        spot_placer=('dynamic_fallback_per_gpu'
+                     if logical else 'dynamic_fallback'))
+    manager._version_specs = {1: spec}
+    manager._uses_logical_replicas = logical
+    manager._logical_exact_accelerator_shapes = ({'L4': 1} if logical else {})
     cheap = make_location('us-central1-a', {'L4': 1}, cloud_name='GCP')
     expensive = make_location('us-central1-b', {'L4': 1}, cloud_name='GCP')
     cheap.cloud = clouds.GCP()
     expensive.cloud = clouds.GCP()
     cheap.instance_type = 'g2-standard-4'
     expensive.instance_type = 'g2-standard-8'
-    _set_paid_placer(manager, {cheap: 0.1, expensive: 0.2})
+    _set_paid_placer(manager, {
+        cheap: 0.1,
+        expensive: 0.2
+    },
+                     placement_contract=spec.placement_contract)
     return manager, cheap, expensive
 
 
-def _set_paid_placer(manager, costs, *, num_nodes=1):
-    placer = make_placer(costs)
+def _set_paid_placer(manager, costs, *, num_nodes=1, placement_contract=None):
+    if placement_contract is None:
+        placement_contract = manager._version_specs[1].placement_contract
+    placer = make_placer(costs, placement_contract)
     placer.num_nodes = num_nodes
     placer.placement_catalog = dataclasses.replace(placer.placement_catalog,
                                                    num_nodes=num_nodes)
@@ -1977,29 +2196,96 @@ def _provider_free_paid_budget(manager,
                                       frontier_key_by_location=frontiers)
 
 
-def test_prepare_paid_launch_specs_is_bounded_cost_ordered_and_io_free():
+def _materialize_test_paid_launch_specs(
+    manager,
+    templates: tuple[paid_capacity.PaidLaunchTemplate, ...],
+) -> tuple[paid_capacity.PaidLaunchSpec, ...]:
+    """Bind deterministic test identities after template preflight.
+
+    Production performs this expansion under the PostgreSQL capacity lock.
+    Replica-manager publication tests start after that commit, so this fixture
+    supplies the already-committed shape without reviving a second allocator.
+    """
+    specs = []
+    for ordinal, template in enumerate(templates):
+        replica_id = manager._next_replica_id + ordinal
+        replica_record_id = str(
+            uuid.uuid5(uuid.NAMESPACE_URL,
+                       f'test-paid:{template.pool_key}:{replica_id}'))
+        cluster_name = serve_utils.generate_replica_cluster_name(
+            manager._service_name, replica_id, manager._resource_scope)
+        log_file_name = serve_utils.generate_replica_launch_log_file_name(
+            manager._service_name, replica_id, manager._resource_scope)
+        controller_config_path = (
+            serve_utils.generate_versioned_config_yaml_file_name(
+                manager._service_name, manager.latest_version,
+                manager._resource_scope))
+        stored_override = paid_capacity.thaw_paid_launch_payload(
+            template.resources_override)
+        worker_construction = paid_capacity.freeze_paid_launch_payload({
+            'schema_version': 1,
+            'launch_yaml_content': manager.yaml_content,
+            'cluster_name': cluster_name,
+            'log_file_name': log_file_name,
+            'resources_override': stored_override,
+            'retry_until_up': False,
+            'frozen_controller_config_path': controller_config_path,
+        })
+        body_template = (
+            replica_managers.paid_launch_request.PaidLaunchBodyTemplate(
+                submitted_bytes=template.prepared_launch_body_template))
+        prepared_request = (replica_managers.paid_launch_request.
+                            materialize_paid_launch_request(
+                                body_template,
+                                replica_id=replica_id,
+                                cluster_name=cluster_name,
+                                launch_fence={}))
+        specs.append(
+            paid_capacity.PaidLaunchSpec(
+                ordinal=ordinal,
+                service_name=template.service_name,
+                service_hash=template.service_hash,
+                service_lifecycle_epoch=template.service_lifecycle_epoch,
+                service_version=template.service_version,
+                replica_id=replica_id,
+                replica_record_id=replica_record_id,
+                cluster_name_seed=cluster_name,
+                worker_construction=worker_construction,
+                prepared_launch_request=prepared_request.submitted_bytes,
+                provider_account=template.provider_account,
+                provider_project_id=template.provider_project_id,
+                cloud=template.cloud,
+                workspace=template.workspace,
+                region=template.region,
+                zone=template.zone,
+                instance_type=template.instance_type,
+                pool_key=template.pool_key,
+                frontier_key=template.frontier_key,
+                accelerator=template.accelerator,
+                gpu_units_per_node=template.gpu_units_per_node,
+                num_nodes=template.num_nodes,
+                resources_override=template.resources_override,
+                catalog_evidence=paid_capacity.PaidLaunchCatalogEvidence(
+                    placement_catalog_sha256=(
+                        template.placement_catalog_sha256),
+                    catalog_rank=template.catalog_rank,
+                    exploration_round=0,
+                    slot_within_pool_window=0,
+                    version_authority=template.version_authority)))
+    return tuple(specs)
+
+
+def test_prepare_paid_launch_templates_are_cost_ordered_and_io_free():
     manager, cheap, expensive = _provider_free_paid_manager()
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={'api_server': {'endpoint': 'local'}}), \
-         mock.patch.object(paid_capacity, 'base_limit', return_value=2), \
-         mock.patch.object(replica_managers.serve_state,
+    initial_replica_id = manager._next_replica_id
+    with mock.patch.object(replica_managers.serve_state,
                            'get_spec',
                            side_effect=AssertionError('unexpected DB read')), \
          mock.patch.object(paid_capacity,
                            '_active_aws_account_id_for_workspace',
                            side_effect=AssertionError('unexpected provider')):
-        specs = manager.prepare_paid_launch_specs(
+        templates = manager.prepare_paid_launch_templates(
             accelerator_shapes={'L4': 1},
-            max_gpu_units_by_accelerator={'l4': 6},
-            max_candidates=6,
-            occupied_replica_ids={1},
             version_authority=_paid_version_authority(manager),
             paid_location_launch_budget=_provider_free_paid_budget(
                 manager, {
@@ -2007,9 +2293,7 @@ def test_prepare_paid_launch_specs_is_bounded_cost_ordered_and_io_free():
                     expensive: 2,
                 }, service_remaining=6))
 
-    assert len(specs) == 6
-    assert [spec.replica_id for spec in specs] == list(range(2, 8))
-    assert manager._next_replica_id == 1
+    assert manager._next_replica_id == initial_replica_id
     cheap_key = paid_capacity.pool_key(cheap,
                                        workspace='default',
                                        num_nodes=1,
@@ -2018,27 +2302,56 @@ def test_prepare_paid_launch_specs_is_bounded_cost_ordered_and_io_free():
                                            workspace='default',
                                            num_nodes=1,
                                            gcp_project_id='test-project')
-    assert [spec.pool_key for spec in specs] == [
-        cheap_key, cheap_key, cheap_key, cheap_key, expensive_key, expensive_key
-    ]
-    assert all(spec.accelerator == 'l4' and spec.physical_gpu_units == 1
-               for spec in specs)
-    for spec in specs:
+    assert [template.pool_key for template in templates
+           ] == [cheap_key, expensive_key]
+    assert all(template.accelerator == 'l4' and template.physical_gpu_units == 1
+               for template in templates)
+    for template in templates:
         assert paid_capacity.thaw_paid_launch_payload(
-            spec.resources_override)['cloud'] == 'gcp'
-        assert spec.provider_project_id == 'test-project'
-        request_body = json.loads(spec.prepared_launch_request)
+            template.resources_override)['cloud'] == 'gcp'
+        assert template.provider_project_id == 'test-project'
+        request_body = json.loads(template.prepared_launch_body_template)
         assert '\n  infra: gcp/' in request_body['task']
-    assert all(
-        paid_capacity.build_pristine_paid_replica_state(
-            spec, replica_port='8080', planned_capacity=1, created_at=None)
-        ['planned_capacity'] == 1 for spec in specs)
+        assert request_body['cluster_name'] == 'sky-paid-launch-template'
+        assert request_body['extra_launch_context'] == {}
+        assert request_body['task'].count(
+            '__SKYPILOT_PAID_REPLICA_ID_TEMPLATE__') == 1
     assert all(not isinstance(value, (dict, list, set))
-               for spec in specs
-               for value in vars(spec).values())
+               for template in templates
+               for value in vars(template).values())
+    assert all(not hasattr(template, 'replica_id') and
+               not hasattr(template, 'replica_record_id') and
+               not hasattr(template, 'cluster_name_seed')
+               for template in templates)
 
 
-def test_prepare_paid_launch_specs_does_not_reserve_retry_probe(monkeypatch):
+def test_logical_paid_templates_keep_wide_prefix_and_narrow_remainder_pool():
+    manager, _, _ = _provider_free_paid_manager(logical=True)
+    wide = make_location('us-wide', {'L4': 8}, cloud_name='GCP')
+    narrow = make_location('us-narrow', {'L4': 1}, cloud_name='GCP')
+    for location, instance_type in ((wide, 'g2-standard-96'),
+                                    (narrow, 'g2-standard-4')):
+        location.cloud = clouds.GCP()
+        location.instance_type = instance_type
+    _set_paid_placer(manager, {
+        wide: 0.80,
+        narrow: 0.13,
+    })
+
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'L4': 1},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager, {
+                wide: 100,
+                narrow: 100,
+            }, service_remaining=100))
+
+    assert [template.gpu_units_per_node for template in templates] == [8, 1]
+    assert [template.catalog_rank for template in templates] == [0, 1]
+
+
+def test_prepare_paid_launch_templates_do_not_reserve_retry_probe(monkeypatch):
     manager, cheap, _ = _provider_free_paid_manager()
     now = [1000.0]
     monkeypatch.setattr(replica_managers.spot_placer.time, 'time',
@@ -2049,60 +2362,40 @@ def test_prepare_paid_launch_specs_does_not_reserve_retry_probe(monkeypatch):
                1)
     state_before = manager._spot_placer.dump_retry_state()
 
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={'api_server': {'endpoint': 'local'}}):
-        specs = manager.prepare_paid_launch_specs(
-            accelerator_shapes={'L4': 1},
-            max_gpu_units_by_accelerator={'l4': 1},
-            max_candidates=1,
-            occupied_replica_ids=(),
-            version_authority=_paid_version_authority(manager),
-            paid_location_launch_budget=_provider_free_paid_budget(
-                manager, {cheap: 1}, service_remaining=1))
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'L4': 1},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager, {cheap: 1}, service_remaining=1))
 
-    assert len(specs) == 1
+    assert len(templates) == 1
     assert manager._spot_placer.dump_retry_state() == state_before
     assert not manager._spot_placer.retry_state_dirty
     assert cheap not in manager._spot_placer.location2retry_reserved_at
 
 
-def test_prepare_paid_launch_specs_fails_closed_if_alternatives_exceed_bound():
+def test_prepare_paid_launch_templates_reject_too_many_accelerator_cards():
     manager, _, _ = _provider_free_paid_manager()
     initial_replica_id = manager._next_replica_id
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={'api_server': {'endpoint': 'local'}}):
-        specs = manager.prepare_paid_launch_specs(
-            accelerator_shapes={'L4': 1},
-            max_gpu_units_by_accelerator={'l4': 6},
-            max_candidates=5,
-            occupied_replica_ids=(),
-            version_authority=_paid_version_authority(manager),
-            paid_location_launch_budget=_provider_free_paid_budget(
-                manager, {
-                    location: 6
-                    for location in manager._spot_placer.active_locations()
-                },
-                service_remaining=6))
+    shapes = {f'card-{index}': 1 for index in range(9)}
+    with mock.patch.object(replica_managers.paid_launch_request,
+                           'prepare_paid_launch_body_template') as prepare_body:
+        with pytest.raises(ValueError, match='eight-card'):
+            manager.prepare_paid_launch_templates(
+                accelerator_shapes=shapes,
+                version_authority=_paid_version_authority(manager),
+                paid_location_launch_budget=_provider_free_paid_budget(
+                    manager, {
+                        location: 6
+                        for location in manager._spot_placer.active_locations()
+                    },
+                    service_remaining=6))
 
-    assert specs == ()
+    prepare_body.assert_not_called()
     assert manager._next_replica_id == initial_replica_id
 
 
-def test_prepare_paid_launch_specs_uses_state_aware_third_pool_fallback():
+def test_prepare_paid_launch_templates_cover_state_aware_third_pool_fallback():
     manager, cheap, middle = _provider_free_paid_manager()
     fallback = make_location('us-central1-c', {'L4': 1}, cloud_name='GCP')
     fallback.cloud = clouds.GCP()
@@ -2113,29 +2406,16 @@ def test_prepare_paid_launch_specs_uses_state_aware_third_pool_fallback():
         fallback: 0.3,
     })
 
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={'api_server': {'endpoint': 'local'}}), \
-         mock.patch.object(paid_capacity, 'base_limit', return_value=2):
-        specs = manager.prepare_paid_launch_specs(
-            accelerator_shapes={'L4': 1},
-            max_gpu_units_by_accelerator={'l4': 100},
-            max_candidates=100,
-            occupied_replica_ids=(),
-            version_authority=_paid_version_authority(manager),
-            paid_location_launch_budget=_provider_free_paid_budget(
-                manager, {
-                    cheap: 50,
-                    middle: 1,
-                    fallback: 49,
-                },
-                service_remaining=100))
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'L4': 1},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager, {
+                cheap: 50,
+                middle: 1,
+                fallback: 49,
+            },
+            service_remaining=100))
 
     pool_keys = [
         paid_capacity.pool_key(location,
@@ -2144,17 +2424,69 @@ def test_prepare_paid_launch_specs_uses_state_aware_third_pool_fallback():
                                gcp_project_id='test-project')
         for location in (cheap, middle, fallback)
     ]
-    assert len(specs) == 100
-    assert [spec.pool_key for spec in specs].count(pool_keys[0]) == 50
-    assert [spec.pool_key for spec in specs].count(pool_keys[1]) == 1
-    assert [spec.pool_key for spec in specs].count(pool_keys[2]) == 49
+    assert [template.pool_key for template in templates] == pool_keys
 
 
-@pytest.mark.parametrize(('initial_headroom', 'expected_selections'),
-                         [((60, 60, 60), (34, 33, 33)),
-                          ((60, 60, 1), (50, 49, 1))])
-def test_prepare_paid_launch_specs_balances_cheapest_equal_cost_tier(
-        initial_headroom, expected_selections):
+def test_prepare_paid_launch_templates_keep_cheapest_aws_gcp_fallback():
+    manager, gcp, _ = _provider_free_paid_manager()
+    aws = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    aws.cloud = clouds.AWS()
+    aws.instance_type = 'g6.xlarge'
+    _set_paid_placer(manager, {aws: 0.1, gcp: 0.2})
+
+    with mock.patch.object(replica_managers.paid_launch_request,
+                           'prepare_paid_launch_body_template',
+                           return_value=types.SimpleNamespace(
+                               submitted_bytes=b'identity-free-template')):
+        templates = manager.prepare_paid_launch_templates(
+            accelerator_shapes={'L4': 1},
+            version_authority=_paid_version_authority(manager),
+            paid_location_launch_budget=_provider_free_paid_budget(
+                manager, {
+                    aws: 60,
+                    gcp: 60,
+                },
+                aws_account_id='210987654321',
+                service_remaining=100))
+
+    assert [template.cloud for template in templates] == ['aws', 'gcp']
+    assert [template.catalog_rank for template in templates] == [0, 1]
+
+
+def test_prepare_paid_launch_templates_skip_nonpositive_advisory_headroom():
+    manager, zero, negative = _provider_free_paid_manager()
+    usable = make_location('us-central1-c', {'L4': 1}, cloud_name='GCP')
+    usable.cloud = clouds.GCP()
+    usable.instance_type = 'g2-standard-12'
+    _set_paid_placer(manager, {
+        zero: 0.1,
+        negative: 0.2,
+        usable: 0.3,
+    })
+
+    with mock.patch.object(
+            replica_managers.paid_launch_request,
+            'prepare_paid_launch_body_template',
+            wraps=(replica_managers.paid_launch_request.
+                   prepare_paid_launch_body_template)) as prepare_body:
+        templates = manager.prepare_paid_launch_templates(
+            accelerator_shapes={'L4': 1},
+            version_authority=_paid_version_authority(manager),
+            paid_location_launch_budget=_provider_free_paid_budget(
+                manager, {
+                    zero: 0,
+                    negative: -1,
+                    usable: 100,
+                },
+                service_remaining=100))
+
+    assert [template.region for template in templates] == [usable.region]
+    prepare_body.assert_called_once()
+
+
+@pytest.mark.parametrize('initial_headroom', [(60, 60, 60), (60, 60, 1)])
+def test_prepare_paid_launch_templates_keep_minimal_equal_cost_prefix(
+        initial_headroom):
     manager, first, second = _provider_free_paid_manager()
     third = make_location('us-central1-c', {'L4': 1}, cloud_name='GCP')
     third.cloud = clouds.GCP()
@@ -2162,26 +2494,13 @@ def test_prepare_paid_launch_specs_balances_cheapest_equal_cost_tier(
     locations = (first, second, third)
     _set_paid_placer(manager, {location: 0.424 for location in locations})
 
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={'api_server': {'endpoint': 'local'}}), \
-         mock.patch.object(paid_capacity, 'base_limit', return_value=60):
-        specs = manager.prepare_paid_launch_specs(
-            accelerator_shapes={'L4': 1},
-            max_gpu_units_by_accelerator={'l4': 100},
-            max_candidates=100,
-            occupied_replica_ids=(),
-            version_authority=_paid_version_authority(manager),
-            paid_location_launch_budget=_provider_free_paid_budget(
-                manager,
-                dict(zip(locations, initial_headroom)),
-                service_remaining=100))
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'L4': 1},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager,
+            dict(zip(locations, initial_headroom)),
+            service_remaining=100))
 
     pool_keys = tuple(
         paid_capacity.pool_key(location,
@@ -2189,13 +2508,17 @@ def test_prepare_paid_launch_specs_balances_cheapest_equal_cost_tier(
                                num_nodes=1,
                                gcp_project_id='test-project')
         for location in locations)
-    assert len(specs) == 100
-    assert tuple([spec.pool_key
-                  for spec in specs].count(pool_key)
-                 for pool_key in pool_keys) == expected_selections
+    ranked_keys = tuple(
+        paid_capacity.pool_key(location,
+                               workspace='default',
+                               num_nodes=1,
+                               gcp_project_id='test-project')
+        for location in manager._spot_placer.ranked_active_locations())
+    assert tuple(template.pool_key for template in templates) == ranked_keys[:2]
+    assert set(template.pool_key for template in templates).issubset(pool_keys)
 
 
-def test_prepare_paid_launch_specs_moves_bounded_wave_after_capacity_feedback():
+def test_prepare_paid_launch_templates_move_after_capacity_feedback():
     """GCP capacity feedback moves the next bounded wave to another region."""
     manager, first, second = _provider_free_paid_manager()
     first.region = 'us-central1'
@@ -2218,42 +2541,26 @@ def test_prepare_paid_launch_specs_moves_bounded_wave_after_capacity_feedback():
         fourth: 0.34166,
     })
 
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={'api_server': {'endpoint': 'local'}}), \
-         mock.patch.object(paid_capacity, 'base_limit', return_value=60):
-        specs = manager.prepare_paid_launch_specs(
-            accelerator_shapes={'L4': 1},
-            max_gpu_units_by_accelerator={'l4': 100},
-            max_candidates=100,
-            occupied_replica_ids=(),
-            version_authority=_paid_version_authority(manager),
-            paid_location_launch_budget=_provider_free_paid_budget(
-                manager, {location: 60 for location in locations},
-                service_remaining=100,
-                frontier_limit=36))
-        # This is the production feedback boundary used after the launch
-        # reducer classifies provider-native capacity exhaustion.  Keep the
-        # admission budget unchanged: the placer bench, rather than a test-only
-        # allocator or synthetic zero headroom, must force regional failover.
-        manager._spot_placer.set_preemptive(first, reason='capacity')
-        manager._spot_placer.set_preemptive(second, reason='capacity')
-        refill_specs = manager.prepare_paid_launch_specs(
-            accelerator_shapes={'L4': 1},
-            max_gpu_units_by_accelerator={'l4': 100},
-            max_candidates=100,
-            occupied_replica_ids=(),
-            version_authority=_paid_version_authority(manager),
-            paid_location_launch_budget=_provider_free_paid_budget(
-                manager, {location: 60 for location in locations},
-                service_remaining=100,
-                frontier_limit=36))
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'L4': 1},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager, {location: 60 for location in locations},
+            service_remaining=100,
+            frontier_limit=36))
+    # This is the production feedback boundary used after the launch reducer
+    # classifies provider-native capacity exhaustion.  Keep the admission
+    # budget unchanged: the placer bench, rather than a test-only allocator or
+    # synthetic zero headroom, must force regional failover.
+    manager._spot_placer.set_preemptive(first, reason='capacity')
+    manager._spot_placer.set_preemptive(second, reason='capacity')
+    refill_templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'L4': 1},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager, {location: 60 for location in locations},
+            service_remaining=100,
+            frontier_limit=36))
 
     pool_keys = tuple(
         paid_capacity.pool_key(location,
@@ -2261,68 +2568,55 @@ def test_prepare_paid_launch_specs_moves_bounded_wave_after_capacity_feedback():
                                num_nodes=1,
                                gcp_project_id='test-project')
         for location in locations)
-    prepared_pool_keys = [spec.pool_key for spec in specs]
-    assert len(specs) == 100
+    assert tuple(template.pool_key for template in templates) == pool_keys[:2]
+    assert all(template.accelerator == 'l4' and template.physical_gpu_units == 1
+               for template in templates)
     assert tuple(
-        prepared_pool_keys.count(pool_key) for pool_key in pool_keys) == (50,
-                                                                          50, 0,
-                                                                          0)
-    assert set(prepared_pool_keys) == set(pool_keys[:2])
-    assert all(spec.accelerator == 'l4' and spec.physical_gpu_units == 1
-               for spec in specs)
-    refill_pool_keys = [spec.pool_key for spec in refill_specs]
-    assert len(refill_specs) == 100
-    assert tuple(
-        refill_pool_keys.count(pool_key) for pool_key in pool_keys) == (0, 0,
-                                                                        50, 50)
-    assert all(spec.accelerator == 'l4' and spec.physical_gpu_units == 1
-               for spec in refill_specs)
-    assert {(spec.region, spec.zone) for spec in refill_specs} == {
-        ('us-east4', 'us-east4-a'),
-        ('us-east4', 'us-east4-c'),
-    }
+        template.pool_key for template in refill_templates) == pool_keys[2:]
+    assert all(template.accelerator == 'l4' and template.physical_gpu_units == 1
+               for template in refill_templates)
+    assert {(template.region, template.zone) for template in refill_templates
+           } == {
+               ('us-east4', 'us-east4-a'),
+               ('us-east4', 'us-east4-c'),
+           }
 
 
-def test_prepare_paid_launch_specs_preserves_each_accelerator_frontier():
+def test_prepare_paid_launch_templates_preserve_each_accelerator_frontier():
     manager, l4, _ = _provider_free_paid_manager()
     a100 = make_location('us-central1-b', {'A100': 1}, cloud_name='GCP')
     a100.cloud = clouds.GCP()
     a100.instance_type = 'a2-highgpu-1g'
-    _set_paid_placer(manager, {l4: 0.1, a100: 0.2})
+    l4_fallback = make_location('us-central1-c', {'L4': 1}, cloud_name='GCP')
+    l4_fallback.cloud = clouds.GCP()
+    l4_fallback.instance_type = 'g2-standard-12'
+    _set_paid_placer(manager, {
+        l4: 0.1,
+        a100: 0.2,
+        l4_fallback: 0.3,
+    })
 
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={'api_server': {'endpoint': 'local'}}):
-        specs = manager.prepare_paid_launch_specs(
-            accelerator_shapes={
-                'L4': 1,
-                'A100': 1,
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={
+            'L4': 1,
+            'A100': 1,
+        },
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager, {
+                l4: 60,
+                a100: 100,
+                l4_fallback: 40,
             },
-            max_gpu_units_by_accelerator={
-                'l4': 4,
-                'a100': 4,
-            },
-            max_candidates=8,
-            occupied_replica_ids=(),
-            version_authority=_paid_version_authority(manager),
-            paid_location_launch_budget=_provider_free_paid_budget(
-                manager, {
-                    l4: 4,
-                    a100: 4,
-                }, service_remaining=8))
+            service_remaining=200))
 
-    assert len(specs) == 8
-    assert [spec.accelerator for spec in specs].count('l4') == 4
-    assert [spec.accelerator for spec in specs].count('a100') == 4
+    assert [template.accelerator for template in templates
+           ] == ['l4', 'a100', 'l4']
+    assert [template.catalog_rank for template in templates
+           ] == sorted(template.catalog_rank for template in templates)
 
 
-def test_prepare_paid_launch_specs_is_bounded_by_wave_not_catalog_size():
+def test_prepare_paid_launch_templates_are_bounded_by_wave_not_catalog_size():
     manager, _, _ = _provider_free_paid_manager()
     locations = []
     costs = {}
@@ -2338,131 +2632,83 @@ def test_prepare_paid_launch_specs_is_bounded_by_wave_not_catalog_size():
         manager, {location: 60 for location in locations},
         service_remaining=100)
 
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={'api_server': {'endpoint': 'local'}}):
-        specs = manager.prepare_paid_launch_specs(
+    original_prepare = (
+        replica_managers.paid_launch_request.prepare_paid_launch_body_template)
+    with mock.patch.object(replica_managers.paid_launch_request,
+                           'prepare_paid_launch_body_template',
+                           wraps=original_prepare) as prepare_body:
+        templates = manager.prepare_paid_launch_templates(
             accelerator_shapes={'L4': 1},
-            max_gpu_units_by_accelerator={'l4': 100},
-            max_candidates=100,
-            occupied_replica_ids=(),
             version_authority=_paid_version_authority(manager),
             paid_location_launch_budget=budget)
 
-    assert len(specs) == 100
-    assert len({spec.pool_key for spec in specs}) == 2
-    assert len(specs) < len(locations)
+    assert len(templates) == 2
+    assert tuple(template.catalog_rank for template in templates) == (0, 1)
+    assert prepare_body.call_count == 2
 
 
-def test_prepare_paid_launch_specs_honors_multinode_physical_cap():
+def test_prepare_paid_launch_templates_preserve_multinode_physical_shape():
     manager, _, _ = _provider_free_paid_manager()
     location = make_location('us-central1-a', {'A100': 8}, cloud_name='GCP')
     location.cloud = clouds.GCP()
     location.instance_type = 'a2-highgpu-8g'
     _set_paid_placer(manager, {location: 1.0}, num_nodes=2)
 
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={}):
-        specs = manager.prepare_paid_launch_specs(
-            accelerator_shapes={'A100': 8},
-            max_gpu_units_by_accelerator={'A100': 120},
-            max_candidates=13,
-            occupied_replica_ids=(),
-            version_authority=_paid_version_authority(manager),
-            paid_location_launch_budget=_provider_free_paid_budget(
-                manager, {location: 7}, service_remaining=7))
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'A100': 8},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager, {location: 7}, service_remaining=7))
 
-    assert len(specs) == 7
-    assert all(
-        spec.num_nodes == 2 and spec.physical_gpu_units == 16 for spec in specs)
+    assert len(templates) == 1
+    assert templates[0].num_nodes == 2
+    assert templates[0].physical_gpu_units == 16
 
 
-def test_prepare_paid_launch_specs_freezes_resolved_aws_account():
+def test_prepare_paid_launch_templates_freeze_resolved_aws_account():
     manager, _, _ = _provider_free_paid_manager()
     aws = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     aws.cloud = clouds.AWS()
     aws.instance_type = 'g6.xlarge'
     _set_paid_placer(manager, {aws: 0.1})
 
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={}):
-        specs = manager.prepare_paid_launch_specs(
-            accelerator_shapes={'L4': 1},
-            max_gpu_units_by_accelerator={'L4': 1},
-            max_candidates=1,
-            occupied_replica_ids=(),
-            version_authority=_paid_version_authority(manager),
-            paid_location_launch_budget=_provider_free_paid_budget(
-                manager, {aws: 1}, aws_account_id='210987654321'))
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'L4': 1},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager, {aws: 1}, aws_account_id='210987654321'))
 
-    assert len(specs) == 1
-    assert specs[0].provider_account == '210987654321'
+    assert len(templates) == 1
+    assert templates[0].provider_account == '210987654321'
     assert paid_capacity.pool_key_payload(
-        specs[0].pool_key)['provider_identity'] == {
+        templates[0].pool_key)['provider_identity'] == {
             'aws_account_id': '210987654321'
         }
 
 
-def test_prepare_paid_launch_specs_without_aws_identity_keeps_gcp():
+def test_prepare_paid_launch_templates_without_aws_identity_keep_gcp():
     manager, gcp, _ = _provider_free_paid_manager()
     aws = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    aws.cloud = clouds.AWS()
     aws.instance_type = 'g6.xlarge'
     _set_paid_placer(manager, {aws: 0.1, gcp: 0.2})
-    account_scoped_pool_key = paid_capacity.pool_key
+    budget = _provider_free_paid_budget(manager, {
+        aws: 2,
+        gcp: 2,
+    },
+                                        service_remaining=2)
+    aws_pool_key = budget.pool_key_by_location.pop(aws)
+    budget.remaining_by_location.pop(aws)
+    budget.frontier_key_by_location.pop(aws)
+    budget.states_by_pool_key.pop(aws_pool_key)
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'L4': 1},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=budget)
 
-    def _pool_key_without_aws_identity(location, **kwargs):
-        if (str(location.cloud).casefold() == 'aws' and
-                kwargs.get('aws_account_id') is None):
-            raise ValueError('AWS identity unavailable')
-        return account_scoped_pool_key(location, **kwargs)
-
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={}), \
-         mock.patch.object(paid_capacity,
-                           'pool_key',
-                           side_effect=_pool_key_without_aws_identity):
-        specs = manager.prepare_paid_launch_specs(
-            accelerator_shapes={'L4': 1},
-            max_gpu_units_by_accelerator={'L4': 2},
-            max_candidates=2,
-            occupied_replica_ids=(),
-            version_authority=_paid_version_authority(manager),
-            paid_location_launch_budget=_provider_free_paid_budget(
-                manager, {
-                    aws: 2,
-                    gcp: 2,
-                }, service_remaining=2))
-
-    assert len(specs) == 2
-    assert all(
-        spec.cloud == 'gcp' and spec.provider_account is None for spec in specs)
+    assert len(templates) == 1
+    assert templates[0].cloud == 'gcp'
+    assert templates[0].provider_account is None
 
 
 def _fused_paid_binding(
@@ -2506,28 +2752,16 @@ def _fused_paid_binding(
 
 def test_materialize_paid_launch_receipt_builds_only_sparse_members():
     manager, _, _ = _provider_free_paid_manager()
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={}), \
-         mock.patch.object(paid_capacity, 'base_limit', return_value=2):
-        specs = manager.prepare_paid_launch_specs(
-            accelerator_shapes={'l4': 1},
-            max_gpu_units_by_accelerator={'l4': 2},
-            max_candidates=2,
-            occupied_replica_ids=(),
-            version_authority=_paid_version_authority(manager),
-            paid_location_launch_budget=_provider_free_paid_budget(
-                manager, {
-                    location: 1
-                    for location in manager._spot_placer.active_locations()
-                },
-                service_remaining=2))
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'l4': 1},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager, {
+                location: 1
+                for location in manager._spot_placer.active_locations()
+            },
+            service_remaining=2))
+    specs = _materialize_test_paid_launch_specs(manager, templates)
     selected = specs[1]
     member = paid_capacity.PaidLaunchReceiptMember(
         replica_id=selected.replica_id,
@@ -2609,23 +2843,12 @@ def test_materialize_paid_launch_receipt_builds_only_sparse_members():
 def _committed_paid_member_for_adoption():
     """Prepare one committed paid member plus its fused binding and row."""
     manager, cheap, _ = _provider_free_paid_manager()
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={}):
-        specs = manager.prepare_paid_launch_specs(
-            accelerator_shapes={'l4': 1},
-            max_gpu_units_by_accelerator={'l4': 1},
-            max_candidates=1,
-            occupied_replica_ids=(),
-            version_authority=_paid_version_authority(manager),
-            paid_location_launch_budget=_provider_free_paid_budget(
-                manager, {cheap: 1}, service_remaining=1))
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'l4': 1},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager, {cheap: 1}, service_remaining=1))
+    specs = _materialize_test_paid_launch_specs(manager, templates)
     spec = specs[0]
     member = paid_capacity.PaidLaunchReceiptMember(
         replica_id=spec.replica_id,
@@ -2779,27 +3002,16 @@ def test_paid_publication_refuses_foreign_local_request_identity():
 
 def test_paid_materialization_failure_recovers_complete_sparse_receipt():
     manager, _, _ = _provider_free_paid_manager()
-    with mock.patch.object(manager,
-                           '_task_template_for_version',
-                           return_value=mock.Mock()), \
-         mock.patch.object(replica_managers,
-                           '_get_resources_ports',
-                           return_value='8080'), \
-         mock.patch.object(replica_managers.skypilot_config,
-                           'to_dict',
-                           return_value={}):
-        specs = manager.prepare_paid_launch_specs(
-            accelerator_shapes={'l4': 1},
-            max_gpu_units_by_accelerator={'l4': 2},
-            max_candidates=2,
-            occupied_replica_ids=(),
-            version_authority=_paid_version_authority(manager),
-            paid_location_launch_budget=_provider_free_paid_budget(
-                manager, {
-                    location: 1
-                    for location in manager._spot_placer.active_locations()
-                },
-                service_remaining=2))
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'l4': 1},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager, {
+                location: 1
+                for location in manager._spot_placer.active_locations()
+            },
+            service_remaining=2))
+    specs = _materialize_test_paid_launch_specs(manager, templates)
     members = tuple(
         paid_capacity.PaidLaunchReceiptMember(
             replica_id=spec.replica_id,
@@ -13250,30 +13462,49 @@ class TestLogicalCapacityPlanning:
         assert (replica_managers.exact_accelerator_shapes_from_resources(
             resources) == {})
 
-    def test_logical_preflight_rejects_conflicting_same_card_widths(self):
+    def test_logical_card_units_ignore_physical_catalog_widths(self):
         resources = [
             types.SimpleNamespace(accelerators={'L4': 1}),
             types.SimpleNamespace(accelerators={'l4': 8}),
         ]
-        task = types.SimpleNamespace(resources=resources,
-                                     service=types.SimpleNamespace(pool=False),
-                                     num_nodes=1)
-        spec = types.SimpleNamespace(
-            uses_logical_replicas=True,
-            placement_contract=types.SimpleNamespace(enabled=True),
-        )
 
-        with mock.patch.object(replica_managers.serve_state,
-                               'get_yaml_content',
-                               return_value='service: {}'), \
-             mock.patch.object(replica_managers,
-                               'load_task_with_service_spec',
-                               return_value=task), \
-             mock.patch.object(replica_managers.serve_utils,
-                               'resolve_replica_ingress_port'), \
-             pytest.raises(ValueError,
-                           match='exactly one physical whole-GPU width'):
-            replica_managers.validate_service_update_preflight('svc', 1, spec)
+        assert replica_managers.logical_accelerator_card_units_from_resources(
+            resources) == {
+                'L4': 1
+            }
+
+    @pytest.mark.parametrize('seed_width', [1, 8])
+    def test_logical_card_unit_is_one_for_every_whole_gpu_seed(
+            self, seed_width):
+        resources = [types.SimpleNamespace(accelerators={'L4': seed_width})]
+
+        assert replica_managers.logical_accelerator_card_units_from_resources(
+            resources) == {
+                'L4': 1
+            }
+
+    def test_current_multi_gpu_replica_uses_planned_physical_width(self):
+        info = replica_managers.ReplicaInfo(
+            replica_id=1,
+            cluster_name='svc-1',
+            replica_port='8000',
+            is_spot=True,
+            location=None,
+            version=1,
+            resources_override={'accelerators': {
+                'L4': 8
+            }},
+            planned_capacity=8)
+
+        assert (replica_managers.SkyPilotReplicaManager.
+                _logical_replica_accelerator(
+                    info, (('L4', 1),), require_configured_shape=True) == 'L4')
+
+        info.planned_capacity = 7
+        assert (replica_managers.SkyPilotReplicaManager.
+                _logical_replica_accelerator(info, (('L4', 1),),
+                                             require_configured_shape=True)
+                is None)
 
     @pytest.mark.parametrize('accelerators,expected', [
         ({

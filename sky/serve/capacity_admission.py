@@ -52,6 +52,7 @@ from sky.utils.db import db_utils
 if TYPE_CHECKING:
     from sky.serve import serve_history
     from sky.serve.ordinary_launch_binding import ControllerBindingAuthority
+    from sky.serve.paid_launch_request import PaidLaunchBodyTemplate
     from sky.serve.paid_launch_request import ReplicaLaunchRuntime
     from sky.serve.reserved_fill_planner import AuthenticatedAllocationMap
     from sky.serve.reserved_fill_planner import FillCapacityUnit
@@ -900,10 +901,9 @@ class CapacityPlanInput:
 class CapacityPlanDecision:
     """Pure planner output for one locked current demand/supply snapshot.
 
-    The repository owns every durable identity and inventory field.  A planner
-    may return only the exact-card target plus the three derived autoscaler
-    fields that are intentionally embedded in ``normalized_demand`` for later
-    claim verification.
+    The repository owns every durable identity and inventory field.  The
+    callback therefore returns policy only; it cannot nominate the digest
+    against which its own result will be checked.
     """
 
     capacity_target_by_accelerator: Mapping[str, int]
@@ -1052,7 +1052,7 @@ class PaidLaunchAuthority:
     paid_launch_target_by_accelerator: tuple[tuple[str, int], ...]
     reserved_fill_authority: ReservedFillPlanAuthority
     capacity_unit: capacity_planning.CapacityUnit
-    physical_gpu_width_by_accelerator: tuple[tuple[str, int], ...]
+    planning_capacity_quantum_by_accelerator: tuple[tuple[str, int], ...]
     backend_num_nodes: int = 1
 
     def economic_residual(self) -> dict[str, int]:
@@ -1067,7 +1067,7 @@ class PaidLaunchAuthority:
         card = accelerator.casefold()
         widths = {
             raw_card.casefold(): width
-            for raw_card, width in self.physical_gpu_width_by_accelerator
+            for raw_card, width in self.planning_capacity_quantum_by_accelerator
         }
         physical_width = widths.get(card)
         if (type(physical_width) is not int or physical_width < 1 or  # pylint: disable=unidiomatic-typecheck
@@ -1243,6 +1243,7 @@ class CommittedCapacityPlan:
     allocation_map: AuthenticatedAllocationMap | None
     paid_launch_receipt: serve_paid_capacity.PaidLaunchReceipt
     paid_launch_bindings: tuple[FusedBindingReceiptMember, ...]
+    paid_launch_specs: tuple[serve_paid_capacity.PaidLaunchSpec, ...] = ()
 
     def __post_init__(self) -> None:
         if (not isinstance(self.authority, PaidLaunchAuthority) or
@@ -1258,6 +1259,9 @@ class CommittedCapacityPlan:
                 any(not isinstance(
                     binding, paid_wave_admission.FusedBindingReceiptMember)
                     for binding in self.paid_launch_bindings) or
+                type(self.paid_launch_specs) is not tuple or
+                any(not isinstance(spec, serve_paid_capacity.PaidLaunchSpec)
+                    for spec in self.paid_launch_specs) or
                 self.candidate.snapshot_fingerprint
                 != self.planner_snapshot.fingerprint):
             raise ValueError('Committed capacity plan is malformed.')
@@ -1276,6 +1280,11 @@ class CommittedCapacityPlan:
                      (binding.replica_id, binding.replica_record_id)
                      for binding in self.paid_launch_bindings):
             raise ValueError('Committed paid launch bindings are incomplete.')
+        if tuple((member.replica_id, member.replica_record_id)
+                 for member in receipt.members) != tuple(
+                     (spec.replica_id, spec.replica_record_id)
+                     for spec in self.paid_launch_specs):
+            raise ValueError('Committed paid launch specs are incomplete.')
         if self.allocation_map is not None and not isinstance(
                 self.allocation_map,
                 reserved_fill_planner.AuthenticatedAllocationMap):
@@ -1439,6 +1448,7 @@ class ReservedSupplyProjection:
     economic_replica_infos: tuple[Any, ...]
     economic_kueue_capacity: (kueue_lane_capacity.KueueReplicaCapacitySnapshot)
     economic_capacity_graph_sha256: str
+    planner_replica_projection_sha256: str
     existing_zero_cost_capacity_by_accelerator: Mapping[str, int] = (
         dataclasses.field(default_factory=dict))
     existing_paid_capacity_by_accelerator: Mapping[str,
@@ -1487,7 +1497,10 @@ class ReservedSupplyProjection:
                 not isinstance(self.economic_kueue_capacity,
                                kueue_lane_capacity.KueueReplicaCapacitySnapshot)
                 or not isinstance(self.economic_capacity_graph_sha256, str) or
-                _SHA256_RE.fullmatch(self.economic_capacity_graph_sha256)
+                _SHA256_RE.fullmatch(
+                    self.economic_capacity_graph_sha256) is None or
+                not isinstance(self.planner_replica_projection_sha256, str) or
+                _SHA256_RE.fullmatch(self.planner_replica_projection_sha256)
                 is None or not isinstance(self.fill_policy_sha256, str) or
                 _SHA256_RE.fullmatch(self.fill_policy_sha256) is None or
                 not isinstance(self.reservation_evidence_sha256, str) or
@@ -1603,7 +1616,6 @@ def _validate_planner_against_locked_supply(
     reservation_commitment: Mapping[str, int],
     static_fill_target: Mapping[str, int],
     supply_projection: ReservedSupplyProjection | None,
-    expected_planner_input_fingerprint: str | None,
 ) -> None:
     """Bind a pure planner envelope to the PostgreSQL-locked supply facts."""
     configured_cards = {
@@ -1613,13 +1625,13 @@ def _validate_planner_against_locked_supply(
             configured_cards != accounting_cards):
         raise CapacityAdmissionConflict(
             'Planner snapshot names a different service version or card set.')
-    expected_source_fingerprint = expected_planner_input_fingerprint
-    if supply_projection is not None:
-        expected_source_fingerprint = locked_planning_source_fingerprint(
-            expected_source_fingerprint,
-            supply_projection.economic_capacity_graph_sha256)
-    if (expected_source_fingerprint is not None and
-            planner_snapshot.source_fingerprint != expected_source_fingerprint):
+    if supply_projection is None:
+        raise CapacityAdmissionConflict(
+            'Planner has no repository-owned locked supply projection.')
+    expected_source_fingerprint = locked_planning_source_fingerprint(
+        supply_projection.planner_replica_projection_sha256,
+        supply_projection.economic_capacity_graph_sha256)
+    if planner_snapshot.source_fingerprint != expected_source_fingerprint:
         raise CapacityAdmissionConflict(
             'Planner snapshot names a different locked planning or scheduler '
             'capacity state.')
@@ -1940,8 +1952,8 @@ def _authority(
         reserved_fill_authority=reserved_fill_authority,
         capacity_unit=candidate.capacity_unit,
         backend_num_nodes=candidate.backend_num_nodes,
-        physical_gpu_width_by_accelerator=tuple(
-            candidate.physical_gpu_width_by_accelerator.entries))
+        planning_capacity_quantum_by_accelerator=tuple(
+            candidate.planning_capacity_quantum_by_accelerator.entries))
 
 
 def _validate_reserved_fill_authority_in_connection(
@@ -2044,9 +2056,9 @@ class _ReservedFillServiceConfig:
 
 @dataclasses.dataclass(frozen=True)
 class _PreparedPaidLaunchPreflight:
-    """Validated paid request bytes fenced to one advisory source read."""
+    """Validated identity-free catalog fenced to one advisory source read."""
 
-    specs: tuple[serve_paid_capacity.PaidLaunchSpec, ...]
+    templates: tuple[serve_paid_capacity.PaidLaunchTemplate, ...]
     replica_port: str
     binding_authority: ControllerBindingAuthority
     resource_scope: str
@@ -2854,8 +2866,9 @@ def _economic_capacity_graph_snapshot(
     lane_projection: kueue_lane_capacity.KueueAdmissionCapacityProjection,
     *,
     service_version: int,
+    capacity_unit: FillCapacityUnit,
 ) -> tuple[tuple[Any, ...], kueue_lane_capacity.KueueReplicaCapacitySnapshot,
-           str]:
+           str, str]:
     """Decode supply and fingerprint only reserved-side economic semantics.
 
     Paid replicas are deliberately absent from the fingerprint.  Publishing a
@@ -3013,7 +3026,42 @@ def _economic_capacity_graph_snapshot(
             [list(shape) for shape in lane_projection.unknown_shapes]),
         'unbounded_unknown': lane_projection.unbounded_unknown,
     })
-    return tuple(replica_infos), capacity_snapshot, digest
+    planner_material = []
+    for info in sorted(replica_infos, key=lambda item: item.replica_id):
+        try:
+            record_id = str(uuid.UUID(str(info.replica_record_id)))
+            shape = spot_placer.durable_exact_accelerator_shape(
+                getattr(info, 'location', None),
+                getattr(info, 'resources_override', None))
+        except (TypeError, ValueError, AttributeError) as error:
+            raise CapacityAdmissionConflict(
+                'Planner replica projection has malformed immutable identity '
+                'or shape.') from error
+        expected_capacity = (
+            None if shape is None else shape[1] if capacity_unit
+            is reserved_fill_planner.FillCapacityUnit.LOGICAL else 1)
+        if (not info.is_terminal and
+            (shape is None or info.planned_capacity != expected_capacity)):
+            # The promoted path accounts logical GPU slots.  A live row whose
+            # durable physical width and planner debit differ can otherwise
+            # suppress or manufacture a paid residual.  Cleanup-proven
+            # terminal history remains readable because it has no capacity
+            # effect and is needed only for quiescence bookkeeping.
+            raise CapacityAdmissionConflict(
+                'Live planner replica has no exact capacity shape.')
+        planner_material.append({
+            'replica_id': info.replica_id,
+            'replica_record_id': record_id,
+            'service_version': info.version,
+            'cluster_name': info.cluster_name,
+            'exact_gpu_shape': shape,
+            'durable_gpu_shape': shape,
+            'planned_capacity': info.planned_capacity,
+        })
+    planner_digest = hashlib.sha256(
+        json.dumps(planner_material, sort_keys=True,
+                   separators=(',', ':')).encode('utf-8')).hexdigest()
+    return tuple(replica_infos), capacity_snapshot, digest, planner_digest
 
 
 def _replica_service_ceiling_capacity(
@@ -3176,7 +3224,8 @@ def _planner_bound_pool_shape(
     pool_key: Any,
     candidate: capacity_planning.CapacityPlanCandidate,
     debit_accelerator: str,
-) -> serve_paid_capacity.PhysicalBackendShape:
+    placement_contract: placement_policy.PlacementContract,
+) -> tuple[serve_paid_capacity.PhysicalBackendShape, int]:
     """Decode and bind one relational pool to immutable planner shape."""
     try:
         pool_shape = serve_paid_capacity.paid_pool_gpu_shape(pool_key)
@@ -3189,15 +3238,17 @@ def _planner_bound_pool_shape(
         expected_shape = serve_paid_capacity.PhysicalBackendShape(
             accelerator=expected_card,
             gpu_units_per_node=(
-                candidate.physical_gpu_width_by_accelerator.get(expected_card)),
+                candidate.planning_capacity_quantum_by_accelerator.get(
+                    expected_card)),
             num_nodes=candidate.backend_num_nodes)
+        plan_units = serve_paid_capacity.paid_launch_plan_units(
+            contract=placement_contract,
+            configured_shape=expected_shape,
+            candidate_shape=pool_shape)
     except serve_paid_capacity.PaidGPUAttributionError as error:
         raise CapacityAdmissionConflict(
             'Planner-bound paid claim provider pool is malformed.') from error
-    if pool_shape != expected_shape:
-        raise CapacityAdmissionConflict(
-            'Paid claim provider pool contradicts its immutable backend shape.')
-    return pool_shape
+    return pool_shape, plan_units
 
 
 def _plan_claim_projection(
@@ -3209,6 +3260,7 @@ def _plan_claim_projection(
     accounting_cards: set[str],
     capacity_unit: capacity_planning.CapacityUnit | None,
     candidate: capacity_planning.CapacityPlanCandidate | None = None,
+    placement_contract: placement_policy.PlacementContract | None = None,
 ) -> _PlanClaimProjection:
     """Read one locked typed claim projection for units and physical debit."""
     units = {card: 0 for card in accounting_cards}
@@ -3238,9 +3290,18 @@ def _plan_claim_projection(
                     exact_card_matches = (card == AGGREGATE_ACCELERATOR or
                                           pool_shape.accelerator
                                           == card.casefold())
+                    expected_plan_units = (
+                        1 if capacity_unit
+                        is capacity_planning.CapacityUnit.PHYSICAL_BACKEND else
+                        pool_shape.gpu_units_per_node)
                 else:
-                    pool_shape = _planner_bound_pool_shape(
-                        row['pool_key'], candidate, card)
+                    if placement_contract is None:
+                        raise CapacityAdmissionConflict(
+                            'Planner-bound paid claim has no placement '
+                            'contract.')
+                    pool_shape, expected_plan_units = (
+                        _planner_bound_pool_shape(row['pool_key'], candidate,
+                                                  card, placement_contract))
                     exact_card_matches = True
             except (serve_paid_capacity.PaidGPUAttributionError,
                     CapacityAdmissionConflict) as error:
@@ -3250,12 +3311,11 @@ def _plan_claim_projection(
                 raise CapacityAdmissionConflict(
                     'Planner-bound claim attribution is malformed.')
             if (capacity_unit is capacity_planning.CapacityUnit.PHYSICAL_BACKEND
-                    and count != 1):
+                    and count != expected_plan_units):
                 raise CapacityAdmissionConflict(
                     'Physical-backend claim attribution is malformed.')
             if (capacity_unit is capacity_planning.CapacityUnit.LOGICAL_GPU and
-                (pool_shape.num_nodes != 1 or
-                 count != pool_shape.gpu_units_per_node)):
+                    count != expected_plan_units):
                 raise CapacityAdmissionConflict(
                     'Logical-GPU claim attribution is malformed.')
             physical_gpu_units += pool_shape.total_gpu_units
@@ -4066,6 +4126,182 @@ def service_name_has_terminal_absence_authority_in_connection(
     return all(row['service_hash'] == service['hash'] for row in waiters)
 
 
+def _canonical_prepared_paid_launch_templates(
+    value: Sequence[serve_paid_capacity.PaidLaunchTemplate],
+    *,
+    service: Mapping[str, Any],
+    service_name: str,
+    service_hash: str,
+    service_lifecycle_epoch: int,
+    service_version: int,
+    accounting_cards: Mapping[str, int],
+    backend_num_nodes: int,
+    locked_version: _LockedPaidLaunchVersionAuthority | None,
+    launch_runtime: ReplicaLaunchRuntime,
+) -> tuple[tuple[serve_paid_capacity.PaidLaunchTemplate, ...], str | None]:
+    """Validate the identity-free provider catalog used by locked expansion."""
+    if (not isinstance(value, Sequence) or isinstance(value,
+                                                      (str, bytes, bytearray))):
+        raise ValueError('Prepared paid launch templates must be a sequence.')
+    templates = tuple(value)
+    if any(not isinstance(item, serve_paid_capacity.PaidLaunchTemplate)
+           for item in templates):
+        raise ValueError('Prepared paid launch template is malformed.')
+    if not templates:
+        return (), None
+    if locked_version is None:
+        raise CapacityAdmissionConflict(
+            'Elected version has no immutable paid launch authority.')
+    if not isinstance(launch_runtime, paid_launch_request.ReplicaLaunchRuntime):
+        raise CapacityAdmissionConflict(
+            'Prepared paid launch has no frozen runtime inputs.')
+    workspace = service.get('workspace')
+    if not isinstance(workspace, str) or not workspace:
+        raise CapacityAdmissionConflict(
+            'Paid launch requires an exact service workspace.')
+    try:
+        controller_config = locked_version.controller_config
+        controller_config_digest = locked_version.controller_config_digest
+        controller_config_snapshot_id = (
+            locked_version.controller_config_snapshot_id)
+        if (not isinstance(controller_config, bytes) or
+                not isinstance(controller_config_digest, str) or
+                not isinstance(controller_config_snapshot_id, str)):
+            raise ValueError('Elected version controller config is absent.')
+        expected_version_authority = (
+            serve_paid_capacity.PaidLaunchVersionAuthority(
+                service_spec=locked_version.service_spec,
+                service_spec_sha256=hashlib.sha256(
+                    locked_version.service_spec).hexdigest(),
+                controller_config=controller_config,
+                controller_config_digest=controller_config_digest,
+                controller_config_snapshot_id=controller_config_snapshot_id))
+        frozen_controller_config = (
+            serve_utils.parse_and_validate_version_controller_config(
+                controller_config, workspace,
+                'locked paid launch controller config'))
+        if (not isinstance(locked_version.launch_yaml_content, str) or
+                not locked_version.launch_yaml_content or
+                not isinstance(locked_version.placement_catalog, Mapping)):
+            raise ValueError('Elected version launch inputs are absent.')
+        catalog_payload = dict(locked_version.placement_catalog)
+        catalog_sha256 = serve_paid_capacity.paid_launch_payload_sha256(
+            catalog_payload)
+        catalog = spot_placer.PlacementCatalog.from_dict(catalog_payload)
+        if catalog.num_nodes != backend_num_nodes:
+            raise ValueError('Placement catalog has a different node count.')
+        launch_spec = pickle.loads(expected_version_authority.service_spec)
+        launch_task = serve_utils.load_task_with_service_spec(
+            locked_version.launch_yaml_content, launch_spec)
+        if launch_task.service is None:
+            raise ValueError('Elected version has no service policy.')
+        replica_port = serve_utils.resolve_replica_ingress_port(
+            launch_task, pool=launch_task.service.pool)
+        ranked_catalog = catalog.ranked_entries(
+            locked_version.placement_contract)
+        catalog_by_location = {
+            entry.location: entry for entry in ranked_catalog
+        }
+        gcp_project_id_by_location = (
+            serve_paid_capacity.resolve_gcp_project_ids_for_locations(
+                catalog_by_location,
+                workspace=workspace,
+                frozen_controller_config=frozen_controller_config))
+    except (TypeError, ValueError) as error:
+        raise CapacityAdmissionConflict(
+            'Elected version paid launch authority is malformed.') from error
+    resource_scope = service.get('resource_scope')
+    if (not isinstance(resource_scope, str) or not resource_scope or
+            resource_scope != service_hash):
+        raise CapacityAdmissionConflict(
+            'Paid launch requires the current incarnation resource scope.')
+    expected_identity = (service_name, service_hash, service_lifecycle_epoch,
+                         service_version)
+    previous_rank = -1
+    seen_pool_keys: set[str] = set()
+    for template in templates:
+        if ((template.service_name, template.service_hash,
+             template.service_lifecycle_epoch, template.service_version)
+                != expected_identity or template.workspace != workspace or
+                template.accelerator not in accounting_cards or
+                template.num_nodes != backend_num_nodes or
+                template.version_authority != expected_version_authority or
+                template.placement_catalog_sha256 != catalog_sha256 or
+                template.catalog_rank <= previous_rank or
+                template.pool_key in seen_pool_keys):
+            raise CapacityAdmissionConflict(
+                'Prepared paid launch catalog is stale or noncanonical.')
+        try:
+            serve_paid_capacity.paid_launch_plan_units(
+                contract=locked_version.placement_contract,
+                configured_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=template.accelerator,
+                    gpu_units_per_node=accounting_cards[template.accelerator],
+                    num_nodes=backend_num_nodes),
+                candidate_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=template.accelerator,
+                    gpu_units_per_node=template.gpu_units_per_node,
+                    num_nodes=template.num_nodes))
+            stored_override = serve_paid_capacity.thaw_paid_launch_payload(
+                template.resources_override)
+            decoded_override = spot_placer.decode_resources_override(
+                stored_override)
+            location = spot_placer.Location.from_resources_override(
+                decoded_override)
+            if location is None:
+                raise ValueError('Paid launch location is absent.')
+            catalog_entry = catalog_by_location.get(location)
+            if catalog_entry is None:
+                raise ValueError('Paid launch location is not in the catalog.')
+            canonical_override = catalog_entry.location.to_dict()
+            canonical_override['cloud'] = str(
+                catalog_entry.location.cloud).casefold()
+            canonical_stored_override = (
+                spot_placer.encode_resources_override(canonical_override))
+            expected_pool_key = serve_paid_capacity.pool_key(
+                location,
+                workspace=template.workspace,
+                num_nodes=template.num_nodes,
+                aws_account_id=template.provider_account,
+                gcp_project_id=gcp_project_id_by_location.get(location))
+            expected_body_template = (
+                paid_launch_request.prepare_paid_launch_body_template(
+                    yaml_content=locked_version.launch_yaml_content,
+                    authoritative_service_spec=launch_spec,
+                    frozen_controller_config=frozen_controller_config,
+                    resources_override=catalog_entry.location.to_dict(),
+                    workspace=template.workspace,
+                    service_name=template.service_name,
+                    runtime=launch_runtime,
+                    task_template=launch_task))
+        except (TypeError, ValueError) as error:
+            raise CapacityAdmissionConflict(
+                'Prepared paid launch catalog member is malformed.') from error
+        if (catalog_entry.rank != template.catalog_rank or
+                catalog_entry.location.use_spot is not True or
+                str(catalog_entry.location.cloud).casefold() not in ('aws',
+                                                                     'gcp') or
+                not math.isfinite(catalog_entry.hourly_cost) or
+                catalog_entry.hourly_cost <= 0 or
+                not math.isfinite(catalog_entry.normalized_hourly_cost) or
+                catalog_entry.normalized_hourly_cost <= 0 or
+                canonical_stored_override != stored_override or
+                expected_body_template.submitted_bytes
+                != template.prepared_launch_body_template or
+                expected_pool_key != template.pool_key or
+                serve_paid_capacity.frontier_key(location)
+                != template.frontier_key or
+            (template.cloud == 'gcp' and template.provider_project_id
+             != gcp_project_id_by_location.get(location)) or
+                not isinstance(replica_port, str) or not replica_port):
+            raise CapacityAdmissionConflict(
+                'Prepared paid launch catalog disagrees with the elected '
+                'version.')
+        previous_rank = template.catalog_rank
+        seen_pool_keys.add(template.pool_key)
+    return templates, replica_port
+
+
 def _canonical_prepared_paid_launch_specs(
     value: Sequence[serve_paid_capacity.PaidLaunchSpec],
     *,
@@ -4077,7 +4313,7 @@ def _canonical_prepared_paid_launch_specs(
     accounting_cards: Mapping[str, int],
     backend_num_nodes: int,
     locked_version: _LockedPaidLaunchVersionAuthority | None,
-    launch_runtime: ReplicaLaunchRuntime | None,
+    launch_body_templates_by_pool_key: Mapping[str, PaidLaunchBodyTemplate],
 ) -> tuple[tuple[serve_paid_capacity.PaidLaunchSpec, ...], str | None]:
     """Validate the provider-free candidate lock superset."""
     if (not isinstance(value, Sequence) or isinstance(value,
@@ -4098,9 +4334,13 @@ def _canonical_prepared_paid_launch_specs(
     if locked_version is None:
         raise CapacityAdmissionConflict(
             'Elected version has no immutable paid launch authority.')
-    if not isinstance(launch_runtime, paid_launch_request.ReplicaLaunchRuntime):
+    if (not isinstance(launch_body_templates_by_pool_key, Mapping) or any(
+            not isinstance(pool_key, str) or not pool_key or
+            not isinstance(template, paid_launch_request.PaidLaunchBodyTemplate)
+            for pool_key, template in launch_body_templates_by_pool_key.items())
+       ):
         raise CapacityAdmissionConflict(
-            'Prepared paid launch has no frozen runtime inputs.')
+            'Prepared paid launch has no canonical body templates.')
     workspace = service.get('workspace')
     if not isinstance(workspace, str) or not workspace:
         raise CapacityAdmissionConflict(
@@ -4191,12 +4431,21 @@ def _canonical_prepared_paid_launch_specs(
         if ((spec.service_name, spec.service_hash, spec.service_lifecycle_epoch,
              spec.service_version) != expected or spec.workspace != workspace or
                 spec.accelerator not in accounting_cards or
-                spec.gpu_units_per_node != accounting_cards[spec.accelerator] or
                 spec.num_nodes != backend_num_nodes):
             raise CapacityAdmissionConflict(
                 'Prepared paid launch identity changed before admission.')
         evidence = spec.catalog_evidence
         try:
+            serve_paid_capacity.paid_launch_plan_units(
+                contract=locked_version.placement_contract,
+                configured_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=spec.accelerator,
+                    gpu_units_per_node=accounting_cards[spec.accelerator],
+                    num_nodes=backend_num_nodes),
+                candidate_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=spec.accelerator,
+                    gpu_units_per_node=spec.gpu_units_per_node,
+                    num_nodes=spec.num_nodes))
             worker = serve_paid_capacity.thaw_paid_launch_payload(
                 spec.worker_construction)
             stored_override = serve_paid_capacity.thaw_paid_launch_payload(
@@ -4270,7 +4519,6 @@ def _canonical_prepared_paid_launch_specs(
             raise CapacityAdmissionConflict(
                 'Prepared paid launch disagrees with the elected catalog.')
         assert catalog_entry is not None
-        runtime_override = catalog_entry.location.to_dict()
         try:
             launch_fence = ordinary_launch_binding.build_paid_launch_fence(
                 service_name=service_name,
@@ -4284,19 +4532,15 @@ def _canonical_prepared_paid_launch_specs(
                 controller_owner_epoch=service['controller_owner_epoch'],
                 controller_pid=service['controller_pid'],
                 controller_ip=service['controller_ip'])
+            body_template = launch_body_templates_by_pool_key.get(spec.pool_key)
+            if body_template is None:
+                raise ValueError('Paid launch body template is absent.')
             expected_prepared_request = (
-                paid_launch_request.prepare_paid_launch_request(
-                    yaml_content=locked_version.launch_yaml_content,
-                    authoritative_service_spec=launch_spec,
-                    frozen_controller_config=frozen_controller_config,
-                    resources_override=runtime_override,
+                paid_launch_request.materialize_paid_launch_request(
+                    body_template,
                     replica_id=spec.replica_id,
                     cluster_name=spec.cluster_name_seed,
-                    workspace=workspace,
-                    service_name=service_name,
-                    launch_fence=launch_fence,
-                    runtime=launch_runtime,
-                    task_template=launch_task))
+                    launch_fence=launch_fence))
         except Exception as error:  # pylint: disable=broad-except
             raise CapacityAdmissionConflict(
                 'Prepared paid executable cannot be rebuilt from its locked '
@@ -4347,7 +4591,7 @@ def _canonical_prepared_paid_launch_specs(
 
 def _prepare_paid_launch_preflight(
     engine: sqlalchemy.engine.Engine,
-    value: Sequence[serve_paid_capacity.PaidLaunchSpec],
+    value: Sequence[serve_paid_capacity.PaidLaunchTemplate],
     *,
     service_name: str,
     service_hash: str,
@@ -4358,7 +4602,7 @@ def _prepare_paid_launch_preflight(
     accounting_cards: Mapping[str, int],
     backend_num_nodes: int,
 ) -> _PreparedPaidLaunchPreflight:
-    """Validate paid request bytes before taking correctness locks.
+    """Validate identity-free catalog members before correctness locks.
 
     This advisory read cannot authorize a launch.  The correctness transaction
     compares the complete service binding authority and immutable version facts
@@ -4402,7 +4646,7 @@ def _prepare_paid_launch_preflight(
     if not binding_authority.generic_launches_required:
         raise CapacityAdmissionConflict(
             'Prepared paid launch requires generic request authority.')
-    specs, replica_port = _canonical_prepared_paid_launch_specs(
+    templates, replica_port = _canonical_prepared_paid_launch_templates(
         value,
         service=service,
         service_name=service_name,
@@ -4414,20 +4658,12 @@ def _prepare_paid_launch_preflight(
         locked_version=locked_version,
         launch_runtime=launch_runtime)
     assert replica_port is not None
-    try:
-        paid_wave_admission.validate_prepared_specs(specs, binding_authority)
-    except (ordinary_launch_binding.OrdinaryLaunchBindingUnavailable,
-            ordinary_launch_binding.OrdinaryLaunchBindingConflict,
-            ValueError) as error:
-        raise CapacityAdmissionConflict(
-            'Prepared paid executable admission was rejected: '
-            f'{error}') from error
     resource_scope = service.get('resource_scope')
     if not isinstance(resource_scope, str) or not resource_scope:
         raise CapacityAdmissionConflict(
             'Paid launch requires the current incarnation resource scope.')
     return _PreparedPaidLaunchPreflight(
-        specs=specs,
+        templates=templates,
         replica_port=replica_port,
         binding_authority=binding_authority,
         resource_scope=resource_scope,
@@ -4487,11 +4723,11 @@ def _resolve_locked_policy_history(
             prior_snapshot, candidate = capacity_planning.decode_planner_envelope(
                 payload.get('planner'))
             prior_shapes = _canonical_counts(
-                prior_snapshot.physical_gpu_width_by_accelerator.as_dict(),
-                'prior planner physical_gpu_width_by_accelerator')
+                prior_snapshot.planning_capacity_quantum_by_accelerator.as_dict(
+                ), 'prior planner planning_capacity_quantum_by_accelerator')
             candidate_shapes = _canonical_counts(
-                candidate.physical_gpu_width_by_accelerator.as_dict(),
-                'prior candidate physical_gpu_width_by_accelerator')
+                candidate.planning_capacity_quantum_by_accelerator.as_dict(),
+                'prior candidate planning_capacity_quantum_by_accelerator')
         except ValueError as error:
             raise CapacityAdmissionConflict(
                 'Current capacity policy is not strict format 6.') from error
@@ -4554,7 +4790,7 @@ def _resolve_locked_policy_history(
             last_reduced_demand_generation=0,
             capacity_unit=capacity_unit,
             maximum_capacity=config.max_capacity,
-            physical_gpu_width_by_accelerator=(
+            planning_capacity_quantum_by_accelerator=(
                 capacity_planning.AcceleratorCapacity.from_mapping(
                     accounting_cards)),
             backend_num_nodes=backend_num_nodes)
@@ -4628,6 +4864,7 @@ def _prepare_paid_admission_candidates(
     frontier_limit: int,
     replica_port: str,
     created_at: float,
+    placement_contract: placement_policy.PlacementContract,
 ) -> tuple[_PreparedPaidAdmission, ...]:
     """Materialize the state-aware target-compatible launch candidates."""
     if candidate.reserved_launch_target.total() > 0:
@@ -4641,19 +4878,31 @@ def _prepare_paid_admission_candidates(
         for card, _ in candidate.paid_launch_target.entries
     }
     physical_widths = {
-        card.casefold(): width
-        for card, width in candidate.physical_gpu_width_by_accelerator.entries
+        card.casefold(): width for card, width in
+        candidate.planning_capacity_quantum_by_accelerator.entries
     }
     candidates = []
     for launch_spec in prepared_specs:
         card = launch_spec.accelerator.casefold()
-        if (physical_widths.get(card) != launch_spec.gpu_units_per_node or
-                candidate.backend_num_nodes != launch_spec.num_nodes):
+        planning_quantum = physical_widths.get(card)
+        if planning_quantum is None:
             raise CapacityAdmissionConflict(
-                'Prepared paid launch contradicts the planned backend shape.')
-        plan_units = (1 if candidate.capacity_unit
-                      is capacity_planning.CapacityUnit.PHYSICAL_BACKEND else
-                      launch_spec.gpu_units_per_node)
+                'Prepared paid launch names an unplanned accelerator.')
+        try:
+            plan_units = serve_paid_capacity.paid_launch_plan_units(
+                contract=placement_contract,
+                configured_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=card,
+                    gpu_units_per_node=planning_quantum,
+                    num_nodes=candidate.backend_num_nodes),
+                candidate_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=card,
+                    gpu_units_per_node=launch_spec.gpu_units_per_node,
+                    num_nodes=launch_spec.num_nodes))
+        except serve_paid_capacity.PaidGPUAttributionError as error:
+            raise CapacityAdmissionConflict(
+                'Prepared paid launch contradicts the placement contract.') \
+                from error
         if target.get(card, 0) < plan_units:
             continue
         persistence_spec = launch_spec.persistence_spec(
@@ -4673,6 +4922,195 @@ def _prepare_paid_admission_candidates(
                 plan_units=plan_units,
                 physical_gpu_units=launch_spec.physical_gpu_units))
     return tuple(candidates)
+
+
+def _materialize_locked_paid_launch_specs(
+    *,
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    preflight: _PreparedPaidLaunchPreflight | None,
+    locked_version: _LockedPaidLaunchVersionAuthority | None,
+    candidate: capacity_planning.CapacityPlanCandidate,
+    paid_context: Any,
+    first_replica_id: int,
+) -> tuple[serve_paid_capacity.PaidLaunchSpec, ...]:
+    """Expand immutable catalog templates against the locked paid baseline.
+
+    This is the only identity allocator for promoted paid admission.  It runs
+    after the service, replica, association, claim, waiter, and exact-pool rows
+    have been locked and after the pure planner has chosen its target.
+    """
+    if preflight is None or candidate.reserved_launch_target.total() > 0:
+        return ()
+    if (locked_version is None or not isinstance(first_replica_id, int) or
+            isinstance(first_replica_id, bool) or first_replica_id < 1):
+        raise CapacityAdmissionConflict(
+            'Locked paid launch materialization has no version or identity '
+            'baseline.')
+    target = {
+        card.casefold(): units
+        for card, units in candidate.paid_launch_target.entries
+    }
+    if not any(target.values()):
+        return ()
+    try:
+        body_templates = {
+            template.pool_key: paid_launch_request.PaidLaunchBodyTemplate(
+                submitted_bytes=template.prepared_launch_body_template
+            ) for template in preflight.templates
+        }
+    except (TypeError, ValueError) as error:
+        raise CapacityAdmissionConflict(
+            'Locked paid launch executable authority is malformed.') from error
+
+    remaining = dict(target)
+    occurrence_by_rank: dict[int, int] = {}
+    prepared: list[serve_paid_capacity.PaidLaunchSpec] = []
+    next_replica_id = first_replica_id
+    transaction_now = paid_context.transaction_now
+    for template in preflight.templates:
+        card = template.accelerator
+        try:
+            plan_units = serve_paid_capacity.paid_launch_plan_units(
+                contract=locked_version.placement_contract,
+                configured_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=card,
+                    gpu_units_per_node=(
+                        candidate.planning_capacity_quantum_by_accelerator.get(
+                            card)),
+                    num_nodes=candidate.backend_num_nodes),
+                candidate_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=card,
+                    gpu_units_per_node=template.gpu_units_per_node,
+                    num_nodes=template.num_nodes))
+        except serve_paid_capacity.PaidGPUAttributionError as error:
+            raise CapacityAdmissionConflict(
+                'Locked paid catalog contradicts the placement contract.') \
+                from error
+        if remaining.get(card, 0) < plan_units:
+            continue
+        pool = paid_context.pool_rows.get(template.pool_key)
+        if pool is None:
+            raise CapacityAdmissionConflict(
+                'Paid catalog pool was not locked before expansion.')
+        valid_claims, _ = serve_state._valid_paid_capacity_claims_in_session(  # pylint: disable=protected-access
+            connection, template.pool_key)
+        admission_limit = serve_paid_capacity.effective_admission_limit(
+            pool.current_limit,
+            pool.last_success_at,
+            pool.last_failure_at,
+            bootstrap_limit=serve_paid_capacity.base_limit(),
+            ceiling_limit=serve_paid_capacity.max_limit(),
+            now=transaction_now,
+            success_ttl=serve_paid_capacity.success_ttl_seconds(),
+            failure_cooldown=serve_paid_capacity.failure_cooldown_seconds())
+        available = max(0, admission_limit.limit - len(valid_claims))
+        requested = remaining[card] // plan_units
+        count = min(
+            available, requested,
+            serve_paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS -
+            len(prepared))
+        for _ in range(count):
+            replica_id = next_replica_id
+            next_replica_id += 1
+            replica_record_id = str(uuid.uuid4())
+            cluster_name = serve_utils.generate_replica_cluster_name(
+                str(service['name']), replica_id, preflight.resource_scope)
+            log_file_name = serve_utils.generate_replica_launch_log_file_name(
+                str(service['name']), replica_id, preflight.resource_scope)
+            controller_config_path = (
+                serve_utils.generate_versioned_config_yaml_file_name(
+                    str(service['name']), int(service['current_version']),
+                    preflight.resource_scope))
+            stored_override = serve_paid_capacity.thaw_paid_launch_payload(
+                template.resources_override)
+            body_template = body_templates.get(template.pool_key)
+            if body_template is None:
+                raise CapacityAdmissionConflict(
+                    'Locked paid catalog pool disappeared.')
+            launch_fence = ordinary_launch_binding.build_paid_launch_fence(
+                service_name=str(service['name']),
+                service_hash=str(service['hash']),
+                service_version=int(service['current_version']),
+                replica_id=replica_id,
+                replica_record_id=replica_record_id,
+                service_lifecycle_epoch=int(service['lifecycle_epoch']),
+                binding_epoch=int(service['ordinary_launch_binding_epoch']),
+                controller_incarnation=service['controller_incarnation'],
+                controller_owner_epoch=int(service['controller_owner_epoch']),
+                controller_pid=service['controller_pid'],
+                controller_ip=service['controller_ip'])
+            prepared_request = paid_launch_request.materialize_paid_launch_request(
+                body_template,
+                replica_id=replica_id,
+                cluster_name=cluster_name,
+                launch_fence=launch_fence,
+            )
+            worker_construction = serve_paid_capacity.freeze_paid_launch_payload(
+                {
+                    'schema_version': 1,
+                    'launch_yaml_content': locked_version.launch_yaml_content,
+                    'cluster_name': cluster_name,
+                    'log_file_name': log_file_name,
+                    'resources_override': stored_override,
+                    'retry_until_up': False,
+                    'frozen_controller_config_path': controller_config_path,
+                })
+            occurrence = occurrence_by_rank.get(template.catalog_rank, 0)
+            occurrence_by_rank[template.catalog_rank] = occurrence + 1
+            spec = serve_paid_capacity.PaidLaunchSpec(
+                ordinal=len(prepared),
+                service_name=template.service_name,
+                service_hash=template.service_hash,
+                service_lifecycle_epoch=template.service_lifecycle_epoch,
+                service_version=template.service_version,
+                replica_id=replica_id,
+                replica_record_id=replica_record_id,
+                cluster_name_seed=cluster_name,
+                worker_construction=worker_construction,
+                prepared_launch_request=prepared_request.submitted_bytes,
+                provider_account=template.provider_account,
+                provider_project_id=template.provider_project_id,
+                cloud=template.cloud,
+                workspace=template.workspace,
+                region=template.region,
+                zone=template.zone,
+                instance_type=template.instance_type,
+                pool_key=template.pool_key,
+                frontier_key=template.frontier_key,
+                accelerator=template.accelerator,
+                gpu_units_per_node=template.gpu_units_per_node,
+                num_nodes=template.num_nodes,
+                resources_override=template.resources_override,
+                catalog_evidence=serve_paid_capacity.PaidLaunchCatalogEvidence(
+                    placement_catalog_sha256=(
+                        template.placement_catalog_sha256),
+                    catalog_rank=template.catalog_rank,
+                    exploration_round=(occurrence //
+                                       serve_paid_capacity.base_limit()),
+                    slot_within_pool_window=(occurrence %
+                                             serve_paid_capacity.base_limit()),
+                    version_authority=template.version_authority))
+            serve_paid_capacity.build_pristine_paid_replica_state(
+                spec,
+                replica_port=preflight.replica_port,
+                planned_capacity=plan_units,
+                created_at=None)
+            prepared.append(spec)
+            remaining[card] -= plan_units
+        if (len(prepared)
+                >= serve_paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS):
+            break
+    try:
+        paid_wave_admission.validate_prepared_specs(tuple(prepared),
+                                                    preflight.binding_authority)
+    except (ordinary_launch_binding.OrdinaryLaunchBindingUnavailable,
+            ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+            ValueError) as error:
+        raise CapacityAdmissionConflict(
+            'Locked paid executable admission was rejected: '
+            f'{error}') from error
+    return tuple(prepared)
 
 
 def _read_paid_launch_receipt(
@@ -5278,9 +5716,12 @@ class CapacityAdmissionRepository:
                 now=now,
                 config=config,
                 lane_projection=lane_projection)
-            economic_infos, economic_kueue, economic_digest = (
-                _economic_capacity_graph_snapshot(
-                    locked, lane_projection, service_version=service_version))
+            (economic_infos, economic_kueue, economic_digest,
+             planner_replica_digest) = (_economic_capacity_graph_snapshot(
+                 locked,
+                 lane_projection,
+                 service_version=service_version,
+                 capacity_unit=config.capacity_unit))
             policy, evidence_state, authenticated, eligible = (
                 _reserved_supply_policy_and_evidence(
                     config,
@@ -5307,6 +5748,7 @@ class CapacityAdmissionRepository:
             economic_replica_infos=economic_infos,
             economic_kueue_capacity=economic_kueue,
             economic_capacity_graph_sha256=economic_digest,
+            planner_replica_projection_sha256=planner_replica_digest,
             existing_zero_cost_capacity_by_accelerator=full_zero_cost,
             existing_paid_capacity_by_accelerator=full_paid,
             charged_paid_gpu_units=charged_paid,
@@ -5456,9 +5898,8 @@ class CapacityAdmissionRepository:
             demand_state.DurableAutoscalingSnapshot, ReservedSupplyProjection |
             None
         ], CapacityPlanDecision],
-        prepared_paid_launch_specs: Sequence[
-            serve_paid_capacity.PaidLaunchSpec] = (),
-        expected_planner_input_fingerprint: str | None = None,
+        prepared_paid_launch_templates: Sequence[
+            serve_paid_capacity.PaidLaunchTemplate] = (),
         ttl_seconds: int = constants.CAPACITY_PLAN_TTL_SECONDS,
     ) -> CommittedCapacityPlan:
         """Plan and atomically admit from one PostgreSQL-linearized graph.
@@ -5489,10 +5930,6 @@ class CapacityAdmissionRepository:
             raise ValueError('Expected controller authority is malformed.')
         if not callable(planner):
             raise ValueError('planner must be callable.')
-        if (expected_planner_input_fingerprint is not None and
-                not _SHA256_RE.fullmatch(expected_planner_input_fingerprint)):
-            raise ValueError('expected_planner_input_fingerprint must be a '
-                             'lowercase SHA-256 digest.')
         if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
             raise ValueError('ttl_seconds must be positive.')
 
@@ -5531,13 +5968,13 @@ class CapacityAdmissionRepository:
         bind_paid_executables = (
             paid_wave_admission.bind_accepted_in_transaction)
         record_paid_executable_commit = paid_wave_admission.record_fused_commit
-        has_prepared_paid_launches = bool(prepared_paid_launch_specs)
+        has_prepared_paid_launches = bool(prepared_paid_launch_templates)
         request_runtime = (
             request_postgres.prepare_non_pool_launch_binding_runtime()
             if has_prepared_paid_launches else None)
         paid_preflight = (_prepare_paid_launch_preflight(
             self.engine,
-            prepared_paid_launch_specs,
+            prepared_paid_launch_templates,
             service_name=service_name,
             service_hash=service_hash,
             service_lifecycle_epoch=service_lifecycle_epoch,
@@ -5602,12 +6039,12 @@ class CapacityAdmissionRepository:
                     backend_num_nodes != 1):
                 raise CapacityAdmissionConflict(
                     'Logical capacity requires one-node paid backends.')
-            prepared_specs = (() if paid_preflight is None else
-                              paid_preflight.specs)
+            prepared_templates = (() if paid_preflight is None else
+                                  paid_preflight.templates)
             paid_replica_port = (None if paid_preflight is None else
                                  paid_preflight.replica_port)
             binding_authority = None
-            if prepared_specs:
+            if prepared_templates:
                 try:
                     binding_authority = (
                         ordinary_launch_binding._authority_from_service(  # pylint: disable=protected-access
@@ -5753,11 +6190,12 @@ class CapacityAdmissionRepository:
             # authority.  It must not hide existing or already-committed
             # zero-cost capacity (including pending launches), or paid
             # replicas, and thereby manufacture a paid residual.
-            economic_infos, economic_kueue, economic_digest = (
-                _economic_capacity_graph_snapshot(
-                    locked_capacity,
-                    lane_projection,
-                    service_version=service_version))
+            (economic_infos, economic_kueue, economic_digest,
+             planner_replica_digest) = (_economic_capacity_graph_snapshot(
+                 locked_capacity,
+                 lane_projection,
+                 service_version=service_version,
+                 capacity_unit=fill_config.capacity_unit))
             policy, evidence_state, authenticated, eligible = (
                 _reserved_supply_policy_and_evidence(
                     fill_config,
@@ -5785,6 +6223,7 @@ class CapacityAdmissionRepository:
                 economic_replica_infos=economic_infos,
                 economic_kueue_capacity=economic_kueue,
                 economic_capacity_graph_sha256=economic_digest,
+                planner_replica_projection_sha256=planner_replica_digest,
                 existing_zero_cost_capacity_by_accelerator=full_zero_cost,
                 existing_paid_capacity_by_accelerator=full_paid,
                 charged_paid_gpu_units=charged_paid,
@@ -5809,20 +6248,6 @@ class CapacityAdmissionRepository:
                 reserved_accelerators=reservation_catalog,
                 allocation_bound=validated_allocation is not None)
 
-            existing_replica_ids = {
-                int(row['replica_id']) for row in locked_capacity.replica_rows
-            }
-            existing_record_ids = {
-                str(row['replica_state'].get('replica_record_id'))
-                for row in locked_capacity.replica_rows
-                if isinstance(row['replica_state'], Mapping)
-            }
-            if any(spec.replica_id in existing_replica_ids or
-                   spec.replica_record_id in existing_record_ids
-                   for spec in prepared_specs):
-                raise CapacityAdmissionConflict(
-                    'Prepared paid launch collides with a locked replica.')
-
             # The current head/plan precede every paid-pool row in the single
             # repository-wide lock order.  Never reacquire them after this.
             locked_history = _lock_plan_history_in_connection(
@@ -5832,27 +6257,10 @@ class CapacityAdmissionRepository:
                     workspace=service.get('workspace'),
                     service_name=service_name,
                     service_hash=service_hash))
-            if prepared_specs and paid_replica_port is None:
+            if prepared_templates and paid_replica_port is None:
                 raise CapacityAdmissionConflict(
                     'Prepared paid launch has no locked replica port.')
             canonical_paid_replica_port = paid_replica_port or ''
-            temporary_persistence_specs = [
-                spec.persistence_spec(
-                    priority=constants.LB_REQUEST_PRIORITY_MIN,
-                    frontier_limit=frontier_limit,
-                    replica_port=canonical_paid_replica_port,
-                    planned_capacity=(
-                        spec.gpu_units_per_node if fill_config.capacity_unit
-                        is reserved_fill_planner.FillCapacityUnit.LOGICAL else
-                        1),
-                    created_at=None) for spec in prepared_specs
-            ]
-            serve_state._validate_paid_capacity_admission_inputs(  # pylint: disable=protected-access
-                temporary_persistence_specs,
-                service_limit=None,
-                max_live_paid_gpu_units=fill_config.max_live_paid_gpu_units,
-                frontier_default_limit=None,
-                frontier_limits_by_key=None)
             upstream = serve_state._PaidCapacityAdmissionUpstreamContext(  # pylint: disable=protected-access
                 service_hash=service_hash,
                 service_version=service_version,
@@ -5860,8 +6268,7 @@ class CapacityAdmissionRepository:
             paid_census = serve_state._paid_capacity_admission_census_in_session(  # pylint: disable=protected-access
                 connection,
                 service_name,
-                service_hash,
-                temporary_persistence_specs,
+                service_hash, [],
                 max_live_paid_gpu_units=fill_config.max_live_paid_gpu_units)
             if paid_census is None:
                 raise CapacityAdmissionConflict(
@@ -5872,8 +6279,10 @@ class CapacityAdmissionRepository:
             paid_context = serve_state._lock_paid_capacity_admission_context_in_session(  # pylint: disable=protected-access
                 connection,
                 self.engine,
-                service_name,
-                temporary_persistence_specs,
+                service_name, [],
+                candidate_pool_keys={
+                    template.pool_key for template in prepared_templates
+                },
                 upstream=upstream,
                 census=paid_census,
                 base_limit=serve_paid_capacity.base_limit(),
@@ -5915,7 +6324,7 @@ class CapacityAdmissionRepository:
                 service_name=service_name,
                 service_hash=service_hash,
                 exhaustive_history_census=not has_validated_format_6_head,
-                prepared_specs=prepared_specs,
+                prepared_specs=(),
                 locked_capacity=locked_capacity,
                 lane_projection=lane_projection)
             active_effect_rows = dependent_graph.active_association_rows
@@ -5927,22 +6336,27 @@ class CapacityAdmissionRepository:
                 raise CapacityAdmissionConflict(
                     'A retained authority graph belongs to another service '
                     'incarnation.')
-            raw_claim_ids = {int(row[0]) for row in raw_claim_rows}
-            association_replica_ids = {
-                int(row['replica_id']) for row in active_effect_rows
-            }
-            association_record_ids = {
-                str(row['replica_record_id'])
-                for row in dependent_graph.association_rows
-            }
-            if any(spec.replica_id in raw_claim_ids or
-                   spec.replica_id in association_replica_ids or
-                   spec.replica_record_id in association_record_ids
-                   for spec in prepared_specs):
-                raise CapacityAdmissionConflict(
-                    'Prepared paid launch collides with a retained authority '
-                    'graph.')
-
+            association_highwater = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.max(ordinary_associations.c.replica_id)).
+                where(ordinary_associations.c.service_name == service_name,
+                      ordinary_associations.c.service_hash ==
+                      service_hash)).scalar_one_or_none()
+            identity_baseline = [
+                int(row['replica_id']) for row in locked_capacity.replica_rows
+            ]
+            identity_baseline.extend(int(row[0]) for row in raw_claim_rows)
+            identity_baseline.extend(
+                int(row['replica_id'])
+                for row in locked_capacity.intent_rows
+                if row['replica_id'] is not None)
+            identity_baseline.extend(
+                int(row.replica_id)
+                for row in lane_projection.rows
+                if row.replica_id is not None)
+            if association_highwater is not None:
+                identity_baseline.append(int(association_highwater))
+            first_paid_replica_id = max(identity_baseline, default=0) + 1
             if not has_validated_format_6_head:
                 prior_policy_state, prior_candidate = (
                     _resolve_locked_policy_history(
@@ -6026,9 +6440,7 @@ class CapacityAdmissionRepository:
                 capacity_target=capacity_target,
                 reservation_commitment=reservation_commitment,
                 static_fill_target=static_fill_target,
-                supply_projection=supply_projection,
-                expected_planner_input_fingerprint=(
-                    expected_planner_input_fingerprint))
+                supply_projection=supply_projection)
             statically_incompatible_cards = None
             if (sequenced_reserved_fill and positive_target and
                     candidate.reservation_demand_relation is capacity_planning.
@@ -6076,25 +6488,47 @@ class CapacityAdmissionRepository:
             else:
                 final_authority = ReservedFillPlanAuthority.not_applicable()
 
+            paid_launch_version = fill_config.paid_launch_version
+            assert paid_launch_version is not None
+            prepared_specs = _materialize_locked_paid_launch_specs(
+                connection=connection,
+                service=service,
+                preflight=paid_preflight,
+                locked_version=paid_launch_version,
+                candidate=candidate,
+                paid_context=paid_context,
+                first_replica_id=first_paid_replica_id)
+            if prepared_specs:
+                assert paid_preflight is not None
+                _canonical_prepared_paid_launch_specs(
+                    prepared_specs,
+                    service=service,
+                    service_name=service_name,
+                    service_hash=service_hash,
+                    service_lifecycle_epoch=service_lifecycle_epoch,
+                    service_version=service_version,
+                    accounting_cards=canonical_cards,
+                    backend_num_nodes=backend_num_nodes,
+                    locked_version=paid_launch_version,
+                    launch_body_templates_by_pool_key={
+                        template.pool_key:
+                            paid_launch_request.PaidLaunchBodyTemplate(
+                                submitted_bytes=(
+                                    template.prepared_launch_body_template))
+                        for template in paid_preflight.templates
+                    })
             paid_candidates = _prepare_paid_admission_candidates(
                 prepared_specs,
                 candidate=candidate,
                 decision=decision,
                 frontier_limit=frontier_limit,
                 replica_port=canonical_paid_replica_port,
-                created_at=paid_context.transaction_now)
-            temporary_index = {
-                spec.candidate.replica_id: index
-                for index, spec in enumerate(temporary_persistence_specs)
-            }
-            candidate_indices = tuple(
-                temporary_index[item.launch_spec.replica_id]
-                for item in paid_candidates)
+                created_at=paid_context.transaction_now,
+                placement_contract=paid_launch_version.placement_contract)
             candidate_census = serve_state._PaidCapacityAdmissionCensus(  # pylint: disable=protected-access
                 service_claims=paid_census.service_claims,
                 paid_gpu_units_by_index=tuple(
-                    paid_census.paid_gpu_units_by_index[index]
-                    for index in candidate_indices),
+                    item.physical_gpu_units for item in paid_candidates),
                 live_paid_gpu_units=paid_census.live_paid_gpu_units)
             candidate_context = serve_state._LockedPaidCapacityAdmissionContext(  # pylint: disable=protected-access
                 upstream=paid_context.upstream,
@@ -6104,6 +6538,12 @@ class CapacityAdmissionRepository:
             candidate_persistence_specs = [
                 item.persistence_spec for item in paid_candidates
             ]
+            serve_state._validate_paid_capacity_admission_inputs(  # pylint: disable=protected-access
+                candidate_persistence_specs,
+                service_limit=None,
+                max_live_paid_gpu_units=fill_config.max_live_paid_gpu_units,
+                frontier_default_limit=None,
+                frontier_limits_by_key=None)
             positive_paid_target = tuple(
                 sorted((card.casefold(), count)
                        for card, count in candidate.paid_launch_target.entries
@@ -6293,7 +6733,8 @@ class CapacityAdmissionRepository:
                 candidate=candidate,
                 allocation_map=validated_allocation,
                 paid_launch_receipt=paid_launch_receipt,
-                paid_launch_bindings=paid_launch_bindings)
+                paid_launch_bindings=paid_launch_bindings,
+                paid_launch_specs=tuple(item.launch_spec for item in accepted))
             witness_semantic_sha256 = candidate.demand_witness_sha256
             assert witness_semantic_sha256 is not None
             try:
@@ -6331,6 +6772,7 @@ def _validate_committed_paid_claim_in_connection(
     claim_accelerator: str,
     claim_units: int,
     planner_candidate: capacity_planning.CapacityPlanCandidate,
+    placement_contract: placement_policy.PlacementContract,
     now: datetime.datetime,
 ) -> datetime.datetime:
     """Validate immutable post-admission authority against current routing.
@@ -6424,7 +6866,8 @@ def _validate_committed_paid_claim_in_connection(
         generation=int(claim_plan['generation']),
         accounting_cards=accounting_cards,
         capacity_unit=planner_candidate.capacity_unit,
-        candidate=planner_candidate)
+        candidate=planner_candidate,
+        placement_contract=placement_contract)
     claimed_units = claim_projection.units_by_accelerator
     if (claimed_units.get(claim_accelerator, 0) < claim_units or
             any(claimed_units[card] > authorized_paid[card]
@@ -6445,7 +6888,8 @@ def _validate_planner_claim_pool_shape(
     claim: Mapping[str, Any],
     candidate: capacity_planning.CapacityPlanCandidate,
     accelerator: str,
-) -> None:
+    placement_contract: placement_policy.PlacementContract,
+) -> int:
     """Bind one claim's relational pool identity to immutable task shape."""
     relational_pool_key = claim.get('paid_capacity_pool_key')
     claim_pool_key = claim.get('pool_key')
@@ -6458,7 +6902,9 @@ def _validate_planner_claim_pool_shape(
     if not isinstance(pool_key, str) or not pool_key:
         raise CapacityAdmissionConflict(
             'Planner-bound paid claim has no exact provider pool identity.')
-    _planner_bound_pool_shape(pool_key, candidate, accelerator)
+    _, plan_units = _planner_bound_pool_shape(pool_key, candidate, accelerator,
+                                              placement_contract)
+    return plan_units
 
 
 def validate_paid_claim_in_connection(
@@ -6539,13 +6985,40 @@ def validate_paid_claim_in_connection(
         # fresh claim. Committed recovery/provider checks remain valid below.
         raise CapacityAdmissionConflict(
             'Format-6 paid claims require fused plan admission.')
+    fill_config = _reserved_fill_service_config_in_connection(
+        connection, service)
+    paid_launch_version = fill_config.paid_launch_version
+    if paid_launch_version is None:
+        raise CapacityAdmissionConflict(
+            'Paid claim has no elected placement contract.')
+    placement_contract = paid_launch_version.placement_contract
+    expected_member_units: tuple[int, ...]
     if _batch_member_pool_keys is None:
-        _validate_planner_claim_pool_shape(claim, planner_candidate,
-                                           accelerator)
+        expected_member_units = (_validate_planner_claim_pool_shape(
+            claim, planner_candidate, accelerator, placement_contract),)
     else:
-        for member_pool_key in _batch_member_pool_keys:
-            _planner_bound_pool_shape(member_pool_key, planner_candidate,
-                                      accelerator)
+        if (_batch_member_units is None or
+                len(_batch_member_pool_keys) != len(_batch_member_units)):
+            raise CapacityAdmissionConflict(
+                'Paid claim batch shape evidence is incomplete.')
+        expected_batch_units = []
+        for member_pool_key, actual_member_units in zip(_batch_member_pool_keys,
+                                                        _batch_member_units,
+                                                        strict=True):
+            _, expected_units = _planner_bound_pool_shape(
+                member_pool_key, planner_candidate, accelerator,
+                placement_contract)
+            if actual_member_units != expected_units:
+                raise CapacityAdmissionConflict(
+                    'Paid claim batch contradicts the placement contract.')
+            expected_batch_units.append(expected_units)
+        expected_member_units = tuple(expected_batch_units)
+    claim_member_units = ((claim_units,) if _batch_member_units is None else
+                          _batch_member_units)
+    if (not claim_member_units or claim_member_units != expected_member_units or
+            sum(claim_member_units) != claim_units):
+        raise CapacityAdmissionConflict(
+            'Paid claim does not debit exact whole-backend capacity.')
     if not prospective:
         return _validate_committed_paid_claim_in_connection(
             connection,
@@ -6556,6 +7029,7 @@ def validate_paid_claim_in_connection(
             claim_accelerator=accelerator,
             claim_units=claim_units,
             planner_candidate=planner_candidate,
+            placement_contract=placement_contract,
             now=now)
     head = connection.execute(
         sqlalchemy.select(_HEADS).where(
@@ -6574,8 +7048,6 @@ def validate_paid_claim_in_connection(
             'Capacity plan digest no longer matches its payload.')
     reserved_fill_authority_present = 'reserved_fill_authority' in payload
     raw_reserved_fill_authority = payload.get('reserved_fill_authority')
-    fill_config = _reserved_fill_service_config_in_connection(
-        connection, service)
     try:
         plan_reserved_fill_authority = (
             ReservedFillPlanAuthority.from_mapping(raw_reserved_fill_authority))
@@ -6817,18 +7289,6 @@ def validate_paid_claim_in_connection(
             existing_paid=baseline_paid,
             paid_residual=paid,
             paid_launch_target=paid_launch))
-    launch_width = (
-        1 if planner_candidate.capacity_unit
-        is capacity_planning.CapacityUnit.PHYSICAL_BACKEND else
-        planner_candidate.physical_gpu_width_by_accelerator.get(accelerator))
-    member_units = ((claim_units,)
-                    if _batch_member_units is None else _batch_member_units)
-    if (launch_width <= 0 or not member_units or
-            sum(member_units) != claim_units or any(
-                type(units) is not int or units != launch_width
-                for units in member_units)):
-        raise CapacityAdmissionConflict(
-            'Paid claim does not debit exact whole-backend capacity.')
     locked_capacity = _lock_capacity_rows(connection,
                                           service_name=service['name'],
                                           service_hash=service['hash'],
@@ -6842,10 +7302,11 @@ def validate_paid_claim_in_connection(
         accounting_cards=accounting_cards,
         locked=locked_capacity)
     if economic_graph_sha256 is not None:
-        _, _, current_economic_digest = _economic_capacity_graph_snapshot(
+        _, _, current_economic_digest, _ = _economic_capacity_graph_snapshot(
             locked_capacity,
             lane_projection,
-            service_version=int(service['current_version']))
+            service_version=int(service['current_version']),
+            capacity_unit=fill_config.capacity_unit)
         if current_economic_digest != economic_graph_sha256:
             raise CapacityAdmissionConflict(
                 'Economic supply or scheduler capacity changed after the '
@@ -6915,7 +7376,8 @@ def validate_paid_claim_in_connection(
         generation=validation_generation,
         accounting_cards=accounting_cards,
         capacity_unit=planner_candidate.capacity_unit,
-        candidate=planner_candidate)
+        candidate=planner_candidate,
+        placement_contract=placement_contract)
     claim_units_by_card = claim_projection.units_by_accelerator
     claimed_paid_gpu_units = claim_projection.physical_gpu_units
     expected_paid = {

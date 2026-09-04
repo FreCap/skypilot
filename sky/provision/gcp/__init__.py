@@ -11,6 +11,8 @@ from sky.provision.gcp.instance import query_instances_batch
 from sky.provision.gcp.instance import query_managed_boot_disks
 from sky.provision.gcp.instance import run_instances
 from sky.provision.gcp.instance import stop_instances
+from sky.provision.gcp.instance import submit_terminate_exact_instances
+from sky.provision.gcp.instance import submit_terminate_exact_managed_boot_disks
 from sky.provision.gcp.instance import terminate_instances
 from sky.provision.gcp.instance import terminate_managed_boot_disks
 from sky.provision.gcp.instance import wait_instances
