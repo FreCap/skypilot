@@ -24,6 +24,7 @@ from unittest import mock
 
 from fastapi import testclient as fastapi_testclient
 import pytest
+from spot_placer_test_utils import make_location
 
 from sky import clouds
 from sky import exceptions
@@ -84,7 +85,7 @@ def _capacity_plan(demand,
     return capacity_planning.CapacityPlanCandidate(
         kind=kind,
         capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
-        physical_gpu_width_by_accelerator=(
+        planning_capacity_quantum_by_accelerator=(
             capacity_planning.AcceleratorCapacity.from_mapping(widths)),
         aggregate_demand_target=sum(demand.values()),
         raw_demand_target=sum(demand.values()),
@@ -1012,6 +1013,40 @@ class TestGetRoutingSpec:
         assert configured == ['L4', 'A100']
         placer.known_location_costs.assert_called_once_with()
         placer.cost_per_hour.assert_not_called()
+
+    def test_logical_catalog_orders_cards_by_per_gpu_cost(self):
+        ctrl = _make_controller()
+        l4_location = make_location('us-l4', {'L4': 8}, cloud_name='GCP')
+        a100_location = make_location('us-a100', {'A100': 1}, cloud_name='AWS')
+        placer = mock.Mock(
+            num_nodes=1,
+            placement_contract=placement_policy.resolve_fresh_contract(
+                placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False))
+        placer.known_location_costs.return_value = {
+            l4_location: 0.80,
+            a100_location: 0.20,
+        }
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            yaml_content='service: {}',
+            spot_placer=placer)
+        task = types.SimpleNamespace(resources=[
+            types.SimpleNamespace(accelerators={'A100': 1}),
+            types.SimpleNamespace(accelerators={'L4': 1}),
+        ],
+                                     num_nodes=1)
+        spec = types.SimpleNamespace(min_replicas_by_accelerator={},
+                                     target_qps_per_replica={
+                                         'A100': 1.0,
+                                         'L4': 1.0,
+                                     },
+                                     uses_logical_replicas=True)
+        with mock.patch.object(controller.replica_managers,
+                               'load_task_with_service_spec',
+                               return_value=task):
+            configured = ctrl._configured_accelerators(  # pylint: disable=protected-access
+                spec)
+
+        assert configured == ['L4', 'A100']
 
     def test_configured_catalog_preserves_order_when_price_is_unknown(self):
         ctrl = _make_controller()
@@ -4748,7 +4783,7 @@ class TestAutoscalerRuntimeSnapshot:
                 last_reduced_demand_generation=0,
                 capacity_unit=capacity_unit,
                 maximum_capacity=scaler.max_replicas,
-                physical_gpu_width_by_accelerator=(
+                planning_capacity_quantum_by_accelerator=(
                     capacity_planning.AcceleratorCapacity.from_mapping(
                         scaler.configured_accelerator_shapes)),
                 backend_num_nodes=scaler.backend_num_nodes))
@@ -4822,7 +4857,7 @@ class TestAutoscalerRuntimeSnapshot:
                     last_reduced_demand_generation=scaler.reconcile_generation,
                     capacity_unit=capacity_unit,
                     maximum_capacity=scaler.max_replicas,
-                    physical_gpu_width_by_accelerator=(
+                    planning_capacity_quantum_by_accelerator=(
                         capacity_planning.AcceleratorCapacity.from_mapping(
                             scaler.configured_accelerator_shapes))))
             policy_input = capacity_planning.CapacityPolicyInput(
@@ -4849,7 +4884,7 @@ class TestAutoscalerRuntimeSnapshot:
             service_version=scaler.latest_version,
             configured_accelerators=cards,
             capacity_unit=capacity_unit,
-            physical_gpu_width_by_accelerator=(
+            planning_capacity_quantum_by_accelerator=(
                 capacity_planning.AcceleratorCapacity.from_mapping(
                     scaler.configured_accelerator_shapes)),
             capacity_per_accelerator=(
@@ -5117,13 +5152,17 @@ class TestAutoscalerRuntimeSnapshot:
         authority = _paid_launch_version_authority()
         budget = mock.sentinel.paid_budget
         manager = mock.Mock()
+        manager.spot_placer.placement_contract = (
+            placement_policy.resolve_fresh_contract(
+                placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False))
+        manager.spot_placer.num_nodes = 1
         manager.spot_placer.ranked_active_locations.return_value = []
         manager.workspace = 'default'
 
         def _prepare(**kwargs):
             call_order.append('prepare')
             assert kwargs['accelerator_shapes'] == {
-                'a100': 8,
+                'a100': 1,
                 'h200': 1,
                 'l4': 1,
             }
@@ -5133,10 +5172,11 @@ class TestAutoscalerRuntimeSnapshot:
 
         manager.prepare_paid_launch_templates.side_effect = _prepare
         ctrl._replica_manager = manager  # pylint: disable=protected-access
-        scaler = types.SimpleNamespace(
-            max_replicas=10_000,
-            backend_num_nodes=1,
-            configured_accelerator_shapes=(configured_shapes))
+        scaler = types.SimpleNamespace(max_replicas=10_000,
+                                       backend_num_nodes=1,
+                                       configured_accelerator_shapes={
+                                           card: 1 for card in configured_shapes
+                                       })
 
         def _build_budget(*args, **kwargs):
             assert not manager.prepare_paid_launch_templates.called
@@ -5185,6 +5225,10 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl = _make_controller()
         authority = _paid_launch_version_authority()
         manager = mock.Mock()
+        manager.spot_placer.placement_contract = (
+            placement_policy.resolve_fresh_contract(
+                placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False))
+        manager.spot_placer.num_nodes = 1
         manager.spot_placer.ranked_active_locations.return_value = []
         manager.workspace = 'default'
         manager.prepare_paid_launch_templates.return_value = ()
@@ -5193,9 +5237,9 @@ class TestAutoscalerRuntimeSnapshot:
                                        backend_num_nodes=1,
                                        configured_accelerator_shapes={
                                            'L4': 1,
-                                           'A100': 8,
-                                           'A100-80GB': 8,
-                                           'H200': 8,
+                                           'A100': 1,
+                                           'A100-80GB': 1,
+                                           'H200': 1,
                                        })
 
         def _build_budget(*_args, **kwargs):
@@ -5243,6 +5287,10 @@ class TestAutoscalerRuntimeSnapshot:
                                    accelerators={'L4': 1},
                                    instance_type='g2-standard-4')
         manager = mock.Mock()
+        manager.spot_placer.placement_contract = (
+            placement_policy.resolve_fresh_contract(
+                placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False))
+        manager.spot_placer.num_nodes = 1
         manager.spot_placer.ranked_active_locations.return_value = [gcp, aws]
         manager.workspace = 'default'
         manager.prepare_paid_launch_templates.return_value = ()
@@ -5283,6 +5331,10 @@ class TestAutoscalerRuntimeSnapshot:
     def test_paid_template_preparation_forwards_active_paid_cap(self):
         ctrl = _make_controller()
         manager = mock.Mock()
+        manager.spot_placer.placement_contract = (
+            placement_policy.resolve_fresh_contract(
+                placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False))
+        manager.spot_placer.num_nodes = 1
         manager.spot_placer.ranked_active_locations.return_value = []
         manager.workspace = 'default'
         manager.prepare_paid_launch_templates.return_value = ()
@@ -5290,8 +5342,8 @@ class TestAutoscalerRuntimeSnapshot:
         authority = _paid_launch_version_authority()
         scaler = types.SimpleNamespace(
             max_replicas=100,
-            backend_num_nodes=2,
-            configured_accelerator_shapes={'A100': 8})
+            backend_num_nodes=1,
+            configured_accelerator_shapes={'A100': 1})
 
         def _build_budget(*_args, **kwargs):
             assert kwargs['max_live_paid_gpu_units'] == 120
@@ -5318,7 +5370,7 @@ class TestAutoscalerRuntimeSnapshot:
 
         assert prepared == ()
         manager.prepare_paid_launch_templates.assert_called_once_with(
-            accelerator_shapes={'a100': 8},
+            accelerator_shapes={'a100': 1},
             version_authority=authority,
             paid_location_launch_budget=mock.sentinel.paid_budget)
 
@@ -5326,6 +5378,10 @@ class TestAutoscalerRuntimeSnapshot:
             self):
         ctrl = _make_controller()
         manager = mock.Mock()
+        manager.spot_placer.placement_contract = (
+            placement_policy.resolve_fresh_contract(
+                placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False))
+        manager.spot_placer.num_nodes = 1
         manager.spot_placer.ranked_active_locations.return_value = []
         manager.workspace = 'default'
         manager.prepare_paid_launch_templates.return_value = ()
@@ -5963,6 +6019,10 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler = self._logical_durable_autoscaler(  # pylint: disable=protected-access
             target=220, emit_scale_up=True)
         manager = mock.Mock()
+        manager.spot_placer.placement_contract = (
+            placement_policy.resolve_fresh_contract(
+                placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False))
+        manager.spot_placer.num_nodes = 1
         manager.spot_placer.ranked_active_locations.return_value = []
         manager.workspace = 'default'
         ctrl._replica_manager = manager  # pylint: disable=protected-access

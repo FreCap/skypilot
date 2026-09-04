@@ -2675,6 +2675,12 @@ def _paid_claim_payload(
         raise OrdinaryLaunchBindingConflict(
             'Non-pool profile lost its exact paid-capacity claim.')
     row = rows[0]
+    if (row['capacity_plan_generation'] is not None and
+        (not isinstance(info.planned_capacity, int) or
+         isinstance(info.planned_capacity, bool) or
+         info.planned_capacity != row['capacity_plan_units'])):
+        raise OrdinaryLaunchBindingConflict(
+            'Paid replica width contradicts its capacity-plan debit.')
     payload = {
         'claimed_at': row['claimed_at'],
         'pool_key': pool_key,

@@ -28,6 +28,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.serve import constants
+from sky.serve import placement_policy
 from sky.serve import spot_placer
 from sky.utils import common_utils
 
@@ -136,6 +137,47 @@ class PhysicalBackendShape:
     @property
     def total_gpu_units(self) -> int:
         return self.gpu_units_per_node * self.num_nodes
+
+
+def paid_launch_plan_units(
+    *,
+    contract: placement_policy.PlacementContract,
+    configured_shape: PhysicalBackendShape,
+    candidate_shape: PhysicalBackendShape,
+) -> int:
+    """Map one exact paid backend into the elected service capacity unit.
+
+    Logical services plan in one-GPU slots, so a same-card, single-node paid
+    backend contributes its complete physical GPU width. Physical services
+    plan in whole backends and therefore accept only their configured exact
+    shape as one unit. This is the sole conversion boundary; callers must not
+    infer plan units from a YAML count or a catalog shape independently.
+    """
+    if (not isinstance(contract, placement_policy.PlacementContract) or
+            not isinstance(configured_shape, PhysicalBackendShape) or
+            not isinstance(candidate_shape, PhysicalBackendShape)):
+        raise PaidGPUAttributionError(
+            'Paid backend does not match the placement contract.')
+    if not contract.enabled:
+        raise PaidGPUAttributionError(
+            'Paid backend does not match the placement contract.')
+    if contract.uses_logical_replicas:
+        if (contract.catalog_mode
+                != placement_policy.CATALOG_MODE_WHOLE_GPU_SHAPES or
+                configured_shape.accelerator is None or
+                candidate_shape.accelerator != configured_shape.accelerator or
+                configured_shape.num_nodes != 1 or
+                configured_shape.gpu_units_per_node != 1 or
+                candidate_shape.num_nodes != 1 or
+                candidate_shape.gpu_units_per_node <= 0):
+            raise PaidGPUAttributionError(
+                'Paid backend does not match the placement contract.')
+        return candidate_shape.gpu_units_per_node
+    if (contract.catalog_mode != placement_policy.CATALOG_MODE_CONFIGURED_SHAPES
+            or candidate_shape != configured_shape):
+        raise PaidGPUAttributionError(
+            'Paid backend does not match the placement contract.')
+    return 1
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -1725,6 +1767,22 @@ def _exact_whole_gpu_shape(
     return card.casefold(), int(count)
 
 
+def physical_backend_shape_from_location(
+    location: spot_placer.Location,
+    *,
+    num_nodes: int,
+) -> PhysicalBackendShape:
+    """Return one catalog location's exact typed physical GPU shape."""
+    if not isinstance(location, spot_placer.Location):
+        raise PaidGPUAttributionError(
+            'Paid backend location is not a catalog location.')
+    card, width = _exact_whole_gpu_shape(location.accelerators,
+                                         field='paid backend catalog location')
+    return PhysicalBackendShape(accelerator=card,
+                                gpu_units_per_node=width,
+                                num_nodes=num_nodes)
+
+
 def active_paid_spot_accelerator_shapes(
     placer: spot_placer.SpotPlacer,) -> frozenset[tuple[str, int]]:
     """Project exact GPU shapes that can consume a paid preparation wave.
@@ -2459,6 +2517,11 @@ def build_launch_budget(
             frontier_ceiling=configured_max_frontier)
         service_remaining = max(0, service_claim_limit - service_claims)
     else:
+        # Deprecated transition-only allocator. Production promoted services
+        # use ``prospective_claims`` plus locked templates and never pass a
+        # PaidLaunchAuthority here. Remove this singular-width branch after
+        # the format-7 provider qualification horizon; it cannot represent a
+        # mixed-width logical catalog and must not regain a production caller.
         try:
             claimed_units = serve_state.get_paid_capacity_plan_claimed_units(
                 paid_launch_authority.service_name,

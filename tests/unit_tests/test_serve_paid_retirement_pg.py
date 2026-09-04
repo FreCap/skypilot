@@ -54,7 +54,7 @@ def _planner_payload(
         service_version=1,
         configured_accelerators=('l4',),
         capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
-        physical_gpu_width_by_accelerator=capacity({'l4': 1}),
+        planning_capacity_quantum_by_accelerator=capacity({'l4': 1}),
         capacity_per_accelerator=work({'l4': 1}),
         floors=capacity({}),
         minimum_capacity=0,

@@ -2835,13 +2835,12 @@ def validate_service_update_preflight(
     uses_logical_replicas = service_spec.uses_logical_replicas is True
     default_planned_capacity = _uniform_whole_gpu_capacity(task.resources)
     if uses_logical_replicas:
-        exact_accelerator_shapes = exact_accelerator_shapes_from_resources(
+        logical_card_units = logical_accelerator_card_units_from_resources(
             task.resources)
-        if not exact_accelerator_shapes:
+        if not logical_card_units:
             raise ValueError(
-                'Logical replicas require exactly one physical whole-GPU '
-                'width for each configured accelerator. Conflicting widths '
-                'for the same accelerator are not supported.')
+                'Logical replicas require every configured accelerator to '
+                'have an exact whole-GPU catalog seed.')
     candidate_placer = None
     if service_spec.placement_contract.enabled:
         candidate_placer = _load_spot_placer(service_name, version,
@@ -3076,6 +3075,29 @@ def exact_accelerator_shapes_from_resources(
             return {}
         shapes[canonical] = width
     return shapes if saw_resource else {}
+
+
+def logical_accelerator_card_units_from_resources(
+        resources: typing.Iterable[resources_lib.Resources]) -> dict[str, int]:
+    """Return one logical GPU-slot unit for every exact configured card.
+
+    Physical widths remain catalog/provider facts under
+    ``dynamic_fallback_per_gpu``. Multiple whole-GPU widths for the same card
+    therefore collapse to one card identity instead of conflicting.
+    """
+    units: dict[str, int] = {}
+    canonical_by_name: dict[str, str] = {}
+    saw_resource = False
+    for resource in resources:
+        saw_resource = True
+        accelerators = resource.accelerators
+        if (_whole_gpu_capacity(accelerators) is None or accelerators is None):
+            return {}
+        card = str(next(iter(accelerators)))
+        folded = card.casefold()
+        canonical = canonical_by_name.setdefault(folded, card)
+        units[canonical] = 1
+    return units if saw_resource else {}
 
 
 def _validate_logical_capacity_sources(default_capacity: int | None,
@@ -4348,9 +4370,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             catalog_entries = {
                 entry.location: entry for entry in placer.ranked_catalog_entries
             }
-            templates: list[paid_capacity.PaidLaunchTemplate] = []
+            templates_by_card: dict[str,
+                                    list[paid_capacity.PaidLaunchTemplate]] = {
+                                        card: [] for card in shapes
+                                    }
             seen_pool_keys = set()
             covered_headroom = {card: 0 for card in shapes}
+            narrow_pool_found = {card: False for card in shapes}
+            logical_contract = placer.placement_contract.uses_logical_replicas
             for location in placer.ranked_active_locations():
                 cloud = str(location.cloud).casefold()
                 accelerators = location.accelerators
@@ -4362,11 +4389,28 @@ class SkyPilotReplicaManager(ReplicaManager):
                     continue
                 raw_card, raw_width = next(iter(accelerators.items()))
                 card = str(raw_card).casefold()
-                if (card not in shapes or type(raw_width) is not int or  # pylint: disable=unidiomatic-typecheck
-                        raw_width != shapes[card]):
+                if card not in shapes or type(raw_width) is not int:  # pylint: disable=unidiomatic-typecheck
                     continue
-                if (covered_headroom[card] >=
-                        paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS):
+                try:
+                    paid_capacity.paid_launch_plan_units(
+                        contract=placer.placement_contract,
+                        configured_shape=paid_capacity.PhysicalBackendShape(
+                            accelerator=card,
+                            gpu_units_per_node=shapes[card],
+                            num_nodes=num_nodes),
+                        candidate_shape=paid_capacity.PhysicalBackendShape(
+                            accelerator=card,
+                            gpu_units_per_node=raw_width,
+                            num_nodes=num_nodes))
+                except paid_capacity.PaidGPUAttributionError:
+                    continue
+                covered = (
+                    covered_headroom[card]
+                    >= paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS)
+                if covered and (not logical_contract or
+                                narrow_pool_found[card]):
+                    continue
+                if covered and raw_width != 1:
                     continue
                 advisory_headroom = (
                     paid_location_launch_budget.remaining_by_location.get(
@@ -4394,9 +4438,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                     continue
                 if exact_pool_key in seen_pool_keys:
                     continue
-                if len(templates) >= _MAX_PAID_LAUNCH_TEMPLATES:
-                    raise ValueError(
-                        'Paid launch template catalog exceeds its total bound.')
                 seen_pool_keys.add(exact_pool_key)
                 runtime_override = location.to_dict()
                 canonical_storage_override = dict(runtime_override)
@@ -4425,7 +4466,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 provider_project_id = (provider_identity.get('gcp_project_id')
                                        if isinstance(provider_identity, dict)
                                        else None)
-                templates.append(
+                templates_by_card[card].append(
                     paid_capacity.PaidLaunchTemplate(
                         service_name=self._service_name,
                         service_hash=service_hash,
@@ -4450,13 +4491,34 @@ class SkyPilotReplicaManager(ReplicaManager):
                         placement_catalog_sha256=placement_catalog_sha256,
                         catalog_rank=catalog_entry.rank,
                         version_authority=version_authority))
+                narrow_pool_found[card] |= raw_width == 1
                 covered_headroom[card] = min(
                     paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS,
                     covered_headroom[card] + advisory_headroom)
                 if all(headroom >=
-                       paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS
-                       for headroom in covered_headroom.values()):
+                       paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS and
+                       (not logical_contract or narrow_pool_found[covered_card])
+                       for covered_card, headroom in covered_headroom.items()):
                     break
+            # One late narrow remainder pool may follow a full 100-pool prefix.
+            # Replace the least-preferred wide member so each card still owns
+            # at most one atomic wave of staged authority.
+            for card, card_templates in templates_by_card.items():
+                if len(card_templates) <= (
+                        paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS):
+                    continue
+                assert logical_contract and narrow_pool_found[card]
+                for index in range(len(card_templates) - 2, -1, -1):
+                    if card_templates[index].gpu_units_per_node != 1:
+                        del card_templates[index]
+                        break
+            templates = sorted(
+                (template for card_templates in templates_by_card.values()
+                 for template in card_templates),
+                key=lambda template: template.catalog_rank)
+            if len(templates) > _MAX_PAID_LAUNCH_TEMPLATES:
+                raise ValueError(
+                    'Paid launch template catalog exceeds its total bound.')
             return tuple(templates)
 
     def _prepare_paid_launch_adopter_postcommit(
@@ -6767,7 +6829,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._default_planned_capacity = _uniform_whole_gpu_capacity(
             task.resources)
         self._logical_exact_accelerator_shapes = (
-            exact_accelerator_shapes_from_resources(task.resources)
+            logical_accelerator_card_units_from_resources(task.resources)
             if self._uses_logical_replicas else {})
         self._spot_placer = _load_spot_placer(service_name, version, spec, task,
                                               self._workspace)
@@ -12438,7 +12500,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 planned = int(info.planned_capacity)
             except (TypeError, ValueError):
                 return None
-            if count != configured_count or planned != configured_count:
+            if (configured_count != 1 or count <= 0 or planned != count):
                 return None
         return card
 
@@ -19262,7 +19324,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             _validate_logical_capacity_sources(new_default_planned_capacity,
                                                None, new_task.num_nodes)
         new_logical_exact_accelerator_shapes = (
-            exact_accelerator_shapes_from_resources(new_task.resources)
+            logical_accelerator_card_units_from_resources(new_task.resources)
             if new_uses_logical_replicas else {})
         # A service update may change the placement policy or any_of shape
         # set. Use the preflight placer when provided; otherwise load the

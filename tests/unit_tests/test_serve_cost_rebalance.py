@@ -11,6 +11,7 @@ from spot_placer_test_utils import make_placer
 from sky import clouds
 from sky.serve import autoscalers
 from sky.serve import constants
+from sky.serve import placement_policy
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import service_spec
@@ -373,6 +374,35 @@ class TestEconomicDecisions:
         ]
         assert len(launches) == 1
         assert launches[0].target['region'] == cheap.region
+
+    def test_logical_catalog_allows_same_wide_shape_not_narrow_replacement(
+            self):
+        scaler = _autoscaler(_spec(replica_unit='logical', max_replicas=16))
+        scaler.set_configured_accelerator_shapes({'L4': 1})
+        incumbent_location = make_location('paid',
+                                           accelerators={'L4': 8},
+                                           use_spot=True)
+        same_width = make_location('same-width',
+                                   accelerators={'L4': 8},
+                                   use_spot=True)
+        narrower = make_location('narrower',
+                                 accelerators={'L4': 4},
+                                 use_spot=True)
+        contract = placement_policy.resolve_fresh_contract(
+            placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
+        scaler.set_spot_placer(
+            make_placer(
+                {
+                    incumbent_location: 0.80,
+                    same_width: 0.72,
+                    narrower: 0.40,
+                }, contract))
+        incumbent = _Replica(1, incumbent_location, 0.80, gpu_count=8)
+
+        assert scaler._cost_rebalance_location_is_compatible(
+            incumbent, same_width)
+        assert not scaler._cost_rebalance_location_is_compatible(
+            incumbent, narrower)
 
     def test_persisted_cross_card_pair_keeps_incumbent(self):
         scaler = _autoscaler()

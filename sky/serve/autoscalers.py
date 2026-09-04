@@ -24,6 +24,7 @@ from sky.serve import autoscaler_decisions
 from sky.serve import capacity_planning
 from sky.serve import constants
 from sky.serve import kueue_lane_capacity
+from sky.serve import paid_capacity
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
@@ -733,6 +734,38 @@ def _generate_scale_up_decisions(
     ]
 
 
+def _paid_catalog_card(
+    *,
+    location: spot_placer.Location,
+    placer: spot_placer.SpotPlacer,
+    canonical_by_name: Mapping[str, str],
+    configured_gpu_count: typing.Callable[[str], int],
+    location_gpu_shape: typing.Callable[[spot_placer.Location], tuple[str,
+                                                                      int]],
+) -> tuple[str, int] | None:
+    """Validate one physical catalog shape against the placement contract."""
+    try:
+        raw_card, gpu_count = location_gpu_shape(location)
+        card = canonical_by_name.get(raw_card.casefold())
+        if card is None:
+            return None
+        configured_shape = paid_capacity.PhysicalBackendShape(
+            accelerator=card.casefold(),
+            gpu_units_per_node=configured_gpu_count(card),
+            num_nodes=placer.num_nodes)
+        candidate_shape = paid_capacity.PhysicalBackendShape(
+            accelerator=raw_card.casefold(),
+            gpu_units_per_node=gpu_count,
+            num_nodes=placer.num_nodes)
+        paid_capacity.paid_launch_plan_units(contract=placer.placement_contract,
+                                             configured_shape=configured_shape,
+                                             candidate_shape=candidate_shape)
+    except (AttributeError, TypeError, ValueError,
+            paid_capacity.PaidGPUAttributionError):
+        return None
+    return card, gpu_count
+
+
 def _order_cold_paid_cards(
     configured_cards: list[str],
     placer: spot_placer.SpotPlacer | None,
@@ -754,10 +787,14 @@ def _order_cold_paid_cards(
         except Exception:  # pylint: disable=broad-except
             return list(configured_cards)
     for location, raw_cost in known_location_costs.items():
-        raw_card, gpu_count = location_gpu_shape(location)
-        card = canonical_by_name.get(raw_card.casefold())
-        if card is None or gpu_count != configured_gpu_count(card):
+        matched = _paid_catalog_card(location=location,
+                                     placer=placer,
+                                     canonical_by_name=canonical_by_name,
+                                     configured_gpu_count=configured_gpu_count,
+                                     location_gpu_shape=location_gpu_shape)
+        if matched is None:
             continue
+        card, gpu_count = matched
         try:
             hourly_cost = float(raw_cost)
         except Exception:  # pylint: disable=broad-except
@@ -768,7 +805,9 @@ def _order_cold_paid_cards(
         elif hourly_cost == 0:
             zero_cost_cards.add(card)
         else:
-            paid_costs[card] = min(hourly_cost,
+            normalized_cost = placer.placement_contract.normalize_hourly_cost(
+                hourly_cost, gpu_count)
+            paid_costs[card] = min(normalized_cost,
                                    paid_costs.get(card, float('inf')))
 
     # A card is reserved-only only when every inspected location is free and
@@ -823,10 +862,14 @@ def _prospective_paid_cards(
         # later provider guard can only reject after publication.
         if getattr(location, 'use_spot', None) is not True:
             continue
-        raw_card, gpu_count = location_gpu_shape(location)
-        card = canonical_by_name.get(raw_card.casefold())
-        if card is None or gpu_count != configured_gpu_count(card):
+        matched = _paid_catalog_card(location=location,
+                                     placer=placer,
+                                     canonical_by_name=canonical_by_name,
+                                     configured_gpu_count=configured_gpu_count,
+                                     location_gpu_shape=location_gpu_shape)
+        if matched is None:
             continue
+        card, _ = matched
         try:
             hourly_cost = float(raw_cost)
         except Exception:  # pylint: disable=broad-except
@@ -4437,6 +4480,7 @@ class _GpuShapeResolverMixin:
     # created row can never inherit its predecessor's shape or cost.
     _replica_cache_record_ids: dict[int, str]
     configured_accelerator_shapes: dict[str, int]
+    _cost_rebalance_spot_placer: spot_placer.SpotPlacer | None
     latest_version: int
     _service_name: str
     # Immutable per-decision legacy handle snapshot, populated before the
@@ -4944,6 +4988,9 @@ class _GpuShapeResolverMixin:
         configured_shapes = self.configured_accelerator_shapes
         if not configured_shapes:
             return True
+        placer = self._cost_rebalance_spot_placer
+        if placer is None:
+            return False
         canonical_by_name = {
             card.casefold(): (card, count)
             for card, count in configured_shapes.items()
@@ -4956,9 +5003,30 @@ class _GpuShapeResolverMixin:
         if configured is None:
             return False
         canonical_card, configured_count = configured
-        return (incumbent_card.casefold() == canonical_card.casefold() and
-                incumbent_count == configured_count and
-                candidate_count == configured_count)
+        try:
+            configured_shape = paid_capacity.PhysicalBackendShape(
+                accelerator=canonical_card.casefold(),
+                gpu_units_per_node=configured_count,
+                num_nodes=placer.num_nodes)
+            incumbent_shape = paid_capacity.PhysicalBackendShape(
+                accelerator=incumbent_card.casefold(),
+                gpu_units_per_node=incumbent_count,
+                num_nodes=placer.num_nodes)
+            candidate_shape = paid_capacity.physical_backend_shape_from_location(
+                location, num_nodes=placer.num_nodes)
+            paid_capacity.paid_launch_plan_units(
+                contract=placer.placement_contract,
+                configured_shape=configured_shape,
+                candidate_shape=incumbent_shape)
+            paid_capacity.paid_launch_plan_units(
+                contract=placer.placement_contract,
+                configured_shape=configured_shape,
+                candidate_shape=candidate_shape)
+        except paid_capacity.PaidGPUAttributionError:
+            return False
+        # Rebalancing is one-for-one, so it may cross providers/regions but
+        # cannot silently change the logical capacity of the replica.
+        return incumbent_count == candidate_count
 
 
 class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
@@ -6537,7 +6605,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 next_policy_state.maximum_capacity != self.max_replicas or
                 committed_candidate.capacity_unit
                 is not capacity_planning.CapacityUnit.LOGICAL_GPU or
-                committed_candidate.physical_gpu_width_by_accelerator
+                committed_candidate.planning_capacity_quantum_by_accelerator
                 != expected_widths or
                 committed_candidate.backend_num_nodes != 1):
             raise ValueError('Committed durable capacity plan has a different '
@@ -6697,7 +6765,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             }
             prior_shapes = {
                 card.casefold(): width for card, width in
-                prior_candidate.physical_gpu_width_by_accelerator.entries
+                prior_candidate.planning_capacity_quantum_by_accelerator.entries
             }
             if (set(canonical) != {
                     card.casefold()
@@ -7653,7 +7721,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 configured_accelerators=configured_cards,
                 capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
                 backend_num_nodes=1,
-                physical_gpu_width_by_accelerator=(
+                planning_capacity_quantum_by_accelerator=(
                     capacity_planning.AcceleratorCapacity.from_mapping(
                         self.configured_accelerator_shapes)),
                 capacity_per_accelerator=(
@@ -9982,7 +10050,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                            capacity_planning.CapacityUnit.PHYSICAL_BACKEND),
             backend_num_nodes=(1 if self.replica_unit == 'logical' else
                                self.backend_num_nodes),
-            physical_gpu_width_by_accelerator=(
+            planning_capacity_quantum_by_accelerator=(
                 capacity_planning.AcceleratorCapacity.from_mapping({
                     card: self._configured_gpu_count(card)
                     for card in configured_cards

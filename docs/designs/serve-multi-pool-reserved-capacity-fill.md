@@ -1,6 +1,6 @@
 # SkyServe multi-pool reserved-capacity admission
 
-Last updated: 2026-09-03
+Last updated: 2026-09-04
 
 Status: **the PostgreSQL-authoritative reservation-aware planner, exact-card
 compatibility, bounded Spot-only paid admission, historical at-least-100 Spot
@@ -93,6 +93,8 @@ lock or treated only as disposable telemetry for a later reconciliation.
 | Reserved intents and Kueue admission/capacity class | The repository-locked intent and lane projection paired with those exact replica rows | None; there is no independently refreshed scheduler snapshot |
 | Service-time evidence, provider identity, catalog offerings and deterministic paid ordering | Bounded immutable input token | May be prepared before the transaction, but cannot name current replicas or grant authority |
 | Future paid-launch specifications | Immutable candidate templates | May be prepared before the transaction; the locked planner clips them and the repository atomically binds only accepted members |
+| Logical accelerator card and slot unit | Elected placement contract plus task resources | In `whole_gpu_shapes` mode every card has unit width one; YAML counts seed/constrain catalog discovery but do not become the width of every backend |
+| Exact physical paid-backend shape | Elected immutable placement catalog, revalidated from each template and pool key | May be staged as a location template; it never changes logical demand attribution and becomes spend only after locked admission |
 | Provider ``RUNNING``/application ``READY`` feedback | A later provider/replica observation | Never a prerequisite for committing a successor transaction when locked residual and headroom remain |
 
 The practical review rule is ownership completeness: every field needed to
@@ -529,8 +531,11 @@ same 420-member queue and consume more central-database capacity.
 The existing ``CapacityAdmissionRepository.plan_and_admit_current()``
 transaction is the sole paid request-materialization unit. Before it begins,
 the controller constructs an immutable, canonically ordered tuple containing
-one identity-free ``PaidLaunchTemplate`` per eligible exact Spot location. The
-repository performs one non-authoritative PostgreSQL read, closes that
+one identity-free ``PaidLaunchTemplate`` per selected exact Spot location. The
+selection is the smallest globally cost-ordered positive-headroom prefix that
+can cover one atomic wave per card, plus a narrow logical remainder pool when
+available, with hard per-card and total bounds; it does not stage every catalog
+location. The repository performs one non-authoritative PostgreSQL read, closes that
 checkout, validates only immutable service/version/catalog/provider facts, and
 freezes the binding authority, resource scope, replica port, and launch runtime.
 Manager-side template construction remains provider-, HTTP-, filesystem-, and
@@ -1923,29 +1928,36 @@ may coexist during an idle drain.
 Paid demand debit and paid actuation are likewise distinct typed projections.
 ``paid_residual`` is the logical compatible work left after committed reserved,
 pending reserved, and existing/committed paid capacity.
-``cold_launch_authority`` is the deterministic whole-backend projection
-required to spend that residual. For one logical unit on an eight-GPU paid
-backend it grants exactly one eight-slot launch and records seven slots of paid
-packing padding. The complete eight slots count against the paid cap and
-same-generation pending/retention accounting, so the logical residual cannot
-livelock a physical launch or mint a second machine. Paid packing padding is
-never demand, is never attributed to a request, and cannot independently
-retain a machine after the covered demand drains.
+``cold_launch_authority`` is the exact logical-card budget available to the
+locked catalog materializer. Physical shape selection is deliberately later:
+the materializer takes only whole same-card backends whose exact width fits the
+remaining logical target and paid GPU cap. Thus one unit of residual does not
+authorize an eight-GPU paid backend; it uses a later one-GPU template or
+remains unfilled. No paid packing padding is manufactured from an assumed
+per-card backend width. The exact accepted physical widths become
+same-generation pending/retention accounting and cap debit before any provider
+effect.
 
-The planner has one authoritative per-node physical GPU width for each
-accelerator card and one task-authoritative ``backend_num_nodes`` for the
-service version. Logical replicas require ``backend_num_nodes=1``. Physical
-backend service units remain one per backend, while the hard paid-cap debit is
+The planner has one authoritative
+``planning_capacity_quantum_by_accelerator`` for each accelerator card and one
+task-authoritative ``backend_num_nodes`` for the service version. The name is
+deliberate: this is not a catalog machine width. For logical services the
+quantum is always one GPU slot and
+``backend_num_nodes=1``; exact paid backend widths are the separate catalog
+dimension described above. Physical-backend service units remain one per
+backend, with configured per-node width, while the hard paid-cap debit is
 ``per_node_width * backend_num_nodes``. A CPU-only paid pool has an empty
 accelerator shape and a typed zero-GPU debit; its legacy non-planner Phase-A
 path remains subject to ordinary claim, pool, service, and provider policy.
 The GPU-only immutable planner does not synthesize an aggregate accelerator to
 represent CPU. The adapter loads width and node count from the same exact task
 and must never obtain either by last-write-wins
-iteration over ``task.resources``. A logical service version that offers the
-same card at conflicting widths is rejected during
-preflight until the public contract is extended with a typed backend-shape
-dimension; silently choosing the first, last, minimum, or maximum width would
+iteration over ``task.resources``. A logical service version may seed the same
+card with different exact whole-GPU provider widths because the placement
+contract already supplies the typed backend-shape dimension; every occurrence
+still maps to the same one-slot logical card unit. A physical service that
+offers conflicting widths remains rejected rather than silently choosing the
+first, last, minimum, or maximum width, which would
 make reserved and paid debits describe different provider effects. This
 service-level invariant is independent of provider inventory observation,
 which may still coalesce several queries for the same physical pool.
@@ -2419,7 +2431,8 @@ it has merged or been deployed.
 | Paid restart replay and frozen cleanup | **The replay correction, historical repair, and final row settlement are production-complete; the temporary repair is ready for removal.** Recovery supplied priority 0 to an adoption UPSERT that rewrote nine existing priority-20 claims after their profiles were frozen. Release `1.1.1583` made existing claim replay/adoption validation-only and deployed a cleanup-only transition accepting solely a current priority of 0 whose historical-priority reconstruction exactly matches the frozen profile. Production released all nine claims. Release `1.1.1584` then consumed each exact same-record irreversible `COMMITTED` receipt atomically with its replica; supported cleanup also settled the two older `ACTIVE` rows. The affected PostgreSQL graph reached exact zero and stayed provider/cleanup-clean for 372 seconds, satisfying the strict-removal gate. |
 | Provider-native paid E2E | **Current-writer launch and automatic exact teardown are proven; multi-wave count, timing, and exact-ledger gates remain open.** `paid-e2e-1643a` committed 100 launch graphs, reached 90 provider-`RUNNING` AWS Spot L4 VMs, classified ten exact AWS capacity failures, and reconciled 13 late successes to three joined exact-zero samples without manual deletion. Release `1.1.1650` then recovered the interrupted `paid-e2e-1648a` graph through `21 claims / 21 debit units / 21 instances / 21 disks`, `4 / 6 / 17 / 17`, and `0 / 0 / 2 / 1` to three joined exact-zero AWS/GCP/PostgreSQL observations, again without manual deletion. Historical `spot-e2e-0901k` remains the at-least-100 count proof at 113. The remaining gate is one fresh current-writer campaign: reach at least 100 AWS/GCP Spot L4 VMs within the 15-minute correctness window, retain the five-minute diagnostic, complete 10,000 authenticated async identities, and naturally return to three joined exact-zero samples. |
 | Format-4 activation | **Superseded cleanly.** No older capacity plan, claim, or provider effect crossed the strict-current decoder boundary before format 6 activation. There was no row rewrite, compatibility decoder, storage migration, or infrastructure change. |
-| Format-6 activation | **Complete from an exact-zero service recreation and current through `1.1.1650`.** Current writers strictly reject formats 1--5; lifecycle 152 and later campaigns committed schema-6 heads and paid waves. The service is now absent, so the next clean fleet creation requires no retained service-version migration. |
+| Format-6 activation | **Superseded from exact zero.** Lifecycle 152 and later campaigns committed schema-6 heads and paid waves through `1.1.1650`; the service is now absent and its provider graph is exact zero. |
+| Format-7 planning quantum | **Source implementation and PostgreSQL qualification in progress.** The misleading per-card ``physical_gpu_width`` field is replaced by an explicit planning quantum: one logical GPU slot for per-GPU services, or the configured per-node width for physical-backend services. Exact paid machine width exists only in catalog/template/spec/pool/replica facts and crosses through one typed placement-contract conversion. Format 7 strictly rejects earlier envelopes; the absent disposable test service will be recreated after a homogeneous deployment, with no row rewrite or migration. |
 | Lifecycle-137 evidence | Release `1.1.1554` reached exactly 100 provider-`RUNNING` GCP Spot one-L4 workers with zero ordinary on-demand and zero wrong-shape capacity. All 10,000 authenticated warm requests returned first-attempt HTTP 200. Normal down converged service, replica, claim, waiter, VM, and disk state to exact zero before the schema-3 cutover. |
 | Lifecycle-136 evidence | Run `9462207b-e026-4c5e-b610-acaba61e9b0a` on `1.1.1550` reached exactly 100 provider-`RUNNING` GCP Spot L4 VMs, with zero on-demand and zero non-L4 VMs. It accepted the 10,000-ID continuation and subsequent 5,000-ID extension. Normal teardown reached provider zero in about 3 minutes 16 seconds and full PostgreSQL/provider/disk zero in about 3 minutes 45 seconds. The immutable bundle records SHA-256 `audit.jsonl` `51807331f170d1352e9001324bd2e66f169a8a04867b7ca9bf94d8c4b953a8d7`, `arm.json` `92542d925ad50f0916cd8dcdc3977d27aa7f6a5e27b269445e03b70eadc36e70`, and `guard.json` `54a503e1f83eaa4899bce38bcc254591f885587ba87e81241fe3332a4188a649`. |
 | Cold-scale timing | **The executor-budget correction is deployed and the first 100 graphs commit promptly; multi-wave timing proof remains open.** `paid-e2e-1643a` committed 100 launches in 8.4 seconds and reached 90 AWS Spot VMs before ten exact capacity failures. The next wave was blocked by controller optimistic-precondition starvation, not provider or executor concurrency. Deterministic tests now reproduce terminal/removal churn at the controller-to-PostgreSQL boundary and prove two successor 100-member transactions commit on their next reconciliations without provider readiness. The next campaign must prove the resulting provider wall time. Five minutes remains the recorded performance benchmark; the 15-minute bound is the correctness timeout. |
@@ -2994,6 +3007,35 @@ state, and paid accounting are reconstructed only from locked PostgreSQL rows.
 
 #### Provider-free paid templates
 
+The placement contract separates logical work from physical supply. Under
+``dynamic_fallback_per_gpu`` / ``whole_gpu_shapes``, each configured
+accelerator card has a planning unit of exactly one logical GPU slot. A YAML
+count such as ``L4:8`` is a provider/catalog seed or constraint; it is not a
+claim that every selectable L4 backend has width eight. The immutable catalog
+may therefore contain single-node L4 backends with widths 1, 2, 4, and 8. The
+exact physical width belongs only to that catalog location, its paid pool key,
+the resulting template/spec, and the persisted replica. Under the physical
+``configured_shapes`` contract, by contrast, the configured width and node
+count remain the exact backend shape and one backend consumes one plan unit.
+
+One pure typed boundary combines the elected ``PlacementContract`` with a
+``PhysicalBackendShape``. It returns one plan unit for an exact physical-mode
+backend, returns the candidate's exact GPU width for a same-card single-node
+logical backend, and rejects every other combination. Controller preparation,
+manager catalog traversal, repository template validation, locked
+materialization, and current-version ready/retirement attribution all use
+these same semantics. In logical mode a persisted current-version replica is
+valid when its exact catalog/resource width equals its positive
+``planned_capacity``; it is not compared with the card's one-slot planning
+unit.
+
+The older ``PaidLaunchAuthority``-to-``PlanBoundAdmissionCohort`` projection
+has no production caller; only retained unit tests exercise it. It assumes one
+physical width per card and is explicitly deprecated, must not receive a new
+caller, and will be deleted after the format-7 provider qualification horizon.
+The production path is the fused prospective-claim budget plus locked mixed-
+width templates described here; there is no second allocator for it.
+
 A staged ``PaidLaunchTemplate`` is a deeply immutable, keyword-only value. It
 contains no mutable ``ReplicaInfo``, ``Location``, mapping, list, callback,
 closure, worker, provider reservation, or object whose later mutation could
@@ -3041,9 +3083,14 @@ postcommit materialization compare the complete committed storage document
 against the same constructor, preventing a wrong port or pre-stamped terminal
 state from becoming provider authority.
 
-No new independently idempotent member key is invented. Preparation stages one
-identity-free template per eligible exact catalog pool. The transaction locks
-that finite pool set, computes current headroom, expands at most 100 members,
+No new independently idempotent member key is invented. Preparation stages a
+bounded identity-free subset of eligible exact catalog pools. For each of at
+most eight configured paid cards it keeps the minimum global-cost-ordered
+positive-headroom prefix capable of supplying one 100-member atomic wave, plus
+the cheapest active one-GPU pool when needed to represent a smaller logical
+remainder. The total pre-lock catalog is therefore bounded by 800 templates;
+an over-card or over-template input fails closed before SQL. The transaction
+locks that finite pool set, computes current headroom, expands at most 100 members,
 and accepts only the subset allowed by the current plan, physical cap, pool,
 frontier, fairness, and pacing authority. A prospective location that cannot
 be prepared simply contributes no template; there is no complete-cohort
@@ -3496,6 +3543,12 @@ One bounded operation:
    or started. Queue visibility at this commit is executable authority.
 
 Each template and resulting launch spec keep one exact cheapest-first location.
+Logical materialization greedily consumes exact widths in that immutable cost
+order only when the whole width fits the remaining card target and physical
+GPU cap. A later narrow template may fill the remainder; the transaction never
+rounds up or partially debits an indivisible backend. If the bounded catalog
+cannot represent the remainder, it commits only the representable prefix (or
+no paid member) and leaves the remainder fail-closed for a later observation.
 Pool saturation may underfill its card but never causes an in-transaction
 reassignment. Process
 headroom only bounds later execution; it does not shrink the transaction's
@@ -3880,7 +3933,9 @@ missing telemetry.
     Local files, caches, and process memory are never recovery authority; all
     durable request, capacity, replica, and recovery state is PostgreSQL-only.
 13. **Multi-GPU completeness:** every visible compatible GPU has its own worker
-    slot and must complete fresh work in qualification.
+    slot and must complete fresh work in qualification. Logical card identity
+    is independent of physical backend width; current-version planned capacity
+    must equal the exact persisted whole-GPU backend width.
 14. **Telemetry is not authority:** UI and status are read-only projections and
     cannot launch, retire, or prove provider billing state.
 15. **Teardown is log-independent:** after bounded functional drain, provider
@@ -3909,10 +3964,11 @@ missing telemetry.
 21. **Closed Spot discovery:** an empty, failed, or on-demand-only prospective
     discovery remains empty and authorizes no paid launch; only an explicitly
     discovered Spot placement may enter fleet cold-launch authority.
-22. **Whole-backend paid actuation:** logical paid residual and physical paid
-    cold-launch authority are separate same-plan projections. Every authority
-    is width-quantized, its padding is accounted, and its complete width is
-    debited before a second launch.
+22. **Whole-backend paid actuation:** logical paid residual and exact physical
+    paid backends are separate same-plan projections. The locked materializer
+    admits a complete backend only when its width fits the remaining target;
+    accepted exact width is debited before a second launch, and paid admission
+    never rounds the target upward or manufactures padding.
 23. **Scoped reservation packing:** a non-fitting whole reservation worker is
     omitted from prospective supply for that card; it cannot partially launch
     or globally suppress an independently valid exact-card Spot residual.
@@ -4040,6 +4096,15 @@ format-6 decoder strictly rejects formats 1--5; there is no row rewrite, dual
 decoder, EFS/PVC state, or mixed-writer interval. Rollback is permitted only
 before any format-6 head exists. After the first format-6 head, recovery is
 fix-forward on a newer homogeneous format-6-capable image.
+
+Format 7 uses the same current-only discipline for the planning-quantum rename.
+It is intentionally not a compatibility alias for schema 6: accepting the old
+``physical_gpu_width`` name would preserve the false abstraction that caused
+catalog machine width and logical capacity unit to be conflated. The test-only
+service and complete provider graph are already absent, so deploy one
+homogeneous format-7-capable image and recreate the service; do not migrate or
+rewrite old plan rows. Once the first format-7 head commits, repair remains
+fix-forward on a homogeneous format-7-capable image.
 
 ### Failure and rollback
 
@@ -4231,6 +4296,23 @@ on-demand spill.
   subtracted under the combined locked transaction, never during provider-free
   template preparation. Prove advancing the head cannot free a cleanup-unproven
   claim from an older generation.
+- For both unpinned ``L4:1`` and ``L4:8`` logical YAML seeds, enumerate the
+  available 1/2/4/8-GPU L4 catalog shapes and prove they retain one logical-card
+  identity. Exercise cost orders with the widest shape first and prove a
+  13-slot target admits 8+4+1, records plan units and physical GPU debits
+  8+4+1, and never admits 14 or 16. Remove or saturate the one-GPU remainder
+  pool and prove only 8+4 commits: the unrepresentable one-slot remainder must
+  not become padding or a wider launch. Repeat ready-capacity, retirement,
+  recovery, and launch-guard attribution for a current-version eight-GPU row;
+  its persisted planned capacity must equal eight even though the logical card
+  catalog unit is one.
+- Construct eight paid cards with 100 positive-headroom one-claim pools each
+  and prove the 800-template lower-bound case is accepted without truncation;
+  a ninth card or any 801st template fails closed before the correctness
+  transaction. In a 277-location single-card catalog with 60 claims of
+  headroom per location, prove preparation serializes exactly two body
+  templates, not all 277, while retaining global price order and the required
+  narrow-width remainder pool.
 - For an eight-GPU, two-node ``PHYSICAL_BACKEND``, prove cap 16 grants exactly
   one backend, cap 32 grants two, and one existing backend leaves exactly one
   new backend at cap 32. Prove advisory headroom 15 rejects, headroom 16 admits
@@ -4272,7 +4354,7 @@ on-demand spill.
   same-numeric-ID/different-UUID, or claim mismatch fails closed. Never build
   from a precommit template after ambiguous acknowledgement, and never replay
   a historical batch.
-- Encode a format-6 plan with DB-epoch policy fields and prove formats 1--5 are
+- Encode a format-7 plan with DB-epoch policy fields and prove formats 1--6 are
   strict failures. Before qualification, down to the complete service/provider
   zero inventory, hold Serve writes, deploy every role homogeneously, and only
   then recreate. Prove rollback is allowed before the first format-6 head and
@@ -4538,7 +4620,7 @@ condition of the already-complete paid Spot provider-lifecycle gate.
    every current compatible reserved worker is committed first.
    The convergence target is the configured paid cap or the lower
    provider-available limit, not an instantaneous exact count of 100. Require
-   bounded overshoot/undershoot to reconcile within a few minutes and record
+   bounded provider lag/undershoot to reconcile within a few minutes and record
    time-to-limit from the atomic paid-wave commit.
    From an authenticated idle map, additionally require the first positive
    paid claim to postdate a schema-6 allocation with a non-blind covering

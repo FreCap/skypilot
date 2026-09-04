@@ -395,7 +395,7 @@ def _snapshot(
         'service_version': 3,
         'configured_accelerators': ('L4', 'A100'),
         'capacity_unit': capacity_planning.CapacityUnit.LOGICAL_GPU,
-        'physical_gpu_width_by_accelerator': _capacity(L4=1, A100=1),
+        'planning_capacity_quantum_by_accelerator': _capacity(L4=1, A100=1),
         'capacity_per_accelerator': _work(L4=1, A100=1),
         'floors': _capacity(),
         'minimum_capacity': 0,
@@ -530,7 +530,7 @@ def _prior_candidate(
                 state.last_reduced_demand_generation),
             capacity_unit=state.capacity_unit,
             maximum_capacity=state.maximum_capacity,
-            physical_gpu_width_by_accelerator=_capacity(L4=1, A100=1))
+            planning_capacity_quantum_by_accelerator=_capacity(L4=1, A100=1))
         assert genesis_state.service_name == state.service_name
         return dataclasses.replace(candidate, next_policy_state=state)
     demand = (() if target == 0 else (_demand(50, (card,), target),))
@@ -622,7 +622,7 @@ def test_genesis_policy_builds_one_valid_zero_prior_pair() -> None:
         last_reduced_demand_generation=6,
         capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
         maximum_capacity=20,
-        physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8))
+        planning_capacity_quantum_by_accelerator=_capacity(L4=1, A100=8))
 
     assert candidate.next_policy_state == state
     assert candidate.source_generation == 6
@@ -644,7 +644,7 @@ def test_policy_history_reprojection_rejects_card_domain_changes(
         last_reduced_demand_generation=6,
         capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
         maximum_capacity=20,
-        physical_gpu_width_by_accelerator=_capacity(l4=1, a100=8))
+        planning_capacity_quantum_by_accelerator=_capacity(l4=1, a100=8))
 
     with pytest.raises(ValueError, match='identity|accelerator domain'):
         capacity_planning.reproject_capacity_policy_history(
@@ -660,7 +660,7 @@ def _folded_genesis_history() -> tuple[capacity_planning.CapacityPolicyState,
         last_reduced_demand_generation=6,
         capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
         maximum_capacity=20,
-        physical_gpu_width_by_accelerator=_capacity(l4=1, a100=8))
+        planning_capacity_quantum_by_accelerator=_capacity(l4=1, a100=8))
 
 
 def test_policy_history_reprojection_rejects_same_size_card_swap() -> None:
@@ -720,7 +720,7 @@ def test_policy_history_reprojection_preserves_counts_across_domains() -> None:
         'A100': 2,
         'L4': 3,
     }
-    assert new_candidate.physical_gpu_width_by_accelerator.as_dict() == {
+    assert new_candidate.planning_capacity_quantum_by_accelerator.as_dict() == {
         'A100': 8,
         'L4': 1,
     }
@@ -932,13 +932,13 @@ def test_policy_rejects_future_db_epoch_instead_of_rebasing_it() -> None:
 
 def test_snapshot_fingerprint_binds_physical_gpu_packing() -> None:
     one_gpu = _snapshot(
-        physical_gpu_width_by_accelerator=_capacity(L4=1, A100=1))
+        planning_capacity_quantum_by_accelerator=_capacity(L4=1, A100=1))
     eight_gpu = _snapshot(
-        physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8))
+        planning_capacity_quantum_by_accelerator=_capacity(L4=1, A100=8))
 
     assert one_gpu.fingerprint != eight_gpu.fingerprint
-    assert (capacity_planning.plan_capacity(
-        eight_gpu).physical_gpu_width_by_accelerator.as_dict()['A100'] == 8)
+    assert (capacity_planning.plan_capacity(eight_gpu).
+            planning_capacity_quantum_by_accelerator.as_dict()['A100'] == 8)
 
 
 def test_reserved_supply_changes_actuation_not_demand_attribution() -> None:
@@ -960,7 +960,8 @@ def test_supply_rematch_preserves_explicit_cold_paid_order() -> None:
     demand = (_demand(20, ('A100', 'L4'), 1),)
     plan = capacity_planning.plan_capacity(
         _snapshot(configured_accelerators=('A100', 'L4'),
-                  physical_gpu_width_by_accelerator=_capacity(A100=1, L4=1),
+                  planning_capacity_quantum_by_accelerator=_capacity(A100=1,
+                                                                     L4=1),
                   capacity_per_accelerator=_work(A100=1, L4=1),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
@@ -1190,7 +1191,7 @@ def test_logical_reservation_debit_launches_one_complete_eight_gpu_backend(
     demand = (_demand(50, ('A100',), 1),)
     plan = capacity_planning.plan_capacity(
         _snapshot(
-            physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+            planning_capacity_quantum_by_accelerator=_capacity(L4=1, A100=8),
             demand_profiles=demand,
             explicit_demand_profiles=demand,
             paid_demand_profiles=demand,
@@ -1213,7 +1214,7 @@ def test_partial_multi_gpu_reservation_stays_spot_demand() -> None:
     demand = (_demand(50, ('A100',), 1),)
     plan = capacity_planning.plan_capacity(
         _snapshot(
-            physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+            planning_capacity_quantum_by_accelerator=_capacity(L4=1, A100=8),
             demand_profiles=demand,
             explicit_demand_profiles=demand,
             paid_demand_profiles=demand,
@@ -1237,7 +1238,8 @@ def test_multi_gpu_paid_launch_is_minimal_whole_backend_cover() -> None:
     demand = (_demand(50, ('A100',), 9),)
 
     plan = capacity_planning.plan_capacity(
-        _snapshot(physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+        _snapshot(planning_capacity_quantum_by_accelerator=_capacity(L4=1,
+                                                                     A100=8),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
                   paid_demand_profiles=demand))
@@ -1252,7 +1254,8 @@ def test_paid_cap_preserves_residual_while_authorizing_one_whole_backend(
     demand = (_demand(50, ('A100',), 9),)
 
     plan = capacity_planning.plan_capacity(
-        _snapshot(physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+        _snapshot(planning_capacity_quantum_by_accelerator=_capacity(L4=1,
+                                                                     A100=8),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
                   paid_demand_profiles=demand,
@@ -1279,7 +1282,8 @@ def test_physical_paid_cap_debits_every_backend_node(
     plan = capacity_planning.plan_capacity(
         _snapshot(capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
                   backend_num_nodes=2,
-                  physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+                  planning_capacity_quantum_by_accelerator=_capacity(L4=1,
+                                                                     A100=8),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
                   paid_demand_profiles=demand,
@@ -1297,15 +1301,16 @@ def test_physical_backend_shape_product_overflow_is_rejected() -> None:
     with pytest.raises(ValueError, match='exact accounting range'):
         _snapshot(capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
                   backend_num_nodes=2,
-                  physical_gpu_width_by_accelerator=_capacity(L4=(1 << 63) - 1,
-                                                              A100=8))
+                  planning_capacity_quantum_by_accelerator=_capacity(
+                      L4=(1 << 63) - 1, A100=8))
 
 
 def test_existing_paid_capacity_is_charged_before_new_authority() -> None:
     demand = (_demand(50, ('A100',), 1),)
 
     plan = capacity_planning.plan_capacity(
-        _snapshot(physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+        _snapshot(planning_capacity_quantum_by_accelerator=_capacity(L4=1,
+                                                                     A100=8),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
                   paid_demand_profiles=demand,
@@ -1325,7 +1330,8 @@ def test_cleanup_unproven_old_paid_capacity_charges_without_covering_demand(
                                       charged_paid_gpu_units=8)
 
     plan = capacity_planning.plan_capacity(
-        _snapshot(physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+        _snapshot(planning_capacity_quantum_by_accelerator=_capacity(L4=1,
+                                                                     A100=8),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
                   paid_demand_profiles=demand,
@@ -1345,7 +1351,8 @@ def test_paid_cap_skips_nonfitting_wide_card_for_later_narrow_card() -> None:
     )
 
     plan = capacity_planning.plan_capacity(
-        _snapshot(physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+        _snapshot(planning_capacity_quantum_by_accelerator=_capacity(L4=1,
+                                                                     A100=8),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
                   paid_demand_profiles=demand,
@@ -1361,7 +1368,8 @@ def test_paid_cap_smaller_than_backend_grants_no_fractional_authority() -> None:
     demand = (_demand(50, ('A100',), 1),)
 
     plan = capacity_planning.plan_capacity(
-        _snapshot(physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+        _snapshot(planning_capacity_quantum_by_accelerator=_capacity(L4=1,
+                                                                     A100=8),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
                   paid_demand_profiles=demand,
@@ -1377,7 +1385,8 @@ def test_candidate_rejects_nonminimal_or_inconsistent_paid_backend_cover(
         launch: int, padding: int) -> None:
     demand = (_demand(50, ('A100',), 1),)
     plan = capacity_planning.plan_capacity(
-        _snapshot(physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+        _snapshot(planning_capacity_quantum_by_accelerator=_capacity(L4=1,
+                                                                     A100=8),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
                   paid_demand_profiles=demand))
@@ -1675,7 +1684,7 @@ def test_gate_witness_binds_scope_and_ignores_volatile_inputs() -> None:
             configured_reservation_accelerators=('L4', 'A100'))) != baseline
     assert witness(
         dataclasses.replace(snapshot,
-                            physical_gpu_width_by_accelerator=_capacity(
+                            planning_capacity_quantum_by_accelerator=_capacity(
                                 L4=1, A100=8))) != baseline
     physical = dataclasses.replace(
         snapshot, capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND)
@@ -1692,7 +1701,7 @@ def test_gate_witness_binds_reduced_acquisition_classes() -> None:
     snapshot = _snapshot(
         configured_accelerators=('A100',),
         configured_reservation_accelerators=('A100',),
-        physical_gpu_width_by_accelerator=_capacity(A100=1),
+        planning_capacity_quantum_by_accelerator=_capacity(A100=1),
         capacity_per_accelerator=_work(A100=1),
         demand_profiles=demand,
         explicit_demand_profiles=(),
@@ -1728,7 +1737,9 @@ def test_fractional_copack_intersects_acquisition_compatibility() -> None:
 
     plan = capacity_planning.plan_capacity(
         _snapshot(configured_accelerators=configured,
-                  physical_gpu_width_by_accelerator=_capacity(A=1, B=1, C=1),
+                  planning_capacity_quantum_by_accelerator=_capacity(A=1,
+                                                                     B=1,
+                                                                     C=1),
                   capacity_per_accelerator=_work(A=1, B=1, C=1),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
@@ -1747,7 +1758,8 @@ def test_acquisition_class_excludes_card_that_cannot_carry_copacked_work(
 
     plan = capacity_planning.plan_capacity(
         _snapshot(configured_accelerators=('FAST', 'SLOW'),
-                  physical_gpu_width_by_accelerator=_capacity(FAST=1, SLOW=1),
+                  planning_capacity_quantum_by_accelerator=_capacity(FAST=1,
+                                                                     SLOW=1),
                   capacity_per_accelerator=_work(FAST=2, SLOW=1),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
@@ -1765,7 +1777,8 @@ def test_fixed_work_exact_pins_a_shared_fractional_slot() -> None:
 
     plan = capacity_planning.plan_capacity(
         _snapshot(configured_accelerators=('A100', 'H200'),
-                  physical_gpu_width_by_accelerator=_capacity(A100=1, H200=1),
+                  planning_capacity_quantum_by_accelerator=_capacity(A100=1,
+                                                                     H200=1),
                   capacity_per_accelerator=_work(A100=1, H200=1),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
@@ -1784,7 +1797,8 @@ def test_disjoint_high_priority_demand_does_not_upgrade_fixed_work() -> None:
 
     plan = capacity_planning.plan_capacity(
         _snapshot(configured_accelerators=('A100', 'L4'),
-                  physical_gpu_width_by_accelerator=_capacity(A100=1, L4=1),
+                  planning_capacity_quantum_by_accelerator=_capacity(A100=1,
+                                                                     L4=1),
                   capacity_per_accelerator=_work(A100=1, L4=1),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
@@ -1806,7 +1820,7 @@ def test_logical_multi_gpu_target_carries_one_class_per_logical_slot() -> None:
 
     plan = capacity_planning.plan_capacity(
         _snapshot(configured_accelerators=('A100',),
-                  physical_gpu_width_by_accelerator=_capacity(A100=8),
+                  planning_capacity_quantum_by_accelerator=_capacity(A100=8),
                   capacity_per_accelerator=_work(A100=1),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
@@ -1831,7 +1845,7 @@ def test_joint_matcher_consumes_all_compatible_free_cards_before_paid() -> None:
     plan = capacity_planning.plan_capacity(
         _snapshot(
             configured_accelerators=configured,
-            physical_gpu_width_by_accelerator=free,
+            planning_capacity_quantum_by_accelerator=free,
             capacity_per_accelerator=_work(A=1, B=1, C=1),
             demand_profiles=demand,
             explicit_demand_profiles=demand,
@@ -1866,7 +1880,7 @@ def test_zero_cost_preference_beats_lower_rank_paid_counterexample() -> None:
     plan = capacity_planning.plan_capacity(
         _snapshot(
             configured_accelerators=configured,
-            physical_gpu_width_by_accelerator=_capacity(A=1, B=1, C=1),
+            planning_capacity_quantum_by_accelerator=_capacity(A=1, B=1, C=1),
             capacity_per_accelerator=_work(A=1, B=1, C=1),
             demand_profiles=demand,
             explicit_demand_profiles=demand,
@@ -1905,7 +1919,7 @@ def test_deadline_only_target_uses_exact_selected_acquisition_class() -> None:
     plan = capacity_planning.plan_capacity(
         _snapshot(
             configured_accelerators=('A100',),
-            physical_gpu_width_by_accelerator=_capacity(A100=1),
+            planning_capacity_quantum_by_accelerator=_capacity(A100=1),
             capacity_per_accelerator=_work(A100=1),
             demand_profiles=(),
             explicit_demand_profiles=(),
@@ -1936,7 +1950,7 @@ def test_mixed_case_cards_share_one_matcher_domain() -> None:
     plan = capacity_planning.plan_capacity(
         _snapshot(
             configured_accelerators=('A100', 'h200'),
-            physical_gpu_width_by_accelerator=free,
+            planning_capacity_quantum_by_accelerator=free,
             capacity_per_accelerator=_work(A100=1, h200=1),
             demand_profiles=demand,
             explicit_demand_profiles=demand,
@@ -2317,7 +2331,7 @@ def test_gate_off_zero_demand_observer_blackout_preserves_proven_holdings(
 ) -> None:
     plan = capacity_planning.plan_capacity(
         _snapshot(
-            physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+            planning_capacity_quantum_by_accelerator=_capacity(L4=1, A100=8),
             demand_profiles=(),
             explicit_demand_profiles=(),
             paid_demand_profiles=(),
@@ -2403,7 +2417,7 @@ def test_snapshot_canonicalizes_card_casing_to_configured_names() -> None:
     l4_demand = (_demand(20, ('l4',), 1),)
     plan = capacity_planning.plan_capacity(
         _snapshot(configured_accelerators=('L4',),
-                  physical_gpu_width_by_accelerator=_capacity(l4=1),
+                  planning_capacity_quantum_by_accelerator=_capacity(l4=1),
                   capacity_per_accelerator=_work(l4=1),
                   demand_profiles=l4_demand,
                   explicit_demand_profiles=l4_demand,
@@ -2423,7 +2437,8 @@ def test_snapshot_rejects_invalid_paid_gpu_cap(invalid_cap: object) -> None:
 
 def test_snapshot_rejects_fractional_backend_retirement_shelter() -> None:
     with pytest.raises(ValueError, match='whole-backend exact'):
-        _snapshot(physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+        _snapshot(planning_capacity_quantum_by_accelerator=_capacity(L4=1,
+                                                                     A100=8),
                   retirement_shelter_target=_capacity(A100=7))
 
 
@@ -2516,7 +2531,8 @@ def test_retirement_shelter_composes_same_card_without_double_counting(
     demand = (_demand(50, ('A100',), 1),)
 
     plan = capacity_planning.plan_capacity(
-        _snapshot(physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+        _snapshot(planning_capacity_quantum_by_accelerator=_capacity(L4=1,
+                                                                     A100=8),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
                   paid_demand_profiles=demand,
@@ -2532,7 +2548,8 @@ def test_retirement_shelter_composes_disjoint_card_without_creating_demand(
     demand = (_demand(50, ('L4',), 1),)
 
     plan = capacity_planning.plan_capacity(
-        _snapshot(physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+        _snapshot(planning_capacity_quantum_by_accelerator=_capacity(L4=1,
+                                                                     A100=8),
                   demand_profiles=demand,
                   explicit_demand_profiles=demand,
                   paid_demand_profiles=demand,
@@ -2549,7 +2566,8 @@ def test_disjoint_demand_evicts_unfittable_whole_backend_shelter() -> None:
 
     plan = capacity_planning.plan_capacity(
         _snapshot(configured_accelerators=('L4', 'H200'),
-                  physical_gpu_width_by_accelerator=_capacity(L4=1, H200=8),
+                  planning_capacity_quantum_by_accelerator=_capacity(L4=1,
+                                                                     H200=8),
                   capacity_per_accelerator=_work(L4=1, H200=1),
                   maximum_capacity=10,
                   demand_profiles=demand,
@@ -2567,7 +2585,7 @@ def test_disjoint_demand_evicts_unfittable_whole_backend_shelter() -> None:
 def test_fresh_zero_retirement_floor_combines_retention_and_shelter() -> None:
     plan = capacity_planning.plan_capacity(
         _snapshot(
-            physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+            planning_capacity_quantum_by_accelerator=_capacity(L4=1, A100=8),
             planning_purpose=(
                 capacity_planning.CapacityPlanningPurpose.FRESH_ZERO_RETENTION),
             minimum_capacity=0,
@@ -2804,7 +2822,7 @@ def test_planner_envelope_rejects_invalid_card_map_value() -> None:
     payload = _planner_payload()
     snapshot = payload['snapshot']
     assert isinstance(snapshot, dict)
-    widths = snapshot['physical_gpu_width_by_accelerator']
+    widths = snapshot['planning_capacity_quantum_by_accelerator']
     assert isinstance(widths, dict)
     entries = widths['entries']
     assert isinstance(entries, list)
@@ -2859,7 +2877,7 @@ def test_planner_envelope_rejects_noncanonical_card_order() -> None:
     payload = copy.deepcopy(_planner_payload())
     snapshot = payload['snapshot']
     assert isinstance(snapshot, dict)
-    widths = snapshot['physical_gpu_width_by_accelerator']
+    widths = snapshot['planning_capacity_quantum_by_accelerator']
     assert isinstance(widths, dict)
     entries = widths['entries']
     assert isinstance(entries, list)

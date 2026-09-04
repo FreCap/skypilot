@@ -21,6 +21,7 @@ from sky.serve import capacity_planning
 from sky.serve import constants
 from sky.serve import demand_state
 from sky.serve import kueue_lane_capacity
+from sky.serve import placement_policy
 from sky.serve import request_aggregator
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
@@ -352,7 +353,7 @@ def _durable_prior(autoscaler, *, generation=0):
         last_reduced_demand_generation=generation,
         capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
         maximum_capacity=autoscaler.max_replicas,
-        physical_gpu_width_by_accelerator=(
+        planning_capacity_quantum_by_accelerator=(
             capacity_planning.AcceleratorCapacity.from_mapping(
                 autoscaler.configured_accelerator_shapes)))
 
@@ -563,10 +564,11 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         self.assertEqual(candidate.paid_residual.as_dict(), expected_target)
         self.assertEqual(candidate.paid_launch_target.as_dict(),
                          expected_target)
-        self.assertEqual(candidate.physical_gpu_width_by_accelerator.as_dict(),
-                         {'L4': 1})
+        self.assertEqual(
+            candidate.planning_capacity_quantum_by_accelerator.as_dict(),
+            {'L4': 1})
         paid_units = candidate.paid_launch_target.get('L4')
-        width = candidate.physical_gpu_width_by_accelerator.get('L4')
+        width = candidate.planning_capacity_quantum_by_accelerator.get('L4')
         physical_target, remainder = divmod(paid_units, width)
         self.assertEqual(remainder, 0)
         self.assertEqual(physical_target, 800)
@@ -745,7 +747,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             last_reduced_demand_generation=0,
             capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
             maximum_capacity=autoscaler.max_replicas,
-            physical_gpu_width_by_accelerator=(
+            planning_capacity_quantum_by_accelerator=(
                 capacity_planning.AcceleratorCapacity.from_mapping(
                     genesis_shapes)))
         zero_inventory = (capacity_planning.AcceleratorCapacity.from_mapping({
@@ -2547,7 +2549,7 @@ def _allocation(target,
     return capacity_planning.CapacityPlanCandidate(
         kind=capacity_planning.CapacityPlanKind.DEMAND,
         capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
-        physical_gpu_width_by_accelerator=(
+        planning_capacity_quantum_by_accelerator=(
             capacity_planning.AcceleratorCapacity.from_mapping(
                 {card: 1 for card in target})),
         aggregate_demand_target=sum(target.values()),
@@ -2892,8 +2894,18 @@ class TestColdPaidCardOrdering(unittest.TestCase):
         assert len(location.accelerators) == 1
         return next(iter(location.accelerators.items()))
 
-    def _order(self, costs):
+    @staticmethod
+    def _placer(*, logical: bool = False):
         placer = mock.Mock()
+        placer.placement_contract = placement_policy.resolve_fresh_contract(
+            placement_policy.CAPACITY_AWARE_SPOT_PLACER
+            if logical else placement_policy.SPOT_HEDGE_PLACER,
+            pool=False)
+        placer.num_nodes = 1
+        return placer
+
+    def _order(self, costs):
+        placer = self._placer()
         placer.known_location_costs.return_value = costs
         order = autoscalers._order_cold_paid_cards(['L4', 'A100'], placer,
                                                    lambda _: 1, lambda location:
@@ -2905,10 +2917,28 @@ class TestColdPaidCardOrdering(unittest.TestCase):
     def test_uses_catalog_costs_without_provider_resolution(self):
         self.assertEqual(self._order({'L4': 2.0, 'A100': 0.0}), ['L4', 'A100'])
 
+    def test_logical_catalog_accepts_wide_shapes_and_orders_per_gpu(self):
+        l4 = self._location('L4', use_spot=True)
+        l4.accelerators = {'L4': 8}
+        a100 = self._location('A100', use_spot=True)
+        placer = self._placer(logical=True)
+        costs = {l4: 0.80, a100: 0.20}
+        placer.known_location_costs.return_value = costs
+
+        order = autoscalers._order_cold_paid_cards(['A100', 'L4'], placer,
+                                                   lambda _: 1,
+                                                   self._location_gpu_shape)
+        prospective = autoscalers._prospective_paid_cards(
+            ['A100', 'L4'], placer, lambda _: 1, self._location_gpu_shape,
+            costs)
+
+        self.assertEqual(order, ['L4', 'A100'])
+        self.assertEqual(prospective, ['L4', 'A100'])
+
     def test_prospective_paid_cards_mixed_catalog_keeps_only_spot_cards(self):
         l4_spot = self._location('L4', use_spot=True)
         a100_ondemand = self._location('A100', use_spot=False)
-        placer = mock.Mock()
+        placer = self._placer()
         placer.known_location_costs.return_value = {
             l4_spot: 2.0,
             a100_ondemand: 1.0,
@@ -2925,7 +2955,7 @@ class TestColdPaidCardOrdering(unittest.TestCase):
         for raw_cost in (2.0, float('inf')):
             with self.subTest(raw_cost=raw_cost):
                 a100_ondemand = self._location('A100', use_spot=False)
-                placer = mock.Mock()
+                placer = self._placer()
                 placer.known_location_costs.return_value = {
                     a100_ondemand: raw_cost,
                 }
@@ -2937,7 +2967,7 @@ class TestColdPaidCardOrdering(unittest.TestCase):
                 placer.known_location_costs.assert_called_once_with()
 
     def test_prospective_paid_cards_fail_closed_on_catalog_error(self):
-        placer = mock.Mock()
+        placer = self._placer()
         placer.known_location_costs.side_effect = RuntimeError('unavailable')
 
         cards = autoscalers._prospective_paid_cards(['A100', 'L4'], placer,
@@ -2947,7 +2977,7 @@ class TestColdPaidCardOrdering(unittest.TestCase):
         self.assertEqual(cards, [])
 
     def test_prospective_paid_cards_fail_closed_on_empty_catalog(self):
-        placer = mock.Mock()
+        placer = self._placer()
         placer.known_location_costs.return_value = {}
 
         cards = autoscalers._prospective_paid_cards(['A100', 'L4'], placer,
@@ -2984,7 +3014,7 @@ class TestColdPaidCardOrdering(unittest.TestCase):
             a100_unpriced: 'A100',
             l4_paid: 'L4',
         }
-        placer = mock.Mock()
+        placer = self._placer()
         placer.known_location_costs.return_value = costs
 
         order = autoscalers._order_cold_paid_cards(['A100', 'L4'], placer,
@@ -3000,7 +3030,7 @@ class TestColdPaidCardOrdering(unittest.TestCase):
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
         l4 = mock.Mock(accelerators={'L4': 1})
         a100 = mock.Mock(accelerators={'A100': 1})
-        placer = mock.Mock()
+        placer = self._placer()
         placer.known_location_costs.side_effect = [
             {
                 l4: 2.0,
@@ -3041,7 +3071,7 @@ class TestColdPaidCardOrdering(unittest.TestCase):
         a100 = mock.Mock(accelerators={'A100': 1})
         catalog_costs = {l4: 2.0, a100: 1.0}
         workspace_eligible = set(catalog_costs)
-        placer = mock.Mock()
+        placer = self._placer()
         placer.known_location_costs.side_effect = lambda: {
             location: cost
             for location, cost in catalog_costs.items()
@@ -3080,7 +3110,7 @@ class TestColdPaidCardOrdering(unittest.TestCase):
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
         l4 = mock.Mock(accelerators={'L4': 1})
         a100 = mock.Mock(accelerators={'A100': 1})
-        placer = mock.Mock()
+        placer = self._placer()
         placer.known_location_costs.side_effect = [
             {
                 l4: 2.0,
@@ -3106,7 +3136,7 @@ class TestColdPaidCardOrdering(unittest.TestCase):
         self.assertIsNone(autoscaler._cold_paid_location_costs_for_tick)
 
     def test_snapshot_failure_preserves_service_order(self):
-        placer = mock.Mock()
+        placer = self._placer()
         placer.known_location_costs.side_effect = RuntimeError('unavailable')
 
         order = autoscalers._order_cold_paid_cards(['L4', 'A100'], placer,
@@ -6689,6 +6719,9 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         a100_location = mock.Mock(accelerators={'A100': 1})
         l4_location = mock.Mock(accelerators={'L4': 1})
         placer = mock.Mock()
+        placer.placement_contract = placement_policy.resolve_fresh_contract(
+            placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
+        placer.num_nodes = 1
         placer.known_location_costs.return_value = {
             a100_location: 0.0,
             l4_location: 1.0,
@@ -6729,6 +6762,9 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         a100_unpriced = mock.Mock(accelerators={'A100': 1})
         l4_location = mock.Mock(accelerators={'L4': 1})
         placer = mock.Mock()
+        placer.placement_contract = placement_policy.resolve_fresh_contract(
+            placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
+        placer.num_nodes = 1
         placer.known_location_costs.return_value = {
             a100_zero: 0.0,
             a100_unpriced: float('inf'),
@@ -6756,6 +6792,9 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         l4_location = mock.Mock(accelerators={'L4': 1})
         a100_location = mock.Mock(accelerators={'A100': 1})
         placer = mock.Mock()
+        placer.placement_contract = placement_policy.resolve_fresh_contract(
+            placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
+        placer.num_nodes = 1
         placer.known_location_costs.return_value = {
             l4_location: float('inf'),
             a100_location: 2.0,
@@ -7008,6 +7047,9 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                                            accelerators={'L4': 1},
                                            use_spot=True)
         placer = mock.Mock()
+        placer.placement_contract = placement_policy.resolve_fresh_contract(
+            placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
+        placer.num_nodes = 1
         placer.known_location_costs.return_value = {
             a100_location: 0.0,
             l4_location: 1.0,
@@ -7075,6 +7117,9 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                                            accelerators={'L4': 1},
                                            use_spot=True)
         placer = mock.Mock()
+        placer.placement_contract = placement_policy.resolve_fresh_contract(
+            placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
+        placer.num_nodes = 1
         placer.known_location_costs.return_value = {
             a100_location: 0.0,
             l4_location: 1.0,

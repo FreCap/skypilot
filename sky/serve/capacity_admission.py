@@ -1052,7 +1052,7 @@ class PaidLaunchAuthority:
     paid_launch_target_by_accelerator: tuple[tuple[str, int], ...]
     reserved_fill_authority: ReservedFillPlanAuthority
     capacity_unit: capacity_planning.CapacityUnit
-    physical_gpu_width_by_accelerator: tuple[tuple[str, int], ...]
+    planning_capacity_quantum_by_accelerator: tuple[tuple[str, int], ...]
     backend_num_nodes: int = 1
 
     def economic_residual(self) -> dict[str, int]:
@@ -1067,7 +1067,7 @@ class PaidLaunchAuthority:
         card = accelerator.casefold()
         widths = {
             raw_card.casefold(): width
-            for raw_card, width in self.physical_gpu_width_by_accelerator
+            for raw_card, width in self.planning_capacity_quantum_by_accelerator
         }
         physical_width = widths.get(card)
         if (type(physical_width) is not int or physical_width < 1 or  # pylint: disable=unidiomatic-typecheck
@@ -1952,8 +1952,8 @@ def _authority(
         reserved_fill_authority=reserved_fill_authority,
         capacity_unit=candidate.capacity_unit,
         backend_num_nodes=candidate.backend_num_nodes,
-        physical_gpu_width_by_accelerator=tuple(
-            candidate.physical_gpu_width_by_accelerator.entries))
+        planning_capacity_quantum_by_accelerator=tuple(
+            candidate.planning_capacity_quantum_by_accelerator.entries))
 
 
 def _validate_reserved_fill_authority_in_connection(
@@ -3224,7 +3224,8 @@ def _planner_bound_pool_shape(
     pool_key: Any,
     candidate: capacity_planning.CapacityPlanCandidate,
     debit_accelerator: str,
-) -> serve_paid_capacity.PhysicalBackendShape:
+    placement_contract: placement_policy.PlacementContract,
+) -> tuple[serve_paid_capacity.PhysicalBackendShape, int]:
     """Decode and bind one relational pool to immutable planner shape."""
     try:
         pool_shape = serve_paid_capacity.paid_pool_gpu_shape(pool_key)
@@ -3237,15 +3238,17 @@ def _planner_bound_pool_shape(
         expected_shape = serve_paid_capacity.PhysicalBackendShape(
             accelerator=expected_card,
             gpu_units_per_node=(
-                candidate.physical_gpu_width_by_accelerator.get(expected_card)),
+                candidate.planning_capacity_quantum_by_accelerator.get(
+                    expected_card)),
             num_nodes=candidate.backend_num_nodes)
+        plan_units = serve_paid_capacity.paid_launch_plan_units(
+            contract=placement_contract,
+            configured_shape=expected_shape,
+            candidate_shape=pool_shape)
     except serve_paid_capacity.PaidGPUAttributionError as error:
         raise CapacityAdmissionConflict(
             'Planner-bound paid claim provider pool is malformed.') from error
-    if pool_shape != expected_shape:
-        raise CapacityAdmissionConflict(
-            'Paid claim provider pool contradicts its immutable backend shape.')
-    return pool_shape
+    return pool_shape, plan_units
 
 
 def _plan_claim_projection(
@@ -3257,6 +3260,7 @@ def _plan_claim_projection(
     accounting_cards: set[str],
     capacity_unit: capacity_planning.CapacityUnit | None,
     candidate: capacity_planning.CapacityPlanCandidate | None = None,
+    placement_contract: placement_policy.PlacementContract | None = None,
 ) -> _PlanClaimProjection:
     """Read one locked typed claim projection for units and physical debit."""
     units = {card: 0 for card in accounting_cards}
@@ -3286,9 +3290,18 @@ def _plan_claim_projection(
                     exact_card_matches = (card == AGGREGATE_ACCELERATOR or
                                           pool_shape.accelerator
                                           == card.casefold())
+                    expected_plan_units = (
+                        1 if capacity_unit
+                        is capacity_planning.CapacityUnit.PHYSICAL_BACKEND else
+                        pool_shape.gpu_units_per_node)
                 else:
-                    pool_shape = _planner_bound_pool_shape(
-                        row['pool_key'], candidate, card)
+                    if placement_contract is None:
+                        raise CapacityAdmissionConflict(
+                            'Planner-bound paid claim has no placement '
+                            'contract.')
+                    pool_shape, expected_plan_units = (
+                        _planner_bound_pool_shape(row['pool_key'], candidate,
+                                                  card, placement_contract))
                     exact_card_matches = True
             except (serve_paid_capacity.PaidGPUAttributionError,
                     CapacityAdmissionConflict) as error:
@@ -3298,12 +3311,11 @@ def _plan_claim_projection(
                 raise CapacityAdmissionConflict(
                     'Planner-bound claim attribution is malformed.')
             if (capacity_unit is capacity_planning.CapacityUnit.PHYSICAL_BACKEND
-                    and count != 1):
+                    and count != expected_plan_units):
                 raise CapacityAdmissionConflict(
                     'Physical-backend claim attribution is malformed.')
             if (capacity_unit is capacity_planning.CapacityUnit.LOGICAL_GPU and
-                (pool_shape.num_nodes != 1 or
-                 count != pool_shape.gpu_units_per_node)):
+                    count != expected_plan_units):
                 raise CapacityAdmissionConflict(
                     'Logical-GPU claim attribution is malformed.')
             physical_gpu_units += pool_shape.total_gpu_units
@@ -4212,8 +4224,6 @@ def _canonical_prepared_paid_launch_templates(
              template.service_lifecycle_epoch, template.service_version)
                 != expected_identity or template.workspace != workspace or
                 template.accelerator not in accounting_cards or
-                template.gpu_units_per_node
-                != accounting_cards[template.accelerator] or
                 template.num_nodes != backend_num_nodes or
                 template.version_authority != expected_version_authority or
                 template.placement_catalog_sha256 != catalog_sha256 or
@@ -4222,6 +4232,16 @@ def _canonical_prepared_paid_launch_templates(
             raise CapacityAdmissionConflict(
                 'Prepared paid launch catalog is stale or noncanonical.')
         try:
+            serve_paid_capacity.paid_launch_plan_units(
+                contract=locked_version.placement_contract,
+                configured_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=template.accelerator,
+                    gpu_units_per_node=accounting_cards[template.accelerator],
+                    num_nodes=backend_num_nodes),
+                candidate_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=template.accelerator,
+                    gpu_units_per_node=template.gpu_units_per_node,
+                    num_nodes=template.num_nodes))
             stored_override = serve_paid_capacity.thaw_paid_launch_payload(
                 template.resources_override)
             decoded_override = spot_placer.decode_resources_override(
@@ -4411,12 +4431,21 @@ def _canonical_prepared_paid_launch_specs(
         if ((spec.service_name, spec.service_hash, spec.service_lifecycle_epoch,
              spec.service_version) != expected or spec.workspace != workspace or
                 spec.accelerator not in accounting_cards or
-                spec.gpu_units_per_node != accounting_cards[spec.accelerator] or
                 spec.num_nodes != backend_num_nodes):
             raise CapacityAdmissionConflict(
                 'Prepared paid launch identity changed before admission.')
         evidence = spec.catalog_evidence
         try:
+            serve_paid_capacity.paid_launch_plan_units(
+                contract=locked_version.placement_contract,
+                configured_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=spec.accelerator,
+                    gpu_units_per_node=accounting_cards[spec.accelerator],
+                    num_nodes=backend_num_nodes),
+                candidate_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=spec.accelerator,
+                    gpu_units_per_node=spec.gpu_units_per_node,
+                    num_nodes=spec.num_nodes))
             worker = serve_paid_capacity.thaw_paid_launch_payload(
                 spec.worker_construction)
             stored_override = serve_paid_capacity.thaw_paid_launch_payload(
@@ -4694,11 +4723,11 @@ def _resolve_locked_policy_history(
             prior_snapshot, candidate = capacity_planning.decode_planner_envelope(
                 payload.get('planner'))
             prior_shapes = _canonical_counts(
-                prior_snapshot.physical_gpu_width_by_accelerator.as_dict(),
-                'prior planner physical_gpu_width_by_accelerator')
+                prior_snapshot.planning_capacity_quantum_by_accelerator.as_dict(
+                ), 'prior planner planning_capacity_quantum_by_accelerator')
             candidate_shapes = _canonical_counts(
-                candidate.physical_gpu_width_by_accelerator.as_dict(),
-                'prior candidate physical_gpu_width_by_accelerator')
+                candidate.planning_capacity_quantum_by_accelerator.as_dict(),
+                'prior candidate planning_capacity_quantum_by_accelerator')
         except ValueError as error:
             raise CapacityAdmissionConflict(
                 'Current capacity policy is not strict format 6.') from error
@@ -4761,7 +4790,7 @@ def _resolve_locked_policy_history(
             last_reduced_demand_generation=0,
             capacity_unit=capacity_unit,
             maximum_capacity=config.max_capacity,
-            physical_gpu_width_by_accelerator=(
+            planning_capacity_quantum_by_accelerator=(
                 capacity_planning.AcceleratorCapacity.from_mapping(
                     accounting_cards)),
             backend_num_nodes=backend_num_nodes)
@@ -4835,6 +4864,7 @@ def _prepare_paid_admission_candidates(
     frontier_limit: int,
     replica_port: str,
     created_at: float,
+    placement_contract: placement_policy.PlacementContract,
 ) -> tuple[_PreparedPaidAdmission, ...]:
     """Materialize the state-aware target-compatible launch candidates."""
     if candidate.reserved_launch_target.total() > 0:
@@ -4848,19 +4878,31 @@ def _prepare_paid_admission_candidates(
         for card, _ in candidate.paid_launch_target.entries
     }
     physical_widths = {
-        card.casefold(): width
-        for card, width in candidate.physical_gpu_width_by_accelerator.entries
+        card.casefold(): width for card, width in
+        candidate.planning_capacity_quantum_by_accelerator.entries
     }
     candidates = []
     for launch_spec in prepared_specs:
         card = launch_spec.accelerator.casefold()
-        if (physical_widths.get(card) != launch_spec.gpu_units_per_node or
-                candidate.backend_num_nodes != launch_spec.num_nodes):
+        planning_quantum = physical_widths.get(card)
+        if planning_quantum is None:
             raise CapacityAdmissionConflict(
-                'Prepared paid launch contradicts the planned backend shape.')
-        plan_units = (1 if candidate.capacity_unit
-                      is capacity_planning.CapacityUnit.PHYSICAL_BACKEND else
-                      launch_spec.gpu_units_per_node)
+                'Prepared paid launch names an unplanned accelerator.')
+        try:
+            plan_units = serve_paid_capacity.paid_launch_plan_units(
+                contract=placement_contract,
+                configured_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=card,
+                    gpu_units_per_node=planning_quantum,
+                    num_nodes=candidate.backend_num_nodes),
+                candidate_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=card,
+                    gpu_units_per_node=launch_spec.gpu_units_per_node,
+                    num_nodes=launch_spec.num_nodes))
+        except serve_paid_capacity.PaidGPUAttributionError as error:
+            raise CapacityAdmissionConflict(
+                'Prepared paid launch contradicts the placement contract.') \
+                from error
         if target.get(card, 0) < plan_units:
             continue
         persistence_spec = launch_spec.persistence_spec(
@@ -4928,9 +4970,23 @@ def _materialize_locked_paid_launch_specs(
     transaction_now = paid_context.transaction_now
     for template in preflight.templates:
         card = template.accelerator
-        plan_units = (1 if candidate.capacity_unit
-                      is capacity_planning.CapacityUnit.PHYSICAL_BACKEND else
-                      template.gpu_units_per_node)
+        try:
+            plan_units = serve_paid_capacity.paid_launch_plan_units(
+                contract=locked_version.placement_contract,
+                configured_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=card,
+                    gpu_units_per_node=(
+                        candidate.planning_capacity_quantum_by_accelerator.get(
+                            card)),
+                    num_nodes=candidate.backend_num_nodes),
+                candidate_shape=serve_paid_capacity.PhysicalBackendShape(
+                    accelerator=card,
+                    gpu_units_per_node=template.gpu_units_per_node,
+                    num_nodes=template.num_nodes))
+        except serve_paid_capacity.PaidGPUAttributionError as error:
+            raise CapacityAdmissionConflict(
+                'Locked paid catalog contradicts the placement contract.') \
+                from error
         if remaining.get(card, 0) < plan_units:
             continue
         pool = paid_context.pool_rows.get(template.pool_key)
@@ -6432,11 +6488,13 @@ class CapacityAdmissionRepository:
             else:
                 final_authority = ReservedFillPlanAuthority.not_applicable()
 
+            paid_launch_version = fill_config.paid_launch_version
+            assert paid_launch_version is not None
             prepared_specs = _materialize_locked_paid_launch_specs(
                 connection=connection,
                 service=service,
                 preflight=paid_preflight,
-                locked_version=fill_config.paid_launch_version,
+                locked_version=paid_launch_version,
                 candidate=candidate,
                 paid_context=paid_context,
                 first_replica_id=first_paid_replica_id)
@@ -6451,7 +6509,7 @@ class CapacityAdmissionRepository:
                     service_version=service_version,
                     accounting_cards=canonical_cards,
                     backend_num_nodes=backend_num_nodes,
-                    locked_version=fill_config.paid_launch_version,
+                    locked_version=paid_launch_version,
                     launch_body_templates_by_pool_key={
                         template.pool_key:
                             paid_launch_request.PaidLaunchBodyTemplate(
@@ -6465,7 +6523,8 @@ class CapacityAdmissionRepository:
                 decision=decision,
                 frontier_limit=frontier_limit,
                 replica_port=canonical_paid_replica_port,
-                created_at=paid_context.transaction_now)
+                created_at=paid_context.transaction_now,
+                placement_contract=paid_launch_version.placement_contract)
             candidate_census = serve_state._PaidCapacityAdmissionCensus(  # pylint: disable=protected-access
                 service_claims=paid_census.service_claims,
                 paid_gpu_units_by_index=tuple(
@@ -6713,6 +6772,7 @@ def _validate_committed_paid_claim_in_connection(
     claim_accelerator: str,
     claim_units: int,
     planner_candidate: capacity_planning.CapacityPlanCandidate,
+    placement_contract: placement_policy.PlacementContract,
     now: datetime.datetime,
 ) -> datetime.datetime:
     """Validate immutable post-admission authority against current routing.
@@ -6806,7 +6866,8 @@ def _validate_committed_paid_claim_in_connection(
         generation=int(claim_plan['generation']),
         accounting_cards=accounting_cards,
         capacity_unit=planner_candidate.capacity_unit,
-        candidate=planner_candidate)
+        candidate=planner_candidate,
+        placement_contract=placement_contract)
     claimed_units = claim_projection.units_by_accelerator
     if (claimed_units.get(claim_accelerator, 0) < claim_units or
             any(claimed_units[card] > authorized_paid[card]
@@ -6827,7 +6888,8 @@ def _validate_planner_claim_pool_shape(
     claim: Mapping[str, Any],
     candidate: capacity_planning.CapacityPlanCandidate,
     accelerator: str,
-) -> None:
+    placement_contract: placement_policy.PlacementContract,
+) -> int:
     """Bind one claim's relational pool identity to immutable task shape."""
     relational_pool_key = claim.get('paid_capacity_pool_key')
     claim_pool_key = claim.get('pool_key')
@@ -6840,7 +6902,9 @@ def _validate_planner_claim_pool_shape(
     if not isinstance(pool_key, str) or not pool_key:
         raise CapacityAdmissionConflict(
             'Planner-bound paid claim has no exact provider pool identity.')
-    _planner_bound_pool_shape(pool_key, candidate, accelerator)
+    _, plan_units = _planner_bound_pool_shape(pool_key, candidate, accelerator,
+                                              placement_contract)
+    return plan_units
 
 
 def validate_paid_claim_in_connection(
@@ -6921,13 +6985,40 @@ def validate_paid_claim_in_connection(
         # fresh claim. Committed recovery/provider checks remain valid below.
         raise CapacityAdmissionConflict(
             'Format-6 paid claims require fused plan admission.')
+    fill_config = _reserved_fill_service_config_in_connection(
+        connection, service)
+    paid_launch_version = fill_config.paid_launch_version
+    if paid_launch_version is None:
+        raise CapacityAdmissionConflict(
+            'Paid claim has no elected placement contract.')
+    placement_contract = paid_launch_version.placement_contract
+    expected_member_units: tuple[int, ...]
     if _batch_member_pool_keys is None:
-        _validate_planner_claim_pool_shape(claim, planner_candidate,
-                                           accelerator)
+        expected_member_units = (_validate_planner_claim_pool_shape(
+            claim, planner_candidate, accelerator, placement_contract),)
     else:
-        for member_pool_key in _batch_member_pool_keys:
-            _planner_bound_pool_shape(member_pool_key, planner_candidate,
-                                      accelerator)
+        if (_batch_member_units is None or
+                len(_batch_member_pool_keys) != len(_batch_member_units)):
+            raise CapacityAdmissionConflict(
+                'Paid claim batch shape evidence is incomplete.')
+        expected_batch_units = []
+        for member_pool_key, actual_member_units in zip(_batch_member_pool_keys,
+                                                        _batch_member_units,
+                                                        strict=True):
+            _, expected_units = _planner_bound_pool_shape(
+                member_pool_key, planner_candidate, accelerator,
+                placement_contract)
+            if actual_member_units != expected_units:
+                raise CapacityAdmissionConflict(
+                    'Paid claim batch contradicts the placement contract.')
+            expected_batch_units.append(expected_units)
+        expected_member_units = tuple(expected_batch_units)
+    claim_member_units = ((claim_units,) if _batch_member_units is None else
+                          _batch_member_units)
+    if (not claim_member_units or claim_member_units != expected_member_units or
+            sum(claim_member_units) != claim_units):
+        raise CapacityAdmissionConflict(
+            'Paid claim does not debit exact whole-backend capacity.')
     if not prospective:
         return _validate_committed_paid_claim_in_connection(
             connection,
@@ -6938,6 +7029,7 @@ def validate_paid_claim_in_connection(
             claim_accelerator=accelerator,
             claim_units=claim_units,
             planner_candidate=planner_candidate,
+            placement_contract=placement_contract,
             now=now)
     head = connection.execute(
         sqlalchemy.select(_HEADS).where(
@@ -6956,8 +7048,6 @@ def validate_paid_claim_in_connection(
             'Capacity plan digest no longer matches its payload.')
     reserved_fill_authority_present = 'reserved_fill_authority' in payload
     raw_reserved_fill_authority = payload.get('reserved_fill_authority')
-    fill_config = _reserved_fill_service_config_in_connection(
-        connection, service)
     try:
         plan_reserved_fill_authority = (
             ReservedFillPlanAuthority.from_mapping(raw_reserved_fill_authority))
@@ -7199,18 +7289,6 @@ def validate_paid_claim_in_connection(
             existing_paid=baseline_paid,
             paid_residual=paid,
             paid_launch_target=paid_launch))
-    launch_width = (
-        1 if planner_candidate.capacity_unit
-        is capacity_planning.CapacityUnit.PHYSICAL_BACKEND else
-        planner_candidate.physical_gpu_width_by_accelerator.get(accelerator))
-    member_units = ((claim_units,)
-                    if _batch_member_units is None else _batch_member_units)
-    if (launch_width <= 0 or not member_units or
-            sum(member_units) != claim_units or any(
-                type(units) is not int or units != launch_width
-                for units in member_units)):
-        raise CapacityAdmissionConflict(
-            'Paid claim does not debit exact whole-backend capacity.')
     locked_capacity = _lock_capacity_rows(connection,
                                           service_name=service['name'],
                                           service_hash=service['hash'],
@@ -7298,7 +7376,8 @@ def validate_paid_claim_in_connection(
         generation=validation_generation,
         accounting_cards=accounting_cards,
         capacity_unit=planner_candidate.capacity_unit,
-        candidate=planner_candidate)
+        candidate=planner_candidate,
+        placement_contract=placement_contract)
     claim_units_by_card = claim_projection.units_by_accelerator
     claimed_paid_gpu_units = claim_projection.physical_gpu_units
     expected_paid = {

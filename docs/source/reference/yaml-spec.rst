@@ -1719,10 +1719,13 @@ one-job-per-whole-GPU execution contract. It requires a positive integer
 Values above one retain waiting work as headroom without increasing execution
 concurrency. SkyServe may provision a multi-GPU backend that contributes
 several replicas.
-Because a backend is indivisible, ready capacity can exceed ``max_replicas`` by
-the width of the final backend without causing scaling churn. This mode
-currently requires rolling updates and does not yet support blue-green updates
-or multi-GPU ``reserved_capacity_fill`` shapes.
+Paid backends are indivisible and launch only when their complete physical
+width fits both the remaining logical target and
+``max_live_paid_gpu_units``. SkyServe does not exceed ``max_replicas`` to fit a
+wider paid machine; it selects a narrower same-card catalog shape or leaves the
+unrepresentable remainder unfilled. This mode currently requires rolling
+updates and does not yet support blue-green updates or multi-GPU
+``reserved_capacity_fill`` shapes.
 
 .. code-block:: yaml
 
@@ -1758,8 +1761,9 @@ Service never scales below this count.
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Maximum requested replicas (optional). With ``dynamic_fallback_per_gpu``, this
-clamps the demand target in logical GPU slots; an indivisible multi-GPU backend
-may create stable materialized capacity above it.
+is a hard logical-GPU-slot ceiling for paid materialization. An indivisible
+paid multi-GPU backend is admitted only when its complete width fits below the
+ceiling.
 
 If not specified, SkyServe will use a fixed number of replicas (the same as min_replicas) and ignore any QPS threshold specified below.
 

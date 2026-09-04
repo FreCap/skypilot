@@ -2088,7 +2088,7 @@ def test_system_recovery_mutation_fence_is_installed_and_has_no_db_io():
     db_read.assert_not_called()
 
 
-def _provider_free_paid_manager(next_replica_id=1):
+def _provider_free_paid_manager(next_replica_id=1, *, logical=False):
     manager = _make_manager(next_replica_id=next_replica_id)
     manager._service_hash = 'hash'
     manager._resource_scope = 'hash'
@@ -2098,29 +2098,39 @@ def _provider_free_paid_manager(next_replica_id=1):
         binding_epoch=2,
         generic=True)
     manager.yaml_content = 'resources: {}'
-    manager._version_specs = {
-        1: service_spec.SkyServiceSpec(readiness_path='/health',
-                                       initial_delay_seconds=0,
-                                       readiness_timeout_seconds=5,
-                                       endpoint_probe_interval_seconds=1,
-                                       lb_stream_timeout_seconds=10,
-                                       min_replicas=0,
-                                       max_replicas=100,
-                                       target_concurrency_per_replica=1,
-                                       spot_placer='dynamic_fallback')
-    }
+    spec = service_spec.SkyServiceSpec(
+        readiness_path='/health',
+        initial_delay_seconds=0,
+        readiness_timeout_seconds=5,
+        endpoint_probe_interval_seconds=1,
+        lb_stream_timeout_seconds=10,
+        min_replicas=0,
+        max_replicas=100,
+        target_concurrency_per_replica=1,
+        graceful_drain_async_occupancy=True if logical else None,
+        spot_placer=('dynamic_fallback_per_gpu'
+                     if logical else 'dynamic_fallback'))
+    manager._version_specs = {1: spec}
+    manager._uses_logical_replicas = logical
+    manager._logical_exact_accelerator_shapes = ({'L4': 1} if logical else {})
     cheap = make_location('us-central1-a', {'L4': 1}, cloud_name='GCP')
     expensive = make_location('us-central1-b', {'L4': 1}, cloud_name='GCP')
     cheap.cloud = clouds.GCP()
     expensive.cloud = clouds.GCP()
     cheap.instance_type = 'g2-standard-4'
     expensive.instance_type = 'g2-standard-8'
-    _set_paid_placer(manager, {cheap: 0.1, expensive: 0.2})
+    _set_paid_placer(manager, {
+        cheap: 0.1,
+        expensive: 0.2
+    },
+                     placement_contract=spec.placement_contract)
     return manager, cheap, expensive
 
 
-def _set_paid_placer(manager, costs, *, num_nodes=1):
-    placer = make_placer(costs)
+def _set_paid_placer(manager, costs, *, num_nodes=1, placement_contract=None):
+    if placement_contract is None:
+        placement_contract = manager._version_specs[1].placement_contract
+    placer = make_placer(costs, placement_contract)
     placer.num_nodes = num_nodes
     placer.placement_catalog = dataclasses.replace(placer.placement_catalog,
                                                    num_nodes=num_nodes)
@@ -2313,6 +2323,32 @@ def test_prepare_paid_launch_templates_are_cost_ordered_and_io_free():
                not hasattr(template, 'replica_record_id') and
                not hasattr(template, 'cluster_name_seed')
                for template in templates)
+
+
+def test_logical_paid_templates_keep_wide_prefix_and_narrow_remainder_pool():
+    manager, _, _ = _provider_free_paid_manager(logical=True)
+    wide = make_location('us-wide', {'L4': 8}, cloud_name='GCP')
+    narrow = make_location('us-narrow', {'L4': 1}, cloud_name='GCP')
+    for location, instance_type in ((wide, 'g2-standard-96'),
+                                    (narrow, 'g2-standard-4')):
+        location.cloud = clouds.GCP()
+        location.instance_type = instance_type
+    _set_paid_placer(manager, {
+        wide: 0.80,
+        narrow: 0.13,
+    })
+
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'L4': 1},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager, {
+                wide: 100,
+                narrow: 100,
+            }, service_remaining=100))
+
+    assert [template.gpu_units_per_node for template in templates] == [8, 1]
+    assert [template.catalog_rank for template in templates] == [0, 1]
 
 
 def test_prepare_paid_launch_templates_do_not_reserve_retry_probe(monkeypatch):
@@ -13426,30 +13462,49 @@ class TestLogicalCapacityPlanning:
         assert (replica_managers.exact_accelerator_shapes_from_resources(
             resources) == {})
 
-    def test_logical_preflight_rejects_conflicting_same_card_widths(self):
+    def test_logical_card_units_ignore_physical_catalog_widths(self):
         resources = [
             types.SimpleNamespace(accelerators={'L4': 1}),
             types.SimpleNamespace(accelerators={'l4': 8}),
         ]
-        task = types.SimpleNamespace(resources=resources,
-                                     service=types.SimpleNamespace(pool=False),
-                                     num_nodes=1)
-        spec = types.SimpleNamespace(
-            uses_logical_replicas=True,
-            placement_contract=types.SimpleNamespace(enabled=True),
-        )
 
-        with mock.patch.object(replica_managers.serve_state,
-                               'get_yaml_content',
-                               return_value='service: {}'), \
-             mock.patch.object(replica_managers,
-                               'load_task_with_service_spec',
-                               return_value=task), \
-             mock.patch.object(replica_managers.serve_utils,
-                               'resolve_replica_ingress_port'), \
-             pytest.raises(ValueError,
-                           match='exactly one physical whole-GPU width'):
-            replica_managers.validate_service_update_preflight('svc', 1, spec)
+        assert replica_managers.logical_accelerator_card_units_from_resources(
+            resources) == {
+                'L4': 1
+            }
+
+    @pytest.mark.parametrize('seed_width', [1, 8])
+    def test_logical_card_unit_is_one_for_every_whole_gpu_seed(
+            self, seed_width):
+        resources = [types.SimpleNamespace(accelerators={'L4': seed_width})]
+
+        assert replica_managers.logical_accelerator_card_units_from_resources(
+            resources) == {
+                'L4': 1
+            }
+
+    def test_current_multi_gpu_replica_uses_planned_physical_width(self):
+        info = replica_managers.ReplicaInfo(
+            replica_id=1,
+            cluster_name='svc-1',
+            replica_port='8000',
+            is_spot=True,
+            location=None,
+            version=1,
+            resources_override={'accelerators': {
+                'L4': 8
+            }},
+            planned_capacity=8)
+
+        assert (replica_managers.SkyPilotReplicaManager.
+                _logical_replica_accelerator(
+                    info, (('L4', 1),), require_configured_shape=True) == 'L4')
+
+        info.planned_capacity = 7
+        assert (replica_managers.SkyPilotReplicaManager.
+                _logical_replica_accelerator(info, (('L4', 1),),
+                                             require_configured_shape=True)
+                is None)
 
     @pytest.mark.parametrize('accelerators,expected', [
         ({

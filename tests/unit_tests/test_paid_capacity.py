@@ -27,6 +27,85 @@ def make_placer(*args, **kwargs):
     return placer
 
 
+@pytest.mark.parametrize('candidate_width', [1, 2, 4, 8])
+def test_logical_paid_shape_uses_exact_candidate_gpu_units(candidate_width):
+    contract = placement_policy.resolve_fresh_contract(
+        placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
+    configured = paid_capacity.PhysicalBackendShape(accelerator='l4',
+                                                    gpu_units_per_node=1,
+                                                    num_nodes=1)
+    candidate = paid_capacity.PhysicalBackendShape(
+        accelerator='l4', gpu_units_per_node=candidate_width, num_nodes=1)
+
+    assert paid_capacity.paid_launch_plan_units(
+        contract=contract,
+        configured_shape=configured,
+        candidate_shape=candidate) == candidate_width
+
+
+def test_physical_paid_shape_requires_the_configured_backend():
+    contract = placement_policy.resolve_fresh_contract(
+        placement_policy.SPOT_HEDGE_PLACER, pool=False)
+    configured = paid_capacity.PhysicalBackendShape(accelerator='l4',
+                                                    gpu_units_per_node=4,
+                                                    num_nodes=2)
+
+    assert paid_capacity.paid_launch_plan_units(contract=contract,
+                                                configured_shape=configured,
+                                                candidate_shape=configured) == 1
+    for candidate in (
+            paid_capacity.PhysicalBackendShape(accelerator='l4',
+                                               gpu_units_per_node=8,
+                                               num_nodes=2),
+            paid_capacity.PhysicalBackendShape(accelerator='l4',
+                                               gpu_units_per_node=4,
+                                               num_nodes=1),
+            paid_capacity.PhysicalBackendShape(accelerator='a100',
+                                               gpu_units_per_node=4,
+                                               num_nodes=2),
+    ):
+        with pytest.raises(paid_capacity.PaidGPUAttributionError,
+                           match='placement contract'):
+            paid_capacity.paid_launch_plan_units(contract=contract,
+                                                 configured_shape=configured,
+                                                 candidate_shape=candidate)
+
+
+def test_logical_paid_shape_rejects_cross_card_and_multinode_backends():
+    contract = placement_policy.resolve_fresh_contract(
+        placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
+    configured = paid_capacity.PhysicalBackendShape(accelerator='l4',
+                                                    gpu_units_per_node=1,
+                                                    num_nodes=1)
+    for candidate in (
+            paid_capacity.PhysicalBackendShape(accelerator='a100',
+                                               gpu_units_per_node=1,
+                                               num_nodes=1),
+            paid_capacity.PhysicalBackendShape(accelerator='l4',
+                                               gpu_units_per_node=8,
+                                               num_nodes=2),
+    ):
+        with pytest.raises(paid_capacity.PaidGPUAttributionError,
+                           match='placement contract'):
+            paid_capacity.paid_launch_plan_units(contract=contract,
+                                                 configured_shape=configured,
+                                                 candidate_shape=candidate)
+
+
+def test_logical_paid_shape_rejects_non_unit_planner_shape():
+    contract = placement_policy.resolve_fresh_contract(
+        placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
+
+    with pytest.raises(paid_capacity.PaidGPUAttributionError,
+                       match='placement contract'):
+        paid_capacity.paid_launch_plan_units(
+            contract=contract,
+            configured_shape=paid_capacity.PhysicalBackendShape(
+                accelerator='l4', gpu_units_per_node=8, num_nodes=1),
+            candidate_shape=paid_capacity.PhysicalBackendShape(
+                accelerator='l4', gpu_units_per_node=8, num_nodes=1))
+
+
 @pytest.fixture(autouse=True)
 def _clear_paid_capacity_config_cache(monkeypatch):
     original_pool_key = paid_capacity.pool_key
@@ -325,7 +404,7 @@ def _paid_launch_authority(
             capacity_admission.ReservedFillPlanAuthority.not_applicable()),
         capacity_unit=capacity_unit,
         backend_num_nodes=backend_num_nodes,
-        physical_gpu_width_by_accelerator=tuple(
+        planning_capacity_quantum_by_accelerator=tuple(
             sorted((card.casefold(), width) for card, width in widths.items())))
 
 

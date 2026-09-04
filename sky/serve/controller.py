@@ -3793,10 +3793,14 @@ class SkyServeController:
             for accelerator, raw_count in (resources.accelerators or
                                            {}).items():
                 normalized = accelerator.casefold()
-                try:
-                    count = int(raw_count)
-                except (TypeError, ValueError):
+                if (isinstance(raw_count, bool) or
+                    (isinstance(raw_count, float) and
+                     (not math.isfinite(raw_count) or
+                      not raw_count.is_integer())) or
+                        not isinstance(raw_count, (int, float))):
                     count = 0
+                else:
+                    count = int(raw_count)
                 counts_by_accelerator.setdefault(normalized, set()).add(count)
                 if normalized in seen:
                     continue
@@ -3871,6 +3875,19 @@ class SkyServeController:
         # unavailable prices preserve the deterministic service fallback.
         if placer is not None:
             configured_by_name = {card.casefold(): card for card in configured}
+            if getattr(service_spec, 'uses_logical_replicas', False) is True:
+                planning_shapes = (
+                    replica_managers.
+                    logical_accelerator_card_units_from_resources(
+                        task.resources))
+            else:
+                planning_shapes = (
+                    replica_managers.exact_accelerator_shapes_from_resources(
+                        task.resources))
+            planning_shapes_by_name = {
+                card.casefold(): width
+                for card, width in planning_shapes.items()
+            }
             paid_costs: dict[str, float] = {}
             unpriced_cards: set[str] = set()
             try:
@@ -3886,6 +3903,20 @@ class SkyServeController:
                 if card is None:
                     continue
                 try:
+                    candidate_shape = (
+                        paid_capacity.physical_backend_shape_from_location(
+                            location, num_nodes=placer.num_nodes))
+                    paid_capacity.paid_launch_plan_units(
+                        contract=placer.placement_contract,
+                        configured_shape=paid_capacity.PhysicalBackendShape(
+                            accelerator=card.casefold(),
+                            gpu_units_per_node=planning_shapes_by_name[
+                                card.casefold()],
+                            num_nodes=placer.num_nodes),
+                        candidate_shape=candidate_shape)
+                except (KeyError, paid_capacity.PaidGPUAttributionError):
+                    continue
+                try:
                     hourly_cost = float(raw_cost)
                 except Exception:  # pylint: disable=broad-except
                     unpriced_cards.add(card)
@@ -3895,7 +3926,10 @@ class SkyServeController:
                     continue
                 if hourly_cost == 0:
                     continue
-                paid_costs[card] = min(hourly_cost,
+                normalized_cost = (
+                    placer.placement_contract.normalize_hourly_cost(
+                        hourly_cost, candidate_shape.gpu_units_per_node))
+                paid_costs[card] = min(normalized_cost,
                                        paid_costs.get(card, float('inf')))
             if (not unpriced_cards and
                     all(card in paid_costs for card in configured)):
@@ -3914,7 +3948,7 @@ class SkyServeController:
 
     def _configured_backend_shape(
             self, service_spec: Any) -> tuple[dict[str, int], int]:
-        """Return the exact per-node GPU catalog and task node count."""
+        """Return per-card planning quantums and task node count."""
         configured = self._configured_accelerators(service_spec)
         if not configured:
             return {}, 1
@@ -3927,8 +3961,14 @@ class SkyServeController:
         if (not isinstance(num_nodes, int) or isinstance(num_nodes, bool) or
                 num_nodes < 1):
             return {}, 1
-        exact_shapes = replica_managers.exact_accelerator_shapes_from_resources(
-            task.resources)
+        if getattr(service_spec, 'uses_logical_replicas', False) is True:
+            exact_shapes = (
+                replica_managers.logical_accelerator_card_units_from_resources(
+                    task.resources))
+        else:
+            exact_shapes = (
+                replica_managers.exact_accelerator_shapes_from_resources(
+                    task.resources))
         exact_shapes_by_name = {
             card.casefold(): width for card, width in exact_shapes.items()
         }
@@ -6377,12 +6417,30 @@ class SkyServeController:
                 common_utils.format_exception(error))
             return ()
         # A reserved-only configured card must not consume a speculative paid
-        # transaction member.  Successor reconciles can then use the whole
-        # bounded wave for cards that actually have a paid Spot backend.
+        # transaction member. Physical catalog width is a separate dimension
+        # for logical services, so validate it through the placement contract
+        # instead of comparing it with the one-slot planning unit.
+        paid_cards = set()
+        for card, configured_width in shapes.items():
+            configured_shape = paid_capacity.PhysicalBackendShape(
+                accelerator=card,
+                gpu_units_per_node=configured_width,
+                num_nodes=backend_num_nodes)
+            for candidate_card, candidate_width in paid_shapes:
+                try:
+                    paid_capacity.paid_launch_plan_units(
+                        contract=placer.placement_contract,
+                        configured_shape=configured_shape,
+                        candidate_shape=paid_capacity.PhysicalBackendShape(
+                            accelerator=candidate_card,
+                            gpu_units_per_node=candidate_width,
+                            num_nodes=backend_num_nodes))
+                except paid_capacity.PaidGPUAttributionError:
+                    continue
+                paid_cards.add(card)
+                break
         shapes = {
-            card: width
-            for card, width in shapes.items()
-            if (card, width) in paid_shapes
+            card: width for card, width in shapes.items() if card in paid_cards
         }
         if not shapes:
             return ()
@@ -6498,6 +6556,13 @@ class SkyServeController:
         receipt: paid_capacity.PaidLaunchReceipt,
     ) -> bool:
         """Whether optimistic pool selection left locked paid work unfilled."""
+        # Only a committed partial wave warrants an immediate successor.  An
+        # empty receipt means there was no launch progress (for example, no
+        # eligible template or a saturated provider window); spinning a new
+        # generation cannot change that external condition and can starve the
+        # normal manager publication behind an unbounded reconcile loop.
+        if not receipt.members:
+            return False
         accepted: dict[str, int] = {}
         for member in receipt.members:
             card = member.accelerator.casefold()
