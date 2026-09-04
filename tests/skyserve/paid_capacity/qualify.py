@@ -1,6 +1,9 @@
-"""Read-only paid-Spot qualification shared by small and scale profiles.
+"""Paid-Spot qualification shared by small and scale profiles.
 
-This module never creates or deletes infrastructure.  Billable runs must use
+Provider and PostgreSQL observers are read-only. The traffic driver sends
+ordinary authenticated synchronous requests through the production load
+balancer and accepts only exact backend-authored HTTP 200 results. This module
+never creates or deletes infrastructure. Billable runs must use
 ``lifecycle.py``, whose finalizer owns normal ``sky serve down`` and exact
 cleanup evidence.
 
@@ -62,9 +65,10 @@ import yaml
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.adaptors import gcp as gcp_adaptor
+from sky.provision import common as provision_common
 from sky.provision import constants as provision_constants
+from sky.provision.aws import instance as aws_instance
 from sky.provision.gcp import instance_utils
-from sky.serve import async_request_ledger
 from sky.serve import auth_tokens
 from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
@@ -152,10 +156,10 @@ class AbsoluteDeadline:
 
 
 _PROVIDER_SCOPE_SCHEMA_VERSION = 6
-_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 13
-_CLEANUP_RECEIPT_SCHEMA_VERSION = 3
+_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 15
+_CLEANUP_RECEIPT_SCHEMA_VERSION = 4
 _AGGREGATE_RECEIPT_SCHEMA_VERSION = 3
-_CLEANUP_COMPATIBLE_QUALIFICATION_SCHEMAS = frozenset({10, 11, 12, 13})
+_CLEANUP_COMPATIBLE_QUALIFICATION_SCHEMAS = frozenset({10, 11, 12, 13, 14, 15})
 _CAMPAIGN_LOAD_WINDOW_SECONDS = (
     serve_constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
 _AWS_CENSUS_MAX_WORKERS = 8
@@ -173,7 +177,7 @@ class Profile:
     exact_requests: int
     request_concurrency: int
     request_queue_timeout_seconds: int
-    terminal_publication_timeout_seconds: int
+    request_completion_timeout_seconds: int
     scale_timeout_seconds: float
     scale_slo_seconds: float
     drain_timeout_seconds: float
@@ -191,7 +195,7 @@ PROFILES = {
                      exact_requests=16,
                      request_concurrency=4,
                      request_queue_timeout_seconds=600,
-                     terminal_publication_timeout_seconds=600,
+                     request_completion_timeout_seconds=600,
                      scale_timeout_seconds=15 * 60,
                      scale_slo_seconds=5 * 60,
                      drain_timeout_seconds=20 * 60,
@@ -204,15 +208,15 @@ PROFILES = {
                      max_units=800,
                      minimum_running=100,
                      exact_requests=10_000,
-                     request_concurrency=128,
+                     request_concurrency=400,
                      request_queue_timeout_seconds=600,
-                     terminal_publication_timeout_seconds=600,
+                     request_completion_timeout_seconds=600,
                      scale_timeout_seconds=15 * 60,
                      scale_slo_seconds=5 * 60,
                      drain_timeout_seconds=30 * 60,
                      zero_hold_seconds=6 * 60,
                      poll_seconds=10,
-                     scale_up_min_replicas=800,
+                     scale_up_min_replicas=400,
                      scale_up_period_seconds=10),
     # The provider canary uses the same exact one-L4 task shape as the economic
     # run and permits one physical backend without naming an instance type.
@@ -223,7 +227,7 @@ PROFILES = {
                                exact_requests=1,
                                request_concurrency=1,
                                request_queue_timeout_seconds=600,
-                               terminal_publication_timeout_seconds=600,
+                               request_completion_timeout_seconds=600,
                                scale_timeout_seconds=15 * 60,
                                scale_slo_seconds=5 * 60,
                                drain_timeout_seconds=20 * 60,
@@ -245,8 +249,9 @@ def request_queue_max_concurrency(profile: Profile) -> int:
 
 
 def scale_stimulus_count(profile: Profile) -> int:
-    """Return the bounded cohort sufficient to request the configured cap."""
-    return min(profile.max_units, profile.exact_requests)
+    """Return the bounded resident transport cohort used to prove scale."""
+    return min(profile.max_units, profile.exact_requests,
+               profile.request_concurrency)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -266,66 +271,6 @@ class ExactRequestCampaignCounters:
     offered: int
     succeeded: int
     accepting_offers: bool = True
-
-
-class ExactRequestAttemptState(str, enum.Enum):
-    """Admission ownership state for one immutable request identity."""
-
-    UNSEEN = 'unseen'
-    POST_IN_FLIGHT_OR_AMBIGUOUS = 'post_in_flight_or_ambiguous'
-    DEFINITIVELY_UNADMITTED = 'definitively_unadmitted'
-    ACCEPTED = 'accepted'
-    TERMINAL = 'terminal'
-
-
-@dataclasses.dataclass(kw_only=True)
-class ExactRequestAttemptLifecycle:
-    """Typed request state used by the one production traffic driver."""
-
-    request_id: str
-    state: ExactRequestAttemptState = dataclasses.field(
-        default=ExactRequestAttemptState.UNSEEN, init=False)
-
-    def begin_submission(self) -> None:
-        if self.state not in (ExactRequestAttemptState.UNSEEN,
-                              ExactRequestAttemptState.DEFINITIVELY_UNADMITTED):
-            raise QualificationError(
-                f'{self.request_id} has an invalid submission transition.')
-        self.state = ExactRequestAttemptState.POST_IN_FLIGHT_OR_AMBIGUOUS
-
-    def mark_ambiguous(self) -> None:
-        if self.state in (ExactRequestAttemptState.ACCEPTED,
-                          ExactRequestAttemptState.TERMINAL):
-            return
-        if self.state is not ExactRequestAttemptState.POST_IN_FLIGHT_OR_AMBIGUOUS:
-            raise QualificationError(
-                f'{self.request_id} has an invalid ambiguity transition.')
-
-    def mark_definitively_unadmitted(self) -> None:
-        if self.state is not ExactRequestAttemptState.POST_IN_FLIGHT_OR_AMBIGUOUS:
-            raise QualificationError(
-                f'{self.request_id} has an invalid rejection transition.')
-        self.state = ExactRequestAttemptState.DEFINITIVELY_UNADMITTED
-
-    def mark_admitted(self, receipt: 'ExactAsyncReceipt') -> None:
-        if (self.state is ExactRequestAttemptState.TERMINAL and
-                receipt.state == 'SUCCEEDED'):
-            return
-        if self.state not in (
-                ExactRequestAttemptState.POST_IN_FLIGHT_OR_AMBIGUOUS,
-                ExactRequestAttemptState.ACCEPTED):
-            raise QualificationError(
-                f'{self.request_id} has an invalid acceptance transition.')
-        if receipt.state == 'SUCCEEDED':
-            self.state = ExactRequestAttemptState.TERMINAL
-        else:
-            self.state = ExactRequestAttemptState.ACCEPTED
-
-    def mark_terminal(self) -> None:
-        if self.state is not ExactRequestAttemptState.ACCEPTED:
-            raise QualificationError(
-                f'{self.request_id} has an invalid terminal transition.')
-        self.state = ExactRequestAttemptState.TERMINAL
 
 
 class ExactRequestTrafficEvidence(typing.Protocol):
@@ -409,7 +354,7 @@ class ExactRequestCampaignProgress:
         *,
         deferred_error: BaseException | None = None,
     ) -> None:
-        """Record one exact terminal receipt before the worker takes another ID."""
+        """Record one exact backend success before the worker takes another ID."""
         async with self._lock:
             if self._succeeded >= self._offered:
                 raise QualificationError(
@@ -417,20 +362,6 @@ class ExactRequestCampaignProgress:
             self._succeeded += 1
             if deferred_error is not None:
                 self._record_error_locked(deferred_error)
-
-    async def authorize_retry_after_definitive_no_admission(
-            self, attempt: ExactRequestAttemptLifecycle) -> bool:
-        """Atomically stop a rejected identity when campaign admission closes."""
-        async with self._lock:
-            if attempt.state is not (
-                    ExactRequestAttemptState.DEFINITIVELY_UNADMITTED):
-                raise QualificationError(
-                    'Exact request retry lacks definitive no-admission evidence.'
-                )
-            if not self._accepting_offers:
-                return False
-            attempt.begin_submission()
-            return True
 
     async def record_error(self, error: BaseException) -> None:
         """Close admission at the first worker error under the offer lock."""
@@ -528,23 +459,6 @@ def _campaign_manifest_sha256(prefix: str, count: int) -> str:
         })).hexdigest()
 
 
-def _validate_campaign_terminal_rows(
-    *,
-    prefix: str,
-    count: int,
-    rows: collections.abc.Sequence[collections.abc.Mapping[str, Any]],
-) -> str:
-    """Require the exact campaign key set as current SUCCEEDED attempts."""
-    expected = frozenset(_campaign_request_key_sha256s(prefix, count))
-    observed = [row.get('request_key_sha256') for row in rows]
-    if (len(rows) != count or len(set(observed)) != count or
-            frozenset(observed) != expected or
-            any(row.get('state') != 'SUCCEEDED' for row in rows)):
-        raise QualificationError(
-            'PostgreSQL lacks exact campaign membership at terminal success.')
-    return _campaign_manifest_sha256(prefix, count)
-
-
 def _next_scale_arrival_attribution_state(
     *,
     previous: _ScaleArrivalAttributionState | None,
@@ -558,7 +472,7 @@ def _next_scale_arrival_attribution_state(
     campaign_offered: object,
     campaign_succeeded: object,
 ) -> _ScaleArrivalAttributionState | None:
-    """Bound rolling arrivals by the campaign's exact terminal frontier."""
+    """Bound rolling arrivals by the campaign's exact success frontier."""
     if (previous is not None and
             not isinstance(previous, _ScaleArrivalAttributionState)):
         return None
@@ -590,9 +504,9 @@ def _next_scale_arrival_attribution_state(
         (campaign_offered < previous.campaign_offered or
          campaign_succeeded < previous.campaign_succeeded)):
         return None
-    # Later rolling counters may rise when a natural terminal success exposes
+    # Later rolling counters may rise when a backend success exposes
     # the next never-before-offered identity, or fall as old arrivals age out.
-    # The driver-owned terminal frontier—not campaign cardinality alone—is the
+    # The driver-owned success frontier—not campaign cardinality alone—is the
     # hard upper bound. Exact final ledger evidence independently requires all
     # immutable identities and no others to reach SUCCEEDED.
     return _ScaleArrivalAttributionState(
@@ -656,8 +570,8 @@ class ProviderExpectation:
                 self.minimum_physical_running < 1 or
                 type(self.exact_request_count) is not int or
                 self.exact_request_count < 1 or
-            (self.kind is ExpectationKind.ECONOMIC and
-             self.providers != ('aws', 'gcp')) or
+            (self.kind is ExpectationKind.ECONOMIC and self.providers !=
+             ('aws', 'gcp')) or
             (self.kind is ExpectationKind.PROVIDER_CANARY and
              len(self.providers) != 1)):
             raise ValueError('Paid-provider expectation is malformed.')
@@ -696,14 +610,10 @@ _REQUEST_PRIORITY = 50
 _GCP_LIST_PAGE_SIZE = 500
 _GCP_API_RETRIES = 3
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+_SYNCHRONOUS_RESPONSE_MAX_BYTES = 4096
 _ENDPOINT_AUTHENTICATION_TIMEOUT_SECONDS = 5 * 60
 _ENDPOINT_AUTHENTICATION_POLL_SECONDS = 2
 _ENDPOINT_AUTHENTICATION_REQUEST_TIMEOUT_SECONDS = 15
-_ASYNC_ACTIVE_STATES = frozenset({
-    'DISPATCH_MAY_HAVE_OCCURRED',
-    'ACCEPTED',
-    'AMBIGUOUS',
-})
 _ACTIVE_DEMAND_NAMES = frozenset({
     'async_occupancy',
     'busy_replicas',
@@ -838,7 +748,7 @@ def demand_units(payload: object) -> int:
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class RequestTelemetry:
-    """Production-reduced request gauges plus exact-ledger state counts."""
+    """Production-reduced request gauges for ordinary synchronous traffic."""
 
     observed_at: float
     state: str
@@ -846,53 +756,33 @@ class RequestTelemetry:
     compatibility_complete: bool
     queue_depth: int | None
     in_flight_requests: int | None
+    http_in_flight_requests: int | None
     processing_requests: int | None
     confirmed_in_flight_requests: int | None
     confirmed_processing_requests: int | None
-    ledger_state_counts: tuple[tuple[str, int], ...]
-
-    def ledger_count(self, state: str) -> int:
-        return dict(self.ledger_state_counts).get(state, 0)
-
-    @property
-    def ledger_total(self) -> int:
-        return sum(count for _, count in self.ledger_state_counts)
-
-    @property
-    def ledger_active(self) -> int:
-        counts = dict(self.ledger_state_counts)
-        return sum(counts.get(state, 0) for state in _ASYNC_ACTIVE_STATES)
-
-    @property
-    def ledger_succeeded(self) -> int:
-        return self.ledger_count('SUCCEEDED')
 
     def is_fresh_complete(self) -> bool:
         return (math.isfinite(self.observed_at) and self.observed_at > 0 and
                 self.state == 'fresh' and self.reason == 'complete' and
                 self.compatibility_complete and self.queue_depth is not None and
                 self.in_flight_requests is not None and
-                self.processing_requests is not None)
+                self.http_in_flight_requests is not None and
+                self.processing_requests is not None and
+                self.confirmed_in_flight_requests is not None and
+                self.confirmed_processing_requests is not None)
 
     def is_exact_zero(self) -> bool:
         return (self.is_fresh_complete() and self.queue_depth == 0 and
                 self.in_flight_requests == 0 and
-                self.processing_requests == 0 and self.ledger_active == 0)
+                self.http_in_flight_requests == 0 and
+                self.processing_requests == 0 and
+                self.confirmed_in_flight_requests == 0 and
+                self.confirmed_processing_requests == 0)
 
 
 def request_telemetry_from_summary(
-    summary: collections.abc.Mapping[str, Any],
-    ledger_state_counts: collections.abc.Mapping[str, int],
-) -> RequestTelemetry:
-    """Validate one production demand summary and exact-ledger projection."""
-    states = tuple(
-        state.value for state in async_request_ledger.AsyncRequestState)
-    normalized_counts: list[tuple[str, int]] = []
-    for state in states:
-        count = ledger_state_counts.get(state, 0)
-        if type(count) is not int or count < 0:
-            raise QualificationError('Async-ledger state count is invalid.')
-        normalized_counts.append((state, count))
+    summary: collections.abc.Mapping[str, Any],) -> RequestTelemetry:
+    """Validate one production demand summary."""
 
     def _nullable_count(field: str) -> int | None:
         value = summary.get(field)
@@ -924,12 +814,12 @@ def request_telemetry_from_summary(
         compatibility_complete=complete,
         queue_depth=_nullable_count('request_queue_depth'),
         in_flight_requests=_nullable_count('in_flight_requests'),
+        http_in_flight_requests=_nullable_count('http_in_flight_requests'),
         processing_requests=_nullable_count('processing_requests'),
         confirmed_in_flight_requests=_nullable_count(
             'confirmed_in_flight_requests'),
         confirmed_processing_requests=_nullable_count(
             'confirmed_processing_requests'),
-        ledger_state_counts=tuple(normalized_counts),
     )
 
 
@@ -956,6 +846,7 @@ class ProviderCloudState:
     disk_count: int
     inflight_operation_count: int
     shapes: tuple[ProviderShapeState, ...] = ()
+    security_group_count: int = 0
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -970,6 +861,7 @@ class ProviderState:
     inflight_operation_count: int
     cluster_names: frozenset[str]
     clouds: tuple[ProviderCloudState, ...] = ()
+    security_group_count: int = 0
 
     def cloud(self, name: str) -> ProviderCloudState:
         matches = [state for state in self.clouds if state.cloud == name]
@@ -996,7 +888,9 @@ def combine_provider_states(*states: ProviderState) -> ProviderState:
             state.inflight_operation_count for state in states),
         cluster_names=frozenset().union(
             *(state.cluster_names for state in states)),
-        clouds=clouds)
+        clouds=clouds,
+        security_group_count=sum(
+            state.security_group_count for state in states))
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -1014,6 +908,7 @@ class AwsProviderCensus:
 
     service_instances: object
     service_volumes: object
+    server_owned_security_groups: object = ()
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -1142,6 +1037,9 @@ class QualificationServiceContract:
     request_queue_max_concurrency: int
     request_queue_timeout_seconds: float
     max_concurrency_per_replica: int
+    stream_timeout_seconds: float
+    graceful_drain_async_occupancy: bool
+    use_async_occupancy: bool
 
 
 def _fixture_duration_limit(config: collections.abc.Mapping[str, Any]) -> float:
@@ -1348,6 +1246,12 @@ def _validate_qualification_service_config(
         queue, dict) else None)
     queue_timeout = queue.get('timeout_seconds') if isinstance(queue,
                                                                dict) else None
+    stream_timeout = (load_balancer.get('stream_timeout_seconds') if isinstance(
+        load_balancer, dict) else None)
+    graceful_drain_async_occupancy = service.get(
+        'graceful_drain_async_occupancy')
+    use_async_occupancy = (queue.get('use_async_occupancy') if isinstance(
+        queue, dict) else None)
     resource_branches = resources.get('any_of')
     canonical_clouds: set[str] = set()
     canonical_resources = (isinstance(resource_branches, list) and
@@ -1391,7 +1295,11 @@ def _validate_qualification_service_config(
                                                         (int, float)) or
             isinstance(queue_timeout, bool) or queue_timeout <= 0 or
             type(per_replica_concurrency) is not int or
-            per_replica_concurrency < 1 or not canonical_resources):
+            per_replica_concurrency < 1 or
+            not isinstance(stream_timeout,
+                           (int, float)) or isinstance(stream_timeout, bool) or
+            stream_timeout <= 0 or graceful_drain_async_occupancy is not True or
+            use_async_occupancy is not False or not canonical_resources):
         raise ValueError('service YAML is not generic whole-L4 Spot')
     return QualificationServiceContract(
         providers=tuple(sorted(canonical_clouds)),
@@ -1404,7 +1312,10 @@ def _validate_qualification_service_config(
         request_queue_max_size=queue_max_size,
         request_queue_max_concurrency=queue_max_concurrency,
         request_queue_timeout_seconds=float(queue_timeout),
-        max_concurrency_per_replica=per_replica_concurrency)
+        max_concurrency_per_replica=per_replica_concurrency,
+        stream_timeout_seconds=float(stream_timeout),
+        graceful_drain_async_occupancy=graceful_drain_async_occupancy,
+        use_async_occupancy=use_async_occupancy)
 
 
 def provider_scope_from_controller_config(
@@ -1460,7 +1371,10 @@ def provider_scope_from_controller_config(
         raise GuardViolation(
             'Current service version is not generic whole-L4 Spot.') \
             from error
-    if (request_processing_seconds(profile) > duration_limit or
+    if (request_processing_seconds(profile) >= contract.stream_timeout_seconds
+            or duration_limit >= contract.stream_timeout_seconds or
+            contract.stream_timeout_seconds >
+            profile.request_completion_timeout_seconds or
             duration_limit >= contract.request_queue_timeout_seconds):
         raise GuardViolation(
             'Current service duration contract cannot preserve bounded demand.')
@@ -1612,8 +1526,8 @@ def read_provider_scope(path: pathlib.Path, service_name: str) -> ProviderScope:
     if (not isinstance(payload, dict) or
             payload.get('schema_version') != _PROVIDER_SCOPE_SCHEMA_VERSION or
             payload.get('service_name') != service_name or
-            payload.get('provider') != 'serve-paid-spot' or set(payload)
-            != field_names | {'schema_version', 'service_name', 'provider'}):
+            payload.get('provider') != 'serve-paid-spot' or set(payload) !=
+            field_names | {'schema_version', 'service_name', 'provider'}):
         raise QualificationError('Provider-scope receipt is malformed.')
     try:
         values = {field: payload[field] for field in field_names}
@@ -1642,20 +1556,19 @@ def read_provider_scope(path: pathlib.Path, service_name: str) -> ProviderScope:
             type(scope.max_live_paid_gpu_units) is not int or
             scope.max_live_paid_gpu_units < 1 or
             scope.providers not in (('aws',), ('gcp',), ('aws', 'gcp')) or
-        (('gcp' in scope.providers)
-         != (isinstance(scope.project_id, str) and re.fullmatch(
+        (('gcp' in scope.providers) !=
+         (isinstance(scope.project_id, str) and re.fullmatch(
              r'[a-z][a-z0-9-]{4,28}[a-z0-9]', scope.project_id) is not None)) or
             not isinstance(scope.workspace, str) or not scope.workspace or
-        (('gcp' in scope.providers) != (scope.location_scope
-                                        is GcpLocationScope.PROJECT_WIDE)) or
-        (('aws' in scope.providers)
-         != (scope.aws_location_scope
-             is AwsLocationScope.FROZEN_CATALOG_REGIONS)) or
-        (('aws' in scope.providers) != bool(scope.aws_regions)) or
+        (('gcp' in scope.providers) !=
+         (scope.location_scope is GcpLocationScope.PROJECT_WIDE)) or
+        (('aws' in scope.providers) !=
+         (scope.aws_location_scope is AwsLocationScope.FROZEN_CATALOG_REGIONS))
+            or (('aws' in scope.providers) != bool(scope.aws_regions)) or
             tuple(sorted(scope.aws_regions, key=lambda region: region.region))
             != scope.aws_regions or
-            len({region.region for region in scope.aws_regions}) != len(
-                scope.aws_regions) or
+            len({region.region
+                 for region in scope.aws_regions}) != len(scope.aws_regions) or
             any(not isinstance(region.region, str) or not region.region or
                 (region.credential_profile is not None and
                  (not isinstance(region.credential_profile, str) or
@@ -1672,8 +1585,8 @@ def read_provider_scope(path: pathlib.Path, service_name: str) -> ProviderScope:
                 not shape.instance_type or type(shape.gpu_units_per_instance)
                 is not int or shape.gpu_units_per_instance < 1
                 for shape in scope.catalog_shapes) or
-        {shape.cloud for shape in scope.catalog_shapes} != set(
-            scope.providers) or
+        {shape.cloud for shape in scope.catalog_shapes} != set(scope.providers)
+            or
             not isinstance(scope.placement_catalog_sha256, str) or re.fullmatch(
                 r'[0-9a-f]{64}', scope.placement_catalog_sha256) is None or
             not isinstance(scope.service_yaml_sha256, str) or
@@ -1681,15 +1594,15 @@ def read_provider_scope(path: pathlib.Path, service_name: str) -> ProviderScope:
             scope.qualification_profile not in PROFILES or
             scope.max_live_paid_gpu_units != PROFILES.get(
                 scope.qualification_profile, PROFILES['small']).max_units or
-        ((scope.qualification_profile == 'provider-canary') != (len(
-            scope.providers) == 1)) or
+        ((scope.qualification_profile == 'provider-canary') !=
+         (len(scope.providers) == 1)) or
             not isinstance(scope.qualification_source_sha256, str) or
             re.fullmatch(r'[0-9a-f]{64}',
                          scope.qualification_source_sha256) is None or
             not isinstance(scope.qualification_projection_sha256, str) or
             re.fullmatch(r'[0-9a-f]{64}', scope.qualification_projection_sha256)
-            is None or scope.qualification_projection_sha256
-            != _qualification_projection_sha256(
+            is None or scope.qualification_projection_sha256 !=
+            _qualification_projection_sha256(
                 source_sha256=scope.qualification_source_sha256,
                 profile=PROFILES[scope.qualification_profile],
                 providers=scope.providers) or
@@ -1783,8 +1696,8 @@ def _gcp_instance_l4_width(instance: collections.abc.Mapping[str, Any]) -> int:
     accelerators = instance.get('guestAccelerators')
     if (not isinstance(accelerators, list) or len(accelerators) != 1 or
             not isinstance(accelerators[0], dict) or
-            _basename(accelerators[0].get('acceleratorType')).casefold()
-            != 'nvidia-l4'):
+            _basename(accelerators[0].get('acceleratorType')).casefold() !=
+            'nvidia-l4'):
         raise GuardViolation(
             f'GCP instance {instance.get("name")!r} is not exact L4.')
     width = accelerators[0].get('acceleratorCount')
@@ -1815,14 +1728,14 @@ def parse_gcp_state(
         if expected_cluster_zones is None:
             raise GuardViolation('Durable launch binding has no GCP identity.')
         expected_identities = {
-            cluster_name: GcpProviderIdentity(
-                cluster_name_on_cloud=cluster_name,
-                gpu_units_per_instance=1,
-                instance_type='g2-standard-4',
-                project_id='unit-test-project',
-                region=_gcp_region_from_zone(zone) or '',
-                workspace='unit-test',
-                zone=zone)
+            cluster_name:
+            GcpProviderIdentity(cluster_name_on_cloud=cluster_name,
+                                gpu_units_per_instance=1,
+                                instance_type='g2-standard-4',
+                                project_id='unit-test-project',
+                                region=_gcp_region_from_zone(zone) or '',
+                                workspace='unit-test',
+                                zone=zone)
             for cluster_name, zone in expected_cluster_zones.items()
         }
     elif expected_cluster_zones is not None:
@@ -1897,8 +1810,8 @@ def parse_gcp_state(
             raise GuardViolation(
                 f'GCP instance {instance.get("name")!r} is not Spot.')
         expected_identity = expected_identities[cluster_name]
-        if (_basename(instance.get('machineType'))
-                != expected_identity.instance_type):
+        if (_basename(instance.get('machineType')) !=
+                expected_identity.instance_type):
             raise GuardViolation(
                 f'GCP instance {instance.get("name")!r} has the wrong shape.')
         instance_zone = _basename(instance.get('zone'))
@@ -1906,8 +1819,8 @@ def parse_gcp_state(
             raise GuardViolation(
                 f'GCP instance {instance.get("name")!r} is in the wrong '
                 'binding zone.')
-        if (_gcp_instance_l4_width(instance)
-                != expected_identity.gpu_units_per_instance):
+        if (_gcp_instance_l4_width(instance) !=
+                expected_identity.gpu_units_per_instance):
             raise GuardViolation(
                 f'GCP instance {instance.get("name")!r} has the wrong L4 '
                 'width.')
@@ -1929,14 +1842,14 @@ def parse_gcp_state(
             raise GuardViolation(
                 'A one-node paid binding has multiple GCP disk effects.')
         disk_identity_by_cluster[cluster_name] = identity
-        if (_basename(disk.get('zone'))
-                != expected_identities[cluster_name].zone):
+        if (_basename(disk.get('zone')) !=
+                expected_identities[cluster_name].zone):
             raise GuardViolation(
                 f'GCP disk {disk.get("name")!r} is in the wrong binding zone.')
     for cluster_name in instance_identity_by_cluster.keys(
     ) & disk_identity_by_cluster.keys():
-        if (instance_identity_by_cluster[cluster_name]
-                != disk_identity_by_cluster[cluster_name]):
+        if (instance_identity_by_cluster[cluster_name] !=
+                disk_identity_by_cluster[cluster_name]):
             raise GuardViolation(
                 'A paid binding has different GCP instance and disk identities.'
             )
@@ -2416,13 +2329,13 @@ def parse_aws_state(*,
         raw_volume_ids = instance.get('volume_ids')
         if (observed_identity is None or not isinstance(instance_id, str) or
                 not instance_id or instance_id in seen_instance_ids or
-                instance.get('cluster_name_on_cloud')
-                != observed_identity.cluster_name_on_cloud or
+                instance.get('cluster_name_on_cloud') !=
+                observed_identity.cluster_name_on_cloud or
                 instance.get('availability_zone') != observed_identity.zone or
                 instance.get('region') != observed_identity.region or
                 instance.get('instance_type') != observed_identity.instance_type
-                or instance.get('provider_gpu_units')
-                != observed_identity.gpu_units_per_instance or
+                or instance.get('provider_gpu_units') !=
+                observed_identity.gpu_units_per_instance or
                 instance.get('market') != 'spot' or state not in {
                     'pending', 'running', 'shutting-down', 'stopping', 'stopped'
                 } or not isinstance(raw_volume_ids, tuple) or
@@ -2447,8 +2360,8 @@ def parse_aws_state(*,
             attached_volume_ids.update(raw_volume_ids)
         seen_instance_ids.add(instance_id)
         allocation_counts[observed_identity.client_token] += 1
-        if (allocation_counts[observed_identity.client_token]
-                > observed_identity.num_nodes):
+        if (allocation_counts[observed_identity.client_token] >
+                observed_identity.num_nodes):
             raise GuardViolation(
                 'AWS provider allocation exceeded its retained node count.')
         live_clusters.append(observed_identity.cluster_name_on_cloud)
@@ -2511,8 +2424,14 @@ def parse_aws_state(*,
                          clouds=(cloud_state,))
 
 
-def parse_aws_cleanup_state(*, service_instances: object,
-                            service_volumes: object) -> ProviderState:
+def parse_aws_cleanup_state(
+        *,
+        service_instances: object,
+        service_volumes: object,
+        security_group_identities: collections.abc.Sequence[
+            provision_common.AWSServerOwnedSecurityGroupIdentity] = (),
+        server_owned_security_groups: object = (),
+) -> ProviderState:
     """Count AWS effects from frozen regions after database state is gone."""
     instances, volumes = _canonical_aws_resources(instances=service_instances,
                                                   volumes=service_volumes)
@@ -2540,6 +2459,53 @@ def parse_aws_cleanup_state(*, service_instances: object,
         volume_ids.add(volume_id)
         if isinstance(cluster_name, str):
             cluster_names.add(cluster_name)
+    expected_security_groups: dict[tuple[str, str, str, str], dict[str,
+                                                                   str]] = {}
+    expected_security_group_ids: set[tuple[str, str, str]] = set()
+    for identity in security_group_identities:
+        if not isinstance(identity,
+                          provision_common.AWSServerOwnedSecurityGroupIdentity):
+            raise GuardViolation(
+                'AWS cleanup security-group identity is not canonical.')
+        key = (identity.aws_account_id, identity.region, identity.vpc_id,
+               identity.security_group_id)
+        id_key = (identity.aws_account_id, identity.region,
+                  identity.security_group_id)
+        if (key in expected_security_groups or
+                id_key in expected_security_group_ids):
+            raise GuardViolation(
+                'AWS cleanup security-group identity is duplicated.')
+        expected_security_groups[key] = {
+            'aws_account_id': identity.aws_account_id,
+            'region': identity.region,
+            'vpc_id': identity.vpc_id,
+            'security_group_id': identity.security_group_id,
+            'security_group_name': identity.security_group_name,
+        }
+        expected_security_group_ids.add(id_key)
+    if not isinstance(server_owned_security_groups, (list, tuple)):
+        raise QualificationError(
+            'AWS cleanup security-group census is malformed.')
+    observed_security_groups: set[tuple[str, str, str, str]] = set()
+    expected_fields = {
+        'aws_account_id', 'region', 'vpc_id', 'security_group_id',
+        'security_group_name'
+    }
+    for group in server_owned_security_groups:
+        if (not isinstance(group, collections.abc.Mapping) or
+                set(group) != expected_fields or
+                any(not isinstance(group[field], str) or not group[field]
+                    for field in expected_fields)):
+            raise GuardViolation(
+                'AWS cleanup security-group census is not canonical.')
+        key = (group['aws_account_id'], group['region'], group['vpc_id'],
+               group['security_group_id'])
+        expected = expected_security_groups.get(key)
+        if (expected is None or dict(group) != expected or
+                key in observed_security_groups):
+            raise GuardViolation(
+                'AWS cleanup security group escaped its retained identity.')
+        observed_security_groups.add(key)
     shapes = _aws_shape_states(instances)
     gpu_units = sum(
         int(instance['provider_gpu_units']) for instance in instances)
@@ -2556,7 +2522,8 @@ def parse_aws_cleanup_state(*, service_instances: object,
         running_gpu_units=running_gpu_units,
         disk_count=len(volumes),
         inflight_operation_count=0,
-        shapes=shapes)
+        shapes=shapes,
+        security_group_count=len(observed_security_groups))
     return ProviderState(instance_count=cloud_state.instance_count,
                          running_count=cloud_state.running_count,
                          gpu_units=cloud_state.gpu_units,
@@ -2564,7 +2531,8 @@ def parse_aws_cleanup_state(*, service_instances: object,
                          disk_count=cloud_state.disk_count,
                          inflight_operation_count=0,
                          cluster_names=frozenset(cluster_names),
-                         clouds=(cloud_state,))
+                         clouds=(cloud_state,),
+                         security_group_count=cloud_state.security_group_count)
 
 
 class AwsObserver:
@@ -2578,10 +2546,17 @@ class AwsObserver:
         scope: ProviderScope,
         retained_volume_ids_by_region: collections.abc.Mapping[
             str, collections.abc.Sequence[str]] | None = None,
+        retained_security_group_identities: collections.abc.Sequence[
+            provision_common.AWSServerOwnedSecurityGroupIdentity] = (),
+        discover_server_owned_security_groups: bool = False,
     ) -> None:
+        if type(discover_server_owned_security_groups) is not bool:
+            raise TypeError('AWS security-group discovery mode is invalid.')
         self._profile = profile
         self._service_name = service_name
         self._scope = scope
+        self._discover_server_owned_security_groups = (
+            discover_server_owned_security_groups)
         configured_regions = {region.region for region in scope.aws_regions}
         retained = retained_volume_ids_by_region or {}
         if not set(retained).issubset(configured_regions):
@@ -2593,6 +2568,11 @@ class AwsObserver:
             for region in configured_regions
         }
         self._instance_type_widths: dict[tuple[str, str], int] = {}
+        self._retained_security_group_identities: dict[
+            tuple[str, str, str, str],
+            provision_common.AWSServerOwnedSecurityGroupIdentity] = {}
+        self.accept_retained_security_group_identities(
+            retained_security_group_identities)
 
     @staticmethod
     def _tags(resource: collections.abc.Mapping[str, Any]) -> dict[str, str]:
@@ -2617,8 +2597,8 @@ class AwsObserver:
         if (not isinstance(ray_name, str) or
                 not ray_name.startswith(f'{self._service_name}-') or
                 sky_name != ray_name or
-                tags.get(provision_constants.TAG_SKYPILOT_MANAGED)
-                != provision_constants.SKYPILOT_MANAGED_TAG_VALUE):
+                tags.get(provision_constants.TAG_SKYPILOT_MANAGED) !=
+                provision_constants.SKYPILOT_MANAGED_TAG_VALUE):
             return None
         return ray_name
 
@@ -2950,9 +2930,92 @@ class AwsObserver:
         return (tuple(instances_by_id[key] for key in sorted(instances_by_id)),
                 tuple(volumes_by_id[key] for key in sorted(volumes_by_id)))
 
+    def _discover_security_group_identities(
+        self,
+    ) -> tuple[provision_common.AWSServerOwnedSecurityGroupIdentity, ...]:
+        """Discover exact SG identities through the provider read interface."""
+        discovered: list[
+            provision_common.AWSServerOwnedSecurityGroupIdentity] = []
+        for region_scope in sorted(self._scope.aws_regions,
+                                   key=lambda item: item.region):
+            session = aws_adaptor.session(
+                profile=region_scope.credential_profile)
+            try:
+                identities = (
+                    aws_instance.discover_server_owned_service_security_groups(
+                        session=session,
+                        aws_account_id=region_scope.aws_account_id,
+                        region=region_scope.region,
+                        service_name=self._service_name,
+                        service_incarnation=self._scope.service_hash,
+                        service_lifecycle_epoch=self._scope.lifecycle_epoch))
+            except ValueError as error:
+                raise GuardViolation(
+                    'AWS security group escaped its service scope.') from error
+            discovered.extend(identities)
+        return CleanupScope().retain((),
+                                     discovered).aws_security_group_identities
+
+    def _security_group_census(self) -> tuple[dict[str, str], ...]:
+        """Read every retained server-owned SG by exact provider ID."""
+        if self._discover_server_owned_security_groups:
+            self.accept_retained_security_group_identities(
+                self._discover_security_group_identities())
+        observed: list[dict[str, str]] = []
+        by_region: dict[
+            str, list[provision_common.AWSServerOwnedSecurityGroupIdentity]] = (
+                collections.defaultdict(list))
+        for identity in self._retained_security_group_identities.values():
+            by_region[identity.region].append(identity)
+        region_scope_by_name = {
+            item.region: item for item in self._scope.aws_regions
+        }
+        for region, identities in sorted(by_region.items()):
+            region_scope = region_scope_by_name.get(region)
+            if region_scope is None:
+                raise GuardViolation(
+                    'Retained AWS security group escaped frozen regions.')
+            session = aws_adaptor.session(
+                profile=region_scope.credential_profile)
+            for identity in sorted(identities,
+                                   key=lambda item: item.security_group_id):
+                try:
+                    observation = (
+                        aws_instance.
+                        observe_exact_server_owned_service_security_group(
+                            identity, session=session))
+                except ValueError as error:
+                    raise GuardViolation(
+                        'AWS security-group identity changed at the provider.') \
+                        from error
+                if not isinstance(
+                        observation, provision_common.
+                        AWSServerOwnedSecurityGroupObservation):
+                    raise GuardViolation(
+                        'AWS exact security-group census is incomplete.')
+                if observation.identity != identity:
+                    raise GuardViolation(
+                        'AWS exact security-group receipt changed identity.')
+                if observation.presence is (
+                        aws_instance.ServerOwnedSecurityGroupPresence.ABSENT):
+                    continue
+                if observation.presence is not (
+                        aws_instance.ServerOwnedSecurityGroupPresence.PRESENT):
+                    raise GuardViolation(
+                        'AWS exact security-group census is incomplete.')
+                observed.append({
+                    'aws_account_id': identity.aws_account_id,
+                    'region': identity.region,
+                    'vpc_id': identity.vpc_id,
+                    'security_group_id': identity.security_group_id,
+                    'security_group_name': identity.security_group_name,
+                })
+        return tuple(observed)
+
     def census(self) -> AwsProviderCensus:
         try:
             service_instances, service_volumes = self._service_census()
+            security_groups = self._security_group_census()
         except GuardViolation:
             raise
         except QualificationError:
@@ -2960,7 +3023,8 @@ class AwsObserver:
         except Exception as error:  # pylint: disable=broad-except
             raise QualificationError('AWS EC2 census failed.') from error
         return AwsProviderCensus(service_instances=service_instances,
-                                 service_volumes=service_volumes)
+                                 service_volumes=service_volumes,
+                                 server_owned_security_groups=security_groups)
 
     def retained_volume_ids(self) -> dict[str, list[str]]:
         """Return credential-free disk identities for durable receipts."""
@@ -2969,12 +3033,36 @@ class AwsObserver:
                 self._retained_volume_ids_by_region.items())
         }
 
+    def retained_security_group_identities(
+        self,
+    ) -> tuple[provision_common.AWSServerOwnedSecurityGroupIdentity, ...]:
+        """Return the monotonic exact SG absence scope."""
+        return tuple(
+            self._retained_security_group_identities[key]
+            for key in sorted(self._retained_security_group_identities))
+
     def accept_retained_volume_ids(self, value: object) -> None:
         """Monotonically extend cleanup identity inside one child runtime."""
         retained = _accepted_retained_volume_ids(self.retained_volume_ids(),
                                                  value)
         for region, volume_ids in retained.items():
             self._retained_volume_ids_by_region[region].update(volume_ids)
+
+    def accept_retained_security_group_identities(
+        self,
+        identities: collections.abc.Sequence[
+            provision_common.AWSServerOwnedSecurityGroupIdentity],
+    ) -> None:
+        """Monotonically retain exact SG identities inside the child."""
+        retained = CleanupScope(aws_security_group_identities=tuple(
+            self._retained_security_group_identities.values())).retain(
+                (), identities).aws_security_group_identities
+        for identity in retained:
+            _validate_aws_security_group_identity_scope(
+                identity, service_name=self._service_name, scope=self._scope)
+            key = (identity.aws_account_id, identity.region, identity.vpc_id,
+                   identity.security_group_id)
+            self._retained_security_group_identities[key] = identity
 
     def reduce(
         self, census: AwsProviderCensus,
@@ -3039,6 +3127,7 @@ class DatabaseState:
     gcp_provider_identities: tuple[GcpProviderIdentity, ...]
     aws_provider_identities: tuple[AwsProviderIdentity, ...]
     provider_free_unbound_replica_ids: tuple[int, ...] = ()
+    cleanup_cluster_identities: 'tuple[CleanupClusterIdentity, ...]' = ()
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -3088,10 +3177,14 @@ class CleanupScope:
     """Monotonic exact auxiliary identities learned during one teardown."""
 
     cluster_identities: tuple[CleanupClusterIdentity, ...] = ()
+    aws_security_group_identities: tuple[
+        provision_common.AWSServerOwnedSecurityGroupIdentity, ...] = ()
 
     def retain(
         self,
         observed: collections.abc.Sequence[CleanupClusterIdentity],
+        observed_aws_security_groups: collections.abc.Sequence[
+            provision_common.AWSServerOwnedSecurityGroupIdentity] = (),
     ) -> 'CleanupScope':
         by_replica: dict[tuple[int, uuid.UUID, str],
                          CleanupClusterIdentity] = {}
@@ -3112,7 +3205,92 @@ class CleanupScope:
             sorted(by_replica.values(),
                    key=lambda item: (item.replica_id, item.cluster_name,
                                      str(item.cluster_record_uuid))))
-        return CleanupScope(cluster_identities=identities)
+        security_groups: dict[
+            tuple[str, str, str, str],
+            provision_common.AWSServerOwnedSecurityGroupIdentity] = {}
+        security_group_ids: dict[
+            tuple[str, str, str],
+            provision_common.AWSServerOwnedSecurityGroupIdentity] = {}
+        for identity in (*self.aws_security_group_identities,
+                         *observed_aws_security_groups):
+            if not isinstance(
+                    identity,
+                    provision_common.AWSServerOwnedSecurityGroupIdentity):
+                raise GuardViolation(
+                    'Cleanup AWS security-group identity is malformed.')
+            key = (identity.aws_account_id, identity.region, identity.vpc_id,
+                   identity.security_group_id)
+            id_key = (identity.aws_account_id, identity.region,
+                      identity.security_group_id)
+            prior = security_groups.setdefault(key, identity)
+            prior_id = security_group_ids.setdefault(id_key, identity)
+            if prior != identity or prior_id != identity:
+                raise GuardViolation(
+                    'Cleanup observations reuse an AWS security-group '
+                    'identity.')
+        return CleanupScope(
+            cluster_identities=identities,
+            aws_security_group_identities=tuple(
+                security_groups[key] for key in sorted(security_groups)))
+
+
+def _validate_aws_security_group_identity_scope(
+    identity: provision_common.AWSServerOwnedSecurityGroupIdentity,
+    *,
+    service_name: str,
+    scope: ProviderScope,
+) -> None:
+    configured = {
+        (item.aws_account_id, item.region) for item in scope.aws_regions
+    }
+    if ((identity.aws_account_id, identity.region) not in configured or
+            identity.security_group_name != f'sky-sg-{service_name}' or
+            identity.service_name != service_name or
+            identity.service_incarnation != scope.service_hash or
+            identity.creator_lifecycle_epoch > scope.lifecycle_epoch):
+        raise GuardViolation(
+            'Retained AWS security group escaped service scope.')
+
+
+def _aws_security_group_identities_from_process_payload(
+    payload: object,
+    *,
+    service_name: str,
+    scope: ProviderScope,
+) -> tuple[provision_common.AWSServerOwnedSecurityGroupIdentity, ...]:
+    if (not isinstance(payload, list) or
+            len(payload) > _MAX_CLEANUP_CLUSTER_IDENTITIES):
+        raise GuardViolation(
+            'AWS security-group identity response is malformed.')
+    try:
+        identities = tuple(
+            provision_common.AWSServerOwnedSecurityGroupIdentity.from_mapping(
+                item) for item in payload)
+    except (TypeError, ValueError) as error:
+        raise GuardViolation(
+            'AWS security-group identity response is malformed.') from error
+    retained = CleanupScope().retain((),
+                                     identities).aws_security_group_identities
+    if len(retained) != len(identities):
+        raise GuardViolation(
+            'AWS security-group identity response contains duplicates.')
+    for identity in retained:
+        _validate_aws_security_group_identity_scope(identity,
+                                                    service_name=service_name,
+                                                    scope=scope)
+    return retained
+
+
+def _retain_discovered_aws_security_group_identities(
+    current: CleanupScope,
+    payload: object,
+    *,
+    service_name: str,
+    scope: ProviderScope,
+) -> CleanupScope:
+    discovered = _aws_security_group_identities_from_process_payload(
+        payload, service_name=service_name, scope=scope)
+    return current.retain((), discovered)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -3186,12 +3364,11 @@ def _cleanup_cluster_record_identities(
             generation = binding['launch_generation']
             if (type(replica_id) is not int or replica_id < 1 or
                     not isinstance(cluster_name, str) or not cluster_name or
-                    protocol
-                    != ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION
-                    or type(cohort) is not int or cohort < cohort_floor or
-                    cohort
-                    > ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
-                    or type(generation) is not int or generation < 1):
+                    protocol !=
+                    ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION or
+                    type(cohort) is not int or cohort < cohort_floor or cohort >
+                    ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH or
+                    type(generation) is not int or generation < 1):
                 raise GuardViolation(
                     'Retained paid history lacks Cohort-16 cluster identity.')
             action_identity = (
@@ -3263,8 +3440,9 @@ def cleanup_database_state_from_rows(
     # identity exposes its UUIDv5 incarnation.  Retain the relational join key
     # explicitly so validation never tries to reverse a UUIDv5.
     expected_by_retained_key = {
-        (identity.replica_id, identity.replica_record_id, identity.cluster_name):
-            identity.cluster_record_uuid for identity in identities
+        (identity.replica_id, identity.replica_record_id,
+         identity.cluster_name): identity.cluster_record_uuid
+        for identity in identities
     }
 
     for replica in replicas:
@@ -3371,8 +3549,8 @@ def paid_claim_census(
                     type(claim['capacity_plan_generation']) is not int or
                     claim['capacity_plan_generation'] <= 0 or
                     not isinstance(claim['capacity_plan_sha256'], str) or
-                    claim['capacity_plan_sha256']
-                    != claim['persisted_plan_sha256'] or
+                    claim['capacity_plan_sha256'] !=
+                    claim['persisted_plan_sha256'] or
                     str(claim['capacity_plan_accelerator']).casefold() != 'l4'
                     or type(claim['capacity_plan_units']) is not int or
                     claim['capacity_plan_units'] < 1):
@@ -3413,8 +3591,8 @@ def _retained_launch_request(
     if (str(request_row['ordinary_launch_association_id']) != str(
             binding['association_id']) or
             request_row['request_id'] != binding['request_id'] or
-            request_row['handler_name']
-            != non_pool_launch.NON_POOL_LAUNCH_HANDLER_NAME or
+            request_row['handler_name'] !=
+            non_pool_launch.NON_POOL_LAUNCH_HANDLER_NAME or
             request_row['user_id'] != binding['tenant_scope'] or
             request_row['cluster_name'] != binding['cluster_name'] or
             any(request_row[field] != binding[field]
@@ -3553,8 +3731,8 @@ def aws_identity_from_retained_request(
                 identity['num_nodes'] != 1 or
                 identity['use_spot'] is not True or
                 len(matching_region_scopes) != 1 or
-                matching_region_scopes[0].aws_account_id
-                != identity['aws_account_id']):
+                matching_region_scopes[0].aws_account_id !=
+                identity['aws_account_id']):
             raise ValueError('request-derived provider identity mismatch')
         return AwsProviderIdentity(
             aws_account_id=identity['aws_account_id'],
@@ -3697,8 +3875,8 @@ def _is_exact_provider_free_unbound_paid_debit(
         info.status.value == replica.get('status') and
         info.is_spot is replica.get('is_spot') and
         info.paid_capacity_pool_key == pool_key and
-        ordinary_launch_binding.classify_non_pool_launch_profile(info)
-        is ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+        ordinary_launch_binding.classify_non_pool_launch_profile(info) is
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
 
 
 def select_replica_binding(
@@ -4027,44 +4205,7 @@ class PostgresObserver:
         summary = demand_state.get_request_summary(self._service_name,
                                                    scope.service_hash,
                                                    engine=self._engine)
-        ledger = async_request_ledger.get_summary(self._service_name,
-                                                  scope.service_hash,
-                                                  engine=self._engine)
-        if (ledger.get('available') is not True or
-                ledger.get('service_hash') != scope.service_hash or
-                not isinstance(ledger.get('state_counts'), dict)):
-            raise QualificationError(
-                'Exact async-ledger request summary is unavailable.')
-        return request_telemetry_from_summary(summary, ledger['state_counts'])
-
-    def campaign_terminal_membership(self, prefix: str, count: int) -> str:
-        """Prove exact campaign keys are current SUCCEEDED attempts."""
-        scope = self._provider_scope
-        if scope is None:
-            raise QualificationError('Provider scope was not frozen.')
-        request_keys = _campaign_request_key_sha256s(prefix, count)
-        statement = sqlalchemy.text('''
-            SELECT request.request_key_sha256, attempt.state
-            FROM serve_async_requests AS request
-            JOIN serve_async_request_attempts AS attempt
-              ON attempt.service_name = request.service_name
-             AND attempt.service_hash = request.service_hash
-             AND attempt.request_key_sha256 = request.request_key_sha256
-             AND attempt.attempt_id = request.current_attempt_id
-            WHERE request.service_name = :service_name
-              AND request.service_hash = :service_hash
-              AND request.request_key_sha256 IN :request_keys
-        ''').bindparams(sqlalchemy.bindparam('request_keys', expanding=True))
-        with self._engine.connect() as connection:
-            rows = connection.execute(
-                statement, {
-                    'service_name': self._service_name,
-                    'service_hash': scope.service_hash,
-                    'request_keys': request_keys,
-                }).mappings().all()
-        return _validate_campaign_terminal_rows(prefix=prefix,
-                                                count=count,
-                                                rows=rows)
+        return request_telemetry_from_summary(summary)
 
     def snapshot(
         self,
@@ -4124,14 +4265,14 @@ class PostgresObserver:
                     lifecycle_epoch != scope.lifecycle_epoch or
                     authority['current_version'] != scope.service_version or
                     authority['workspace'] != scope.workspace or
-                    authority['controller_config_digest']
-                    != scope.controller_config_digest or
-                    authority['controller_config_snapshot_id']
-                    != scope.controller_config_snapshot_id or
+                    authority['controller_config_digest'] !=
+                    scope.controller_config_digest or
+                    authority['controller_config_snapshot_id'] !=
+                    scope.controller_config_snapshot_id or
                     not isinstance(authority['placement_catalog'], dict) or
                     hashlib.sha256(rfc8785.dumps(
-                        authority['placement_catalog'])).hexdigest()
-                    != scope.placement_catalog_sha256 or
+                        authority['placement_catalog'])).hexdigest() !=
+                    scope.placement_catalog_sha256 or
                     not isinstance(authority['yaml_content'], str) or
                     hashlib.sha256(
                         authority['yaml_content'].encode('utf-8')).hexdigest()
@@ -4241,8 +4382,8 @@ class PostgresObserver:
                         is not ordinary_launch_binding.
                         NonPoolLaunchAuthorizationKind.PAID_CAPACITY_CLAIM or
                         binding['service_lifecycle_epoch'] != lifecycle_epoch or
-                        context.profile.authorization_reference
-                        != f'paid-capacity:{service_hash}:'
+                        context.profile.authorization_reference !=
+                        f'paid-capacity:{service_hash}:'
                         f'{context.replica_record_id}:'
                         f'{binding["paid_capacity_pool_key"]}'):
                     raise ValueError('binding identity mismatch')
@@ -4275,13 +4416,13 @@ class PostgresObserver:
                     from error
             if (replica['is_spot'] is not True or
                     not replica['replica_record_id'] or
-                    binding['paid_capacity_pool_key']
-                    != replica['paid_capacity_pool_key']):
+                    binding['paid_capacity_pool_key'] !=
+                    replica['paid_capacity_pool_key']):
                 raise GuardViolation(
                     'Paid replica has no exact retained Spot launch binding.')
             claim = claim_by_replica_id.get(replica['replica_id'])
-            if (claim is not None and claim['capacity_plan_units']
-                    != identity.gpu_units_per_instance):
+            if (claim is not None and claim['capacity_plan_units'] !=
+                    identity.gpu_units_per_instance):
                 raise GuardViolation(
                     'Paid claim units disagree with its provider shape.')
             if isinstance(identity, GcpProviderIdentity):
@@ -4310,6 +4451,8 @@ class PostgresObserver:
             aws_provider_identities=aws_identities,
             provider_free_unbound_replica_ids=tuple(
                 sorted(provider_free_unbound_replica_ids)),
+            cleanup_cluster_identities=(
+                _cleanup_cluster_record_identities(bindings)),
         )
 
 
@@ -4348,8 +4491,8 @@ def select_route_authoritative_report(
     if (authority.get('lb_ha_enabled') != 1 or
             authority.get('lb_cutover_phase') != 'STABLE' or
             authority.get('lb_active_slot') != load_balancer.slot or
-            authority.get('lb_cutover_generation')
-            != load_balancer.role_generation):
+            authority.get('lb_cutover_generation') !=
+            load_balancer.role_generation):
         raise QualificationError(
             'HTTP probe does not match stable PostgreSQL LB authority.')
     candidates = []
@@ -4550,7 +4693,9 @@ def _scope_from_process_payload(
 
 def _cleanup_scope_process_payload(scope: CleanupScope) -> dict[str, Any]:
     if (not isinstance(scope, CleanupScope) or
-            len(scope.cluster_identities) > _MAX_CLEANUP_CLUSTER_IDENTITIES):
+            len(scope.cluster_identities) > _MAX_CLEANUP_CLUSTER_IDENTITIES or
+            len(scope.aws_security_group_identities) >
+            _MAX_CLEANUP_CLUSTER_IDENTITIES):
         raise GuardViolation('Cleanup identity scope exceeds its protocol.')
     return {
         'cluster_identities': [{
@@ -4558,16 +4703,22 @@ def _cleanup_scope_process_payload(scope: CleanupScope) -> dict[str, Any]:
             'replica_record_id': str(identity.replica_record_id),
             'cluster_name': identity.cluster_name,
             'cluster_record_uuid': str(identity.cluster_record_uuid),
-        } for identity in scope.cluster_identities]
+        } for identity in scope.cluster_identities],
+        'aws_security_group_identities': [
+            identity.canonical_mapping()
+            for identity in scope.aws_security_group_identities
+        ],
     }
 
 
 def _cleanup_scope_from_process_payload(payload: object) -> CleanupScope:
-    if (not isinstance(payload, collections.abc.Mapping) or
-            set(payload) != {'cluster_identities'} or
+    if (not isinstance(payload, collections.abc.Mapping) or set(payload) !=
+        {'cluster_identities', 'aws_security_group_identities'} or
             not isinstance(payload['cluster_identities'], list) or
-            len(payload['cluster_identities'])
-            > _MAX_CLEANUP_CLUSTER_IDENTITIES):
+            not isinstance(payload['aws_security_group_identities'], list) or
+            len(payload['cluster_identities']) > _MAX_CLEANUP_CLUSTER_IDENTITIES
+            or len(payload['aws_security_group_identities']) >
+            _MAX_CLEANUP_CLUSTER_IDENTITIES):
         raise GuardViolation('Cleanup identity scope is malformed.')
     identities: list[CleanupClusterIdentity] = []
     for item in payload['cluster_identities']:
@@ -4587,8 +4738,17 @@ def _cleanup_scope_from_process_payload(payload: object) -> CleanupScope:
                                    cluster_record_uuid=_canonical_cleanup_uuid(
                                        item['cluster_record_uuid'],
                                        'scope global cluster record')))
-    scope = CleanupScope().retain(identities)
-    if len(scope.cluster_identities) != len(identities):
+    try:
+        security_groups = tuple(
+            provision_common.AWSServerOwnedSecurityGroupIdentity.from_mapping(
+                item) for item in payload['aws_security_group_identities'])
+    except (TypeError, ValueError) as error:
+        raise GuardViolation(
+            'Cleanup AWS security-group identity scope is malformed.') \
+            from error
+    scope = CleanupScope().retain(identities, security_groups)
+    if (len(scope.cluster_identities) != len(identities) or
+            len(scope.aws_security_group_identities) != len(security_groups)):
         raise GuardViolation('Cleanup identity scope contains duplicates.')
     return scope
 
@@ -4596,7 +4756,8 @@ def _cleanup_scope_from_process_payload(payload: object) -> CleanupScope:
 def _accepted_cleanup_scope(current: CleanupScope,
                             payload: object) -> CleanupScope:
     observed = _cleanup_scope_from_process_payload(payload)
-    if current.retain(observed.cluster_identities) != observed:
+    if current.retain(observed.cluster_identities,
+                      observed.aws_security_group_identities) != observed:
         raise GuardViolation('Cleanup child shrank its identity scope.')
     return observed
 
@@ -4616,6 +4777,15 @@ def _database_state_from_process_payload(
         for item in values['aws_provider_identities'])
     values['provider_free_unbound_replica_ids'] = tuple(
         values['provider_free_unbound_replica_ids'])
+    values['cleanup_cluster_identities'] = tuple(
+        CleanupClusterIdentity(
+            replica_id=item['replica_id'],
+            replica_record_id=_canonical_cleanup_uuid(
+                item['replica_record_id'], 'snapshot replica record'),
+            cluster_name=item['cluster_name'],
+            cluster_record_uuid=_canonical_cleanup_uuid(
+                item['cluster_record_uuid'], 'snapshot global cluster record'))
+        for item in values['cleanup_cluster_identities'])
     return DatabaseState(**values)
 
 
@@ -4627,6 +4797,7 @@ class _IsolatedObserverChildRuntime:
         self._service_name: str | None = None
         self._scope: ProviderScope | None = None
         self._profile: Profile | None = None
+        self._discover_server_owned_security_groups: bool | None = None
         self._gcp: GcpObserver | None = None
         self._aws: AwsObserver | None = None
         self._provider_executor: concurrent.futures.ThreadPoolExecutor | None = (
@@ -4643,17 +4814,26 @@ class _IsolatedObserverChildRuntime:
             self._postgres = None
 
     def _bind_provider(self, service_name: str, scope: ProviderScope,
-                       profile: Profile, retained: object) -> None:
-        identity = (service_name, scope, profile)
-        current = (self._service_name, self._scope, self._profile)
+                       profile: Profile, retained: object,
+                       cleanup_scope: CleanupScope,
+                       discover_server_owned_security_groups: bool) -> None:
+        identity = (service_name, scope, profile,
+                    discover_server_owned_security_groups)
+        current = (self._service_name, self._scope, self._profile,
+                   self._discover_server_owned_security_groups)
         if self._service_name is None:
-            self._service_name, self._scope, self._profile = identity
+            (self._service_name, self._scope, self._profile,
+             self._discover_server_owned_security_groups) = identity
             self._gcp, self._aws = _provider_observers(
                 service_name=service_name,
                 scope=scope,
                 profile=profile,
                 retained_volume_ids_by_region=typing.cast(
-                    collections.abc.Mapping[str, list[str]], retained))
+                    collections.abc.Mapping[str, list[str]], retained),
+                retained_security_group_identities=(
+                    cleanup_scope.aws_security_group_identities),
+                discover_server_owned_security_groups=(
+                    discover_server_owned_security_groups))
             observer_count = sum(
                 observer is not None for observer in (self._gcp, self._aws))
             if observer_count == 0:
@@ -4667,6 +4847,8 @@ class _IsolatedObserverChildRuntime:
                 'Persistent provider observation authority changed.')
         if self._aws is not None:
             self._aws.accept_retained_volume_ids(retained)
+            self._aws.accept_retained_security_group_identities(
+                cleanup_scope.aws_security_group_identities)
 
     def _provider_payload(self, values: collections.abc.Mapping[str, Any],
                           service_name: str,
@@ -4677,7 +4859,12 @@ class _IsolatedObserverChildRuntime:
                 not isinstance(retained, dict)):
             raise QualificationError('Provider census request lacks scope.')
         profile = Profile(**raw_profile)
-        self._bind_provider(service_name, scope, profile, retained)
+        cleanup_scope_payload = values.get('cleanup_scope')
+        cleanup_scope = (
+            CleanupScope() if cleanup_scope_payload is None else
+            _cleanup_scope_from_process_payload(cleanup_scope_payload))
+        self._bind_provider(service_name, scope, profile, retained,
+                            cleanup_scope, cleanup_scope_payload is not None)
         observers = [
             observer for observer in (self._gcp, self._aws)
             if observer is not None
@@ -4699,6 +4886,11 @@ class _IsolatedObserverChildRuntime:
                 ),
             'retained_volume_ids_by_region':
                 ({} if self._aws is None else self._aws.retained_volume_ids()),
+            'retained_aws_security_group_identities':
+                ([] if self._aws is None else [
+                    identity.canonical_mapping() for identity in
+                    self._aws.retained_security_group_identities()
+                ]),
         }
 
     def _bind_postgres(self, database_url: object,
@@ -4741,15 +4933,6 @@ class _IsolatedObserverChildRuntime:
             return {
                 'telemetry': dataclasses.asdict(postgres.request_telemetry())
             }
-        if projection == 'membership':
-            if (not isinstance(values.get('campaign_prefix'), str) or
-                    type(values.get('campaign_count')) is not int):
-                raise QualificationError(
-                    'Terminal-membership observation lacks a campaign.')
-            return {
-                'membership': postgres.campaign_terminal_membership(
-                    values['campaign_prefix'], values['campaign_count'])
-            }
         if projection == 'snapshot':
             if not isinstance(values.get('load_balancer'), dict):
                 raise QualificationError(
@@ -4776,8 +4959,8 @@ def _isolated_observer_response(
 ) -> dict[str, Any]:
     request_id: str | None = None
     try:
-        if (not isinstance(raw, dict) or raw.get('protocol_version')
-                != _ISOLATED_OBSERVER_PROTOCOL_VERSION or
+        if (not isinstance(raw, dict) or raw.get('protocol_version') !=
+                _ISOLATED_OBSERVER_PROTOCOL_VERSION or
                 not isinstance(raw.get('request_id'), str) or
                 not isinstance(raw.get('arguments'), dict)):
             raise ValueError('Malformed observer request.')
@@ -5094,8 +5277,8 @@ class IsolatedObserverSession:
                 raise QualificationError(
                     'Isolated observer readiness exceeded its byte budget.')
             ready = json.loads(ready_line)
-            if (not isinstance(ready, dict) or ready.get('protocol_version')
-                    != _ISOLATED_OBSERVER_PROTOCOL_VERSION or
+            if (not isinstance(ready, dict) or ready.get('protocol_version') !=
+                    _ISOLATED_OBSERVER_PROTOCOL_VERSION or
                     ready.get('ready') is not True or
                     ready.get('domain') != self._domain.value):
                 raise QualificationError(
@@ -5176,8 +5359,8 @@ class IsolatedObserverSession:
                 raise QualificationError(
                     'Isolated observer response is malformed.') from error
             if (not isinstance(response, dict) or
-                    response.get('protocol_version')
-                    != _ISOLATED_OBSERVER_PROTOCOL_VERSION or
+                    response.get('protocol_version') !=
+                    _ISOLATED_OBSERVER_PROTOCOL_VERSION or
                     response.get('request_id') != request_id or
                     type(response.get('ok')) is not bool):
                 await self._retire_locked()
@@ -5255,6 +5438,7 @@ class Observation:
                 self.database.demand_units == 0 and
                 self.provider.instance_count == 0 and
                 self.provider.disk_count == 0 and
+                self.provider.security_group_count == 0 and
                 self.provider.inflight_operation_count == 0 and
                 self.load_balancer.demand_units == 0 and
                 self.load_balancer.ready_replicas == 0)
@@ -5286,8 +5470,8 @@ def validate_observation(
             not math.isfinite(observation.observed_started_monotonic) or
             not math.isfinite(observation.observed_monotonic) or
             observation.observed_started_monotonic < 0 or
-            observation.observed_monotonic
-            < observation.observed_started_monotonic):
+            observation.observed_monotonic <
+            observation.observed_started_monotonic):
         raise QualificationError(
             'Provider observation has an invalid sample interval.')
     database = observation.database
@@ -5408,22 +5592,7 @@ class Observer:
         payload = result.get('telemetry')
         if not isinstance(payload, dict):
             raise QualificationError('Isolated request telemetry is malformed.')
-        payload['ledger_state_counts'] = tuple(
-            tuple(item) for item in payload['ledger_state_counts'])
         return RequestTelemetry(**payload)
-
-    async def campaign_terminal_membership(self, prefix: str, count: int,
-                                           deadline_monotonic: float) -> str:
-        result = await self._postgres_session.request(
-            IsolatedObservationKind.POSTGRES,
-            self._postgres_arguments(projection='membership',
-                                     campaign_prefix=prefix,
-                                     campaign_count=count), deadline_monotonic)
-        membership = result.get('membership')
-        if not isinstance(membership, str) or not membership:
-            raise QualificationError(
-                'Isolated terminal membership is malformed.')
-        return membership
 
     async def snapshot(
         self,
@@ -5548,8 +5717,8 @@ class Progress:
                 self.peak_running_gpu_units_by_cloud.get(cloud.cloud, 0),
                 cloud.running_gpu_units)
         if (qualify_scale and self.scale_reached_monotonic is None and
-                observation.provider.running_count
-                >= expectation.minimum_physical_running):
+                observation.provider.running_count >=
+                expectation.minimum_physical_running):
             if self.scale_started_monotonic is None:
                 raise QualificationError(
                     'Provider reached the physical RUNNING target '
@@ -5583,8 +5752,8 @@ class Progress:
                        profile: Profile) -> bool:
         return (self.zero_samples >= 3 and
                 self.zero_since_monotonic is not None and
-                observation.observed_monotonic - self.zero_since_monotonic
-                >= profile.zero_hold_seconds)
+                observation.observed_monotonic - self.zero_since_monotonic >=
+                profile.zero_hold_seconds)
 
 
 def observation_summary(observation: Observation) -> dict[str, Any]:
@@ -5623,11 +5792,13 @@ def observation_summary(observation: Observation) -> dict[str, Any]:
                 'gpu_units': cloud.gpu_units,
                 'running_gpu_units': cloud.running_gpu_units,
                 'disks': cloud.disk_count,
+                'security_groups': cloud.security_group_count,
                 'inflight_operations': cloud.inflight_operation_count,
                 'shapes': [dataclasses.asdict(shape) for shape in cloud.shapes],
             } for cloud in observation.provider.clouds
         },
         'provider_disks': observation.provider.disk_count,
+        'provider_security_groups': observation.provider.security_group_count,
         'provider_inflight_operations':
             (observation.provider.inflight_operation_count),
         'lb_demand_units': observation.load_balancer.demand_units,
@@ -5660,6 +5831,7 @@ class Receipt:
             expectation = provider_expectation(profile, None)
         self._path = path
         self._expectation_kind = expectation.kind
+        self._cleanup_scope = CleanupScope()
         self._payload: dict[str, Any] = {
             'schema_version': _QUALIFICATION_RECEIPT_SCHEMA_VERSION,
             'service_name': service_name,
@@ -5670,13 +5842,17 @@ class Receipt:
             'max_units': profile.max_units,
             'minimum_running': expectation.minimum_physical_running,
             'exact_request_count': expectation.exact_request_count,
-            'terminal_publication_timeout_seconds':
-                profile.terminal_publication_timeout_seconds,
+            'request_queue_timeout_seconds':
+                profile.request_queue_timeout_seconds,
+            'request_completion_timeout_seconds':
+                profile.request_completion_timeout_seconds,
             'scale_slo_seconds': profile.scale_slo_seconds,
             'scale_timeout_seconds': profile.scale_timeout_seconds,
             'started_at': time.time(),
             'samples': [],
             'request_telemetry_samples': [],
+            'cleanup_scope': _cleanup_scope_process_payload(self._cleanup_scope
+                                                           ),
         }
         if scope is not None:
             self._payload.update({
@@ -5709,13 +5885,13 @@ class Receipt:
         self._payload['campaign_manifest_sha256'] = (_campaign_manifest_sha256(
             prefix, count))
 
-    def bind_campaign_terminal_membership(self, digest: str) -> None:
-        """Record the PostgreSQL-proven terminal request-key set once."""
-        if ('campaign_terminal_membership_sha256' in self._payload or
+    def bind_campaign_success_manifest(self, digest: str) -> None:
+        """Record the backend-validated successful request set once."""
+        if ('campaign_success_manifest_sha256' in self._payload or
                 digest != self._payload.get('campaign_manifest_sha256')):
             raise QualificationError(
-                'Qualification receipt has conflicting campaign membership.')
-        self._payload['campaign_terminal_membership_sha256'] = digest
+                'Qualification receipt has conflicting campaign success set.')
+        self._payload['campaign_success_manifest_sha256'] = digest
 
     def sample(self,
                phase: str,
@@ -5724,6 +5900,10 @@ class Receipt:
                scale_iteration_id: int | None = None,
                baseline_iteration_id: int | None = None,
                baseline_pair_observed_at: float | None = None) -> None:
+        self._cleanup_scope = self._cleanup_scope.retain(
+            observation.database.cleanup_cluster_identities)
+        self._payload['cleanup_scope'] = _cleanup_scope_process_payload(
+            self._cleanup_scope)
         sample = {
             'phase': phase,
             'exact_zero': observation.is_exact_zero(),
@@ -5795,9 +5975,6 @@ class Receipt:
         sample = {
             'phase': phase,
             **dataclasses.asdict(telemetry),
-            'ledger_active': telemetry.ledger_active,
-            'ledger_succeeded': telemetry.ledger_succeeded,
-            'ledger_total': telemetry.ledger_total,
         }
         if scale_iteration_id is not None:
             sample['scale_iteration_id'] = scale_iteration_id
@@ -5812,8 +5989,6 @@ class Receipt:
                exact_request_successes: int,
                aws_volume_ids: collections.abc.Mapping[str, list[str]] |
                None = None,
-               ledger_baseline: RequestTelemetry | None = None,
-               ledger_final: RequestTelemetry | None = None,
                error: BaseException | None = None) -> None:
         self._payload.update({
             'finished_at': time.time(),
@@ -5839,21 +6014,6 @@ class Receipt:
             'exact_request_successes': exact_request_successes,
             'aws_retained_volume_ids': dict(aws_volume_ids or {}),
         })
-        if ledger_baseline is not None:
-            self._payload['ledger_baseline_total'] = (
-                ledger_baseline.ledger_total)
-            self._payload['ledger_baseline_succeeded'] = (
-                ledger_baseline.ledger_succeeded)
-        if ledger_final is not None:
-            self._payload['ledger_final_total'] = ledger_final.ledger_total
-            self._payload['ledger_final_succeeded'] = (
-                ledger_final.ledger_succeeded)
-        if ledger_baseline is not None and ledger_final is not None:
-            self._payload['ledger_request_delta'] = (
-                ledger_final.ledger_total - ledger_baseline.ledger_total)
-            self._payload['ledger_succeeded_delta'] = (
-                ledger_final.ledger_succeeded -
-                ledger_baseline.ledger_succeeded)
         if error is not None:
             # Never serialize exception text: transport/database errors may
             # contain an endpoint or credential-bearing connection string.
@@ -5928,561 +6088,188 @@ def read_optional_aws_volume_ids_receipt(
         return {}
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class ExactAsyncReceipt:
-    """Receipt fields required to complete one synthetic exact request."""
-
-    attempt_id: str
-    attempt_no: int
-    state: str
-    revision: int
-
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class _ExactAsyncAdmission:
-    """Accepted attempt plus any response-body error deferred to terminal."""
-
-    receipt: ExactAsyncReceipt
-    intent_sha256: str
-    deferred_protocol_error: QualificationError | None = None
-
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class _ExactRequestCompletion:
-    """Terminalized admission, or definitive no-admission after closure."""
-
-    terminalized: bool
-    deferred_protocol_error: QualificationError | None = None
-
-
-class _ExactAdmissionRecoveryAction(enum.Enum):
-    RETURN = enum.auto()
-    RETRY_SUBMISSION = enum.auto()
-    POLL_RECEIPT = enum.auto()
-
-
-def _single_response_header(response: aiohttp.ClientResponse, name: str) -> str:
-    get_all = getattr(response.headers, 'getall', None)
-    if callable(get_all):
-        values = list(get_all(name, []))
-    else:
-        value = response.headers.get(name)
-        values = [] if value is None else [value]
-    if len(values) != 1 or not isinstance(values[0], str) or not values[0]:
-        raise QualificationError(
-            f'Exact async response lacks one {name} header.')
-    return values[0]
-
-
-def _receipt_from_headers(
-    response: aiohttp.ClientResponse,
-    *,
-    service_hash: str,
-) -> ExactAsyncReceipt:
-    _validate_exact_response_fence(response, service_hash=service_hash)
-    attempt_id = _single_response_header(
-        response, serve_constants.LB_ASYNC_ATTEMPT_ID_HEADER)
+def read_optional_cleanup_scope_receipt(
+    path: pathlib.Path,
+    service_name: str,
+) -> CleanupScope:
+    """Read live-observed cleanup identities, or empty scope before receipt."""
     try:
-        if str(uuid.UUID(attempt_id)) != attempt_id:
-            raise ValueError
-        attempt_no = int(
-            _single_response_header(response,
-                                    serve_constants.LB_ASYNC_ATTEMPT_NO_HEADER))
-        revision = int(
-            _single_response_header(
-                response, serve_constants.LB_ASYNC_LEDGER_REVISION_HEADER))
-    except (TypeError, ValueError) as error:
-        raise QualificationError(
-            'Exact async response has malformed receipt identity.') from error
-    state = _single_response_header(
-        response, serve_constants.LB_ASYNC_LEDGER_STATE_HEADER)
-    if attempt_no < 1 or revision < 1:
-        raise QualificationError(
-            'Exact async response has a conflicting receipt transition.')
-    return ExactAsyncReceipt(attempt_id=attempt_id,
-                             attempt_no=attempt_no,
-                             state=state,
-                             revision=revision)
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        # ``serve up`` may lose its acknowledgement before qualification has
+        # created a receipt. The frozen provider scope still authorizes the
+        # normal finalizer, but there are no live-observed DB identities yet.
+        return CleanupScope()
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise QualificationError('Qualification receipt is unavailable.') \
+            from error
+    if (not isinstance(payload, dict) or payload.get('schema_version') !=
+            _QUALIFICATION_RECEIPT_SCHEMA_VERSION or
+            payload.get('service_name') != service_name):
+        raise QualificationError('Qualification receipt is malformed.')
+    return _cleanup_scope_from_process_payload(payload.get('cleanup_scope'))
 
 
-def _validate_exact_response_fence(response: aiohttp.ClientResponse, *,
-                                   service_hash: str) -> None:
-    """Require proof that a receipt response came from this exact service."""
-    if (_single_response_header(
-            response, serve_constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER) != str(
-                serve_constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION) or
-            _single_response_header(
-                response, serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER)
-            != service_hash):
-        raise QualificationError(
-            'Exact async response changed protocol or service incarnation.')
-
-
-def _validate_submission_receipt(
-    current: ExactAsyncReceipt,
-    *,
-    previous_rejection: ExactAsyncReceipt | None,
-    accepted_response: bool,
+def _persist_cleanup_scope_receipt(
+    path: pathlib.Path,
+    service_name: str,
+    observed: CleanupScope,
 ) -> None:
-    """Validate one public response against reachable ledger transitions."""
-    if accepted_response:
-        valid_state_revision = (
-            (current.state == 'ACCEPTED' and current.revision == 2) or
-            (current.state == 'SUCCEEDED' and current.revision in (2, 3)))
+    """Atomically extend cleanup authority without rewriting other evidence."""
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        payload = {
+            'schema_version': _QUALIFICATION_RECEIPT_SCHEMA_VERSION,
+            'service_name': service_name,
+        }
+        current = CleanupScope()
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise QualificationError('Qualification receipt is unavailable.') \
+            from error
     else:
-        valid_state_revision = (
-            current.state == 'REJECTED_PRE_DISPATCH' and
-            (current.revision == 2 or
-             (current.attempt_no == 1 and current.revision == 1)))
-    valid_attempt = True
-    if previous_rejection is not None:
-        same_rejection = (
-            not accepted_response and
-            current.attempt_id == previous_rejection.attempt_id and
-            current.attempt_no == previous_rejection.attempt_no and
-            current.revision == previous_rejection.revision)
-        later_attempt = (current.attempt_id != previous_rejection.attempt_id and
-                         current.attempt_no > previous_rejection.attempt_no)
-        valid_attempt = later_attempt if accepted_response else (
-            same_rejection or later_attempt)
-    if not valid_state_revision or not valid_attempt:
-        raise QualificationError(
-            'Exact async response has a conflicting receipt transition.')
+        if (not isinstance(payload, dict) or payload.get('schema_version') !=
+                _QUALIFICATION_RECEIPT_SCHEMA_VERSION or
+                payload.get('service_name') != service_name):
+            raise QualificationError('Qualification receipt is malformed.')
+        current = _cleanup_scope_from_process_payload(
+            payload.get('cleanup_scope'))
+    retained = current.retain(observed.cluster_identities,
+                              observed.aws_security_group_identities)
+    if retained != observed:
+        raise GuardViolation('Pre-down cleanup identity scope shrank.')
+    payload['cleanup_scope'] = _cleanup_scope_process_payload(retained)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f'.{path.name}.{uuid.uuid4().hex}.tmp')
+    try:
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) +
+                             '\n',
+                             encoding='utf-8')
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
-def _validate_recovered_submission_receipt(
-    current: ExactAsyncReceipt,
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value = dict(pairs)
+    if len(value) != len(pairs):
+        raise ValueError('duplicate JSON member')
+    return value
+
+
+def _invalid_json_constant(value: str) -> typing.NoReturn:
+    raise ValueError(f'invalid JSON constant {value}')
+
+
+async def _bounded_response_body(response: aiohttp.ClientResponse) -> bytes:
+    """Read a complete response without trusting an unbounded peer body."""
+    try:
+        await response.content.readexactly(_SYNCHRONOUS_RESPONSE_MAX_BYTES + 1)
+    except asyncio.IncompleteReadError as error:
+        return error.partial
+    raise QualificationError('Synchronous backend response is too large.')
+
+
+async def _one_synchronous_request(
+    session: aiohttp.ClientSession,
     *,
+    endpoint: str,
+    token: str,
     request_id: str,
-    previous_rejection: ExactAsyncReceipt | None,
-    pending_dispatch: ExactAsyncReceipt | None,
-) -> _ExactAdmissionRecoveryAction:
-    """Validate one read-only or duplicate-POST admission observation."""
-    if current.state in {'AMBIGUOUS', 'FAILED', 'CANCELLED', 'EXPIRED'}:
-        raise QualificationError(
-            f'{request_id} has durable exact admission state {current.state}.')
-    if current.state == 'DISPATCH_MAY_HAVE_OCCURRED':
-        if current.revision != 1:
-            raise QualificationError(
-                'Exact async response has a conflicting receipt transition.')
-        if pending_dispatch is not None:
-            valid_attempt = (
-                current == pending_dispatch or
-                (current.attempt_id != pending_dispatch.attempt_id and
-                 current.attempt_no > pending_dispatch.attempt_no))
-        elif previous_rejection is not None:
-            valid_attempt = (current.attempt_id != previous_rejection.attempt_id
-                             and
-                             current.attempt_no > previous_rejection.attempt_no)
-        else:
-            valid_attempt = True
-        if not valid_attempt:
-            raise QualificationError(
-                'Exact async response has a conflicting receipt transition.')
-        return _ExactAdmissionRecoveryAction.POLL_RECEIPT
-    if current.state not in {'REJECTED_PRE_DISPATCH', 'ACCEPTED', 'SUCCEEDED'}:
-        raise QualificationError(
-            f'{request_id} has unsupported durable exact admission state '
-            f'{current.state}.')
-    accepted = current.state in {'ACCEPTED', 'SUCCEEDED'}
-    if pending_dispatch is None:
-        _validate_submission_receipt(current,
-                                     previous_rejection=previous_rejection,
-                                     accepted_response=accepted)
-        return (_ExactAdmissionRecoveryAction.RETURN
-                if accepted else _ExactAdmissionRecoveryAction.RETRY_SUBMISSION)
-    same_attempt = (current.attempt_id == pending_dispatch.attempt_id and
-                    current.attempt_no == pending_dispatch.attempt_no)
-    later_attempt = (current.attempt_id != pending_dispatch.attempt_id and
-                     current.attempt_no > pending_dispatch.attempt_no)
-    if not (same_attempt or later_attempt):
-        raise QualificationError(
-            'Exact async response has a conflicting receipt transition.')
-    if (same_attempt and current.state == 'REJECTED_PRE_DISPATCH' and
-            current.revision != 2):
-        # Revision 1 is reserved for a no-route initial rejection. A bound
-        # DISPATCH/r1 attempt can reject only through its r2 transition.
-        raise QualificationError(
-            'Exact async response has a conflicting receipt transition.')
-    _validate_submission_receipt(current,
-                                 previous_rejection=None,
-                                 accepted_response=accepted)
-    return (_ExactAdmissionRecoveryAction.RETURN
-            if accepted else _ExactAdmissionRecoveryAction.RETRY_SUBMISSION)
-
-
-def _validate_completion_receipt(accepted: ExactAsyncReceipt,
-                                 current: ExactAsyncReceipt) -> None:
-    """Require the exact accepted attempt to advance to terminal success."""
-    if (accepted.state != 'ACCEPTED' or accepted.revision != 2 or
-            current.state != 'SUCCEEDED' or
-            current.attempt_id != accepted.attempt_id or
-            current.attempt_no != accepted.attempt_no or
-            current.revision != accepted.revision + 1):
-        raise QualificationError(
-            'Exact async response has a conflicting receipt transition.')
-
-
-def _canonical_exact_request(request_id: str,
-                             duration_seconds: float) -> tuple[bytes, str]:
-    body = rfc8785.dumps({
-        'action': 'async_predict',
-        'payload': {
-            'duration_seconds': duration_seconds,
-        },
-        'request_id': request_id,
-    })
-    return body, hashlib.sha256(body).hexdigest()
-
-
-def _exact_request_headers(*, token: str, service_hash: str, request_id: str,
-                           stable_job_id: str,
-                           intent_sha256: str) -> dict[str, str]:
-    return {
+    stable_job_id: str,
+    duration_seconds: float,
+    campaign_deadline: AbsoluteDeadline,
+    attempt_timeout_seconds: float,
+) -> None:
+    """Require one ordinary request to return its exact backend-authored ID."""
+    url = endpoint.rstrip('/') + '/v1/models/model:predict'
+    headers = {
         _AUTH_HEADER: f'Bearer {token}',
         _JOB_ID_HEADER: stable_job_id,
         _PRIORITY_HEADER: str(_REQUEST_PRIORITY),
         _ACCELERATORS_HEADER: 'L4',
         'Content-Type': 'application/json',
-        serve_constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: str(
-            serve_constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION),
-        serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: service_hash,
-        serve_constants.LB_ASYNC_INTENT_SHA256_HEADER: intent_sha256,
-        serve_constants.LB_ASYNC_EXECUTION_REQUEST_ID_HEADER: request_id,
-    }
-
-
-def _bounded_retry_delay(retry_after: object, *, attempt: int,
-                         request_id: str) -> float:
-    """Return bounded exponential delay with stable per-request jitter."""
-    try:
-        base = max(0.1, float(retry_after))
-    except (TypeError, ValueError):
-        base = 1.0
-    exponential = base * 2**min(max(attempt, 0), 4)
-    digest = hashlib.sha256(f'{request_id}:{attempt}'.encode()).digest()
-    fraction = int.from_bytes(digest[:8], 'big') / float(2**64 - 1)
-    jittered = exponential * (0.75 + 0.5 * fraction)
-    return min(10.0, max(0.1, jittered))
-
-
-async def _submit_exact_async_request(
-    session: aiohttp.ClientSession,
-    *,
-    endpoint: str,
-    token: str,
-    service_hash: str,
-    request_id: str,
-    stable_job_id: str,
-    duration_seconds: float,
-    deadline: float,
-    attempt_lifecycle: ExactRequestAttemptLifecycle | None = None,
-    campaign_progress: ExactRequestCampaignProgress | None = None,
-) -> _ExactAsyncAdmission | None:
-    """Submit or read-only recover one immutable exact async request."""
-    absolute_deadline = AbsoluteDeadline.at(deadline)
-    if attempt_lifecycle is None:
-        attempt_lifecycle = ExactRequestAttemptLifecycle(request_id=request_id)
-    if attempt_lifecycle.request_id != request_id:
-        raise QualificationError('Exact request lifecycle identity changed.')
-    if attempt_lifecycle.state is ExactRequestAttemptState.UNSEEN:
-        attempt_lifecycle.begin_submission()
-    url = endpoint.rstrip('/') + '/v1/models/model:predict'
-    receipt_url = (endpoint.rstrip('/') +
-                   serve_constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH)
-    body, intent_sha256 = _canonical_exact_request(request_id, duration_seconds)
-    headers = _exact_request_headers(token=token,
-                                     service_hash=service_hash,
-                                     request_id=request_id,
-                                     stable_job_id=stable_job_id,
-                                     intent_sha256=intent_sha256)
-    receipt_headers = {
-        _AUTH_HEADER: f'Bearer {token}',
-        'Content-Type': 'application/json',
-        serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: service_hash,
-    }
-    receipt_payload = {
-        'ledger_protocol_version':
-            serve_constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION,
-        'request_id': request_id,
-        'intent_sha256': intent_sha256,
-    }
-    retry_attempt = 0
-    previous_rejection: ExactAsyncReceipt | None = None
-    pending_dispatch: ExactAsyncReceipt | None = None
-    durable_receipt_observed = False
-    recovering = False
-    while not absolute_deadline.expired():
-        if (attempt_lifecycle.state
-                is ExactRequestAttemptState.DEFINITIVELY_UNADMITTED):
-            if campaign_progress is None:
-                attempt_lifecycle.begin_submission()
-            elif not await (campaign_progress.
-                            authorize_retry_after_definitive_no_admission(
-                                attempt_lifecycle)):
-                return None
-        retry_after = '0.5'
-        observed_receipt: ExactAsyncReceipt | None = None
-        read_only = recovering
-        # Construct the timeout outside the retryable transport boundary.  An
-        # exhausted phase budget is terminal; treating it as a request timeout
-        # would spin forever if expiry occurs between the loop guard and POST.
-        request_timeout = absolute_deadline.http_timeout()
-        try:
-            if read_only:
-                request = session.post(receipt_url,
-                                       headers=receipt_headers,
-                                       json=receipt_payload,
-                                       timeout=request_timeout)
-            else:
-                request = session.post(url,
-                                       headers=headers,
-                                       data=body,
-                                       timeout=request_timeout)
-            async with request as response:
-                if read_only:
-                    if response.status == 404:
-                        _validate_exact_response_fence(
-                            response, service_hash=service_hash)
-                        if durable_receipt_observed:
-                            raise QualificationError(
-                                f'{request_id} lost a previously durable exact '
-                                'admission receipt.')
-                        attempt_lifecycle.mark_definitively_unadmitted()
-                        recovering = False
-                    elif response.status == 200:
-                        observed_receipt = _receipt_from_headers(
-                            response, service_hash=service_hash)
-                        durable_receipt_observed = True
-                        retry_after = response.headers.get('Retry-After', '0.5')
-                    elif response.status not in _RETRYABLE_STATUSES:
-                        raise QualificationError(
-                            f'{request_id} receipt lookup returned '
-                            f'HTTP {response.status}.')
-                    else:
-                        retry_after = response.headers.get('Retry-After', '0.5')
-                elif response.status == 202:
-                    receipt = _receipt_from_headers(response,
-                                                    service_hash=service_hash)
-                    durable_receipt_observed = True
-                    _validate_submission_receipt(
-                        receipt,
-                        previous_rejection=previous_rejection,
-                        accepted_response=True)
-                    attempt_lifecycle.mark_admitted(receipt)
-                    deferred_protocol_error = None
-                    try:
-                        response_body = await response.read()
-                        result = json.loads(response_body)
-                    except (UnicodeDecodeError, ValueError):
-                        deferred_protocol_error = QualificationError(
-                            f'{request_id} returned invalid JSON.')
-                    else:
-                        if result != {
-                                'request_id': request_id,
-                                'status': 'accepted',
-                        }:
-                            deferred_protocol_error = QualificationError(
-                                f'{request_id} returned an invalid acceptance.')
-                    return _ExactAsyncAdmission(
-                        receipt=receipt,
-                        intent_sha256=intent_sha256,
-                        deferred_protocol_error=deferred_protocol_error)
-                elif (response.status == 409 or
-                      response.status in _RETRYABLE_STATUSES):
-                    try:
-                        observed_receipt = _receipt_from_headers(
-                            response, service_hash=service_hash)
-                        durable_receipt_observed = True
-                    except QualificationError:
-                        if response.status == 409:
-                            raise
-                        recovering = True
-                    retry_after = response.headers.get('Retry-After', '1')
-                else:
-                    raise QualificationError(
-                        f'{request_id} returned HTTP {response.status}.')
-        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError,
-                asyncio.TimeoutError):
-            # Once a submission response is lost, only the read-only durable
-            # receipt endpoint can authorize an identical replay. A lookup
-            # transport error remains read-only and is retried to the same
-            # shared deadline.
-            attempt_lifecycle.mark_ambiguous()
-            recovering = True
-        if observed_receipt is not None:
-            action = _validate_recovered_submission_receipt(
-                observed_receipt,
-                request_id=request_id,
-                previous_rejection=previous_rejection,
-                pending_dispatch=pending_dispatch if read_only else None)
-            if action is _ExactAdmissionRecoveryAction.RETURN:
-                attempt_lifecycle.mark_admitted(observed_receipt)
-                return _ExactAsyncAdmission(receipt=observed_receipt,
-                                            intent_sha256=intent_sha256)
-            if action is _ExactAdmissionRecoveryAction.RETRY_SUBMISSION:
-                previous_rejection = observed_receipt
-                pending_dispatch = None
-                attempt_lifecycle.mark_definitively_unadmitted()
-                recovering = False
-            else:
-                pending_dispatch = observed_receipt
-                attempt_lifecycle.mark_ambiguous()
-                recovering = True
-        delay = _bounded_retry_delay(retry_after,
-                                     attempt=retry_attempt,
-                                     request_id=request_id)
-        retry_attempt += 1
-        await absolute_deadline.sleep(delay)
-    raise QualificationError(
-        f'{request_id} exhausted its exact admission deadline.')
-
-
-async def _complete_exact_async_request(
-    session: aiohttp.ClientSession,
-    *,
-    endpoint: str,
-    token: str,
-    service_hash: str,
-    request_id: str,
-    intent_sha256: str,
-    accepted: ExactAsyncReceipt,
-    processing_time_us: int,
-    deadline: float,
-) -> None:
-    """Retry only the idempotent terminal callback for an accepted attempt."""
-    absolute_deadline = AbsoluteDeadline.at(deadline)
-    url = (endpoint.rstrip('/') +
-           serve_constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH)
-    headers = {
-        _AUTH_HEADER: f'Bearer {token}',
-        serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: service_hash,
     }
     payload = {
-        'ledger_protocol_version':
-            serve_constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION,
+        'duration_seconds': duration_seconds,
         'request_id': request_id,
-        'intent_sha256': intent_sha256,
-        'attempt_id': accepted.attempt_id,
-        'attempt_no': accepted.attempt_no,
-        'expected_revision': accepted.revision,
-        'status': 'SUCCEEDED',
-        'processing_time_us': processing_time_us,
     }
-    retry_attempt = 0
-    while not absolute_deadline.expired():
-        retry_after = '0.5'
-        request_timeout = absolute_deadline.http_timeout()
-        try:
-            async with session.post(url,
-                                    headers=headers,
-                                    json=payload,
-                                    timeout=request_timeout) as response:
-                await response.read()
-                if response.status == 204:
-                    completion = _receipt_from_headers(
-                        response, service_hash=service_hash)
-                    _validate_completion_receipt(accepted, completion)
-                    return
-                if (response.status not in _RETRYABLE_STATUSES and
-                        response.status != 409):
-                    raise QualificationError(
-                        f'{request_id} completion returned '
-                        f'HTTP {response.status}.')
-                retry_after = response.headers.get('Retry-After', '0.5')
-        except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
-            pass
-        delay = _bounded_retry_delay(retry_after,
-                                     attempt=retry_attempt,
-                                     request_id=request_id)
-        retry_attempt += 1
-        await absolute_deadline.sleep(delay)
-    raise QualificationError(f'{request_id} exhausted its completion deadline.')
+    attempt_deadline = campaign_deadline.capped_after(attempt_timeout_seconds)
+    try:
+        async with session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=attempt_deadline.http_timeout()) as response:
+            body = await _bounded_response_body(response)
+            if response.status != 200:
+                raise QualificationError(
+                    f'{request_id} returned HTTP {response.status}.')
+            try:
+                decoded = json.loads(body,
+                                     object_pairs_hook=_unique_json_object,
+                                     parse_constant=_invalid_json_constant)
+            except (UnicodeDecodeError, ValueError, TypeError,
+                    RecursionError) as error:
+                raise QualificationError(
+                    f'{request_id} returned malformed backend JSON.') from error
+            if decoded != {
+                    'request_id': request_id,
+                    'status': 'ok',
+            }:
+                raise QualificationError(
+                    f'{request_id} returned a conflicting backend ID.')
+    except QualificationError:
+        raise
+    except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError,
+            asyncio.TimeoutError) as error:
+        # Once a POST has begun, any transport failure has an ambiguous worker
+        # outcome. Fail the run instead of replaying synthetic work.
+        raise QualificationError(
+            f'{request_id} has an ambiguous synchronous outcome.') from error
 
 
-async def _one_exact_async_request(
-    session: aiohttp.ClientSession,
+async def send_synchronous_requests(
     *,
     endpoint: str,
     token: str,
-    service_hash: str,
-    request_id: str,
-    stable_job_id: str,
-    duration_seconds: float,
-    admission_deadline: float,
-    terminal_timeout_seconds: float,
-    attempt_lifecycle: ExactRequestAttemptLifecycle | None = None,
-    campaign_progress: ExactRequestCampaignProgress | None = None,
-) -> _ExactRequestCompletion:
-    if attempt_lifecycle is None:
-        attempt_lifecycle = ExactRequestAttemptLifecycle(request_id=request_id)
-    admission = await _submit_exact_async_request(
-        session,
-        endpoint=endpoint,
-        token=token,
-        service_hash=service_hash,
-        request_id=request_id,
-        stable_job_id=stable_job_id,
-        duration_seconds=duration_seconds,
-        deadline=admission_deadline,
-        attempt_lifecycle=attempt_lifecycle,
-        campaign_progress=campaign_progress)
-    if admission is None:
-        return _ExactRequestCompletion(terminalized=False)
-    if admission.receipt.state == 'SUCCEEDED':
-        return _ExactRequestCompletion(
-            terminalized=True,
-            deferred_protocol_error=admission.deferred_protocol_error)
-    await asyncio.sleep(duration_seconds)
-    await _complete_exact_async_request(
-        session,
-        endpoint=endpoint,
-        token=token,
-        service_hash=service_hash,
-        request_id=request_id,
-        intent_sha256=(admission.intent_sha256),
-        accepted=admission.receipt,
-        processing_time_us=int(duration_seconds * 1_000_000),
-        deadline=(time.monotonic() + terminal_timeout_seconds))
-    attempt_lifecycle.mark_terminal()
-    return _ExactRequestCompletion(
-        terminalized=True,
-        deferred_protocol_error=admission.deferred_protocol_error)
-
-
-async def send_exact_async_requests(
-    *,
-    endpoint: str,
-    token: str,
-    service_hash: str,
     prefix: str,
     count: int,
-    concurrency: int,
-    hold_requests: int,
+    resident_window: int,
+    request_concurrency: int,
     hold_seconds: float,
     timeout_seconds: float,
     request_queue_timeout_seconds: float,
-    terminal_timeout_seconds: float,
     campaign_progress: ExactRequestCampaignProgress | None = None,
 ) -> int:
-    """Submit and durably complete exact synthetic async requests."""
-    if (not math.isfinite(timeout_seconds) or timeout_seconds <= 0 or
-            not math.isfinite(request_queue_timeout_seconds) or
-            request_queue_timeout_seconds <= 0 or
-            not math.isfinite(terminal_timeout_seconds) or
-            terminal_timeout_seconds <= 0):
-        raise ValueError('Exact request campaign deadlines are invalid.')
-    worker_count = min(count, concurrency)
+    """Run one bounded window through the ordinary production HTTP path."""
+    numeric_deadlines = (hold_seconds, timeout_seconds,
+                         request_queue_timeout_seconds)
+    if any(not math.isfinite(value) or value <= 0
+           for value in numeric_deadlines):
+        raise ValueError('Synchronous request campaign deadlines are invalid.')
+    if (type(count) is not int or count <= 0 or
+            type(resident_window) is not int or resident_window <= 0 or
+            resident_window > count or type(request_concurrency) is not int or
+            request_concurrency < resident_window):
+        raise ValueError('Synchronous request campaign cardinality is invalid.')
+    worker_count = resident_window
     if campaign_progress is None:
         campaign_progress = ExactRequestCampaignProgress(
             total_count=count, window_size=worker_count)
     elif (campaign_progress.total_count != count or
           campaign_progress.window_size != worker_count):
-        raise ValueError('Exact request campaign progress does not match.')
+        raise ValueError(
+            'Synchronous request campaign progress does not match.')
     queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
     for index in range(count):
         queue.put_nowait((index, _campaign_request_id(prefix, index)))
-    admission_deadline = time.monotonic() + timeout_seconds
+    campaign_deadline = AbsoluteDeadline.after(timeout_seconds)
+    # A request may legitimately spend its full queue budget before a backend
+    # holds the synchronous stream. Keep those two bounded phases distinct.
+    attempt_timeout_seconds = (request_queue_timeout_seconds + hold_seconds +
+                               max(5.0, 2 * PROFILES['scale'].poll_seconds))
 
     async def worker(session: aiohttp.ClientSession) -> None:
         while True:
@@ -6491,31 +6278,19 @@ async def send_exact_async_requests(
             except asyncio.QueueEmpty:
                 return
             try:
-                attempt_lifecycle = ExactRequestAttemptLifecycle(
-                    request_id=request_id)
                 if not await campaign_progress.mark_offered(
-                        admission_deadline=admission_deadline):
+                        admission_deadline=campaign_deadline.monotonic):
                     return
-                attempt_lifecycle.begin_submission()
-                completion = await _one_exact_async_request(
+                await _one_synchronous_request(
                     session,
                     endpoint=endpoint,
                     token=token,
-                    service_hash=service_hash,
                     request_id=request_id,
                     stable_job_id=f'{prefix}-job-{index:05d}',
-                    duration_seconds=(hold_seconds
-                                      if index < hold_requests else 0),
-                    admission_deadline=admission_deadline,
-                    terminal_timeout_seconds=terminal_timeout_seconds,
-                    attempt_lifecycle=attempt_lifecycle,
-                    campaign_progress=campaign_progress)
-                if not completion.terminalized:
-                    return
-                await campaign_progress.mark_succeeded(
-                    deferred_error=completion.deferred_protocol_error)
-                if completion.deferred_protocol_error is not None:
-                    raise completion.deferred_protocol_error
+                    duration_seconds=hold_seconds,
+                    campaign_deadline=campaign_deadline,
+                    attempt_timeout_seconds=attempt_timeout_seconds)
+                await campaign_progress.mark_succeeded()
             except BaseException as error:
                 await campaign_progress.record_error(error)
                 raise
@@ -6523,10 +6298,10 @@ async def send_exact_async_requests(
                 queue.task_done()
 
     async def run_worker_cohort() -> list[object]:
-        timeout = aiohttp.ClientTimeout(total=None)
-        connector = aiohttp.TCPConnector(limit=concurrency)
-        async with aiohttp.ClientSession(timeout=timeout,
-                                         connector=connector) as session:
+        connector = aiohttp.TCPConnector(limit=request_concurrency)
+        async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None),
+                connector=connector) as session:
             return await asyncio.gather(
                 *(worker(session) for _ in range(worker_count)),
                 return_exceptions=True)
@@ -6547,11 +6322,11 @@ async def send_exact_async_requests(
     if unexpected_error is not None:
         raise unexpected_error
     final = await campaign_progress.snapshot()
-    complete = (final.offered == count and final.succeeded == count)
+    complete = final.offered == count and final.succeeded == count
     drained_after_stop = (not final.accepting_offers and
                           final.offered == final.succeeded)
     if not (complete or drained_after_stop):
-        raise QualificationError('Exact request campaign is incomplete.')
+        raise QualificationError('Synchronous request campaign is incomplete.')
     return final.succeeded
 
 
@@ -6624,27 +6399,22 @@ async def _wait_for_joined_baseline(
 
 def _has_exact_campaign_demand(telemetry: RequestTelemetry,
                                baseline: RequestTelemetry) -> bool:
-    """Return whether dispatched work is exactly ledger-attributed."""
+    """Return whether ordinary HTTP work has one coherent exact projection."""
     if (not baseline.is_exact_zero() or not telemetry.is_fresh_complete() or
             telemetry.queue_depth is None or
             telemetry.in_flight_requests is None or
+            telemetry.http_in_flight_requests is None or
             telemetry.processing_requests is None or
             telemetry.confirmed_in_flight_requests is None or
             telemetry.confirmed_processing_requests is None):
         return False
     if (telemetry.confirmed_in_flight_requests != telemetry.in_flight_requests
-            or telemetry.confirmed_processing_requests
-            != telemetry.processing_requests or
-            telemetry.processing_requests > telemetry.in_flight_requests):
+            or
+            telemetry.http_in_flight_requests != telemetry.in_flight_requests or
+            telemetry.processing_requests != 0 or
+            telemetry.confirmed_processing_requests != 0):
         return False
-    active_delta = telemetry.ledger_active - baseline.ledger_active
-    # A queued request has not selected a READY replica and therefore has no
-    # ledger row yet.  Exact async rows bind at dispatch, so ledger-active must
-    # equal in-flight—not queued + in-flight—while the immutable terminal
-    # ledger delta later proves that every queued identity was processed.
-    return (active_delta >= 0 and
-            active_delta == telemetry.in_flight_requests and
-            telemetry.queue_depth + telemetry.in_flight_requests > 0)
+    return telemetry.queue_depth + telemetry.http_in_flight_requests > 0
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -6652,65 +6422,30 @@ class CampaignDemandEvidence:
     """Capabilities exposed by one validated request observation."""
 
     queue_depth: int
-    active_ledger_delta: int
+    http_in_flight_requests: int
     confirmed_in_flight_requests: int
-    confirmed_processing_requests: int
-    exact_resident: int | None
+    exact_resident: int
 
     @property
     def has_resident_demand(self) -> bool:
-        return self.queue_depth > 0 or self.active_ledger_delta > 0
+        return self.exact_resident > 0
 
 
 def _campaign_demand_evidence(
         telemetry: RequestTelemetry,
         baseline: RequestTelemetry) -> CampaignDemandEvidence | None:
-    """Classify presence versus exact-total capabilities.
-
-    Queue reports and async-ledger counts do not share a publication cut.  A
-    partial occupancy sample may therefore prove only that demand exists; it
-    must never derive a total by adding those independently timed projections.
-    A complete occupancy report whose in-flight total equals the active-ledger
-    delta may additionally prove an exact resident count.
-    """
-    if (not baseline.is_exact_zero() or
-            not math.isfinite(telemetry.observed_at) or
-            telemetry.observed_at <= 0 or telemetry.state != 'fresh' or
-            not telemetry.compatibility_complete or
-            telemetry.queue_depth is None or
-            telemetry.confirmed_in_flight_requests is None or
-            telemetry.confirmed_processing_requests is None):
+    """Return one exact queue + HTTP projection from the same LB reduction."""
+    if not _has_exact_campaign_demand(telemetry, baseline):
         return None
-    active_delta = telemetry.ledger_active - baseline.ledger_active
-    if (active_delta < 0 or telemetry.confirmed_processing_requests
-            > telemetry.confirmed_in_flight_requests or
-            telemetry.confirmed_in_flight_requests > active_delta):
-        return None
-    exact_resident = None
-    if telemetry.reason == 'complete':
-        if (telemetry.in_flight_requests is None or
-                telemetry.processing_requests is None or
-                telemetry.confirmed_in_flight_requests
-                != telemetry.in_flight_requests or
-                telemetry.confirmed_processing_requests
-                != telemetry.processing_requests or
-                telemetry.processing_requests > telemetry.in_flight_requests or
-                active_delta != telemetry.in_flight_requests):
-            return None
-        exact_resident = (telemetry.queue_depth + telemetry.in_flight_requests)
-    elif telemetry.reason == 'in_flight_incomplete':
-        # A partial projection must not masquerade lower bounds as totals.
-        if (telemetry.in_flight_requests is not None or
-                telemetry.processing_requests is not None):
-            return None
-    else:
-        return None
+    assert telemetry.queue_depth is not None
+    assert telemetry.http_in_flight_requests is not None
+    assert telemetry.confirmed_in_flight_requests is not None
     return CampaignDemandEvidence(
         queue_depth=telemetry.queue_depth,
-        active_ledger_delta=active_delta,
+        http_in_flight_requests=telemetry.http_in_flight_requests,
         confirmed_in_flight_requests=telemetry.confirmed_in_flight_requests,
-        confirmed_processing_requests=telemetry.confirmed_processing_requests,
-        exact_resident=exact_resident)
+        exact_resident=(telemetry.queue_depth +
+                        telemetry.http_in_flight_requests))
 
 
 async def _wait_for_scale_stimulus(
@@ -6788,28 +6523,14 @@ async def _wait_for_positive_request_telemetry(
                 profile.poll_seconds)
             continue
         evidence = _campaign_demand_evidence(telemetry, baseline)
-        if (_has_exact_campaign_demand(telemetry, baseline) and
-                evidence is not None and telemetry.queue_depth is not None and
-            (profile.name == 'scale' or telemetry.queue_depth > 0) and
-                telemetry.in_flight_requests is not None and
-                telemetry.in_flight_requests > 0 and
-                telemetry.processing_requests is not None and
-                telemetry.processing_requests > 0 and
-                telemetry.confirmed_in_flight_requests is not None and
-                telemetry.confirmed_in_flight_requests > 0 and
-                telemetry.confirmed_processing_requests is not None and
-                telemetry.confirmed_processing_requests > 0 and
-                telemetry.ledger_total > baseline.ledger_total and
-                telemetry.ledger_count('ACCEPTED') > 0 and
-            (profile.name != 'scale' or
-             evidence.exact_resident == scale_stimulus_count(profile))):
+        if (evidence is not None and evidence.http_in_flight_requests > 0 and
+                evidence.exact_resident == scale_stimulus_count(profile)):
             receipt.request_telemetry('positive', telemetry)
             return telemetry
         await AbsoluteDeadline.at(deadline_monotonic).sleep(profile.poll_seconds
                                                            )
     raise QualificationError(
-        'No fresh positive processing and in-flight sample was observed for '
-        'exact traffic.')
+        'No fresh exact synchronous request sample was observed.')
 
 
 async def _wait_for_final_request_telemetry(
@@ -6818,9 +6539,10 @@ async def _wait_for_final_request_telemetry(
     profile: Profile,
     receipt: Receipt,
     baseline: RequestTelemetry,
-    expected_succeeded_delta: int,
-    campaign_prefix: str,
 ) -> RequestTelemetry:
+    """Require the production request gauges to return to exact zero."""
+    if not baseline.is_exact_zero():
+        raise QualificationError('Final request proof lacks a zero baseline.')
     deadline = time.monotonic() + 5 * 60
     while time.monotonic() < deadline:
         try:
@@ -6831,28 +6553,12 @@ async def _wait_for_final_request_telemetry(
         except Exception:  # pylint: disable=broad-except
             await AbsoluteDeadline.at(deadline).sleep(profile.poll_seconds)
             continue
-        if (telemetry.is_exact_zero() and
-                telemetry.ledger_total - baseline.ledger_total
-                == expected_succeeded_delta and
-                telemetry.ledger_succeeded - baseline.ledger_succeeded
-                == expected_succeeded_delta):
-            try:
-                terminal_membership_sha256 = await (
-                    observer.campaign_terminal_membership(
-                        campaign_prefix,
-                        expected_succeeded_delta,
-                        deadline_monotonic=deadline))
-            except ObservationTimeoutError as error:
-                receipt.miss('final', error)
-                raise
-            receipt.bind_campaign_terminal_membership(
-                terminal_membership_sha256)
+        if telemetry.is_exact_zero():
             receipt.request_telemetry('final', telemetry)
             return telemetry
         await AbsoluteDeadline.at(deadline).sleep(profile.poll_seconds)
     raise QualificationError(
-        'Exact request telemetry did not reach the required SUCCEEDED delta '
-        'and current-work zero.')
+        'Exact request telemetry did not return to current-work zero.')
 
 
 async def _read_validated_observation(
@@ -6863,9 +6569,9 @@ async def _read_validated_observation(
         deadline_monotonic: float,
         expectation: ProviderExpectation | None = None) -> Observation:
     """Read and validate an observation before publishing any proof state."""
-    observation = await observer.snapshot(require_complete_demand_report=phase
-                                          != 'scale',
-                                          deadline_monotonic=deadline_monotonic)
+    observation = await observer.snapshot(
+        require_complete_demand_report=phase != 'scale',
+        deadline_monotonic=deadline_monotonic)
     validate_observation(observation, profile, expectation)
     return observation
 
@@ -6949,22 +6655,15 @@ async def _wait_for_scale(
         except Exception:  # pylint: disable=broad-except
             await AbsoluteDeadline.at(deadline).sleep(profile.poll_seconds)
             continue
-        active_delta = telemetry.ledger_active - baseline.ledger_active
-        if active_delta < 0 or active_delta > expectation.exact_request_count:
-            raise QualificationError(
-                'Scale demand has contradictory exact dispatched identities.')
         evidence = _campaign_demand_evidence(telemetry, baseline)
         if evidence is None or not evidence.has_resident_demand:
-            # The LB demand report and request ledger are independent durable
-            # publications.  A queue-to-dispatch handoff can therefore be
-            # visible in either projection first. Partial evidence proves only
-            # current presence; campaign pressure is independently bracketed
-            # around the provider census below.
+            # The provider census is useful only while the ordinary HTTP
+            # cohort remains visible in the production request reduction.
             await AbsoluteDeadline.at(deadline).sleep(profile.poll_seconds)
             continue
         stimulus = (scale_stimulus_count(profile)
                     if profile.name == 'scale' else 1)
-        if profile.name == 'scale' and evidence.exact_resident is not None:
+        if profile.name == 'scale':
             if evidence.exact_resident > stimulus:
                 raise QualificationError(
                     'Scale demand exceeds the bounded sliding window.')
@@ -6988,7 +6687,7 @@ async def _wait_for_scale(
                 continue
         else:
             resident = evidence.exact_resident
-            if resident is None or resident < stimulus:
+            if resident < stimulus:
                 await AbsoluteDeadline.at(deadline).sleep(profile.poll_seconds)
                 continue
             if resident > stimulus:
@@ -7061,7 +6760,7 @@ async def _wait_for_scale(
             if next_arrival_attribution is None:
                 raise QualificationError(
                     'Scale stimulus contains unattributed offered arrivals.')
-            # Rolling counters may rise with terminal-gated replacements or
+            # Rolling counters may rise with success-gated replacements or
             # fall as prior arrivals age out; the atomic driver frontier binds
             # either projection to this immutable campaign.
             arrival_attribution = next_arrival_attribution
@@ -7207,6 +6906,9 @@ def _provider_observers(
     profile: Profile,
     retained_volume_ids_by_region: collections.abc.Mapping[str, list[str]] |
     None = None,
+    retained_security_group_identities: collections.abc.Sequence[
+        provision_common.AWSServerOwnedSecurityGroupIdentity] = (),
+    discover_server_owned_security_groups: bool = False,
 ) -> tuple[GcpObserver | None, AwsObserver | None]:
     """Construct only the provider clients frozen into this service version."""
     gcp = (GcpObserver(service_name=service_name, scope=scope, profile=profile)
@@ -7216,6 +6918,9 @@ def _provider_observers(
         service_name=service_name,
         scope=scope,
         retained_volume_ids_by_region=retained_volume_ids_by_region,
+        retained_security_group_identities=(retained_security_group_identities),
+        discover_server_owned_security_groups=(
+            discover_server_owned_security_groups),
     ) if 'aws' in scope.providers else None)
     return gcp, aws
 
@@ -7265,8 +6970,95 @@ async def freeze_provider_scope(args: argparse.Namespace) -> None:
             sort_keys=True))
 
 
+async def freeze_cleanup_scope(args: argparse.Namespace) -> None:
+    """Persist monotonic provider/DB identities immediately before down."""
+    database_url = os.environ.get(args.postgres_url_env)
+    if not database_url:
+        raise QualificationError(
+            f'{args.postgres_url_env} must contain the PostgreSQL URL.')
+    scope = read_provider_scope(pathlib.Path(args.scope), args.service_name)
+    cleanup_scope = read_optional_cleanup_scope_receipt(
+        pathlib.Path(args.receipt), args.service_name)
+    retained_volume_ids = read_optional_aws_volume_ids_receipt(
+        pathlib.Path(args.receipt), args.service_name)
+    retained_by_region = {
+        region.region: sorted(retained_volume_ids.get(region.region, ()))
+        for region in scope.aws_regions
+    }
+    cleanup_profile = dataclasses.replace(
+        PROFILES['scale'], max_units=scope.max_live_paid_gpu_units)
+    deadline = time.monotonic() + args.timeout_seconds
+    postgres_session = IsolatedObserverSession(
+        IsolatedObservationDomain.POSTGRES)
+    provider_session = IsolatedObserverSession(
+        IsolatedObservationDomain.PROVIDER)
+    try:
+        await asyncio.gather(postgres_session.start(deadline),
+                             provider_session.start(deadline))
+        while time.monotonic() < deadline:
+            started = time.monotonic()
+            try:
+                provider_result = await provider_session.request(
+                    IsolatedObservationKind.PROVIDER_CENSUS, {
+                        'service_name': args.service_name,
+                        'scope': _scope_process_payload(scope),
+                        'profile': dataclasses.asdict(cleanup_profile),
+                        'retained': retained_by_region,
+                        'cleanup_scope':
+                            _cleanup_scope_process_payload(cleanup_scope),
+                    }, deadline)
+                if 'aws' in scope.providers:
+                    retained_by_region = _accepted_retained_volume_ids(
+                        retained_by_region,
+                        provider_result.get('retained_volume_ids_by_region'))
+                    cleanup_scope = (
+                        _retain_discovered_aws_security_group_identities(
+                            cleanup_scope,
+                            provider_result.get(
+                                'retained_aws_security_group_identities'),
+                            service_name=args.service_name,
+                            scope=scope))
+                    _persist_cleanup_scope_receipt(pathlib.Path(args.receipt),
+                                                   args.service_name,
+                                                   cleanup_scope)
+                result = await postgres_session.request(
+                    IsolatedObservationKind.POSTGRES, {
+                        'service_name': args.service_name,
+                        'database_url': database_url,
+                        'scope': _scope_process_payload(scope),
+                        'projection': 'cleanup',
+                        'cleanup_scope':
+                            _cleanup_scope_process_payload(cleanup_scope),
+                    }, deadline)
+                cleanup_scope = _accepted_cleanup_scope(
+                    cleanup_scope, result.get('cleanup_scope'))
+                _persist_cleanup_scope_receipt(pathlib.Path(args.receipt),
+                                               args.service_name, cleanup_scope)
+                return
+            except GuardViolation:
+                raise
+            except Exception as error:  # pylint: disable=broad-except
+                if time.monotonic() >= deadline:
+                    raise QualificationError(
+                        'Pre-down cleanup identity scope was not frozen.') \
+                        from error
+                await AbsoluteDeadline.at(deadline).sleep(
+                    max(0, started + args.poll_seconds - time.monotonic()))
+        raise QualificationError(
+            'Pre-down cleanup identity scope was not frozen.')
+    finally:
+        await asyncio.gather(postgres_session.aclose(),
+                             provider_session.aclose())
+
+
 async def wait_for_cleanup(args: argparse.Namespace) -> None:
     """Wait until teardown has no scoped provider effect or paid DB debit."""
+    if (not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0 or
+            not math.isfinite(args.zero_hold_seconds) or
+            args.zero_hold_seconds <= 0 or
+            args.zero_hold_seconds >= args.timeout_seconds or
+            not math.isfinite(args.poll_seconds) or args.poll_seconds <= 0):
+        raise QualificationError('Cleanup deadlines are invalid.')
     database_url = os.environ.get(args.postgres_url_env)
     if not database_url:
         raise QualificationError(
@@ -7278,11 +7070,14 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
         region.region: sorted(retained_volume_ids.get(region.region, ()))
         for region in scope.aws_regions
     }
-    cleanup_scope = CleanupScope()
+    cleanup_scope = read_optional_cleanup_scope_receipt(
+        pathlib.Path(args.receipt), args.service_name)
     cleanup_profile = dataclasses.replace(
         PROFILES['scale'], max_units=scope.max_live_paid_gpu_units)
     deadline = time.monotonic() + args.timeout_seconds
     consecutive_zero = 0
+    zero_since_monotonic: float | None = None
+    zero_hold_elapsed_seconds = 0.0
     started_at = time.time()
     samples: list[dict[str, Any]] = []
     failure: BaseException | None = None
@@ -7302,7 +7097,19 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
                 'scope': _scope_process_payload(scope),
                 'profile': dataclasses.asdict(cleanup_profile),
                 'retained': retained_by_region,
+                'cleanup_scope': _cleanup_scope_process_payload(cleanup_scope),
             }, deadline)
+        if 'aws' in scope.providers:
+            cleanup_scope = (_retain_discovered_aws_security_group_identities(
+                cleanup_scope,
+                provider_result.get('retained_aws_security_group_identities'),
+                service_name=args.service_name,
+                scope=scope))
+            # The exact IDs become the durable parent-owned absence scope
+            # before any later observer can fail or association history can
+            # disappear.
+            _persist_cleanup_scope_receipt(pathlib.Path(args.receipt),
+                                           args.service_name, cleanup_scope)
         if 'gcp' not in scope.providers:
             gcp_state = empty_provider_state('gcp')
         else:
@@ -7330,7 +7137,11 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
                 retained_by_region, retained)
             aws_state = parse_aws_cleanup_state(
                 service_instances=aws_census.service_instances,
-                service_volumes=aws_census.service_volumes)
+                service_volumes=aws_census.service_volumes,
+                security_group_identities=(
+                    cleanup_scope.aws_security_group_identities),
+                server_owned_security_groups=(
+                    aws_census.server_owned_security_groups))
         provider = combine_provider_states(gcp_state, aws_state)
         # Persist newly discovered detached-volume identities in the owning
         # loop before a separate PostgreSQL observation can fail. The next
@@ -7373,6 +7184,8 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
                 # until the original cleanup deadline. Persistent loss still
                 # reaches the fail-closed timeout below.
                 consecutive_zero = 0
+                zero_since_monotonic = None
+                zero_hold_elapsed_seconds = 0.0
                 observation_finished_at = time.time()
                 observation_finished_monotonic = time.monotonic()
                 sample = {
@@ -7385,6 +7198,7 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
                     'observation_error_type': type(error).__name__,
                     'exact_zero': False,
                     'zero_samples': consecutive_zero,
+                    'zero_hold_elapsed_seconds': zero_hold_elapsed_seconds,
                 }
                 samples.append(sample)
                 print(json.dumps(sample, sort_keys=True), flush=True)
@@ -7397,11 +7211,21 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
                 continue
             exact_zero = (provider.instance_count == 0 and
                           provider.disk_count == 0 and
+                          provider.security_group_count == 0 and
                           provider.inflight_operation_count == 0 and
                           database.is_exact_zero())
-            consecutive_zero = consecutive_zero + 1 if exact_zero else 0
             observation_finished_at = time.time()
             observation_finished_monotonic = time.monotonic()
+            if exact_zero:
+                consecutive_zero += 1
+                if zero_since_monotonic is None:
+                    zero_since_monotonic = observation_finished_monotonic
+                zero_hold_elapsed_seconds = max(
+                    0.0, observation_finished_monotonic - zero_since_monotonic)
+            else:
+                consecutive_zero = 0
+                zero_since_monotonic = None
+                zero_hold_elapsed_seconds = 0.0
             sample = {
                 'observation_started_at': observation_started_at,
                 'observation_finished_at': observation_finished_at,
@@ -7419,6 +7243,8 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
                 'cleanup_retention_pins': database.retention_pin_count,
                 'cleanup_provider_disks': provider.disk_count,
                 'cleanup_provider_instances': provider.instance_count,
+                'cleanup_provider_security_groups':
+                    provider.security_group_count,
                 'cleanup_provider_operations':
                     provider.inflight_operation_count,
                 'cleanup_provider_by_cloud': {
@@ -7430,10 +7256,12 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
                 'cleanup_waiters': database.waiter_count,
                 'exact_zero': exact_zero,
                 'zero_samples': consecutive_zero,
+                'zero_hold_elapsed_seconds': zero_hold_elapsed_seconds,
             }
             samples.append(sample)
             print(json.dumps(sample, sort_keys=True), flush=True)
-            if consecutive_zero >= 3:
+            if (consecutive_zero >= 3 and
+                    zero_hold_elapsed_seconds >= args.zero_hold_seconds):
                 return
             await AbsoluteDeadline.at(deadline).sleep(
                 max(
@@ -7486,6 +7314,8 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
             'finished_at': time.time(),
             'outcome': _receipt_outcome(failure),
             'zero_samples': consecutive_zero,
+            'zero_hold_required_seconds': args.zero_hold_seconds,
+            'zero_hold_elapsed_seconds': zero_hold_elapsed_seconds,
             'samples': samples,
         }
         if failure is not None:
@@ -7548,6 +7378,7 @@ _ZERO_OBSERVATION_FIELDS = (
     'provider_gpu_units',
     'provider_running_gpu_units',
     'provider_disks',
+    'provider_security_groups',
     'provider_inflight_operations',
     'lb_demand_units',
     'lb_ready_replicas',
@@ -7562,6 +7393,7 @@ _ZERO_PROVIDER_CLOUD_FIELDS = (
     'gpu_units',
     'running_gpu_units',
     'disks',
+    'security_groups',
     'inflight_operations',
 )
 _PROVIDER_CLOUD_FIELDS = frozenset((*_ZERO_PROVIDER_CLOUD_FIELDS, 'shapes'))
@@ -7628,33 +7460,16 @@ def _validate_natural_drain_samples(samples: object,
     return timestamps[0], timestamps[-1]
 
 
-def _ledger_counts(sample: collections.abc.Mapping[str, Any]) -> dict[str, int]:
-    raw = sample.get('ledger_state_counts')
-    expected_states = [
-        state.value for state in async_request_ledger.AsyncRequestState
-    ]
-    if not isinstance(raw, list) or len(raw) != len(expected_states):
-        raise QualificationError('Request telemetry evidence is malformed.')
-    counts: dict[str, int] = {}
-    for expected_state, item in zip(expected_states, raw):
-        if (not isinstance(item, list) or len(item) != 2 or
-                item[0] != expected_state or type(item[1]) is not int or
-                item[1] < 0):
-            raise QualificationError('Request telemetry evidence is malformed.')
-        counts[item[0]] = item[1]
-    return counts
-
-
 def _request_telemetry_from_evidence(
         sample: collections.abc.Mapping[str, Any]) -> RequestTelemetry | None:
     """Parse a receipt sample into the same type consumed by live proof."""
-    counts = _ledger_counts(sample)
     observed_at = sample.get('observed_at')
     telemetry_state = sample.get('state')
     reason = sample.get('reason')
     compatibility_complete = sample.get('compatibility_complete')
-    fields = ('queue_depth', 'in_flight_requests', 'processing_requests',
-              'confirmed_in_flight_requests', 'confirmed_processing_requests')
+    fields = ('queue_depth', 'in_flight_requests', 'http_in_flight_requests',
+              'processing_requests', 'confirmed_in_flight_requests',
+              'confirmed_processing_requests')
     values = {field: sample.get(field) for field in fields}
     if (not isinstance(observed_at, (int, float)) or
             isinstance(observed_at, bool) or not math.isfinite(observed_at) or
@@ -7671,31 +7486,24 @@ def _request_telemetry_from_evidence(
         compatibility_complete=compatibility_complete,
         queue_depth=values['queue_depth'],
         in_flight_requests=values['in_flight_requests'],
+        http_in_flight_requests=values['http_in_flight_requests'],
         processing_requests=values['processing_requests'],
         confirmed_in_flight_requests=values['confirmed_in_flight_requests'],
         confirmed_processing_requests=values['confirmed_processing_requests'],
-        ledger_state_counts=tuple(
-            (ledger_state.value, counts[ledger_state.value])
-            for ledger_state in async_request_ledger.AsyncRequestState))
-    if (sample.get('ledger_active') != telemetry.ledger_active or
-            sample.get('ledger_total') != telemetry.ledger_total or
-            sample.get('ledger_succeeded') != telemetry.ledger_succeeded):
-        return None
+    )
     return telemetry
 
 
-def _telemetry_is_exactly_attributed(sample: collections.abc.Mapping[str, Any],
-                                     baseline_active: int) -> bool:
+def _telemetry_is_coherent_synchronous(
+        sample: collections.abc.Mapping[str, Any]) -> bool:
+    """Return whether all request gauges describe ordinary HTTP work."""
     telemetry = _request_telemetry_from_evidence(sample)
     if telemetry is None or not telemetry.is_fresh_complete():
         return False
-    return (telemetry.confirmed_in_flight_requests
-            == telemetry.in_flight_requests and
-            telemetry.confirmed_processing_requests
-            == telemetry.processing_requests and
-            telemetry.processing_requests <= telemetry.in_flight_requests and
-            telemetry.ledger_active - baseline_active
-            == telemetry.in_flight_requests)
+    return (telemetry.confirmed_in_flight_requests ==
+            telemetry.in_flight_requests == telemetry.http_in_flight_requests
+            and telemetry.processing_requests == 0 and
+            telemetry.confirmed_processing_requests == 0)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -7770,11 +7578,10 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
         pair_id = sample.get('baseline_iteration_id')
         pair_at = _strict_timestamp(
             {'observed_at': sample.get('baseline_pair_observed_at')})
-        if (pair_id != expected_id or
-                not _telemetry_is_exactly_attributed(sample, 0) or
-                sample.get('queue_depth') != 0 or
-                sample.get('in_flight_requests') != 0 or
-                sample.get('processing_requests') != 0):
+        baseline_telemetry = _request_telemetry_from_evidence(sample)
+        if (pair_id != expected_id or baseline_telemetry is None or
+                not _telemetry_is_coherent_synchronous(sample) or
+                not baseline_telemetry.is_exact_zero()):
             raise QualificationError(
                 'Qualification receipt has a nonzero or unpaired request '
                 'baseline.')
@@ -7785,9 +7592,6 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
             'Qualification receipt has replayed request baseline evidence.')
     baseline = baselines[-1]
     final = finals[0]
-    baseline_counts = _ledger_counts(baseline)
-    baseline_active = sum(
-        baseline_counts.get(state, 0) for state in _ASYNC_ACTIVE_STATES)
     baseline_telemetry = _request_telemetry_from_evidence(baseline)
     if baseline_telemetry is None:
         raise QualificationError(
@@ -7807,8 +7611,8 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
         stimulus_evidence = (None if stimulus_telemetry is None
                              else _campaign_demand_evidence(
                                  stimulus_telemetry, baseline_telemetry))
-        if (stimulus_evidence is None or stimulus_evidence.exact_resident
-                != scale_stimulus_count(profile)):
+        if (stimulus_evidence is None or stimulus_evidence.exact_resident !=
+                scale_stimulus_count(profile)):
             raise QualificationError(
                 'Qualification receipt has an incomplete scale stimulus.')
         scale_stimulus_observed_at = _strict_timestamp(stimulus)
@@ -7839,7 +7643,6 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
             raise QualificationError(
                 'Qualification receipt contains unattributed scale demand.')
         if (profile.name == 'scale' and
-                scale_evidence.exact_resident is not None and
                 scale_evidence.exact_resident != scale_stimulus_count(profile)):
             raise QualificationError(
                 'Qualification receipt contains unattributed scale demand.')
@@ -7863,12 +7666,15 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
             sample for sample in typed_samples
             if sample.get('phase') == 'positive'
         ]
-        if (len(positive) != 1 or not _telemetry_is_exactly_attributed(
-                positive[0], baseline_active) or
-                positive[0]['in_flight_requests'] <= 0 or
-                positive[0]['processing_requests'] <= 0 or
-                positive[0]['queue_depth'] + positive[0]['in_flight_requests']
-                != scale_stimulus_count(profile)):
+        positive_telemetry = (None if len(positive) != 1 else
+                              _request_telemetry_from_evidence(positive[0]))
+        positive_evidence = (None if positive_telemetry is None
+                             else _campaign_demand_evidence(
+                                 positive_telemetry, baseline_telemetry))
+        if (positive_evidence is None or
+                positive_evidence.http_in_flight_requests <= 0 or
+                positive_evidence.exact_resident !=
+                scale_stimulus_count(profile)):
             raise QualificationError(
                 'Qualification receipt lacks exact positive request telemetry.')
         positive_observed_at = _strict_timestamp(positive[0])
@@ -7876,18 +7682,12 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
         raise QualificationError(
             'Provider canary contains economic request telemetry.')
 
-    final_counts = _ledger_counts(final)
-    final_active = sum(
-        final_counts.get(state, 0) for state in _ASYNC_ACTIVE_STATES)
-    if (not _telemetry_is_exactly_attributed(final, baseline_active) or
-            final_active != 0 or final.get('queue_depth') != 0 or
-            final.get('in_flight_requests') != 0 or
-            final.get('processing_requests') != 0 or
-            sum(final_counts.values()) - sum(baseline_counts.values())
-            != exact_count or final_counts.get('SUCCEEDED', 0) -
-            baseline_counts.get('SUCCEEDED', 0) != exact_count):
+    final_telemetry = _request_telemetry_from_evidence(final)
+    if (final_telemetry is None or
+            not _telemetry_is_coherent_synchronous(final) or
+            not final_telemetry.is_exact_zero()):
         raise QualificationError(
-            'Qualification receipt lacks exact terminal ledger evidence.')
+            'Qualification receipt lacks exact final request telemetry.')
     final_observed_at = _strict_timestamp(final)
     if (not scale_timestamps or final_observed_at <= max(scale_timestamps) or
             baseline_pairs[-1][1] >= min(scale_timestamps) or
@@ -8015,6 +7815,7 @@ def _complete_provider_sample(
         'gpu_units': 'provider_gpu_units',
         'running_gpu_units': 'provider_running_gpu_units',
         'disks': 'provider_disks',
+        'security_groups': 'provider_security_groups',
         'inflight_operations': 'provider_inflight_operations',
     }
     totals = {
@@ -8250,8 +8051,8 @@ def _validate_provider_scale_samples(
             range(1,
                   len(request_evidence.scale_iterations) + 1)) or
             tuple(baseline_pairs) != request_evidence.baseline_pairs or
-            payload.get('baseline_qualified_iteration_id')
-            != request_evidence.baseline_pairs[-1][0] or
+            payload.get('baseline_qualified_iteration_id') !=
+            request_evidence.baseline_pairs[-1][0] or
             payload.get('baseline_qualified_observed_at') != final_baseline_at
             or not baseline_is_immediate or first_scale_observed_at is None or
             last_scale_observed_at is None or
@@ -8261,16 +8062,16 @@ def _validate_provider_scale_samples(
             qualified_at is None or
             qualified_at >= request_evidence.final_observed_at or
             bound_qualified_at != qualified_at or
-            payload.get('scale_qualified_iteration_id')
-            != qualified_iteration_id or elapsed is None or
+            payload.get('scale_qualified_iteration_id') !=
+            qualified_iteration_id or elapsed is None or
             not math.isfinite(elapsed) or elapsed < 0 or
-            elapsed > profile.scale_timeout_seconds or
-            scale_slo_met != (elapsed <= profile.scale_slo_seconds) or
+            elapsed > profile.scale_timeout_seconds or scale_slo_met !=
+        (elapsed <= profile.scale_slo_seconds) or
             payload.get('peak_running') != calculated_peak or
             payload.get('peak_running_gpu_units') != calculated_gpu_peak or
             payload.get('peak_running_by_cloud') != calculated_by_cloud or
-            payload.get('peak_running_gpu_units_by_cloud')
-            != calculated_gpu_by_cloud):
+            payload.get('peak_running_gpu_units_by_cloud') !=
+            calculated_gpu_by_cloud):
         raise QualificationError(
             'Qualification receipt lacks provider scale evidence.')
     if profile.name == 'scale':
@@ -8340,17 +8141,17 @@ def _read_qualification_evidence(
             type(payload.get('peak_running')) is not int or
             payload['peak_running'] < 1 or type(exact_count) is not int or
             exact_count < 1 or exact_successes != exact_count or
-            type(payload.get('terminal_publication_timeout_seconds')) is not int
-            or payload['terminal_publication_timeout_seconds'] < 1 or
+            type(payload.get('request_queue_timeout_seconds')) is not int or
+            payload['request_queue_timeout_seconds'] < 1 or type(
+                payload.get('request_completion_timeout_seconds')) is not int or
+            payload['request_completion_timeout_seconds'] < 1 or
             not isinstance(campaign_prefix, str) or not campaign_prefix or
             not isinstance(campaign_manifest_sha256, str) or
             re.fullmatch(r'[0-9a-f]{64}', campaign_manifest_sha256) is None or
             campaign_manifest_sha256 != _campaign_manifest_sha256(
                 campaign_prefix, exact_count) or
-            payload.get('campaign_terminal_membership_sha256')
-            != campaign_manifest_sha256 or
-            payload.get('ledger_request_delta') != exact_count or
-            payload.get('ledger_succeeded_delta') != exact_count or
+            payload.get('campaign_success_manifest_sha256') !=
+            campaign_manifest_sha256 or
         (kind is ExpectationKind.ECONOMIC and
          'authorized_economic_receipt_sha256' in payload) or
         (kind is ExpectationKind.PROVIDER_CANARY and
@@ -8361,10 +8162,13 @@ def _read_qualification_evidence(
     providers = tuple(providers_raw)
     profile = (PROFILES['scale'] if kind is ExpectationKind.ECONOMIC else
                PROFILES['provider-canary'])
-    if (payload['terminal_publication_timeout_seconds']
-            != profile.terminal_publication_timeout_seconds):
+    if (payload['request_queue_timeout_seconds'] !=
+            profile.request_queue_timeout_seconds or
+            payload['request_completion_timeout_seconds'] !=
+            profile.request_completion_timeout_seconds):
         raise QualificationError(
-            'Qualification receipt has invalid terminal publication policy.')
+            'Qualification receipt has invalid request deadline policy.')
+    _cleanup_scope_from_process_payload(payload.get('cleanup_scope'))
     request_evidence = _validate_request_evidence(payload,
                                                   profile=profile,
                                                   exact_count=exact_count)
@@ -8387,8 +8191,8 @@ def _read_qualification_evidence(
         raise QualificationError(
             'Qualification receipt does not meet its typed evidence gate.')
     if (payload.get('qualification_profile') != profile.name or
-            payload['qualification_projection_sha256']
-            != _qualification_projection_sha256(
+            payload['qualification_projection_sha256'] !=
+            _qualification_projection_sha256(
                 source_sha256=payload['qualification_source_sha256'],
                 profile=profile,
                 providers=providers)):
@@ -8457,42 +8261,106 @@ def _authorize_provider_canary(economic_receipt: object, *, provider: str,
     return economic
 
 
-def _validate_cleanup_evidence(path: pathlib.Path,
-                               qualification: QualificationEvidence) -> str:
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class CleanupEvidenceExpectation:
+    """Immutable identity and policy to which cleanup proof must bind."""
+
+    service_name: str
+    service_hash: str
+    lifecycle_epoch: int
+    service_version: int
+    controller_config_digest: str
+    controller_config_snapshot_id: str
+    expected_providers: tuple[str, ...]
+    service_yaml_sha256: str
+    qualification_profile: str
+    qualification_source_sha256: str
+    qualification_projection_sha256: str
+    qualification_receipt_sha256: str
+    zero_hold_seconds: float
+
+
+_PASSED_CLEANUP_RECEIPT_FIELDS = frozenset({
+    'schema_version',
+    'service_name',
+    'service_hash',
+    'lifecycle_epoch',
+    'service_version',
+    'controller_config_digest',
+    'controller_config_snapshot_id',
+    'expected_providers',
+    'service_yaml_sha256',
+    'qualification_profile',
+    'qualification_source_sha256',
+    'qualification_projection_sha256',
+    'qualification_receipt_sha256',
+    'started_at',
+    'finished_at',
+    'outcome',
+    'zero_samples',
+    'zero_hold_required_seconds',
+    'zero_hold_elapsed_seconds',
+    'samples',
+})
+
+
+def _validate_cleanup_evidence_against(
+        path: pathlib.Path, expectation: CleanupEvidenceExpectation) -> str:
+    """Validate one exact-zero receipt against one immutable expectation."""
     payload, sha256 = _read_json_object(path, 'Cleanup receipt')
     matching_identity = (
-        payload.get('service_name') == qualification.service_name and
-        payload.get('service_hash') == qualification.service_hash and
-        payload.get('lifecycle_epoch') == qualification.lifecycle_epoch and
-        payload.get('service_version') == qualification.service_version and
+        payload.get('service_name') == expectation.service_name and
+        payload.get('service_hash') == expectation.service_hash and
+        payload.get('lifecycle_epoch') == expectation.lifecycle_epoch and
+        payload.get('service_version') == expectation.service_version and
         payload.get('controller_config_digest')
-        == qualification.controller_config_digest and
+        == expectation.controller_config_digest and
         payload.get('controller_config_snapshot_id')
-        == qualification.controller_config_snapshot_id and
-        payload.get('service_yaml_sha256') == qualification.service_yaml_sha256
+        == expectation.controller_config_snapshot_id and
+        payload.get('service_yaml_sha256') == expectation.service_yaml_sha256
         and payload.get('qualification_profile')
-        == ('scale' if qualification.expectation_kind
-            is ExpectationKind.ECONOMIC else 'provider-canary') and
+        == expectation.qualification_profile and
         payload.get('qualification_source_sha256')
-        == qualification.qualification_source_sha256 and
+        == expectation.qualification_source_sha256 and
         payload.get('qualification_projection_sha256')
-        == qualification.qualification_projection_sha256 and
+        == expectation.qualification_projection_sha256 and
         tuple(payload.get('expected_providers',
-                          ())) == qualification.expected_providers and
-        payload.get('qualification_receipt_sha256') == qualification.sha256)
+                          ())) == expectation.expected_providers and
+        payload.get('qualification_receipt_sha256')
+        == expectation.qualification_receipt_sha256)
     samples = payload.get('samples')
-    if (payload.get('schema_version') != _CLEANUP_RECEIPT_SCHEMA_VERSION or
+    required_hold = payload.get('zero_hold_required_seconds')
+    recorded_hold = payload.get('zero_hold_elapsed_seconds')
+    started_at = payload.get('started_at')
+    finished_at = payload.get('finished_at')
+    if (set(payload) != _PASSED_CLEANUP_RECEIPT_FIELDS or
+            payload.get('schema_version') != _CLEANUP_RECEIPT_SCHEMA_VERSION or
             payload.get('outcome') != 'passed' or not matching_identity or
+            not isinstance(started_at,
+                           (int, float)) or isinstance(started_at, bool) or
+            not math.isfinite(started_at) or started_at <= 0 or
+            not isinstance(finished_at,
+                           (int, float)) or isinstance(finished_at, bool) or
+            not math.isfinite(finished_at) or finished_at < started_at or
             type(payload.get('zero_samples')) is not int or
             payload['zero_samples'] < 3 or not isinstance(samples, list) or
-            len(samples) < 3):
+            len(samples) < payload['zero_samples'] or
+            not isinstance(required_hold,
+                           (int, float)) or isinstance(required_hold, bool) or
+            not math.isfinite(required_hold) or
+            required_hold != expectation.zero_hold_seconds or
+            not isinstance(recorded_hold,
+                           (int, float)) or isinstance(recorded_hold, bool) or
+            not math.isfinite(recorded_hold) or recorded_hold < required_hold):
         raise QualificationError('Cleanup receipt is malformed.')
-    final_samples = samples[-3:]
+    final_samples = samples[-payload['zero_samples']:]
     timestamps: list[float] = []
     counters: list[int] = []
+    hold_elapsed: list[float] = []
     cleanup_cloud_fields = {
         'cloud', 'instance_count', 'running_count', 'gpu_units',
-        'running_gpu_units', 'disk_count', 'inflight_operation_count', 'shapes'
+        'running_gpu_units', 'disk_count', 'security_group_count',
+        'inflight_operation_count', 'shapes'
     }
     for sample in final_samples:
         by_cloud = (sample.get('cleanup_provider_by_cloud') if isinstance(
@@ -8505,6 +8373,7 @@ def _validate_cleanup_evidence(path: pathlib.Path,
                         'cleanup_blocking_requests', 'cleanup_queue_deliveries',
                         'cleanup_retention_pins', 'cleanup_cluster_records',
                         'cleanup_provider_disks', 'cleanup_provider_instances',
+                        'cleanup_provider_security_groups',
                         'cleanup_provider_operations', 'cleanup_replicas',
                         'cleanup_service_rows', 'cleanup_waiters')) or
                 not isinstance(by_cloud, dict) or
@@ -8516,21 +8385,99 @@ def _validate_cleanup_evidence(path: pathlib.Path,
                         by_cloud[cloud].get(field) != 0
                         for field in ('instance_count', 'running_count',
                                       'gpu_units', 'running_gpu_units',
-                                      'disk_count', 'inflight_operation_count'))
+                                      'disk_count', 'security_group_count',
+                                      'inflight_operation_count'))
                     for cloud in ('aws', 'gcp')) or
                 type(sample.get('zero_samples')) is not int):
             raise QualificationError(
                 'Cleanup receipt does not prove sustained exact zero.')
         timestamps.append(_strict_timestamp(sample))
         counters.append(sample['zero_samples'])
+        elapsed = sample.get('zero_hold_elapsed_seconds')
+        if (not isinstance(elapsed,
+                           (int, float)) or isinstance(elapsed, bool) or
+                not math.isfinite(elapsed) or elapsed < 0):
+            raise QualificationError(
+                'Cleanup receipt does not prove sustained exact zero.')
+        hold_elapsed.append(float(elapsed))
     if (any(current <= prior
             for prior, current in zip(timestamps, timestamps[1:])) or
-            any(current != prior + 1
-                for prior, current in zip(counters, counters[1:])) or
-            counters[-1] != payload['zero_samples']):
+            counters != list(range(1, payload['zero_samples'] + 1)) or
+            hold_elapsed[0] != 0 or
+            any(current < prior
+                for prior, current in zip(hold_elapsed, hold_elapsed[1:])) or
+            hold_elapsed[-1] != recorded_hold or
+            hold_elapsed[-1] < required_hold or
+            timestamps[-1] - timestamps[0] < required_hold):
         raise QualificationError(
             'Cleanup receipt does not prove sustained exact zero.')
     return sha256
+
+
+def _validate_cleanup_evidence(path: pathlib.Path,
+                               qualification: QualificationEvidence) -> str:
+    """Independently revalidate cleanup evidence for the aggregate gate."""
+    profile_name = ('scale' if
+                    qualification.expectation_kind is ExpectationKind.ECONOMIC
+                    else 'provider-canary')
+    return _validate_cleanup_evidence_against(
+        path,
+        CleanupEvidenceExpectation(
+            service_name=qualification.service_name,
+            service_hash=qualification.service_hash,
+            lifecycle_epoch=qualification.lifecycle_epoch,
+            service_version=qualification.service_version,
+            controller_config_digest=qualification.controller_config_digest,
+            controller_config_snapshot_id=(
+                qualification.controller_config_snapshot_id),
+            expected_providers=qualification.expected_providers,
+            service_yaml_sha256=qualification.service_yaml_sha256,
+            qualification_profile=profile_name,
+            qualification_source_sha256=(
+                qualification.qualification_source_sha256),
+            qualification_projection_sha256=(
+                qualification.qualification_projection_sha256),
+            qualification_receipt_sha256=qualification.sha256,
+            zero_hold_seconds=PROFILES[profile_name].zero_hold_seconds))
+
+
+def validate_lifecycle_cleanup_evidence(*, cleanup_path: pathlib.Path,
+                                        qualification_path: pathlib.Path,
+                                        provider_scope_path: pathlib.Path,
+                                        service_name: str,
+                                        profile_name: str) -> str:
+    """Validate lifecycle cleanup against its frozen scope and receipt."""
+    profile = PROFILES.get(profile_name)
+    if profile is None:
+        raise QualificationError('Qualification profile is invalid.')
+    scope = read_provider_scope(provider_scope_path, service_name)
+    if scope.qualification_profile != profile_name:
+        raise QualificationError(
+            'Cleanup scope does not match the qualification profile.')
+    try:
+        qualification_sha256 = hashlib.sha256(
+            qualification_path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise QualificationError(
+            'Qualification receipt is unavailable for cleanup binding.') \
+            from error
+    return _validate_cleanup_evidence_against(
+        cleanup_path,
+        CleanupEvidenceExpectation(
+            service_name=service_name,
+            service_hash=scope.service_hash,
+            lifecycle_epoch=scope.lifecycle_epoch,
+            service_version=scope.service_version,
+            controller_config_digest=scope.controller_config_digest,
+            controller_config_snapshot_id=scope.controller_config_snapshot_id,
+            expected_providers=scope.providers,
+            service_yaml_sha256=scope.service_yaml_sha256,
+            qualification_profile=scope.qualification_profile,
+            qualification_source_sha256=scope.qualification_source_sha256,
+            qualification_projection_sha256=(
+                scope.qualification_projection_sha256),
+            qualification_receipt_sha256=qualification_sha256,
+            zero_hold_seconds=profile.zero_hold_seconds))
 
 
 def aggregate_evidence(args: argparse.Namespace) -> None:
@@ -8690,8 +8637,7 @@ async def _qualify_with_sessions(
         authorized_economic_receipt_sha256=(None if authorized_economic is None
                                             else authorized_economic.sha256))
     exact_request_successes = 0
-    ledger_baseline: RequestTelemetry | None = None
-    ledger_final: RequestTelemetry | None = None
+    request_baseline: RequestTelemetry | None = None
     failure: BaseException | None = None
     campaign_progress: ExactRequestCampaignProgress | None = None
     traffic: asyncio.Task[int] | None = None
@@ -8702,7 +8648,7 @@ async def _qualify_with_sessions(
                                    expectation.exact_request_count)
     try:
         await http.prove_authentication()
-        ledger_baseline = await _wait_for_joined_baseline(
+        request_baseline = await _wait_for_joined_baseline(
             observer=observer,
             profile=profile,
             progress=progress,
@@ -8712,61 +8658,35 @@ async def _qualify_with_sessions(
         assert progress.scale_started_monotonic is not None
         positive_deadline = positive_telemetry_deadline_monotonic(
             profile, scale_started_monotonic=progress.scale_started_monotonic)
+        stimulus_count = scale_stimulus_count(profile)
+        campaign_progress = ExactRequestCampaignProgress(
+            total_count=expectation.exact_request_count,
+            window_size=stimulus_count)
+        traffic = asyncio.create_task(
+            send_synchronous_requests(
+                endpoint=args.endpoint,
+                token=token,
+                prefix=campaign_prefix,
+                count=expectation.exact_request_count,
+                resident_window=stimulus_count,
+                request_concurrency=profile.request_concurrency,
+                hold_seconds=request_processing_seconds(profile),
+                timeout_seconds=(profile.scale_timeout_seconds +
+                                 profile.drain_timeout_seconds),
+                request_queue_timeout_seconds=(
+                    profile.request_queue_timeout_seconds),
+                campaign_progress=campaign_progress))
         if profile.name == 'scale':
-            stimulus_count = scale_stimulus_count(profile)
-            campaign_progress = ExactRequestCampaignProgress(
-                total_count=expectation.exact_request_count,
-                window_size=stimulus_count)
-            traffic = asyncio.create_task(
-                send_exact_async_requests(
-                    endpoint=args.endpoint,
-                    token=token,
-                    service_hash=provider_scope.service_hash,
-                    prefix=campaign_prefix,
-                    count=expectation.exact_request_count,
-                    concurrency=stimulus_count,
-                    hold_requests=expectation.exact_request_count,
-                    hold_seconds=request_processing_seconds(profile),
-                    timeout_seconds=(profile.scale_timeout_seconds +
-                                     profile.drain_timeout_seconds),
-                    request_queue_timeout_seconds=(
-                        profile.request_queue_timeout_seconds),
-                    terminal_timeout_seconds=(
-                        profile.terminal_publication_timeout_seconds),
-                    campaign_progress=campaign_progress))
             stimulus_deadline = (progress.scale_started_monotonic +
                                  _CAMPAIGN_LOAD_WINDOW_SECONDS)
             await _wait_for_scale_stimulus(observer=observer,
                                            profile=profile,
                                            receipt=receipt,
                                            traffic=traffic,
-                                           baseline=ledger_baseline,
+                                           baseline=request_baseline,
                                            expected_resident=stimulus_count,
                                            deadline_monotonic=stimulus_deadline)
-        else:
-            worker_count = min(expectation.exact_request_count,
-                               profile.request_concurrency)
-            campaign_progress = ExactRequestCampaignProgress(
-                total_count=expectation.exact_request_count,
-                window_size=worker_count)
-            traffic = asyncio.create_task(
-                send_exact_async_requests(
-                    endpoint=args.endpoint,
-                    token=token,
-                    service_hash=provider_scope.service_hash,
-                    prefix=campaign_prefix,
-                    count=expectation.exact_request_count,
-                    concurrency=profile.request_concurrency,
-                    hold_requests=scale_stimulus_count(profile),
-                    hold_seconds=request_processing_seconds(profile),
-                    timeout_seconds=(profile.scale_timeout_seconds +
-                                     profile.drain_timeout_seconds),
-                    request_queue_timeout_seconds=(
-                        profile.request_queue_timeout_seconds),
-                    terminal_timeout_seconds=(
-                        profile.terminal_publication_timeout_seconds),
-                    campaign_progress=campaign_progress))
-        assert ledger_baseline is not None
+        assert request_baseline is not None
         assert traffic is not None
         assert campaign_progress is not None
         if profile.name == 'scale':
@@ -8776,7 +8696,7 @@ async def _qualify_with_sessions(
                 progress=progress,
                 receipt=receipt,
                 traffic=traffic,
-                baseline=ledger_baseline,
+                baseline=request_baseline,
                 campaign_progress=campaign_progress,
                 expectation=expectation,
                 positive_deadline_monotonic=positive_deadline)
@@ -8787,26 +8707,26 @@ async def _qualify_with_sessions(
                     profile=profile,
                     receipt=receipt,
                     traffic=traffic,
-                    baseline=ledger_baseline,
+                    baseline=request_baseline,
                     deadline_monotonic=positive_deadline)
             await _wait_for_scale(observer=observer,
                                   profile=profile,
                                   progress=progress,
                                   receipt=receipt,
                                   traffic=traffic,
-                                  baseline=ledger_baseline,
+                                  baseline=request_baseline,
                                   expectation=expectation)
         exact_request_successes = await asyncio.shield(traffic)
         if exact_request_successes != expectation.exact_request_count:
             raise QualificationError('Exact request count is incomplete.')
-        assert ledger_baseline is not None
-        ledger_final = await _wait_for_final_request_telemetry(
-            observer=observer,
-            profile=profile,
-            receipt=receipt,
-            baseline=ledger_baseline,
-            expected_succeeded_delta=expectation.exact_request_count,
-            campaign_prefix=campaign_prefix)
+        receipt.bind_campaign_success_manifest(
+            _campaign_manifest_sha256(campaign_prefix,
+                                      expectation.exact_request_count))
+        assert request_baseline is not None
+        await _wait_for_final_request_telemetry(observer=observer,
+                                                profile=profile,
+                                                receipt=receipt,
+                                                baseline=request_baseline)
         await _wait_for_drain(observer=observer,
                               profile=profile,
                               progress=progress,
@@ -8828,8 +8748,6 @@ async def _qualify_with_sessions(
         receipt.finish(progress=progress,
                        exact_request_successes=exact_request_successes,
                        aws_volume_ids=observer.retained_volume_ids(),
-                       ledger_baseline=ledger_baseline,
-                       ledger_final=ledger_final,
                        error=failure)
     print(
         json.dumps(
@@ -9003,6 +8921,7 @@ def _parser() -> argparse.ArgumentParser:
     cleanup.add_argument('--receipt', required=True)
     cleanup.add_argument('--output', required=True)
     cleanup.add_argument('--timeout-seconds', type=float, default=10 * 60)
+    cleanup.add_argument('--zero-hold-seconds', type=float, default=6 * 60)
     cleanup.add_argument('--poll-seconds', type=float, default=10)
     cleanup.add_argument('--postgres-url-env',
                          default='SKYPILOT_DB_CONNECTION_URI')
