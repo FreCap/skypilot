@@ -142,6 +142,18 @@ def _patch_common(monkeypatch, events, replicas):
     monkeypatch.setattr(serve_state, 'add_or_update_replica',
                         lambda *a, **k: None)
     monkeypatch.setattr(serve_state, 'remove_replica', lambda *a, **k: None)
+    def _finalize_paid(_service_name, replica_id, _record_id, _cluster_name,
+                       **_kwargs):
+        info = next((replica for replica in replicas
+                     if replica.replica_id == replica_id), None)
+        if info is None:
+            return False
+        replicas.remove(info)
+        return True
+
+    monkeypatch.setattr(replica_managers,
+                        'finalize_projected_paid_provider_absence',
+                        _finalize_paid)
     monkeypatch.setattr(serve_state, 'get_service_versions', lambda svc: [])
 
     def _reserve(_service_name, candidates, **_kwargs):
@@ -831,13 +843,16 @@ def test_cleanup_restart_observes_pending_paid_teardown_without_resubmission(
     monkeypatch.setattr(reconciliation, 'advance_paid_teardown_observation',
                         _observe_once)
 
-    def _remove_replica(_service_name, replica_id, **_kwargs):
+    def _finalize_paid(_service_name, replica_id, _record_id, _cluster_name,
+                       **_kwargs):
         assert replica_id == info.replica_id
         replicas.clear()
         calls.append(('row_removed', replica_id))
         return True
 
-    monkeypatch.setattr(serve_state, 'remove_replica', _remove_replica)
+    monkeypatch.setattr(replica_managers,
+                        'finalize_projected_paid_provider_absence',
+                        _finalize_paid)
 
     lifecycle_lock = types.SimpleNamespace(epoch=31)
     finalize_args = ('svc', types.SimpleNamespace(pool=True), '/tmp/svc', 1,
@@ -905,9 +920,9 @@ def test_paid_teardown_submission_exception_retains_recovery_authority(
     assert ('remove_script', 'svc') not in calls
 
 
-def test_hung_paid_teardown_observer_releases_coordinator_at_deadline(
+def test_paid_teardown_observer_uses_one_deadline_and_releases_coordinator(
         monkeypatch):
-    """A stuck provider read cannot hold whole-service cleanup forever."""
+    """Every retry receives the replica's original cleanup deadline."""
     info, context = _paid_cleanup_case(1)
     authority = types.SimpleNamespace(
         capable=True,
@@ -923,7 +938,7 @@ def test_hung_paid_teardown_observer_releases_coordinator_at_deadline(
     replicas = [info]
     events = []
     observer_started = threading.Event()
-    release_observer = threading.Event()
+    observer_deadlines = []
     _patch_common(monkeypatch, events, replicas)
     monkeypatch.setattr(service, 'cleanup_storage_intents',
                         lambda *_args, **_kwargs: True)
@@ -935,9 +950,10 @@ def test_hung_paid_teardown_observer_releases_coordinator_at_deadline(
     clock = iter(range(0, 10_000, 100))
     monkeypatch.setattr(service.time, 'monotonic', lambda: next(clock))
 
-    def _hang_observer(*_args, **_kwargs):
+    def _unknown_observer(*_args, **kwargs):
         observer_started.set()
-        release_observer.wait()
+        observer_deadlines.append(
+            kwargs['provider_operation_deadline_monotonic'])
         return non_pool_launch_reconciliation.PaidTeardownObservationStep(
             non_pool_launch_reconciliation.PaidTeardownObservationDisposition.
             RETRY_UNKNOWN,
@@ -945,26 +961,25 @@ def test_hung_paid_teardown_observer_releases_coordinator_at_deadline(
                 ordinary_launch_binding.ProviderEvidence.UNKNOWN, {}))
 
     monkeypatch.setattr(non_pool_launch_reconciliation,
-                        'advance_paid_teardown_observation', _hang_observer)
+                        'advance_paid_teardown_observation', _unknown_observer)
     remove_replica = mock.Mock()
     monkeypatch.setattr(serve_state, 'remove_replica', remove_replica)
 
-    try:
-        failed = service._cleanup(
-            'svc',
-            True,
-            'incarnation-a',
-            123,
-            None,
-            types.SimpleNamespace(epoch=31),
-            binding_authority=authority,
-            provider_present_cleanup_contexts={
-                (info.replica_id, info.replica_record_id): context
-            })
-    finally:
-        release_observer.set()
+    failed = service._cleanup(
+        'svc',
+        True,
+        'incarnation-a',
+        123,
+        None,
+        types.SimpleNamespace(epoch=31),
+        binding_authority=authority,
+        provider_present_cleanup_contexts={
+            (info.replica_id, info.replica_record_id): context
+        })
 
     assert observer_started.is_set()
+    assert observer_deadlines
+    assert len(set(observer_deadlines)) == 1
     assert failed
     assert replicas == [info]
     assert info.status_property.sky_down_status is common_utils.ProcessStatus.FAILED

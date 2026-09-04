@@ -15,6 +15,7 @@ Focused on the helpers added for HA leader-aware routing:
 # pylint: disable=import-outside-toplevel,missing-class-docstring
 # pylint: disable=protected-access,unreachable
 import contextlib
+import functools
 import json
 import multiprocessing
 import socket
@@ -132,6 +133,17 @@ def _provider_absent_paid_cleanup_info():
     assert (service.ordinary_launch_binding.
             replica_has_projected_provider_absence_cleanup_marker(info))
     return info
+
+
+def _provider_absent_paid_cleanup_infos(count):
+    infos = []
+    for replica_id in range(1, count + 1):
+        info = _provider_absent_paid_cleanup_info()
+        info.replica_id = replica_id
+        info.replica_record_id = (f'00000000-0000-4000-8000-{replica_id:012d}')
+        info.cluster_name = f'svc-a-r{replica_id}'
+        infos.append(info)
+    return infos
 
 
 def _binding_authority(
@@ -1962,22 +1974,26 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
         expected_replica_record_id=(present.replica_record_id))
 
 
-@pytest.mark.parametrize('profile_kind, cluster_record_present', [
-    (service.ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
-     True),
-    (service.ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
-     False),
-])
+@pytest.mark.parametrize(
+    ('profile_kind', 'cluster_record_present', 'persist_paid_transition'), [
+        (service.ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+         True, True),
+        (service.ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+         False, True),
+        (service.ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+         False, False),
+    ])
 def test_cleanup_routes_provider_present_marker_through_exact_termination(
-        profile_kind, cluster_record_present):
+        profile_kind, cluster_record_present, persist_paid_transition):
 
     class SynchronousThread:
 
-        def __init__(self, target, args, kwargs):
+        def __init__(self, target, args=(), kwargs=None, **_thread_kwargs):
             self._target = target
             self._args = args
-            self._kwargs = kwargs
+            self._kwargs = kwargs or {}
             self.format_exc = None
+            self.exception = None
             self.started = False
             self.ident = None
 
@@ -2071,6 +2087,22 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination(
     existing_cluster_names = ({'svc-a-r3'} if cluster_record_present else set())
     expected_owner = (4242, '10.4.7.7')
 
+    def _exact_terminate(*_args, **_kwargs):
+        if not reserved_fill and persist_paid_transition:
+            binding.transition_provider_present_teardown_phase(
+                info,
+                expected=binding.ProviderPresentTeardownPhase.
+                SUBMISSION_RUNNING,
+                target=binding.ProviderPresentTeardownPhase.
+                ABSENCE_OBSERVATION_PENDING)
+
+    settled_absent = (
+        service.non_pool_launch_reconciliation.PaidTeardownObservationStep(
+            service.non_pool_launch_reconciliation.
+            PaidTeardownObservationDisposition.SETTLED_ABSENT,
+            service.non_pool_launch_reconciliation.ProviderObservation(
+                binding.ProviderEvidence.ABSENT, {})))
+
     with mock.patch.object(serve_state,
                            'get_replica_infos', return_value=[info]), \
          mock.patch.object(serve_state,
@@ -2094,6 +2126,8 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination(
          mock.patch.object(serve_state,
                            'add_or_update_replica', return_value=True), \
          mock.patch.object(serve_state,
+                           'get_replica_info_from_id', return_value=info), \
+         mock.patch.object(serve_state,
                            'remove_replica', return_value=True) as remove, \
          mock.patch.object(
              serve_state,
@@ -2107,30 +2141,42 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination(
              service.request_postgres,
              'bound_non_pool_provider_present_cleanup_is_authorized',
              return_value=True), \
-         mock.patch.object(
-             service.non_pool_launch_reconciliation,
-             'reconcile',
-             return_value=service.non_pool_launch_reconciliation.
-             ProviderObservation(
-                 service.ordinary_launch_binding.ProviderEvidence.PRESENT,
-                 {})) as reconcile, \
+         mock.patch.object(service.non_pool_launch_reconciliation,
+                           'advance_paid_teardown_observation',
+                           return_value=settled_absent) as observe, \
          mock.patch.object(
              service.replica_managers,
-             'terminate_bound_non_pool_provider_present_cluster'
+             'terminate_bound_non_pool_provider_present_cluster',
+             side_effect=_exact_terminate
          ) as exact_terminate, \
+         mock.patch.object(
+             service.replica_managers,
+             'finalize_projected_paid_provider_absence',
+             return_value=True) as finalize, \
          mock.patch.object(service.time, 'sleep'), \
          mock.patch.object(service,
                            'cleanup_storage_intents', return_value=True):
-        failed = service._cleanup('svc',
-                                  True,
-                                  'incarnation-a',
-                                  expected_owner[0],
-                                  expected_owner[1],
-                                  lifecycle_lock,
-                                  binding_authority=authority,
-                                  provider_present_cleanup_contexts={
-                                      (3, str(record_id)): context
-                                  })
+        cleanup = functools.partial(service._cleanup,
+                                    'svc',
+                                    True,
+                                    'incarnation-a',
+                                    expected_owner[0],
+                                    expected_owner[1],
+                                    lifecycle_lock,
+                                    binding_authority=authority,
+                                    provider_present_cleanup_contexts={
+                                        (3, str(record_id)): context
+                                    })
+        if not reserved_fill and not persist_paid_transition:
+            with pytest.raises(
+                    binding.OrdinaryLaunchBindingConflict,
+                    match='did not leave one exact observation-pending'):
+                cleanup()
+            observe.assert_not_called()
+            finalize.assert_not_called()
+            remove.assert_not_called()
+            return
+        failed = cleanup()
 
     assert not failed
     generic_terminate.assert_not_called()
@@ -2140,15 +2186,17 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination(
     assert exact_terminate.call_args.args[4] == info.cluster_name
     if cleanup_fence is None:
         assert 'cleanup_fence' not in exact_terminate.call_args.kwargs
-        reconcile.assert_called_once()
-        assert reconcile.call_args.kwargs['force_provider_read'] is True
+        observe.assert_called_once()
+        finalize.assert_called_once()
+        remove.assert_not_called()
     else:
         assert (
             exact_terminate.call_args.kwargs['cleanup_fence'] == cleanup_fence)
-        reconcile.assert_not_called()
+        observe.assert_not_called()
+        finalize.assert_not_called()
+        remove.assert_called_once()
     assert status.sky_launch_status == (
         service.common_utils.ProcessStatus.INTERRUPTED)
-    remove.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -2249,28 +2297,271 @@ def test_failed_cleanup_retires_only_authorized_absent_reserved_1516_replica(
     provider_down.assert_not_called()
 
 
-@pytest.mark.parametrize(('authorized', 'cluster_records', 'expected_removed',
-                          'expected_metadata_removal'), [
-                              (True, [{
-                                  'status': status_lib.ClusterStatus.INIT,
-                                  'cluster_hash': 'old-generation',
-                              }, None], True, True),
-                              (False, [], False, False),
-                              (True, [{
-                                  'status': status_lib.ClusterStatus.INIT,
-                                  'cluster_hash': 'old-generation',
-                              }, {
-                                  'status': status_lib.ClusterStatus.INIT,
-                                  'cluster_hash': 'replacement-generation',
-                              }], False, True),
-                              (True, [{
-                                  'status': status_lib.ClusterStatus.UP,
-                                  'cluster_hash': 'old-generation',
-                              }], False, False),
-                          ])
-def test_failed_cleanup_retires_hash_fenced_provider_absent_paid_replica(
-        authorized, cluster_records, expected_removed,
-        expected_metadata_removal):
+def test_cleanup_bounds_and_progresses_projected_paid_finalization():
+    max_concurrent = (service.non_pool_launch_reconciliation.
+                      OneShotProviderObservationLane.MAX_CONCURRENT)
+    infos = _provider_absent_paid_cleanup_infos(max_concurrent + 5)
+    keys = frozenset(
+        (info.replica_id, info.replica_record_id) for info in infos)
+    lifecycle_lock = mock.Mock(epoch=31)
+    release_first_wave = threading.Event()
+    first_wave_started = threading.Event()
+    active = 0
+    peak = 0
+    started = 0
+    finished = 0
+    counters_lock = threading.Lock()
+    result = []
+    cleanup_error = []
+
+    def _finalize(*_args, **_kwargs):
+        nonlocal active, peak, started, finished
+        with counters_lock:
+            active += 1
+            started += 1
+            peak = max(peak, active)
+            if started == max_concurrent:
+                first_wave_started.set()
+        if started <= max_concurrent:
+            assert release_first_wave.wait(timeout=5)
+        with counters_lock:
+            active -= 1
+            finished += 1
+        return True
+
+    def _run_cleanup():
+        try:
+            result.append(
+                service._cleanup('svc', False, 'incarnation-a', 4242,
+                                 '10.4.7.7', lifecycle_lock))
+        except BaseException as error:  # surfaced in the test thread
+            cleanup_error.append(error)
+
+    preparation = service._ProviderPresentCleanupPreparation(  # pylint: disable=protected-access
+        contexts={},
+        projected_absence_keys=keys,
+        failures={})
+    with mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=infos), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(service.serve_utils,
+                           'get_existing_replica_cluster_names',
+                           return_value=set()), \
+         mock.patch.object(service,
+                           '_prepare_provider_present_cleanup',
+                           return_value=preparation), \
+         mock.patch.object(
+             service.replica_managers,
+             'finalize_projected_paid_provider_absence',
+             side_effect=_finalize) as finalize, \
+         mock.patch.object(serve_state,
+                           'add_or_update_replica', return_value=True) as persist, \
+         mock.patch.object(service,
+                           'cleanup_storage_intents',
+                           side_effect=lambda *_: finished == len(infos)):
+        cleanup_thread = threading.Thread(target=_run_cleanup, daemon=True)
+        cleanup_thread.start()
+        concurrent_progress = first_wave_started.wait(timeout=2)
+        release_first_wave.set()
+        cleanup_thread.join(timeout=10)
+
+    assert concurrent_progress
+    assert not cleanup_thread.is_alive()
+    assert cleanup_error == []
+    assert result == [False]
+    assert peak == max_concurrent
+    assert started == finished == len(infos)
+    assert finalize.call_count == len(infos)
+    persist.assert_not_called()
+
+
+def test_cleanup_drains_expired_projected_paid_worker_before_returning():
+    info = _provider_absent_paid_cleanup_info()
+    key = (info.replica_id, info.replica_record_id)
+    lifecycle_lock = mock.Mock(epoch=31)
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    storage_started = threading.Event()
+    result = []
+    cleanup_error = []
+
+    def _finalize(*_args, **_kwargs):
+        worker_started.set()
+        assert release_worker.wait(timeout=5)
+        return True
+
+    def _run_cleanup():
+        try:
+            result.append(
+                service._cleanup('svc', False, 'incarnation-a', 4242,
+                                 '10.4.7.7', lifecycle_lock))
+        except BaseException as error:  # surfaced in the test thread
+            cleanup_error.append(error)
+
+    preparation = service._ProviderPresentCleanupPreparation(  # pylint: disable=protected-access
+        contexts={},
+        projected_absence_keys=frozenset({key}),
+        failures={})
+    with mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=[info]), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(service.serve_utils,
+                           'get_existing_replica_cluster_names',
+                           return_value=set()), \
+         mock.patch.object(service,
+                           '_prepare_provider_present_cleanup',
+                           return_value=preparation), \
+         mock.patch.object(
+             service.replica_managers,
+             'finalize_projected_paid_provider_absence',
+             side_effect=_finalize), \
+         mock.patch.object(service,
+                           '_PAID_PROVIDER_OBSERVATION_TIMEOUT_SECONDS', 0.01), \
+         mock.patch.object(
+             service,
+             'cleanup_storage_intents',
+             side_effect=lambda *_: storage_started.set() or True):
+        cleanup_thread = threading.Thread(target=_run_cleanup, daemon=True)
+        cleanup_thread.start()
+        assert worker_started.wait(timeout=2)
+        time.sleep(0.05)
+        returned_while_worker_live = not cleanup_thread.is_alive()
+        storage_raced_worker = storage_started.is_set()
+        release_worker.set()
+        cleanup_thread.join(timeout=5)
+
+    assert not returned_while_worker_live
+    assert not storage_raced_worker
+    assert not cleanup_thread.is_alive()
+    assert cleanup_error == []
+    assert result == [False]
+    assert storage_started.is_set()
+
+
+def test_cleanup_provider_observation_precedes_auxiliary_backlog():
+    max_concurrent = (service.non_pool_launch_reconciliation.
+                      OneShotProviderObservationLane.MAX_CONCURRENT)
+    projected_infos = _provider_absent_paid_cleanup_infos(max_concurrent)
+    observation_info = _provider_absent_paid_cleanup_info()
+    observation_info.replica_id = 100
+    observation_info.replica_record_id = (
+        '00000000-0000-4000-8000-000000000100')
+    observation_info.cluster_name = 'svc-a-r100'
+    observation_key = (observation_info.replica_id,
+                       observation_info.replica_record_id)
+    projected_keys = frozenset(
+        (info.replica_id, info.replica_record_id) for info in projected_infos)
+    context = mock.Mock()
+    context.profile.kind = (
+        service.ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    lifecycle_lock = mock.Mock(epoch=31)
+    observer_started = threading.Event()
+    release_finalizers = threading.Event()
+    result = []
+    cleanup_error = []
+
+    def _finalize(*_args, **_kwargs):
+        assert release_finalizers.wait(timeout=5)
+        return True
+
+    def _observe(*_args, **_kwargs):
+        observer_started.set()
+        return service.non_pool_launch_reconciliation.PaidTeardownObservationStep(
+            disposition=(service.non_pool_launch_reconciliation.
+                         PaidTeardownObservationDisposition.SETTLED_ABSENT),
+            observation=service.non_pool_launch_reconciliation.
+            ProviderObservation(
+                service.ordinary_launch_binding.ProviderEvidence.ABSENT, {}))
+
+    def _run_cleanup():
+        try:
+            result.append(
+                service._cleanup('svc',
+                                 False,
+                                 'incarnation-a',
+                                 4242,
+                                 '10.4.7.7',
+                                 lifecycle_lock,
+                                 binding_authority=mock.sentinel.authority,
+                                 provider_present_cleanup_contexts={
+                                     observation_key: context
+                                 }))
+        except BaseException as error:  # surfaced in the test thread
+            cleanup_error.append(error)
+
+    preparation = service._ProviderPresentCleanupPreparation(  # pylint: disable=protected-access
+        contexts={observation_key: context},
+        projected_absence_keys=projected_keys,
+        failures={})
+    infos = [*projected_infos, observation_info]
+    with mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=infos), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(service.serve_utils,
+                           'get_existing_replica_cluster_names',
+                           return_value=set()), \
+         mock.patch.object(service,
+                           '_prepare_provider_present_cleanup',
+                           return_value=preparation), \
+         mock.patch.object(service,
+                           '_provider_present_cleanup_context',
+                           return_value=context), \
+         mock.patch.object(service.reserved_capacity,
+                           'parse_protocol_v2_cleanup_fence',
+                           return_value=None), \
+         mock.patch.object(
+             serve_state,
+             'get_replica_resource_action_identities',
+             return_value={observation_info.replica_id: None}), \
+         mock.patch.object(
+             service.replica_managers,
+             'finalize_projected_paid_provider_absence',
+             side_effect=_finalize), \
+         mock.patch.object(
+             service.non_pool_launch_reconciliation,
+             'advance_paid_teardown_observation',
+             side_effect=_observe) as observe, \
+         mock.patch.object(service,
+                           'cleanup_storage_intents', return_value=True):
+        cleanup_thread = threading.Thread(target=_run_cleanup, daemon=True)
+        cleanup_thread.start()
+        observation_made_progress = observer_started.wait(timeout=2)
+        release_finalizers.set()
+        cleanup_thread.join(timeout=10)
+
+    assert observation_made_progress
+    assert not cleanup_thread.is_alive()
+    assert cleanup_error == []
+    assert result == [False]
+    observe.assert_called_once()
+
+
+@pytest.mark.parametrize(('authorized', 'finalized'), [(True, True),
+                                                       (True, False),
+                                                       (False, None)])
+def test_cleanup_routes_provider_absent_paid_replica_to_exact_finalizer(
+        authorized, finalized):
     info = _provider_absent_paid_cleanup_info()
     lifecycle_lock = mock.Mock(epoch=31)
     expected_owner = (4242, '10.4.7.7')
@@ -2293,11 +2584,9 @@ def test_failed_cleanup_retires_hash_fenced_provider_absent_paid_replica(
              'bound_non_pool_projected_provider_absence_is_authorized',
              return_value=authorized) as authorize, \
          mock.patch.object(
-             service.global_user_state,
-             'get_cluster_from_name', side_effect=cluster_records) \
-             as get_cluster, \
-         mock.patch.object(service.global_user_state,
-                           'remove_cluster') as remove_cluster, \
+             service.replica_managers,
+             'finalize_projected_paid_provider_absence',
+             return_value=finalized) as exact_finalize, \
          mock.patch.object(serve_state,
                            'add_or_update_replica', return_value=True) \
              as persist, \
@@ -2315,29 +2604,22 @@ def test_failed_cleanup_retires_hash_fenced_provider_absent_paid_replica(
                                   expected_owner[0], expected_owner[1],
                                   lifecycle_lock)
 
-    assert failed is (not expected_removed)
+    assert failed is (not (authorized and finalized))
     authorize.assert_called_once_with('svc', 3, info.replica_record_id)
-    if expected_metadata_removal:
-        remove_cluster.assert_called_once_with(
-            info.cluster_name,
-            terminate=True,
-            existing_cluster_hash='old-generation')
-    else:
-        remove_cluster.assert_not_called()
     if authorized:
-        assert get_cluster.call_count == len(cluster_records)
+        exact_finalize.assert_called_once()
+        assert exact_finalize.call_args.args == ('svc', 3,
+                                                 info.replica_record_id,
+                                                 info.cluster_name)
+        assert exact_finalize.call_args.kwargs[
+            'provider_operation_deadline_monotonic'] > time.monotonic()
+        assert callable(exact_finalize.call_args.kwargs['continue_guard'])
     else:
-        get_cluster.assert_not_called()
-    if expected_removed:
-        remove_many.assert_called_once_with(
-            'svc', [3],
-            expected_service_hash='incarnation-a',
-            expected_lifecycle_epoch=31,
-            expected_controller_owner=expected_owner,
-            expected_replica_record_ids={3: info.replica_record_id})
+        exact_finalize.assert_not_called()
+    remove_many.assert_not_called()
+    if authorized and finalized:
         persist.assert_not_called()
     else:
-        remove_many.assert_not_called()
         persist.assert_called_once()
     remove.assert_not_called()
     parse_fence.assert_not_called()

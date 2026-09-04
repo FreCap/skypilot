@@ -924,6 +924,27 @@ def _prepare_paid_provider_absence_graph(
             priority=canonical_paid_claim_priority
         ) is paid_capacity.ClaimResult.ACQUIRED
 
+    if profile_kind is (
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+        resource_identity = (
+            ordinary_launch_binding.
+            derive_fresh_ordinary_paid_resource_action_identity(
+                replica_id=3,
+                replica_record_id=_GC_REPLICA_RECORD_ID,
+                cluster_name='gc-service-3'))
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    'gc-service',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        replica_incarnation=(
+                            resource_identity.replica_incarnation),
+                        desired_generation=(
+                            resource_identity.desired_generation),
+                        sky_cluster_record_uuid=(
+                            resource_identity.sky_cluster_record_uuid)))
+
     profile = ordinary_launch_binding.resolve_non_pool_launch_profile(
         'gc-service', 3, _GC_REPLICA_RECORD_ID)
     assert profile.kind is profile_kind
@@ -3249,6 +3270,35 @@ def test_paid_provider_negative_ack_projects_and_releases_debits_atomically(
         info)
     assert claim_count == pin_count == 0
     assert replica['paid_capacity_pool_key'] == graph.pool_key
+    cleanup_scope = (
+        request_postgres.
+        bound_non_pool_projected_paid_provider_absence_cleanup_scope(
+            'gc-service', 3, str(_GC_REPLICA_RECORD_ID)))
+    assert cleanup_scope is not None
+    assert isinstance(cleanup_scope,
+                      request_postgres.ProjectedPaidAuxiliaryCleanupAuthority)
+    assert cleanup_scope.service_name == 'gc-service'
+    assert cleanup_scope.replica_record_id == _GC_REPLICA_RECORD_ID
+    assert cleanup_scope.resource_action_identity == (
+        ordinary_launch_binding.
+        derive_fresh_ordinary_paid_resource_action_identity(
+            replica_id=3,
+            replica_record_id=_GC_REPLICA_RECORD_ID,
+            cluster_name='gc-service-3'))
+    assert cleanup_scope.cloud == 'aws'
+    assert cleanup_scope.provider_identity == {
+        'aws_account_id': '123456789012',
+        'client_token': ordinary_launch_binding.ordinary_paid_aws_client_token(
+            graph.context),
+        'cluster_name_on_cloud': _gc_cloud_cluster_name(),
+        'credential_profile': None,
+        'instance_type': 'g6.xlarge',
+        'num_nodes': 1,
+        'region': 'us-east-1',
+        'use_spot': True,
+        'workspace': 'workspace-a',
+        'zone': 'us-east-1a',
+    }
     with engine.connect() as connection:
         pool = connection.execute(
             sqlalchemy.select(
@@ -3786,6 +3836,34 @@ def test_gcp_paid_exact_label_absence_projects_and_releases_debits_atomically(
     assert association['resolution'] == 'PROJECTED'
     assert association['provider_evidence_payload'] == payload
     assert claim_count == pin_count == 0
+    resource_action_identity = (
+        ordinary_launch_binding.
+        derive_fresh_ordinary_paid_resource_action_identity(
+            replica_id=3,
+            replica_record_id=_GC_REPLICA_RECORD_ID,
+            cluster_name='gc-service-3'))
+    assert (request_postgres.
+            bound_non_pool_projected_paid_provider_absence_cleanup_scope(
+                'gc-service', 3, str(_GC_REPLICA_RECORD_ID)) ==
+            request_postgres.ProjectedPaidAuxiliaryCleanupAuthority(
+                service_name='gc-service',
+                replica_record_id=_GC_REPLICA_RECORD_ID,
+                resource_action_identity=resource_action_identity,
+                cleanup_scope=(
+                    request_postgres.ProjectedPaidProviderAbsenceCleanupScope(
+                        cloud='gcp', provider_identity=identity))))
+    # A syntactically complete but non-derived generation cannot inherit the
+    # provider auxiliary authority retained by the projected association.
+    with graph.engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'gc-service',
+                serve_state_schema.replicas_table.c.replica_id == 3).values(
+                    desired_generation=2))
+    assert (request_postgres.
+            bound_non_pool_projected_paid_provider_absence_cleanup_scope(
+                'gc-service', 3, str(_GC_REPLICA_RECORD_ID)) is None)
 
 
 def test_gcp_paid_unknown_replacement_absence_uses_frozen_cleanup_graph(
@@ -3857,6 +3935,11 @@ def test_gcp_paid_unknown_replacement_absence_uses_frozen_cleanup_graph(
     assert claim_count == pin_count == 0
     assert request_postgres.bound_non_pool_projected_provider_absence_is_authorized(
         'gc-service', 3, str(_GC_REPLICA_RECORD_ID))
+    # Retained replacement history may still authorize provider-free row
+    # retirement, but it cannot mint Cohort-16 auxiliary provider authority.
+    assert (request_postgres.
+            bound_non_pool_projected_paid_provider_absence_cleanup_scope(
+                'gc-service', 3, str(_GC_REPLICA_RECORD_ID)) is None)
     assert request_postgres.retire_bound_non_pool_projected_paid_provider_absence(
         'gc-service', 3, str(_GC_REPLICA_RECORD_ID))
 
@@ -4265,7 +4348,7 @@ def test_gcp_v2_paid_terminal_present_then_absent_retires_atomically(
         production_http_normalization=True,
         terminal_status=terminal_status,
         terminal_cause=terminal_cause)
-    assert graph.context.capability_cohort_epoch == 15
+    assert graph.context.capability_cohort_epoch == 16
     pool_identity = json.loads(graph.pool_key)
     assert pool_identity['version'] == 2
     assert pool_identity['provider_identity'] == {
@@ -6112,6 +6195,8 @@ def test_paid_active_snapshot_does_not_wait_for_reserved_protocol_lock(
     'expired_claim',
     'cancelled_association',
     'stale_cohort',
+    'missing_resource_identity',
+    'mismatched_resource_identity',
 ])
 def test_paid_active_snapshot_fails_closed_for_invalid_graph(
         bound_request_database, monkeypatch, invalid_state):
@@ -6202,6 +6287,26 @@ def test_paid_active_snapshot_fails_closed_for_invalid_graph(
             elif invalid_state == 'cancelled_association':
                 ordinary_launch_binding.request_cancel_in_connection(
                     connection, graph.context, 'test-cancel')
+            elif invalid_state == 'missing_resource_identity':
+                connection.execute(
+                    sqlalchemy.update(serve_state_schema.replicas_table).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        graph.context.service_name,
+                        serve_state_schema.replicas_table.c.replica_id ==
+                        graph.context.replica_id).values(
+                            replica_incarnation=None,
+                            desired_generation=None,
+                            sky_cluster_record_uuid=None))
+            elif invalid_state == 'mismatched_resource_identity':
+                connection.execute(
+                    sqlalchemy.update(serve_state_schema.replicas_table).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        graph.context.service_name,
+                        serve_state_schema.replicas_table.c.replica_id ==
+                        graph.context.replica_id).values(
+                            replica_incarnation=uuid.uuid4(),
+                            desired_generation=1,
+                            sky_cluster_record_uuid=uuid.uuid4()))
             else:
                 raise AssertionError(f'Unknown invalid state: {invalid_state}')
 

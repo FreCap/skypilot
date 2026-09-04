@@ -1,13 +1,19 @@
 """Utility functions for subprocesses."""
 import collections
 from collections.abc import Callable
+from collections.abc import Iterator
+from collections.abc import Mapping
 import concurrent.futures
+import contextlib
 import contextvars
+import dataclasses
+import math
 import multiprocessing
 import os
 import random
 import resource
 import shlex
+import signal
 import subprocess
 import sys
 import termios
@@ -37,6 +43,273 @@ logger = sky_logging.init_logger(__name__)
 _fd_limit_warning_shown = False
 
 _PROCFS = '/proc'
+
+_PROVIDER_PROCESS_COMMON_ENV_NAMES = frozenset({
+    'CURL_CA_BUNDLE',
+    'GRPC_DEFAULT_SSL_ROOTS_FILE_PATH',
+    'HOME',
+    'HTTPS_PROXY',
+    'HTTP_PROXY',
+    'LANG',
+    'LC_ALL',
+    'LC_CTYPE',
+    'LD_LIBRARY_PATH',
+    'LOGNAME',
+    'NO_PROXY',
+    'PATH',
+    'PYTHONHOME',
+    'PYTHONPATH',
+    'PYTHONUNBUFFERED',
+    'PYTHONWARNINGS',
+    'REQUESTS_CA_BUNDLE',
+    'SSL_CERT_DIR',
+    'SSL_CERT_FILE',
+    'TMPDIR',
+    'TZ',
+    'USER',
+    'VIRTUAL_ENV',
+    'XDG_CACHE_HOME',
+    'XDG_CONFIG_HOME',
+    'all_proxy',
+    'https_proxy',
+    'http_proxy',
+    'no_proxy',
+})
+_PROVIDER_PROCESS_ENV_PREFIXES = {
+    'aws': ('AWS_',),
+    'gcp': ('CLOUDSDK_', 'GCE_', 'GCP_', 'GOOGLE_'),
+}
+
+
+def provider_process_env(provider: str) -> dict[str, str]:
+    """Return the minimal runtime and exact-provider environment.
+
+    This is a same-process-identity dependency boundary, not a security
+    sandbox.  The allowlist prevents an isolated provider leaf from
+    accidentally consuming database, API, or unrelated application secrets.
+    """
+    prefixes = _PROVIDER_PROCESS_ENV_PREFIXES.get(provider)
+    if prefixes is None:
+        raise ValueError(
+            f'Unsupported provider process environment: {provider}')
+    return {
+        name: value for name, value in os.environ.items() if
+        name in _PROVIDER_PROCESS_COMMON_ENV_NAMES or name.startswith(prefixes)
+    }
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ProcessGroupResult:
+    """Closed result from one physically quiescent child process group."""
+
+    returncode: int
+    stdout: str | None
+    stderr: str | None
+
+
+def _process_group_exists(process: subprocess.Popen[str]) -> bool:
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Existence without signal permission is still existence.
+        return True
+    return True
+
+
+def _signal_process_group(process: subprocess.Popen[str],
+                          signum: signal.Signals) -> None:
+    try:
+        os.killpg(process.pid, signum)
+    except ProcessLookupError:
+        pass
+
+
+def _close_process_pipes(process: subprocess.Popen[str]) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None and not stream.closed:
+            stream.close()
+
+
+def _validate_process_group_grace(value: float, label: str) -> None:
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+            not math.isfinite(value) or value < 0):
+        raise ValueError(f'{label} must be finite and nonnegative.')
+
+
+def terminate_and_reap_process_groups(
+    processes: tuple[subprocess.Popen[str], ...],
+    *,
+    term_grace_seconds: float,
+    reap_grace_seconds: float,
+) -> None:
+    """TERM/KILL/reap N process groups under one aggregate pair of horizons."""
+    _validate_process_group_grace(term_grace_seconds, 'TERM grace')
+    _validate_process_group_grace(reap_grace_seconds, 'reap grace')
+    unique_by_pid = {process.pid: process for process in processes}
+    owned = tuple(unique_by_pid[pid] for pid in sorted(unique_by_pid))
+    for process in owned:
+        _signal_process_group(process, signal.SIGTERM)
+    term_deadline = time.monotonic() + term_grace_seconds
+    while time.monotonic() < term_deadline:
+        for process in owned:
+            process.poll()
+        if all(not _process_group_exists(process) for process in owned):
+            break
+        time.sleep(0.01)
+    for process in owned:
+        if _process_group_exists(process):
+            _signal_process_group(process, signal.SIGKILL)
+    reap_deadline = time.monotonic() + reap_grace_seconds
+    while time.monotonic() < reap_deadline:
+        for process in owned:
+            process.poll()
+        if all(process.returncode is not None and
+               not _process_group_exists(process) for process in owned):
+            break
+        time.sleep(0.01)
+    survivors = [
+        process.pid
+        for process in owned
+        if process.poll() is None or _process_group_exists(process)
+    ]
+    if survivors:
+        raise RuntimeError(
+            f'Child process groups survived SIGKILL: {survivors!r}.')
+    for process in owned:
+        _close_process_pipes(process)
+
+
+class ProcessGroupRegistry:
+    """Lifecycle owner for bounded process groups spawned by one lane."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._processes: dict[int, subprocess.Popen[str]] = {}
+        self._closed = False
+
+    @contextlib.contextmanager
+    def activate(self) -> Iterator[None]:
+        token = _ACTIVE_PROCESS_GROUP_REGISTRY.set(self)
+        try:
+            yield
+        finally:
+            _ACTIVE_PROCESS_GROUP_REGISTRY.reset(token)
+
+    def _popen(self, args: list[str], **kwargs: Any) -> subprocess.Popen[str]:
+        """Atomically spawn and register, or reject after owner shutdown."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError('Process-group registry is closed.')
+            process = subprocess.Popen(args, start_new_session=True, **kwargs)
+            self._processes[process.pid] = process
+            return process
+
+    def _unregister(self, process: subprocess.Popen[str]) -> None:
+        with self._lock:
+            if self._processes.get(process.pid) is process:
+                del self._processes[process.pid]
+
+    def close(self, *, term_grace_seconds: float,
+              reap_grace_seconds: float) -> None:
+        """Stop admission and physically quiesce every admitted child."""
+        with self._lock:
+            self._closed = True
+            processes = tuple(self._processes.values())
+        terminate_and_reap_process_groups(processes,
+                                          term_grace_seconds=term_grace_seconds,
+                                          reap_grace_seconds=reap_grace_seconds)
+        with self._lock:
+            for process in processes:
+                if self._processes.get(process.pid) is process:
+                    del self._processes[process.pid]
+
+    @property
+    def process_count(self) -> int:
+        with self._lock:
+            return len(self._processes)
+
+
+_ACTIVE_PROCESS_GROUP_REGISTRY: contextvars.ContextVar[
+    ProcessGroupRegistry | None] = contextvars.ContextVar(
+        'active_process_group_registry', default=None)
+
+
+def run_in_process_group(
+    args: list[str],
+    *,
+    deadline_monotonic: float,
+    term_grace_seconds: float,
+    reap_grace_seconds: float,
+    input_text: str | None = None,
+    env: Mapping[str, str] | None = None,
+    stdout: int | None = subprocess.PIPE,
+    stderr: int | None = subprocess.PIPE,
+) -> ProcessGroupResult:
+    """Run one child within an absolute deadline and return only after reap."""
+    if (isinstance(deadline_monotonic, bool) or
+            not isinstance(deadline_monotonic, (int, float)) or
+            not math.isfinite(deadline_monotonic)):
+        raise ValueError('Process-group deadline is malformed.')
+    _validate_process_group_grace(term_grace_seconds, 'TERM grace')
+    _validate_process_group_grace(reap_grace_seconds, 'reap grace')
+    if deadline_monotonic <= time.monotonic():
+        raise TimeoutError('Timed out waiting for child process group.')
+    registry = _ACTIVE_PROCESS_GROUP_REGISTRY.get()
+    popen_kwargs: dict[str, Any] = {
+        'stdin': subprocess.PIPE
+                 if input_text is not None else subprocess.DEVNULL,
+        'stdout': stdout,
+        'stderr': stderr,
+        'text': True,
+    }
+    if env is not None:
+        popen_kwargs['env'] = dict(env)
+    process = (
+        registry._popen(  # pylint: disable=protected-access
+            args, **popen_kwargs) if registry is not None else subprocess.Popen(
+                args, start_new_session=True, **popen_kwargs))
+    output: str | None = None
+    error: str | None = None
+    try:
+        remaining = deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout=0)
+        try:
+            output, error = process.communicate(input=input_text,
+                                                timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            terminate_and_reap_process_groups(
+                (process,),
+                term_grace_seconds=term_grace_seconds,
+                reap_grace_seconds=reap_grace_seconds)
+            raise TimeoutError(
+                'Timed out waiting for child process group.') from exc
+        except BaseException:  # pylint: disable=broad-except
+            terminate_and_reap_process_groups(
+                (process,),
+                term_grace_seconds=term_grace_seconds,
+                reap_grace_seconds=reap_grace_seconds)
+            raise
+        if _process_group_exists(process):
+            terminate_and_reap_process_groups(
+                (process,),
+                term_grace_seconds=term_grace_seconds,
+                reap_grace_seconds=reap_grace_seconds)
+            raise RuntimeError('Child left a live descendant process.')
+        if process.returncode is None:
+            raise RuntimeError('Child process was not reaped.')
+        return ProcessGroupResult(returncode=process.returncode,
+                                  stdout=output,
+                                  stderr=error)
+    finally:
+        if not _process_group_exists(process):
+            process.poll()
+            _close_process_pipes(process)
+            if registry is not None:
+                registry._unregister(  # pylint: disable=protected-access
+                    process)
 
 
 def _safe_children(process: 'psutil.Process') -> list['psutil.Process']:

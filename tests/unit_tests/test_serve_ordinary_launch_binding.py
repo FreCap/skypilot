@@ -123,11 +123,69 @@ def test_non_pool_profile_envelope_is_closed_and_canonical() -> None:
 
 def test_supported_non_pool_profile_set_digest_is_stable_and_complete() -> None:
     digest = binding.supported_non_pool_profile_set_digest()
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 15
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 16
     assert len(digest) == 64
     assert digest == binding.supported_non_pool_profile_set_digest()
     assert set(binding._PROFILE_AUTHORIZATION_KIND) == set(  # pylint: disable=protected-access
         binding.NonPoolLaunchProfileKind)
+
+
+def test_fresh_paid_resource_action_identity_is_pure_and_domain_separated(
+) -> None:
+    first = binding.derive_fresh_ordinary_paid_resource_action_identity(
+        replica_id=3, replica_record_id=_RECORD_ID, cluster_name='svc-3')
+    replay = binding.derive_fresh_ordinary_paid_resource_action_identity(
+        replica_id=3, replica_record_id=str(_RECORD_ID), cluster_name='svc-3')
+    other_record = binding.derive_fresh_ordinary_paid_resource_action_identity(
+        replica_id=3,
+        replica_record_id=uuid.UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'),
+        cluster_name='svc-3')
+
+    assert first == replay
+    assert first.replica_id == 3
+    assert first.cluster_name == 'svc-3'
+    assert first.desired_generation == 1
+    assert first.replica_incarnation != first.sky_cluster_record_uuid
+    assert other_record.replica_incarnation != first.replica_incarnation
+    assert (other_record.sky_cluster_record_uuid !=
+            first.sky_cluster_record_uuid)
+
+
+def test_fresh_paid_resource_action_identity_from_context_is_cohort_gated(
+        monkeypatch) -> None:
+    launch_context = {binding.BINDING_PROTOCOL_VERSION_KEY: 2}
+    context = types.SimpleNamespace(
+        profile=types.SimpleNamespace(
+            kind=binding.NonPoolLaunchProfileKind.ORDINARY_PAID),
+        replica_id=3,
+        replica_record_id=_RECORD_ID,
+        launch_generation=1,
+        capability_cohort_epoch=binding.NON_POOL_CAPABILITY_COHORT_EPOCH)
+    monkeypatch.setattr(binding, 'parse_bound_non_pool_launch_context',
+                        lambda _launch_context: context)
+
+    current = (binding.
+               fresh_ordinary_paid_resource_action_identity_from_launch_context(
+                   launch_context, 'svc-3'))
+    assert current == binding.derive_fresh_ordinary_paid_resource_action_identity(
+        replica_id=3, replica_record_id=_RECORD_ID, cluster_name='svc-3')
+
+    # Retained N-1/N-2 graphs remain cleanup-compatible, but old launch
+    # contexts must never mint the new global cluster-record identity.
+    for historical_cohort in (binding.NON_POOL_CAPABILITY_COHORT_EPOCH - 1,
+                              binding.NON_POOL_CAPABILITY_COHORT_EPOCH - 2):
+        context.capability_cohort_epoch = historical_cohort
+        assert (
+            binding.
+            fresh_ordinary_paid_resource_action_identity_from_launch_context(
+                launch_context, 'svc-3') is None)
+
+    context.capability_cohort_epoch = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    context.launch_generation = 2
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='cohort or generation'):
+        binding.fresh_ordinary_paid_resource_action_identity_from_launch_context(
+            launch_context, 'svc-3')
 
 
 def test_generic_capability_requires_the_complete_exact_tuple() -> None:
@@ -1019,7 +1077,7 @@ def test_non_pool_identity_and_context_are_structurally_distinct() -> None:
     binding.install_bound_non_pool_context(body, identity, 7)
     context = body.extra_launch_context
     assert context[binding.PROFILE_KIND_KEY] == 'ORDINARY_PAID'
-    assert context[binding.CAPABILITY_COHORT_EPOCH_KEY] == 15
+    assert context[binding.CAPABILITY_COHORT_EPOCH_KEY] == 16
     parsed = binding.parse_bound_non_pool_launch_context(context)
     assert isinstance(parsed, binding.BoundNonPoolLaunchContext)
     assert parsed.profile == identity.profile

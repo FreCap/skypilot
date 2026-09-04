@@ -228,6 +228,48 @@ def test_action_aware_cluster_upsert_is_atomic_and_ordinary_updates_preserve(
     assert row['status'] == 'INIT'
     assert row['is_managed'] == 1
 
+    ready_cluster_hash = global_user_state.add_or_update_cluster(
+        'complete-row',
+        _MinimalHandle('exact-ready'),
+        requested_resources=set(),
+        ready=True,
+        is_managed=True,
+        existing_cluster_hash=cluster_hash,
+        cluster_record_uuid=_RECORD_UUID,
+    )
+    assert ready_cluster_hash == cluster_hash
+    with full_state_database.connect() as connection:
+        ready_row = connection.execute(
+            sqlalchemy.select(global_user_state.cluster_table).where(
+                global_user_state.cluster_table.c.name ==
+                'complete-row')).mappings().one()
+    assert ready_row['cluster_record_uuid'] == _RECORD_UUID
+    assert ready_row['cluster_hash'] == cluster_hash
+    assert ready_row['status'] == 'UP'
+    ready_handle = global_user_state.get_handle_from_cluster_name(
+        'complete-row', existing_cluster_hash=cluster_hash)
+    assert ready_handle is not None
+    assert ready_handle.marker == 'exact-ready'
+
+    with pytest.raises(global_user_state.ClusterRecordIdentityConflictError,
+                       match='expected'):
+        global_user_state.add_or_update_cluster(
+            'complete-row',
+            _MinimalHandle('wrong-identity'),
+            requested_resources=set(),
+            ready=False,
+            is_managed=True,
+            existing_cluster_hash=cluster_hash,
+            cluster_record_uuid=_OTHER_UUID,
+        )
+    unchanged_handle, unchanged_status = (
+        global_user_state.get_cluster_handle_status_from_name(
+            'complete-row', existing_cluster_hash=cluster_hash))
+    assert unchanged_handle is not None
+    assert unchanged_handle.marker == 'exact-ready'
+    assert unchanged_status is not None
+    assert unchanged_status.value == 'UP'
+
     global_user_state.add_or_update_cluster(
         'complete-row',
         _MinimalHandle('ordinary-update'),

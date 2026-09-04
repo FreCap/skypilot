@@ -1178,4 +1178,4 @@ MAX_NUMBER_OF_SERVICES_REACHED_ERROR = 'Max number of services reached'
 # Every live API, controller, and executor participant and every service
 # capability tuple must agree before a new paid provider effect can rely on
 # these semantics; adjacent cohorts remain settlement-only.
-NON_POOL_CAPABILITY_COHORT_EPOCH = 15
+NON_POOL_CAPABILITY_COHORT_EPOCH = 16

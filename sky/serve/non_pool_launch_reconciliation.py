@@ -15,6 +15,11 @@ from collections.abc import Callable
 from collections.abc import Mapping
 import dataclasses
 import enum
+import json
+import math
+import subprocess
+import sys
+import threading
 import time
 import typing
 from typing import Any, cast
@@ -27,6 +32,7 @@ from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
 from sky.serve import reserved_capacity
 from sky.utils import common_utils
+from sky.utils import subprocess_utils
 from sky.utils import thread_utils
 
 if typing.TYPE_CHECKING:
@@ -43,6 +49,12 @@ resource_actions = adaptors_common.LazyImport('sky.serve.resource_actions')
 
 _AWS_EMPTY_CENSUS_INTERVAL_SECONDS = 2.0
 _GCP_EMPTY_CENSUS_INTERVAL_SECONDS = 2.0
+_PROVIDER_CENSUS_WORKER_ARGUMENT = '__paid-provider-census-worker__'
+_PROVIDER_CENSUS_PROTOCOL_VERSION = 1
+_PROVIDER_CENSUS_DEFAULT_TIMEOUT_SECONDS = 30.0
+_PROVIDER_CENSUS_WORKER_TERM_GRACE_SECONDS = 1.0
+_PROVIDER_CENSUS_WORKER_REAP_GRACE_SECONDS = 5.0
+_PROVIDER_CENSUS_MAX_PROTOCOL_BYTES = 1024 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -89,30 +101,41 @@ class OneShotProviderObservationLane:
         self._workers: dict[tuple[int, str], thread_utils.SafeThread] = {}
         self._results: thread_utils.ThreadSafeDict[tuple[int, str], Any] = (
             thread_utils.ThreadSafeDict())
+        self._state_lock = threading.RLock()
+        self._process_registry = subprocess_utils.ProcessGroupRegistry()
+        self._closed = False
 
     def schedule(self, key: tuple[int, str], operation: Callable[[],
                                                                  Any]) -> bool:
         """Start one operation when its exact key and a lane slot are free."""
-        if key in self._workers or len(self._workers) >= self.MAX_CONCURRENT:
-            return False
 
         def _run() -> None:
-            self._results[key] = operation()
+            with self._process_registry.activate():
+                self._results[key] = operation()
 
         worker = thread_utils.SafeThread(
             target=_run,
             name=f'replica-{key[0]}-teardown-observation',
             daemon=True)
-        self._workers[key] = worker
-        try:
-            worker.start()
-        except BaseException:
-            del self._workers[key]
-            # A custom/instrumented Thread.start() can fail after invoking the
-            # target.  Never let that ambiguous start leave a result which a
-            # later retry with the same exact key could consume.
-            self._results.pop(key)
-            raise
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError('Provider observation lane is closed.')
+            if (key in self._workers or
+                    len(self._workers) >= self.MAX_CONCURRENT):
+                return False
+            self._workers[key] = worker
+            try:
+                # Keep admission and start atomic with close().  A real worker
+                # may block briefly while installing its process registration;
+                # it proceeds as soon as this lock is released.
+                worker.start()
+            except BaseException:
+                del self._workers[key]
+                # A custom/instrumented Thread.start() can fail after invoking
+                # the target. Never let that ambiguous start leave a result
+                # which a later retry with the same exact key could consume.
+                self._results.pop(key)
+                raise
         return True
 
     def take_completed(
@@ -121,11 +144,16 @@ class OneShotProviderObservationLane:
     ) -> tuple[OneShotProviderObservationCompletion, ...]:
         """Join and remove completed one-shot work without blocking on live work."""
         completed = []
-        for worker_key, worker in list(self._workers.items()):
+        with self._state_lock:
+            workers = list(self._workers.items())
+        for worker_key, worker in workers:
             if ((key is not None and worker_key != key) or worker.is_alive()):
                 continue
             worker.join()
-            del self._workers[worker_key]
+            with self._state_lock:
+                if self._workers.get(worker_key) is not worker:
+                    continue
+                del self._workers[worker_key]
             result = self._results.pop(worker_key)
             completed.append(
                 OneShotProviderObservationCompletion(
@@ -137,13 +165,202 @@ class OneShotProviderObservationLane:
 
     @property
     def available_slots(self) -> int:
-        return self.MAX_CONCURRENT - len(self._workers)
+        with self._state_lock:
+            return self.MAX_CONCURRENT - len(self._workers)
 
     def contains(self, key: tuple[int, str]) -> bool:
-        return key in self._workers
+        with self._state_lock:
+            return key in self._workers
 
     def has_work(self) -> bool:
-        return bool(self._workers)
+        with self._state_lock:
+            return bool(self._workers)
+
+    @property
+    def mutation_is_allowed(self) -> bool:
+        """Whether an admitted worker may still enter a mutation boundary."""
+        with self._state_lock:
+            return not self._closed
+
+    def close(self) -> None:
+        """Stop admission and quiesce all registered provider child groups.
+
+        Python threads cannot be forcibly terminated. They are given one
+        bounded join horizon, while callers fence their database mutations via
+        ``mutation_is_allowed`` plus durable lifecycle authority. A surviving
+        thread is reported explicitly; it is never described as quiescent.
+        """
+        with self._state_lock:
+            self._closed = True
+            workers = tuple(self._workers.values())
+        self._process_registry.close(
+            term_grace_seconds=_PROVIDER_CENSUS_WORKER_TERM_GRACE_SECONDS,
+            reap_grace_seconds=_PROVIDER_CENSUS_WORKER_REAP_GRACE_SECONDS)
+        join_deadline = (time.monotonic() +
+                         _PROVIDER_CENSUS_WORKER_REAP_GRACE_SECONDS)
+        for worker in workers:
+            worker.join(timeout=max(0, join_deadline - time.monotonic()))
+        self.take_completed()
+        with self._state_lock:
+            if self._process_registry.process_count:
+                raise RuntimeError(
+                    'Provider observation child groups did not drain at '
+                    'shutdown.')
+            if self._workers:
+                raise RuntimeError(
+                    'A Python provider observation worker survived lane '
+                    'shutdown; child groups are quiescent and its mutation '
+                    'gate is closed.')
+
+
+def _provider_census_worker_command() -> list[str]:
+    """Return the one private child entry point for paid provider reads."""
+    return [
+        sys.executable, '-m', 'sky.serve.non_pool_launch_reconciliation',
+        _PROVIDER_CENSUS_WORKER_ARGUMENT
+    ]
+
+
+def _provider_census_worker_env(cloud: str) -> dict[str, str]:
+    """Retain cloud credentials but remove unrelated control-plane secrets."""
+    return subprocess_utils.provider_process_env(cloud)
+
+
+def _run_paid_provider_census_worker(
+    request: Mapping[str, Any],
+    *,
+    deadline_monotonic: float,
+) -> Any:
+    """Run one exact read in a deadline-owned, killable process group."""
+    if (isinstance(deadline_monotonic, bool) or
+            not isinstance(deadline_monotonic, (int, float)) or
+            not math.isfinite(deadline_monotonic)):
+        raise ValueError('Paid provider census deadline is malformed.')
+    try:
+        request_text = json.dumps(dict(request),
+                                  sort_keys=True,
+                                  separators=(',', ':'),
+                                  allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            'Paid provider census request is malformed.') from error
+    if len(request_text.encode('utf-8')) > _PROVIDER_CENSUS_MAX_PROTOCOL_BYTES:
+        raise ValueError('Paid provider census request is too large.')
+    remaining = deadline_monotonic - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError('Timed out waiting for paid provider census.')
+    cloud = request.get('cloud')
+    if cloud not in ('aws', 'gcp'):
+        raise ValueError('Paid provider census cloud is malformed.')
+    try:
+        result = subprocess_utils.run_in_process_group(
+            _provider_census_worker_command(),
+            deadline_monotonic=deadline_monotonic,
+            term_grace_seconds=_PROVIDER_CENSUS_WORKER_TERM_GRACE_SECONDS,
+            reap_grace_seconds=_PROVIDER_CENSUS_WORKER_REAP_GRACE_SECONDS,
+            input_text=request_text,
+            env=_provider_census_worker_env(cloud),
+            stderr=subprocess.DEVNULL)
+    except TimeoutError as error:
+        raise TimeoutError(
+            'Timed out waiting for paid provider census.') from error
+    if result.returncode != 0:
+        raise RuntimeError(
+            f'Paid provider census worker failed (exit={result.returncode}).')
+    stdout = result.stdout
+    if stdout is None:
+        raise RuntimeError('Paid provider census worker returned no output.')
+    if len(stdout.encode('utf-8')) > _PROVIDER_CENSUS_MAX_PROTOCOL_BYTES:
+        raise RuntimeError('Paid provider census response is too large.')
+    try:
+        response = json.loads(stdout)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            'Paid provider census worker returned malformed output.') from error
+    if (not isinstance(response, dict) or set(response) != {'ok', 'result'} or
+            response['ok'] is not True):
+        raise RuntimeError('Paid provider census worker failed closed.')
+    return response['result']
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _AwsProviderCensusWorkerScope:
+    provider_identity: Mapping[str, Any]
+    credential_profile: str | None
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _GcpProviderCensusWorkerReplica:
+    cluster_name: str
+
+
+def _provider_census_worker_main() -> int:
+    """Execute the private JSON protocol without exposing SDK diagnostics."""
+    protocol_stdout = sys.stdout
+    try:
+        request_bytes = sys.stdin.buffer.read(
+            _PROVIDER_CENSUS_MAX_PROTOCOL_BYTES + 1)
+        if len(request_bytes) > _PROVIDER_CENSUS_MAX_PROTOCOL_BYTES:
+            raise ValueError('Paid provider census request is too large.')
+        request = json.loads(request_bytes)
+        if (not isinstance(request, dict) or request.get('protocol_version')
+                != _PROVIDER_CENSUS_PROTOCOL_VERSION or
+                request.get('cloud') not in ('aws', 'gcp') or
+                not isinstance(request.get('provider_identity'), dict)):
+            raise ValueError('Paid provider census request is malformed.')
+        # Provider clients occasionally write diagnostics to stdout. Keep the
+        # parent's result channel singular and send all such output to stderr,
+        # which the parent deliberately discards.
+        sys.stdout = sys.stderr
+        result: Any
+        if request['cloud'] == 'aws':
+            credential_profile = request.get('credential_profile')
+            if (credential_profile is not None and
+                (not isinstance(credential_profile, str) or
+                 not credential_profile)):
+                raise ValueError('AWS census credential profile is malformed.')
+            result = _query_aws_paid_provider_census(
+                _AwsProviderCensusWorkerScope(
+                    provider_identity=request['provider_identity'],
+                    credential_profile=credential_profile))
+        else:
+            cluster_name = request.get('cluster_name')
+            if not isinstance(cluster_name, str) or not cluster_name:
+                raise ValueError('GCP census cluster name is malformed.')
+            instances, disks, operations = _query_gcp_paid_provider_census(
+                _GcpProviderCensusWorkerReplica(cluster_name=cluster_name),
+                request['provider_identity'])
+            result = {
+                'disks': disks,
+                'instances': instances,
+                'operations': operations,
+            }
+        response = {'ok': True, 'result': result}
+    except BaseException as error:  # pylint: disable=broad-except
+        response = {
+            'ok': False,
+            'result': {
+                'error_type': type(error).__name__,
+            },
+        }
+    finally:
+        sys.stdout = protocol_stdout
+    response_text = json.dumps(response,
+                               sort_keys=True,
+                               separators=(',', ':'),
+                               allow_nan=False)
+    if len(response_text.encode('utf-8')) > _PROVIDER_CENSUS_MAX_PROTOCOL_BYTES:
+        response_text = json.dumps(
+            {
+                'ok': False,
+                'result': {
+                    'error_type': 'ResponseTooLarge',
+                },
+            },
+            separators=(',', ':'))
+    protocol_stdout.write(response_text)
+    protocol_stdout.flush()
+    return 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -423,7 +640,8 @@ def _gcp_observation_payload(
 
 
 def _query_aws_paid_provider_census(
-    scope: request_postgres_types.BoundAwsProviderCensusScope,
+    scope: request_postgres_types.BoundAwsProviderCensusScope |
+    _AwsProviderCensusWorkerScope,
 ) -> list[dict[str, str]]:
     """Perform one uncached, account-checked EC2 client-token census."""
     provider_identity = scope.provider_identity
@@ -525,6 +743,26 @@ def _query_aws_paid_provider_census(
     return instances
 
 
+def _query_aws_paid_provider_census_isolated(
+    scope: request_postgres_types.BoundAwsProviderCensusScope,
+    *,
+    deadline_monotonic: float,
+) -> list[dict[str, str]]:
+    """Query exact AWS identity behind the killable provider boundary."""
+    result = _run_paid_provider_census_worker(
+        {
+            'cloud': 'aws',
+            'credential_profile': scope.credential_profile,
+            'protocol_version': _PROVIDER_CENSUS_PROTOCOL_VERSION,
+            'provider_identity': dict(scope.provider_identity),
+        },
+        deadline_monotonic=deadline_monotonic)
+    if not isinstance(result, list) or any(
+            not isinstance(instance, dict) for instance in result):
+        raise RuntimeError('AWS provider census result is malformed.')
+    return cast(list[dict[str, str]], result)
+
+
 def _aws_observation_payload(
     context: ordinary_launch_binding.BoundNonPoolLaunchContext,
     replica_info: Any,
@@ -545,10 +783,21 @@ def _aws_observation_payload(
     }
 
 
+def _sleep_provider_quiet_interval(seconds: float,
+                                   deadline_monotonic: float) -> None:
+    """Sleep only when the same observation deadline covers the interval."""
+    remaining = deadline_monotonic - time.monotonic()
+    if remaining < seconds:
+        raise TimeoutError('Timed out waiting for paid provider census.')
+    time.sleep(seconds)
+
+
 def _observe_aws_paid_provider(
     context: ordinary_launch_binding.BoundNonPoolLaunchContext,
     replica_info: Any,
     authority: ordinary_launch_binding.ControllerBindingAuthority,
+    *,
+    deadline_monotonic: float,
 ) -> ProviderObservation:
     """Query frozen AWS account, placement, and EC2 client-token identity."""
     scope = request_postgres.bound_non_pool_aws_provider_census_scope(
@@ -568,7 +817,8 @@ def _observe_aws_paid_provider(
             })
     identity = scope.provider_identity
     try:
-        instances = _query_aws_paid_provider_census(scope)
+        instances = _query_aws_paid_provider_census_isolated(
+            scope, deadline_monotonic=deadline_monotonic)
     except Exception as error:  # pylint: disable=broad-except
         return ProviderObservation(
             ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
@@ -595,9 +845,11 @@ def _observe_aws_paid_provider(
                 'provider_identity': identity,
                 'reason': 'aws-create-settling',
             })
-    time.sleep(_AWS_EMPTY_CENSUS_INTERVAL_SECONDS)
+    _sleep_provider_quiet_interval(_AWS_EMPTY_CENSUS_INTERVAL_SECONDS,
+                                   deadline_monotonic)
     try:
-        instances = _query_aws_paid_provider_census(scope)
+        instances = _query_aws_paid_provider_census_isolated(
+            scope, deadline_monotonic=deadline_monotonic)
     except Exception as error:  # pylint: disable=broad-except
         return ProviderObservation(
             ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
@@ -637,6 +889,42 @@ def _query_gcp_paid_provider_census(
     return sorted(instances), sorted(disks), create_targets
 
 
+def _query_gcp_paid_provider_census_isolated(
+    replica_info: Any,
+    provider_identity: Mapping[str, Any],
+    *,
+    deadline_monotonic: float,
+) -> tuple[list[str], list[str], dict[str, list[str]]]:
+    """Query exact GCP identity behind the killable provider boundary."""
+    result = _run_paid_provider_census_worker(
+        {
+            'cloud': 'gcp',
+            'cluster_name': str(getattr(replica_info, 'cluster_name', '')),
+            'protocol_version': _PROVIDER_CENSUS_PROTOCOL_VERSION,
+            'provider_identity': dict(provider_identity),
+        },
+        deadline_monotonic=deadline_monotonic)
+    if not isinstance(result, dict) or set(result) != {
+            'disks', 'instances', 'operations'
+    }:
+        raise RuntimeError('GCP provider census result is malformed.')
+    instances = result['instances']
+    disks = result['disks']
+    operations = result['operations']
+    expected_operation_states = {'failed', 'inflight', 'succeeded'}
+    if (not isinstance(instances, list) or
+            any(not isinstance(value, str) for value in instances) or
+            not isinstance(disks, list) or
+            any(not isinstance(value, str) for value in disks) or
+            not isinstance(operations, dict) or
+            set(operations) != expected_operation_states or
+            any(not isinstance(values, list) or any(not isinstance(value, str)
+                                                    for value in values)
+                for values in operations.values())):
+        raise RuntimeError('GCP provider census result is malformed.')
+    return (instances, disks, cast(dict[str, list[str]], operations))
+
+
 def _gcp_unknown_observation(
     base: Mapping[str, Any],
     identity: Mapping[str, Any],
@@ -661,6 +949,8 @@ def _observe_gcp_paid_provider(
     context: ordinary_launch_binding.BoundNonPoolLaunchContext,
     replica_info: Any,
     authority: ordinary_launch_binding.ControllerBindingAuthority,
+    *,
+    deadline_monotonic: float,
 ) -> ProviderObservation:
     """Query frozen GCP VM, disk, and retained create-operation identity."""
     identity = request_postgres.bound_non_pool_gcp_provider_identity(
@@ -680,7 +970,8 @@ def _observe_gcp_paid_provider(
             })
     try:
         instance_ids, disk_ids, create_targets = (
-            _query_gcp_paid_provider_census(replica_info, identity))
+            _query_gcp_paid_provider_census_isolated(
+                replica_info, identity, deadline_monotonic=deadline_monotonic))
     except Exception as error:  # pylint: disable=broad-except
         return ProviderObservation(
             ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
@@ -711,10 +1002,12 @@ def _observe_gcp_paid_provider(
     # first empty read. Require a second complete uncached census; operation
     # retention is the durable fence, and this quiet interval closes list
     # propagation races around terminal request quiescence.
-    time.sleep(_GCP_EMPTY_CENSUS_INTERVAL_SECONDS)
+    _sleep_provider_quiet_interval(_GCP_EMPTY_CENSUS_INTERVAL_SECONDS,
+                                   deadline_monotonic)
     try:
         instance_ids, disk_ids, create_targets = (
-            _query_gcp_paid_provider_census(replica_info, identity))
+            _query_gcp_paid_provider_census_isolated(
+                replica_info, identity, deadline_monotonic=deadline_monotonic))
     except Exception as error:  # pylint: disable=broad-except
         return ProviderObservation(
             ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
@@ -741,6 +1034,8 @@ def observe_provider(
     context: ordinary_launch_binding.BoundNonPoolLaunchContext,
     replica_info: Any,
     authority: ordinary_launch_binding.ControllerBindingAuthority | None = None,
+    *,
+    provider_operation_deadline_monotonic: float | None = None,
 ) -> ProviderObservation:
     """Read only the exact provider identity retained by the profile."""
     if not isinstance(context,
@@ -754,15 +1049,31 @@ def observe_provider(
     }
     if (ordinary_launch_binding.is_paid_provider_reconciliation_profile(
             context.profile.kind) and authority is not None):
+        deadline_monotonic = provider_operation_deadline_monotonic
+        if deadline_monotonic is None:
+            deadline_monotonic = (time.monotonic() +
+                                  _PROVIDER_CENSUS_DEFAULT_TIMEOUT_SECONDS)
+        elif (isinstance(deadline_monotonic, bool) or
+              not isinstance(deadline_monotonic, (int, float)) or
+              not math.isfinite(deadline_monotonic)):
+            raise ValueError('Paid provider census deadline is malformed.')
         pool_key = getattr(replica_info, 'paid_capacity_pool_key', None)
         pool_identity = (paid_capacity.pool_key_payload(pool_key) if isinstance(
             pool_key, str) else None)
         cloud = (pool_identity.get('cloud') if isinstance(
             pool_identity, Mapping) else None)
         if cloud == 'aws':
-            return _observe_aws_paid_provider(context, replica_info, authority)
+            return _observe_aws_paid_provider(
+                context,
+                replica_info,
+                authority,
+                deadline_monotonic=deadline_monotonic)
         if cloud == 'gcp':
-            return _observe_gcp_paid_provider(context, replica_info, authority)
+            return _observe_gcp_paid_provider(
+                context,
+                replica_info,
+                authority,
+                deadline_monotonic=deadline_monotonic)
         return ProviderObservation(
             ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
                 **base,
@@ -873,10 +1184,23 @@ def _reduce_observation(
     authority: ordinary_launch_binding.ControllerBindingAuthority,
     project_replica_result: Callable[..., bool],
     observation: ProviderObservation,
+    *,
+    continue_guard: Callable[[], bool] | None = None,
 ) -> None:
     """Persist and reduce one already-completed exact provider observation."""
+    if continue_guard is not None and not continue_guard():
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider reconciliation lost lifecycle authority before evidence '
+            'persistence.')
     request_postgres.record_bound_non_pool_provider_evidence(
         context, authority, observation.evidence, observation.payload)
+    # Both transactions revalidate the immutable lifecycle/association
+    # authority in PostgreSQL. Recheck the process-local lane fence between
+    # them too, so a worker outliving close() cannot begin a second mutation.
+    if continue_guard is not None and not continue_guard():
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider reconciliation lost lifecycle authority before evidence '
+            'projection.')
     if observation.evidence == ordinary_launch_binding.ProviderEvidence.ABSENT:
         request_postgres.project_bound_non_pool_provider_absence(
             context, authority, project_replica_result=project_replica_result)
@@ -1034,8 +1358,16 @@ def submit_paid_provider_teardown(
     else:
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Paid provider cleanup lost its immutable pool cloud.')
-    request_postgres.mark_bound_non_pool_provider_teardown_observation_pending(
-        context, authority)
+    persisted = (request_postgres.
+                 mark_bound_non_pool_provider_teardown_observation_pending(
+                     context, authority))
+    expected_phase = (ordinary_launch_binding.ProviderPresentTeardownPhase.
+                      ABSENCE_OBSERVATION_PENDING)
+    if ordinary_launch_binding.provider_present_teardown_phase(
+            persisted) is not expected_phase:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Paid provider teardown did not durably reach observation '
+            'pending.')
     return submission
 
 
@@ -1065,9 +1397,10 @@ def reconcile(
     project_replica_result: Callable[..., bool],
     *,
     force_provider_read: bool = False,
-    before_absence_projection: Callable[[], None] | None = None,
+    provider_operation_deadline_monotonic: float | None = None,
+    continue_guard: Callable[[], bool] | None = None,
 ) -> ProviderObservation:
-    """Observe outside locks, then reduce exact absence or authorize cleanup."""
+    """Observe outside locks, then reduce exact provider evidence."""
     if not request_postgres.bound_non_pool_provider_reconciliation_ready(
             context, authority):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
@@ -1079,8 +1412,10 @@ def reconcile(
         # ABSENT is immutable exact evidence. Project it before another
         # provider read: a later transient UNKNOWN observation must not strand
         # a row whose absence was already proven after executor quiescence.
-        if before_absence_projection is not None:
-            before_absence_projection()
+        if continue_guard is not None and not continue_guard():
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider reconciliation lost lifecycle authority before '
+                'absence projection.')
         request_postgres.project_bound_non_pool_provider_absence(
             context, authority, project_replica_result=project_replica_result)
         return ProviderObservation(
@@ -1107,17 +1442,26 @@ def reconcile(
             observation = ProviderObservation(
                 ordinary_launch_binding.ProviderEvidence.ABSENT, paid_payload)
     if observation is None:
-        observation = observe_provider(context, replica_info, authority)
-    if (observation.evidence == ordinary_launch_binding.ProviderEvidence.ABSENT
-            and before_absence_projection is not None):
-        before_absence_projection()
+        deadline_kwargs = ({
+            'provider_operation_deadline_monotonic': provider_operation_deadline_monotonic
+        } if provider_operation_deadline_monotonic is not None else {})
+        observation = observe_provider(context, replica_info, authority,
+                                       **deadline_kwargs)
     if (paid_teardown_observation_pending and observation.evidence
             != ordinary_launch_binding.ProviderEvidence.ABSENT):
         # UNKNOWN cannot erase the last exact PRESENT cleanup authority, and
         # PRESENT needs only to hand the row back to the submission phase.
         # Only ABSENT is settlement evidence for this split teardown phase.
         return observation
-    _reduce_observation(context, authority, project_replica_result, observation)
+    # _reduce_observation records before it projects.  If ABSENT projection
+    # fails, the retry consumes that immutable receipt without another
+    # provider read.  Local cluster-record finalization is a separate,
+    # provider-free step after this transaction releases paid authority.
+    _reduce_observation(context,
+                        authority,
+                        project_replica_result,
+                        observation,
+                        continue_guard=continue_guard)
     return observation
 
 
@@ -1127,7 +1471,8 @@ def advance_paid_teardown_observation(
     authority: ordinary_launch_binding.ControllerBindingAuthority,
     project_replica_result: Callable[..., bool],
     *,
-    before_absence_projection: Callable[[], None] | None = None,
+    provider_operation_deadline_monotonic: float | None = None,
+    continue_guard: Callable[[], bool] | None = None,
 ) -> PaidTeardownObservationStep:
     """Observe once and perform the only legal paid teardown transition."""
     if (not ordinary_launch_binding.is_paid_provider_reconciliation_profile(
@@ -1137,15 +1482,23 @@ def advance_paid_teardown_observation(
             ProviderPresentTeardownPhase.ABSENCE_OBSERVATION_PENDING):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Paid teardown observation requires its durable pending phase.')
-    observation = reconcile(context,
-                            replica_info,
-                            authority,
-                            project_replica_result,
-                            before_absence_projection=before_absence_projection)
+    observation = reconcile(
+        context,
+        replica_info,
+        authority,
+        project_replica_result,
+        provider_operation_deadline_monotonic=(
+            provider_operation_deadline_monotonic),
+        continue_guard=continue_guard,
+    )
     if observation.evidence is ordinary_launch_binding.ProviderEvidence.ABSENT:
         return PaidTeardownObservationStep(
             PaidTeardownObservationDisposition.SETTLED_ABSENT, observation)
     if observation.evidence is ordinary_launch_binding.ProviderEvidence.PRESENT:
+        if continue_guard is not None and not continue_guard():
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Paid teardown observation lost lifecycle authority before '
+                'resubmission.')
         scheduled = request_postgres.requeue_bound_non_pool_provider_teardown_submission(
             context, authority)
         return PaidTeardownObservationStep(
@@ -1154,3 +1507,9 @@ def advance_paid_teardown_observation(
             scheduled_replica_info=scheduled)
     return PaidTeardownObservationStep(
         PaidTeardownObservationDisposition.RETRY_UNKNOWN, observation)
+
+
+if __name__ == '__main__':
+    if sys.argv[1:] != [_PROVIDER_CENSUS_WORKER_ARGUMENT]:
+        raise SystemExit(2)
+    raise SystemExit(_provider_census_worker_main())

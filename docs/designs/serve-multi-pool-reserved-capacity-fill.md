@@ -5,39 +5,40 @@ Last updated: 2026-09-04
 Status: **the PostgreSQL-authoritative reservation-aware planner, exact-card
 compatibility, bounded Spot-only paid admission, historical at-least-100 Spot
 scale, 10,000-request transport, and current-writer provider-native teardown
-are production-proven. Receipt schema 12's single sliding campaign,
-terminal-frontier, exact campaign-membership proof, and cancellation-resistant
-lifecycle finalizer are merged and deployed in release 1.1.1664. Its first
-current-writer run reached 172 provider-``RUNNING`` AWS Spot VMs, proving that
-provider scale is healthy, and qualified the provider gate at 131. It exposed
-one production liveness gate: all 172 launch graphs reached
-``SERVICE_JOB_RECORDED``, but readiness was published once for replicas 1--38
-and never again, pinning the fleet at 38 ``READY`` and 134 ``PROVISIONING``
-replicas for 38 minutes. The row-by-row paid transaction performed 5,915 SQL
-statements for one 100-member/552-pool wave. Retained native Aurora logs prove
-the immediate shared-row starvation mechanism: the old controller produced
-1,495 PostgreSQL lock-timeout cancellations from 02:19:31 through 03:08:04 UTC;
-1,361 targeted this service's ``services`` row and 134 targeted its
-``service_lifecycle_fences`` row. PostgreSQL recorded tuple-lock contexts for
-both relations, and the continuous 02:33--03:07 timeout interval exactly spans
-the 38-minute readiness freeze. The exact holding PID and statement were not
-retained because Performance Insights, enhanced monitoring, ``log_lock_waits``,
-and a pre-down ``pg_stat_activity`` capture were unavailable. The 5,915-
-statement capacity-admission transaction is therefore the strongest identified
-holder mechanism, and the set-based rewrite is necessary; only a live rerun can
-prove it is sufficient. The same investigation found an independent latent qualifier bug:
-partial queue and ledger observations had been combined as if they shared one
-transactional cut. Schema 13's evidence-capability correction is source-
-qualified but not yet deployed. Set-based paid admission, multi-wave current-
-writer traffic, drain, and exact-zero requalification therefore remain open.**
-The failed qualification did not leak billable state. Its cancellation-safe
-finalizer retained the exact service scope while normal controller teardown
-reduced 172 AWS Spot VMs to zero, then recorded three consecutive joined
-exact-zero observations for PostgreSQL debits, claims and waiters, AWS/GCP
-instances, provider disks, and in-flight provider operations. The cleanup
-phase completed in 1,716.2 seconds without manual row deletion or provider
-intervention; its immutable receipt SHA-256 is
-``9cb2b65b25004630a576cd9fc215e06dd4812a0a8d9eadc3426c9bc198df5ec9``.
+are production-proven independently. Release 1.1.1665 deployed the set-based
+paid-admission rewrite and receipt schema 13's evidence-capability correction.
+Its current-writer campaign reached 104 provider-``RUNNING`` AWS Spot VMs and
+later peaked at 125, so unpinned provider scale still works, but it first crossed
+100 after about 21 minutes and therefore missed the 900-second correctness gate.
+The campaign did not prove 10,000 successes. Aurora reached its configured eight
+ACU maximum, 100% CPU, and about 837 sessions while long-running disposable
+``sky.launch`` invocation processes each retained reusable, namespaced
+``QueuePool`` sessions for their entire provider call. That process/database
+lifecycle mismatch is the immediate production liveness blocker; the
+set-based admission transaction itself is no longer the observed bottleneck.
+The qualifier also exposed an independent test-plane liveness defect: its loop
+deadlines did not cap an already-awaited provider, PostgreSQL, load-balancer, or
+telemetry observation, so the nominal 900-second proof did not return at its
+deadline. The current source checkpoint moves synchronous provider and
+PostgreSQL observation behind two persistent, single-flight child process
+groups, one per dependency/client-lifetime authority domain. Cross-domain
+commands are rejected and unnecessary environment credentials are removed as
+defense in depth, but the children share the pod UID, ServiceAccount, mounts,
+and network and are not security sandboxes. Their JSON-lines commands consume
+the proof's remaining absolute phase budget; timeout or cancellation kills and
+reaps the whole group before control returns. This amortizes interpreter and
+client startup without weakening physical cancellation. It
+still requires deterministic regression gates, a homogeneous deployment, and
+a fresh current-writer ≥100/10,000/drain/exact-zero campaign. At 08:32--08:34
+UTC, supported sequential normal ``sky down`` removed exact cohort-15 rows
+121--136; the controller projected all 16 associations to
+``ABSENT/PROJECTED``, and services, replicas, claims, waiters, clusters, AWS
+``eu-south-2`` instances, and EBS volumes all reached and retained exact zero.
+This closes the prior database-settlement gate; scale latency and the complete
+10,000-success campaign remain open.**
+The failed qualification did not leak billable provider state. Its
+cancellation-safe finalizer retained the exact service scope while normal
+controller teardown reduced the campaign's scoped AWS Spot VMs to zero.
 Campaign `paid-e2e-1643a` committed the first 100 complete paid
 launch graphs in 8.4 seconds and produced 90 provider-`RUNNING` AWS Spot VMs;
 the other ten requests ended in exact AWS capacity failures. Thirteen provider
@@ -295,14 +296,21 @@ Receipt schema 11 therefore names and keeps three clocks separate:
    attempt advances to ``SUCCEEDED``. Provider and telemetry observation never
    delay, release, or otherwise control this transition.
 
-The verifier ownership boundary is normative:
+The billable E2E harness is itself a control plane. Its effect owners are the
+campaign offerer and one top-level lifecycle process; observers are killably
+bounded read-only capabilities. Four independent review axes are normative:
+mutation authority says who may change state, physical lifetime says when
+owned work is actually gone, the evidence cut says which ordered observations
+authorize a verdict, and aggregate budgets bound proof work, accepted work,
+finalization, and billable resources. Passing one axis never substitutes for
+another.
 
 | Owner | Permitted power | Forbidden power |
 |---|---|---|
 | Campaign offerer | Create each frozen identity once and, after a proof failure, stop only stimulus that has never been offered. | Cancel, shorten, or withhold completion from an offered or accepted request. |
 | Accepted production request path | Own queueing, backend processing/occupancy, and bounded terminal publication through the real load-balancer and ledger protocol. | Gate request lifetime or terminal publication on a verifier verdict. |
-| Provider and telemetry observers | Read production/provider state and append observations to evidence. | Launch, terminate, admit, complete, or otherwise mutate production state. |
-| Lifecycle finalizer | Always run scope-fenced provider-native cleanup and absence proof after success, failure, or cancellation. | Expand cleanup beyond frozen ownership or rewrite the qualification verdict. |
+| Provider and telemetry observers | Read production/provider state and append observations to evidence. | Launch, terminate, admit, complete, trigger cleanup, or otherwise mutate production state. |
+| Lifecycle finalizer | While its one process and event loop survive, invoke one cooperative-cancellation finalizer after success, failure, or cancellation; request normal scope-fenced teardown and then persist separately observed native absence. | Claim durable execution after owner loss, expand cleanup beyond frozen ownership, duplicate cleanup, or rewrite the qualification verdict. |
 | Receipt verdict | Persist local evidence and derive pass or failure after observation. | Mutate demand, requests, replicas, providers, or any other production state. |
 
 Evidence strength is also normative. Presence and liveness proofs consume the
@@ -347,11 +355,13 @@ offline validation rejects counter regression, ``offered > 800 + succeeded``,
 or a rolling load-balancer arrival count greater than ``offered``. The first
 800-resident proof does not block or delay any later completion.
 
-The proof dependency graph is deliberately one-way: the immutable 10,000-ID
-campaign produces a bounded sliding demand window; ordinary admission,
-processing, and terminal publication produce production evidence; the positive
-telemetry and at-least-100 provider observers only consume that evidence. The
-observers neither feed back into request lifetime nor depend on one another.
+The proof dependency graph is a DAG: immutable campaign offer → admission →
+processing → terminal publication; those states → independent telemetry and
+provider observers → receipt verdict or failure; that return invokes the one
+in-process lifecycle finalizer → normal teardown → separately observed and
+persisted native absence evidence. Auxiliary provider/local
+cleanup is a separate retryable, identity-fenced leaf. Observers neither feed back into request
+lifetime nor depend on one another.
 They may pass in either order. On a fatal proof failure, the qualification
 orchestrator may tell the driver to stop offering identities that have never
 been submitted; it must still let every already-offered identity finish its
@@ -367,6 +377,87 @@ second failure-path regression must prove an observer failure cannot cancel an
 accepted request. Together they prevent reintroducing a static completion latch
 under another name.
 
+One qualification owner starts two persistent JSON-lines sessions in parallel:
+one provider-only child and one PostgreSQL-only child. Each child has a frozen
+service/scope/profile identity, retains only its domain's clients, accepts one
+command at a time, and rejects cross-domain commands. These are dependency and
+client-lifetime boundaries, not OS privilege boundaries: environment
+minimization reduces accidental credential use but does not sandbox either
+same-pod child. One snapshot has a single evidence order: provider census, the
+parent's asynchronous authenticated load-balancer read, then PostgreSQL
+reduction. Only a validated on-time provider response may extend retained AWS
+cleanup identities, and cleanup preserves
+provider-census-before-PostgreSQL-debit order even when the latter fails.
+The provider child creates one fixed executor sized to its one or two actual
+cloud observers and reuses it for its lifecycle. The single-flight PostgreSQL
+child owns one explicit reusable ``QueuePool`` connection with zero overflow
+and bounded checkout/connect timeouts. Both pools close with their child.
+
+Provider transport carries compact service-scoped decision evidence, never raw
+project-wide resource payloads. Requests and responses share one four-MiB frame
+budget, also used as the subprocess stream-reader limit. The scale profile caps
+the campaign at 800 VMs, so this provides an aggregate four-KiB envelope per VM
+for compact instance, disk, and operation evidence plus protocol overhead.
+Frames above 64 KiB must work; an over-budget request fails before spawn and an
+over-budget response retires its child before failure returns.
+
+Each command's spawn/ready handshake, stdin drain, response read, and cadence
+sleep consumes the same absolute monotonic phase deadline. The resident process
+group may remain alive only while its owning qualification, freeze, or cleanup
+phase is alive. A command timeout, cancellation, EOF, or malformed protocol
+first sends TERM, then bounded-grace SIGKILL, then proves the whole process group
+extinct before returning. A later phase iteration may respawn only after that
+proof. Explicit close uses a separate bounded reap grace and applies the same
+descendant-extinction rule. There is no cooperative thread timeout or
+per-command interpreter-startup path. Acquiring a session's single-flight lock
+also consumes the caller's phase deadline; a waiter that expires behind another
+command fails without killing or otherwise disturbing the current owner.
+
+The general lifecycle invariant is: logical completion is not physical
+completion. Any operation that owns a thread, child, process group, connection,
+or provider effect must cross a quiescence boundary before its owner returns,
+reuses capacity, publishes absence, or claims cleanup. For these local child
+processes, quiescence means TERM/SIGKILL as needed, direct-child reap, and
+verified process-group/descendant extinction. For provider effects it means a
+separate complete native absence census; one invariant must not be used as
+evidence for the other.
+
+The aggregate budgets remain distinct. Proof collection has one phase
+deadline; each accepted request has its independent 600-second queue/terminal
+contract; the 300-second normal ``serve down`` budget covers durable
+``SHUTTING_DOWN`` admission and retry, not provider absence; the separate
+1,800-second cleanup budget proves exact native and database zero; and the
+smoke runner's outer billable timeout explicitly contains those phases plus
+termination grace. The local finalizer is invoked once only within one
+surviving process under cooperative asyncio cancellation or handled
+SIGINT/SIGTERM/SIGHUP. It is not a durable saga: ``SIGKILL``, process/pod loss,
+or node loss can prevent it from running. In that case the last lifecycle
+receipt remains interrupted or unknown and explicitly requires
+operator/external-reaper escalation; no exactly-once cleanup claim is made.
+
+One harder owner-loss gate remains open. Local ``sky serve up`` client death
+cannot prove that the remote ASGI request stopped before its durable service
+insert, and a later name scan cannot close that pre-insert race. The durable
+solution requires an authenticated caller-supplied operation UUID and
+idempotency token, exact duplicate-spec comparison, retry through one durable
+admission receipt, and exact cancel/quiescence of that operation. It is a
+production API contract (roughly six to eight files), not a harness-only
+patch, and is intentionally outside this checkpoint. Until it lands, a paid
+campaign requires an acknowledged ``serve up`` response before qualification
+and retains external/manual supervision for hard lifecycle-owner loss.
+
+The proof deadline bounds evidence collection; it does not erase the separate
+accepted-work contract. Once that deadline fixes a failed proof verdict, the
+top-level qualifier invokes the request driver's one idempotent close-and-drain
+operation. Admission closes, but every already-offered identity retains its
+independent queue, work, and terminal-publication budgets. The lifecycle
+finalizer starts only after those workers quiesce. Meta-tests stall each domain
+child and the asynchronous load-balancer read, inject lock contention, timeout,
+oversized frames, and repeated cancellation during process and request
+draining, and prove that valid responses above 64 KiB work, no timed-out or
+closed process group survives, the original primary failure is preserved, and
+the one live lifecycle process invokes its finalizer once.
+
 Receipt schemas 12 and 13 make the request driver one shielded cohort. The first
 worker failure closes admission under the same lock that advances the offered
 frontier, but it does not close the HTTP session or cancel sibling workers.
@@ -380,6 +471,13 @@ valid acceptance receives a separate named 600-second
 header-valid ``202/ACCEPTED`` is therefore terminalized even when its response
 body is malformed; the deferred protocol error is raised only after the exact
 accepted attempt reaches a terminal receipt.
+
+Each identity also has a typed attempt state: unseen, POST-in-flight/ambiguous,
+definitively unadmitted, accepted, or terminal. Campaign closure suppresses a
+new POST only for a definitively unadmitted attempt. An ambiguous attempt keeps
+performing read-only receipt recovery after closure and an accepted attempt
+keeps draining to terminal; neither can be replayed merely because the proof
+failed.
 
 The receipt stores the immutable request prefix and a canonical digest of the
 complete request-key manifest. The final PostgreSQL gate must observe exactly
@@ -3572,8 +3670,65 @@ lifecycle, original service version, non-null `committed_at`, and null
 atomically. A missing receipt remains valid for provider-free launch rejection;
 `ACTIVE`, `CANCELLED`, mismatched, active-route, or Kueue state fails closed.
 Current controller identity and mutable plan generations are intentionally not
-reconsulted, because a committed receipt must survive controller takeover. No
-provider operation can be authorized by this cleanup transaction.
+reconsulted, because a committed receipt must survive controller takeover. This
+generic retirement authority is provider-free and cannot authorize a cloud
+operation. A separate immutable auxiliary-cleanup authority may be derived in
+the same locked PostgreSQL snapshot only for a current-cohort, generation-one
+``ORDINARY_PAID`` association whose replica incarnation and global cluster UUID
+exactly rederive from its immutable replica record. It carries that complete
+action identity together with the canonical provider leaf scope. Retained
+N-1/N-2 associations and ``UNKNOWN_CAPACITY_REPLACEMENT`` may still complete
+provider-free row retirement after the global cluster row is independently
+absent, but can never inherit this auxiliary cloud-effect authority.
+
+Every new paid launch atomically commits a non-null ``replica_incarnation`` and
+``sky_cluster_record_uuid`` with fused admission. The retained request carries
+the immutable replica record from which those domain-separated identities are
+derived, and the backend writes the same UUID into its cluster row. A durable
+native ``ABSENT`` projection releases the paid claim, request pin, and launch
+provider authority before auxiliary finalization. The retained action-aware
+replica and cluster row are then the cleanup tombstone, not billing authority.
+Under the standard cluster-status and resource-operation locks, finalization
+consumes the distinct auxiliary authority and revalidates the exact replica
+record, cluster UUID, serialized handle, and immutable provider-evidence
+identity. For the supported paid VM contract it performs only one possible
+cloud effect: direct deletion of GCP's deterministic per-replica ports firewall,
+treating exact 404 as success and awaiting the returned global operation.
+Because discovery/ADC construction can perform network I/O before a
+request timeout exists, the complete GCP leaf runs in one process group. The
+parent retains the original absolute deadline and passes only its frozen
+remaining duration; the child creates a process-local deadline because
+absolute monotonic readings never cross processes. Parent timeout performs
+TERM, KILL, reap, and process-group absence proof before returning ambiguity to
+the outer exact retry. The delete request and exact operation wait share the
+child-local budget, disable SDK retries, and leave retry policy to the outer
+reconciler.
+Whole-service teardown runs observation and this auxiliary finalization through
+one fixed 16-worker lane, gives still-billable provider observation precedence,
+and drains every admitted bounded worker before relinquishing service ownership.
+It performs no VM/disk census and never deletes AWS's externally owned
+service-scoped security group. After validating the exact generated YAML path,
+the same leaf also removes only that replica's controller-local metadata, SSH
+entry, generated YAML, and debug YAML; it does not invoke generic provider
+cleanup or delete the durable cluster-YAML record. Only after those effects
+succeed may it remove the
+UUID-and-handle-fenced cluster row and retire the residual Serve row. An error,
+identity mismatch, managed clone image, attached volume, or custom network
+retains both tombstones for retry or adjudication without restoring the already
+released paid claim. Legacy null-identity rows fail closed while a same-name
+cluster row exists; a test-only service may be reset only after scope-fenced
+exact-zero evidence.
+
+The global cluster row is also the durable ordered completion receipt for
+provider auxiliaries.  The qualifier does not add a second GCP firewall
+census: production permits that exact row to disappear only after the
+identity-fenced ports-firewall delete reaches DONE or exact 404.  Unpaid
+production tests prove a firewall failure retains both cluster and replica
+rows, retry repeats the same identity, and the successful order is firewall,
+local exact artifacts, global cluster row, then replica.  Cleanup evidence
+therefore independently proves VM, disk, and create-operation absence plus the
+PostgreSQL graph's exact zero.  It does not claim to independently detect an
+out-of-band firewall recreation after finalization.
 
 Reserved-first uses the planner's existing typed projections and introduces no
 component-state abstraction. If the candidate proposes any new compatible
@@ -3810,6 +3965,27 @@ per launch slot, subject to the per-service teardown cap. Saturating either
 direction therefore cannot starve the other; normal scale-down, whole-service
 cleanup, failed-service purge, and orphan purge all use this gate rather than
 independent per-row loops.
+
+Database connection ownership follows the same aggregate-lifecycle rule as
+worker ownership. Reusable API, controller, load-balancer, and executor daemon
+processes may own an explicitly bounded process-local `QueuePool`; a disposable
+invocation process that executes exactly one request must use transient
+`NullPool` connections and close each transaction's physical session when the
+transaction ends. Passing a daemon's positive pool size into hundreds of
+minutes-long launch children would retain at least one idle session per engine
+namespace per child, making database sessions scale with provider latency
+rather than active database work. The configured budget is evaluated as the
+sum across every replica, process, engine namespace, advisory-lock session,
+asynchronous engine, and nested worker—not as a safe-looking per-process
+number. A wrapper seam test proves that the real one-request wrapper selects
+the transient policy before its first request-database read. A separate real
+spawned-process PostgreSQL test starts from the old positive policy, creates
+multiple production-shaped engine namespaces, and proves that the resulting
+engines are transient and retain no sessions after their transactions finish.
+The current-writer production rerun separately records peak PostgreSQL sessions
+and rejects the operational gate if retained sessions grow with in-flight
+provider launches after database transactions have completed; this is retained
+qualification evidence, not a new autoscaling input or correctness authority.
 
 An active launch worker may call `core.down` inline to clean a partial provider
 attempt before retrying. That cleanup remains charged to its launch reservation
@@ -4610,8 +4786,33 @@ totals are reduced from complete raw samples, not trusted receipt scalars. The
 gate also validates the typed physical scale timeout and diagnostic result,
 three distinct
 increasing pre-down natural-drain samples, and three distinct increasing
-post-down cleanup samples with canonical AWS and GCP zero projections. Runtime
-placement policy remains unchanged.
+post-down cleanup samples with canonical AWS and GCP zero projections. Cleanup
+receipt schema 3 reads each sample in one PostgreSQL REPEATABLE READ cut.  It
+requires the per-name lifecycle fence still equal the frozen epoch, the exact
+service row absent, all same-name replica rows absent, exact-hash paid claims
+absent, and *all* exact-hash waiter rows absent (including stale-heartbeat
+rows).  The same cut reduces the complete exact-incarnation launch graph with
+the production final-deletion classifiers: every association not proven
+terminal and execution-quiesced, every blocking or malformed API-request root,
+every retained queue delivery, and every retention pin is nonzero authority.
+Only fully settled/quiesced association and request tombstones may remain as
+history.  It derives global cluster UUID/name pairs from retained Cohort-16
+ordinary-paid associations and grows that exact identity catalog monotonically
+from the first cleanup observation; association GC can never shrink a later
+name-or-UUID lookup.  Every catalogued cluster row must be absent.  A one-sided
+UUID/name match, an advanced lifecycle fence, or a same-name foreign
+service/claim/waiter is an incarnation conflict, never zero.  Runtime placement
+policy remains unchanged.
+
+Request-root IDs are deliberately not duplicated into the harness cleanup
+scope. Every campaign association's ``tombstone_not_before`` is beyond the
+cleanup horizon, and the supported destructive writer locks that association,
+classifies its linked request as ``CLOSED_QUIESCED``, and requires zero queue
+and pin rows in the same final-deletion transaction before history can later be
+collected. Thus no supported GC can remove the association while an executable
+root remains. The qualifier reuses that classifier and root collector directly;
+the separate monotonic scope is needed only for the auxiliary global-cluster
+name/UUID whose physical deletion completes outside the request graph.
 
 PR #1854 is the canonical executable provider-native qualifier for the next
 run and supersedes PR #1813's GCP-only runner. Its merged code is source

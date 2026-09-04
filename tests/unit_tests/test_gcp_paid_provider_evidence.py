@@ -1,13 +1,21 @@
 """Tests for exact GCP VM and launch-owned boot-disk evidence."""
 
+import os
+import pathlib
+import sys
+import time
+import types
 from unittest import mock
 
 import pytest
 
 from sky.provision import common
+from sky.provision.gcp import exact_firewall_cleanup_worker
 from sky.provision.gcp import instance
 from sky.provision.gcp import instance_utils
+from sky.serve import non_pool_launch_reconciliation
 from sky.server.requests import postgres as request_postgres
+from sky.utils import subprocess_utils
 
 _PROJECT_ID = 'boltz-spot-project'
 _ZONE = 'us-central1-a'
@@ -426,4 +434,279 @@ def test_submit_exact_compute_terminations_never_waits_for_operations(
     assert collection.delete.return_value.execute.call_args_list == [
         mock.call(num_retries=instance_utils.GCP_MAX_RETRIES) for _ in names
     ]
+    wait.assert_not_called()
+
+
+def test_delete_exact_cluster_ports_firewall_uses_direct_delete_and_waits(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    compute = mock.Mock()
+    operation = {'name': 'delete-firewall'}
+    compute.firewalls.return_value.delete.return_value.execute.return_value = (
+        operation)
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'load_resource',
+                        lambda: compute)
+    wait = mock.Mock()
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'wait_for_operation',
+                        wait)
+
+    assert instance.delete_exact_cluster_ports_firewall(_PROJECT_ID,
+                                                        _INSTANCE_NAME)
+
+    compute.firewalls.return_value.list.assert_not_called()
+    compute.firewalls.return_value.delete.assert_called_once_with(
+        project=_PROJECT_ID, firewall=f'sky-ports-{_INSTANCE_NAME}')
+    compute.firewalls.return_value.delete.return_value.execute.assert_called_once_with(
+        num_retries=instance_utils.GCP_MAX_RETRIES)
+    wait.assert_called_once_with(operation, _PROJECT_ID, zone=None)
+
+
+def test_delete_exact_cluster_ports_firewall_bounds_operation_wait(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    compute = mock.Mock()
+    operation = {'name': 'delete-firewall'}
+    delete_request = compute.firewalls.return_value.delete.return_value
+    delete_request.execute.return_value = operation
+    wait_request = compute.globalOperations.return_value.wait.return_value
+    wait_request.execute.return_value = {'status': 'DONE'}
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'load_resource',
+                        lambda: compute)
+    wait = mock.Mock()
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'wait_for_operation',
+                        wait)
+
+    assert instance._delete_exact_cluster_ports_firewall_direct(  # pylint: disable=protected-access
+        _PROJECT_ID,
+        _INSTANCE_NAME,
+        deadline_monotonic=instance.time.monotonic() + 17)
+
+    delete_request.execute.assert_called_once_with(num_retries=0)
+    assert 0 < delete_request.http.timeout <= 17
+    compute.globalOperations.return_value.wait.assert_called_once_with(
+        project=_PROJECT_ID, operation='delete-firewall')
+    wait_request.execute.assert_called_once_with(num_retries=0)
+    assert 0 < wait_request.http.timeout <= delete_request.http.timeout
+    wait.assert_not_called()
+
+
+def test_delete_exact_cluster_ports_firewall_passes_one_absolute_deadline_to_worker(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    run_worker = mock.Mock(return_value=True)
+    monkeypatch.setattr(instance, '_run_exact_firewall_worker', run_worker)
+
+    assert instance.delete_exact_cluster_ports_firewall(
+        _PROJECT_ID, _INSTANCE_NAME, deadline_monotonic=117.5)
+
+    run_worker.assert_called_once_with(_PROJECT_ID, _INSTANCE_NAME, 117.5)
+
+
+def test_parent_freezes_relative_worker_budget_but_keeps_original_deadline(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    run_process = mock.Mock(return_value=subprocess_utils.ProcessGroupResult(
+        returncode=0, stdout=None, stderr=''))
+    monkeypatch.setattr(subprocess_utils, 'run_in_process_group', run_process)
+    monkeypatch.setattr(instance.time, 'monotonic', lambda: 100.0)
+    command = mock.Mock(return_value=['worker'])
+    monkeypatch.setattr(instance, '_exact_firewall_worker_command', command)
+    monkeypatch.setenv('GOOGLE_APPLICATION_CREDENTIALS', '/gcp/identity.json')
+    monkeypatch.setenv('AWS_SESSION_TOKEN', 'other-provider-secret')
+    monkeypatch.setenv('GITHUB_TOKEN', 'unrelated-secret')
+
+    assert instance._run_exact_firewall_worker(  # pylint: disable=protected-access
+        _PROJECT_ID, _INSTANCE_NAME, 110.0)
+
+    command.assert_called_once_with(_PROJECT_ID, _INSTANCE_NAME, 10.0)
+    assert run_process.call_args.kwargs['deadline_monotonic'] == 110.0
+    child_env = run_process.call_args.kwargs['env']
+    assert child_env['GOOGLE_APPLICATION_CREDENTIALS'] == '/gcp/identity.json'
+    assert 'AWS_SESSION_TOKEN' not in child_env
+    assert 'GITHUB_TOKEN' not in child_env
+
+
+def test_worker_constructs_a_local_deadline_from_relative_budget(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    direct_delete = mock.Mock(return_value=True)
+    monkeypatch.setattr(exact_firewall_cleanup_worker.instance,
+                        '_delete_exact_cluster_ports_firewall_direct',
+                        direct_delete)
+    monkeypatch.setattr(exact_firewall_cleanup_worker.instance.time,
+                        'monotonic', lambda: 200.0)
+
+    assert exact_firewall_cleanup_worker.main(
+        [_PROJECT_ID, _INSTANCE_NAME, '5.5']) == 0
+
+    direct_delete.assert_called_once_with(_PROJECT_ID,
+                                          _INSTANCE_NAME,
+                                          deadline_monotonic=205.5)
+
+
+def test_exact_firewall_worker_reports_already_absent_by_closed_return_code(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    run_process = mock.Mock(return_value=subprocess_utils.ProcessGroupResult(
+        returncode=instance._EXACT_FIREWALL_ALREADY_ABSENT_RETURN_CODE,  # pylint: disable=protected-access
+        stdout=None,
+        stderr=''))
+    monkeypatch.setattr(subprocess_utils, 'run_in_process_group', run_process)
+    monkeypatch.setattr(instance.time, 'monotonic', lambda: 100.0)
+    monkeypatch.setattr(instance, '_exact_firewall_worker_command',
+                        lambda *_args: ['worker'])
+
+    assert not instance._run_exact_firewall_worker(  # pylint: disable=protected-access
+        _PROJECT_ID, _INSTANCE_NAME, 110.0)
+
+
+@pytest.mark.skipif(not hasattr(os, 'killpg'),
+                    reason='requires POSIX process groups')
+def test_observation_lane_close_kills_exact_firewall_worker(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    worker_pid_path = tmp_path / 'firewall-worker.pid'
+    command = [
+        sys.executable,
+        '-c',
+        ('import os, pathlib, signal, sys, time; '
+         'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+         'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); '
+         'time.sleep(60)'),
+        str(worker_pid_path),
+    ]
+    monkeypatch.setattr(instance, '_exact_firewall_worker_command',
+                        lambda *_args: command)
+    lane = non_pool_launch_reconciliation.OneShotProviderObservationLane()
+
+    assert lane.schedule(
+        (3, 'record-3'),
+        lambda: instance._run_exact_firewall_worker(_PROJECT_ID, _INSTANCE_NAME,
+                                                    time.monotonic() + 60))
+    deadline = time.monotonic() + 5
+    while not worker_pid_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert worker_pid_path.exists()
+
+    lane.close()
+
+    assert not lane.has_work()
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(worker_pid_path.read_text()), 0)
+
+
+def test_exact_firewall_worker_and_descendant_are_killed_at_deadline(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    worker_pid_path = tmp_path / 'worker.pid'
+    descendant_pid_path = tmp_path / 'descendant.pid'
+    descendant_program = (
+        'import os, pathlib, signal, sys, time; '
+        'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+        'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); '
+        'time.sleep(60)')
+    command = [
+        sys.executable,
+        '-c',
+        ('import os, pathlib, signal, subprocess, sys, time; '
+         'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+         'subprocess.Popen([sys.executable, "-c", sys.argv[3], sys.argv[2]]); '
+         'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); '
+         'time.sleep(60)'),
+        str(worker_pid_path),
+        str(descendant_pid_path),
+        descendant_program,
+    ]
+    monkeypatch.setattr(instance, '_exact_firewall_worker_command',
+                        lambda *_args: command)
+
+    with pytest.raises(TimeoutError, match='Timed out deleting'):
+        instance._run_exact_firewall_worker(  # pylint: disable=protected-access
+            _PROJECT_ID, _INSTANCE_NAME,
+            instance.time.monotonic() + 1.0)
+
+    for pid_path in (worker_pid_path, descendant_pid_path):
+        process_id = int(pid_path.read_text())
+        with pytest.raises(ProcessLookupError):
+            os.kill(process_id, 0)
+
+
+def test_delete_exact_cluster_ports_firewall_does_not_reset_deadline_on_http_error(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class _FakeHttpError(Exception):
+
+        def __init__(self) -> None:
+            super().__init__('transient')
+            self.resp = types.SimpleNamespace(status=503)
+
+    compute = mock.Mock()
+    delete_request = compute.firewalls.return_value.delete.return_value
+    delete_request.execute.return_value = {'name': 'delete-firewall'}
+    wait_request = compute.globalOperations.return_value.wait.return_value
+    wait_request.execute.side_effect = _FakeHttpError()
+    monotonic_values = iter((101.0, 103.0))
+    monkeypatch.setattr(instance.time, 'monotonic',
+                        lambda: next(monotonic_values))
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'load_resource',
+                        lambda: compute)
+    monkeypatch.setattr(instance.gcp, 'http_error_exception',
+                        lambda: _FakeHttpError)
+
+    with pytest.raises(_FakeHttpError, match='transient'):
+        instance._delete_exact_cluster_ports_firewall_direct(  # pylint: disable=protected-access
+            _PROJECT_ID,
+            _INSTANCE_NAME,
+            deadline_monotonic=105)
+
+    assert delete_request.http.timeout == 4
+    delete_request.execute.assert_called_once_with(num_retries=0)
+    assert wait_request.http.timeout == 2
+    wait_request.execute.assert_called_once_with(num_retries=0)
+
+
+def test_delete_exact_cluster_ports_firewall_treats_404_as_success(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class _FakeHttpError(Exception):
+
+        def __init__(self) -> None:
+            super().__init__('not found')
+            self.resp = types.SimpleNamespace(status=404)
+
+    compute = mock.Mock()
+    compute.firewalls.return_value.delete.return_value.execute.side_effect = (
+        _FakeHttpError())
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'load_resource',
+                        lambda: compute)
+    monkeypatch.setattr(instance.gcp, 'http_error_exception',
+                        lambda: _FakeHttpError)
+    wait = mock.Mock()
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'wait_for_operation',
+                        wait)
+
+    assert not instance.delete_exact_cluster_ports_firewall(
+        _PROJECT_ID, _INSTANCE_NAME)
+
+    compute.firewalls.return_value.list.assert_not_called()
+    wait.assert_not_called()
+
+
+def test_delete_exact_cluster_ports_firewall_propagates_non_404(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class _FakeHttpError(Exception):
+
+        def __init__(self) -> None:
+            super().__init__('forbidden')
+            self.resp = types.SimpleNamespace(status=403)
+
+    compute = mock.Mock()
+    compute.firewalls.return_value.delete.return_value.execute.side_effect = (
+        _FakeHttpError())
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'load_resource',
+                        lambda: compute)
+    monkeypatch.setattr(instance.gcp, 'http_error_exception',
+                        lambda: _FakeHttpError)
+    wait = mock.Mock()
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'wait_for_operation',
+                        wait)
+
+    with pytest.raises(_FakeHttpError, match='forbidden'):
+        instance.delete_exact_cluster_ports_firewall(_PROJECT_ID,
+                                                     _INSTANCE_NAME)
+
+    compute.firewalls.return_value.list.assert_not_called()
     wait.assert_not_called()

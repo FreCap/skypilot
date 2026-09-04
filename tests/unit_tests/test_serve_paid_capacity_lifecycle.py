@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import importlib
 import json
+import os
 import pathlib
 import shlex
 import sys
@@ -116,7 +117,7 @@ def _install_operations(monkeypatch,
         events.append(('render', args.profile))
         pathlib.Path(args.output).write_text('rendered\n', encoding='utf-8')
 
-    def freeze(args):
+    async def freeze(args):
         events.append(('freeze', args.service_name))
         if freeze_error is not None:
             raise freeze_error
@@ -199,6 +200,120 @@ def test_sky_cli_lifecycle_pins_workspace_at_command_boundary(
     assert commands == [('sky', 'serve', 'up', '-n', 'paid-e2e', '-y',
                          str(tmp_path / 'service.yaml'), '--config',
                          'active_workspace=mt_hybrid')]
+
+
+def test_sky_cli_down_returns_after_durable_teardown_admission():
+    calls = []
+    lifecycle = lifecycle_module.SkyCliLifecycle(executable='sky',
+                                                 command_timeout_seconds=900,
+                                                 endpoint_timeout_seconds=900,
+                                                 down_timeout_seconds=300,
+                                                 poll_seconds=10,
+                                                 workspace=None)
+
+    async def run(*arguments, capture, phase_deadline):
+        calls.append((arguments, capture, phase_deadline.remaining()))
+        return lifecycle_module.CommandResult(returncode=0, stdout='')
+
+    lifecycle._run = run
+
+    asyncio.run(lifecycle.down('paid-e2e'))
+
+    assert len(calls) == 1
+    assert calls[0][0] == ('serve', 'down', '-y', 'paid-e2e')
+    assert calls[0][1] is False
+    assert 299 < calls[0][2] <= 300
+
+
+def test_sky_cli_command_communicate_uses_remaining_phase_deadline(monkeypatch):
+    monkeypatch.setattr(lifecycle_module, '_LIFECYCLE_REAP_GRACE_SECONDS', 0.05)
+    lifecycle = lifecycle_module.SkyCliLifecycle(executable=sys.executable,
+                                                 command_timeout_seconds=60,
+                                                 endpoint_timeout_seconds=60,
+                                                 down_timeout_seconds=60,
+                                                 poll_seconds=1,
+                                                 workspace=None)
+
+    async def exercise():
+        started = time.monotonic()
+        with pytest.raises(asyncio.TimeoutError):
+            await lifecycle._run(
+                '-c',
+                'import time; time.sleep(60)',
+                capture=True,
+                phase_deadline=(
+                    lifecycle_module.qualify.AbsoluteDeadline.after(0.05)))
+        assert time.monotonic() - started < 1
+
+    asyncio.run(exercise())
+
+
+def test_sky_cli_command_spawn_uses_remaining_phase_deadline(monkeypatch):
+    spawn_cancelled = False
+
+    async def create_subprocess_exec(*_command, **_kwargs):
+        nonlocal spawn_cancelled
+        try:
+            await asyncio.Future()
+        finally:
+            spawn_cancelled = True
+
+    monkeypatch.setattr(lifecycle_module.asyncio, 'create_subprocess_exec',
+                        create_subprocess_exec)
+    lifecycle = lifecycle_module.SkyCliLifecycle(executable='sky',
+                                                 command_timeout_seconds=60,
+                                                 endpoint_timeout_seconds=60,
+                                                 down_timeout_seconds=60,
+                                                 poll_seconds=1,
+                                                 workspace=None)
+
+    async def exercise():
+        started = time.monotonic()
+        with pytest.raises(asyncio.TimeoutError):
+            await lifecycle._run(
+                'serve',
+                'status',
+                capture=True,
+                phase_deadline=(
+                    lifecycle_module.qualify.AbsoluteDeadline.after(0.02)))
+        assert time.monotonic() - started < 1
+
+    asyncio.run(exercise())
+    assert spawn_cancelled
+
+
+def test_sky_cli_success_reaps_stubborn_process_group_descendant(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(lifecycle_module, '_LIFECYCLE_REAP_GRACE_SECONDS', 0.05)
+    pid_path = tmp_path / 'descendant.pid'
+    child_source = textwrap.dedent(f'''\
+        import pathlib
+        import signal
+        import subprocess
+        import sys
+        descendant = subprocess.Popen([
+            sys.executable, '-c',
+            'import signal, time; signal.signal(signal.SIGTERM, '
+            'signal.SIG_IGN); time.sleep(60)',
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+           stderr=subprocess.DEVNULL, close_fds=True)
+        pathlib.Path({str(pid_path)!r}).write_text(str(descendant.pid),
+                                                   encoding='utf-8')
+        print('complete')
+    ''')
+    lifecycle = lifecycle_module.SkyCliLifecycle(executable=sys.executable,
+                                                 command_timeout_seconds=2,
+                                                 endpoint_timeout_seconds=2,
+                                                 down_timeout_seconds=2,
+                                                 poll_seconds=0.1,
+                                                 workspace=None)
+
+    result = asyncio.run(lifecycle._run('-c', child_source, capture=True))
+
+    pid = int(pid_path.read_text(encoding='utf-8'))
+    assert result.stdout == 'complete'
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 def test_in_cluster_endpoint_uses_frozen_resource_scope(tmp_path):
@@ -312,13 +427,14 @@ def test_lifecycle_success_owns_normal_down_and_exact_cleanup(
     assert receipt['emergency_provider_cleanup'] == 'not_performed'
 
 
-@pytest.mark.parametrize('error', [
-    RuntimeError('failed'),
-    KeyboardInterrupt(),
-    asyncio.CancelledError(),
+@pytest.mark.parametrize(('error', 'expected_outcome'), [
+    (RuntimeError('failed'), 'failed'),
+    (KeyboardInterrupt(), 'interrupted'),
+    (asyncio.CancelledError(), 'interrupted'),
 ])
 def test_lifecycle_failure_or_interrupt_still_finalizes(monkeypatch, tmp_path,
-                                                        error):
+                                                        error,
+                                                        expected_outcome):
     events = []
     _install_operations(monkeypatch, events, qualification_error=error)
 
@@ -329,7 +445,7 @@ def test_lifecycle_failure_or_interrupt_still_finalizes(monkeypatch, tmp_path,
 
     assert [event[0] for event in events][-2:] == ['down', 'cleanup']
     receipt = _receipt(tmp_path)
-    assert receipt['outcome'] == 'failed'
+    assert receipt['outcome'] == expected_outcome
     assert receipt['cleanup_evidence_error_type'] is None
     assert receipt['exact_cleanup_proven'] is True
     assert receipt['cleanup_receipt_sha256'] is not None
@@ -372,6 +488,7 @@ def test_lifecycle_cleanup_starts_after_qualifier_terminal_drain(
     names = [event[0] for event in events]
     assert names.index('accepted') < names.index('terminal') < names.index(
         'down')
+    assert names.count('down') == names.count('cleanup') == 1
 
 
 def test_repeated_cancellation_cannot_interrupt_owned_finalizer(
@@ -413,7 +530,9 @@ def test_repeated_cancellation_cannot_interrupt_owned_finalizer(
 
     asyncio.run(scenario())
 
-    assert [event[0] for event in events][-2:] == ['down', 'cleanup']
+    names = [event[0] for event in events]
+    assert names[-2:] == ['down', 'cleanup']
+    assert names.count('down') == names.count('cleanup') == 1
     stages = {stage['name']: stage for stage in _receipt(tmp_path)['stages']}
     assert stages['serve-down']['outcome'] == 'passed'
     assert stages['wait-cleanup']['outcome'] == 'passed'
@@ -454,6 +573,7 @@ def test_first_cancellation_during_normal_finalizer_is_deferred(
     assert stages['serve-down']['outcome'] == 'passed'
     assert stages['wait-cleanup']['outcome'] == 'passed'
     assert _receipt(tmp_path)['exact_cleanup_proven'] is True
+
 
 def test_lost_up_acknowledgement_still_finalizes(monkeypatch, tmp_path):
     events = []

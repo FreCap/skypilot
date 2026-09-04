@@ -14,11 +14,13 @@ import shlex
 import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import types
 import typing
 from typing import Any
+from unittest import mock
 import urllib.error
 import urllib.request
 import uuid
@@ -151,6 +153,34 @@ def _provider_scope(**overrides):
     return qualifier.ProviderScope(**values)
 
 
+def _install_fake_isolated_sessions(monkeypatch, request):
+    sessions = []
+
+    class Session:
+
+        def __init__(self, domain, **_kwargs):
+            self.domain = domain
+            self.started = 0
+            self.requests = 0
+            self.closed = 0
+            sessions.append(self)
+
+        async def start(self, deadline_monotonic):
+            assert time.monotonic() < deadline_monotonic
+            self.started += 1
+
+        async def request(self, kind, arguments, deadline_monotonic):
+            assert qualifier._observation_domain(kind) is self.domain
+            self.requests += 1
+            return await request(kind, arguments, deadline_monotonic)
+
+        async def aclose(self):
+            self.closed += 1
+
+    monkeypatch.setattr(qualifier, 'IsolatedObserverSession', Session)
+    return sessions
+
+
 def _instance(*,
               provisioning_model: str = 'SPOT',
               cluster_name: str = 'paid-e2e-1',
@@ -253,6 +283,23 @@ def _database_state(**overrides):
     }
     values.update(overrides)
     return qualifier.DatabaseState(**values)
+
+
+def _cleanup_database_state(**overrides):
+    values = {
+        'debit_units': 0,
+        'claim_count': 0,
+        'waiter_count': 0,
+        'service_row_count': 0,
+        'replica_count': 0,
+        'cluster_record_count': 0,
+        'effect_capable_association_count': 0,
+        'blocking_request_count': 0,
+        'queue_delivery_count': 0,
+        'retention_pin_count': 0,
+    }
+    values.update(overrides)
+    return qualifier.CleanupDatabaseState(**values)
 
 
 def _provider_state(**overrides):
@@ -764,6 +811,33 @@ def test_campaign_progress_serializes_window_and_terminal_order():
 
     assert asyncio.run(exercise()) == qualifier.ExactRequestCampaignCounters(
         offered=3, succeeded=3)
+
+
+def test_campaign_close_does_not_deadlock_if_driver_is_cancelled_before_bind():
+    """A task cancelled before its first bytecode cannot strand close/drain."""
+
+    async def exercise():
+        progress = qualifier.ExactRequestCampaignProgress(total_count=1,
+                                                          window_size=1)
+        traffic = asyncio.create_task(
+            qualifier.send_exact_async_requests(endpoint='https://unused.test',
+                                                token='secret',
+                                                service_hash='incarnation-a',
+                                                prefix='pre-bind',
+                                                count=1,
+                                                concurrency=1,
+                                                hold_requests=1,
+                                                hold_seconds=1,
+                                                timeout_seconds=1,
+                                                request_queue_timeout_seconds=1,
+                                                terminal_timeout_seconds=1,
+                                                campaign_progress=progress))
+        traffic.cancel('before bind')
+        with pytest.raises(asyncio.CancelledError):
+            await traffic
+        return await asyncio.wait_for(progress.close_and_drain(), timeout=0.1)
+
+    assert asyncio.run(exercise()) == 0
 
 
 def test_positive_telemetry_deadline_allows_one_retry_after_scale_timeout():
@@ -1374,6 +1448,354 @@ def test_gcp_observer_sanitizes_api_failures():
     assert 'credential-bearing' not in str(error.value)
 
 
+def test_gcp_child_transport_compacts_service_decision_evidence():
+    cluster = 'paid-e2e-1'
+    name = f'{cluster}-head-1234abcd-compute'
+    group_id = str(uuid.uuid4())
+    census = qualifier.ProviderCensus(
+        instances=[{
+            'name': name,
+            'zone': 'zones/us-central1-a',
+            'labels': {
+                'ray-cluster-name': cluster,
+                'unneeded': 'x' * 100_000,
+            },
+            'scheduling': {
+                'provisioningModel': 'SPOT',
+                'unneeded': 'x' * 100_000,
+            },
+            'machineType': 'machineTypes/g2-standard-4',
+            'guestAccelerators': [{
+                'acceleratorType': 'acceleratorTypes/nvidia-l4',
+                'acceleratorCount': 1,
+                'unneeded': 'x' * 100_000,
+            }],
+            'status': 'RUNNING',
+            'metadata': 'x' * 100_000,
+        }, {
+            'name': 'unrelated-head-1234abcd-compute',
+            'zone': 'zones/us-central1-a',
+            'metadata': 'x' * 100_000,
+        }],
+        disks=[{
+            'name': name,
+            'zone': 'zones/us-central1-a',
+            'labels': {
+                'ray-cluster-name': cluster,
+                'skypilot-managed': 'true',
+                'unneeded': 'x' * 100_000,
+            },
+            'users': ['unneeded'],
+        }],
+        operations=[{
+            'operationType': 'insert',
+            'operationGroupId': group_id,
+            'targetLink': f'zones/us-central1-a/instances/{name}',
+            'status': 'DONE',
+            'unneeded': 'x' * 100_000,
+        }, {
+            'operationType': 'bulkInsert',
+            'operationGroupId': group_id,
+            'targetLink': 'regions/us-central1/instances/bulk',
+            'status': 'RUNNING',
+            'unneeded': 'x' * 100_000,
+        }, {
+            'operationType': 'insert',
+            'targetLink': ('zones/us-central1-a/instances/'
+                           'unrelated-head-1234abcd-compute'),
+            'status': 'RUNNING',
+            'unneeded': 'x' * 100_000,
+        }])
+
+    compact = qualifier._compact_gcp_provider_census('paid-e2e', census)
+
+    assert len(json.dumps(dataclasses.asdict(compact))) < 4096
+    assert len(compact.instances) == 1
+    assert compact.instances[0]['labels'] == {'ray-cluster-name': cluster}
+    assert compact.instances[0]['scheduling'] == {'provisioningModel': 'SPOT'}
+    assert compact.instances[0]['guestAccelerators'] == [{
+        'acceleratorType': 'acceleratorTypes/nvidia-l4',
+        'acceleratorCount': 1,
+    }]
+    assert len(compact.disks) == 1
+    assert len(compact.operations) == 2
+    assert all('unneeded' not in value for value in compact.operations)
+
+
+def test_provider_child_runtime_reuses_one_executor_per_lifecycle(monkeypatch):
+    executors = []
+
+    class Executor:
+
+        def __init__(self, *, max_workers, thread_name_prefix):
+            self.max_workers = max_workers
+            self.thread_name_prefix = thread_name_prefix
+            self.map_count = 0
+            self.shutdown_call = None
+            executors.append(self)
+
+        def map(self, function, observers):
+            self.map_count += 1
+            return [function(observer) for observer in observers]
+
+        def shutdown(self, *, wait, cancel_futures):
+            self.shutdown_call = (wait, cancel_futures)
+
+    class Gcp:
+
+        def census(self):
+            return qualifier.ProviderCensus(instances=[],
+                                            disks=[],
+                                            operations=[])
+
+    class Aws:
+
+        def __init__(self):
+            self.retained = {'us-east-2': []}
+
+        def census(self):
+            return qualifier.AwsProviderCensus(service_instances=(),
+                                               service_volumes=())
+
+        def accept_retained_volume_ids(self, value):
+            self.retained = value
+
+        def retained_volume_ids(self):
+            return self.retained
+
+    monkeypatch.setattr(qualifier.concurrent.futures, 'ThreadPoolExecutor',
+                        Executor)
+    monkeypatch.setattr(qualifier, '_provider_observers', lambda **_kwargs:
+                        (Gcp(), Aws()))
+    scope = _provider_scope()
+    arguments = {
+        'service_name': 'paid-e2e',
+        'scope': qualifier._scope_process_payload(scope),
+        'profile': dataclasses.asdict(qualifier.PROFILES['small']),
+        'retained': {
+            'us-east-2': [],
+        },
+    }
+    runtime = qualifier._IsolatedObserverChildRuntime(
+        qualifier.IsolatedObservationDomain.PROVIDER)
+
+    for _ in range(2):
+        result = runtime.execute(
+            qualifier.IsolatedObservationKind.PROVIDER_CENSUS, arguments)
+        assert result['retained_volume_ids_by_region'] == {'us-east-2': []}
+    runtime.close()
+
+    assert len(executors) == 1
+    assert executors[0].max_workers == 2
+    assert executors[0].map_count == 2
+    assert executors[0].shutdown_call == (True, True)
+
+
+def test_postgres_observer_has_one_explicit_reusable_connection(monkeypatch):
+    calls = []
+
+    class Engine:
+
+        def dispose(self):
+            calls.append('disposed')
+
+    def create_engine(database_url, **kwargs):
+        calls.append((database_url, kwargs))
+        return Engine()
+
+    monkeypatch.setattr(qualifier.sqlalchemy, 'create_engine', create_engine)
+    observer = qualifier.PostgresObserver(
+        'postgresql://user:password@database.example.test/sky', 'paid-e2e')
+    observer.close()
+
+    assert calls[0] == (
+        'postgresql://user:password@database.example.test/sky', {
+            'poolclass': qualifier.sqlalchemy.pool.QueuePool,
+            'pool_size': 1,
+            'max_overflow': 0,
+            'pool_timeout':
+                qualifier._POSTGRES_OBSERVER_OPERATION_TIMEOUT_SECONDS,
+            'pool_pre_ping': True,
+            'pool_recycle': 1800,
+            'connect_args': {
+                'connect_timeout':
+                    qualifier._POSTGRES_OBSERVER_OPERATION_TIMEOUT_SECONDS,
+            },
+        })
+    assert calls[1] == 'disposed'
+
+
+def test_postgres_cleanup_reads_complete_exact_graph_in_one_transaction():
+    scope = _provider_scope()
+    binding = _cleanup_binding()
+    seen = []
+
+    class Result:
+
+        def __init__(self, rows):
+            self._rows = rows
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return self._rows
+
+        def __iter__(self):
+            return iter(self._rows)
+
+    class Connection:
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def execute(statement, params=None):
+            sql = str(statement)
+            seen.append((sql, params))
+            if 'service_lifecycle_fences' in sql:
+                return Result([{'epoch': scope.lifecycle_epoch}])
+            if 'FROM services AS service' in sql:
+                return Result([])
+            if 'FROM replicas AS replica' in sql:
+                return Result([])
+            if 'FROM paid_capacity_claims' in sql:
+                return Result([])
+            if 'FROM paid_capacity_waiters' in sql:
+                return Result([])
+            if 'FROM serve_ordinary_launch_associations' in sql:
+                return Result([binding])
+            if 'FROM clusters' in sql:
+                return Result([])
+            return Result([])
+
+    class Engine:
+
+        @staticmethod
+        def begin():
+            return Connection()
+
+    observer = object.__new__(qualifier.PostgresObserver)
+    observer._engine = Engine()
+    observer._service_name = 'paid-e2e'
+    observer._provider_scope = scope
+
+    state, cleanup_scope = observer.cleanup_state(qualifier.CleanupScope())
+    assert state.is_exact_zero()
+    assert len(cleanup_scope.cluster_identities) == 1
+    waiter_query = next(
+        sql for sql, _ in seen if 'FROM paid_capacity_waiters' in sql)
+    assert 'heartbeat_at' not in waiter_query
+    binding_query, binding_params = next(
+        (sql, params)
+        for sql, params in seen
+        if 'FROM serve_ordinary_launch_associations' in sql)
+    assert 'service_hash = :service_hash' in binding_query
+    assert binding_params['service_hash'] == scope.service_hash
+    assert 'service_lifecycle_epoch = :lifecycle_epoch' in binding_query
+    assert binding_params['lifecycle_epoch'] == scope.lifecycle_epoch
+    cluster_query, cluster_params = next(
+        (sql, params) for sql, params in seen if 'FROM clusters' in sql)
+    assert 'name IN' in cluster_query
+    assert 'cluster_record_uuid IN' in cluster_query
+    assert cluster_params['cluster_names'] == (binding['cluster_name'],)
+
+
+def test_postgres_cleanup_identity_scope_never_shrinks_after_association_gc():
+    """Deleting history cannot hide a surviving exact global cluster row."""
+    scope = _provider_scope()
+    binding = _cleanup_binding()
+    identity = (qualifier._cleanup_cluster_record_identities([binding])[0])
+    transaction_index = -1
+
+    class Result:
+
+        def __init__(self, rows):
+            self._rows = rows
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return self._rows
+
+        def __iter__(self):
+            return iter(self._rows)
+
+    class Connection:
+
+        def __init__(self, index):
+            self._index = index
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            if 'service_lifecycle_fences' in sql:
+                return Result([{'epoch': scope.lifecycle_epoch}])
+            if ('FROM services AS service' in sql or
+                    'FROM replicas AS replica' in sql or
+                    'FROM paid_capacity_claims' in sql or
+                    'FROM paid_capacity_waiters' in sql):
+                return Result([])
+            if 'FROM serve_ordinary_launch_associations' in sql:
+                return Result([binding] if self._index == 0 else [])
+            if 'FROM clusters' in sql:
+                assert params['cluster_names'] == (binding['cluster_name'],)
+                if self._index == 0:
+                    return Result([])
+                return Result([{
+                    'name': binding['cluster_name'],
+                    'cluster_record_uuid': identity.cluster_record_uuid,
+                }])
+            return Result([])
+
+    class Engine:
+
+        @staticmethod
+        def begin():
+            nonlocal transaction_index
+            transaction_index += 1
+            return Connection(transaction_index)
+
+    observer = object.__new__(qualifier.PostgresObserver)
+    observer._engine = Engine()
+    observer._service_name = 'paid-e2e'
+    observer._provider_scope = scope
+
+    first, cleanup_scope = observer.cleanup_state(qualifier.CleanupScope())
+    assert first.is_exact_zero()
+    # A restarted isolated child receives the parent-owned monotonic scope.
+    restarted_observer = object.__new__(qualifier.PostgresObserver)
+    restarted_observer._engine = observer._engine
+    restarted_observer._service_name = observer._service_name
+    restarted_observer._provider_scope = observer._provider_scope
+    second, cleanup_scope = restarted_observer.cleanup_state(cleanup_scope)
+    assert second.cluster_record_count == 1
+    assert not second.is_exact_zero()
+    assert len(cleanup_scope.cluster_identities) == 1
+
+
+def test_cleanup_scope_protocol_round_trips_and_rejects_child_shrink():
+    binding = _cleanup_binding()
+    frozen = qualifier.CleanupScope().retain(
+        qualifier._cleanup_cluster_record_identities([binding]))
+    payload = qualifier._cleanup_scope_process_payload(frozen)
+
+    assert qualifier._cleanup_scope_from_process_payload(payload) == frozen
+    with pytest.raises(qualifier.GuardViolation, match='shrank'):
+        qualifier._accepted_cleanup_scope(
+            frozen,
+            qualifier._cleanup_scope_process_payload(qualifier.CleanupScope()))
+
+
 def test_aws_retained_identity_is_bound_to_frozen_catalog(monkeypatch):
     scope = _provider_scope(max_live_paid_gpu_units=8)
     pool = {
@@ -1614,7 +2036,10 @@ def test_aws_empty_root_attachment_retries_then_reduces_and_records(
     class Observer:
         """Narrow provider-observation interface with one transient miss."""
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             result = next(outcomes)
             if isinstance(result, Exception):
@@ -1631,13 +2056,15 @@ def test_aws_empty_root_attachment_retries_then_reduces_and_records(
                                     profile=profile,
                                     progress=progress,
                                     receipt=receipt,
-                                    phase='scale'))
+                                    phase='scale',
+                                    deadline_monotonic=time.monotonic() + 1))
     second = asyncio.run(
         qualifier._validated_sample(observer=observer,
                                     profile=profile,
                                     progress=progress,
                                     receipt=receipt,
-                                    phase='scale'))
+                                    phase='scale',
+                                    deadline_monotonic=time.monotonic() + 1))
 
     assert first is None
     assert second is not None
@@ -2520,10 +2947,365 @@ def test_cleanup_census_counts_instance_after_cluster_label_loss():
     assert state.running_count == 1
 
 
+def _cleanup_binding(*,
+                     replica_id=7,
+                     replica_record_id='22222222-2222-4222-8222-222222222222',
+                     cluster_name='paid-e2e-7'):
+    association_id = uuid.UUID('11111111-1111-4111-8111-111111111111')
+    quiesced_at = datetime.datetime(2026,
+                                    9,
+                                    1,
+                                    1,
+                                    0,
+                                    tzinfo=datetime.timezone.utc)
+    profile = qualifier.ordinary_launch_binding.NonPoolLaunchProfile.create(
+        qualifier.ordinary_launch_binding.NonPoolLaunchProfileKind.
+        ORDINARY_PAID,
+        authorization_reference=(
+            f'paid-capacity:incarnation:{replica_record_id}:pool'),
+        authorization_generation=1,
+        authorization_payload={'capacity_plan_generation': 1})
+    return {
+        'association_id': association_id,
+        'request_id': 'request-1',
+        'service_name': 'paid-e2e',
+        'service_hash': 'incarnation',
+        'service_lifecycle_epoch': 7,
+        'replica_id': replica_id,
+        'replica_record_id': replica_record_id,
+        'cluster_name': cluster_name,
+        'launch_generation': 1,
+        'paid_capacity_pool_key': 'pool',
+        'effect_phase': 'NOT_STARTED',
+        'resolution': 'PRE_EFFECT_TERMINAL',
+        'terminal_status': 'FAILED',
+        'terminal_cause': 'handler_failed',
+        'terminal_execution_generation': 1,
+        'execution_quiescence_required': True,
+        'execution_quiesced_generation': 1,
+        'execution_quiesced_at': quiesced_at,
+        'service_job_id': None,
+        'result_recorded_at': None,
+        'ambiguity_code': None,
+        'projected_at': quiesced_at,
+        'pin_released_at': quiesced_at,
+        'tombstone_not_before': quiesced_at + datetime.timedelta(days=60),
+        'cancel_reason': None,
+        'cancel_requested_at': None,
+        'binding_protocol_version':
+            (qualifier.ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION
+            ),
+        'profile_kind': profile.kind.value,
+        'profile_version': profile.version,
+        'profile_digest': profile.digest,
+        'capability_cohort_epoch':
+            (qualifier.ordinary_launch_binding.
+             ORDINARY_PAID_RESOURCE_ACTION_IDENTITY_COHORT_FLOOR),
+        'capability_profile_set_digest':
+            (qualifier.ordinary_launch_binding.
+             supported_non_pool_profile_set_digest()),
+        'receipt_protocol_version': 1,
+        'authorization_kind': profile.authorization_kind.value,
+        'authorization_reference': profile.authorization_reference,
+        'authorization_generation': profile.authorization_generation,
+        'authorization_digest': profile.authorization_digest,
+        'reconciliation_outcome': 'PRE_EFFECT_TERMINAL',
+        'provider_evidence': 'NOT_QUERIED',
+        'provider_evidence_observed_at': None,
+        'provider_evidence_payload': None,
+        'provider_evidence_digest': None,
+    }
+
+
+def _cleanup_replica(binding, *, sky_down_status='SUCCEEDED'):
+    identity = (qualifier.ordinary_launch_binding.
+                derive_fresh_ordinary_paid_resource_action_identity(
+                    replica_id=binding['replica_id'],
+                    replica_record_id=binding['replica_record_id'],
+                    cluster_name=binding['cluster_name']))
+    pool_key = json.dumps(
+        {
+            'accelerators': [['l4', 1]],
+            'cloud': 'gcp',
+            'instance_type': 'g2-standard-4',
+            'num_nodes': 1,
+            'region': 'us-central1',
+            'use_spot': True,
+            'version': 1,
+            'workspace': 'workspace-a',
+            'zone': 'us-central1-a',
+        },
+        sort_keys=True,
+        separators=(',', ':'))
+    return {
+        'replica_id': binding['replica_id'],
+        'replica_record_id': binding['replica_record_id'],
+        'cluster_name': binding['cluster_name'],
+        'sky_cluster_record_uuid': identity.sky_cluster_record_uuid,
+        'paid_capacity_pool_key': pool_key,
+        'sky_down_status': sky_down_status,
+        'replica_state': {
+            'status_property': {
+                'sky_down_status': sky_down_status,
+            },
+            'paid_capacity_pool_key': pool_key,
+            'is_zero_cost': False,
+        },
+    }
+
+
+def _cleanup_closed_request(binding):
+    return {
+        'request_id': binding['request_id'],
+        'ordinary_launch_association_id': binding['association_id'],
+        'handler_name': qualifier.non_pool_launch.NON_POOL_LAUNCH_HANDLER_NAME,
+        'status': binding['terminal_status'],
+        'terminal_cause': binding['terminal_cause'],
+        'finished_at': binding['execution_quiesced_at'],
+        'execution_generation': binding['terminal_execution_generation'],
+        'execution_quiescence_required': True,
+        'execution_quiesced_generation':
+            binding['execution_quiesced_generation'],
+        'execution_quiesced_at': binding['execution_quiesced_at'],
+        'resource_action_id': None,
+        'resource_action_attempt': None,
+        **{
+            field: binding[field] for field in qualifier._BOUND_REQUEST_PROFILE_FIELDS
+        },
+    }
+
+
+def _reduce_cleanup_execution(bindings, request_rows, queue_rows, pin_rows):
+    scope = _provider_scope()
+    return qualifier.cleanup_database_state_from_rows(
+        scope=scope,
+        lifecycle_fence_rows=[{
+            'epoch': scope.lifecycle_epoch
+        }],
+        service_rows=[],
+        replicas=[],
+        claim_rows=[],
+        waiter_rows=[],
+        bindings=bindings,
+        request_rows=request_rows,
+        queue_rows=queue_rows,
+        pin_rows=pin_rows,
+        cluster_identities=qualifier._cleanup_cluster_record_identities(
+            bindings),
+        cluster_rows=[])
+
+
+def test_cleanup_execution_state_ignores_only_closed_quiesced_history():
+    binding = _cleanup_binding()
+    request = _cleanup_closed_request(binding)
+
+    state = _reduce_cleanup_execution([binding], [request], [], [])
+
+    assert state.is_exact_zero()
+
+
+def test_cleanup_execution_state_counts_unquiesced_request_delivery_and_pin():
+    binding = _cleanup_binding()
+    request = {
+        **_cleanup_closed_request(binding),
+        'execution_quiesced_generation': None,
+        'execution_quiesced_at': None,
+    }
+
+    state = _reduce_cleanup_execution([binding], [request], [{
+        'request_id': binding['request_id']
+    }], [{
+        'pin_id': binding['association_id'],
+        'request_id': binding['request_id'],
+    }])
+
+    assert state.effect_capable_association_count == 0
+    assert state.blocking_request_count == 1
+    assert state.queue_delivery_count == 1
+    assert state.retention_pin_count == 1
+
+
+def test_cleanup_execution_state_counts_unsettled_association_authority():
+    binding = {
+        **_cleanup_binding(),
+        'resolution': 'BOUND',
+        'reconciliation_outcome': None,
+        'terminal_status': None,
+        'terminal_cause': None,
+        'terminal_execution_generation': None,
+        'execution_quiesced_generation': None,
+        'execution_quiesced_at': None,
+        'projected_at': None,
+        'pin_released_at': None,
+        'tombstone_not_before': None,
+    }
+
+    state = _reduce_cleanup_execution([binding], [], [], [])
+
+    assert state.effect_capable_association_count == 1
+    assert state.blocking_request_count == 0
+
+
+def test_cleanup_database_state_keeps_auxiliary_rows_live_after_debit_settles():
+    """Cohort-16 settlement is earlier than graph-finalization completion."""
+    binding = _cleanup_binding()
+    replica = _cleanup_replica(binding)
+    identity = (qualifier.ordinary_launch_binding.
+                derive_fresh_ordinary_paid_resource_action_identity(
+                    replica_id=binding['replica_id'],
+                    replica_record_id=binding['replica_record_id'],
+                    cluster_name=binding['cluster_name']))
+
+    state = qualifier.cleanup_database_state_from_rows(
+        scope=_provider_scope(),
+        lifecycle_fence_rows=[{
+            'epoch': 7
+        }],
+        service_rows=[],
+        replicas=[replica],
+        claim_rows=[],
+        waiter_rows=[],
+        bindings=[binding],
+        request_rows=[],
+        queue_rows=[],
+        pin_rows=[],
+        cluster_identities=qualifier._cleanup_cluster_record_identities(
+            [binding]),
+        cluster_rows=[{
+            'name': binding['cluster_name'],
+            'cluster_record_uuid': identity.sky_cluster_record_uuid,
+        }])
+
+    assert state.debit_units == 0
+    assert state.claim_count == 0
+    assert state.waiter_count == 0
+    assert state.replica_count == 1
+    assert state.cluster_record_count == 1
+    assert not state.is_exact_zero()
+
+
+def test_cleanup_database_state_accepts_retained_tombstone_identity_at_zero():
+    """Retained launch history is identity evidence, not a live resource."""
+    state = qualifier.cleanup_database_state_from_rows(
+        scope=_provider_scope(),
+        lifecycle_fence_rows=[{
+            'epoch': 7
+        }],
+        service_rows=[],
+        replicas=[],
+        claim_rows=[],
+        waiter_rows=[],
+        bindings=[_cleanup_binding()],
+        request_rows=[],
+        queue_rows=[],
+        pin_rows=[],
+        cluster_identities=qualifier._cleanup_cluster_record_identities(
+            [_cleanup_binding()]),
+        cluster_rows=[])
+
+    assert state.is_exact_zero()
+
+
+def test_cleanup_database_state_rejects_cluster_name_uuid_reincarnation():
+    binding = _cleanup_binding()
+    with pytest.raises(qualifier.GuardViolation,
+                       match='global cluster identity'):
+        qualifier.cleanup_database_state_from_rows(
+            scope=_provider_scope(),
+            lifecycle_fence_rows=[{
+                'epoch': 7
+            }],
+            service_rows=[],
+            replicas=[],
+            claim_rows=[],
+            waiter_rows=[],
+            bindings=[binding],
+            request_rows=[],
+            queue_rows=[],
+            pin_rows=[],
+            cluster_identities=qualifier._cleanup_cluster_record_identities(
+                [binding]),
+            cluster_rows=[{
+                'name': binding['cluster_name'],
+                'cluster_record_uuid':
+                    uuid.UUID('33333333-3333-4333-8333-333333333333'),
+            }])
+
+
+def test_cleanup_database_state_rejects_same_name_foreign_lifecycle():
+    scope = _provider_scope()
+    with pytest.raises(qualifier.GuardViolation,
+                       match='different service incarnation'):
+        qualifier.cleanup_database_state_from_rows(
+            scope=scope,
+            lifecycle_fence_rows=[{
+                'epoch': scope.lifecycle_epoch
+            }],
+            service_rows=[{
+                'service_hash': 'replacement',
+                'lifecycle_epoch': scope.lifecycle_epoch + 1,
+            }],
+            replicas=[],
+            claim_rows=[],
+            waiter_rows=[],
+            bindings=[],
+            request_rows=[],
+            queue_rows=[],
+            pin_rows=[],
+            cluster_identities=[],
+            cluster_rows=[])
+
+
+def test_cleanup_database_state_rejects_advanced_lifecycle_fence():
+    scope = _provider_scope()
+    with pytest.raises(qualifier.GuardViolation, match='lifecycle fence'):
+        qualifier.cleanup_database_state_from_rows(
+            scope=scope,
+            lifecycle_fence_rows=[{
+                'epoch': scope.lifecycle_epoch + 1
+            }],
+            service_rows=[],
+            replicas=[],
+            claim_rows=[],
+            waiter_rows=[],
+            bindings=[],
+            request_rows=[],
+            queue_rows=[],
+            pin_rows=[],
+            cluster_identities=[],
+            cluster_rows=[])
+
+
+def test_cleanup_database_state_counts_stale_waiter_as_retained_authority():
+    scope = _provider_scope()
+    state = qualifier.cleanup_database_state_from_rows(
+        scope=scope,
+        lifecycle_fence_rows=[{
+            'epoch': scope.lifecycle_epoch
+        }],
+        service_rows=[],
+        replicas=[],
+        claim_rows=[],
+        waiter_rows=[{
+            'service_hash': scope.service_hash,
+            'heartbeat_at': 1.0,
+        }],
+        bindings=[],
+        request_rows=[],
+        queue_rows=[],
+        pin_rows=[],
+        cluster_identities=[],
+        cluster_rows=[])
+
+    assert state.waiter_count == 1
+    assert not state.is_exact_zero()
+
+
 def _cleanup_wait_fixture(monkeypatch,
                           tmp_path,
                           census,
                           *,
+                          database_state=None,
                           timeout_seconds=2,
                           poll_seconds=0):
     base = _provider_scope()
@@ -2547,35 +3329,36 @@ def _cleanup_wait_fixture(monkeypatch,
     qualifier.write_provider_scope(scope_path, 'paid-e2e', scope)
     qualification_path.write_text('{"receipt": "test"}\n', encoding='utf-8')
 
-    class Postgres:
-        """Exact-zero database observer double."""
-
-        def __init__(self, *_args):
-            pass
-
-        def bind_provider_scope(self, observed_scope):
-            assert observed_scope == scope
-
-        @staticmethod
-        def cleanup_debits():
-            return (0, 0, 0)
-
-        @staticmethod
-        def close():
-            pass
-
     census_fn = census
+    database_state_fn = database_state or _cleanup_database_state
 
-    class Gcp:
-
-        @staticmethod
-        def census():
-            return census_fn()
+    async def isolated_observation(kind, arguments, deadline_monotonic,
+                                   **_kwargs):
+        assert qualifier._scope_from_process_payload(
+            arguments['scope']) == scope
+        if time.monotonic() >= deadline_monotonic:
+            raise qualifier.ObservationTimeoutError(
+                'Isolated observer exhausted its absolute deadline.')
+        if kind is qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
+            observed = census_fn()
+            return {
+                'gcp_census': dataclasses.asdict(observed),
+                'aws_census': None,
+                'retained_volume_ids_by_region': {},
+            }
+        assert kind is qualifier.IsolatedObservationKind.POSTGRES
+        assert arguments['projection'] == 'cleanup'
+        cleanup_scope = qualifier._cleanup_scope_from_process_payload(
+            arguments['cleanup_scope'])
+        return {
+            'cleanup': dataclasses.asdict(database_state_fn()),
+            'cleanup_scope':
+                qualifier._cleanup_scope_process_payload(cleanup_scope),
+        }
 
     monkeypatch.setenv('TEST_DATABASE_URL', 'postgresql://unused')
-    monkeypatch.setattr(qualifier, 'PostgresObserver', Postgres)
-    monkeypatch.setattr(qualifier, '_provider_observers', lambda **_kwargs:
-                        (Gcp(), None))
+    sessions = _install_fake_isolated_sessions(monkeypatch,
+                                               isolated_observation)
     args = types.SimpleNamespace(
         postgres_url_env='TEST_DATABASE_URL',
         service_name='paid-e2e',
@@ -2585,17 +3368,69 @@ def _cleanup_wait_fixture(monkeypatch,
         timeout_seconds=timeout_seconds,
         poll_seconds=poll_seconds,
     )
-    return args, output_path, qualification_path, scope
+    return args, output_path, qualification_path, scope, sessions
 
 
 def _empty_gcp_census():
     return qualifier.ProviderCensus(instances=[], disks=[], operations=[])
 
 
+def test_freeze_scope_owns_and_closes_one_postgres_session(
+        monkeypatch, tmp_path):
+    scope = _provider_scope()
+
+    async def request(kind, arguments, _deadline):
+        assert kind is qualifier.IsolatedObservationKind.FREEZE_SCOPE
+        assert arguments['service_name'] == 'paid-e2e'
+        return {'scope': qualifier._scope_process_payload(scope)}
+
+    sessions = _install_fake_isolated_sessions(monkeypatch, request)
+    monkeypatch.setenv('TEST_DATABASE_URL', 'postgresql://unused')
+    args = types.SimpleNamespace(postgres_url_env='TEST_DATABASE_URL',
+                                 service_name='paid-e2e',
+                                 output=str(tmp_path / 'scope.json'),
+                                 timeout_seconds=1,
+                                 poll_seconds=0)
+
+    asyncio.run(qualifier.freeze_provider_scope(args))
+
+    assert len(sessions) == 1
+    assert sessions[0].domain is qualifier.IsolatedObservationDomain.POSTGRES
+    assert sessions[0].requests == sessions[0].closed == 1
+
+
+def test_qualify_wrapper_closes_both_sessions_after_failure(monkeypatch):
+    sessions = []
+
+    class Session:
+
+        def __init__(self, domain):
+            self.domain = domain
+            self.closed = 0
+            sessions.append(self)
+
+        async def aclose(self):
+            self.closed += 1
+
+    async def fail(_args, provider, postgres):
+        assert provider.domain is qualifier.IsolatedObservationDomain.PROVIDER
+        assert postgres.domain is qualifier.IsolatedObservationDomain.POSTGRES
+        raise RuntimeError('proof failed')
+
+    monkeypatch.setattr(qualifier, 'IsolatedObserverSession', Session)
+    monkeypatch.setattr(qualifier, '_qualify_with_sessions', fail)
+
+    with pytest.raises(RuntimeError, match='proof failed'):
+        asyncio.run(qualifier.qualify(types.SimpleNamespace()))
+
+    assert len(sessions) == 2
+    assert all(session.closed == 1 for session in sessions)
+
+
 def test_wait_cleanup_writes_identity_bound_sustained_zero_receipt(
         monkeypatch, tmp_path):
-    args, output_path, qualification_path, scope = _cleanup_wait_fixture(
-        monkeypatch, tmp_path, _empty_gcp_census)
+    args, output_path, qualification_path, scope, sessions = (
+        _cleanup_wait_fixture(monkeypatch, tmp_path, _empty_gcp_census))
 
     asyncio.run(qualifier.wait_for_cleanup(args))
 
@@ -2608,6 +3443,57 @@ def test_wait_cleanup_writes_identity_bound_sustained_zero_receipt(
            ] == [True, True, True]
     assert payload['qualification_receipt_sha256'] == hashlib.sha256(
         qualification_path.read_bytes()).hexdigest()
+    assert len(sessions) == 2
+    assert all(session.started == session.closed == 1 for session in sessions)
+
+
+def test_wait_cleanup_does_not_pass_after_only_paid_debits_settle(
+        monkeypatch, tmp_path):
+    states = [
+        _cleanup_database_state(replica_count=1, cluster_record_count=1),
+        *[_cleanup_database_state() for _ in range(3)],
+    ]
+    args, output_path, _, _, _ = _cleanup_wait_fixture(
+        monkeypatch,
+        tmp_path,
+        _empty_gcp_census,
+        database_state=lambda: states.pop(0))
+
+    asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    assert [sample['exact_zero'] for sample in payload['samples']
+           ] == [False, True, True, True]
+    first = payload['samples'][0]
+    assert first['cleanup_replicas'] == 1
+    assert first['cleanup_cluster_records'] == 1
+
+
+def test_wait_cleanup_requires_exact_zero_execution_authority(
+        monkeypatch, tmp_path):
+    states = [
+        _cleanup_database_state(effect_capable_association_count=1,
+                                blocking_request_count=1,
+                                queue_delivery_count=1,
+                                retention_pin_count=1),
+        *[_cleanup_database_state() for _ in range(3)],
+    ]
+    args, output_path, _, _, _ = _cleanup_wait_fixture(
+        monkeypatch,
+        tmp_path,
+        _empty_gcp_census,
+        database_state=lambda: states.pop(0))
+
+    asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    assert [sample['exact_zero'] for sample in payload['samples']
+           ] == [False, True, True, True]
+    first = payload['samples'][0]
+    assert first['cleanup_effect_capable_associations'] == 1
+    assert first['cleanup_blocking_requests'] == 1
+    assert first['cleanup_queue_deliveries'] == 1
+    assert first['cleanup_retention_pins'] == 1
 
 
 def test_wait_cleanup_retries_provider_miss_and_restarts_zero_streak(
@@ -2623,8 +3509,8 @@ def test_wait_cleanup_retries_provider_miss_and_restarts_zero_streak(
             raise outcome
         return _empty_gcp_census()
 
-    args, output_path, _, _ = _cleanup_wait_fixture(monkeypatch, tmp_path,
-                                                    census)
+    args, output_path, _, _, _ = _cleanup_wait_fixture(monkeypatch, tmp_path,
+                                                       census)
 
     asyncio.run(qualifier.wait_for_cleanup(args))
 
@@ -2649,15 +3535,14 @@ def test_wait_cleanup_persistent_provider_miss_fails_at_deadline(
         attempts.append(None)
         raise RuntimeError('credential material')
 
-    args, output_path, _, _ = _cleanup_wait_fixture(monkeypatch,
-                                                    tmp_path,
-                                                    census,
-                                                    timeout_seconds=0.2,
-                                                    poll_seconds=0.01)
+    args, output_path, _, _, _ = _cleanup_wait_fixture(monkeypatch,
+                                                       tmp_path,
+                                                       census,
+                                                       timeout_seconds=0.2,
+                                                       poll_seconds=0.01)
 
-    with pytest.raises(
-            qualifier.QualificationError,
-            match='Teardown left paid database debits or scoped provider'):
+    with pytest.raises(qualifier.QualificationError,
+                       match='Teardown left service graph rows'):
         asyncio.run(qualifier.wait_for_cleanup(args))
 
     payload_text = output_path.read_text(encoding='utf-8')
@@ -2671,6 +3556,117 @@ def test_wait_cleanup_persistent_provider_miss_fails_at_deadline(
                for sample in payload['samples'])
     assert all(sample['exact_zero'] is False for sample in payload['samples'])
     assert 'credential material' not in payload_text
+
+
+def test_wait_cleanup_caps_provider_observation_at_phase_deadline(
+        monkeypatch, tmp_path):
+    attempts = []
+
+    def census():
+        attempts.append(None)
+        time.sleep(0.1)
+        return _empty_gcp_census()
+
+    args, output_path, _, _, _ = _cleanup_wait_fixture(monkeypatch,
+                                                       tmp_path,
+                                                       census,
+                                                       timeout_seconds=0.01,
+                                                       poll_seconds=0)
+
+    with pytest.raises(qualifier.ObservationTimeoutError,
+                       match='absolute deadline'):
+        asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    assert payload['outcome'] == 'failed'
+    assert payload['error_type'] == 'ObservationTimeoutError'
+    assert len(attempts) == 1
+    assert len(payload['samples']) == 1
+    assert payload['samples'][0]['observation_error_type'] == (
+        'ObservationTimeoutError')
+
+
+def test_cleanup_retains_aws_volume_identity_before_postgres_failure(
+        monkeypatch, tmp_path):
+    """A later tag miss cannot erase EBS scope learned before a DB failure."""
+    base = _provider_scope()
+    scope = dataclasses.replace(
+        base,
+        max_live_paid_gpu_units=1,
+        providers=('aws',),
+        project_id=None,
+        location_scope=None,
+        qualification_profile='provider-canary',
+        qualification_projection_sha256=(
+            qualifier._qualification_projection_sha256(
+                source_sha256=base.qualification_source_sha256,
+                profile=qualifier.PROFILES['provider-canary'],
+                providers=('aws',))),
+        catalog_shapes=tuple(
+            shape for shape in base.catalog_shapes
+            if shape.cloud == 'aws' and shape.gpu_units_per_instance == 1))
+    scope_path = tmp_path / 'scope.json'
+    qualification_path = tmp_path / 'qualification.json'
+    output_path = tmp_path / 'cleanup.json'
+    qualifier.write_provider_scope(scope_path, 'paid-e2e', scope)
+    qualification_path.write_text('{"receipt": "test"}\n', encoding='utf-8')
+    provider_calls = 0
+    postgres_calls = 0
+
+    async def isolated_observation(kind, arguments, _deadline, **_kwargs):
+        nonlocal provider_calls, postgres_calls
+        assert qualifier._scope_from_process_payload(
+            arguments['scope']) == scope
+        if kind is qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
+            provider_calls += 1
+            retained = arguments['retained']['us-east-2']
+            if provider_calls == 1:
+                assert retained == []
+            else:
+                assert retained == ['vol-new']
+            # The first result discovers the service-tagged volume. On the next
+            # pass its tag query is absent, but retained-ID lookup still finds
+            # it. Only later does that exact retained identity disappear.
+            volumes = ((_aws_volume(),) if provider_calls <= 2 else ())
+            return {
+                'gcp_census': None,
+                'aws_census': dataclasses.asdict(
+                    qualifier.AwsProviderCensus(service_instances=(),
+                                                service_volumes=volumes)),
+                'retained_volume_ids_by_region': {
+                    'us-east-2': ['vol-new']
+                },
+            }
+        assert kind is qualifier.IsolatedObservationKind.POSTGRES
+        assert arguments['projection'] == 'cleanup'
+        postgres_calls += 1
+        if postgres_calls == 1:
+            raise RuntimeError('database unavailable')
+        cleanup_scope = qualifier._cleanup_scope_from_process_payload(
+            arguments['cleanup_scope'])
+        return {
+            'cleanup': dataclasses.asdict(_cleanup_database_state()),
+            'cleanup_scope':
+                qualifier._cleanup_scope_process_payload(cleanup_scope),
+        }
+
+    monkeypatch.setenv('TEST_DATABASE_URL', 'postgresql://unused')
+    _install_fake_isolated_sessions(monkeypatch, isolated_observation)
+    args = types.SimpleNamespace(postgres_url_env='TEST_DATABASE_URL',
+                                 service_name='paid-e2e',
+                                 scope=str(scope_path),
+                                 receipt=str(qualification_path),
+                                 output=str(output_path),
+                                 timeout_seconds=2,
+                                 poll_seconds=0)
+
+    asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    assert [sample['exact_zero'] for sample in payload['samples']
+           ] == [False, False, True, True, True]
+    assert payload['samples'][0]['observation_error_type'] == 'RuntimeError'
+    assert payload['samples'][1]['cleanup_provider_disks'] == 1
 
 
 @pytest.mark.parametrize('child_status', ('RUNNING', 'DONE'))
@@ -3500,7 +4496,10 @@ def test_exact_provider_free_unbound_paid_debit_remains_visible_during_scale(
     class Observer:
         """Return one provider-free phase-A observation."""
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             return phase_a
 
@@ -3512,7 +4511,8 @@ def test_exact_provider_free_unbound_paid_debit_remains_visible_during_scale(
                                     profile=qualifier.PROFILES['scale'],
                                     progress=qualifier.Progress(),
                                     receipt=receipt,
-                                    phase='scale'))
+                                    phase='scale',
+                                    deadline_monotonic=time.monotonic() + 1))
     assert observed is phase_a
     sample = receipt._payload['samples'][-1]
     assert sample['phase'] == 'scale'
@@ -3536,7 +4536,10 @@ def test_phase_a_observation_cannot_hide_a_provider_effect(tmp_path):
     class Observer:
         """Return a phase-A observation that already has a provider effect."""
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             return phase_a_with_effect
 
@@ -3550,7 +4553,9 @@ def test_phase_a_observation_cannot_hide_a_provider_effect(tmp_path):
                                         profile=qualifier.PROFILES['scale'],
                                         progress=qualifier.Progress(),
                                         receipt=receipt,
-                                        phase='scale'))
+                                        phase='scale',
+                                        deadline_monotonic=(time.monotonic() +
+                                                            1)))
 
 
 @pytest.mark.parametrize('phase', ['baseline', 'drain'])
@@ -3560,10 +4565,13 @@ def test_zero_gates_require_complete_demand_reports(tmp_path, phase):
     class Observer:
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             return _request_telemetry()
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert require_complete_demand_report
             return observation
 
@@ -3575,7 +4583,8 @@ def test_zero_gates_require_complete_demand_reports(tmp_path, phase):
                                     profile=qualifier.PROFILES['scale'],
                                     progress=qualifier.Progress(),
                                     receipt=receipt,
-                                    phase=phase))
+                                    phase=phase,
+                                    deadline_monotonic=time.monotonic() + 1))
     assert observed is observation
     assert receipt._payload['samples'][-1]['phase'] == phase
 
@@ -3590,10 +4599,13 @@ def test_provider_baseline_fails_on_first_valid_nonzero_sample(tmp_path):
     class Observer:
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             return _request_telemetry()
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert require_complete_demand_report
             return observations.pop(0)
 
@@ -3619,7 +4631,7 @@ def test_request_baseline_fails_on_first_valid_nonzero_sample(tmp_path):
 
     class Observer:
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             return telemetry.pop(0)
 
         @staticmethod
@@ -3788,6 +4800,563 @@ def test_progress_scale_counts_physical_vms_not_logical_gpu_units():
     assert progress.scale_reached_monotonic is None
 
 
+def _write_immediate_observer_child(path: pathlib.Path) -> None:
+    path.write_text(textwrap.dedent('''\
+            import json
+            import sys
+
+            print(json.dumps({
+                'protocol_version': 1,
+                'ready': True,
+                'domain': sys.argv[2],
+            }), flush=True)
+            for line in sys.stdin:
+                request = json.loads(line)
+                print(json.dumps({
+                    'protocol_version': 1,
+                    'request_id': request['request_id'],
+                    'ok': True,
+                    'result': {'observed': True},
+                }), flush=True)
+        '''),
+                    encoding='utf-8')
+
+
+def _write_timeout_then_success_observer_child(path: pathlib.Path) -> None:
+    path.write_text(textwrap.dedent('''\
+            import json
+            import os
+            import pathlib
+            import signal
+            import sys
+            import time
+
+            print(json.dumps({
+                'protocol_version': 1,
+                'ready': True,
+                'domain': sys.argv[2],
+            }), flush=True)
+            request = json.loads(sys.stdin.readline())
+            marker = pathlib.Path(request['arguments']['marker_path'])
+            if not marker.exists():
+                marker.write_text('started', encoding='utf-8')
+                pathlib.Path(request['arguments']['pid_path']).write_text(
+                    str(os.getpid()), encoding='utf-8')
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                time.sleep(60)
+            print(json.dumps({
+                'protocol_version': 1,
+                'request_id': request['request_id'],
+                'ok': True,
+                'result': {'observed': True},
+            }), flush=True)
+            for _line in sys.stdin:
+                pass
+        '''),
+                    encoding='utf-8')
+
+
+def _write_observer_with_stubborn_descendant(path: pathlib.Path) -> None:
+    path.write_text(textwrap.dedent('''\
+            import json
+            import pathlib
+            import subprocess
+            import sys
+            import time
+
+            print(json.dumps({
+                'protocol_version': 1,
+                'ready': True,
+                'domain': sys.argv[2],
+            }), flush=True)
+            request = json.loads(sys.stdin.readline())
+            pid_path = pathlib.Path(request['arguments']['pid_path'])
+            child_source = (
+                "import os, pathlib, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"pathlib.Path({str(pid_path)!r}).write_text("
+                "str(os.getpid()), encoding='utf-8'); time.sleep(60)"
+            )
+            subprocess.Popen(
+                [sys.executable, '-c', child_source],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            while not pid_path.exists():
+                time.sleep(0.001)
+            print(json.dumps({
+                'protocol_version': 1,
+                'request_id': request['request_id'],
+                'ok': True,
+                'result': {'observed': True},
+            }), flush=True)
+            for _line in sys.stdin:
+                pass
+        '''),
+                    encoding='utf-8')
+
+
+def _write_serial_observer_child(path: pathlib.Path) -> None:
+    path.write_text(textwrap.dedent('''\
+            import json
+            import os
+            import pathlib
+            import sys
+            import time
+
+            print(json.dumps({
+                'protocol_version': 1,
+                'ready': True,
+                'domain': sys.argv[2],
+            }), flush=True)
+            for line in sys.stdin:
+                request = json.loads(line)
+                arguments = request['arguments']
+                marker = arguments.get('marker_path')
+                if marker is not None:
+                    pathlib.Path(marker).write_text(
+                        str(os.getpid()), encoding='utf-8')
+                time.sleep(arguments.get('delay_seconds', 0))
+                print(json.dumps({
+                    'protocol_version': 1,
+                    'request_id': request['request_id'],
+                    'ok': True,
+                    'result': {
+                        'blob': 'x' * arguments.get('response_bytes', 0),
+                    },
+                }), flush=True)
+        '''),
+                    encoding='utf-8')
+
+
+def _write_oversized_observer_child(path: pathlib.Path) -> None:
+    path.write_text(textwrap.dedent('''\
+            import json
+            import os
+            import pathlib
+            import sys
+            import time
+
+            print(json.dumps({
+                'protocol_version': 1,
+                'ready': True,
+                'domain': sys.argv[2],
+            }), flush=True)
+            request = json.loads(sys.stdin.readline())
+            pathlib.Path(request['arguments']['pid_path']).write_text(
+                str(os.getpid()), encoding='utf-8')
+            print(json.dumps({
+                'protocol_version': 1,
+                'request_id': request['request_id'],
+                'ok': True,
+                'result': {'blob': 'x' * 4096},
+            }), flush=True)
+            time.sleep(60)
+        '''),
+                    encoding='utf-8')
+
+
+def _pid_is_executing(pid: int) -> bool:
+    try:
+        state = pathlib.Path(f'/proc/{pid}/stat').read_text(
+            encoding='utf-8').split()[2]
+    except (FileNotFoundError, IndexError):
+        return False
+    return state != 'Z'
+
+
+def test_persistent_observer_timeout_reaps_group_then_respawns(
+        tmp_path, monkeypatch):
+    child = tmp_path / 'timeout_then_success.py'
+    pid_path = tmp_path / 'observer.pid'
+    marker_path = tmp_path / 'first-started'
+    _write_timeout_then_success_observer_child(child)
+    monkeypatch.setattr(qualifier, '_ISOLATED_OBSERVER_TERMINATE_GRACE_SECONDS',
+                        0.05)
+    real_spawn = qualifier.asyncio.create_subprocess_exec
+    spawns = []
+
+    async def spawn(*args, **kwargs):
+        spawns.append(args)
+        return await real_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(qualifier.asyncio, 'create_subprocess_exec', spawn)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        started = time.monotonic()
+        try:
+            with pytest.raises(qualifier.ObservationTimeoutError):
+                await session.request(
+                    qualifier.IsolatedObservationKind.PROVIDER_CENSUS, {
+                        'service_name': 'paid-e2e',
+                        'pid_path': str(pid_path),
+                        'marker_path': str(marker_path),
+                    },
+                    # Process startup competes with the rest of the xdist
+                    # suite.  Keep the deadline short relative to the child's
+                    # 60-second hang, but long enough that the request reaches
+                    # the child before the timeout being exercised.
+                    time.monotonic() + 2)
+            pid = int(pid_path.read_text(encoding='utf-8'))
+            assert time.monotonic() - started < 3
+            assert not _pid_is_executing(pid)
+            assert await session.request(
+                qualifier.IsolatedObservationKind.PROVIDER_CENSUS, {
+                    'service_name': 'paid-e2e',
+                    'pid_path': str(pid_path),
+                    'marker_path': str(marker_path),
+                },
+                time.monotonic() + 1) == {
+                    'observed': True
+                }
+        finally:
+            await session.aclose()
+
+    asyncio.run(exercise())
+    assert len(spawns) == 2
+
+
+def test_persistent_observer_cancellation_reaps_before_propagating(
+        tmp_path, monkeypatch):
+    child = tmp_path / 'cancel_then_success.py'
+    pid_path = tmp_path / 'observer.pid'
+    marker_path = tmp_path / 'first-started'
+    _write_timeout_then_success_observer_child(child)
+    monkeypatch.setattr(qualifier, '_ISOLATED_OBSERVER_TERMINATE_GRACE_SECONDS',
+                        0.05)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        arguments = {
+            'service_name': 'paid-e2e',
+            'pid_path': str(pid_path),
+            'marker_path': str(marker_path),
+        }
+        task = asyncio.create_task(
+            session.request(qualifier.IsolatedObservationKind.PROVIDER_CENSUS,
+                            arguments,
+                            time.monotonic() + 10))
+        try:
+            for _ in range(1000):
+                if pid_path.exists():
+                    break
+                await asyncio.sleep(0.001)
+            pid = int(pid_path.read_text(encoding='utf-8'))
+            task.cancel('primary cancellation')
+            for _ in range(5):
+                await asyncio.sleep(0)
+                task.cancel('later cancellation')
+            with pytest.raises(asyncio.CancelledError) as cancelled:
+                await task
+            assert cancelled.value.args == ('primary cancellation',)
+            assert not _pid_is_executing(pid)
+            assert await session.request(
+                qualifier.IsolatedObservationKind.PROVIDER_CENSUS, arguments,
+                time.monotonic() + 1) == {
+                    'observed': True
+                }
+        finally:
+            await session.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_persistent_observer_production_child_keeps_stdout_protocol_clean():
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER)
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='lacks a service name'):
+                await session.request(
+                    qualifier.IsolatedObservationKind.PROVIDER_CENSUS,
+                    {'service_name': ''},
+                    time.monotonic() + 30)
+        finally:
+            await session.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_persistent_observer_close_reaps_stubborn_descendant(
+        tmp_path, monkeypatch):
+    child = tmp_path / 'observer_with_descendant.py'
+    pid_path = tmp_path / 'descendant.pid'
+    _write_observer_with_stubborn_descendant(child)
+    monkeypatch.setattr(qualifier, '_ISOLATED_OBSERVER_TERMINATE_GRACE_SECONDS',
+                        0.05)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        assert await session.request(
+            qualifier.IsolatedObservationKind.PROVIDER_CENSUS, {
+                'service_name': 'paid-e2e',
+                'pid_path': str(pid_path),
+            },
+            time.monotonic() + 1) == {
+                'observed': True
+            }
+        pid = int(pid_path.read_text(encoding='utf-8'))
+        assert _pid_is_executing(pid)
+        await session.aclose()
+        for _ in range(100):
+            if not _pid_is_executing(pid):
+                break
+            await asyncio.sleep(0.01)
+        assert not _pid_is_executing(pid)
+
+    asyncio.run(exercise())
+
+
+def test_persistent_observer_reuses_one_spawn_and_scopes_authority(
+        monkeypatch, tmp_path):
+    calls = []
+    child = tmp_path / 'immediate.py'
+    _write_immediate_observer_child(child)
+    real_spawn = qualifier.asyncio.create_subprocess_exec
+
+    async def create_subprocess_exec(*command, **kwargs):
+        calls.append((command, kwargs))
+        return await real_spawn(*command, **kwargs)
+
+    monkeypatch.setenv('SKYPILOT_DB_CONNECTION_URI', 'postgresql://secret')
+    monkeypatch.setenv('AWS_SECRET_ACCESS_KEY', 'cloud-secret')
+    monkeypatch.setattr(qualifier.asyncio, 'create_subprocess_exec',
+                        create_subprocess_exec)
+
+    async def exercise():
+        provider = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        postgres = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.POSTGRES, child_program=child)
+        deadline = time.monotonic() + 2
+        try:
+            for _ in range(2):
+                assert await provider.request(
+                    qualifier.IsolatedObservationKind.PROVIDER_CENSUS,
+                    {'service_name': 'paid-e2e'}, deadline) == {
+                        'observed': True
+                    }
+            assert await postgres.request(
+                qualifier.IsolatedObservationKind.POSTGRES,
+                {'service_name': 'paid-e2e'}, deadline) == {
+                    'observed': True
+                }
+            with pytest.raises(qualifier.QualificationError,
+                               match='authority domain'):
+                await provider.request(
+                    qualifier.IsolatedObservationKind.POSTGRES,
+                    {'service_name': 'paid-e2e'}, deadline)
+        finally:
+            await asyncio.gather(provider.aclose(), postgres.aclose())
+
+    asyncio.run(exercise())
+
+    assert len(calls) == 2
+    assert all(
+        call[1]['stderr'] is asyncio.subprocess.DEVNULL for call in calls)
+    assert all(call[1]['start_new_session'] is True for call in calls)
+    assert calls[0][0][-1] == 'provider'
+    assert calls[1][0][-1] == 'postgres'
+    assert 'SKYPILOT_DB_CONNECTION_URI' not in calls[0][1]['env']
+    assert calls[0][1]['env']['AWS_SECRET_ACCESS_KEY'] == 'cloud-secret'
+    assert 'AWS_SECRET_ACCESS_KEY' not in calls[1][1]['env']
+
+
+def test_persistent_observer_waiter_deadline_does_not_kill_inflight_owner(
+        monkeypatch, tmp_path):
+    child = tmp_path / 'serial.py'
+    marker_path = tmp_path / 'first-started'
+    _write_serial_observer_child(child)
+    real_spawn = qualifier.asyncio.create_subprocess_exec
+    spawns = []
+
+    async def create_subprocess_exec(*command, **kwargs):
+        spawns.append(command)
+        return await real_spawn(*command, **kwargs)
+
+    monkeypatch.setattr(qualifier.asyncio, 'create_subprocess_exec',
+                        create_subprocess_exec)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        first = asyncio.create_task(
+            session.request(
+                qualifier.IsolatedObservationKind.PROVIDER_CENSUS, {
+                    'service_name': 'paid-e2e',
+                    'marker_path': str(marker_path),
+                    'delay_seconds': 0.15,
+                },
+                time.monotonic() + 2))
+        try:
+            for _ in range(1000):
+                if marker_path.exists():
+                    break
+                await asyncio.sleep(0.001)
+            pid = int(marker_path.read_text(encoding='utf-8'))
+            with pytest.raises(qualifier.ObservationTimeoutError):
+                await session.request(
+                    qualifier.IsolatedObservationKind.PROVIDER_CENSUS,
+                    {'service_name': 'paid-e2e'},
+                    time.monotonic() + 0.02)
+            assert _pid_is_executing(pid)
+            assert await first == {'blob': ''}
+            assert await session.request(
+                qualifier.IsolatedObservationKind.PROVIDER_CENSUS,
+                {'service_name': 'paid-e2e'},
+                time.monotonic() + 1) == {
+                    'blob': ''
+                }
+        finally:
+            if not first.done():
+                first.cancel()
+                await asyncio.gather(first, return_exceptions=True)
+            await session.aclose()
+
+    asyncio.run(exercise())
+    assert len(spawns) == 1
+
+
+def test_persistent_observer_accepts_response_larger_than_stream_default(
+        tmp_path):
+    child = tmp_path / 'large.py'
+    _write_serial_observer_child(child)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        try:
+            result = await session.request(
+                qualifier.IsolatedObservationKind.PROVIDER_CENSUS, {
+                    'service_name': 'paid-e2e',
+                    'response_bytes': 70_000,
+                },
+                time.monotonic() + 2)
+            assert len(result['blob']) == 70_000
+        finally:
+            await session.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_persistent_observer_rejects_oversized_response_and_reaps_child(
+        monkeypatch, tmp_path):
+    child = tmp_path / 'oversized.py'
+    pid_path = tmp_path / 'oversized.pid'
+    _write_oversized_observer_child(child)
+    monkeypatch.setattr(qualifier, '_ISOLATED_OBSERVER_MAX_FRAME_BYTES', 1024)
+    monkeypatch.setattr(qualifier, '_ISOLATED_OBSERVER_TERMINATE_GRACE_SECONDS',
+                        0.05)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='byte budget'):
+                await session.request(
+                    qualifier.IsolatedObservationKind.PROVIDER_CENSUS, {
+                        'service_name': 'paid-e2e',
+                        'pid_path': str(pid_path),
+                    },
+                    time.monotonic() + 1)
+            pid = int(pid_path.read_text(encoding='utf-8'))
+            assert session._process is None  # pylint: disable=protected-access
+            assert not _pid_is_executing(pid)
+        finally:
+            await session.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_persistent_observer_rejects_oversized_request_before_spawn(
+        monkeypatch, tmp_path):
+    child = tmp_path / 'unused.py'
+    _write_immediate_observer_child(child)
+    monkeypatch.setattr(qualifier, '_ISOLATED_OBSERVER_MAX_FRAME_BYTES', 128)
+    spawn = mock.AsyncMock()
+    monkeypatch.setattr(qualifier.asyncio, 'create_subprocess_exec', spawn)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='byte budget'):
+                await session.request(
+                    qualifier.IsolatedObservationKind.PROVIDER_CENSUS, {
+                        'service_name': 'paid-e2e',
+                        'payload': 'x' * 1024,
+                    },
+                    time.monotonic() + 1)
+        finally:
+            await session.aclose()
+
+    asyncio.run(exercise())
+    spawn.assert_not_awaited()
+
+
+def test_composite_observer_bounds_load_balancer_and_skips_postgres(
+        monkeypatch):
+    calls = []
+    cancelled = asyncio.Event()
+
+    async def run_isolated(kind, _arguments, _deadline):
+        calls.append(kind)
+        if kind is not qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
+            raise AssertionError('PostgreSQL must not start after LB timeout.')
+        return {
+            'gcp_census': None,
+            'aws_census': None,
+            'retained_volume_ids_by_region': {
+                'us-east-2': [],
+            },
+        }
+
+    class HangingHttpObserver:
+
+        async def snapshot(self):
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+    class ProviderSession:
+
+        async def request(self, kind, arguments, deadline):
+            return await run_isolated(kind, arguments, deadline)
+
+    class PostgresSession(ProviderSession):
+        pass
+
+    observer = qualifier.Observer(database_url='postgresql://unused',
+                                  http=HangingHttpObserver(),
+                                  service_name='paid-e2e',
+                                  scope=_provider_scope(),
+                                  profile=qualifier.PROFILES['small'],
+                                  provider_session=ProviderSession(),
+                                  postgres_session=PostgresSession())
+
+    async def exercise():
+        started = time.monotonic()
+        with pytest.raises(qualifier.ObservationTimeoutError,
+                           match='Load-balancer observation exhausted'):
+            await observer.snapshot(deadline_monotonic=time.monotonic() + 0.02)
+        assert time.monotonic() - started < 1
+        assert cancelled.is_set()
+
+    asyncio.run(exercise())
+    assert calls == [qualifier.IsolatedObservationKind.PROVIDER_CENSUS]
+
+
 def test_economic_progress_does_not_require_an_artificial_provider_mix():
     profile = qualifier.PROFILES['scale']
     observation = _observation(provider=_cross_cloud_provider_state(
@@ -3863,12 +5432,15 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
         """Attributed telemetry with transient provider observation loss."""
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             # Before a replica is READY, all exact stimulus identities are
             # attributable but queued and therefore have no ledger row.
             return _request_telemetry(queue_depth=64)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             result = observations.pop(0)
             if isinstance(result, Exception):
@@ -3951,10 +5523,13 @@ def test_scale_observes_provider_with_incomplete_replica_occupancy(tmp_path):
             self.provider_reads = 0
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             return telemetry
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             self.provider_reads += 1
             return observation
@@ -4023,10 +5598,13 @@ def test_scale_does_not_publish_provider_success_after_campaign_pressure_stops(
             self.provider_reads = 0
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             return _request_telemetry(queue_depth=800)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             self.provider_reads += 1
             return observation
@@ -4112,10 +5690,13 @@ def test_scale_wait_allows_attributed_arrivals_to_age_out(tmp_path):
     class Observer:
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             return _request_telemetry(queue_depth=800)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             return observations.pop(0)
 
@@ -4195,10 +5776,13 @@ def test_scale_wait_allows_bounded_arrivals_from_sliding_turnover(tmp_path):
     class Observer:
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             return _request_telemetry(queue_depth=800)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             return observations.pop(0)
 
@@ -4272,10 +5856,13 @@ def test_scale_wait_retries_transient_request_projection_skew(tmp_path):
         def __init__(self):
             self.provider_reads = 0
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             return telemetry.pop(0)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             self.provider_reads += 1
             return observation
@@ -4329,10 +5916,13 @@ def test_scale_wait_treats_refill_gap_as_non_qualifying(tmp_path):
         def __init__(self):
             self.provider_reads = 0
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             return telemetry.pop(0)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             self.provider_reads += 1
             return _observation(
@@ -4397,13 +5987,16 @@ def test_scale_and_positive_gates_accept_fully_dispatched_cohort_concurrently(
             self.provider_reads = 0
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             return _request_telemetry(queue_depth=0,
                                       in_flight=800,
                                       processing=100,
                                       state_counts={'ACCEPTED': 800})
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             self.provider_reads += 1
             running = 99 if self.provider_reads == 1 else 100
@@ -4538,7 +6131,7 @@ def test_scale_sliding_window_finishes_before_delayed_provider_proof(tmp_path):
 
     class Observer:
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             # This is the production reduction: real asynchronous occupancy
             # must equal active exact-ledger attempts at every accepted sample.
             while processing != accepted:
@@ -4552,7 +6145,10 @@ def test_scale_sliding_window_finishes_before_delayed_provider_proof(tmp_path):
                                       },
                                       observed_at=time.time())
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             nonlocal completed_at_provider_threshold
             assert not require_complete_demand_report
             running = 2 if len(succeeded) >= 2 else 1
@@ -4724,7 +6320,7 @@ def test_generated_concurrent_receipt_passes_aggregate_gate(tmp_path):
             self.request_reads = 0
             self.provider_reads = 0
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             self.request_reads += 1
             return _request_telemetry(
                 queue_depth=0,
@@ -4733,7 +6329,10 @@ def test_generated_concurrent_receipt_passes_aggregate_gate(tmp_path):
                 state_counts={'ACCEPTED': canonical_profile.max_units},
                 observed_at=100.0 + 10.0 * self.request_reads)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             self.provider_reads += 1
             running = 99 if self.provider_reads == 1 else 100
@@ -4838,22 +6437,43 @@ def test_scale_and_positive_proof_failure_cancels_sibling():
     async def exercise():
         campaign_progress = qualifier.ExactRequestCampaignProgress(
             total_count=1, window_size=1)
-
-        async def wait_for_stop():
-            while (await campaign_progress.snapshot()).accepting_offers:
-                await asyncio.sleep(0)
-            return 0
-
-        traffic = asyncio.create_task(wait_for_stop())
         with pytest.raises(qualifier.QualificationError,
                            match='physical gate failed'):
-            await qualifier._join_independent_proofs(
-                fail_scale(),
-                wait_positive(),
-                traffic=traffic,
-                campaign_progress=campaign_progress)
+            await qualifier._join_independent_proofs(fail_scale(),
+                                                     wait_positive())
         assert sibling_cancelled.is_set()
-        assert traffic.result() == 0
+        assert (await campaign_progress.snapshot()).accepting_offers
+
+    asyncio.run(exercise())
+
+
+def test_proof_join_repeated_cancellation_reaps_siblings_and_preserves_error():
+    sibling_started = asyncio.Event()
+    sibling_reaping = asyncio.Event()
+    release_sibling = asyncio.Event()
+
+    async def proof():
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_reaping.set()
+            await release_sibling.wait()
+
+    async def exercise():
+        joined = asyncio.create_task(
+            qualifier._join_independent_proofs(proof(), proof()))
+        await sibling_started.wait()
+        joined.cancel('primary cancellation')
+        await sibling_reaping.wait()
+        for _ in range(5):
+            joined.cancel('later cancellation')
+            await asyncio.sleep(0)
+        assert not joined.done()
+        release_sibling.set()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await joined
+        assert cancelled.value.args == ('primary cancellation',)
 
     asyncio.run(exercise())
 
@@ -4872,7 +6492,7 @@ def test_proof_consumers_receive_only_read_only_campaign_evidence():
             qualifier.ExactRequestCampaignEvidence | None)
 
 
-def test_observer_failure_before_202_drains_offered_request_before_exit():
+def test_top_level_observer_failure_drains_offered_request_before_exit():
     offered: list[str] = []
     completed: list[str] = []
     post_received = asyncio.Event()
@@ -4949,19 +6569,25 @@ def test_observer_failure_before_202_drains_offered_request_before_exit():
             try:
                 await asyncio.Event().wait()
             finally:
-                # The proof coordinator must close only future offers before
-                # releasing an in-flight POST to receive its 202 obligation.
-                assert not (await progress.snapshot()).accepting_offers
-                release_acceptance.set()
+                assert (await progress.snapshot()).accepting_offers
+
+        async def release_after_admission_closes():
+            while (await progress.snapshot()).accepting_offers:
+                await asyncio.sleep(0)
+            release_acceptance.set()
 
         try:
+            releaser = asyncio.create_task(release_after_admission_closes())
             with pytest.raises(qualifier.QualificationError,
                                match='observer failed'):
-                await qualifier._join_independent_proofs(
-                    fail_observer(),
-                    sibling_observer(),
-                    traffic=traffic,
-                    campaign_progress=progress)
+                try:
+                    await qualifier._join_independent_proofs(
+                        fail_observer(), sibling_observer())
+                except BaseException:
+                    await qualifier._stop_new_campaign_work_and_drain(
+                        traffic=traffic, campaign_progress=progress)
+                    raise
+            await releaser
             return await progress.snapshot()
         finally:
             if not traffic.done():
@@ -5004,7 +6630,7 @@ def test_scale_wait_accepts_provider_convergence_after_diagnostic_slo(tmp_path):
         def __init__(self):
             self.telemetry_reads = 0
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             self.telemetry_reads += 1
             return _request_telemetry(queue_depth=100)
 
@@ -5048,7 +6674,7 @@ def test_scale_wait_stops_at_absolute_qualification_timeout(tmp_path):
         def __init__(self):
             self.telemetry_reads = 0
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             self.telemetry_reads += 1
             raise AssertionError('polled after the qualification timeout')
 
@@ -5150,7 +6776,7 @@ def test_scale_never_accepts_unattributed_mixed_demand(tmp_path):
         """Expose demand that cannot belong solely to the campaign."""
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             # Three demand-bearing requests but only two exact ledger rows.
             return _request_telemetry(queue_depth=2,
                                       in_flight=1,
@@ -5190,7 +6816,7 @@ def test_scale_stimulus_requires_only_the_bounded_resident_cohort(tmp_path):
     class Observer:
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             return stimulus
 
     async def exercise():
@@ -5385,6 +7011,7 @@ def _submit_exact_with_session(session):
             stable_job_id='job-1',
             duration_seconds=0,
             deadline=qualifier.time.monotonic() + 2))
+    assert admission is not None
     return admission.receipt, admission.intent_sha256
 
 
@@ -5394,6 +7021,30 @@ async def _skip_exact_retry_delay(_delay):
 
 _EXACT_SUBMIT_URL = 'https://service.test/v1/models/model:predict'
 _EXACT_RECEIPT_URL = 'https://service.test/_lb/async-request-receipt'
+
+
+def test_exact_http_never_starts_with_zero_remaining_deadline(monkeypatch):
+    """aiohttp total=0 means no timeout, so expiry must fail before POST."""
+    session = _ExactAdmissionSession([_accepted_exact_response()])
+    # Model the deadline expiring between the loop guard and construction of
+    # the per-request timeout.  A zero aiohttp timeout disables the timeout, so
+    # this boundary must raise before calling session.post().
+    monkeypatch.setattr(qualifier.AbsoluteDeadline, 'expired', lambda _: False)
+
+    with pytest.raises(asyncio.TimeoutError,
+                       match='Absolute HTTP deadline expired'):
+        asyncio.run(
+            qualifier._submit_exact_async_request(
+                session,
+                endpoint='https://service.test',
+                token='secret',
+                service_hash='incarnation-a',
+                request_id='execution-1',
+                stable_job_id='job-1',
+                duration_seconds=0,
+                deadline=qualifier.time.monotonic() - 1))
+
+    assert session.calls == []
 
 
 def test_exact_async_request_recovers_lost_response_via_lookup_before_replay(
@@ -5416,7 +7067,12 @@ def test_exact_async_request_recovers_lost_response_via_lookup_before_replay(
     ]
     first_submit = session.calls[0][1]
     replay = session.calls[2][1]
-    assert replay == first_submit
+    assert {
+        key: value for key, value in replay.items() if key != 'timeout'
+    } == {
+        key: value for key, value in first_submit.items() if key != 'timeout'
+    }
+    assert 0 < replay['timeout'].total <= first_submit['timeout'].total <= 2
     assert session.calls[1][1]['json'] == {
         'ledger_protocol_version': 1,
         'request_id': 'execution-1',
@@ -5640,6 +7296,168 @@ def test_exact_async_request_retries_only_after_durable_predispatch_rejection(
     assert len({call['data'] for call in submit_calls}) == 1
 
 
+def test_exact_rejection_then_proof_failure_never_posts_again(monkeypatch):
+    """Closure turns authoritative no-admission into a drained identity."""
+    campaign = qualifier.ExactRequestCampaignProgress(total_count=1,
+                                                      window_size=1)
+    attempt = qualifier.ExactRequestAttemptLifecycle(request_id='execution-1')
+    session = _ExactAdmissionSession([
+        _ExactAdmissionResponse(429, state='REJECTED_PRE_DISPATCH', revision=1),
+        _accepted_exact_response(),
+    ])
+    closed = False
+
+    async def sleep(_delay):
+        nonlocal closed
+        if not closed:
+            closed = True
+            await campaign.record_error(
+                qualifier.QualificationError('provider proof failed'))
+
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', sleep)
+
+    async def exercise():
+        assert await campaign.mark_offered()
+        attempt.begin_submission()
+        return await qualifier._submit_exact_async_request(
+            session,
+            endpoint='https://service.test',
+            token='secret',
+            service_hash='incarnation-a',
+            request_id='execution-1',
+            stable_job_id='job-1',
+            duration_seconds=0,
+            deadline=qualifier.time.monotonic() + 2,
+            attempt_lifecycle=attempt,
+            campaign_progress=campaign)
+
+    assert asyncio.run(exercise()) is None
+    assert attempt.state is qualifier.ExactRequestAttemptState.DEFINITIVELY_UNADMITTED
+    assert [url for url, _ in session.calls] == [_EXACT_SUBMIT_URL]
+
+
+def test_exact_ambiguous_lookup_miss_after_closure_never_replays(monkeypatch):
+    """A fenced receipt miss closes ambiguity without creating new demand."""
+    campaign = qualifier.ExactRequestCampaignProgress(total_count=1,
+                                                      window_size=1)
+    attempt = qualifier.ExactRequestAttemptLifecycle(request_id='execution-1')
+    session = _ExactAdmissionSession([
+        qualifier.aiohttp.ClientConnectionError('lost response'),
+        _ExactAdmissionResponse(404),
+        _accepted_exact_response(),
+    ])
+    sleep_count = 0
+
+    async def sleep(_delay):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 1:
+            await campaign.record_error(
+                qualifier.QualificationError('provider proof failed'))
+
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', sleep)
+
+    async def exercise():
+        assert await campaign.mark_offered()
+        attempt.begin_submission()
+        return await qualifier._submit_exact_async_request(
+            session,
+            endpoint='https://service.test',
+            token='secret',
+            service_hash='incarnation-a',
+            request_id='execution-1',
+            stable_job_id='job-1',
+            duration_seconds=0,
+            deadline=qualifier.time.monotonic() + 2,
+            attempt_lifecycle=attempt,
+            campaign_progress=campaign)
+
+    assert asyncio.run(exercise()) is None
+    assert [url for url, _ in session.calls
+           ] == [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL]
+
+
+def test_exact_ambiguous_request_accepts_and_terminalizes_after_closure(
+        monkeypatch):
+    """Closure keeps ambiguous and subsequently accepted work owned."""
+    campaign = qualifier.ExactRequestCampaignProgress(total_count=1,
+                                                      window_size=1)
+    attempt = qualifier.ExactRequestAttemptLifecycle(request_id='execution-1')
+    session = _ExactAdmissionSession([
+        qualifier.aiohttp.ClientConnectionError('lost response'),
+        _ExactAdmissionResponse(200, state='ACCEPTED', revision=2),
+        _ExactAdmissionResponse(204, state='SUCCEEDED', revision=3),
+    ])
+    closed = False
+
+    async def sleep(_delay):
+        nonlocal closed
+        if not closed:
+            closed = True
+            await campaign.record_error(
+                qualifier.QualificationError('provider proof failed'))
+
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', sleep)
+
+    async def exercise():
+        assert await campaign.mark_offered()
+        attempt.begin_submission()
+        return await qualifier._one_exact_async_request(
+            session,
+            endpoint='https://service.test',
+            token='secret',
+            service_hash='incarnation-a',
+            request_id='execution-1',
+            stable_job_id='job-1',
+            duration_seconds=0,
+            admission_deadline=qualifier.time.monotonic() + 2,
+            terminal_timeout_seconds=2,
+            attempt_lifecycle=attempt,
+            campaign_progress=campaign)
+
+    completion = asyncio.run(exercise())
+    assert completion.terminalized
+    assert attempt.state is qualifier.ExactRequestAttemptState.TERMINAL
+    assert [url for url, _ in session.calls] == [
+        _EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL,
+        'https://service.test/_lb/prediction-completed'
+    ]
+
+
+def test_exact_open_campaign_retries_definitive_no_admission(monkeypatch):
+    """The normal open campaign still retries a typed pre-dispatch rejection."""
+    campaign = qualifier.ExactRequestCampaignProgress(total_count=1,
+                                                      window_size=1)
+    attempt = qualifier.ExactRequestAttemptLifecycle(request_id='execution-1')
+    session = _ExactAdmissionSession([
+        _ExactAdmissionResponse(429, state='REJECTED_PRE_DISPATCH', revision=1),
+        _accepted_exact_response(
+            attempt_id='22222222-2222-4222-8222-222222222222', attempt_no=2),
+    ])
+    monkeypatch.setattr(qualifier.asyncio, 'sleep', _skip_exact_retry_delay)
+
+    async def exercise():
+        assert await campaign.mark_offered()
+        attempt.begin_submission()
+        return await qualifier._submit_exact_async_request(
+            session,
+            endpoint='https://service.test',
+            token='secret',
+            service_hash='incarnation-a',
+            request_id='execution-1',
+            stable_job_id='job-1',
+            duration_seconds=0,
+            deadline=qualifier.time.monotonic() + 2,
+            attempt_lifecycle=attempt,
+            campaign_progress=campaign)
+
+    admission = asyncio.run(exercise())
+    assert admission is not None
+    assert attempt.state is qualifier.ExactRequestAttemptState.ACCEPTED
+    assert [url for url, _ in session.calls
+           ] == [_EXACT_SUBMIT_URL, _EXACT_SUBMIT_URL]
+
+
 @pytest.mark.parametrize('via_lookup', [True, False],
                          ids=['lookup', 'duplicate-post'])
 @pytest.mark.parametrize('state',
@@ -5733,9 +7551,14 @@ def test_exact_async_request_bounds_unreadable_receipt_recovery(monkeypatch):
             self.calls.append((url, kwargs))
             raise qualifier.aiohttp.ClientConnectionError('unreadable')
 
-    ticks = iter([0.0, 0.5, 1.0])
+    current = [-0.2]
+
+    def monotonic():
+        current[0] += 0.2
+        return current[0]
+
     monkeypatch.setattr(qualifier, 'time',
-                        types.SimpleNamespace(monotonic=lambda: next(ticks)))
+                        types.SimpleNamespace(monotonic=monotonic))
 
     async def fake_sleep(_delay):
         return None
@@ -6329,7 +8152,7 @@ def test_exact_campaign_worker_failure_drains_accepted_sibling():
         offered=3, succeeded=2, accepting_offers=False)
 
 
-def test_exact_campaign_caller_cancellation_drains_accepted_workers():
+def test_exact_campaign_repeated_cancellation_drains_accepted_workers():
     """Caller cancellation stops admission but cannot cancel accepted work."""
     offered = []
     terminalized = []
@@ -6373,16 +8196,20 @@ def test_exact_campaign_caller_cancellation_drains_accepted_workers():
                                                 count=3,
                                                 concurrency=2,
                                                 hold_requests=3,
-                                                hold_seconds=0.02,
+                                                hold_seconds=0.1,
                                                 timeout_seconds=2,
                                                 request_queue_timeout_seconds=2,
                                                 terminal_timeout_seconds=2,
                                                 campaign_progress=progress))
         try:
             await both_accepted.wait()
-            traffic.cancel()
-            with pytest.raises(asyncio.CancelledError):
+            traffic.cancel('primary cancellation')
+            for _ in range(5):
+                await asyncio.sleep(0)
+                traffic.cancel('later cancellation')
+            with pytest.raises(asyncio.CancelledError) as cancelled:
                 await traffic
+            assert cancelled.value.args == ('primary cancellation',)
             return await progress.snapshot()
         finally:
             if not traffic.done():
@@ -6404,7 +8231,10 @@ def test_late_exact_acceptance_gets_a_fresh_terminal_deadline():
     async def predict(request):
         payload = await request.json()
         request_id = payload['request_id']
-        await asyncio.sleep(0.08)
+        # Accept immediately before the campaign cutoff.  Every campaign HTTP
+        # operation is now bounded by that cutoff; only terminal publication
+        # receives an independent fresh deadline.
+        await asyncio.sleep(0.04)
         return aiohttp.web.json_response(
             {
                 'request_id': request_id,
@@ -6418,6 +8248,9 @@ def test_late_exact_acceptance_gets_a_fresh_terminal_deadline():
     async def complete(request):
         payload = await request.json()
         request_id = payload['request_id']
+        # Complete after the original campaign deadline to prove this call is
+        # governed by the accepted attempt's separate terminal budget.
+        await asyncio.sleep(0.08)
         terminalized.append(request_id)
         return aiohttp.web.Response(status=204,
                                     headers=_aiohttp_exact_receipt_headers(
@@ -6519,11 +8352,11 @@ def test_request_telemetry_requires_exact_positive_and_terminal_delta(tmp_path):
         def __init__(self, values):
             self.values = list(values)
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             return self.values.pop(0)
 
         @staticmethod
-        async def campaign_terminal_membership(prefix, count):
+        async def campaign_terminal_membership(prefix, count, **_kwargs):
             return qualifier._campaign_manifest_sha256(prefix, count)
 
     async def exercise():
@@ -6876,10 +8709,17 @@ def _write_aggregate_cleanup(path,
             'exact_zero': True,
             'zero_samples': index,
             'cleanup_claims': 0,
+            'cleanup_cluster_records': 0,
             'cleanup_debit_units': 0,
+            'cleanup_effect_capable_associations': 0,
+            'cleanup_blocking_requests': 0,
+            'cleanup_queue_deliveries': 0,
+            'cleanup_retention_pins': 0,
             'cleanup_provider_disks': 0,
             'cleanup_provider_instances': 0,
             'cleanup_provider_operations': 0,
+            'cleanup_replicas': 0,
+            'cleanup_service_rows': 0,
             'cleanup_waiters': 0,
             'cleanup_provider_by_cloud': {
                 cloud: {
@@ -6896,7 +8736,7 @@ def _write_aggregate_cleanup(path,
         }
 
     payload = {
-        'schema_version': 2,
+        'schema_version': 3,
         'service_name': service_name,
         'service_hash': service_hash or f'{service_name}-hash',
         'lifecycle_epoch': 1,
@@ -7976,6 +9816,28 @@ def test_aggregate_rejects_replayed_or_incomplete_cleanup_samples(
             'zero_samples']
     else:
         del payload['samples'][-1]['cleanup_provider_by_cloud']['aws']
+    cleanup_path.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='sustained exact zero'):
+        qualifier.aggregate_evidence(args)
+
+
+@pytest.mark.parametrize('field', [
+    'cleanup_cluster_records', 'cleanup_replicas', 'cleanup_service_rows',
+    'cleanup_effect_capable_associations', 'cleanup_blocking_requests',
+    'cleanup_queue_deliveries', 'cleanup_retention_pins'
+])
+@pytest.mark.parametrize('mutation', ['missing', 'nonzero'])
+def test_aggregate_requires_complete_zero_database_cleanup_graph(
+        tmp_path, field, mutation):
+    args = _aggregate_args(tmp_path)
+    cleanup_path = pathlib.Path(args.economic_cleanup_receipt)
+    payload = json.loads(cleanup_path.read_text(encoding='utf-8'))
+    if mutation == 'missing':
+        del payload['samples'][-1][field]
+    else:
+        payload['samples'][-1][field] = 1
     cleanup_path.write_text(json.dumps(payload), encoding='utf-8')
 
     with pytest.raises(qualifier.QualificationError,

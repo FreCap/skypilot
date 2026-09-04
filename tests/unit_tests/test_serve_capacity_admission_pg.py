@@ -337,6 +337,9 @@ def _fused_paid_graph_identities(
     statement = sqlalchemy.select(
         replicas.c.replica_id,
         replicas.c.replica_state,
+        replicas.c.replica_incarnation,
+        replicas.c.desired_generation,
+        replicas.c.sky_cluster_record_uuid,
         replicas.c.ordinary_launch_association_id.label('replica_pointer'),
         claims.c.capacity_plan_generation,
         claims.c.capacity_plan_sha256,
@@ -4139,6 +4142,91 @@ def _single_pool_paid_templates(engine, incarnation, monkeypatch, *,
     monkeypatch.setattr(paid_capacity, 'max_service_limit',
                         lambda **_: member_count)
     return _paid_catalog_templates(engine, ranks)
+
+
+def test_fused_paid_admission_installs_deterministic_resource_identity(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                       service_name='svc',
+                                       service_hash='svc-hash',
+                                       service_lifecycle_epoch=3,
+                                       service_version=1,
+                                       accounting_cards={'l4': 1},
+                                       backend_num_nodes=1,
+                                       sequenced_reserved_fill=False,
+                                       planner=lambda snapshot, supply:
+                                       _current_decision(snapshot, supply, 1),
+                                       prepared_paid_launch_templates=(
+                                           _paid_launch_template(engine,
+                                                                 pool_rank=0),))
+
+    [row] = _fused_paid_graph_identities(engine)
+    expected = (ordinary_launch_binding.
+                derive_fresh_ordinary_paid_resource_action_identity(
+                    replica_id=row['replica_id'],
+                    replica_record_id=row['replica_record_id'],
+                    cluster_name=row['replica_state']['cluster_name']))
+    assert row['replica_incarnation'] == expected.replica_incarnation
+    assert row['desired_generation'] == 1
+    assert (row['sky_cluster_record_uuid'] == expected.sky_cluster_record_uuid)
+    [binding] = committed.paid_launch_bindings
+    assert binding.context.replica_record_id == row['replica_record_id']
+    assert binding.context.launch_generation == 1
+
+
+@pytest.mark.parametrize('partial', [True, False])
+def test_fused_paid_admission_rejects_preexisting_resource_identity(
+        capacity_database, monkeypatch, partial):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    real_bind = paid_wave_admission.bind_accepted_in_transaction
+
+    def _poison_replica_identity(connection, **kwargs):
+        [(_, spec)] = kwargs['accepted']
+        expected = (ordinary_launch_binding.
+                    derive_fresh_ordinary_paid_resource_action_identity(
+                        replica_id=spec.replica_id,
+                        replica_record_id=spec.replica_record_id,
+                        cluster_name=spec.cluster_name_seed))
+        values = {'replica_incarnation': expected.replica_incarnation}
+        if not partial:
+            values.update({
+                'desired_generation': expected.desired_generation,
+                'sky_cluster_record_uuid': expected.sky_cluster_record_uuid,
+            })
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id ==
+                spec.replica_id).values(**values))
+        return real_bind(connection, **kwargs)
+
+    monkeypatch.setattr(paid_wave_admission, 'bind_accepted_in_transaction',
+                        _poison_replica_identity)
+    expected_error = (sqlalchemy.exc.IntegrityError
+                      if partial else
+                      capacity_admission.CapacityAdmissionConflict)
+    expected_message = ('ck_replicas_resource_action_identity'
+                        if partial else 'resource-action identity')
+    with pytest.raises(expected_error, match=expected_message):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(
+                **_current_owner_kwargs(engine),
+                service_name='svc',
+                service_hash='svc-hash',
+                service_lifecycle_epoch=3,
+                service_version=1,
+                accounting_cards={'l4': 1},
+                backend_num_nodes=1,
+                sequenced_reserved_fill=False,
+                planner=lambda snapshot, supply: _current_decision(
+                    snapshot, supply, 1),
+                prepared_paid_launch_templates=(_paid_launch_template(
+                    engine, pool_rank=0),))
+    assert _fused_paid_graph_counts(engine) == (0,) * 9
 
 
 @dataclasses.dataclass(frozen=True)

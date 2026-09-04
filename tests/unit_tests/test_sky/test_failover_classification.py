@@ -1267,8 +1267,12 @@ def test_retry_zones_paid_provider_outcome_cleanup_contract(
                           'RunInstances response lost',
                           hint='replay same association and ClientToken',
                           retry_wait_seconds=5))
+    replica_record_id = uuid.UUID('22222222-2222-4222-8222-222222222222')
     bound_context = types.SimpleNamespace(
         profile=types.SimpleNamespace(kind=profile_kind),
+        replica_id=1,
+        replica_record_id=replica_record_id,
+        launch_generation=1,
         capability_cohort_epoch=(
             ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
     )
@@ -1291,8 +1295,9 @@ def test_retry_zones_paid_provider_outcome_cleanup_contract(
         })
     monkeypatch.setattr(backend, '_get_workload_attribution', lambda *_:
                         (None, None))
+    add_or_update_cluster = mock.Mock(return_value='cluster-hash')
     monkeypatch.setattr(backend.global_user_state, 'add_or_update_cluster',
-                        lambda *_, **__: 'cluster-hash')
+                        add_or_update_cluster)
     monkeypatch.setattr(backend.global_user_state, 'add_cluster_event',
                         lambda *_, **__: None)
     monkeypatch.setattr(backend.global_user_state,
@@ -1340,6 +1345,18 @@ def test_retry_zones_paid_provider_outcome_cleanup_contract(
 
     cleanup.assert_not_called()
     bulk_provision.assert_called_once()
+    expected_identity = (ordinary_launch_binding.
+                         derive_fresh_ordinary_paid_resource_action_identity(
+                             replica_id=1,
+                             replica_record_id=replica_record_id,
+                             cluster_name='test-cluster'))
+    if profile_kind is (
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+        assert add_or_update_cluster.call_args.kwargs[
+            'cluster_record_uuid'] == expected_identity.sky_cluster_record_uuid
+    else:
+        assert 'cluster_record_uuid' not in (
+            add_or_update_cluster.call_args.kwargs)
     assert bulk_provision.call_args.kwargs[
         'provider_create_idempotency_token'] == receipt['client_token']
     if provider_outcome == 'negative-ack':
@@ -1461,6 +1478,9 @@ def test_retry_zones_refuses_wrong_gcp_project_before_bulk(
     provisioner._service_replica_launch_provider_guard = (
         lambda: contextlib.nullcontext())
     bound_context = types.SimpleNamespace(
+        replica_id=1,
+        replica_record_id=uuid.uuid4(),
+        launch_generation=1,
         profile=types.SimpleNamespace(kind=profile_kind),
         capability_cohort_epoch=(
             ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH))
@@ -3011,7 +3031,9 @@ def test_paid_checkpoint_precedes_post_bulk_deploy_failure(
     replica_record_id = uuid.uuid4()
     bound_context = types.SimpleNamespace(
         association_id=association_id,
+        replica_id=1,
         replica_record_id=replica_record_id,
+        launch_generation=1,
         profile=types.SimpleNamespace(kind=ordinary_launch_binding.
                                       NonPoolLaunchProfileKind.ORDINARY_PAID),
         capability_cohort_epoch=(
@@ -3134,9 +3156,13 @@ def test_paid_checkpoint_conflict_is_terminal_fence_without_teardown(
                                              market_type='spot'))
     bound_context = types.SimpleNamespace(
         association_id=uuid.uuid4(),
+        replica_id=1,
         replica_record_id=uuid.uuid4(),
+        launch_generation=1,
         profile=types.SimpleNamespace(kind=ordinary_launch_binding.
-                                      NonPoolLaunchProfileKind.ORDINARY_PAID))
+                                      NonPoolLaunchProfileKind.ORDINARY_PAID),
+        capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH))
     provisioner._extra_launch_context = {
         ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY: 2,
     }

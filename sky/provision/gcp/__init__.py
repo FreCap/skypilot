@@ -3,6 +3,7 @@
 from sky.provision.gcp.config import bootstrap_instances
 from sky.provision.gcp.instance import cleanup_custom_multi_network
 from sky.provision.gcp.instance import cleanup_ports
+from sky.provision.gcp.instance import delete_exact_cluster_ports_firewall
 from sky.provision.gcp.instance import get_cluster_info
 from sky.provision.gcp.instance import open_ports
 from sky.provision.gcp.instance import query_instance_create_operation_targets
