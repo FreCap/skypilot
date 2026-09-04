@@ -217,11 +217,10 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         if self._stop_event.is_set():
             return
 
-        # Wait before recovery whenever a nonterminal job exists. A previous
-        # image may have a detached scheduler that can claim a WAITING row
-        # after this check without an outer-generation fence. The fixed wait is
-        # a mixed-version drain aid; current images also serialize every claim
-        # with the durable generation.
+        # Wait before recovery only when a nonterminal row still carries
+        # evidence of in-flight or claimed controller work. Pure backlog rows
+        # have no detached controller to outlive the lock handoff, so they do
+        # not justify the fixed failover delay.
         if managed_job_state.has_jobs_requiring_recovery_grace_wait():
             logger.info(
                 f'Waiting {_RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS}s after '
