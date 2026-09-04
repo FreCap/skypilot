@@ -134,6 +134,55 @@ describe('JobsCacheManager invalidation fencing', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps an invalidated in-flight plugin page from restoring stale filtered cache', async () => {
+    const manager = new JobsCacheManager();
+    const firstFetch = deferred();
+    const secondFetch = deferred();
+    const options = { page: 1, limit: 10, statuses: ['RUNNING'] };
+    let pluginCalls = 0;
+
+    window.__skyJobsPaginationFetch = jest.fn(() => {
+      pluginCalls += 1;
+      return pluginCalls === 1 ? firstFetch.promise : secondFetch.promise;
+    });
+
+    const staleResultPromise = manager.getPaginatedJobs(options);
+    manager.invalidateCache(options);
+    const freshResultPromise = manager.getPaginatedJobs(options);
+
+    secondFetch.resolve({
+      items: [{ id: 'fresh-job', status: 'RUNNING' }],
+      total: 1,
+      totalNoFilter: 1,
+      totalPages: 1,
+      hasNext: false,
+      hasPrev: false,
+      controllerStopped: false,
+      statusCounts: { RUNNING: 1 },
+    });
+    const freshResult = await freshResultPromise;
+    expect(freshResult.jobs[0].id).toBe('fresh-job');
+
+    firstFetch.resolve({
+      items: [{ id: 'stale-job', status: 'RUNNING' }],
+      total: 1,
+      totalNoFilter: 1,
+      totalPages: 1,
+      hasNext: false,
+      hasPrev: false,
+      controllerStopped: false,
+      statusCounts: { RUNNING: 1 },
+    });
+    const staleResult = await staleResultPromise;
+    expect(staleResult.jobs[0].id).toBe('stale-job');
+
+    const cachedResult = await manager.getPaginatedJobs(options);
+    expect(cachedResult.fromCache).toBe(true);
+    expect(cachedResult.jobs[0].id).toBe('fresh-job');
+    expect(window.__skyJobsPaginationFetch).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).not.toHaveBeenCalled();
+  });
+
   it('drops a stale background prefetch after invalidation', async () => {
     const manager = new JobsCacheManager();
     const staleFullDataset = deferred();
