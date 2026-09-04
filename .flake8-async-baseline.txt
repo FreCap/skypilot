@@ -1,8 +1,8 @@
 sky/client/interactive_utils.py:86:30: ASYNC231 Sync call os.fdopen in async function,  use a library such as aiofiles or anyio.
 sky/client/interactive_utils.py:92:31: ASYNC231 Sync call os.fdopen in async function,  use a library such as aiofiles or anyio.
 sky/client/interactive_utils.py:108:24: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/jobs/controller.py:1960:28: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/jobs/controller.py:2078:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
+sky/jobs/controller.py:1961:28: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
+sky/jobs/controller.py:2079:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/serve/replica_managers.py:5355:21: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
 sky/serve/replica_managers.py:5358:17: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
 sky/serve/replica_managers.py:5524:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
