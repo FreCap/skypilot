@@ -3,11 +3,11 @@
 # that we can easily switch to a s3-based storage.
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Iterator
 import dataclasses
 import enum
 import json
 import time
-from collections.abc import Iterator
 from typing import Any, cast, TypeAlias
 
 import sqlalchemy
