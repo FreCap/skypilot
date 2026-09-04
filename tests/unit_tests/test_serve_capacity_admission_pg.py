@@ -4375,6 +4375,333 @@ def test_paid_correctness_transaction_takes_no_second_database_checkout(
     assert _fused_paid_graph_counts(engine) == (1, 1, 2, 2, 2, 2, 2, 2, 2)
 
 
+def test_paid_maximum_wave_binding_has_bounded_database_round_trips(
+        capacity_database, monkeypatch):
+    """Binding 100 accepted members is a set operation under service locks."""
+    engine, incarnation, _ = capacity_database
+    member_count = paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS
+    templates = _single_pool_paid_templates(engine,
+                                            incarnation,
+                                            monkeypatch,
+                                            member_count=member_count)
+    real_bind = paid_wave_admission.bind_accepted_in_transaction
+    binding_open = False
+    binding_statements = []
+
+    def _count_binding_statement(_connection, _cursor, statement, _parameters,
+                                 _context, _executemany):
+        if binding_open:
+            binding_statements.append(statement.casefold())
+
+    def _observed_bind(*args, **kwargs):
+        nonlocal binding_open
+        binding_open = True
+        try:
+            return real_bind(*args, **kwargs)
+        finally:
+            binding_open = False
+
+    monkeypatch.setattr(paid_wave_admission, 'bind_accepted_in_transaction',
+                        _observed_bind)
+    monkeypatch.setattr(pathlib.Path, 'touch', mock.Mock())
+    sqlalchemy.event.listen(engine, 'before_cursor_execute',
+                            _count_binding_statement)
+    try:
+        committed = capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(
+                **_bounded_paid_wave_call_kwargs(engine, member_count),
+                prepared_paid_launch_templates=templates)
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute',
+                                _count_binding_statement)
+
+    assert len(committed.paid_launch_bindings) == member_count
+    assert len(binding_statements) <= 24
+    for table in (
+            'serve_ordinary_launch_associations',
+            'api_requests',
+            'api_request_queue',
+            'api_request_retention_pins',
+    ):
+        assert sum(
+            statement.startswith(f'insert into {table}')
+            for statement in binding_statements) == 1
+    assert _fused_paid_graph_counts(engine) == (1, 1, member_count,
+                                                member_count, member_count,
+                                                member_count, member_count,
+                                                member_count, member_count)
+
+
+def test_paid_batch_binding_rejects_mixed_plan_authority(
+        capacity_database, monkeypatch):
+    """Every executable in one wave must retain the same committed plan."""
+    engine, incarnation, _ = capacity_database
+    templates = _single_pool_paid_templates(engine,
+                                            incarnation,
+                                            monkeypatch,
+                                            member_count=2)
+    real_bind = paid_wave_admission.bind_accepted_in_transaction
+
+    def _mutate_one_claim(connection, **kwargs):
+        replica_id = kwargs['accepted'][-1][0].replica_id
+        claims = serve_state_schema.paid_capacity_claims_table
+        connection.execute(
+            sqlalchemy.update(claims).where(
+                claims.c.service_name == 'svc',
+                claims.c.replica_id == replica_id).values(
+                    demand_feed_generation=claims.c.demand_feed_generation + 1))
+        return real_bind(connection, **kwargs)
+
+    monkeypatch.setattr(paid_wave_admission, 'bind_accepted_in_transaction',
+                        _mutate_one_claim)
+    monkeypatch.setattr(pathlib.Path, 'touch', mock.Mock())
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='multiple capacity-plan authorities'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(
+                **_bounded_paid_wave_call_kwargs(engine, 2),
+                prepared_paid_launch_templates=templates)
+
+    assert _fused_paid_graph_counts(engine) == (0,) * 9
+
+
+def test_paid_catalog_scale_transaction_has_bounded_database_round_trips(
+        capacity_database, monkeypatch):
+    """A 552-pool catalog and 100-member wave use a fixed SQL budget."""
+    engine, incarnation, route_receipt = capacity_database
+    catalog_size = 552
+    member_count = paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           max_replicas=member_count)
+    ranks = _install_paid_wave_catalog(engine, pool_count=catalog_size)
+    templates = _paid_catalog_templates(engine, ranks)
+    demand_state.ingest_report(
+        'svc', 'svc-hash', _demand_report(time.time(),
+                                          route_receipt,
+                                          sequence=2))
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 1)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 480)
+    monkeypatch.setattr(paid_capacity, 'service_limit', lambda: member_count)
+    monkeypatch.setattr(paid_capacity, 'max_service_limit',
+                        lambda **_: member_count)
+    monkeypatch.setattr(paid_capacity, 'max_service_exploration_frontier',
+                        lambda **_: member_count)
+    monkeypatch.setattr(paid_capacity, 'waiter_ttl_seconds', lambda: 600)
+    monkeypatch.setattr(pathlib.Path, 'touch', mock.Mock())
+    statements = []
+
+    def _capture(_connection, _cursor, statement, _parameters, _context,
+                 _executemany):
+        statements.append(statement.casefold())
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _capture)
+    try:
+        committed = capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(
+                **_bounded_paid_wave_call_kwargs(engine, member_count),
+                prepared_paid_launch_templates=templates)
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', _capture)
+
+    assert len(committed.paid_launch_bindings) == member_count
+    assert len(statements) <= 96
+    assert sum(
+        statement.startswith('insert into paid_capacity_pools')
+        for statement in statements) == 1
+    assert sum(
+        statement.startswith('insert into replicas')
+        for statement in statements) == 1
+    assert sum(
+        statement.startswith('insert into paid_capacity_claims')
+        for statement in statements) == 1
+
+
+def test_bulk_paid_admission_allows_readiness_retry_after_lock_contention(
+        capacity_database, monkeypatch):
+    """A bounded observer retry progresses after one held paid transaction.
+
+    The production incident kept the lifecycle/service rows contended while
+    paid admission performed per-pool and per-member SQL.  Reproduce that
+    shared boundary deterministically by pausing the production planner after
+    those rows are locked.  The observer must fail its contended attempt
+    quickly, then publish READY after the bulk transaction releases the rows;
+    the maximum successor wave must retain a fixed SQL statement budget.
+    """
+    engine, incarnation, route_receipt = capacity_database
+    catalog_size = 552
+    successor_members = paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS
+    total_target = successor_members + 1
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           max_replicas=total_target)
+    ranks = _install_paid_wave_catalog(engine, pool_count=catalog_size)
+    templates = _paid_catalog_templates(engine, ranks)
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 1)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 480)
+    monkeypatch.setattr(paid_capacity, 'service_limit', lambda: total_target)
+    monkeypatch.setattr(paid_capacity, 'max_service_limit',
+                        lambda **_: total_target)
+    monkeypatch.setattr(paid_capacity, 'max_service_exploration_frontier',
+                        lambda **_: total_target)
+    monkeypatch.setattr(paid_capacity, 'waiter_ttl_seconds', lambda: 600)
+    monkeypatch.setattr(pathlib.Path, 'touch', mock.Mock())
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+
+    # Preparing a production-sized catalog can outlive the fixture report's
+    # freshness horizon on a loaded test host.  Refresh the real durable feed
+    # immediately before each admission generation.
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=1))
+    initial = repository.plan_and_admit_current(
+        **_bounded_paid_wave_call_kwargs(engine, 1),
+        prepared_paid_launch_templates=templates)
+    assert len(initial.paid_launch_bindings) == 1
+    observed_replica_id = initial.paid_launch_receipt.members[0].replica_id
+    opening = serve_state.get_replica_info_from_id('svc', observed_replica_id)
+    assert opening is not None
+    opening.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.SUCCEEDED)
+    assert serve_state.add_or_update_replica(
+        'svc',
+        observed_replica_id,
+        opening,
+        expected_service_hash='svc-hash',
+        expected_lifecycle_epoch=3,
+        expected_controller_owner=(123, '10.0.0.5'),
+        expected_replica_exists=True)
+    opening = serve_state.get_replica_info_from_id('svc', observed_replica_id)
+    assert opening is not None
+    assert opening.status != serve_state.ReplicaStatus.READY
+    assert not opening.status_property.service_ready_now
+
+    patch_type = serve_state.ReplicaObservationPatch
+    desired = copy.deepcopy(opening)
+    desired.status_property.service_ready_now = True
+    desired.status_property.first_ready_time = time.time()
+    write = serve_state.ReplicaObservationWrite(
+        replica_id=opening.replica_id,
+        replica_record_id=opening.replica_record_id,
+        service_version=opening.version,
+        expected_revision=opening.system_recovery_revision,
+        desired_info=desired,
+        expected_observation_state=patch_type.from_replica_info(opening),
+        desired_observation_state=patch_type.from_replica_info(desired))
+    observer_fence = serve_state.ReplicaObserverOwnerFence(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        controller_pid=123,
+        controller_ip='10.0.0.5',
+        controller_incarnation=incarnation,
+        controller_owner_epoch=4)
+
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(),
+                       route_receipt,
+                       sequence=3,
+                       request_count=total_target))
+    planner_entered = threading.Event()
+    release_planner = threading.Event()
+    committed = []
+    errors = []
+    admission_statements = []
+    thread_name = 'held-bulk-paid-admission'
+
+    def _held_planner(snapshot, supply):
+        planner_entered.set()
+        if not release_planner.wait(timeout=15):
+            raise TimeoutError('test did not release the capacity planner')
+        return _current_decision(snapshot, supply, total_target)
+
+    def _capture_admission_sql(_connection, _cursor, statement, _parameters,
+                               _context, _executemany):
+        if threading.current_thread().name == thread_name:
+            admission_statements.append(statement.casefold())
+
+    call_kwargs = {
+        **_current_owner_kwargs(engine),
+        'service_name': 'svc',
+        'service_hash': 'svc-hash',
+        'service_lifecycle_epoch': 3,
+        'service_version': 1,
+        'accounting_cards': {
+            'l4': 1
+        },
+        'backend_num_nodes': 1,
+        'sequenced_reserved_fill': False,
+        'planner': _held_planner,
+        'prepared_paid_launch_templates': templates,
+    }
+
+    def _run_successor():
+        try:
+            committed.append(repository.plan_and_admit_current(**call_kwargs))
+        except BaseException as error:  # pylint: disable=broad-exception-caught
+            errors.append(error)
+
+    # Keep the regression fast while retaining the production fail-closed
+    # lock-timeout path and SQLSTATE translation.
+    monkeypatch.setattr(serve_state, '_PROBE_BATCH_LOCK_TIMEOUT_MS', 100)
+    sqlalchemy.event.listen(engine, 'before_cursor_execute',
+                            _capture_admission_sql)
+    admission_thread = threading.Thread(target=_run_successor,
+                                        name=thread_name,
+                                        daemon=True)
+    try:
+        admission_thread.start()
+        assert planner_entered.wait(timeout=10)
+
+        with pytest.raises(serve_state.ReplicaSystemRecoveryMutationRejected,
+                           match='PostgreSQL transaction timed out'):
+            serve_state.commit_replica_observations_batch(
+                'svc', [write], owner_fence=observer_fence)
+        still_not_ready = serve_state.get_replica_info_from_id(
+            'svc', observed_replica_id)
+        assert still_not_ready is not None
+        assert still_not_ready.status != serve_state.ReplicaStatus.READY
+        assert not still_not_ready.status_property.service_ready_now
+    finally:
+        release_planner.set()
+        admission_thread.join(timeout=15)
+        sqlalchemy.event.remove(engine, 'before_cursor_execute',
+                                _capture_admission_sql)
+
+    assert not admission_thread.is_alive()
+    assert not errors
+    assert len(committed) == 1
+    assert len(committed[0].paid_launch_bindings) == successor_members
+    assert len(admission_statements) <= 96
+
+    fresh = serve_state.get_replica_info_from_id('svc', observed_replica_id)
+    assert fresh is not None
+    ready = copy.deepcopy(fresh)
+    ready.status_property.service_ready_now = True
+    ready.status_property.first_ready_time = time.time()
+    retry = serve_state.ReplicaObservationWrite(
+        replica_id=fresh.replica_id,
+        replica_record_id=fresh.replica_record_id,
+        service_version=fresh.version,
+        expected_revision=fresh.system_recovery_revision,
+        desired_info=ready,
+        expected_observation_state=patch_type.from_replica_info(fresh),
+        desired_observation_state=patch_type.from_replica_info(ready))
+    result = serve_state.commit_replica_observations_batch(
+        'svc', [retry], owner_fence=observer_fence)
+
+    assert result.stale_replica_ids == ()
+    assert len(result.updated_infos) == 1
+    assert result.updated_infos[0].status == serve_state.ReplicaStatus.READY
+    persisted = serve_state.get_replica_info_from_id('svc', observed_replica_id)
+    assert persisted is not None
+    assert persisted.status == serve_state.ReplicaStatus.READY
+
+
 def test_bounded_successor_does_not_lock_active_request_liveness_roots(
         capacity_database, monkeypatch):
     """A long planning callback cannot starve an active execution lease.
@@ -5016,7 +5343,7 @@ def test_paid_launch_validator_rejects_inexact_interleaved_rank_occurrence(
     before = _paid_write_counts(engine)
 
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                       match='stale or noncanonical'):
+                       match='catalog traversal is noncanonical'):
         _validate_prepared_paid_specs(engine, specs, accounting_cards={'l4': 1})
 
     assert _paid_write_counts(engine) == before
@@ -5082,6 +5409,7 @@ def _equal_cost_shape_specs(
             replica_id=spec.replica_id,
             cluster_name=spec.cluster_name_seed,
             launch_fence=submitted['extra_launch_context'])
+        assert request.submitted_bytes == spec.prepared_launch_request
         materialized.append(
             dataclasses.replace(
                 spec, prepared_launch_request=request.submitted_bytes))

@@ -1649,6 +1649,34 @@ def test_aws_empty_root_attachment_retries_then_reduces_and_records(
     ] == ['QualificationError', None]
 
 
+def test_passed_receipt_is_validated_before_canonical_publication(
+        tmp_path, monkeypatch):
+    """A malformed local composite can never appear as a passed verdict."""
+    path = tmp_path / 'qualification.json'
+    receipt = qualifier.Receipt(path=path,
+                                service_name='paid-e2e',
+                                profile=qualifier.PROFILES['small'])
+    candidate_paths = []
+
+    def _reject(candidate_path, expectation_kind):
+        assert expectation_kind is qualifier.ExpectationKind.ECONOMIC
+        assert candidate_path.exists()
+        assert not path.exists()
+        candidate_paths.append(candidate_path)
+        raise qualifier.QualificationError('injected composite rejection')
+
+    monkeypatch.setattr(qualifier, '_read_qualification_evidence', _reject)
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='injected composite rejection'):
+        receipt.finish(progress=qualifier.Progress(), exact_request_successes=0)
+
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    assert payload['outcome'] == 'failed'
+    assert payload['error_type'] == 'QualificationError'
+    assert candidate_paths and not candidate_paths[0].exists()
+
+
 @pytest.mark.parametrize(('field', 'replacement'), [
     ('availability_zone', 'us-east-2b'),
     ('client_token', 'wrong-token'),
@@ -2915,7 +2943,7 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
                                 profile=qualifier.PROFILES['small'])
     receipt.sample('scale', observation)
 
-    assert receipt._payload['schema_version'] == 12
+    assert receipt._payload['schema_version'] == 13
     assert receipt._payload['request_priority'] == 50
     assert receipt._payload['scale_slo_seconds'] == 300
     assert receipt._payload['scale_timeout_seconds'] == 900
@@ -3879,6 +3907,172 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
            ] == [None, 'QualificationError', None]
 
 
+def test_scale_observes_provider_with_incomplete_replica_occupancy(tmp_path):
+    """Replica probe gaps cannot hide exact resident campaign pressure."""
+    profile = dataclasses.replace(qualifier.PROFILES['scale'],
+                                  minimum_running=100,
+                                  poll_seconds=0,
+                                  scale_timeout_seconds=1)
+    started_monotonic = time.monotonic()
+    started_at = time.time()
+    cluster_names = _provider_cluster_names('gcp', 100)
+    observation = _observation(
+        observed_at=started_at + 1,
+        observed_monotonic=started_monotonic + 1,
+        database=_database_state(
+            paid_debit_units=100,
+            demand_units=800,
+            bound_cluster_zones=tuple(
+                (name, 'us-central1-a') for name in cluster_names)),
+        provider=_cross_cloud_provider_state(gcp_running_count=100,
+                                             aws_running_count=0),
+        load_balancer=_load_balancer_state(demand_units=800,
+                                           unique_job_arrivals_60s=800,
+                                           unique_job_arrivals_300s=800))
+    telemetry = qualifier.request_telemetry_from_summary(
+        {
+            'request_telemetry_observed_at': started_at,
+            'request_telemetry_state': 'fresh',
+            'request_telemetry_reason': 'in_flight_incomplete',
+            'request_telemetry_compatibility_complete': True,
+            'request_queue_depth': 762,
+            'in_flight_requests': None,
+            'processing_requests': None,
+            'confirmed_in_flight_requests': 38,
+            'confirmed_processing_requests': 16,
+        }, {
+            'ACCEPTED': 38,
+            'SUCCEEDED': 418,
+        })
+
+    class Observer:
+
+        def __init__(self):
+            self.provider_reads = 0
+
+        @staticmethod
+        async def request_telemetry():
+            return telemetry
+
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
+            self.provider_reads += 1
+            return observation
+
+    async def exercise():
+        observer = Observer()
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            progress = qualifier.Progress(
+                scale_started_monotonic=started_monotonic,
+                scale_started_at=started_at)
+            receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                        service_name='paid-e2e',
+                                        profile=profile)
+            await qualifier._wait_for_scale(observer=observer,
+                                            profile=profile,
+                                            progress=progress,
+                                            receipt=receipt,
+                                            traffic=traffic,
+                                            baseline=_request_telemetry(),
+                                            campaign_progress=await
+                                            _campaign_progress(profile,
+                                                               turnover=418))
+            return observer, progress, receipt
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+
+    observer, progress, receipt = asyncio.run(exercise())
+    assert observer.provider_reads == 1
+    assert progress.peak_running == 100
+    assert progress.scale_reached_monotonic == started_monotonic + 1
+    sample = receipt._payload['request_telemetry_samples'][0]
+    assert sample['reason'] == 'in_flight_incomplete'
+    assert sample['queue_depth'] == 762
+    assert sample['in_flight_requests'] is None
+    assert sample['ledger_active'] == 38
+
+
+def test_scale_does_not_publish_provider_success_after_campaign_pressure_stops(
+        tmp_path):
+    """The post-census frontier validates before progress or receipt mutation."""
+    profile = dataclasses.replace(qualifier.PROFILES['scale'],
+                                  minimum_running=100,
+                                  poll_seconds=0,
+                                  scale_timeout_seconds=0.02)
+    started_monotonic = time.monotonic()
+    cluster_names = _provider_cluster_names('gcp', 100)
+    observation = _observation(
+        observed_at=time.time(),
+        observed_monotonic=started_monotonic + 0.001,
+        database=_database_state(
+            paid_debit_units=100,
+            demand_units=800,
+            bound_cluster_zones=tuple(
+                (name, 'us-central1-a') for name in cluster_names)),
+        provider=_cross_cloud_provider_state(gcp_running_count=100,
+                                             aws_running_count=0),
+        load_balancer=_load_balancer_state(demand_units=800,
+                                           unique_job_arrivals_60s=800,
+                                           unique_job_arrivals_300s=800))
+
+    class Observer:
+
+        def __init__(self):
+            self.provider_reads = 0
+
+        @staticmethod
+        async def request_telemetry():
+            return _request_telemetry(queue_depth=800)
+
+        async def snapshot(self, *, require_complete_demand_report=True):
+            assert not require_complete_demand_report
+            self.provider_reads += 1
+            return observation
+
+    class Campaign:
+
+        def __init__(self):
+            self.calls = 0
+
+        async def snapshot(self):
+            self.calls += 1
+            return qualifier.ExactRequestCampaignCounters(
+                offered=800, succeeded=0, accepting_offers=self.calls == 1)
+
+    async def exercise():
+        observer = Observer()
+        campaign = Campaign()
+        progress = qualifier.Progress(scale_started_monotonic=started_monotonic,
+                                      scale_started_at=time.time())
+        receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                    service_name='paid-e2e',
+                                    profile=profile)
+        traffic = asyncio.create_task(asyncio.Event().wait())
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='Provider did not reach'):
+                await qualifier._wait_for_scale(observer=observer,
+                                                profile=profile,
+                                                progress=progress,
+                                                receipt=receipt,
+                                                traffic=traffic,
+                                                baseline=_request_telemetry(),
+                                                campaign_progress=campaign)
+            return observer, progress, receipt
+        finally:
+            traffic.cancel()
+            await asyncio.gather(traffic, return_exceptions=True)
+
+    observer, progress, receipt = asyncio.run(exercise())
+    assert observer.provider_reads == 1
+    assert progress.scale_reached_monotonic is None
+    assert progress.peak_running == 0
+    assert receipt._payload['samples'] == []
+    assert receipt._payload['request_telemetry_samples'] == []
+
+
 def test_scale_wait_allows_attributed_arrivals_to_age_out(tmp_path):
     """The resident stimulus outlives the LB's rolling arrival window."""
     profile = dataclasses.replace(qualifier.PROFILES['scale'], poll_seconds=0)
@@ -4261,7 +4455,9 @@ def test_scale_and_positive_gates_accept_fully_dispatched_cohort_concurrently(
         sample['phase']
         for sample in receipt._payload['request_telemetry_samples']
     ]
-    assert phases == ['scale-stimulus', 'scale', 'positive', 'scale']
+    assert phases[0] == 'scale-stimulus'
+    assert phases[1:].count('scale') == 2
+    assert phases[1:].count('positive') == 1
     positive = next(
         sample for sample in receipt._payload['request_telemetry_samples']
         if sample['phase'] == 'positive')
@@ -6470,6 +6666,33 @@ def _zero_qualification_sample(observed_at,
     return sample
 
 
+def _move_scale_observation(sample, observed_at):
+    """Move one synthetic provider census without breaking its interval."""
+    duration = sample['observation_duration_seconds']
+    started_at = observed_at - duration
+    sample.update({
+        'observation_started_at': started_at,
+        'observation_finished_at': observed_at,
+        'observed_at': observed_at,
+        'campaign_before_observed_at': started_at,
+        'campaign_after_observed_at': observed_at,
+    })
+
+
+def _set_scale_campaign_frontier(sample, *, offered, succeeded):
+    """Set a coherent full-pressure campaign interval in a synthetic sample."""
+    sample.update({
+        'campaign_offered': offered,
+        'campaign_succeeded': succeeded,
+        'campaign_before_offered': offered,
+        'campaign_before_succeeded': succeeded,
+        'campaign_before_accepting_offers': True,
+        'campaign_after_offered': offered,
+        'campaign_after_succeeded': succeeded,
+        'campaign_after_accepting_offers': True,
+    })
+
+
 def _write_aggregate_qualification(path,
                                    *,
                                    service_name,
@@ -6499,6 +6722,9 @@ def _write_aggregate_qualification(path,
         },
         'phase': 'scale',
         'scale_iteration_id': 1,
+        'observation_started_at': scale_observed_at - 0.5,
+        'observation_finished_at': scale_observed_at,
+        'observation_duration_seconds': 0.5,
         'observed_at': scale_observed_at,
         'exact_zero': False,
         'provider_instances': sum(peaks.values()),
@@ -6517,10 +6743,18 @@ def _write_aggregate_qualification(path,
         **({
             'campaign_offered': stimulus,
             'campaign_succeeded': 0,
+            'campaign_before_offered': stimulus,
+            'campaign_before_succeeded': 0,
+            'campaign_before_accepting_offers': True,
+            'campaign_before_observed_at': scale_observed_at - 0.5,
+            'campaign_after_offered': stimulus,
+            'campaign_after_succeeded': 0,
+            'campaign_after_accepting_offers': True,
+            'campaign_after_observed_at': scale_observed_at,
         } if economic else {}),
     }
     payload = {
-        'schema_version': 12,
+        'schema_version': 13,
         'service_name': service_name,
         'service_hash': f'{service_name}-hash',
         'lifecycle_epoch': 1,
@@ -6775,7 +7009,7 @@ def test_schema_eleven_accepts_late_provider_convergence_and_records_slo_miss(
     request_scale = next(
         sample for sample in payload['request_telemetry_samples']
         if sample['phase'] == 'scale')
-    provider_scale['observed_at'] = 350.0
+    _move_scale_observation(provider_scale, 350.0)
     request_scale['observed_at'] = 349.0
     payload['scale_qualified_observed_at'] = 350.0
     payload['scale_slo_met'] = False
@@ -6824,6 +7058,87 @@ def test_schema_eleven_accepts_positive_after_queue_fully_dispatches(tmp_path):
 
     qualifier._read_qualification_evidence(receipt,
                                            qualifier.ExpectationKind.ECONOMIC)
+
+
+def test_schema_thirteen_accepts_attributed_resident_scale_with_incomplete_occupancy(
+        tmp_path):
+    """Offline verification applies the same partial-observation capability."""
+    args = _aggregate_args(tmp_path)
+    receipt = pathlib.Path(args.economic_receipt)
+    payload = json.loads(receipt.read_text(encoding='utf-8'))
+    scale = next(sample for sample in payload['request_telemetry_samples']
+                 if sample['phase'] == 'scale')
+    scale.update(
+        _request_evidence_sample(phase='scale',
+                                 queue_depth=762,
+                                 in_flight=None,
+                                 processing=None,
+                                 accepted=38,
+                                 observed_at=249.0,
+                                 reason='in_flight_incomplete',
+                                 confirmed_in_flight_requests=38,
+                                 confirmed_processing_requests=16,
+                                 scale_iteration_id=1))
+    receipt.write_text(json.dumps(payload), encoding='utf-8')
+
+    evidence = qualifier._read_qualification_evidence(
+        receipt, qualifier.ExpectationKind.ECONOMIC)
+
+    assert evidence.scale_elapsed_seconds == 246.0
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [('confirmed_in_flight_requests', 39),
+     ('confirmed_processing_requests', 39), ('in_flight_requests', 38)],
+)
+def test_schema_thirteen_rejects_invalid_incomplete_occupancy_scale_evidence(
+        tmp_path, field, value):
+    args = _aggregate_args(tmp_path)
+    payload = json.loads(
+        pathlib.Path(args.economic_receipt).read_text(encoding='utf-8'))
+    scale = next(sample for sample in payload['request_telemetry_samples']
+                 if sample['phase'] == 'scale')
+    scale.update(
+        _request_evidence_sample(phase='scale',
+                                 queue_depth=762,
+                                 in_flight=None,
+                                 processing=None,
+                                 accepted=38,
+                                 observed_at=249.0,
+                                 reason='in_flight_incomplete',
+                                 confirmed_in_flight_requests=38,
+                                 confirmed_processing_requests=16,
+                                 scale_iteration_id=1))
+    scale[field] = value
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='unattributed scale demand'):
+        qualifier._validate_request_evidence(
+            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+
+
+def test_schema_thirteen_rejects_partial_scale_without_current_demand(tmp_path):
+    args = _aggregate_args(tmp_path)
+    payload = json.loads(
+        pathlib.Path(args.economic_receipt).read_text(encoding='utf-8'))
+    scale = next(sample for sample in payload['request_telemetry_samples']
+                 if sample['phase'] == 'scale')
+    scale.update(
+        _request_evidence_sample(phase='scale',
+                                 queue_depth=0,
+                                 in_flight=None,
+                                 processing=None,
+                                 observed_at=249.0,
+                                 reason='in_flight_incomplete',
+                                 confirmed_in_flight_requests=0,
+                                 confirmed_processing_requests=0,
+                                 scale_iteration_id=1))
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='unattributed scale demand'):
+        qualifier._validate_request_evidence(
+            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
 
 
 @pytest.mark.parametrize(
@@ -6948,7 +7263,7 @@ def test_provider_scale_must_precede_terminal_request_evidence(tmp_path):
         sample for sample in provider_samples if sample['phase'] == 'scale')
     second_provider_scale = copy.deepcopy(first_provider_scale)
     second_provider_scale['scale_iteration_id'] = 2
-    second_provider_scale['observed_at'] = 600.0
+    _move_scale_observation(second_provider_scale, 600.0)
     first_drain_index = next(
         index for index, sample in enumerate(provider_samples)
         if sample['phase'] == 'drain')
@@ -7216,7 +7531,7 @@ def test_aggregate_rejects_provider_scale_before_paired_request_sample(
     payload = json.loads(receipt.read_text(encoding='utf-8'))
     scale = next(
         sample for sample in payload['samples'] if sample['phase'] == 'scale')
-    scale['observed_at'] = 6.5
+    _move_scale_observation(scale, 6.5)
     payload['scale_qualified_observed_at'] = 6.5
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
@@ -7273,11 +7588,11 @@ def test_aggregate_rejects_scale_sample_without_campaign_frontier(tmp_path):
     payload = json.loads(receipt.read_text(encoding='utf-8'))
     scale = next(
         sample for sample in payload['samples'] if sample['phase'] == 'scale')
-    del scale['campaign_succeeded']
+    del scale['campaign_before_succeeded']
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
     with pytest.raises(qualifier.QualificationError,
-                       match='unattributed offered arrivals'):
+                       match='sustained campaign pressure'):
         qualifier.aggregate_evidence(args)
 
 
@@ -7295,12 +7610,10 @@ def test_aggregate_accepts_arrivals_aged_out_after_stimulus_commit(tmp_path):
     qualified_scale = copy.deepcopy(first_scale)
     qualified_scale.update({
         'scale_iteration_id': 2,
-        'observation_started_at': 349.5,
-        'observation_finished_at': 350.0,
-        'observed_at': 350.0,
         'lb_unique_job_arrivals_60s': 0,
         'lb_unique_job_arrivals_300s': 0,
     })
+    _move_scale_observation(qualified_scale, 350.0)
     first_scale['provider_running'] = 99
     first_scale['provider_running_gpu_units'] = 99
     first_gcp = first_scale['provider_by_cloud']['gcp']
@@ -7365,25 +7678,20 @@ def test_aggregate_accepts_arrivals_after_terminal_success_frontier(tmp_path):
     aged_scale = copy.deepcopy(first_scale)
     aged_scale.update({
         'scale_iteration_id': 2,
-        'observation_started_at': 349.5,
-        'observation_finished_at': 350.0,
-        'observed_at': 350.0,
         'lb_unique_job_arrivals_60s': 0,
         'lb_unique_job_arrivals_300s': 0,
     })
+    _move_scale_observation(aged_scale, 350.0)
     increased_scale = copy.deepcopy(aged_scale)
     increased_scale.update({
         'scale_iteration_id': 3,
-        'observation_started_at': 350.5,
-        'observation_finished_at': 351.0,
-        'observed_at': 351.0,
         'lb_unique_job_arrivals_60s': 1,
         'lb_unique_job_arrivals_300s': 1,
         'provider_running': 100,
         'provider_running_gpu_units': 100,
-        'campaign_offered': 801,
-        'campaign_succeeded': 1,
     })
+    _move_scale_observation(increased_scale, 351.0)
+    _set_scale_campaign_frontier(increased_scale, offered=801, succeeded=1)
     increased_gcp = increased_scale['provider_by_cloud']['gcp']
     increased_gcp['running'] = 50
     increased_gcp['running_gpu_units'] = 50
@@ -7431,10 +7739,9 @@ def test_aggregate_rejects_arrivals_ahead_of_terminal_success_frontier(
     payload = json.loads(receipt.read_text(encoding='utf-8'))
     scale = next(
         sample for sample in payload['samples'] if sample['phase'] == 'scale')
-    scale['lb_unique_job_arrivals_60s'] = 801
-    scale['lb_unique_job_arrivals_300s'] = 801
-    scale['campaign_offered'] = 801
-    scale['campaign_succeeded'] = 0
+    scale['lb_unique_job_arrivals_60s'] = 802
+    scale['lb_unique_job_arrivals_300s'] = 802
+    _set_scale_campaign_frontier(scale, offered=801, succeeded=1)
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
     with pytest.raises(qualifier.QualificationError,
@@ -7492,12 +7799,13 @@ def test_aggregate_derives_scale_elapsed_from_bound_sample(tmp_path, mutation):
     scale = next(
         sample for sample in payload['samples'] if sample['phase'] == 'scale')
     if mutation == 'diagnostic':
-        scale['observed_at'] = payload['scale_started_at'] + 301
+        _move_scale_observation(scale, payload['scale_started_at'] + 301)
         payload['scale_qualified_observed_at'] = scale['observed_at']
         payload['scale_slo_met'] = True
     elif mutation == 'timeout':
-        scale['observed_at'] = (payload['scale_started_at'] +
-                                payload['scale_timeout_seconds'] + 1)
+        _move_scale_observation(
+            scale,
+            payload['scale_started_at'] + payload['scale_timeout_seconds'] + 1)
         payload['scale_qualified_observed_at'] = scale['observed_at']
         payload['scale_slo_met'] = False
         request_scale = next(

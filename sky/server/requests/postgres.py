@@ -139,8 +139,6 @@ _LEGACY_DAEMON_TRANSITION_LOCK_ID = ('skypilot:runtime-daemon-transition:v1')
 _EXECUTOR_TERMINATION_EVIDENCE_NAMESPACE = uuid.UUID(
     '78ac727a-35da-50ff-b667-e5509dba7091')
 EXECUTOR_TERMINATION_EVIDENCE_PROTOCOL_VERSION = 2
-_ORDINARY_LAUNCH_SUBMISSION_NAMESPACE = uuid.UUID(
-    '58a82cb0-534c-5a5d-bb5d-681759e60469')
 _BOUND_CANCEL_QUIESCENCE_WAIT_SECONDS = 5.0
 _BOUND_CANCEL_QUIESCENCE_POLL_SECONDS = 0.1
 _LEGACY_ORDINARY_LAUNCH_HANDLER_NAME = 'sky.execution:launch'
@@ -3160,6 +3158,138 @@ def bind_and_enqueue_non_pool_launch_in_transaction(
     return admission
 
 
+def bind_and_enqueue_fresh_ordinary_paid_batch_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    requests: typing.Sequence[requests_lib.Request],
+    identities: typing.Sequence[
+        ordinary_launch_binding_lib.NonPoolBindingIdentity],
+    *,
+    prepared: ordinary_launch_binding_lib.PreparedFreshOrdinaryPaidBatch,
+    runtime: NonPoolLaunchBindingRuntime,
+) -> tuple[ordinary_launch_binding_lib.BindingAdmission, ...]:
+    """Set-insert one newly accepted paid association/request graph.
+
+    The preparation proof is transaction-local and guarantees that every
+    member is fresh.  Consequently this path has no exact-retry branch: any
+    collision rejects and rolls back the enclosing capacity-plan transaction.
+    """
+    if not isinstance(prepared,
+                      ordinary_launch_binding.PreparedFreshOrdinaryPaidBatch):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Fresh paid request batch has no prepared binding proof.')
+    requests = tuple(requests)
+    identities = tuple(identities)
+    if (not requests or len(requests) != len(identities) or
+            len(requests) != len(prepared.members)):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Fresh paid request batch is empty or incomplete.')
+    if (not isinstance(runtime, NonPoolLaunchBindingRuntime) or
+            runtime.handler_name
+            != non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME or
+            runtime.storage_backend_type
+            != POSTGRES_REQUEST_STORAGE_BACKEND_TYPE or
+            runtime.queue_backend_type != POSTGRES_REQUEST_QUEUE_BACKEND_TYPE):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Fresh paid request batch requires the built-in PostgreSQL '
+            'request and queue backends.')
+    if (connection.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value
+            or not connection.in_transaction()):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Fresh paid request batch requires an active PostgreSQL '
+            'transaction.')
+    if (len({request.request_id for request in requests}) != len(requests) or
+            len({identity.association_id for identity in identities
+                }) != len(identities)):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Fresh paid request batch identities must be unique.')
+
+    for request, identity in zip(requests, identities, strict=True):
+        submitted_user_id = request.request_body.env_vars.get(
+            skylet_constants.USER_ID_ENV_VAR)
+        if (not isinstance(identity,
+                           ordinary_launch_binding.NonPoolBindingIdentity) or
+                identity.profile.kind is not ordinary_launch_binding.
+                NonPoolLaunchProfileKind.ORDINARY_PAID or
+                request.request_id != identity.request_id or
+                request.retryable or not request.should_enqueue or
+                request.entrypoint is not non_pool_launch_request.launch or
+                request.user_id != identity.tenant_scope or
+                submitted_user_id != identity.tenant_scope):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Fresh paid request batch contains a malformed member.')
+
+    admissions = (ordinary_launch_binding.
+                  commit_prepared_fresh_ordinary_paid_batch_in_connection(
+                      connection, prepared, identities))
+    request_values = []
+    queue_values = []
+    pin_values = []
+    now = connection.execute(
+        sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+    for request, identity, admission in zip(requests,
+                                            identities,
+                                            admissions,
+                                            strict=True):
+        (ordinary_launch_binding.
+         validate_non_pool_submission_execution_context_in_connection(
+             connection, identity, request.request_body.extra_launch_context))
+        ordinary_launch_binding.install_bound_non_pool_context(
+            request.request_body, identity, admission.launch_generation)
+        values = _request_values_for_db(request)
+        if not _lock_managed_job_origin(
+                connection, values, require_admission=True):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Fresh paid request lost its outer admission authority.')
+        values.update({
+            'resource_action_id': None,
+            'resource_action_attempt': None,
+            'ordinary_launch_association_id': identity.association_id,
+            **_non_pool_request_profile_values(identity),
+            'updated_at': now,
+        })
+        request_values.append(values)
+        queued = _queue_values(request)
+        queued.update({
+            'available_at': now,
+            'enqueued_at': now,
+            'updated_at': now,
+        })
+        queue_values.append(queued)
+        pin_values.append({
+            'request_id': request.request_id,
+            'pin_kind': ORDINARY_LAUNCH_RETENTION_PIN_KIND,
+            'pin_id': identity.association_id,
+            'created_at': now,
+        })
+
+    inserted_requests = set(
+        connection.execute(
+            postgresql.insert(REQUESTS).on_conflict_do_nothing(
+                index_elements=[REQUESTS.c.request_id]).returning(
+                    REQUESTS.c.request_id), request_values).scalars())
+    expected_requests = {request.request_id for request in requests}
+    if inserted_requests != expected_requests:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Fresh paid API request set collided during insertion.')
+    inserted_queue = set(
+        connection.execute(
+            postgresql.insert(QUEUE).on_conflict_do_nothing(
+                index_elements=[QUEUE.c.request_id]).returning(
+                    QUEUE.c.request_id), queue_values).scalars())
+    if inserted_queue != expected_requests:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Fresh paid queue set collided during insertion.')
+    inserted_pins = set(
+        connection.execute(
+            sqlalchemy.insert(REQUEST_RETENTION_PINS).returning(
+                REQUEST_RETENTION_PINS.c.pin_id), pin_values).scalars())
+    expected_pins = {identity.association_id for identity in identities}
+    if inserted_pins != expected_pins:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Fresh paid retention-pin set was not inserted exactly once.')
+    return admissions
+
+
 def bind_and_enqueue_non_pool_launch(
     request: requests_lib.Request,
     identity: ordinary_launch_binding_lib.NonPoolBindingIdentity,
@@ -3457,8 +3587,9 @@ def stable_bound_ordinary_launch_submission_id_in_connection(
                 'A cancelled pre-effect launch cannot admit a successor for '
                 'the same replica record.')
         generation = int(latest['launch_generation']) + 1
-    material = f'{service_name}\0{replica_id}\0{record_uuid}\0{generation}'
-    return str(uuid.uuid5(_ORDINARY_LAUNCH_SUBMISSION_NAMESPACE, material))
+    return str(
+        ordinary_launch_binding.derive_ordinary_launch_submission_id(
+            service_name, replica_id, record_uuid, generation))
 
 
 def stable_bound_ordinary_launch_submission_id(

@@ -4926,7 +4926,6 @@ def _prepare_paid_admission_candidates(
 
 def _materialize_locked_paid_launch_specs(
     *,
-    connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
     preflight: _PreparedPaidLaunchPreflight | None,
     locked_version: _LockedPaidLaunchVersionAuthority | None,
@@ -4938,7 +4937,8 @@ def _materialize_locked_paid_launch_specs(
 
     This is the only identity allocator for promoted paid admission.  It runs
     after the service, replica, association, claim, waiter, and exact-pool rows
-    have been locked and after the pure planner has chosen its target.
+    have been locked and after the pure planner has chosen its target. It
+    consumes that immutable snapshot without performing database I/O.
     """
     if preflight is None or candidate.reserved_launch_target.total() > 0:
         return ()
@@ -4968,6 +4968,9 @@ def _materialize_locked_paid_launch_specs(
     prepared: list[serve_paid_capacity.PaidLaunchSpec] = []
     next_replica_id = first_replica_id
     transaction_now = paid_context.transaction_now
+    valid_claims_by_pool = (
+        serve_state._group_locked_paid_capacity_claims(  # pylint: disable=protected-access
+            paid_context.claim_rows, paid_context.pool_rows))
     for template in preflight.templates:
         card = template.accelerator
         try:
@@ -4993,8 +4996,6 @@ def _materialize_locked_paid_launch_specs(
         if pool is None:
             raise CapacityAdmissionConflict(
                 'Paid catalog pool was not locked before expansion.')
-        valid_claims, _ = serve_state._valid_paid_capacity_claims_in_session(  # pylint: disable=protected-access
-            connection, template.pool_key)
         admission_limit = serve_paid_capacity.effective_admission_limit(
             pool.current_limit,
             pool.last_success_at,
@@ -5004,7 +5005,9 @@ def _materialize_locked_paid_launch_specs(
             now=transaction_now,
             success_ttl=serve_paid_capacity.success_ttl_seconds(),
             failure_cooldown=serve_paid_capacity.failure_cooldown_seconds())
-        available = max(0, admission_limit.limit - len(valid_claims))
+        available = max(
+            0, admission_limit.limit -
+            len(valid_claims_by_pool[template.pool_key]))
         requested = remaining[card] // plan_units
         count = min(
             available, requested,
@@ -6286,7 +6289,8 @@ class CapacityAdmissionRepository:
                 upstream=upstream,
                 census=paid_census,
                 base_limit=serve_paid_capacity.base_limit(),
-                now=None)
+                now=None,
+                waiter_ttl_seconds=serve_paid_capacity.waiter_ttl_seconds())
 
             raw_claim_rows = connection.execute(
                 sqlalchemy.select(
@@ -6491,7 +6495,6 @@ class CapacityAdmissionRepository:
             paid_launch_version = fill_config.paid_launch_version
             assert paid_launch_version is not None
             prepared_specs = _materialize_locked_paid_launch_specs(
-                connection=connection,
                 service=service,
                 preflight=paid_preflight,
                 locked_version=paid_launch_version,
@@ -6534,6 +6537,8 @@ class CapacityAdmissionRepository:
                 upstream=paid_context.upstream,
                 census=candidate_census,
                 pool_rows=paid_context.pool_rows,
+                claim_rows=paid_context.claim_rows,
+                waiter_rows=paid_context.waiter_rows,
                 transaction_now=paid_context.transaction_now)
             candidate_persistence_specs = [
                 item.persistence_spec for item in paid_candidates
