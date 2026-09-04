@@ -186,6 +186,20 @@ class _PaidAwsCreateAuthority:
     account_id: str
 
 
+def _bound_paid_cluster_record_identity_kwargs(
+    launch_context: Mapping[str, Any],
+    cluster_name: str,
+) -> dict[str, uuid.UUID]:
+    """Return the exact global-cluster identity for a fresh paid launch."""
+    identity = (
+        ordinary_launch_binding.
+        fresh_ordinary_paid_resource_action_identity_from_launch_context(
+            launch_context, cluster_name))
+    if identity is None:
+        return {}
+    return {'cluster_record_uuid': identity.sky_cluster_record_uuid}
+
+
 def _configure_paid_aws_create_authority(
     *,
     cloud: clouds.Cloud,
@@ -2070,6 +2084,9 @@ class RetryingVmProvisioner:
                     task, cluster_name, self._workload_type,
                     self._extra_launch_context)
                 self._validate_service_replica_launch_preflight()
+                cluster_identity_kwargs = (
+                    _bound_paid_cluster_record_identity_kwargs(
+                        self._extra_launch_context, cluster_name))
                 try:
                     self._active_cluster_hash = (
                         global_user_state.add_or_update_cluster(
@@ -2083,6 +2100,7 @@ class RetryingVmProvisioner:
                             workload_id=workload_id,
                             workload_task_id=workload_task_id,
                             existing_cluster_hash=self._active_cluster_hash,
+                            **cluster_identity_kwargs,
                         ))
                 except ValueError as e:
                     raise exceptions.ResourcesUnavailableError(
@@ -5371,6 +5389,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # into the runtime. The READY transaction preserves that exact plan;
         # a newer distribution revision applies on a later launch or restart.
         with timeline.Event('backend.provision.post_process'):
+            cluster_identity_kwargs = (
+                _bound_paid_cluster_record_identity_kwargs(
+                    getattr(self, '_extra_launch_context', {}),
+                    handle.cluster_name))
             global_user_state.add_or_update_cluster(
                 handle.cluster_name,
                 handle,
@@ -5379,6 +5401,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 config_hash=config_hash,
                 task_config=user_specified_task_config,
                 existing_cluster_hash=cluster_hash,
+                **cluster_identity_kwargs,
             )
 
             # Add cluster event for successful provisioning.

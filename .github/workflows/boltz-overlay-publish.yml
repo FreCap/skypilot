@@ -1,8 +1,8 @@
 name: Publish boltz overlay image
 
-# Builds the boltz image (the full fork wheel plus a freshly built dashboard,
-# installed on the pinned upstream runtime) and pushes it to the gitops-hub
-# ECR. Each improvements commit has one deterministic patch version;
+# Builds the repository's canonical Python 3.14 image, composes the reviewed
+# Boltz reclaim policy, and pushes it to the gitops-hub ECR. Each improvements
+# commit has one deterministic patch version;
 # source provenance remains in the OCI revision label and sky.__commit__.
 #
 # One-time setup to enable pushes: create an OIDC role in the gitops-hub account
@@ -38,21 +38,16 @@ jobs:
     # Manual retries may only publish the integration branch; selecting a
     # feature branch must not reserve one of its deterministic versions.
     if: github.event_name == 'push' || github.ref == 'refs/heads/improvements'
-    runs-on: namespace-profile-skypilot-ci-2x4
+    # The canonical source image resolves the production AWS/GCP/Kubernetes
+    # extras and builds the dashboard. Match the proven amd64 source-image
+    # builder rather than the smaller former overlay-only runner.
+    runs-on: namespace-profile-skypilot-ci-4x8
     steps:
       - uses: actions/checkout@v4
         with:
           # release_version.py uses improvements first-parent history and the
           # image records the full-history build count.
           fetch-depth: 0
-
-      - uses: actions/setup-node@v4
-        # build-overlay.sh builds the dashboard (npm ci + npm run build in
-        # sky/dashboard) so the image ships a bundle matching the fork source.
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: sky/dashboard/package-lock.json
 
       - name: Resolve release
         id: cfg
@@ -127,7 +122,7 @@ jobs:
               -e EXPECTED_VERSION="${RELEASE_VERSION}" \
               -e EXPECTED_COMMIT="${GITHUB_SHA}" \
               "${EXACT_REF}" python -c \
-              'import os, skypilot_serve_system_oom_recovery_authorization, sky; assert sky.__version__ == os.environ["EXPECTED_VERSION"], sky.__version__; assert sky.__commit__ == os.environ["EXPECTED_COMMIT"], sky.__commit__'
+              'import importlib.metadata, os, sys; import boltz_reserved_fill_reclaim_policy, skypilot_serve_system_oom_recovery_authorization, sky; assert sys.version_info[:2] >= (3, 14), sys.version; assert sky.__version__ == os.environ["EXPECTED_VERSION"], sky.__version__; assert sky.__commit__ == os.environ["EXPECTED_COMMIT"], sky.__commit__; assert importlib.metadata.version("skypilot") == sky.__version__; assert importlib.metadata.version("boltz-skypilot-reserved-fill-reclaim-policy") == sky.__version__'
             echo "exists=true" >> "${GITHUB_OUTPUT}"
           elif grep -q 'ImageNotFoundException' "${error_file}"; then
             echo "exists=false" >> "${GITHUB_OUTPUT}"
@@ -168,7 +163,7 @@ jobs:
             -e EXPECTED_VERSION="${RELEASE_VERSION}" \
             -e EXPECTED_COMMIT="${GITHUB_SHA}" \
             "${EXACT_REF}" python -c \
-            'import os, skypilot_serve_system_oom_recovery_authorization, sky; assert sky.__version__ == os.environ["EXPECTED_VERSION"], sky.__version__; assert sky.__commit__ == os.environ["EXPECTED_COMMIT"], sky.__commit__'
+            'import importlib.metadata, os, sys; import boltz_reserved_fill_reclaim_policy, skypilot_serve_system_oom_recovery_authorization, sky; assert sys.version_info[:2] >= (3, 14), sys.version; assert sky.__version__ == os.environ["EXPECTED_VERSION"], sky.__version__; assert sky.__commit__ == os.environ["EXPECTED_COMMIT"], sky.__commit__; assert importlib.metadata.version("skypilot") == sky.__version__; assert importlib.metadata.version("boltz-skypilot-reserved-fill-reclaim-policy") == sky.__version__'
 
           digest="$(aws ecr describe-images \
             --region "${AWS_REGION}" \
@@ -188,7 +183,7 @@ jobs:
         shell: bash
         run: |
           {
-            echo "### boltz overlay"
+            echo "### Boltz production image"
             echo ""
             echo "- release:  \`${{ steps.cfg.outputs.version }}\`"
             echo "- exact:    \`${{ steps.cfg.outputs.exact_ref }}\`"

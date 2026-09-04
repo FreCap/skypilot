@@ -39,6 +39,7 @@ from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
+from sky.provision import metadata_utils
 from sky.provision import provider_facets
 from sky.serve import autoscaler_decisions
 from sky.serve import constants as serve_constants
@@ -108,6 +109,7 @@ reserved_fill_admission = adaptors_common.LazyImport(
 kueue_lane_observer = adaptors_common.LazyImport(
     'sky.serve.kueue_lane_observer')
 requests = adaptors_common.LazyImport('requests')
+gcp_provision = adaptors_common.LazyImport('sky.provision.gcp')
 
 
 def _required_controller_admin_auth_tokens() -> tuple[str, ...]:
@@ -144,6 +146,7 @@ _BOUND_SUBMISSION_RETRY_MAX_BACKOFF_FACTOR = 5
 # re-hammering the same exhausted zone (see _launch_replica).
 _DEFAULT_LAUNCH_MAX_RETRY = 3
 _DEFAULT_DRAIN_SECONDS = 120
+_PAID_PROVIDER_FINALIZATION_TIMEOUT_SECONDS = 420.0
 # Poll cadence for the in-flight-aware drain wait during replica retirement.
 _DRAIN_POLL_SECONDS = 2
 # Paid planning and authenticated request routing share the same exact-card
@@ -164,6 +167,14 @@ class ProbeRouteResult:
     resolved_routes: dict[int, route_projection.ResolvedRouteMaterial]
     identity_verified_replica_ids: set[int]
     complete: bool
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class _ProjectedPaidAbsenceFinalization:
+    """Successful bounded retirement of one exact projected paid tombstone."""
+
+    replica_id: int
+    replica_record_id: str
 
 
 class _ReplicaRemoteIOLane(enum.Enum):
@@ -2722,43 +2733,259 @@ def terminate_bound_non_pool_provider_present_cluster(
         absence_receipt)
 
 
-def cleanup_exact_paid_cluster_record_after_provider_absence(
+def finalize_projected_paid_provider_absence(
     service_name: str,
     replica_id: int,
     replica_record_id: str,
     cluster_name: str,
-) -> None:
-    """Clean exact local/cloud auxiliaries after native VM absence."""
-    exact_replica = serve_state.get_replica_info_with_resource_action_identity(
-        service_name, replica_id)
-    if exact_replica is None:
-        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-            'Provider-absent cleanup lost its exact replica row.')
-    info, identity = exact_replica
-    if (info.replica_record_id != replica_record_id or
-            info.cluster_name != cluster_name):
-        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-            'Provider-absent cleanup found a replaced replica row.')
-    if identity is None:
-        if global_user_state.cluster_with_name_exists(cluster_name):
+    *,
+    provider_operation_deadline_monotonic: float | None = None,
+    continue_guard: Callable[[], bool] | None = None,
+) -> bool:
+    """Clean exact GCP ports, then remove projected-ABSENT DB rows.
+
+    Billable provider absence and claim release are already durable before this
+    function becomes authorized.  It owns only the current paid L4 contract's
+    one per-replica auxiliary: the deterministic GCP ports firewall.  AWS's
+    service-scoped security group is externally owned and is never touched.
+    """
+
+    def _assert_continue(phase: str) -> None:
+        if continue_guard is not None and not continue_guard():
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                'Provider-absent cleanup found an unfenced cluster row.')
-        return
-    snapshot = global_user_state.get_cluster_record_identity_snapshot(
-        cluster_name, identity.sky_cluster_record_uuid)
-    if snapshot is None:
-        return
-    handle = snapshot.handle
+                'Projected paid provider absence lost lifecycle authority '
+                f'{phase}.')
+
+    status_lock = locks.get_lock(
+        backend_utils.cluster_status_lock_id(cluster_name), timeout=1)
+    resource_lock = locks.get_lock(
+        backend_utils.cluster_resource_operation_lock_id(cluster_name),
+        timeout=1)
+    with status_lock:
+        with resource_lock:
+            cleanup_authority = (
+                request_postgres.
+                bound_non_pool_projected_paid_provider_absence_cleanup_scope(
+                    service_name, replica_id, replica_record_id))
+            exact_replica = (
+                serve_state.get_replica_info_with_resource_action_identity(
+                    service_name, replica_id))
+            if exact_replica is None:
+                return False
+            info, identity = exact_replica
+            if (info.replica_record_id != replica_record_id or
+                    info.cluster_name != cluster_name):
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Projected paid absence found a replaced replica row.')
+            if cleanup_authority is None:
+                # Retained N-1/N-2 and UNKNOWN rows may predate deterministic
+                # resource-action identity. They can retire only after their
+                # provider-free PostgreSQL graph is still authorized and no
+                # same-name global row exists. This compatibility path owns no
+                # provider or local auxiliary effects.
+                if (identity is not None or not request_postgres.
+                        bound_non_pool_projected_provider_absence_is_authorized(
+                            service_name, replica_id, replica_record_id) or
+                        global_user_state.cluster_with_name_exists(cluster_name)
+                   ):
+                    return False
+                _assert_continue('before legacy replica-record retirement')
+                return (request_postgres.
+                        retire_bound_non_pool_projected_paid_provider_absence(
+                            service_name, replica_id, replica_record_id))
+            try:
+                expected_replica_record_id = uuid.UUID(replica_record_id)
+            except (AttributeError, TypeError, ValueError) as error:
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Projected paid absence received a malformed replica '
+                    'record identity.') from error
+            if (identity is None or not isinstance(
+                    cleanup_authority,
+                    request_postgres.ProjectedPaidAuxiliaryCleanupAuthority) or
+                    cleanup_authority.service_name != service_name or
+                    cleanup_authority.replica_record_id
+                    != expected_replica_record_id or
+                    cleanup_authority.resource_action_identity != identity):
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Projected paid absence lost its exact durable auxiliary '
+                    'cleanup authority.')
+            cleanup_scope = cleanup_authority.cleanup_scope
+            if (identity.replica_id != replica_id or
+                    identity.cluster_name != cluster_name):
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Projected paid absence found a replaced resource '
+                    'identity.')
+            snapshot = global_user_state.get_cluster_record_identity_snapshot(
+                cluster_name, identity.sky_cluster_record_uuid)
+            if snapshot is not None:
+                _assert_continue('before auxiliary cleanup')
+                _cleanup_projected_paid_provider_auxiliaries(
+                    cleanup_scope,
+                    snapshot.handle,
+                    expected_cluster_name=cluster_name,
+                    provider_operation_deadline_monotonic=(
+                        provider_operation_deadline_monotonic),
+                    continue_guard=continue_guard)
+                # close() may terminate a provider child while this worker is
+                # blocked in it. Recheck after the child returns and
+                # immediately before each independent durable mutation.
+                _assert_continue('before cluster-record retirement')
+                removal = global_user_state.remove_cluster(
+                    cluster_name,
+                    terminate=True,
+                    expected_cluster_record_uuid=(
+                        identity.sky_cluster_record_uuid),
+                    expected_cluster_handle=snapshot.handle)
+                if removal not in (
+                        global_user_state.ClusterRecordRemovalOutcome.
+                        REMOVED_EXACT,
+                        global_user_state.ClusterRecordRemovalOutcome.
+                        ALREADY_ABSENT,
+                ):
+                    raise RuntimeError(
+                        'Exact paid cluster-record finalization returned an '
+                        'unexpected result.')
+            _assert_continue('before replica-record retirement')
+            if not (request_postgres.
+                    retire_bound_non_pool_projected_paid_provider_absence(
+                        service_name, replica_id, replica_record_id)):
+                return False
+    return True
+
+
+def _cleanup_projected_paid_provider_auxiliaries(
+    cleanup_scope: Any,
+    handle: Any,
+    *,
+    expected_cluster_name: str,
+    provider_operation_deadline_monotonic: float | None = None,
+    continue_guard: Callable[[], bool] | None = None,
+) -> None:
+    """Delete only auxiliaries covered by the frozen paid L4 contract."""
+    provider_identity = getattr(cleanup_scope, 'provider_identity', None)
+    provider_name = getattr(cleanup_scope, 'cloud', None)
+    if not isinstance(provider_identity,
+                      Mapping) or provider_name not in ('aws', 'gcp'):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Projected paid absence has a malformed provider identity.')
     if not isinstance(handle, cloud_vm_ray_backend.CloudVmRayResourceHandle):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-            'Provider-absent cleanup found a non-VM cluster handle.')
-    # This runs only in the bounded observation lane, after the exact native
-    # allocation is ABSENT.  It removes ports, networks, SSH/config state, and
-    # the exact UUID-fenced cluster row without consuming a mutation slot.
-    backends.CloudVmRayBackend().post_teardown_cleanup(
-        handle,
-        terminate=True,
-        expected_cluster_record_uuid=str(identity.sky_cluster_record_uuid))
+            'Projected paid absence found a non-VM cluster handle.')
+    resources = handle.launched_resources
+    expected_cloud_type: type[clouds.Cloud]
+    expected_keys = {
+        'cluster_name_on_cloud', 'instance_type', 'num_nodes', 'region',
+        'use_spot', 'workspace', 'zone'
+    }
+    if provider_name == 'gcp':
+        expected_cloud_type = clouds.GCP
+        expected_keys.add('project_id')
+    else:
+        expected_cloud_type = clouds.AWS
+        expected_keys.update(
+            {'aws_account_id', 'client_token', 'credential_profile'})
+    if (set(provider_identity) != expected_keys or
+            not isinstance(provider_identity.get('cluster_name_on_cloud'), str)
+            or not provider_identity['cluster_name_on_cloud'] or
+            not isinstance(provider_identity.get('instance_type'), str) or
+            not provider_identity['instance_type'] or
+            type(provider_identity.get('num_nodes')) is not int or
+            provider_identity['num_nodes'] < 1 or
+            not isinstance(provider_identity.get('region'), str) or
+            not provider_identity['region'] or
+            not isinstance(provider_identity.get('zone'), str) or
+            not provider_identity['zone'] or
+            not isinstance(provider_identity.get('workspace'), str) or
+            not provider_identity['workspace'] or
+            provider_identity.get('use_spot') is not True):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Projected paid absence has a malformed provider identity.')
+    if provider_name == 'gcp' and (
+            not isinstance(provider_identity.get('project_id'), str) or
+            not provider_identity['project_id']):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Projected paid absence has a malformed provider identity.')
+    if provider_name == 'aws' and (
+            not isinstance(provider_identity.get('aws_account_id'), str) or
+            not provider_identity['aws_account_id'] or
+            not isinstance(provider_identity.get('client_token'), str) or
+            not provider_identity['client_token'] or
+        (provider_identity.get('credential_profile') is not None and
+         (not isinstance(provider_identity['credential_profile'], str) or
+          not provider_identity['credential_profile']))):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Projected paid absence has a malformed provider identity.')
+    if (handle.cluster_name != expected_cluster_name or
+            handle.cluster_name_on_cloud
+            != provider_identity['cluster_name_on_cloud'] or
+            not isinstance(resources.cloud, expected_cloud_type) or
+            resources.instance_type != provider_identity['instance_type'] or
+            resources.region != provider_identity['region'] or
+            resources.zone != provider_identity['zone'] or
+            resources.use_spot is not True or
+            type(handle.launched_nodes) is not int or
+            handle.launched_nodes != provider_identity['num_nodes']):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Projected paid cluster handle does not match provider identity.')
+    network_tier = getattr(resources, 'network_tier', None)
+    is_image_managed = getattr(resources, 'is_image_managed', None)
+    if ((is_image_managed is not None and is_image_managed is not False) or
+            getattr(resources, 'volumes', None) is not None or
+            network_tier not in (None, resources_utils.NetworkTier.STANDARD,
+                                 resources_utils.NetworkTier.STANDARD.value)):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Projected paid cluster has unsupported auxiliary resources.')
+    ports = getattr(resources, 'ports', None)
+    if ports is not None and (not isinstance(ports, list) or not ports or any(
+            not isinstance(port, str) or not port for port in ports)):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Projected paid cluster has malformed ports.')
+    generated_root = pathlib.Path(
+        constants.SKY_USER_FILE_PATH).expanduser().resolve()
+    cluster_yaml = handle.cluster_yaml
+    exact_cluster_yaml: pathlib.Path | None = None
+    if cluster_yaml is not None:
+        if not isinstance(cluster_yaml, str) or not cluster_yaml:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Projected paid cluster has a malformed cluster YAML path.')
+        expected_cluster_yaml = generated_root / f'{expected_cluster_name}.yml'
+        try:
+            exact_cluster_yaml = pathlib.Path(
+                cluster_yaml).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Projected paid cluster has a malformed cluster YAML path.'
+            ) from error
+        if exact_cluster_yaml != expected_cluster_yaml:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Projected paid cluster YAML is outside its exact generated '
+                'path.')
+    if provider_name == 'gcp' and ports is not None:
+        if continue_guard is not None and not continue_guard():
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Projected paid provider absence lost lifecycle authority '
+                'before firewall cleanup.')
+        cleanup_kwargs = ({
+            'deadline_monotonic': provider_operation_deadline_monotonic
+        } if provider_operation_deadline_monotonic is not None else {})
+        gcp_provision.delete_exact_cluster_ports_firewall(
+            provider_identity['project_id'],
+            provider_identity['cluster_name_on_cloud'], **cleanup_kwargs)
+    if continue_guard is not None and not continue_guard():
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Projected paid provider absence lost lifecycle authority before '
+            'local auxiliary cleanup.')
+    # These are controller-local artifacts, not provider authority.  Remove
+    # only names and paths already proven by the exact replica, cluster UUID,
+    # serialized handle, and closed generated-path validation above.  Do not
+    # invoke generic post-teardown cleanup or remove the durable cluster-YAML
+    # database record here.
+    metadata_utils.remove_cluster_metadata(expected_cluster_name)
+    common_utils.remove_file_if_exists(
+        str(generated_root / 'ssh' / expected_cluster_name))
+    if exact_cluster_yaml is not None:
+        common_utils.remove_file_if_exists(str(exact_cluster_yaml))
+        common_utils.remove_file_if_exists(f'{exact_cluster_yaml}.debug')
 
 
 def terminate_cluster_with_kueue_absence_receipt(
@@ -5529,29 +5756,33 @@ class SkyPilotReplicaManager(ReplicaManager):
                 is not ordinary_launch_binding.ProviderPresentTeardownPhase.
                 ABSENCE_OBSERVATION_PENDING):
             return
+        lane = self._non_pool_reconciliation_lane
+
+        def _continue_reconciliation() -> bool:
+            return (lane.mutation_is_allowed and
+                    not self._manager_daemon_should_stop())
 
         def _observe_once() -> Any:
-            before_absence_projection = None
-            if paid:
-                before_absence_projection = functools.partial(
-                    cleanup_exact_paid_cluster_record_after_provider_absence,
-                    self._service_name, info.replica_id, info.replica_record_id,
-                    info.cluster_name)
             operation = (
                 non_pool_launch_reconciliation.advance_paid_teardown_observation
                 if paid and self._provider_present_cleanup_marker_shape(info)
                 else non_pool_launch_reconciliation.reconcile)
-            return operation(
-                binding_context,
-                info,
-                authority,
-                functools.partial(self._project_bound_ordinary_launch, None),
-                before_absence_projection=before_absence_projection)
+            return operation(binding_context,
+                             info,
+                             authority,
+                             functools.partial(
+                                 self._project_bound_ordinary_launch, None),
+                             continue_guard=_continue_reconciliation)
 
-        self._non_pool_reconciliation_lane.schedule(key, _observe_once)
+        lane.schedule(key, _observe_once)
 
-    def _finalize_projected_provider_absence_cleanup(self,
-                                                     replica_id: int) -> bool:
+    def _finalize_projected_provider_absence_cleanup(
+        self,
+        replica_id: int,
+        *,
+        provider_operation_deadline_monotonic: float | None = None,
+        continue_guard: Callable[[], bool] | None = None,
+    ) -> bool:
         """Remove an immediate-cleanup row after exact ABSENT projected."""
         runtime = self._legacy_mutation_runtime_state()
         if (replica_id in runtime.launch_thread_pool or
@@ -5574,15 +5805,58 @@ class SkyPilotReplicaManager(ReplicaManager):
                 return False
             self._handle_sky_down_finish(info, format_exc=None)
         else:
-            if not (request_postgres.
-                    retire_bound_non_pool_projected_paid_provider_absence(
-                        self._service_name, replica_id,
-                        info.replica_record_id)):
+            if not finalize_projected_paid_provider_absence(
+                    self._service_name,
+                    replica_id,
+                    info.replica_record_id,
+                    info.cluster_name,
+                    provider_operation_deadline_monotonic=(
+                        provider_operation_deadline_monotonic),
+                    continue_guard=continue_guard):
                 return False
             logger.info(
                 'Replica %s removed after exact paid provider '
                 'negative acknowledgement.', info.replica_id)
         return True
+
+    def _schedule_projected_paid_absence_finalization(
+            self, info: ReplicaInfo) -> bool:
+        """Schedule post-settlement auxiliary cleanup off the manager mutex."""
+        if (info.reserved_fill is not False or info.is_zero_cost is not False or
+                info.is_spot is not True or not ordinary_launch_binding.
+                replica_has_projected_provider_absence_cleanup_marker(info)):
+            return False
+        key = (info.replica_id, info.replica_record_id)
+        if self._non_pool_reconciliation_lane.contains(key):
+            return True
+        if time.monotonic() < self._non_pool_reconciliation_retry_at.get(
+                key, 0):
+            return False
+        deadline_monotonic = (time.monotonic() +
+                              _PAID_PROVIDER_FINALIZATION_TIMEOUT_SECONDS)
+        lane = self._non_pool_reconciliation_lane
+
+        def _continue_finalization() -> bool:
+            return (lane.mutation_is_allowed and
+                    not self._manager_daemon_should_stop())
+
+        def _finalize_once() -> _ProjectedPaidAbsenceFinalization:
+            if not _continue_finalization():
+                raise RuntimeError(
+                    'Projected paid provider absence lost manager lifecycle '
+                    'authority before finalization.')
+            if not self._finalize_projected_provider_absence_cleanup(
+                    info.replica_id,
+                    provider_operation_deadline_monotonic=deadline_monotonic,
+                    continue_guard=_continue_finalization):
+                raise RuntimeError(
+                    'Projected paid provider absence lost exact finalization '
+                    'authority.')
+            return _ProjectedPaidAbsenceFinalization(
+                replica_id=info.replica_id,
+                replica_record_id=info.replica_record_id)
+
+        return lane.schedule(key, _finalize_once)
 
     def _reconcile_unowned_bound_non_pool_launches(
             self, replica_infos: list[ReplicaInfo]) -> None:
@@ -5659,7 +5933,20 @@ class SkyPilotReplicaManager(ReplicaManager):
         for completion in self._non_pool_reconciliation_lane.take_completed():
             key = completion.key
             context_info = infos.get(key)
-            if key not in context_keys or context_info is None:
+            projected_paid_cleanup = bool(
+                context_info is not None and
+                context_info.reserved_fill is False and
+                context_info.is_zero_cost is False and
+                context_info.is_spot is True and ordinary_launch_binding.
+                replica_has_projected_provider_absence_cleanup_marker(
+                    context_info))
+            if isinstance(completion.result, _ProjectedPaidAbsenceFinalization):
+                self._non_pool_reconciliation_attempts.pop(key, None)
+                self._non_pool_reconciliation_retry_at.pop(key, None)
+                self._notify_scale_reconciliation()
+                continue
+            if ((key not in context_keys and not projected_paid_cleanup) or
+                    context_info is None):
                 self._non_pool_reconciliation_attempts.pop(key, None)
                 self._non_pool_reconciliation_retry_at.pop(key, None)
                 continue
@@ -11779,14 +12066,18 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         if projected_provider_absence_info is not None:
             # Provider ABSENT and the released association/pin were committed
-            # before a prior controller died. No provider call remains: route
-            # this restart shape directly through the exact record-fenced
-            # down-result remover.
-            if not self._finalize_projected_provider_absence_cleanup(
-                    projected_provider_absence_info.replica_id):
-                raise RuntimeError(
-                    'Projected provider absence lost exact row-removal '
-                    'authority.')
+            # before a prior controller died. Route the provider-free reserved
+            # shape directly to its row remover; paid GCP may still owe one
+            # exact ports-firewall delete and therefore uses the bounded lane.
+            if projected_provider_absence_info.reserved_fill is True:
+                if not self._finalize_projected_provider_absence_cleanup(
+                        projected_provider_absence_info.replica_id):
+                    raise RuntimeError(
+                        'Projected provider absence lost exact row-removal '
+                        'authority.')
+            else:
+                self._schedule_projected_paid_absence_finalization(
+                    projected_provider_absence_info)
             return
 
         logger.info(f'Terminating replica {replica_id}...')
@@ -11984,6 +12275,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             if (ordinary_launch_binding.
                     replica_has_projected_provider_absence_cleanup_marker(
                         info)):
+                if (info.reserved_fill is False and
+                        info.is_zero_cost is False and info.is_spot is True):
+                    self._schedule_projected_paid_absence_finalization(info)
+                    continue
                 try:
                     if self._finalize_projected_provider_absence_cleanup(
                             info.replica_id):
@@ -14043,6 +14338,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._remote_io_executor = None
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
+
+    def _shutdown_non_pool_reconciliation_lane(self) -> None:
+        """Close lane admission and all registered provider child groups."""
+        lane = getattr(self, '_non_pool_reconciliation_lane', None)
+        if lane is not None:
+            lane.close()
 
     def _cloud_instance_looks_alive(
         self,
@@ -19044,7 +19345,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     return
         finally:
             if self._manager_daemon_stop.is_set():
-                self._shutdown_remote_io_executor()
+                try:
+                    self._shutdown_non_pool_reconciliation_lane()
+                finally:
+                    self._shutdown_remote_io_executor()
 
     def get_active_replica_urls(self) -> list[str]:
         """Get the urls of all active replicas."""

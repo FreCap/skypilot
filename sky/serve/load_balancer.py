@@ -1235,16 +1235,15 @@ class SkyServeLoadBalancer:
                 # have not reached selection consume the fleet-wide remainder.
                 effective = self._effective_replica_free_slots_locked()
                 total_slots = self._replica_total_slots
-                hint = self._capacity_hint or {}
-                logical_replicas = hint.get('replica_unit') == 'logical_slot'
-                planned_capacity = hint.get('planned_capacity_by_url', {})
+                planned_capacity = (
+                    self._planned_logical_capacity_by_url_locked(ready_urls))
                 # The configured per-replica value remains a hard safety cap,
                 # but a heterogeneous replica contributes its actual probed
                 # slots instead of one replica-count unit. Logical mode uses
                 # controller-pinned width for stable queue sizing, while the
                 # effective free-slot sum below remains observation-gated.
-                capacity_by_url = (planned_capacity
-                                   if logical_replicas else total_slots)
+                capacity_by_url = (planned_capacity if planned_capacity
+                                   is not None else total_slots)
                 queue_capacity_units = sum(
                     min(capacity_by_url.get(url, 0),
                         config['max_concurrency_per_replica'])
@@ -1255,6 +1254,17 @@ class SkyServeLoadBalancer:
                     sum(slots for url, slots in effective.items()
                         if url in ready_urls) -
                     self._occupancy_unassigned_reservations)
+            else:
+                planned_capacity = (
+                    self._planned_logical_capacity_by_url_locked(ready_urls))
+                if planned_capacity is not None:
+                    # Synchronous logical-slot services keep the HTTP envelope
+                    # open for the entire prediction. Their immutable controller
+                    # width is therefore both the queue-sizing unit and the
+                    # dispatch ceiling; treating each physical backend as the
+                    # configured maximum oversubscribes narrow machines.
+                    queue_capacity_units = sum(planned_capacity.values())
+                    dispatch_capacity = queue_capacity_units
         dispatch_limit = min(config['max_concurrency'], dispatch_capacity)
         if free_slots is not None:
             # `_active_request_count` already includes admitted requests whose
@@ -1266,6 +1276,48 @@ class SkyServeLoadBalancer:
         queue_size = max(config['min_size'],
                          queue_capacity_units * config['size_per_replica'])
         return dispatch_limit, min(config['max_size'], queue_size)
+
+    def _planned_logical_capacity_by_url_locked(
+            self, ready_urls: set[str]) -> dict[str, int] | None:
+        """Return controller-pinned logical width, capped by queue policy.
+
+        ``None`` denotes the legacy physical-backend contract. Once the
+        controller advertises logical slots, a missing or malformed per-URL
+        width contributes zero capacity; it must never inherit the largest
+        configured backend width.
+        """
+        config = self._request_queue_config
+        if config is None:
+            return None
+        hint = self._capacity_hint or {}
+        if hint.get('replica_unit') != 'logical_slot':
+            return None
+        raw_capacity = hint.get('planned_capacity_by_url')
+        if not isinstance(raw_capacity, dict):
+            raw_capacity = {}
+        hard_cap = max(1, int(config['max_concurrency_per_replica']))
+        capacity: dict[str, int] = {}
+        for url in ready_urls:
+            raw_width = raw_capacity.get(url)
+            capacity[url] = (min(raw_width, hard_cap)
+                             if type(raw_width) is int and raw_width > 0 else 0)
+        return capacity
+
+    def _synchronous_logical_free_slots_by_url_locked(
+            self, ready_urls: set[str]) -> dict[str, int] | None:
+        """Return free synchronous slots under a logical per-URL fence."""
+        capacity = self._planned_logical_capacity_by_url_locked(ready_urls)
+        if capacity is None:
+            return None
+        in_flight = self._load_balancing_policy.snapshot_in_flight()
+        if in_flight is None:
+            # A routing policy without exact in-flight accounting cannot prove
+            # a logical backend has room. Unknown capacity is not free.
+            return {url: 0 for url in ready_urls}
+        return {
+            url: max(0, width - max(0, int(in_flight.get(url, 0))))
+            for url, width in capacity.items()
+        }
 
     def _request_queue_submission_limit(self) -> int:
         """Return the capacity-insensitive controller HTTP concurrency.
@@ -1646,15 +1698,22 @@ class SkyServeLoadBalancer:
             if self._queue_uses_async_occupancy():
                 free_by_url = self._effective_replica_free_slots_locked()
             else:
-                in_flight = self._load_balancing_policy.snapshot_in_flight()
-                config = self._request_queue_config
-                assert config is not None
-                per_replica_limit = max(
-                    1, int(config.get('max_concurrency_per_replica', 1)))
-                free_by_url = {
-                    url: max(0, per_replica_limit -
-                             (in_flight or {}).get(url, 0)) for url in ready_urls
-                }
+                logical_free = (
+                    self._synchronous_logical_free_slots_by_url_locked(
+                        ready_urls))
+                if logical_free is not None:
+                    free_by_url = logical_free
+                else:
+                    in_flight = self._load_balancing_policy.snapshot_in_flight()
+                    config = self._request_queue_config
+                    assert config is not None
+                    per_replica_limit = max(
+                        1, int(config.get('max_concurrency_per_replica', 1)))
+                    free_by_url = {
+                        url: max(0, per_replica_limit -
+                                 (in_flight or {}).get(url, 0))
+                        for url in ready_urls
+                    }
             slots = {accelerator: 0 for accelerator in configured}
             zero_cost_slots = {accelerator: 0 for accelerator in configured}
             for url in ready_urls:
@@ -6246,6 +6305,15 @@ class SkyServeLoadBalancer:
                         self._effective_replica_free_slots_locked().items()
                         if url in ready_urls and slots > 0
                     }
+                else:
+                    logical_free = (
+                        self._synchronous_logical_free_slots_by_url_locked(
+                            routable_urls))
+                    if logical_free is not None:
+                        eligible_urls = {
+                            url for url, slots in logical_free.items()
+                            if slots > 0
+                        }
                 compatible_accelerators = getattr(request,
                                                   _REQUEST_ACCELERATORS_ATTR,
                                                   None)

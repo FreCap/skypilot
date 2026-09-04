@@ -796,12 +796,21 @@ def _admit_generic_paid(
             legacy_requests_drained=lambda _connection: True)
         state = _stored_replica_state(
             {'paid_capacity_pool_key': _CURRENT_PAID_POOL_KEY})
+        resource_identity = (
+            binding.derive_fresh_ordinary_paid_resource_action_identity(
+                replica_id=3,
+                replica_record_id=_RECORD_ID,
+                cluster_name='svc-3'))
         connection.execute(
             sqlalchemy.update(serve_state_schema.replicas_table).where(
                 serve_state_schema.replicas_table.c.service_name == 'svc',
                 serve_state_schema.replicas_table.c.replica_id == 3).values(
                     status='PROVISIONING',
                     paid_capacity_pool_key=_CURRENT_PAID_POOL_KEY,
+                    replica_incarnation=(resource_identity.replica_incarnation),
+                    desired_generation=resource_identity.desired_generation,
+                    sky_cluster_record_uuid=(
+                        resource_identity.sky_cluster_record_uuid),
                     replica_state=state))
         connection.execute(
             sqlalchemy.insert(
@@ -958,9 +967,30 @@ def _assert_current_paid_provider_effect_is_permitted(database,) -> None:
     assert phase == binding.EffectPhase.PROVIDER_IO.value
 
 
+def test_current_paid_provider_effect_rejects_changed_resource_identity(
+        binding_database) -> None:
+    identity, _, launch_context = _admit_generic_paid(binding_database)
+    claim = _Claim(identity.request_id, 1, str(uuid.uuid4()), str(uuid.uuid4()))
+    with binding_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id == 3).values(
+                    sky_cluster_record_uuid=uuid.uuid4()))
+
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='resource-action identity'):
+        with binding.non_pool_provider_effect_guard(
+                launch_context,
+                claim,
+                claim_validator=lambda _connection, _association_id, _claim:
+                True):
+            pytest.fail('provider I/O must remain outside the guard')
+
+
 def test_paid_provider_allocation_first_commit_replay_and_conflict(
         binding_database, monkeypatch) -> None:
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 15
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 16
     monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 4)
     monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 120)
     monkeypatch.setattr(paid_capacity, 'success_ttl_seconds', lambda: 600)
@@ -1387,11 +1417,11 @@ def test_paid_plan_is_mutable_only_before_provider_effect(
 def test_historical_cohort_cannot_start_provider_effect(
         binding_database, monkeypatch, history_distance) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
-    assert current_cohort == 15
+    assert current_cohort == 16
     assert current_cohort > history_distance
     historical_cohort = current_cohort - history_distance
     if history_distance == 1:
-        assert historical_cohort == 14
+        assert historical_cohort == 15
     with monkeypatch.context() as old_code:
         old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
                          historical_cohort)
@@ -1570,7 +1600,7 @@ def _reserved_fill_cleanup_rows(
 def test_reserved_fill_cleanup_accepts_exact_adjacent_cohort_tuple(
         binding_database, monkeypatch) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
-    assert current_cohort == 15
+    assert current_cohort == 16
     service, replica, association, expected_profile = (
         _reserved_fill_cleanup_rows(current_cohort - 1, current_cohort - 1))
     validated: list[binding.NonPoolLaunchProfile] = []
@@ -1599,7 +1629,7 @@ def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
     current_projection = (
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    assert (current_cohort, current_projection) == (15, 10)
+    assert (current_cohort, current_projection) == (16, 10)
     historical_cohort = current_cohort - history_distance
     historical_projection = current_projection - history_distance
     info = _reserved_fill_replica_info()
@@ -2558,7 +2588,7 @@ def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
 def test_reserved_fill_cleanup_rejects_older_or_mismatched_cohorts(
         binding_database, monkeypatch, service_cohort,
         association_cohort) -> None:
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 15
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 16
     service, replica, association, _ = _reserved_fill_cleanup_rows(
         service_cohort, association_cohort)
     profile_validation_called = False

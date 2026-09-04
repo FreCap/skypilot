@@ -29,6 +29,11 @@ FROM python:3.14.5-slim AS process-source
 # Control installation method - default to install from source
 ARG INSTALL_FROM_SOURCE=true
 ARG NEXT_BASE_PATH=/dashboard
+ARG INSTALL_BOLTZ_RECLAIM_POLICY=false
+ARG SKYPILOT_VERSION
+ARG SKYPILOT_COMMIT_SHA
+ARG SKYPILOT_COMMIT_TIMESTAMP
+ARG SKYPILOT_COMMIT_COUNT
 WORKDIR /skypilot
 
 # New Python slim images do not guarantee setuptools is preinstalled. setup.py
@@ -91,11 +96,40 @@ RUN cd /skypilot && \
         rm -rf .git; \
     fi
 
+# setup.py's generic source materialization above must run first: it derives
+# identity from Git and would otherwise overwrite an exact deployment stamp.
+# A deployment release may now project one immutable identity across Python and
+# OCI metadata. Generic builds leave every argument empty, making this a no-op.
+RUN if [ "$INSTALL_FROM_SOURCE" = "true" ]; then \
+      python boltz/stamp_image_release.py \
+        --root /skypilot \
+        --version "$SKYPILOT_VERSION" \
+        --commit "$SKYPILOT_COMMIT_SHA" \
+        --commit-timestamp "$SKYPILOT_COMMIT_TIMESTAMP" \
+        --commit-count "$SKYPILOT_COMMIT_COUNT" \
+        --install-policy "$INSTALL_BOLTZ_RECLAIM_POLICY"; \
+    elif [ "$INSTALL_BOLTZ_RECLAIM_POLICY" != "false" ] || \
+         [ -n "$SKYPILOT_VERSION$SKYPILOT_COMMIT_SHA$SKYPILOT_COMMIT_TIMESTAMP$SKYPILOT_COMMIT_COUNT" ]; then \
+      echo "Error: exact release stamping requires INSTALL_FROM_SOURCE=true" >&2; \
+      exit 1; \
+    fi
+
 
 # Stage 3: Main image
 FROM python:3.14.5-slim
 
 ARG INSTALL_FROM_SOURCE=true
+ARG INSTALL_BOLTZ_RECLAIM_POLICY=false
+ARG SKYPILOT_VERSION
+ARG SKYPILOT_COMMIT_SHA
+ARG SKYPILOT_COMMIT_TIMESTAMP
+ARG SKYPILOT_COMMIT_COUNT
+ARG SKYPILOT_EXTRAS=all
+
+LABEL org.opencontainers.image.version="${SKYPILOT_VERSION}" \
+      org.opencontainers.image.revision="${SKYPILOT_COMMIT_SHA}" \
+      bio.boltz.skypilot.commit-timestamp="${SKYPILOT_COMMIT_TIMESTAMP}" \
+      bio.boltz.skypilot.commit-count="${SKYPILOT_COMMIT_COUNT}"
 
 # Copy Google Cloud SDK from Stage 1
 COPY --from=gcloud-apt-install /usr/lib/google-cloud-sdk /opt/google-cloud-sdk
@@ -140,11 +174,15 @@ RUN ARCH=${TARGETARCH:-$(case "$(uname -m)" in \
 
 # Install Nebius CLI
 RUN curl -sSL https://storage.eu-north1.nebius.cloud/cli/install.sh | NEBIUS_INSTALL_FOLDER=/usr/local/bin bash
-# Install uv
+# Install uv. Azure CLI's pinned dependency graph requires prereleases, so
+# preseed it only for images which actually request the Azure or all extra.
+# The Boltz control-plane image requests only AWS, GCP, and Kubernetes.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    # Cap azure-cli<2.87.0: 2.87.0 pulls the broken azure-mgmt-storage 25.0.0
-    # (see sky/setup_files/dependencies.py).
-    ~/.local/bin/uv pip install --prerelease allow "azure-cli<2.87.0" --system && \
+    case ",${SKYPILOT_EXTRAS}," in \
+      *,all,*|*,azure,*) \
+        ~/.local/bin/uv pip install --prerelease allow \
+          "azure-cli<2.87.0" --system ;; \
+    esac && \
     # Upgrade setuptools in base image to mitigate CVE-2024-6345
     ~/.local/bin/uv pip install --system --upgrade setuptools==78.1.1 && \
     ~/.local/bin/uv cache clean && \
@@ -159,7 +197,7 @@ COPY --from=process-source /skypilot /skypilot
 RUN cd /skypilot && \
     if [ "$INSTALL_FROM_SOURCE" = "true" ]; then \
         echo "Installing from source in editable mode" && \
-        ~/.local/bin/uv pip install -e ".[all]" --system; \
+        ~/.local/bin/uv pip install -e ".[${SKYPILOT_EXTRAS}]" --system; \
     else \
         echo "Installing from wheel file" && \
         WHEEL_FILE=$(ls dist/*skypilot*.whl 2>/dev/null | head -1) && \
@@ -168,8 +206,21 @@ RUN cd /skypilot && \
             ls -la /skypilot/dist/ && \
             exit 1; \
         fi && \
-        ~/.local/bin/uv pip install "${WHEEL_FILE}[all]" --system && \
+        ~/.local/bin/uv pip install \
+          "${WHEEL_FILE}[${SKYPILOT_EXTRAS}]" --system && \
         echo "Skipping dashboard build for wheel installation"; \
+    fi && \
+    if [ "$INSTALL_BOLTZ_RECLAIM_POLICY" = "true" ]; then \
+        if [ "$INSTALL_FROM_SOURCE" != "true" ]; then \
+            echo "Error: the Boltz reclaim policy requires the source image" >&2; \
+            exit 1; \
+        fi; \
+        echo "Installing the Boltz reserved-fill reclaim policy" && \
+        ~/.local/bin/uv pip install --no-deps --no-build-isolation \
+          /skypilot/boltz/reserved_fill_reclaim_policy --system; \
+    elif [ "$INSTALL_BOLTZ_RECLAIM_POLICY" != "false" ]; then \
+        echo "Error: INSTALL_BOLTZ_RECLAIM_POLICY must be true or false" >&2; \
+        exit 1; \
     fi && \
     # Cleanup all caches to reduce the image size
     ~/.local/bin/uv cache clean && \

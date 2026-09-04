@@ -4,13 +4,17 @@ from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Mapping
 import copy
+import math
 from multiprocessing import pool
 import re
+import subprocess
+import sys
 import time
 from typing import Any, Optional
 
 from sky import sky_logging
 from sky.adaptors import gcp
+from sky.clouds import gcp as gcp_cloud
 from sky.provision import common
 from sky.provision import constants as provision_constants
 from sky.provision import provider_facets
@@ -20,10 +24,16 @@ from sky.provision.gcp import instance_utils
 from sky.utils import common_utils
 from sky.utils import resources_utils
 from sky.utils import status_lib
+from sky.utils import subprocess_utils
 
 logger = sky_logging.init_logger(__name__)
 
 _SERVE_INVENTORY_HTTP_TIMEOUT_SECONDS = 10
+_EXACT_FIREWALL_WORKER_MODULE = (
+    'sky.provision.gcp.exact_firewall_cleanup_worker')
+_EXACT_FIREWALL_ALREADY_ABSENT_RETURN_CODE = 3
+_EXACT_FIREWALL_WORKER_TERM_GRACE_SECONDS = 1.0
+_EXACT_FIREWALL_WORKER_REAP_GRACE_SECONDS = 5.0
 
 _INSTANCE_RESOURCE_NOT_FOUND_PATTERN = re.compile(
     r'The resource \'projects/.*/zones/.*/instances/.*\' was not found')
@@ -1076,3 +1086,171 @@ def cleanup_ports(
         firewall_rule_name = provider_config['firewall_rule']
         instance_utils.GCPComputeInstance.delete_firewall_rule(
             project_id, firewall_rule_name)
+
+
+def _delete_exact_cluster_ports_firewall_direct(
+    project_id: str,
+    cluster_name_on_cloud: str,
+    *,
+    deadline_monotonic: float | None = None,
+) -> bool:
+    """Delete and await one deterministic cluster ports firewall.
+
+    Unlike generic port cleanup this issues no list or instance census.  A 404
+    is the idempotent success case for an already-completed prior attempt.
+
+    Returns:
+        True when this call submitted and observed a delete, and False when the
+        exact firewall was already absent.
+    """
+    if not isinstance(project_id, str) or not project_id:
+        raise ValueError('Exact firewall cleanup requires a GCP project ID.')
+    if not isinstance(cluster_name_on_cloud, str) or not cluster_name_on_cloud:
+        raise ValueError(
+            'Exact firewall cleanup requires a cluster name on cloud.')
+    if (deadline_monotonic is not None and
+        (isinstance(deadline_monotonic, bool) or
+         not isinstance(deadline_monotonic, (int, float)) or
+         not math.isfinite(deadline_monotonic))):
+        raise ValueError('Exact firewall cleanup deadline is malformed.')
+
+    def _remaining_seconds() -> float:
+        assert deadline_monotonic is not None
+        remaining = deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                'Timed out deleting the exact GCP ports firewall.')
+        return remaining
+
+    firewall_rule_name = gcp_cloud.USER_PORTS_FIREWALL_RULE_NAME.format(
+        cluster_name_on_cloud)
+    handler = instance_utils.GCPComputeInstance
+    compute = handler.load_resource()
+    try:
+        delete_request = compute.firewalls().delete(
+            project=project_id,
+            firewall=firewall_rule_name,
+        )
+        if deadline_monotonic is None:
+            operation = delete_request.execute(
+                num_retries=instance_utils.GCP_MAX_RETRIES)
+        else:
+            delete_request.http.timeout = _remaining_seconds()
+            # The whole service owns the outer retry and its absolute phase
+            # deadline. SDK retries would multiply this request timeout and
+            # let a daemon worker escape that ownership horizon.
+            operation = delete_request.execute(num_retries=0)
+    except gcp.http_error_exception() as error:
+        status_code = getattr(getattr(error, 'resp', None), 'status', None)
+        if status_code == 404:
+            return False
+        raise
+    if deadline_monotonic is None:
+        handler.wait_for_operation(operation, project_id, zone=None)
+    else:
+        operation_name = (operation.get('name') if isinstance(
+            operation, Mapping) else None)
+        if not isinstance(operation_name, str) or not operation_name:
+            raise ValueError('GCP firewall delete returned no operation name.')
+        while True:
+            wait_request = compute.globalOperations().wait(
+                project=project_id, operation=operation_name)
+            wait_request.http.timeout = _remaining_seconds()
+            result = wait_request.execute(num_retries=0)
+            if not isinstance(result, Mapping):
+                raise ValueError(
+                    'GCP firewall delete returned a malformed operation.')
+            if result.get('status') == 'DONE':
+                operation_error = result.get('error')
+                if operation_error is not None and not isinstance(
+                        operation_error, Mapping):
+                    raise ValueError('GCP firewall delete returned a '
+                                     'malformed operation error.')
+                if operation_error:
+                    error = common.ProvisionerError(
+                        'GCP firewall delete operation failed.')
+                    errors = operation_error.get('errors')
+                    error.errors = (errors if isinstance(errors, list) else
+                                    [dict(operation_error)])
+                    raise error
+                break
+            time.sleep(min(1.0, _remaining_seconds()))
+    return True
+
+
+def _exact_firewall_worker_command(
+    project_id: str,
+    cluster_name_on_cloud: str,
+    budget_seconds: float,
+) -> list[str]:
+    return [
+        sys.executable, '-m', _EXACT_FIREWALL_WORKER_MODULE, project_id,
+        cluster_name_on_cloud,
+        repr(budget_seconds)
+    ]
+
+
+def _run_exact_firewall_worker(
+    project_id: str,
+    cluster_name_on_cloud: str,
+    deadline_monotonic: float,
+) -> bool:
+    """Run provider-capable cleanup in one physically bounded child."""
+    # Absolute monotonic readings are process-local. Freeze only the remaining
+    # duration for the child; the parent retains the original absolute
+    # deadline as the authoritative kill boundary and never reconstructs it.
+    child_budget_seconds = deadline_monotonic - time.monotonic()
+    if child_budget_seconds <= 0:
+        raise TimeoutError('Timed out deleting the exact GCP ports firewall.')
+    try:
+        result = subprocess_utils.run_in_process_group(
+            _exact_firewall_worker_command(project_id, cluster_name_on_cloud,
+                                           child_budget_seconds),
+            deadline_monotonic=deadline_monotonic,
+            term_grace_seconds=_EXACT_FIREWALL_WORKER_TERM_GRACE_SECONDS,
+            reap_grace_seconds=_EXACT_FIREWALL_WORKER_REAP_GRACE_SECONDS,
+            env=subprocess_utils.provider_process_env('gcp'),
+            stdout=subprocess.DEVNULL)
+    except TimeoutError as error:
+        raise TimeoutError(
+            'Timed out deleting the exact GCP ports firewall.') from error
+    if result.returncode == 0:
+        return True
+    if result.returncode == _EXACT_FIREWALL_ALREADY_ABSENT_RETURN_CODE:
+        return False
+    stderr_tail = (result.stderr or '')[-500:]
+    raise RuntimeError('Exact GCP firewall worker failed '
+                       f'(exit={result.returncode}, stderr={stderr_tail!r}).')
+
+
+def delete_exact_cluster_ports_firewall(
+    project_id: str,
+    cluster_name_on_cloud: str,
+    *,
+    deadline_monotonic: float | None = None,
+) -> bool:
+    """Delete one exact ports firewall, using a killable bounded worker.
+
+    Discovery client construction with implicit ADC can contact the metadata
+    service before an HTTP request timeout exists.  Deadline-bound callers
+    therefore run the complete idempotent delete/wait operation in a dedicated
+    process group. The child receives only a frozen relative budget, never the
+    parent's process-local monotonic reading. At the parent's absolute deadline
+    that group is terminated, killed if necessary, reaped, and proven absent;
+    ambiguity is retained for the outer exact retry. Unbounded callers preserve
+    the direct provider API used by ordinary provisioning cleanup.
+    """
+    if deadline_monotonic is None:
+        return _delete_exact_cluster_ports_firewall_direct(
+            project_id, cluster_name_on_cloud)
+    if (isinstance(deadline_monotonic, bool) or
+            not isinstance(deadline_monotonic, (int, float)) or
+            not math.isfinite(deadline_monotonic)):
+        raise ValueError('Exact firewall cleanup deadline is malformed.')
+    if not isinstance(project_id, str) or not project_id:
+        raise ValueError('Exact firewall cleanup requires a GCP project ID.')
+    if not isinstance(cluster_name_on_cloud, str) or not cluster_name_on_cloud:
+        raise ValueError(
+            'Exact firewall cleanup requires a cluster name on cloud.')
+    return _run_exact_firewall_worker(project_id, cluster_name_on_cloud,
+                                      float(deadline_monotonic))

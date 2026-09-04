@@ -5,7 +5,7 @@ service:
     initial_delay_seconds: 10
   graceful_drain_async_occupancy: true
   load_balancer:
-    stream_timeout_seconds: 180
+    stream_timeout_seconds: 600
     request_queue:
       min_size: 4
       size_per_replica: 1
@@ -14,13 +14,12 @@ service:
       max_concurrency: 4
       timeout_seconds: 600
       max_request_body_bytes: 65536
-      use_async_occupancy: true
+      use_async_occupancy: false
   replica_policy:
     min_replicas: 0
     max_replicas: 2
     target_concurrency_per_replica: 1
     target_utilization_percentage: 100
-    expected_request_duration_seconds: 10
     max_scale_up_rate_percentage: 100
     scale_up_rate_min_replicas: 2
     scale_up_rate_period_seconds: 10
@@ -44,10 +43,8 @@ run: |
   import http.server
   import json
   import os
-  import re
   import threading
   import time
-  import uuid
 
   try:
       _capacity = int(os.environ['SKYPILOT_NUM_GPUS_PER_NODE'])
@@ -58,6 +55,22 @@ run: |
   _lock = threading.Lock()
   _running = 0
   _MAX_SYNTHETIC_DURATION_SECONDS = 360
+  _MAX_REQUEST_BODY_BYTES = 64 * 1024
+
+  def _single_header(headers, name):
+      values = headers.get_all(name) or []
+      if len(values) != 1 or not isinstance(values[0], str) or not values[0]:
+          return None
+      return values[0]
+
+  def _unique_json_object(pairs):
+      value = dict(pairs)
+      if len(value) != len(pairs):
+          raise ValueError('duplicate JSON member')
+      return value
+
+  def _invalid_json_constant(value):
+      raise ValueError(f'invalid JSON constant {value}')
 
   class Handler(http.server.BaseHTTPRequestHandler):
       server_version = 'SkyServePaidCapacityTest/1'
@@ -88,78 +101,29 @@ run: |
               self.write_json(404, {'error': 'not found'})
               return
           try:
-              length = int(self.headers.get('Content-Length', '0'))
-              payload = json.loads(self.rfile.read(length) or b'{}')
-          except (ValueError, json.JSONDecodeError):
+              length_value = _single_header(self.headers, 'Content-Length')
+              length = int(length_value)
+              if (str(length) != length_value or not 0 <= length <=
+                      _MAX_REQUEST_BODY_BYTES):
+                  raise ValueError('invalid content length')
+              request_body = self.rfile.read(length) or b'{}'
+              payload = json.loads(
+                  request_body,
+                  object_pairs_hook=_unique_json_object,
+                  parse_constant=_invalid_json_constant)
+          except (TypeError, ValueError, json.JSONDecodeError,
+                  UnicodeDecodeError, RecursionError):
               self.write_json(400, {'error': 'invalid JSON'})
-              return
-          if payload.get('action') == 'async_capacity':
-              with _lock:
-                  running = _running
-              self.write_json(200, {
-                  'status': 'READY',
-                  'running_count': running,
-                  'predict_concurrency': _capacity,
-                  'max_workers': _capacity,
-              })
-              return
-          if payload.get('action') == 'async_predict':
-              request_id = payload.get('request_id')
-              work = payload.get('payload')
-              duration = (work.get('duration_seconds')
-                          if isinstance(work, dict) else None)
-              attempt_id = self.headers.get('X-SkyServe-Async-Attempt-Id')
-              try:
-                  canonical_attempt_id = str(uuid.UUID(attempt_id))
-                  attempt_no = int(
-                      self.headers.get('X-SkyServe-Async-Attempt-No', '0'))
-                  revision = int(
-                      self.headers.get('X-SkyServe-Async-Ledger-Revision', '0'))
-              except (TypeError, ValueError):
-                  canonical_attempt_id = None
-                  attempt_no = 0
-                  revision = 0
-              intent = self.headers.get('X-SkyServe-Async-Intent-Sha256', '')
-              if (set(payload) != {'action', 'payload', 'request_id'} or
-                      set(work or {}) != {'duration_seconds'} or
-                      not isinstance(duration, (int, float)) or
-                      isinstance(duration, bool) or
-                      not 0 <= duration <= _MAX_SYNTHETIC_DURATION_SECONDS or
-                      not isinstance(request_id, str) or not request_id or
-                      self.headers.get('X-SkyServe-Async-Ledger-Protocol') != '1' or
-                      not self.headers.get('X-SkyServe-Service-Incarnation') or
-                      self.headers.get('X-SkyServe-Execution-Request-Id') != request_id or
-                      re.fullmatch(r'[0-9a-f]{64}', intent) is None or
-                      canonical_attempt_id != attempt_id or attempt_no < 1 or
-                      revision < 1):
-                  self.write_json(400, {'error': 'invalid exact request'})
-                  return
-              with _lock:
-                  if _running >= _capacity:
-                      self.write_json(429, {'error': 'worker capacity full'})
-                      return
-                  _running += 1
-
-              def finish_async():
-                  global _running
-                  try:
-                      time.sleep(float(duration))
-                  finally:
-                      with _lock:
-                          _running -= 1
-
-              threading.Thread(target=finish_async, daemon=True).start()
-              self.write_json(202, {
-                  'request_id': request_id,
-                  'status': 'accepted',
-              })
               return
           duration = payload.get('duration_seconds', 0)
           request_id = payload.get('request_id')
-          if (not isinstance(duration, (int, float)) or
+          if (not isinstance(payload, dict) or
+                  set(payload) != {'duration_seconds', 'request_id'} or
+                  not isinstance(duration, (int, float)) or
                   isinstance(duration, bool) or
                   not 0 <= duration <= _MAX_SYNTHETIC_DURATION_SECONDS or
-                  not isinstance(request_id, str) or not request_id):
+                  not isinstance(request_id, str) or not request_id or
+                  len(request_id) > 256):
               self.write_json(400, {'error': 'invalid request'})
               return
           with _lock:

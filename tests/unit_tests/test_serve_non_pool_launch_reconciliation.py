@@ -1,8 +1,15 @@
 """Tests for failure-isolated non-pool provider reconciliation."""
 # pylint: disable=protected-access
 
+import io
 import json
+import os
+import pathlib
+import signal
+import subprocess
+import sys
 import threading
+import time
 import types
 from unittest import mock
 import uuid
@@ -19,6 +26,7 @@ from sky.serve import replica_info
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import resource_actions
+from sky.utils import subprocess_utils
 
 
 def test_one_shot_provider_observation_lane_is_bounded() -> None:
@@ -63,12 +71,336 @@ def test_one_shot_provider_observation_lane_reports_worker_exception() -> None:
     assert lane.schedule(key, _fail)
     lane._workers[key].join(timeout=5)
 
-    (completion,) = lane.take_completed()
+    completions = lane.take_completed()
+    assert len(completions) == 1
+    completion = completions[0]
     assert completion.key == key
     assert completion.result is None
     assert isinstance(completion.error, RuntimeError)
     assert completion.formatted_error == 'RuntimeError: provider read failed'
     assert not lane.has_work()
+
+
+def test_one_shot_provider_observation_lane_reserves_key_atomically(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    lane = reconciliation.OneShotProviderObservationLane()
+    constructor_barrier = threading.Barrier(2)
+    operation_release = threading.Event()
+    real_thread = reconciliation.thread_utils.SafeThread
+
+    class RacingConstructionThread(real_thread):
+
+        def __init__(self, *args, **kwargs):
+            constructor_barrier.wait(timeout=5)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(reconciliation.thread_utils, 'SafeThread',
+                        RacingConstructionThread)
+    operation_calls = 0
+    operation_lock = threading.Lock()
+
+    def _observe() -> str:
+        nonlocal operation_calls
+        with operation_lock:
+            operation_calls += 1
+        assert operation_release.wait(timeout=5)
+        return 'observed'
+
+    results: list[bool] = []
+
+    def _schedule() -> None:
+        results.append(lane.schedule((3, 'record-3'), _observe))
+
+    callers = [threading.Thread(target=_schedule) for _ in range(2)]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(timeout=5)
+    assert not any(caller.is_alive() for caller in callers)
+    assert sorted(results) == [False, True]
+    operation_release.set()
+    for worker in tuple(lane._workers.values()):
+        worker.join(timeout=5)
+    assert len(lane.take_completed()) == 1
+    assert operation_calls == 1
+
+
+@pytest.mark.skipif(not hasattr(os, 'killpg'),
+                    reason='requires POSIX process groups')
+def test_provider_census_worker_kills_stubborn_descendant_at_deadline(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    worker_pid_path = tmp_path / 'worker.pid'
+    descendant_pid_path = tmp_path / 'descendant.pid'
+    descendant_program = (
+        'import os, pathlib, signal, sys, time; '
+        'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+        'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); '
+        'time.sleep(60)')
+    command = [
+        sys.executable,
+        '-c',
+        ('import os, pathlib, signal, subprocess, sys, time; '
+         'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+         'subprocess.Popen([sys.executable, "-c", sys.argv[3], sys.argv[2]]); '
+         'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); '
+         'time.sleep(60)'),
+        str(worker_pid_path),
+        str(descendant_pid_path),
+        descendant_program,
+    ]
+    monkeypatch.setattr(reconciliation, '_provider_census_worker_command',
+                        lambda: command)
+
+    with pytest.raises(TimeoutError, match='provider census'):
+        reconciliation._run_paid_provider_census_worker(  # pylint: disable=protected-access
+            {
+                'cloud': 'gcp',
+                'cluster_name': 'svc-3',
+                'provider_identity': {
+                    'cluster_name_on_cloud': 'svc-3-abc',
+                    'project_id': 'boltz-498512',
+                    'zone': 'us-east4-a',
+                },
+                'protocol_version': 1,
+            },
+            deadline_monotonic=time.monotonic() + 1.0)
+
+    for pid_path in (worker_pid_path, descendant_pid_path):
+        process_id = int(pid_path.read_text())
+        with pytest.raises(ProcessLookupError):
+            os.kill(process_id, 0)
+
+
+@pytest.mark.skipif(not hasattr(os, 'killpg'),
+                    reason='requires POSIX process groups')
+def test_provider_census_worker_reaps_descendant_after_leader_response(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    descendant_pid_path = tmp_path / 'descendant.pid'
+    descendant_program = (
+        'import os, pathlib, signal, sys, time; '
+        'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+        'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); '
+        'time.sleep(60)')
+    command = [
+        sys.executable,
+        '-c',
+        ('import json, pathlib, subprocess, sys, time; '
+         'subprocess.Popen([sys.executable, "-c", sys.argv[2], sys.argv[1]], '
+         'stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, '
+         'stderr=subprocess.DEVNULL); '
+         'p = pathlib.Path(sys.argv[1]); deadline = time.monotonic() + 5; '
+         'exec("while not p.exists() and time.monotonic() < deadline:'
+         '\\n time.sleep(0.01)"); '
+         'print(json.dumps({"ok": True, "result": []}), flush=True)'),
+        str(descendant_pid_path),
+        descendant_program,
+    ]
+    monkeypatch.setattr(reconciliation, '_provider_census_worker_command',
+                        lambda: command)
+    lane = reconciliation.OneShotProviderObservationLane()
+    key = (3, 'record-3')
+
+    assert lane.schedule(
+        key, lambda: reconciliation._run_paid_provider_census_worker(
+            {
+                'cloud': 'aws',
+                'protocol_version': 1,
+                'provider_identity': {},
+            },
+            deadline_monotonic=time.monotonic() + 10))
+    lane._workers[key].join(timeout=10)
+    completion, = lane.take_completed()
+
+    assert isinstance(completion.error, RuntimeError)
+    assert 'live descendant' in str(completion.error)
+    assert descendant_pid_path.exists()
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(descendant_pid_path.read_text()), 0)
+    assert lane._process_registry.process_count == 0
+    lane.close()
+
+
+def test_process_group_runner_closes_all_parent_pipes(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    process = mock.Mock(pid=123, returncode=0, args=['worker'])
+    process.stdin = io.StringIO()
+    process.stdout = io.StringIO()
+    process.stderr = io.StringIO()
+    process.communicate.return_value = ('result', 'diagnostic')
+    process.poll.return_value = 0
+    monkeypatch.setattr(subprocess_utils.subprocess, 'Popen',
+                        mock.Mock(return_value=process))
+    monkeypatch.setattr(subprocess_utils, '_process_group_exists',
+                        lambda _process: False)
+
+    result = subprocess_utils.run_in_process_group(
+        ['worker'],
+        deadline_monotonic=time.monotonic() + 5,
+        term_grace_seconds=0.1,
+        reap_grace_seconds=0.1,
+        input_text='request')
+
+    assert result.stdout == 'result'
+    assert process.stdin.closed
+    assert process.stdout.closed
+    assert process.stderr.closed
+
+
+@pytest.mark.skipif(not hasattr(os, 'killpg'),
+                    reason='requires POSIX process groups')
+def test_provider_census_aggregate_shutdown_has_one_shared_horizon(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(reconciliation,
+                        '_PROVIDER_CENSUS_WORKER_TERM_GRACE_SECONDS', 0.05)
+    monkeypatch.setattr(reconciliation,
+                        '_PROVIDER_CENSUS_WORKER_REAP_GRACE_SECONDS', 1.0)
+    command = [
+        sys.executable, '-c',
+        ('import signal, time; '
+         'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+         'time.sleep(60)')
+    ]
+    owned = tuple(
+        subprocess.Popen(  # pylint: disable=consider-using-with
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True) for _ in range(
+                reconciliation.OneShotProviderObservationLane.MAX_CONCURRENT))
+    try:
+        started = time.monotonic()
+
+        subprocess_utils.terminate_and_reap_process_groups(
+            owned,
+            term_grace_seconds=(
+                reconciliation._PROVIDER_CENSUS_WORKER_TERM_GRACE_SECONDS),
+            reap_grace_seconds=(
+                reconciliation._PROVIDER_CENSUS_WORKER_REAP_GRACE_SECONDS))
+
+        assert time.monotonic() - started < 2.0
+        assert all(process.returncode is not None for process in owned)
+        assert all(not subprocess_utils._process_group_exists(process)
+                   for process in owned)
+    finally:
+        for process in owned:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+
+
+def test_provider_census_worker_env_keeps_cloud_credentials_only(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('SKYPILOT_DB_CONNECTION_URI', 'postgresql://secret')
+    monkeypatch.setenv('SKYPILOT_SERVICE_ACCOUNT_TOKEN', 'request-secret')
+    monkeypatch.setenv('SKYPILOT_SERVE_CONTROLLER_AUTH_TOKEN',
+                       'controller-secret')
+    monkeypatch.setenv('PGPASSWORD', 'database-secret')
+    monkeypatch.setenv('AWS_SESSION_TOKEN', 'aws-provider-secret')
+    monkeypatch.setenv('GOOGLE_APPLICATION_CREDENTIALS', '/gcp/identity.json')
+    monkeypatch.setenv('GITHUB_TOKEN', 'unrelated-secret')
+    monkeypatch.setenv('OPENAI_API_KEY', 'unrelated-secret')
+
+    aws_env = reconciliation._provider_census_worker_env('aws')  # pylint: disable=protected-access
+    gcp_env = reconciliation._provider_census_worker_env('gcp')  # pylint: disable=protected-access
+
+    for child_env in (aws_env, gcp_env):
+        assert 'SKYPILOT_DB_CONNECTION_URI' not in child_env
+        assert 'SKYPILOT_SERVICE_ACCOUNT_TOKEN' not in child_env
+        assert 'SKYPILOT_SERVE_CONTROLLER_AUTH_TOKEN' not in child_env
+        assert 'PGPASSWORD' not in child_env
+        assert 'GITHUB_TOKEN' not in child_env
+        assert 'OPENAI_API_KEY' not in child_env
+    assert aws_env['AWS_SESSION_TOKEN'] == 'aws-provider-secret'
+    assert 'GOOGLE_APPLICATION_CREDENTIALS' not in aws_env
+    assert gcp_env['GOOGLE_APPLICATION_CREDENTIALS'] == '/gcp/identity.json'
+    assert 'AWS_SESSION_TOKEN' not in gcp_env
+
+
+@pytest.mark.skipif(not hasattr(os, 'killpg'),
+                    reason='requires POSIX process groups')
+def test_observation_lane_close_kills_registered_provider_process(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    worker_pid_path = tmp_path / 'worker.pid'
+    command = [
+        sys.executable,
+        '-c',
+        ('import os, pathlib, signal, sys, time; '
+         'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+         'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); '
+         'time.sleep(60)'),
+        str(worker_pid_path),
+    ]
+    monkeypatch.setattr(reconciliation, '_provider_census_worker_command',
+                        lambda: command)
+    lane = reconciliation.OneShotProviderObservationLane()
+
+    def _observe() -> object:
+        return reconciliation._run_paid_provider_census_worker(  # pylint: disable=protected-access
+            {
+                'cloud': 'gcp',
+                'cluster_name': 'svc-3',
+                'provider_identity': {
+                    'cluster_name_on_cloud': 'svc-3-abc',
+                    'project_id': 'boltz-498512',
+                    'zone': 'us-east4-a',
+                },
+                'protocol_version': 1,
+            },
+            deadline_monotonic=time.monotonic() + 60)
+
+    assert lane.schedule((3, 'record-3'), _observe)
+    deadline = time.monotonic() + 5
+    while not worker_pid_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert worker_pid_path.exists()
+
+    lane.close()
+
+    assert not lane.has_work()
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(worker_pid_path.read_text()), 0)
+
+
+def test_lane_close_between_evidence_and_projection_fences_second_mutation(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A surviving Python worker cannot cross a post-close DB boundary."""
+    lane = reconciliation.OneShotProviderObservationLane()
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    observation = reconciliation.ProviderObservation(
+        ordinary_launch_binding.ProviderEvidence.ABSENT, {'result': 'ABSENT'})
+    project = mock.Mock()
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_reconciliation_ready',
+                        lambda *_args: True)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_absence_is_recorded',
+                        lambda *_args: False)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_terminal_provider_absence_payload',
+                        lambda *_args: None)
+    monkeypatch.setattr(reconciliation, 'observe_provider',
+                        lambda *_args, **_kwargs: observation)
+    record = mock.Mock(side_effect=lambda *_args, **_kwargs: lane.close())
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'record_bound_non_pool_provider_evidence', record)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'project_bound_non_pool_provider_absence', project)
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='lifecycle authority'):
+        reconciliation.reconcile(
+            context,
+            _paid_replica('aws'),
+            object(),
+            mock.Mock(),
+            continue_guard=lambda: lane.mutation_is_allowed)
+
+    record.assert_called_once()
+    project.assert_not_called()
 
 
 def _context(
@@ -510,8 +842,9 @@ def test_aws_paid_observation_uses_exact_client_token_scope(
                         lambda *_args: scope)
     calls = []
     monkeypatch.setattr(
-        reconciliation, '_query_aws_paid_provider_census', lambda *_args: calls.
-        append('census') or [dict(instance) for instance in instances])
+        reconciliation, '_query_aws_paid_provider_census_isolated',
+        lambda *_args, **_kwargs: calls.append(
+            'census') or [dict(instance) for instance in instances])
     monkeypatch.setattr(reconciliation.request_postgres,
                         'bound_non_pool_aws_provider_absence_is_settled',
                         lambda *_args: True)
@@ -534,8 +867,9 @@ def test_aws_empty_census_before_settle_horizon_is_unknown(
     monkeypatch.setattr(reconciliation.request_postgres,
                         'bound_non_pool_aws_provider_census_scope',
                         lambda *_args: scope)
-    monkeypatch.setattr(reconciliation, '_query_aws_paid_provider_census',
-                        lambda *_args: [])
+    monkeypatch.setattr(reconciliation,
+                        '_query_aws_paid_provider_census_isolated',
+                        lambda *_args, **_kwargs: [])
     monkeypatch.setattr(reconciliation.request_postgres,
                         'bound_non_pool_aws_provider_absence_is_settled',
                         lambda *_args: False)
@@ -694,7 +1028,7 @@ def test_aws_paid_observation_fails_closed_when_profile_is_unusable(
                         'bound_non_pool_aws_provider_census_scope',
                         lambda *_args: scope)
     monkeypatch.setattr(
-        reconciliation, '_query_aws_paid_provider_census',
+        reconciliation, '_query_aws_paid_provider_census_isolated',
         mock.Mock(side_effect=RuntimeError('profile unavailable')))
 
     observed = reconciliation.observe_provider(context, _paid_replica('aws'),
@@ -823,17 +1157,19 @@ def test_gcp_paid_observation_uses_frozen_exact_label_scope(
         if (actual_context, actual_authority) ==
         (context, 'authority') else pytest.fail('wrong GCP identity authority'))
     calls = []
-    monkeypatch.setattr(reconciliation.provision, 'query_instances',
-                        lambda **kwargs: calls.append(kwargs) or instances)
-    monkeypatch.setattr(reconciliation.gcp_provision,
-                        'query_managed_boot_disks', lambda *_args: disks)
-    monkeypatch.setattr(
-        reconciliation.gcp_provision, 'query_instance_create_operation_targets',
-        lambda *_args: {
+
+    def _census(actual_replica, actual_identity, **_kwargs):
+        assert actual_replica.cluster_name == 'svc-3'
+        assert actual_identity == identity
+        calls.append('census')
+        return sorted(instances), list(disks), {
             'failed': [],
             'inflight': [],
             'succeeded': [],
-        })
+        }
+
+    monkeypatch.setattr(reconciliation,
+                        '_query_gcp_paid_provider_census_isolated', _census)
     monkeypatch.setattr(reconciliation.request_postgres,
                         'bound_non_pool_gcp_provider_absence_is_settled',
                         lambda *_args, **_kwargs: True)
@@ -849,16 +1185,7 @@ def test_gcp_paid_observation_uses_frozen_exact_label_scope(
     assert observed.payload['disk_ids'] == disks
     expected_calls = (2 if expected
                       is ordinary_launch_binding.ProviderEvidence.ABSENT else 1)
-    assert calls == [{
-        'provider_name': 'gcp',
-        'cluster_name': 'svc-3',
-        'cluster_name_on_cloud': 'svc-3-abc',
-        'provider_config': {
-            'availability_zone': 'us-east4-a',
-            'project_id': 'boltz-498512',
-        },
-        'non_terminated_only': False,
-    }] * expected_calls
+    assert calls == ['census'] * expected_calls
 
 
 def test_gcp_done_error_insert_and_empty_resources_is_absent(
@@ -884,13 +1211,9 @@ def test_gcp_done_error_insert_and_empty_resources_is_absent(
     monkeypatch.setattr(reconciliation.request_postgres,
                         'bound_non_pool_gcp_provider_identity',
                         lambda *_args: identity)
-    monkeypatch.setattr(reconciliation.provision, 'query_instances',
-                        lambda **_kwargs: {})
-    monkeypatch.setattr(reconciliation.gcp_provision,
-                        'query_managed_boot_disks', lambda *_args: [])
-    monkeypatch.setattr(reconciliation.gcp_provision,
-                        'query_instance_create_operation_targets',
-                        lambda *_args: operation_targets)
+    monkeypatch.setattr(reconciliation,
+                        '_query_gcp_paid_provider_census_isolated',
+                        lambda *_args, **_kwargs: ([], [], operation_targets))
     settled_calls = []
     monkeypatch.setattr(
         reconciliation.request_postgres,
@@ -921,17 +1244,13 @@ def test_gcp_non_done_insert_and_empty_resources_is_unknown(
     monkeypatch.setattr(reconciliation.request_postgres,
                         'bound_non_pool_gcp_provider_identity',
                         lambda *_args: identity)
-    monkeypatch.setattr(reconciliation.provision, 'query_instances',
-                        lambda **_kwargs: {})
-    monkeypatch.setattr(reconciliation.gcp_provision,
-                        'query_managed_boot_disks', lambda *_args: [])
     monkeypatch.setattr(
-        reconciliation.gcp_provision, 'query_instance_create_operation_targets',
-        lambda *_args: {
+        reconciliation, '_query_gcp_paid_provider_census_isolated',
+        lambda *_args, **_kwargs: ([], [], {
             'failed': [],
             'inflight': [inflight_target],
             'succeeded': [],
-        })
+        }))
     monkeypatch.setattr(
         reconciliation.request_postgres,
         'bound_non_pool_gcp_provider_absence_is_settled', lambda *_args, **
@@ -1499,22 +1818,18 @@ def test_reconcile_projects_recorded_absence_without_provider_reread(
                         'project_bound_non_pool_provider_absence',
                         lambda *_args, **_kwargs: calls.append('project'))
 
-    observed = reconciliation.reconcile(
-        context,
-        _reserved_replica(),
-        authority,
-        lambda *_args: True,
-        before_absence_projection=lambda: calls.append('local-cleanup'))
+    observed = reconciliation.reconcile(context, _reserved_replica(), authority,
+                                        lambda *_args: True)
 
     assert observed == reconciliation.ProviderObservation(
         ordinary_launch_binding.ProviderEvidence.ABSENT, {
             'result': 'ABSENT',
             'source': 'durable-provider-evidence',
         })
-    assert calls == ['local-cleanup', 'project']
+    assert calls == ['project']
 
 
-def test_reconcile_cleans_local_state_before_fresh_absence_settlement(
+def test_reconcile_records_fresh_absence_before_projection_then_settles(
         monkeypatch: pytest.MonkeyPatch) -> None:
     context = _context(
         ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
@@ -1540,14 +1855,65 @@ def test_reconcile_cleans_local_state_before_fresh_absence_settlement(
                         'project_bound_non_pool_provider_absence',
                         lambda *_args, **_kwargs: calls.append('project'))
 
-    assert reconciliation.reconcile(
-        context,
-        _paid_replica('aws'),
-        authority,
-        lambda *_args: True,
-        before_absence_projection=lambda: calls.append('local-cleanup')) == (
-            observation)
-    assert calls == ['observe', 'local-cleanup', 'record', 'project']
+    assert reconciliation.reconcile(context, _paid_replica('aws'), authority,
+                                    lambda *_args: True) == observation
+    assert calls == ['observe', 'record', 'project']
+
+
+def test_absence_survives_projection_failure_and_retry_skips_provider(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    authority = object()
+    observation = reconciliation.ProviderObservation(
+        ordinary_launch_binding.ProviderEvidence.ABSENT, {'result': 'ABSENT'})
+    calls = []
+    recorded = False
+
+    def _is_recorded(*_args):
+        return recorded
+
+    def _record(*_args):
+        nonlocal recorded
+        calls.append('record')
+        recorded = True
+
+    projection_attempt = 0
+
+    def _project(*_args, **_kwargs):
+        nonlocal projection_attempt
+        projection_attempt += 1
+        calls.append(f'project-{projection_attempt}')
+        if projection_attempt == 1:
+            raise RuntimeError('injected projection failure')
+
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_reconciliation_ready',
+                        lambda *_args: True)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_absence_is_recorded',
+                        _is_recorded)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_terminal_provider_absence_payload',
+                        lambda *_args: None)
+    monkeypatch.setattr(reconciliation, 'observe_provider',
+                        lambda *_args: calls.append('observe') or observation)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'record_bound_non_pool_provider_evidence', _record)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'project_bound_non_pool_provider_absence', _project)
+
+    with pytest.raises(RuntimeError, match='injected projection failure'):
+        reconciliation.reconcile(context, _paid_replica('aws'), authority,
+                                 lambda *_args: True)
+
+    assert calls == ['observe', 'record', 'project-1']
+
+    retried = reconciliation.reconcile(context, _paid_replica('aws'), authority,
+                                       lambda *_args: True)
+
+    assert retried.evidence is ordinary_launch_binding.ProviderEvidence.ABSENT
+    assert calls == ['observe', 'record', 'project-1', 'project-2']
 
 
 @pytest.mark.parametrize('evidence', [
@@ -1585,13 +1951,8 @@ def test_pending_paid_teardown_retains_present_authority_until_absent(
         'project_bound_non_pool_provider_absence', lambda *_args, **_kwargs:
         pytest.fail('non-ABSENT observation must not settle'))
 
-    assert reconciliation.reconcile(
-        context,
-        info,
-        authority,
-        lambda *_args: True,
-        before_absence_projection=lambda: pytest.fail(
-            'non-ABSENT observation must not clean local state')) == observation
+    assert reconciliation.reconcile(context, info, authority,
+                                    lambda *_args: True) == observation
 
 
 @pytest.mark.parametrize(('evidence', 'expected'), [

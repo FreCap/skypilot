@@ -29,7 +29,6 @@ import uuid
 import filelock
 
 from sky import exceptions
-from sky import global_user_state
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
@@ -55,7 +54,6 @@ from sky.skylet import constants as skylet_constants
 from sky.utils import auth_utils
 from sky.utils import common_utils
 from sky.utils import controller_utils
-from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import thread_utils
 from sky.utils import ux_utils
@@ -478,40 +476,6 @@ def _replica_needs_exact_provider_cleanup_retry(info: Any) -> bool:
             replica_has_projected_provider_absence_cleanup_marker(info))
 
 
-def _retire_stale_paid_projected_absence_cluster_record(
-        cluster_name: str) -> str | None:
-    """Retire one hash-fenced INIT row after exact paid provider absence.
-
-    The bound association is the provider authority.  A legacy cluster-table
-    row can survive a failed launch even after that authority has durably
-    projected ABSENT.  Removing that metadata is safe only for the observed
-    INIT generation; a same-name replacement must remain untouched.
-    """
-    cluster_record = global_user_state.get_cluster_from_name(
-        cluster_name, include_user_info=False, summary_response=True)
-    if cluster_record is None:
-        return None
-    if cluster_record.get('status') is not status_lib.ClusterStatus.INIT:
-        return ('exact provider absence was projected but its fenced SkyPilot '
-                'cluster record is not stale INIT metadata')
-    cluster_hash = cluster_record.get('cluster_hash')
-    if not isinstance(cluster_hash, str) or not cluster_hash:
-        return ('exact provider absence was projected but its stale INIT '
-                'SkyPilot cluster record has no generation fence')
-    global_user_state.remove_cluster(cluster_name,
-                                     terminate=True,
-                                     existing_cluster_hash=cluster_hash)
-    replacement = global_user_state.get_cluster_from_name(
-        cluster_name, include_user_info=False, summary_response=True)
-    if replacement is not None:
-        return ('exact provider absence was projected but its hash-fenced '
-                'stale INIT SkyPilot cluster record changed or remained')
-    logger.info(
-        'Removed stale INIT cluster metadata for provider-absent paid '
-        'replica %r.', cluster_name)
-    return None
-
-
 def _prepare_provider_present_cleanup(
     service_name: str,
     authority: ordinary_launch_binding.ControllerBindingAuthority | None,
@@ -552,28 +516,17 @@ def _prepare_provider_present_cleanup(
             if (request_postgres.
                     bound_non_pool_projected_provider_absence_is_authorized(
                         service_name, info.replica_id, info.replica_record_id)):
-                if info.cluster_name in existing_cluster_names:
-                    if getattr(info, 'reserved_fill', None) is not False:
-                        failures[key] = (
-                            'exact provider absence was projected but its '
-                            'fenced SkyPilot cluster record is still present')
-                        continue
-                    try:
-                        retirement_failure = (
-                            _retire_stale_paid_projected_absence_cluster_record(
-                                info.cluster_name))
-                    except Exception as error:  # pylint: disable=broad-except
-                        retirement_failure = (
-                            'exact provider absence was projected but its '
-                            'stale INIT SkyPilot cluster record could not be '
-                            'hash-fenced retired '
-                            f'({common_utils.format_exception(error)})')
-                    if retirement_failure is not None:
-                        failures[key] = retirement_failure
-                    else:
-                        projected_absence_keys.add(key)
-                else:
-                    projected_absence_keys.add(key)
+                if (info.cluster_name in existing_cluster_names and
+                        getattr(info, 'reserved_fill', None) is not False):
+                    failures[key] = (
+                        'exact provider absence was projected but its fenced '
+                        'SkyPilot cluster record is still present')
+                    continue
+                # Paid cleanup owns a UUID/handle-fenced auxiliary finalizer.
+                # Never pre-delete its same-name cluster record through the
+                # legacy hash path; the retained action identity is the only
+                # authority for both the exact GCP firewall and row removal.
+                projected_absence_keys.add(key)
             else:
                 failures[key] = (
                     'projected provider-absence candidate lost its exact '
@@ -780,7 +733,28 @@ def _cleanup(
         suffix = '' if reason is None else f': {reason}'
         logger.error(f'Replica {info.replica_id} failed to terminate{suffix}.')
 
+    def _finalize_projected_paid_absence(
+            info: replica_managers.ReplicaInfo,
+            provider_operation_deadline_monotonic: float | None = None,
+            continue_guard: Callable[[], bool] | None = None) -> bool:
+        """Finalize one provider-free paid tombstone under exact ownership."""
+        _assert_owner(
+            f'before finalizing provider-absent replica {info.replica_id}')
+        finalized = replica_managers.finalize_projected_paid_provider_absence(
+            service_name,
+            info.replica_id,
+            info.replica_record_id,
+            info.cluster_name,
+            provider_operation_deadline_monotonic=(
+                provider_operation_deadline_monotonic),
+            continue_guard=continue_guard)
+        if finalized is True:
+            logger.info('Replica %s removed after exact paid provider absence.',
+                        info.replica_id)
+        return finalized
+
     projected_absence_infos: list[replica_managers.ReplicaInfo] = []
+    projected_paid_absence_infos: list[replica_managers.ReplicaInfo] = []
     absent_legacy_infos: list[replica_managers.ReplicaInfo] = []
     cleanup_entries: list[
         tuple[replica_managers.ReplicaInfo,
@@ -819,9 +793,7 @@ def _cleanup(
             if info.reserved_fill is True:
                 projected_absence_infos.append(info)
             else:
-                # Preserve the existing paid projected-absence retirement;
-                # only reserved pre-job cleanup needs the active Kueue scope.
-                absent_legacy_infos.append(info)
+                projected_paid_absence_infos.append(info)
             continue
         try:
             cleanup_fence = (
@@ -1068,15 +1040,15 @@ def _cleanup(
 
     _run_cleanup_submission_wave(cleanup_infos)
 
-    def _ordered_paid_observation_infos() -> list[replica_managers.ReplicaInfo]:
+    def _ordered_paid_infos(
+        infos_by_key: dict[tuple[int, str], replica_managers.ReplicaInfo],
+    ) -> list[replica_managers.ReplicaInfo]:
         """Interleave clouds so one slow provider cannot starve the other."""
         by_cloud: dict[str, list[replica_managers.ReplicaInfo]] = {
             'aws': [],
             'gcp': [],
         }
-        for key, info in paid_observation_infos.items():
-            context = cleanup_specs[key][1]
-            assert context is not None
+        for info in infos_by_key.values():
             pool_identity = paid_capacity.pool_key_payload(
                 str(info.paid_capacity_pool_key))
             cloud = (pool_identity.get('cloud') if isinstance(
@@ -1097,10 +1069,19 @@ def _cleanup(
 
     observation_lane = (
         non_pool_launch_reconciliation.OneShotProviderObservationLane())
+
+    def _paid_lane_mutation_is_allowed() -> bool:
+        return observation_lane.mutation_is_allowed and _still_owns()
+
+    paid_finalization_infos = {
+        (info.replica_id, info.replica_record_id): info
+        for info in projected_paid_absence_infos
+    }
     retry_at: dict[tuple[int, str], float] = {}
     deadlines = {
         key: time.monotonic() + _PAID_PROVIDER_OBSERVATION_TIMEOUT_SECONDS
-        for key in paid_observation_infos
+        for key in paid_observation_infos.keys() |
+        paid_finalization_infos.keys()
     }
     if paid_observation_infos and binding_authority is None:
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
@@ -1116,88 +1097,141 @@ def _cleanup(
         context = cleanup_specs[key][1]
         assert context is not None
 
-        def _cleanup_local_state() -> None:
-            _assert_owner(f'before paid provider-absence cleanup for replica '
-                          f'{info.replica_id}')
-            replica_managers.cleanup_exact_paid_cluster_record_after_provider_absence(
-                service_name, info.replica_id, info.replica_record_id,
-                info.cluster_name)
-
         return non_pool_launch_reconciliation.advance_paid_teardown_observation(
             context,
             info,
             binding_authority,
             functools.partial(_project_bound_ordinary_launch_for_teardown,
                               binding_authority),
-            before_absence_projection=_cleanup_local_state)
+            provider_operation_deadline_monotonic=deadlines[key],
+            continue_guard=_paid_lane_mutation_is_allowed)
 
-    # Reuse the same one-shot reconciliation function and fixed 16-worker
-    # service budget as the live replica manager.  This is intentionally not a
-    # second executor: each worker performs one observation and exits.
-    while paid_observation_infos:
-        _assert_owner('while observing paid provider teardown')
-        now = time.monotonic()
-        resubmit_infos: list[replica_managers.ReplicaInfo] = []
-        for completion in observation_lane.take_completed():
-            key = completion.key
-            completed_info = paid_observation_infos.get(key)
-            if completed_info is None:
-                continue
-            step = completion.result
-            if (completion.error is not None or not isinstance(
-                    step,
-                    non_pool_launch_reconciliation.PaidTeardownObservationStep)
-               ):
-                retry_at[key] = now + _PAID_PROVIDER_OBSERVATION_RETRY_SECONDS
-                continue
-            if step.disposition is (
-                    non_pool_launch_reconciliation.
-                    PaidTeardownObservationDisposition.SETTLED_ABSENT):
-                _remove_replica(completed_info)
-                del paid_observation_infos[key]
-                retry_at.pop(key, None)
-                logger.info(
-                    'Replica %s removed after exact paid provider '
-                    'absence.', completed_info.replica_id)
-                continue
-            if step.disposition is (
-                    non_pool_launch_reconciliation.
-                    PaidTeardownObservationDisposition.RESUBMIT_PRESENT):
-                scheduled = step.scheduled_replica_info
-                assert isinstance(scheduled, replica_managers.ReplicaInfo)
-                paid_observation_infos.pop(key, None)
-                resubmit_infos.append(scheduled)
-                continue
-            retry_at[key] = now + _PAID_PROVIDER_OBSERVATION_RETRY_SECONDS
-        if resubmit_infos:
-            _run_cleanup_submission_wave(resubmit_infos)
-            for info in resubmit_infos:
+    # Reuse one lane and one fixed 16-worker service budget for provider
+    # observation and post-settlement auxiliary finalization.  In particular,
+    # 100 GCP firewall operation waits must neither serialize in the
+    # coordinator nor create an unbounded second executor.
+    try:
+        while (paid_observation_infos or paid_finalization_infos or
+               observation_lane.has_work()):
+            _assert_owner('while reconciling paid provider teardown')
+            now = time.monotonic()
+            resubmit_infos: list[replica_managers.ReplicaInfo] = []
+            for completion in observation_lane.take_completed():
+                key = completion.key
+                finalization_info = paid_finalization_infos.get(key)
+                if finalization_info is not None:
+                    if completion.error is not None:
+                        retry_at[key] = (
+                            now + _PAID_PROVIDER_OBSERVATION_RETRY_SECONDS)
+                        continue
+                    if completion.result is not True:
+                        _set_to_failed_cleanup(
+                            finalization_info,
+                            'provider absence was projected, but exact '
+                            'auxiliary and row finalization lost its immutable '
+                            'authority')
+                        del paid_finalization_infos[key]
+                        retry_at.pop(key, None)
+                        continue
+                    del paid_finalization_infos[key]
+                    retry_at.pop(key, None)
+                    continue
+                completed_info = paid_observation_infos.get(key)
+                if completed_info is None:
+                    continue
+                step = completion.result
+                if (completion.error is not None or not isinstance(
+                        step, non_pool_launch_reconciliation.
+                        PaidTeardownObservationStep)):
+                    retry_at[key] = (now +
+                                     _PAID_PROVIDER_OBSERVATION_RETRY_SECONDS)
+                    continue
+                if step.disposition is (
+                        non_pool_launch_reconciliation.
+                        PaidTeardownObservationDisposition.SETTLED_ABSENT):
+                    del paid_observation_infos[key]
+                    paid_finalization_infos[key] = completed_info
+                    retry_at.pop(key, None)
+                    continue
+                if step.disposition is (
+                        non_pool_launch_reconciliation.
+                        PaidTeardownObservationDisposition.RESUBMIT_PRESENT):
+                    scheduled = step.scheduled_replica_info
+                    assert isinstance(scheduled, replica_managers.ReplicaInfo)
+                    paid_observation_infos.pop(key, None)
+                    resubmit_infos.append(scheduled)
+                    continue
+                retry_at[key] = (now + _PAID_PROVIDER_OBSERVATION_RETRY_SECONDS)
+            if resubmit_infos:
+                _run_cleanup_submission_wave(resubmit_infos)
+                for info in resubmit_infos:
+                    key = (info.replica_id, info.replica_record_id)
+                    deadlines.setdefault(
+                        key,
+                        time.monotonic() +
+                        _PAID_PROVIDER_OBSERVATION_TIMEOUT_SECONDS)
+                    retry_at[key] = (time.monotonic() +
+                                     _PAID_PROVIDER_OBSERVATION_RETRY_SECONDS)
+            now = time.monotonic()
+            for key, info in list(paid_observation_infos.items()):
+                if now >= deadlines[key]:
+                    if observation_lane.contains(key):
+                        # Each provider leaf owns this same absolute deadline.
+                        # It now performs TERM/KILL/reap before its lane thread
+                        # can finish, so this drain is physically bounded.
+                        continue
+                    _set_to_failed_cleanup(
+                        info, 'exact paid provider absence was not observed '
+                        'within the bounded teardown horizon')
+                    del paid_observation_infos[key]
+                    continue
+                if (observation_lane.contains(key) or
+                        now < retry_at.get(key, 0)):
+                    continue
+            for key, info in list(paid_finalization_infos.items()):
+                if now >= deadlines[key]:
+                    if observation_lane.contains(key):
+                        continue
+                    _set_to_failed_cleanup(
+                        info, 'provider absence was projected, but exact '
+                        'auxiliary and row finalization did not complete '
+                        'within the bounded teardown horizon')
+                    del paid_finalization_infos[key]
+                    continue
+                if (observation_lane.contains(key) or
+                        now < retry_at.get(key, 0)):
+                    continue
+            # Billable provider observation always receives lane capacity
+            # before already-settled auxiliary cleanup.  A large GCP firewall
+            # backlog is therefore unable to starve teardown evidence for live
+            # VMs.
+            for info in _ordered_paid_infos(paid_observation_infos):
                 key = (info.replica_id, info.replica_record_id)
-                deadlines.setdefault(
-                    key,
-                    time.monotonic() +
-                    _PAID_PROVIDER_OBSERVATION_TIMEOUT_SECONDS)
-                retry_at[key] = (time.monotonic() +
-                                 _PAID_PROVIDER_OBSERVATION_RETRY_SECONDS)
-        now = time.monotonic()
-        for key, info in list(paid_observation_infos.items()):
-            if now >= deadlines[key]:
-                _set_to_failed_cleanup(
-                    info, 'exact paid provider absence was not observed '
-                    'within the bounded teardown horizon')
-                del paid_observation_infos[key]
-                continue
-            if observation_lane.contains(key) or now < retry_at.get(key, 0):
-                continue
-        for info in _ordered_paid_observation_infos():
-            key = (info.replica_id, info.replica_record_id)
-            if observation_lane.contains(key) or now < retry_at.get(key, 0):
-                continue
-            if not observation_lane.schedule(
-                    key, functools.partial(_observe_paid_provider_once, info)):
-                break
-        if paid_observation_infos:
-            time.sleep(0.2)
+                if (observation_lane.contains(key) or
+                        now < retry_at.get(key, 0)):
+                    continue
+                if not observation_lane.schedule(
+                        key, functools.partial(_observe_paid_provider_once,
+                                               info)):
+                    break
+            for info in _ordered_paid_infos(paid_finalization_infos):
+                key = (info.replica_id, info.replica_record_id)
+                if (observation_lane.contains(key) or
+                        now < retry_at.get(key, 0)):
+                    continue
+                if not observation_lane.schedule(
+                        key,
+                        functools.partial(
+                            _finalize_projected_paid_absence,
+                            info,
+                            provider_operation_deadline_monotonic=deadlines[key],
+                            continue_guard=_paid_lane_mutation_is_allowed)):
+                    break
+            if (paid_observation_infos or paid_finalization_infos or
+                    observation_lane.has_work()):
+                time.sleep(0.2)
+    finally:
+        observation_lane.close()
 
     _assert_owner('before scoped storage cleanup')
 

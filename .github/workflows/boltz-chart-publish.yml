@@ -154,7 +154,7 @@ jobs:
             -e EXPECTED_VERSION="${RELEASE_VERSION}" \
             -e EXPECTED_COMMIT="${RELEASE_SHA}" \
             "${IMAGE_REF}" python -c \
-            'import os, sky; assert sky.__version__ == os.environ["EXPECTED_VERSION"], sky.__version__; assert sky.__commit__ == os.environ["EXPECTED_COMMIT"], sky.__commit__'
+            'import importlib.metadata, os, sys; import boltz_reserved_fill_reclaim_policy, skypilot_serve_system_oom_recovery_authorization, sky; assert sys.version_info[:2] >= (3, 14), sys.version; assert sky.__version__ == os.environ["EXPECTED_VERSION"], sky.__version__; assert sky.__commit__ == os.environ["EXPECTED_COMMIT"], sky.__commit__; assert importlib.metadata.version("skypilot") == sky.__version__; assert importlib.metadata.version("boltz-skypilot-reserved-fill-reclaim-policy") == sky.__version__'
 
       - name: Build chart dependencies
         run: |

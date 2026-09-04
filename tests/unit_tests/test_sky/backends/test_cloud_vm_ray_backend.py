@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import time
+import types
 from unittest.mock import call
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -24,6 +25,7 @@ from sky.backends.cloud_vm_ray_backend import GangSchedulingStatus
 from sky.backends.cloud_vm_ray_backend import RetryingVmProvisioner
 from sky.backends.cloud_vm_ray_backend import SSHTunnelInfo
 from sky.schemas.generated import jobsv1_pb2
+from sky.serve import ordinary_launch_binding
 from sky.utils import status_lib
 
 
@@ -2128,6 +2130,56 @@ class TestCloudVmRayBackendLockedProvision:
             existing_cluster_hash='generation-hash')
         assert add_event.call_args.kwargs['existing_cluster_hash'] == (
             'generation-hash')
+
+    def test_ready_transition_preserves_bound_paid_cluster_record_uuid(self):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        replica_record_id = uuid.UUID('22222222-2222-4222-8222-222222222222')
+        backend._extra_launch_context = {  # pylint: disable=protected-access
+            ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY: 2,
+        }
+        context = types.SimpleNamespace(
+            profile=types.SimpleNamespace(
+                kind=ordinary_launch_binding.NonPoolLaunchProfileKind.
+                ORDINARY_PAID),
+            replica_id=1,
+            replica_record_id=replica_record_id,
+            launch_generation=1,
+            capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH))
+        handle = MagicMock(cluster_name='test-cluster', launched_nodes=1)
+        handle.launched_resources.ports = None
+        handle.provision_runtime_metadata.has_job_queue = False
+        handle.provision_runtime_metadata.ssh_available = False
+        task_obj = MagicMock(resources=set())
+        task_obj.to_yaml_config.return_value = {'run': 'echo ok'}
+
+        with patch.object(
+                ordinary_launch_binding,
+                'parse_bound_non_pool_launch_context',
+                return_value=context), patch.object(
+                    cloud_vm_ray_backend.global_user_state,
+                    'add_or_update_cluster') as add_or_update, patch.object(
+                        cloud_vm_ray_backend.global_user_state,
+                        'add_cluster_event'), patch.object(
+                            cloud_vm_ray_backend.usage_lib.messages.usage,
+                            'update_cluster_resources'), patch.object(
+                                cloud_vm_ray_backend.usage_lib.messages.usage,
+                                'update_final_cluster_status'):
+            backend._update_after_cluster_provisioned(  # pylint: disable=protected-access
+                handle,
+                prev_handle=None,
+                task=task_obj,
+                prev_cluster_status=None,
+                config_hash=None,
+                cluster_hash='generation-hash')
+
+        expected = (ordinary_launch_binding.
+                    derive_fresh_ordinary_paid_resource_action_identity(
+                        replica_id=1,
+                        replica_record_id=replica_record_id,
+                        cluster_name='test-cluster'))
+        assert add_or_update.call_args.kwargs[
+            'cluster_record_uuid'] == expected.sky_cluster_record_uuid
 
     @pytest.mark.parametrize(
         ('prev_cluster_status', 'prev_ports', 'current_ports',

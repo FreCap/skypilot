@@ -8,19 +8,17 @@ import datetime
 import hashlib
 import importlib.util
 import json
-import os
 import pathlib
 import shlex
-import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import types
 import typing
 from typing import Any
-import urllib.error
-import urllib.request
+from unittest import mock
 import uuid
 
 import aiohttp.web
@@ -151,6 +149,34 @@ def _provider_scope(**overrides):
     return qualifier.ProviderScope(**values)
 
 
+def _install_fake_isolated_sessions(monkeypatch, request):
+    sessions = []
+
+    class Session:
+
+        def __init__(self, domain, **_kwargs):
+            self.domain = domain
+            self.started = 0
+            self.requests = 0
+            self.closed = 0
+            sessions.append(self)
+
+        async def start(self, deadline_monotonic):
+            assert time.monotonic() < deadline_monotonic
+            self.started += 1
+
+        async def request(self, kind, arguments, deadline_monotonic):
+            assert qualifier._observation_domain(kind) is self.domain
+            self.requests += 1
+            return await request(kind, arguments, deadline_monotonic)
+
+        async def aclose(self):
+            self.closed += 1
+
+    monkeypatch.setattr(qualifier, 'IsolatedObserverSession', Session)
+    return sessions
+
+
 def _instance(*,
               provisioning_model: str = 'SPOT',
               cluster_name: str = 'paid-e2e-1',
@@ -225,6 +251,9 @@ def _aws_volume(*,
     }
 
 
+_SERVICE_INCARNATION = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+
+
 def _database_state(**overrides):
     bound_cluster_zones = overrides.pop('bound_cluster_zones', ())
     values = {
@@ -250,9 +279,27 @@ def _database_state(**overrides):
                 zone=zone) for cluster_name, zone in bound_cluster_zones),
         'aws_provider_identities': (),
         'provider_free_unbound_replica_ids': (),
+        'cleanup_cluster_identities': (),
     }
     values.update(overrides)
     return qualifier.DatabaseState(**values)
+
+
+def _cleanup_database_state(**overrides):
+    values = {
+        'debit_units': 0,
+        'claim_count': 0,
+        'waiter_count': 0,
+        'service_row_count': 0,
+        'replica_count': 0,
+        'cluster_record_count': 0,
+        'effect_capable_association_count': 0,
+        'blocking_request_count': 0,
+        'queue_delivery_count': 0,
+        'retention_pin_count': 0,
+    }
+    values.update(overrides)
+    return qualifier.CleanupDatabaseState(**values)
 
 
 def _provider_state(**overrides):
@@ -360,9 +407,11 @@ def _observation(observed_at: float = 1000,
 def _request_telemetry(*,
                        queue_depth=0,
                        in_flight=0,
+                       http_in_flight=None,
                        processing=0,
-                       state_counts=None,
                        observed_at=1000.0):
+    if http_in_flight is None:
+        http_in_flight = in_flight
     summary = {
         'request_telemetry_observed_at': observed_at,
         'request_telemetry_state': 'fresh',
@@ -370,11 +419,12 @@ def _request_telemetry(*,
         'request_telemetry_compatibility_complete': True,
         'request_queue_depth': queue_depth,
         'in_flight_requests': in_flight,
+        'http_in_flight_requests': http_in_flight,
         'processing_requests': processing,
         'confirmed_in_flight_requests': in_flight,
         'confirmed_processing_requests': processing,
     }
-    return qualifier.request_telemetry_from_summary(summary, state_counts or {})
+    return qualifier.request_telemetry_from_summary(summary)
 
 
 async def _campaign_progress(profile, *, turnover=0):
@@ -426,7 +476,10 @@ def test_cross_cloud_service_contract_normalizes_one_canonical_shape(
             request_queue_max_size=32,
             request_queue_max_concurrency=4,
             request_queue_timeout_seconds=600,
-            max_concurrency_per_replica=8))
+            max_concurrency_per_replica=8,
+            stream_timeout_seconds=600,
+            graceful_drain_async_occupancy=True,
+            use_async_occupancy=False))
 
 
 @pytest.mark.parametrize('mutation', [
@@ -493,7 +546,7 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
     source = _FIXTURE_DIR / 'service.yaml'
     for name, expected_units, expected_first_wave, expected_period in (
         ('small', 2, 2, 10),
-        ('scale', 800, 800, 10),
+        ('scale', 800, 400, 10),
     ):
         output = tmp_path / f'{name}.yaml'
         args = type(
@@ -586,10 +639,12 @@ def test_scale_profile_exceeds_physical_gate_for_rendered_shape():
     assert profile.max_units == 800
     assert profile.max_units // 1 >= 100
     assert profile.exact_requests == 10_000
-    assert profile.request_concurrency == 128
+    assert profile.request_concurrency == 400
     assert profile.request_concurrency < profile.exact_requests
-    assert qualifier.scale_stimulus_count(profile) == profile.max_units
-    assert profile.scale_up_min_replicas == profile.max_units
+    assert qualifier.scale_stimulus_count(profile) == 400
+    assert profile.request_concurrency == qualifier.scale_stimulus_count(
+        profile)
+    assert profile.scale_up_min_replicas == 400
 
 
 @pytest.mark.parametrize(
@@ -766,6 +821,31 @@ def test_campaign_progress_serializes_window_and_terminal_order():
         offered=3, succeeded=3)
 
 
+def test_campaign_close_does_not_deadlock_if_driver_is_cancelled_before_bind():
+    """A task cancelled before its first bytecode cannot strand close/drain."""
+
+    async def exercise():
+        progress = qualifier.ExactRequestCampaignProgress(total_count=1,
+                                                          window_size=1)
+        traffic = asyncio.create_task(
+            qualifier.send_synchronous_requests(endpoint='https://unused.test',
+                                                token='secret',
+                                                prefix='pre-bind',
+                                                count=1,
+                                                resident_window=1,
+                                                request_concurrency=1,
+                                                hold_seconds=1,
+                                                timeout_seconds=1,
+                                                request_queue_timeout_seconds=1,
+                                                campaign_progress=progress))
+        traffic.cancel('before bind')
+        with pytest.raises(asyncio.CancelledError):
+            await traffic
+        return await asyncio.wait_for(progress.close_and_drain(), timeout=0.1)
+
+    assert asyncio.run(exercise()) == 0
+
+
 def test_positive_telemetry_deadline_allows_one_retry_after_scale_timeout():
     profile = qualifier.PROFILES['scale']
     small = qualifier.PROFILES['small']
@@ -791,11 +871,11 @@ def test_scale_queue_is_bounded_to_one_sliding_window():
         'max_concurrency': projection['request_queue_max_concurrency'],
     }
 
-    assert projection['request_queue_min_size'] == 800
-    assert projection['request_queue_max_size'] == 800
+    assert projection['request_queue_min_size'] == 400
+    assert projection['request_queue_max_size'] == 400
     assert projection['request_queue_max_concurrency'] == 128
     assert projection['request_queue_timeout_seconds'] == 600
-    assert instance._request_queue_submission_limit() == 928
+    assert instance._request_queue_submission_limit() == 528
     assert instance._request_queue_submission_limit() < profile.exact_requests
 
 
@@ -1374,6 +1454,420 @@ def test_gcp_observer_sanitizes_api_failures():
     assert 'credential-bearing' not in str(error.value)
 
 
+def test_gcp_child_transport_compacts_service_decision_evidence():
+    cluster = 'paid-e2e-1'
+    name = f'{cluster}-head-1234abcd-compute'
+    group_id = str(uuid.uuid4())
+    census = qualifier.ProviderCensus(
+        instances=[{
+            'name': name,
+            'zone': 'zones/us-central1-a',
+            'labels': {
+                'ray-cluster-name': cluster,
+                'unneeded': 'x' * 100_000,
+            },
+            'scheduling': {
+                'provisioningModel': 'SPOT',
+                'unneeded': 'x' * 100_000,
+            },
+            'machineType': 'machineTypes/g2-standard-4',
+            'guestAccelerators': [{
+                'acceleratorType': 'acceleratorTypes/nvidia-l4',
+                'acceleratorCount': 1,
+                'unneeded': 'x' * 100_000,
+            }],
+            'status': 'RUNNING',
+            'metadata': 'x' * 100_000,
+        }, {
+            'name': 'unrelated-head-1234abcd-compute',
+            'zone': 'zones/us-central1-a',
+            'metadata': 'x' * 100_000,
+        }],
+        disks=[{
+            'name': name,
+            'zone': 'zones/us-central1-a',
+            'labels': {
+                'ray-cluster-name': cluster,
+                'skypilot-managed': 'true',
+                'unneeded': 'x' * 100_000,
+            },
+            'users': ['unneeded'],
+        }],
+        operations=[{
+            'operationType': 'insert',
+            'operationGroupId': group_id,
+            'targetLink': f'zones/us-central1-a/instances/{name}',
+            'status': 'DONE',
+            'unneeded': 'x' * 100_000,
+        }, {
+            'operationType': 'bulkInsert',
+            'operationGroupId': group_id,
+            'targetLink': 'regions/us-central1/instances/bulk',
+            'status': 'RUNNING',
+            'unneeded': 'x' * 100_000,
+        }, {
+            'operationType': 'insert',
+            'targetLink': ('zones/us-central1-a/instances/'
+                           'unrelated-head-1234abcd-compute'),
+            'status': 'RUNNING',
+            'unneeded': 'x' * 100_000,
+        }])
+
+    compact = qualifier._compact_gcp_provider_census('paid-e2e', census)
+
+    assert len(json.dumps(dataclasses.asdict(compact))) < 4096
+    assert len(compact.instances) == 1
+    assert compact.instances[0]['labels'] == {'ray-cluster-name': cluster}
+    assert compact.instances[0]['scheduling'] == {'provisioningModel': 'SPOT'}
+    assert compact.instances[0]['guestAccelerators'] == [{
+        'acceleratorType': 'acceleratorTypes/nvidia-l4',
+        'acceleratorCount': 1,
+    }]
+    assert len(compact.disks) == 1
+    assert len(compact.operations) == 2
+    assert all('unneeded' not in value for value in compact.operations)
+
+
+def test_provider_child_runtime_reuses_one_executor_per_lifecycle(monkeypatch):
+    executors = []
+
+    class Executor:
+
+        def __init__(self, *, max_workers, thread_name_prefix):
+            self.max_workers = max_workers
+            self.thread_name_prefix = thread_name_prefix
+            self.map_count = 0
+            self.shutdown_call = None
+            executors.append(self)
+
+        def map(self, function, observers):
+            self.map_count += 1
+            return [function(observer) for observer in observers]
+
+        def shutdown(self, *, wait, cancel_futures):
+            self.shutdown_call = (wait, cancel_futures)
+
+    class Gcp:
+
+        def census(self):
+            return qualifier.ProviderCensus(instances=[],
+                                            disks=[],
+                                            operations=[])
+
+    class Aws:
+
+        def __init__(self):
+            self.retained = {'us-east-2': []}
+
+        def census(self):
+            return qualifier.AwsProviderCensus(service_instances=(),
+                                               service_volumes=())
+
+        def accept_retained_volume_ids(self, value):
+            self.retained = value
+
+        def retained_volume_ids(self):
+            return self.retained
+
+    monkeypatch.setattr(qualifier.concurrent.futures, 'ThreadPoolExecutor',
+                        Executor)
+    monkeypatch.setattr(qualifier, '_provider_observers', lambda **_kwargs:
+                        (Gcp(), Aws()))
+    scope = _provider_scope()
+    arguments = {
+        'service_name': 'paid-e2e',
+        'scope': qualifier._scope_process_payload(scope),
+        'profile': dataclasses.asdict(qualifier.PROFILES['small']),
+        'retained': {
+            'us-east-2': [],
+        },
+    }
+    runtime = qualifier._IsolatedObserverChildRuntime(
+        qualifier.IsolatedObservationDomain.PROVIDER)
+
+    for _ in range(2):
+        result = runtime.execute(
+            qualifier.IsolatedObservationKind.PROVIDER_CENSUS, arguments)
+        assert result['retained_volume_ids_by_region'] == {'us-east-2': []}
+    runtime.close()
+
+    assert len(executors) == 1
+    assert executors[0].max_workers == 2
+    assert executors[0].map_count == 2
+    assert executors[0].shutdown_call == (True, True)
+
+
+def test_postgres_observer_has_one_explicit_reusable_connection(monkeypatch):
+    calls = []
+
+    class Engine:
+
+        def dispose(self):
+            calls.append('disposed')
+
+    def create_engine(database_url, **kwargs):
+        calls.append((database_url, kwargs))
+        return Engine()
+
+    monkeypatch.setattr(qualifier.sqlalchemy, 'create_engine', create_engine)
+    observer = qualifier.PostgresObserver(
+        'postgresql://user:password@database.example.test/sky', 'paid-e2e')
+    observer.close()
+
+    assert calls[0] == (
+        'postgresql://user:password@database.example.test/sky', {
+            'poolclass': qualifier.sqlalchemy.pool.QueuePool,
+            'pool_size': 1,
+            'max_overflow': 0,
+            'pool_timeout':
+                qualifier._POSTGRES_OBSERVER_OPERATION_TIMEOUT_SECONDS,
+            'pool_pre_ping': True,
+            'pool_recycle': 1800,
+            'connect_args': {
+                'connect_timeout':
+                    qualifier._POSTGRES_OBSERVER_OPERATION_TIMEOUT_SECONDS,
+            },
+        })
+    assert calls[1] == 'disposed'
+
+
+def test_postgres_cleanup_reads_complete_exact_graph_in_one_transaction():
+    scope = _provider_scope()
+    binding = _cleanup_binding()
+    seen = []
+
+    class Result:
+
+        def __init__(self, rows):
+            self._rows = rows
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return self._rows
+
+        def __iter__(self):
+            return iter(self._rows)
+
+    class Connection:
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def execute(statement, params=None):
+            sql = str(statement)
+            seen.append((sql, params))
+            if 'service_lifecycle_fences' in sql:
+                return Result([{'epoch': scope.lifecycle_epoch}])
+            if 'FROM services AS service' in sql:
+                return Result([])
+            if 'FROM replicas AS replica' in sql:
+                return Result([])
+            if 'FROM paid_capacity_claims' in sql:
+                return Result([])
+            if 'FROM paid_capacity_waiters' in sql:
+                return Result([])
+            if 'FROM serve_ordinary_launch_associations' in sql:
+                return Result([binding])
+            if 'FROM clusters' in sql:
+                return Result([])
+            return Result([])
+
+    class Engine:
+
+        @staticmethod
+        def begin():
+            return Connection()
+
+    observer = object.__new__(qualifier.PostgresObserver)
+    observer._engine = Engine()
+    observer._service_name = 'paid-e2e'
+    observer._provider_scope = scope
+
+    state, cleanup_scope = observer.cleanup_state(qualifier.CleanupScope())
+    assert state.is_exact_zero()
+    assert len(cleanup_scope.cluster_identities) == 1
+    waiter_query = next(
+        sql for sql, _ in seen if 'FROM paid_capacity_waiters' in sql)
+    assert 'heartbeat_at' not in waiter_query
+    binding_query, binding_params = next(
+        (sql, params)
+        for sql, params in seen
+        if 'FROM serve_ordinary_launch_associations' in sql)
+    assert 'service_hash = :service_hash' in binding_query
+    assert binding_params['service_hash'] == scope.service_hash
+    assert 'service_lifecycle_epoch = :lifecycle_epoch' in binding_query
+    assert binding_params['lifecycle_epoch'] == scope.lifecycle_epoch
+    cluster_query, cluster_params = next(
+        (sql, params) for sql, params in seen if 'FROM clusters' in sql)
+    assert 'name IN' in cluster_query
+    assert 'cluster_record_uuid IN' in cluster_query
+    assert cluster_params['cluster_names'] == (binding['cluster_name'],)
+
+
+def test_postgres_cleanup_identity_scope_never_shrinks_after_association_gc():
+    """Deleting history cannot hide a surviving exact global cluster row."""
+    scope = _provider_scope()
+    binding = _cleanup_binding()
+    identity = (qualifier._cleanup_cluster_record_identities([binding])[0])
+    transaction_index = -1
+
+    class Result:
+
+        def __init__(self, rows):
+            self._rows = rows
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return self._rows
+
+        def __iter__(self):
+            return iter(self._rows)
+
+    class Connection:
+
+        def __init__(self, index):
+            self._index = index
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            if 'service_lifecycle_fences' in sql:
+                return Result([{'epoch': scope.lifecycle_epoch}])
+            if ('FROM services AS service' in sql or
+                    'FROM replicas AS replica' in sql or
+                    'FROM paid_capacity_claims' in sql or
+                    'FROM paid_capacity_waiters' in sql):
+                return Result([])
+            if 'FROM serve_ordinary_launch_associations' in sql:
+                return Result([binding] if self._index == 0 else [])
+            if 'FROM clusters' in sql:
+                assert params['cluster_names'] == (binding['cluster_name'],)
+                if self._index == 0:
+                    return Result([])
+                return Result([{
+                    'name': binding['cluster_name'],
+                    'cluster_record_uuid': identity.cluster_record_uuid,
+                }])
+            return Result([])
+
+    class Engine:
+
+        @staticmethod
+        def begin():
+            nonlocal transaction_index
+            transaction_index += 1
+            return Connection(transaction_index)
+
+    observer = object.__new__(qualifier.PostgresObserver)
+    observer._engine = Engine()
+    observer._service_name = 'paid-e2e'
+    observer._provider_scope = scope
+
+    first, cleanup_scope = observer.cleanup_state(qualifier.CleanupScope())
+    assert first.is_exact_zero()
+    # A restarted isolated child receives the parent-owned monotonic scope.
+    restarted_observer = object.__new__(qualifier.PostgresObserver)
+    restarted_observer._engine = observer._engine
+    restarted_observer._service_name = observer._service_name
+    restarted_observer._provider_scope = observer._provider_scope
+    second, cleanup_scope = restarted_observer.cleanup_state(cleanup_scope)
+    assert second.cluster_record_count == 1
+    assert not second.is_exact_zero()
+    assert len(cleanup_scope.cluster_identities) == 1
+
+
+def test_postgres_cleanup_uses_scope_learned_before_first_cleanup_census():
+    """Live qualification identity survives association GC before teardown."""
+    scope = _provider_scope()
+    binding = _cleanup_binding()
+    identity = qualifier._cleanup_cluster_record_identities([binding])[0]
+
+    class Result:
+
+        def __init__(self, rows):
+            self._rows = rows
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return self._rows
+
+        def __iter__(self):
+            return iter(self._rows)
+
+    class Connection:
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def execute(statement, params=None):
+            sql = str(statement)
+            if 'service_lifecycle_fences' in sql:
+                return Result([{'epoch': scope.lifecycle_epoch}])
+            if ('FROM services AS service' in sql or
+                    'FROM replicas AS replica' in sql or
+                    'FROM paid_capacity_claims' in sql or
+                    'FROM paid_capacity_waiters' in sql or
+                    'FROM serve_ordinary_launch_associations' in sql):
+                return Result([])
+            if 'FROM clusters' in sql:
+                assert params['cluster_names'] == (binding['cluster_name'],)
+                return Result([{
+                    'name': binding['cluster_name'],
+                    'cluster_record_uuid': identity.cluster_record_uuid,
+                }])
+            return Result([])
+
+    class Engine:
+
+        @staticmethod
+        def begin():
+            return Connection()
+
+    observer = object.__new__(qualifier.PostgresObserver)
+    observer._engine = Engine()
+    observer._service_name = 'paid-e2e'
+    observer._provider_scope = scope
+    retained = qualifier.CleanupScope().retain((identity,))
+
+    state, returned = observer.cleanup_state(retained)
+
+    assert returned == retained
+    assert state.cluster_record_count == 1
+    assert not state.is_exact_zero()
+
+
+def test_cleanup_scope_protocol_round_trips_and_rejects_child_shrink():
+    binding = _cleanup_binding()
+    frozen = qualifier.CleanupScope().retain(
+        qualifier._cleanup_cluster_record_identities([binding]))
+    payload = qualifier._cleanup_scope_process_payload(frozen)
+
+    assert qualifier._cleanup_scope_from_process_payload(payload) == frozen
+    with pytest.raises(qualifier.GuardViolation, match='shrank'):
+        qualifier._accepted_cleanup_scope(
+            frozen,
+            qualifier._cleanup_scope_process_payload(qualifier.CleanupScope()))
+
+
 def test_aws_retained_identity_is_bound_to_frozen_catalog(monkeypatch):
     scope = _provider_scope(max_live_paid_gpu_units=8)
     pool = {
@@ -1614,7 +2108,10 @@ def test_aws_empty_root_attachment_retries_then_reduces_and_records(
     class Observer:
         """Narrow provider-observation interface with one transient miss."""
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             result = next(outcomes)
             if isinstance(result, Exception):
@@ -1631,13 +2128,15 @@ def test_aws_empty_root_attachment_retries_then_reduces_and_records(
                                     profile=profile,
                                     progress=progress,
                                     receipt=receipt,
-                                    phase='scale'))
+                                    phase='scale',
+                                    deadline_monotonic=time.monotonic() + 1))
     second = asyncio.run(
         qualifier._validated_sample(observer=observer,
                                     profile=profile,
                                     progress=progress,
                                     receipt=receipt,
-                                    phase='scale'))
+                                    phase='scale',
+                                    deadline_monotonic=time.monotonic() + 1))
 
     assert first is None
     assert second is not None
@@ -2520,12 +3019,369 @@ def test_cleanup_census_counts_instance_after_cluster_label_loss():
     assert state.running_count == 1
 
 
+def _cleanup_binding(*,
+                     replica_id=7,
+                     replica_record_id='22222222-2222-4222-8222-222222222222',
+                     cluster_name='paid-e2e-7'):
+    association_id = uuid.UUID('11111111-1111-4111-8111-111111111111')
+    quiesced_at = datetime.datetime(2026,
+                                    9,
+                                    1,
+                                    1,
+                                    0,
+                                    tzinfo=datetime.timezone.utc)
+    profile = qualifier.ordinary_launch_binding.NonPoolLaunchProfile.create(
+        qualifier.ordinary_launch_binding.NonPoolLaunchProfileKind.
+        ORDINARY_PAID,
+        authorization_reference=(
+            f'paid-capacity:incarnation:{replica_record_id}:pool'),
+        authorization_generation=1,
+        authorization_payload={'capacity_plan_generation': 1})
+    return {
+        'association_id': association_id,
+        'request_id': 'request-1',
+        'service_name': 'paid-e2e',
+        'service_hash': 'incarnation',
+        'service_lifecycle_epoch': 7,
+        'replica_id': replica_id,
+        'replica_record_id': replica_record_id,
+        'cluster_name': cluster_name,
+        'launch_generation': 1,
+        'paid_capacity_pool_key': 'pool',
+        'effect_phase': 'NOT_STARTED',
+        'resolution': 'PRE_EFFECT_TERMINAL',
+        'terminal_status': 'FAILED',
+        'terminal_cause': 'handler_failed',
+        'terminal_execution_generation': 1,
+        'execution_quiescence_required': True,
+        'execution_quiesced_generation': 1,
+        'execution_quiesced_at': quiesced_at,
+        'service_job_id': None,
+        'result_recorded_at': None,
+        'ambiguity_code': None,
+        'projected_at': quiesced_at,
+        'pin_released_at': quiesced_at,
+        'tombstone_not_before': quiesced_at + datetime.timedelta(days=60),
+        'cancel_reason': None,
+        'cancel_requested_at': None,
+        'binding_protocol_version':
+            (qualifier.ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION
+            ),
+        'profile_kind': profile.kind.value,
+        'profile_version': profile.version,
+        'profile_digest': profile.digest,
+        'capability_cohort_epoch':
+            (qualifier.ordinary_launch_binding.
+             ORDINARY_PAID_RESOURCE_ACTION_IDENTITY_COHORT_FLOOR),
+        'capability_profile_set_digest':
+            (qualifier.ordinary_launch_binding.
+             supported_non_pool_profile_set_digest()),
+        'receipt_protocol_version': 1,
+        'authorization_kind': profile.authorization_kind.value,
+        'authorization_reference': profile.authorization_reference,
+        'authorization_generation': profile.authorization_generation,
+        'authorization_digest': profile.authorization_digest,
+        'reconciliation_outcome': 'PRE_EFFECT_TERMINAL',
+        'provider_evidence': 'NOT_QUERIED',
+        'provider_evidence_observed_at': None,
+        'provider_evidence_payload': None,
+        'provider_evidence_digest': None,
+    }
+
+
+def _cleanup_replica(binding, *, sky_down_status='SUCCEEDED'):
+    identity = (qualifier.ordinary_launch_binding.
+                derive_fresh_ordinary_paid_resource_action_identity(
+                    replica_id=binding['replica_id'],
+                    replica_record_id=binding['replica_record_id'],
+                    cluster_name=binding['cluster_name']))
+    pool_key = json.dumps(
+        {
+            'accelerators': [['l4', 1]],
+            'cloud': 'gcp',
+            'instance_type': 'g2-standard-4',
+            'num_nodes': 1,
+            'region': 'us-central1',
+            'use_spot': True,
+            'version': 1,
+            'workspace': 'workspace-a',
+            'zone': 'us-central1-a',
+        },
+        sort_keys=True,
+        separators=(',', ':'))
+    return {
+        'replica_id': binding['replica_id'],
+        'replica_record_id': binding['replica_record_id'],
+        'cluster_name': binding['cluster_name'],
+        'sky_cluster_record_uuid': identity.sky_cluster_record_uuid,
+        'paid_capacity_pool_key': pool_key,
+        'sky_down_status': sky_down_status,
+        'replica_state': {
+            'status_property': {
+                'sky_down_status': sky_down_status,
+            },
+            'paid_capacity_pool_key': pool_key,
+            'is_zero_cost': False,
+        },
+    }
+
+
+def _cleanup_closed_request(binding):
+    return {
+        'request_id': binding['request_id'],
+        'ordinary_launch_association_id': binding['association_id'],
+        'handler_name': qualifier.non_pool_launch.NON_POOL_LAUNCH_HANDLER_NAME,
+        'status': binding['terminal_status'],
+        'terminal_cause': binding['terminal_cause'],
+        'finished_at': binding['execution_quiesced_at'],
+        'execution_generation': binding['terminal_execution_generation'],
+        'execution_quiescence_required': True,
+        'execution_quiesced_generation':
+            binding['execution_quiesced_generation'],
+        'execution_quiesced_at': binding['execution_quiesced_at'],
+        'resource_action_id': None,
+        'resource_action_attempt': None,
+        **{
+            field: binding[field] for field in qualifier._BOUND_REQUEST_PROFILE_FIELDS
+        },
+    }
+
+
+def _reduce_cleanup_execution(bindings, request_rows, queue_rows, pin_rows):
+    scope = _provider_scope()
+    return qualifier.cleanup_database_state_from_rows(
+        scope=scope,
+        lifecycle_fence_rows=[{
+            'epoch': scope.lifecycle_epoch
+        }],
+        service_rows=[],
+        replicas=[],
+        claim_rows=[],
+        waiter_rows=[],
+        bindings=bindings,
+        request_rows=request_rows,
+        queue_rows=queue_rows,
+        pin_rows=pin_rows,
+        cluster_identities=qualifier._cleanup_cluster_record_identities(
+            bindings),
+        cluster_rows=[])
+
+
+def test_cleanup_execution_state_ignores_only_closed_quiesced_history():
+    binding = _cleanup_binding()
+    request = _cleanup_closed_request(binding)
+
+    state = _reduce_cleanup_execution([binding], [request], [], [])
+
+    assert state.is_exact_zero()
+
+
+def test_cleanup_execution_state_counts_unquiesced_request_delivery_and_pin():
+    binding = _cleanup_binding()
+    request = {
+        **_cleanup_closed_request(binding),
+        'execution_quiesced_generation': None,
+        'execution_quiesced_at': None,
+    }
+
+    state = _reduce_cleanup_execution([binding], [request], [{
+        'request_id': binding['request_id']
+    }], [{
+        'pin_id': binding['association_id'],
+        'request_id': binding['request_id'],
+    }])
+
+    assert state.effect_capable_association_count == 0
+    assert state.blocking_request_count == 1
+    assert state.queue_delivery_count == 1
+    assert state.retention_pin_count == 1
+
+
+def test_cleanup_execution_state_counts_unsettled_association_authority():
+    binding = {
+        **_cleanup_binding(),
+        'resolution': 'BOUND',
+        'reconciliation_outcome': None,
+        'terminal_status': None,
+        'terminal_cause': None,
+        'terminal_execution_generation': None,
+        'execution_quiesced_generation': None,
+        'execution_quiesced_at': None,
+        'projected_at': None,
+        'pin_released_at': None,
+        'tombstone_not_before': None,
+    }
+
+    state = _reduce_cleanup_execution([binding], [], [], [])
+
+    assert state.effect_capable_association_count == 1
+    assert state.blocking_request_count == 0
+
+
+def test_cleanup_database_state_keeps_auxiliary_rows_live_after_debit_settles():
+    """Cohort-16 settlement is earlier than graph-finalization completion."""
+    binding = _cleanup_binding()
+    replica = _cleanup_replica(binding)
+    identity = (qualifier.ordinary_launch_binding.
+                derive_fresh_ordinary_paid_resource_action_identity(
+                    replica_id=binding['replica_id'],
+                    replica_record_id=binding['replica_record_id'],
+                    cluster_name=binding['cluster_name']))
+
+    state = qualifier.cleanup_database_state_from_rows(
+        scope=_provider_scope(),
+        lifecycle_fence_rows=[{
+            'epoch': 7
+        }],
+        service_rows=[],
+        replicas=[replica],
+        claim_rows=[],
+        waiter_rows=[],
+        bindings=[binding],
+        request_rows=[],
+        queue_rows=[],
+        pin_rows=[],
+        cluster_identities=qualifier._cleanup_cluster_record_identities(
+            [binding]),
+        cluster_rows=[{
+            'name': binding['cluster_name'],
+            'cluster_record_uuid': identity.sky_cluster_record_uuid,
+        }])
+
+    assert state.debit_units == 0
+    assert state.claim_count == 0
+    assert state.waiter_count == 0
+    assert state.replica_count == 1
+    assert state.cluster_record_count == 1
+    assert not state.is_exact_zero()
+
+
+def test_cleanup_database_state_accepts_retained_tombstone_identity_at_zero():
+    """Retained launch history is identity evidence, not a live resource."""
+    state = qualifier.cleanup_database_state_from_rows(
+        scope=_provider_scope(),
+        lifecycle_fence_rows=[{
+            'epoch': 7
+        }],
+        service_rows=[],
+        replicas=[],
+        claim_rows=[],
+        waiter_rows=[],
+        bindings=[_cleanup_binding()],
+        request_rows=[],
+        queue_rows=[],
+        pin_rows=[],
+        cluster_identities=qualifier._cleanup_cluster_record_identities(
+            [_cleanup_binding()]),
+        cluster_rows=[])
+
+    assert state.is_exact_zero()
+
+
+def test_cleanup_database_state_rejects_cluster_name_uuid_reincarnation():
+    binding = _cleanup_binding()
+    with pytest.raises(qualifier.GuardViolation,
+                       match='global cluster identity'):
+        qualifier.cleanup_database_state_from_rows(
+            scope=_provider_scope(),
+            lifecycle_fence_rows=[{
+                'epoch': 7
+            }],
+            service_rows=[],
+            replicas=[],
+            claim_rows=[],
+            waiter_rows=[],
+            bindings=[binding],
+            request_rows=[],
+            queue_rows=[],
+            pin_rows=[],
+            cluster_identities=qualifier._cleanup_cluster_record_identities(
+                [binding]),
+            cluster_rows=[{
+                'name': binding['cluster_name'],
+                'cluster_record_uuid':
+                    uuid.UUID('33333333-3333-4333-8333-333333333333'),
+            }])
+
+
+def test_cleanup_database_state_rejects_same_name_foreign_lifecycle():
+    scope = _provider_scope()
+    with pytest.raises(qualifier.GuardViolation,
+                       match='different service incarnation'):
+        qualifier.cleanup_database_state_from_rows(
+            scope=scope,
+            lifecycle_fence_rows=[{
+                'epoch': scope.lifecycle_epoch
+            }],
+            service_rows=[{
+                'service_hash': 'replacement',
+                'lifecycle_epoch': scope.lifecycle_epoch + 1,
+            }],
+            replicas=[],
+            claim_rows=[],
+            waiter_rows=[],
+            bindings=[],
+            request_rows=[],
+            queue_rows=[],
+            pin_rows=[],
+            cluster_identities=[],
+            cluster_rows=[])
+
+
+def test_cleanup_database_state_rejects_advanced_lifecycle_fence():
+    scope = _provider_scope()
+    with pytest.raises(qualifier.GuardViolation, match='lifecycle fence'):
+        qualifier.cleanup_database_state_from_rows(
+            scope=scope,
+            lifecycle_fence_rows=[{
+                'epoch': scope.lifecycle_epoch + 1
+            }],
+            service_rows=[],
+            replicas=[],
+            claim_rows=[],
+            waiter_rows=[],
+            bindings=[],
+            request_rows=[],
+            queue_rows=[],
+            pin_rows=[],
+            cluster_identities=[],
+            cluster_rows=[])
+
+
+def test_cleanup_database_state_counts_stale_waiter_as_retained_authority():
+    scope = _provider_scope()
+    state = qualifier.cleanup_database_state_from_rows(
+        scope=scope,
+        lifecycle_fence_rows=[{
+            'epoch': scope.lifecycle_epoch
+        }],
+        service_rows=[],
+        replicas=[],
+        claim_rows=[],
+        waiter_rows=[{
+            'service_hash': scope.service_hash,
+            'heartbeat_at': 1.0,
+        }],
+        bindings=[],
+        request_rows=[],
+        queue_rows=[],
+        pin_rows=[],
+        cluster_identities=[],
+        cluster_rows=[])
+
+    assert state.waiter_count == 1
+    assert not state.is_exact_zero()
+
+
 def _cleanup_wait_fixture(monkeypatch,
                           tmp_path,
                           census,
                           *,
+                          database_state=None,
                           timeout_seconds=2,
-                          poll_seconds=0):
+                          poll_seconds=0.001,
+                          zero_hold_seconds=1e-9,
+                          initial_cleanup_scope=None):
     base = _provider_scope()
     scope = dataclasses.replace(
         base,
@@ -2545,37 +3401,46 @@ def _cleanup_wait_fixture(monkeypatch,
     qualification_path = tmp_path / 'qualification.json'
     output_path = tmp_path / 'cleanup.json'
     qualifier.write_provider_scope(scope_path, 'paid-e2e', scope)
-    qualification_path.write_text('{"receipt": "test"}\n', encoding='utf-8')
-
-    class Postgres:
-        """Exact-zero database observer double."""
-
-        def __init__(self, *_args):
-            pass
-
-        def bind_provider_scope(self, observed_scope):
-            assert observed_scope == scope
-
-        @staticmethod
-        def cleanup_debits():
-            return (0, 0, 0)
-
-        @staticmethod
-        def close():
-            pass
+    if initial_cleanup_scope is None:
+        initial_cleanup_scope = qualifier.CleanupScope()
+    qualification_path.write_text(json.dumps({
+        'schema_version': qualifier._QUALIFICATION_RECEIPT_SCHEMA_VERSION,
+        'service_name': 'paid-e2e',
+        'cleanup_scope':
+            qualifier._cleanup_scope_process_payload(initial_cleanup_scope),
+    }) + '\n',
+                                  encoding='utf-8')
 
     census_fn = census
+    database_state_fn = database_state or _cleanup_database_state
 
-    class Gcp:
-
-        @staticmethod
-        def census():
-            return census_fn()
+    async def isolated_observation(kind, arguments, deadline_monotonic,
+                                   **_kwargs):
+        assert qualifier._scope_from_process_payload(
+            arguments['scope']) == scope
+        if time.monotonic() >= deadline_monotonic:
+            raise qualifier.ObservationTimeoutError(
+                'Isolated observer exhausted its absolute deadline.')
+        if kind is qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
+            observed = census_fn()
+            return {
+                'gcp_census': dataclasses.asdict(observed),
+                'aws_census': None,
+                'retained_volume_ids_by_region': {},
+            }
+        assert kind is qualifier.IsolatedObservationKind.POSTGRES
+        assert arguments['projection'] == 'cleanup'
+        cleanup_scope = qualifier._cleanup_scope_from_process_payload(
+            arguments['cleanup_scope'])
+        return {
+            'cleanup': dataclasses.asdict(database_state_fn()),
+            'cleanup_scope':
+                qualifier._cleanup_scope_process_payload(cleanup_scope),
+        }
 
     monkeypatch.setenv('TEST_DATABASE_URL', 'postgresql://unused')
-    monkeypatch.setattr(qualifier, 'PostgresObserver', Postgres)
-    monkeypatch.setattr(qualifier, '_provider_observers', lambda **_kwargs:
-                        (Gcp(), None))
+    sessions = _install_fake_isolated_sessions(monkeypatch,
+                                               isolated_observation)
     args = types.SimpleNamespace(
         postgres_url_env='TEST_DATABASE_URL',
         service_name='paid-e2e',
@@ -2584,18 +3449,135 @@ def _cleanup_wait_fixture(monkeypatch,
         output=str(output_path),
         timeout_seconds=timeout_seconds,
         poll_seconds=poll_seconds,
+        zero_hold_seconds=zero_hold_seconds,
     )
-    return args, output_path, qualification_path, scope
+    return args, output_path, qualification_path, scope, sessions
 
 
 def _empty_gcp_census():
     return qualifier.ProviderCensus(instances=[], disks=[], operations=[])
 
 
+def test_wait_cleanup_rejects_zero_poll_interval(monkeypatch, tmp_path):
+    args, _, _, _, _ = _cleanup_wait_fixture(monkeypatch,
+                                             tmp_path,
+                                             _empty_gcp_census,
+                                             poll_seconds=0)
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='Cleanup deadlines are invalid'):
+        asyncio.run(qualifier.wait_for_cleanup(args))
+
+
+def test_freeze_scope_owns_and_closes_one_postgres_session(
+        monkeypatch, tmp_path):
+    scope = _provider_scope()
+
+    async def request(kind, arguments, _deadline):
+        assert kind is qualifier.IsolatedObservationKind.FREEZE_SCOPE
+        assert arguments['service_name'] == 'paid-e2e'
+        return {'scope': qualifier._scope_process_payload(scope)}
+
+    sessions = _install_fake_isolated_sessions(monkeypatch, request)
+    monkeypatch.setenv('TEST_DATABASE_URL', 'postgresql://unused')
+    args = types.SimpleNamespace(postgres_url_env='TEST_DATABASE_URL',
+                                 service_name='paid-e2e',
+                                 output=str(tmp_path / 'scope.json'),
+                                 timeout_seconds=1,
+                                 poll_seconds=0)
+
+    asyncio.run(qualifier.freeze_provider_scope(args))
+
+    assert len(sessions) == 1
+    assert sessions[0].domain is qualifier.IsolatedObservationDomain.POSTGRES
+    assert sessions[0].requests == sessions[0].closed == 1
+
+
+def test_pre_down_freeze_persists_identity_before_association_can_disappear(
+        monkeypatch, tmp_path):
+    scope = _provider_scope()
+    identity = qualifier._cleanup_cluster_record_identities(
+        [_cleanup_binding()])[0]
+    scope_path = tmp_path / 'provider-scope.json'
+    receipt_path = tmp_path / 'qualification.json'
+    qualifier.write_provider_scope(scope_path, 'paid-e2e', scope)
+    receipt_path.write_text(json.dumps({
+        'schema_version': qualifier._QUALIFICATION_RECEIPT_SCHEMA_VERSION,
+        'service_name': 'paid-e2e',
+        'cleanup_scope': {
+            'cluster_identities': [],
+        },
+    }),
+                            encoding='utf-8')
+
+    async def request(kind, arguments, _deadline):
+        if kind is qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
+            return {
+                'retained_volume_ids_by_region': {
+                    'us-east-2': [],
+                },
+            }
+        assert kind is qualifier.IsolatedObservationKind.POSTGRES
+        assert arguments['projection'] == 'cleanup'
+        assert qualifier._cleanup_scope_from_process_payload(
+            arguments['cleanup_scope']) == qualifier.CleanupScope()
+        return {
+            'cleanup': dataclasses.asdict(
+                _cleanup_database_state(replica_count=1)),
+            'cleanup_scope': qualifier._cleanup_scope_process_payload(
+                qualifier.CleanupScope(cluster_identities=(identity,))),
+        }
+
+    sessions = _install_fake_isolated_sessions(monkeypatch, request)
+    monkeypatch.setenv('TEST_DATABASE_URL', 'postgresql://unused')
+    args = types.SimpleNamespace(postgres_url_env='TEST_DATABASE_URL',
+                                 service_name='paid-e2e',
+                                 scope=str(scope_path),
+                                 receipt=str(receipt_path),
+                                 timeout_seconds=1,
+                                 poll_seconds=0)
+
+    asyncio.run(qualifier.freeze_cleanup_scope(args))
+
+    assert qualifier.read_optional_cleanup_scope_receipt(
+        receipt_path, 'paid-e2e').cluster_identities == (identity,)
+    assert len(sessions) == 2
+    assert all(session.started == session.requests == session.closed == 1
+               for session in sessions)
+
+
+def test_qualify_wrapper_closes_both_sessions_after_failure(monkeypatch):
+    sessions = []
+
+    class Session:
+
+        def __init__(self, domain):
+            self.domain = domain
+            self.closed = 0
+            sessions.append(self)
+
+        async def aclose(self):
+            self.closed += 1
+
+    async def fail(_args, provider, postgres):
+        assert provider.domain is qualifier.IsolatedObservationDomain.PROVIDER
+        assert postgres.domain is qualifier.IsolatedObservationDomain.POSTGRES
+        raise RuntimeError('proof failed')
+
+    monkeypatch.setattr(qualifier, 'IsolatedObserverSession', Session)
+    monkeypatch.setattr(qualifier, '_qualify_with_sessions', fail)
+
+    with pytest.raises(RuntimeError, match='proof failed'):
+        asyncio.run(qualifier.qualify(types.SimpleNamespace()))
+
+    assert len(sessions) == 2
+    assert all(session.closed == 1 for session in sessions)
+
+
 def test_wait_cleanup_writes_identity_bound_sustained_zero_receipt(
         monkeypatch, tmp_path):
-    args, output_path, qualification_path, scope = _cleanup_wait_fixture(
-        monkeypatch, tmp_path, _empty_gcp_census)
+    args, output_path, qualification_path, scope, sessions = (
+        _cleanup_wait_fixture(monkeypatch, tmp_path, _empty_gcp_census))
 
     asyncio.run(qualifier.wait_for_cleanup(args))
 
@@ -2604,10 +3586,246 @@ def test_wait_cleanup_writes_identity_bound_sustained_zero_receipt(
     assert payload['service_hash'] == scope.service_hash
     assert payload['expected_providers'] == ['gcp']
     assert payload['zero_samples'] == 3
+    assert payload['zero_hold_required_seconds'] == args.zero_hold_seconds
+    assert payload['zero_hold_elapsed_seconds'] >= args.zero_hold_seconds
     assert [sample['exact_zero'] for sample in payload['samples']
            ] == [True, True, True]
     assert payload['qualification_receipt_sha256'] == hashlib.sha256(
         qualification_path.read_bytes()).hexdigest()
+    assert len(sessions) == 2
+    assert all(session.started == session.closed == 1 for session in sessions)
+
+
+def test_wait_cleanup_requires_full_hold_and_resets_on_nonzero(
+        monkeypatch, tmp_path):
+    provider_states = [
+        _empty_gcp_census(),
+        _empty_gcp_census(),
+        _empty_gcp_census(),
+        qualifier.ProviderCensus(instances=[_instance()],
+                                 disks=[],
+                                 operations=[]),
+    ]
+
+    def census():
+        if provider_states:
+            return provider_states.pop(0)
+        return _empty_gcp_census()
+
+    args, output_path, _, _, _ = _cleanup_wait_fixture(monkeypatch,
+                                                       tmp_path,
+                                                       census,
+                                                       timeout_seconds=1,
+                                                       poll_seconds=0.02,
+                                                       zero_hold_seconds=0.12)
+
+    asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    assert [sample['exact_zero'] for sample in payload['samples'][:4]
+           ] == [True, True, True, False]
+    assert payload['samples'][3]['zero_samples'] == 0
+    assert payload['samples'][3]['zero_hold_elapsed_seconds'] == 0
+    assert payload['zero_samples'] >= 3
+    assert payload['zero_hold_elapsed_seconds'] >= 0.12
+
+
+def test_wait_cleanup_holds_exact_aws_zero(monkeypatch, tmp_path):
+    base = _provider_scope(service_hash=_SERVICE_INCARNATION)
+    scope = dataclasses.replace(
+        base,
+        max_live_paid_gpu_units=1,
+        providers=('aws',),
+        project_id=None,
+        location_scope=None,
+        qualification_profile='provider-canary',
+        qualification_projection_sha256=(
+            qualifier._qualification_projection_sha256(
+                source_sha256=base.qualification_source_sha256,
+                profile=qualifier.PROFILES['provider-canary'],
+                providers=('aws',))),
+        catalog_shapes=tuple(
+            shape for shape in base.catalog_shapes
+            if shape.cloud == 'aws' and shape.gpu_units_per_instance == 1))
+    scope_path = tmp_path / 'scope.json'
+    qualification_path = tmp_path / 'qualification.json'
+    output_path = tmp_path / 'cleanup.json'
+    qualifier.write_provider_scope(scope_path, 'paid-e2e', scope)
+    qualification_path.write_text(json.dumps({
+        'schema_version': qualifier._QUALIFICATION_RECEIPT_SCHEMA_VERSION,
+        'service_name': 'paid-e2e',
+        'cleanup_scope': {
+            'cluster_identities': [],
+        },
+    }),
+                                  encoding='utf-8')
+    provider_calls = 0
+
+    async def isolated_observation(kind, arguments, _deadline, **_kwargs):
+        nonlocal provider_calls
+        assert qualifier._scope_from_process_payload(
+            arguments['scope']) == scope
+        if kind is qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
+            provider_calls += 1
+            return {
+                'gcp_census': None,
+                'aws_census': dataclasses.asdict(
+                    qualifier.AwsProviderCensus(service_instances=(),
+                                                service_volumes=())),
+                'retained_volume_ids_by_region': {
+                    'us-east-2': [],
+                },
+            }
+        assert kind is qualifier.IsolatedObservationKind.POSTGRES
+        cleanup_scope = qualifier._cleanup_scope_from_process_payload(
+            arguments['cleanup_scope'])
+        assert cleanup_scope == qualifier.CleanupScope()
+        return {
+            'cleanup': dataclasses.asdict(_cleanup_database_state()),
+            'cleanup_scope':
+                qualifier._cleanup_scope_process_payload(cleanup_scope),
+        }
+
+    monkeypatch.setenv('TEST_DATABASE_URL', 'postgresql://unused')
+    _install_fake_isolated_sessions(monkeypatch, isolated_observation)
+    args = types.SimpleNamespace(postgres_url_env='TEST_DATABASE_URL',
+                                 service_name='paid-e2e',
+                                 scope=str(scope_path),
+                                 receipt=str(qualification_path),
+                                 output=str(output_path),
+                                 timeout_seconds=2,
+                                 zero_hold_seconds=1e-9,
+                                 poll_seconds=0.001)
+
+    asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    assert [sample['exact_zero'] for sample in payload['samples']
+           ] == [True, True, True]
+    assert qualifier.read_optional_cleanup_scope_receipt(
+        qualification_path, 'paid-e2e') == qualifier.CleanupScope()
+
+
+def test_wait_cleanup_fails_on_persistent_aws_volume(monkeypatch, tmp_path):
+    base = _provider_scope(service_hash=_SERVICE_INCARNATION)
+    scope = dataclasses.replace(
+        base,
+        max_live_paid_gpu_units=1,
+        providers=('aws',),
+        project_id=None,
+        location_scope=None,
+        qualification_profile='provider-canary',
+        qualification_projection_sha256=(
+            qualifier._qualification_projection_sha256(
+                source_sha256=base.qualification_source_sha256,
+                profile=qualifier.PROFILES['provider-canary'],
+                providers=('aws',))),
+        catalog_shapes=tuple(
+            shape for shape in base.catalog_shapes
+            if shape.cloud == 'aws' and shape.gpu_units_per_instance == 1))
+    scope_path = tmp_path / 'scope.json'
+    qualification_path = tmp_path / 'qualification.json'
+    output_path = tmp_path / 'cleanup.json'
+    qualifier.write_provider_scope(scope_path, 'paid-e2e', scope)
+    qualification_path.write_text(json.dumps({
+        'schema_version': qualifier._QUALIFICATION_RECEIPT_SCHEMA_VERSION,
+        'service_name': 'paid-e2e',
+        'cleanup_scope': {
+            'cluster_identities': [],
+        },
+    }),
+                                  encoding='utf-8')
+
+    async def isolated_observation(kind, arguments, _deadline, **_kwargs):
+        if kind is qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
+            return {
+                'gcp_census': None,
+                'aws_census': dataclasses.asdict(
+                    qualifier.AwsProviderCensus(
+                        service_instances=(),
+                        service_volumes=(_aws_volume(),))),
+                'retained_volume_ids_by_region': {
+                    'us-east-2': ['vol-new'],
+                },
+            }
+        cleanup_scope = qualifier._cleanup_scope_from_process_payload(
+            arguments['cleanup_scope'])
+        return {
+            'cleanup': dataclasses.asdict(_cleanup_database_state()),
+            'cleanup_scope':
+                qualifier._cleanup_scope_process_payload(cleanup_scope),
+        }
+
+    monkeypatch.setenv('TEST_DATABASE_URL', 'postgresql://unused')
+    _install_fake_isolated_sessions(monkeypatch, isolated_observation)
+    args = types.SimpleNamespace(postgres_url_env='TEST_DATABASE_URL',
+                                 service_name='paid-e2e',
+                                 scope=str(scope_path),
+                                 receipt=str(qualification_path),
+                                 output=str(output_path),
+                                 timeout_seconds=0.08,
+                                 zero_hold_seconds=0.02,
+                                 poll_seconds=0.01)
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='Teardown left service graph rows'):
+        asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    assert payload['outcome'] == 'failed'
+    assert payload['samples']
+    assert all(
+        sample['exact_zero'] is False and sample['cleanup_provider_disks'] == 1
+        for sample in payload['samples'])
+
+
+def test_wait_cleanup_does_not_pass_after_only_paid_debits_settle(
+        monkeypatch, tmp_path):
+    states = [
+        _cleanup_database_state(replica_count=1, cluster_record_count=1),
+        *[_cleanup_database_state() for _ in range(3)],
+    ]
+    args, output_path, _, _, _ = _cleanup_wait_fixture(
+        monkeypatch,
+        tmp_path,
+        _empty_gcp_census,
+        database_state=lambda: states.pop(0))
+
+    asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    assert [sample['exact_zero'] for sample in payload['samples']
+           ] == [False, True, True, True]
+    first = payload['samples'][0]
+    assert first['cleanup_replicas'] == 1
+    assert first['cleanup_cluster_records'] == 1
+
+
+def test_wait_cleanup_requires_exact_zero_execution_authority(
+        monkeypatch, tmp_path):
+    states = [
+        _cleanup_database_state(effect_capable_association_count=1,
+                                blocking_request_count=1,
+                                queue_delivery_count=1,
+                                retention_pin_count=1),
+        *[_cleanup_database_state() for _ in range(3)],
+    ]
+    args, output_path, _, _, _ = _cleanup_wait_fixture(
+        monkeypatch,
+        tmp_path,
+        _empty_gcp_census,
+        database_state=lambda: states.pop(0))
+
+    asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    assert [sample['exact_zero'] for sample in payload['samples']
+           ] == [False, True, True, True]
+    first = payload['samples'][0]
+    assert first['cleanup_effect_capable_associations'] == 1
+    assert first['cleanup_blocking_requests'] == 1
+    assert first['cleanup_queue_deliveries'] == 1
+    assert first['cleanup_retention_pins'] == 1
 
 
 def test_wait_cleanup_retries_provider_miss_and_restarts_zero_streak(
@@ -2623,8 +3841,8 @@ def test_wait_cleanup_retries_provider_miss_and_restarts_zero_streak(
             raise outcome
         return _empty_gcp_census()
 
-    args, output_path, _, _ = _cleanup_wait_fixture(monkeypatch, tmp_path,
-                                                    census)
+    args, output_path, _, _, _ = _cleanup_wait_fixture(monkeypatch, tmp_path,
+                                                       census)
 
     asyncio.run(qualifier.wait_for_cleanup(args))
 
@@ -2649,15 +3867,14 @@ def test_wait_cleanup_persistent_provider_miss_fails_at_deadline(
         attempts.append(None)
         raise RuntimeError('credential material')
 
-    args, output_path, _, _ = _cleanup_wait_fixture(monkeypatch,
-                                                    tmp_path,
-                                                    census,
-                                                    timeout_seconds=0.2,
-                                                    poll_seconds=0.01)
+    args, output_path, _, _, _ = _cleanup_wait_fixture(monkeypatch,
+                                                       tmp_path,
+                                                       census,
+                                                       timeout_seconds=0.2,
+                                                       poll_seconds=0.01)
 
-    with pytest.raises(
-            qualifier.QualificationError,
-            match='Teardown left paid database debits or scoped provider'):
+    with pytest.raises(qualifier.QualificationError,
+                       match='Teardown left service graph rows'):
         asyncio.run(qualifier.wait_for_cleanup(args))
 
     payload_text = output_path.read_text(encoding='utf-8')
@@ -2671,6 +3888,125 @@ def test_wait_cleanup_persistent_provider_miss_fails_at_deadline(
                for sample in payload['samples'])
     assert all(sample['exact_zero'] is False for sample in payload['samples'])
     assert 'credential material' not in payload_text
+
+
+def test_wait_cleanup_caps_provider_observation_at_phase_deadline(
+        monkeypatch, tmp_path):
+    attempts = []
+
+    def census():
+        attempts.append(None)
+        time.sleep(0.1)
+        return _empty_gcp_census()
+
+    args, output_path, _, _, _ = _cleanup_wait_fixture(monkeypatch,
+                                                       tmp_path,
+                                                       census,
+                                                       timeout_seconds=0.01,
+                                                       poll_seconds=0.001)
+
+    with pytest.raises(qualifier.ObservationTimeoutError,
+                       match='absolute deadline'):
+        asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    assert payload['outcome'] == 'failed'
+    assert payload['error_type'] == 'ObservationTimeoutError'
+    assert len(attempts) == 1
+    assert len(payload['samples']) == 1
+    assert payload['samples'][0]['observation_error_type'] == (
+        'ObservationTimeoutError')
+
+
+def test_cleanup_retains_aws_volume_identity_before_postgres_failure(
+        monkeypatch, tmp_path):
+    """A later tag miss cannot erase EBS scope learned before a DB failure."""
+    base = _provider_scope()
+    scope = dataclasses.replace(
+        base,
+        max_live_paid_gpu_units=1,
+        providers=('aws',),
+        project_id=None,
+        location_scope=None,
+        qualification_profile='provider-canary',
+        qualification_projection_sha256=(
+            qualifier._qualification_projection_sha256(
+                source_sha256=base.qualification_source_sha256,
+                profile=qualifier.PROFILES['provider-canary'],
+                providers=('aws',))),
+        catalog_shapes=tuple(
+            shape for shape in base.catalog_shapes
+            if shape.cloud == 'aws' and shape.gpu_units_per_instance == 1))
+    scope_path = tmp_path / 'scope.json'
+    qualification_path = tmp_path / 'qualification.json'
+    output_path = tmp_path / 'cleanup.json'
+    qualifier.write_provider_scope(scope_path, 'paid-e2e', scope)
+    qualification_path.write_text(json.dumps({
+        'schema_version': qualifier._QUALIFICATION_RECEIPT_SCHEMA_VERSION,
+        'service_name': 'paid-e2e',
+        'cleanup_scope': {
+            'cluster_identities': [],
+        },
+    }),
+                                  encoding='utf-8')
+    provider_calls = 0
+    postgres_calls = 0
+
+    async def isolated_observation(kind, arguments, _deadline, **_kwargs):
+        nonlocal provider_calls, postgres_calls
+        assert qualifier._scope_from_process_payload(
+            arguments['scope']) == scope
+        if kind is qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
+            provider_calls += 1
+            retained = arguments['retained']['us-east-2']
+            if provider_calls == 1:
+                assert retained == []
+            else:
+                assert retained == ['vol-new']
+            # The first result discovers the service-tagged volume. On the next
+            # pass its tag query is absent, but retained-ID lookup still finds
+            # it. Only later does that exact retained identity disappear.
+            volumes = ((_aws_volume(),) if provider_calls <= 2 else ())
+            return {
+                'gcp_census': None,
+                'aws_census': dataclasses.asdict(
+                    qualifier.AwsProviderCensus(service_instances=(),
+                                                service_volumes=volumes)),
+                'retained_volume_ids_by_region': {
+                    'us-east-2': ['vol-new']
+                },
+            }
+        assert kind is qualifier.IsolatedObservationKind.POSTGRES
+        assert arguments['projection'] == 'cleanup'
+        postgres_calls += 1
+        if postgres_calls == 1:
+            raise RuntimeError('database unavailable')
+        cleanup_scope = qualifier._cleanup_scope_from_process_payload(
+            arguments['cleanup_scope'])
+        return {
+            'cleanup': dataclasses.asdict(_cleanup_database_state()),
+            'cleanup_scope':
+                qualifier._cleanup_scope_process_payload(cleanup_scope),
+        }
+
+    monkeypatch.setenv('TEST_DATABASE_URL', 'postgresql://unused')
+    _install_fake_isolated_sessions(monkeypatch, isolated_observation)
+    args = types.SimpleNamespace(postgres_url_env='TEST_DATABASE_URL',
+                                 service_name='paid-e2e',
+                                 scope=str(scope_path),
+                                 receipt=str(qualification_path),
+                                 output=str(output_path),
+                                 timeout_seconds=2,
+                                 zero_hold_seconds=1e-9,
+                                 poll_seconds=0.001)
+
+    asyncio.run(qualifier.wait_for_cleanup(args))
+
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    assert [sample['exact_zero'] for sample in payload['samples']
+           ] == [False, False, True, True, True]
+    assert payload['samples'][0]['observation_error_type'] == 'RuntimeError'
+    assert payload['samples'][1]['cleanup_provider_disks'] == 1
 
 
 @pytest.mark.parametrize('child_status', ('RUNNING', 'DONE'))
@@ -2943,8 +4279,9 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
                                 profile=qualifier.PROFILES['small'])
     receipt.sample('scale', observation)
 
-    assert receipt._payload['schema_version'] == 13
+    assert receipt._payload['schema_version'] == 15
     assert receipt._payload['request_priority'] == 50
+    assert receipt._payload['request_queue_timeout_seconds'] == 600
     assert receipt._payload['scale_slo_seconds'] == 300
     assert receipt._payload['scale_timeout_seconds'] == 900
     sample = receipt._payload['samples'][0]
@@ -2970,6 +4307,23 @@ def test_receipt_sample_records_exact_controller_owner_and_claim_priority(
         qualifier.controller_identity_from_authority({
             **authority, 'controller_owner_epoch': 0
         })
+
+
+def test_receipt_monotonically_retains_live_cleanup_identity(tmp_path):
+    identity = qualifier._cleanup_cluster_record_identities(
+        [_cleanup_binding()])[0]
+    receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                service_name='paid-e2e',
+                                profile=qualifier.PROFILES['small'])
+
+    receipt.sample(
+        'scale',
+        _observation(database=_database_state(
+            cleanup_cluster_identities=(identity,))))
+    receipt.sample('drain', _observation(observed_at=1001))
+
+    assert qualifier._cleanup_scope_from_process_payload(
+        receipt._payload['cleanup_scope']).cluster_identities == (identity,)
 
 
 def test_route_report_uses_only_the_routed_active_lb():
@@ -3054,6 +4408,7 @@ def test_request_telemetry_uses_observer_postgres_engine(monkeypatch):
             'request_telemetry_compatibility_complete': True,
             'request_queue_depth': 0,
             'in_flight_requests': 0,
+            'http_in_flight_requests': 0,
             'processing_requests': 0,
             'confirmed_in_flight_requests': 0,
             'confirmed_processing_requests': 0,
@@ -3062,82 +4417,14 @@ def test_request_telemetry_uses_observer_postgres_engine(monkeypatch):
     monkeypatch.setattr(qualifier.demand_state, 'get_request_summary',
                         get_request_summary)
 
-    def get_ledger_summary(*_args, **kwargs):
-        seen['ledger_engine'] = kwargs['engine']
-        return {
-            'available': True,
-            'service_hash': 'service-hash',
-            'state_counts': {},
-        }
-
-    monkeypatch.setattr(qualifier.async_request_ledger, 'get_summary',
-                        get_ledger_summary)
-
     telemetry = observer.request_telemetry()
 
     assert seen == {
         'service_name': 'paid-e2e',
         'service_hash': 'service-hash',
         'engine': observer._engine,
-        'ledger_engine': observer._engine,
     }
     assert telemetry.is_exact_zero()
-
-
-def test_campaign_membership_reads_current_attempts_from_observer_postgres():
-    prefix = 'postgres-membership'
-    request_keys = qualifier._campaign_request_key_sha256s(prefix, 3)
-    rows = [{
-        'request_key_sha256': request_key,
-        'state': 'SUCCEEDED',
-    } for request_key in request_keys]
-    seen = {}
-
-    class Result:
-
-        def mappings(self):
-            return self
-
-        def all(self):
-            return rows
-
-    class Connection:
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        @staticmethod
-        def execute(statement, params):
-            seen['statement'] = str(statement)
-            seen['params'] = params
-            return Result()
-
-    class Engine:
-
-        @staticmethod
-        def connect():
-            return Connection()
-
-    observer = object.__new__(qualifier.PostgresObserver)
-    observer._engine = Engine()
-    observer._service_name = 'paid-e2e'
-    observer._provider_scope = _provider_scope(service_hash='service-hash',
-                                               lifecycle_epoch=1,
-                                               service_version=1,
-                                               project_id='project-a')
-
-    assert observer.campaign_terminal_membership(
-        prefix, 3) == qualifier._campaign_manifest_sha256(prefix, 3)
-    assert seen['params'] == {
-        'service_name': 'paid-e2e',
-        'service_hash': 'service-hash',
-        'request_keys': request_keys,
-    }
-    assert 'attempt.attempt_id = request.current_attempt_id' in seen[
-        'statement']
 
 
 def test_cleanup_command_preserves_primary_failure_and_still_cleans(tmp_path):
@@ -3500,7 +4787,10 @@ def test_exact_provider_free_unbound_paid_debit_remains_visible_during_scale(
     class Observer:
         """Return one provider-free phase-A observation."""
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             return phase_a
 
@@ -3512,7 +4802,8 @@ def test_exact_provider_free_unbound_paid_debit_remains_visible_during_scale(
                                     profile=qualifier.PROFILES['scale'],
                                     progress=qualifier.Progress(),
                                     receipt=receipt,
-                                    phase='scale'))
+                                    phase='scale',
+                                    deadline_monotonic=time.monotonic() + 1))
     assert observed is phase_a
     sample = receipt._payload['samples'][-1]
     assert sample['phase'] == 'scale'
@@ -3536,7 +4827,10 @@ def test_phase_a_observation_cannot_hide_a_provider_effect(tmp_path):
     class Observer:
         """Return a phase-A observation that already has a provider effect."""
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             return phase_a_with_effect
 
@@ -3550,7 +4844,9 @@ def test_phase_a_observation_cannot_hide_a_provider_effect(tmp_path):
                                         profile=qualifier.PROFILES['scale'],
                                         progress=qualifier.Progress(),
                                         receipt=receipt,
-                                        phase='scale'))
+                                        phase='scale',
+                                        deadline_monotonic=(time.monotonic() +
+                                                            1)))
 
 
 @pytest.mark.parametrize('phase', ['baseline', 'drain'])
@@ -3560,10 +4856,13 @@ def test_zero_gates_require_complete_demand_reports(tmp_path, phase):
     class Observer:
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             return _request_telemetry()
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert require_complete_demand_report
             return observation
 
@@ -3575,7 +4874,8 @@ def test_zero_gates_require_complete_demand_reports(tmp_path, phase):
                                     profile=qualifier.PROFILES['scale'],
                                     progress=qualifier.Progress(),
                                     receipt=receipt,
-                                    phase=phase))
+                                    phase=phase,
+                                    deadline_monotonic=time.monotonic() + 1))
     assert observed is observation
     assert receipt._payload['samples'][-1]['phase'] == phase
 
@@ -3590,10 +4890,13 @@ def test_provider_baseline_fails_on_first_valid_nonzero_sample(tmp_path):
     class Observer:
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             return _request_telemetry()
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert require_complete_demand_report
             return observations.pop(0)
 
@@ -3613,13 +4916,13 @@ def test_provider_baseline_fails_on_first_valid_nonzero_sample(tmp_path):
 def test_request_baseline_fails_on_first_valid_nonzero_sample(tmp_path):
     profile = dataclasses.replace(qualifier.PROFILES['small'], poll_seconds=0)
     telemetry = [
-        _request_telemetry(queue_depth=1, state_counts={'ACCEPTED': 1}),
+        _request_telemetry(queue_depth=1),
         _request_telemetry(),
     ]
 
     class Observer:
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             return telemetry.pop(0)
 
         @staticmethod
@@ -3788,6 +5091,563 @@ def test_progress_scale_counts_physical_vms_not_logical_gpu_units():
     assert progress.scale_reached_monotonic is None
 
 
+def _write_immediate_observer_child(path: pathlib.Path) -> None:
+    path.write_text(textwrap.dedent('''\
+            import json
+            import sys
+
+            print(json.dumps({
+                'protocol_version': 1,
+                'ready': True,
+                'domain': sys.argv[2],
+            }), flush=True)
+            for line in sys.stdin:
+                request = json.loads(line)
+                print(json.dumps({
+                    'protocol_version': 1,
+                    'request_id': request['request_id'],
+                    'ok': True,
+                    'result': {'observed': True},
+                }), flush=True)
+        '''),
+                    encoding='utf-8')
+
+
+def _write_timeout_then_success_observer_child(path: pathlib.Path) -> None:
+    path.write_text(textwrap.dedent('''\
+            import json
+            import os
+            import pathlib
+            import signal
+            import sys
+            import time
+
+            print(json.dumps({
+                'protocol_version': 1,
+                'ready': True,
+                'domain': sys.argv[2],
+            }), flush=True)
+            request = json.loads(sys.stdin.readline())
+            marker = pathlib.Path(request['arguments']['marker_path'])
+            if not marker.exists():
+                marker.write_text('started', encoding='utf-8')
+                pathlib.Path(request['arguments']['pid_path']).write_text(
+                    str(os.getpid()), encoding='utf-8')
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                time.sleep(60)
+            print(json.dumps({
+                'protocol_version': 1,
+                'request_id': request['request_id'],
+                'ok': True,
+                'result': {'observed': True},
+            }), flush=True)
+            for _line in sys.stdin:
+                pass
+        '''),
+                    encoding='utf-8')
+
+
+def _write_observer_with_stubborn_descendant(path: pathlib.Path) -> None:
+    path.write_text(textwrap.dedent('''\
+            import json
+            import pathlib
+            import subprocess
+            import sys
+            import time
+
+            print(json.dumps({
+                'protocol_version': 1,
+                'ready': True,
+                'domain': sys.argv[2],
+            }), flush=True)
+            request = json.loads(sys.stdin.readline())
+            pid_path = pathlib.Path(request['arguments']['pid_path'])
+            child_source = (
+                "import os, pathlib, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"pathlib.Path({str(pid_path)!r}).write_text("
+                "str(os.getpid()), encoding='utf-8'); time.sleep(60)"
+            )
+            subprocess.Popen(
+                [sys.executable, '-c', child_source],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            while not pid_path.exists():
+                time.sleep(0.001)
+            print(json.dumps({
+                'protocol_version': 1,
+                'request_id': request['request_id'],
+                'ok': True,
+                'result': {'observed': True},
+            }), flush=True)
+            for _line in sys.stdin:
+                pass
+        '''),
+                    encoding='utf-8')
+
+
+def _write_serial_observer_child(path: pathlib.Path) -> None:
+    path.write_text(textwrap.dedent('''\
+            import json
+            import os
+            import pathlib
+            import sys
+            import time
+
+            print(json.dumps({
+                'protocol_version': 1,
+                'ready': True,
+                'domain': sys.argv[2],
+            }), flush=True)
+            for line in sys.stdin:
+                request = json.loads(line)
+                arguments = request['arguments']
+                marker = arguments.get('marker_path')
+                if marker is not None:
+                    pathlib.Path(marker).write_text(
+                        str(os.getpid()), encoding='utf-8')
+                time.sleep(arguments.get('delay_seconds', 0))
+                print(json.dumps({
+                    'protocol_version': 1,
+                    'request_id': request['request_id'],
+                    'ok': True,
+                    'result': {
+                        'blob': 'x' * arguments.get('response_bytes', 0),
+                    },
+                }), flush=True)
+        '''),
+                    encoding='utf-8')
+
+
+def _write_oversized_observer_child(path: pathlib.Path) -> None:
+    path.write_text(textwrap.dedent('''\
+            import json
+            import os
+            import pathlib
+            import sys
+            import time
+
+            print(json.dumps({
+                'protocol_version': 1,
+                'ready': True,
+                'domain': sys.argv[2],
+            }), flush=True)
+            request = json.loads(sys.stdin.readline())
+            pathlib.Path(request['arguments']['pid_path']).write_text(
+                str(os.getpid()), encoding='utf-8')
+            print(json.dumps({
+                'protocol_version': 1,
+                'request_id': request['request_id'],
+                'ok': True,
+                'result': {'blob': 'x' * 4096},
+            }), flush=True)
+            time.sleep(60)
+        '''),
+                    encoding='utf-8')
+
+
+def _pid_is_executing(pid: int) -> bool:
+    try:
+        state = pathlib.Path(f'/proc/{pid}/stat').read_text(
+            encoding='utf-8').split()[2]
+    except (FileNotFoundError, IndexError):
+        return False
+    return state != 'Z'
+
+
+def test_persistent_observer_timeout_reaps_group_then_respawns(
+        tmp_path, monkeypatch):
+    child = tmp_path / 'timeout_then_success.py'
+    pid_path = tmp_path / 'observer.pid'
+    marker_path = tmp_path / 'first-started'
+    _write_timeout_then_success_observer_child(child)
+    monkeypatch.setattr(qualifier, '_ISOLATED_OBSERVER_TERMINATE_GRACE_SECONDS',
+                        0.05)
+    real_spawn = qualifier.asyncio.create_subprocess_exec
+    spawns = []
+
+    async def spawn(*args, **kwargs):
+        spawns.append(args)
+        return await real_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(qualifier.asyncio, 'create_subprocess_exec', spawn)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        started = time.monotonic()
+        try:
+            with pytest.raises(qualifier.ObservationTimeoutError):
+                await session.request(
+                    qualifier.IsolatedObservationKind.PROVIDER_CENSUS,
+                    {
+                        'service_name': 'paid-e2e',
+                        'pid_path': str(pid_path),
+                        'marker_path': str(marker_path),
+                    },
+                    # Process startup competes with the rest of the xdist
+                    # suite.  Keep the deadline short relative to the child's
+                    # 60-second hang, but long enough that the request reaches
+                    # the child before the timeout being exercised.
+                    time.monotonic() + 2)
+            pid = int(pid_path.read_text(encoding='utf-8'))
+            assert time.monotonic() - started < 3
+            assert not _pid_is_executing(pid)
+            assert await session.request(
+                qualifier.IsolatedObservationKind.PROVIDER_CENSUS, {
+                    'service_name': 'paid-e2e',
+                    'pid_path': str(pid_path),
+                    'marker_path': str(marker_path),
+                },
+                time.monotonic() + 1) == {
+                    'observed': True
+                }
+        finally:
+            await session.aclose()
+
+    asyncio.run(exercise())
+    assert len(spawns) == 2
+
+
+def test_persistent_observer_cancellation_reaps_before_propagating(
+        tmp_path, monkeypatch):
+    child = tmp_path / 'cancel_then_success.py'
+    pid_path = tmp_path / 'observer.pid'
+    marker_path = tmp_path / 'first-started'
+    _write_timeout_then_success_observer_child(child)
+    monkeypatch.setattr(qualifier, '_ISOLATED_OBSERVER_TERMINATE_GRACE_SECONDS',
+                        0.05)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        arguments = {
+            'service_name': 'paid-e2e',
+            'pid_path': str(pid_path),
+            'marker_path': str(marker_path),
+        }
+        task = asyncio.create_task(
+            session.request(qualifier.IsolatedObservationKind.PROVIDER_CENSUS,
+                            arguments,
+                            time.monotonic() + 10))
+        try:
+            for _ in range(1000):
+                if pid_path.exists():
+                    break
+                await asyncio.sleep(0.001)
+            pid = int(pid_path.read_text(encoding='utf-8'))
+            task.cancel('primary cancellation')
+            for _ in range(5):
+                await asyncio.sleep(0)
+                task.cancel('later cancellation')
+            with pytest.raises(asyncio.CancelledError) as cancelled:
+                await task
+            assert cancelled.value.args == ('primary cancellation',)
+            assert not _pid_is_executing(pid)
+            assert await session.request(
+                qualifier.IsolatedObservationKind.PROVIDER_CENSUS, arguments,
+                time.monotonic() + 1) == {
+                    'observed': True
+                }
+        finally:
+            await session.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_persistent_observer_production_child_keeps_stdout_protocol_clean():
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER)
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='lacks a service name'):
+                await session.request(
+                    qualifier.IsolatedObservationKind.PROVIDER_CENSUS,
+                    {'service_name': ''},
+                    time.monotonic() + 30)
+        finally:
+            await session.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_persistent_observer_close_reaps_stubborn_descendant(
+        tmp_path, monkeypatch):
+    child = tmp_path / 'observer_with_descendant.py'
+    pid_path = tmp_path / 'descendant.pid'
+    _write_observer_with_stubborn_descendant(child)
+    monkeypatch.setattr(qualifier, '_ISOLATED_OBSERVER_TERMINATE_GRACE_SECONDS',
+                        0.05)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        assert await session.request(
+            qualifier.IsolatedObservationKind.PROVIDER_CENSUS, {
+                'service_name': 'paid-e2e',
+                'pid_path': str(pid_path),
+            },
+            time.monotonic() + 1) == {
+                'observed': True
+            }
+        pid = int(pid_path.read_text(encoding='utf-8'))
+        assert _pid_is_executing(pid)
+        await session.aclose()
+        for _ in range(100):
+            if not _pid_is_executing(pid):
+                break
+            await asyncio.sleep(0.01)
+        assert not _pid_is_executing(pid)
+
+    asyncio.run(exercise())
+
+
+def test_persistent_observer_reuses_one_spawn_and_scopes_authority(
+        monkeypatch, tmp_path):
+    calls = []
+    child = tmp_path / 'immediate.py'
+    _write_immediate_observer_child(child)
+    real_spawn = qualifier.asyncio.create_subprocess_exec
+
+    async def create_subprocess_exec(*command, **kwargs):
+        calls.append((command, kwargs))
+        return await real_spawn(*command, **kwargs)
+
+    monkeypatch.setenv('SKYPILOT_DB_CONNECTION_URI', 'postgresql://secret')
+    monkeypatch.setenv('AWS_SECRET_ACCESS_KEY', 'cloud-secret')
+    monkeypatch.setattr(qualifier.asyncio, 'create_subprocess_exec',
+                        create_subprocess_exec)
+
+    async def exercise():
+        provider = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        postgres = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.POSTGRES, child_program=child)
+        deadline = time.monotonic() + 2
+        try:
+            for _ in range(2):
+                assert await provider.request(
+                    qualifier.IsolatedObservationKind.PROVIDER_CENSUS,
+                    {'service_name': 'paid-e2e'}, deadline) == {
+                        'observed': True
+                    }
+            assert await postgres.request(
+                qualifier.IsolatedObservationKind.POSTGRES,
+                {'service_name': 'paid-e2e'}, deadline) == {
+                    'observed': True
+                }
+            with pytest.raises(qualifier.QualificationError,
+                               match='authority domain'):
+                await provider.request(
+                    qualifier.IsolatedObservationKind.POSTGRES,
+                    {'service_name': 'paid-e2e'}, deadline)
+        finally:
+            await asyncio.gather(provider.aclose(), postgres.aclose())
+
+    asyncio.run(exercise())
+
+    assert len(calls) == 2
+    assert all(
+        call[1]['stderr'] is asyncio.subprocess.DEVNULL for call in calls)
+    assert all(call[1]['start_new_session'] is True for call in calls)
+    assert calls[0][0][-1] == 'provider'
+    assert calls[1][0][-1] == 'postgres'
+    assert 'SKYPILOT_DB_CONNECTION_URI' not in calls[0][1]['env']
+    assert calls[0][1]['env']['AWS_SECRET_ACCESS_KEY'] == 'cloud-secret'
+    assert 'AWS_SECRET_ACCESS_KEY' not in calls[1][1]['env']
+
+
+def test_persistent_observer_waiter_deadline_does_not_kill_inflight_owner(
+        monkeypatch, tmp_path):
+    child = tmp_path / 'serial.py'
+    marker_path = tmp_path / 'first-started'
+    _write_serial_observer_child(child)
+    real_spawn = qualifier.asyncio.create_subprocess_exec
+    spawns = []
+
+    async def create_subprocess_exec(*command, **kwargs):
+        spawns.append(command)
+        return await real_spawn(*command, **kwargs)
+
+    monkeypatch.setattr(qualifier.asyncio, 'create_subprocess_exec',
+                        create_subprocess_exec)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        first = asyncio.create_task(
+            session.request(
+                qualifier.IsolatedObservationKind.PROVIDER_CENSUS, {
+                    'service_name': 'paid-e2e',
+                    'marker_path': str(marker_path),
+                    'delay_seconds': 0.15,
+                },
+                time.monotonic() + 2))
+        try:
+            for _ in range(1000):
+                if marker_path.exists():
+                    break
+                await asyncio.sleep(0.001)
+            pid = int(marker_path.read_text(encoding='utf-8'))
+            with pytest.raises(qualifier.ObservationTimeoutError):
+                await session.request(
+                    qualifier.IsolatedObservationKind.PROVIDER_CENSUS,
+                    {'service_name': 'paid-e2e'},
+                    time.monotonic() + 0.02)
+            assert _pid_is_executing(pid)
+            assert await first == {'blob': ''}
+            assert await session.request(
+                qualifier.IsolatedObservationKind.PROVIDER_CENSUS,
+                {'service_name': 'paid-e2e'},
+                time.monotonic() + 1) == {
+                    'blob': ''
+                }
+        finally:
+            if not first.done():
+                first.cancel()
+                await asyncio.gather(first, return_exceptions=True)
+            await session.aclose()
+
+    asyncio.run(exercise())
+    assert len(spawns) == 1
+
+
+def test_persistent_observer_accepts_response_larger_than_stream_default(
+        tmp_path):
+    child = tmp_path / 'large.py'
+    _write_serial_observer_child(child)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        try:
+            result = await session.request(
+                qualifier.IsolatedObservationKind.PROVIDER_CENSUS, {
+                    'service_name': 'paid-e2e',
+                    'response_bytes': 70_000,
+                },
+                time.monotonic() + 2)
+            assert len(result['blob']) == 70_000
+        finally:
+            await session.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_persistent_observer_rejects_oversized_response_and_reaps_child(
+        monkeypatch, tmp_path):
+    child = tmp_path / 'oversized.py'
+    pid_path = tmp_path / 'oversized.pid'
+    _write_oversized_observer_child(child)
+    monkeypatch.setattr(qualifier, '_ISOLATED_OBSERVER_MAX_FRAME_BYTES', 1024)
+    monkeypatch.setattr(qualifier, '_ISOLATED_OBSERVER_TERMINATE_GRACE_SECONDS',
+                        0.05)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='byte budget'):
+                await session.request(
+                    qualifier.IsolatedObservationKind.PROVIDER_CENSUS, {
+                        'service_name': 'paid-e2e',
+                        'pid_path': str(pid_path),
+                    },
+                    time.monotonic() + 1)
+            pid = int(pid_path.read_text(encoding='utf-8'))
+            assert session._process is None  # pylint: disable=protected-access
+            assert not _pid_is_executing(pid)
+        finally:
+            await session.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_persistent_observer_rejects_oversized_request_before_spawn(
+        monkeypatch, tmp_path):
+    child = tmp_path / 'unused.py'
+    _write_immediate_observer_child(child)
+    monkeypatch.setattr(qualifier, '_ISOLATED_OBSERVER_MAX_FRAME_BYTES', 128)
+    spawn = mock.AsyncMock()
+    monkeypatch.setattr(qualifier.asyncio, 'create_subprocess_exec', spawn)
+
+    async def exercise():
+        session = qualifier.IsolatedObserverSession(
+            qualifier.IsolatedObservationDomain.PROVIDER, child_program=child)
+        try:
+            with pytest.raises(qualifier.QualificationError,
+                               match='byte budget'):
+                await session.request(
+                    qualifier.IsolatedObservationKind.PROVIDER_CENSUS, {
+                        'service_name': 'paid-e2e',
+                        'payload': 'x' * 1024,
+                    },
+                    time.monotonic() + 1)
+        finally:
+            await session.aclose()
+
+    asyncio.run(exercise())
+    spawn.assert_not_awaited()
+
+
+def test_composite_observer_bounds_load_balancer_and_skips_postgres():
+    calls = []
+    cancelled = asyncio.Event()
+
+    async def run_isolated(kind, _arguments, _deadline):
+        calls.append(kind)
+        if kind is not qualifier.IsolatedObservationKind.PROVIDER_CENSUS:
+            raise AssertionError('PostgreSQL must not start after LB timeout.')
+        return {
+            'gcp_census': None,
+            'aws_census': None,
+            'retained_volume_ids_by_region': {
+                'us-east-2': [],
+            },
+        }
+
+    class HangingHttpObserver:
+
+        async def snapshot(self):
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+    class ProviderSession:
+
+        async def request(self, kind, arguments, deadline):
+            return await run_isolated(kind, arguments, deadline)
+
+    class PostgresSession(ProviderSession):
+        pass
+
+    observer = qualifier.Observer(database_url='postgresql://unused',
+                                  http=HangingHttpObserver(),
+                                  service_name='paid-e2e',
+                                  scope=_provider_scope(),
+                                  profile=qualifier.PROFILES['small'],
+                                  provider_session=ProviderSession(),
+                                  postgres_session=PostgresSession())
+
+    async def exercise():
+        started = time.monotonic()
+        with pytest.raises(qualifier.ObservationTimeoutError,
+                           match='Load-balancer observation exhausted'):
+            await observer.snapshot(deadline_monotonic=time.monotonic() + 0.02)
+        assert time.monotonic() - started < 1
+        assert cancelled.is_set()
+
+    asyncio.run(exercise())
+    assert calls == [qualifier.IsolatedObservationKind.PROVIDER_CENSUS]
+
+
 def test_economic_progress_does_not_require_an_artificial_provider_mix():
     profile = qualifier.PROFILES['scale']
     observation = _observation(provider=_cross_cloud_provider_state(
@@ -3863,12 +5723,15 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
         """Attributed telemetry with transient provider observation loss."""
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             # Before a replica is READY, all exact stimulus identities are
             # attributable but queued and therefore have no ledger row.
             return _request_telemetry(queue_depth=64)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             result = observations.pop(0)
             if isinstance(result, Exception):
@@ -3907,12 +5770,12 @@ def test_scale_survives_transient_observer_blackout(tmp_path):
            ] == [None, 'QualificationError', None]
 
 
-def test_scale_observes_provider_with_incomplete_replica_occupancy(tmp_path):
-    """Replica probe gaps cannot hide exact resident campaign pressure."""
+def test_scale_fails_closed_on_incomplete_request_telemetry(tmp_path):
+    """Provider success cannot hide an incomplete request projection."""
     profile = dataclasses.replace(qualifier.PROFILES['scale'],
                                   minimum_running=100,
                                   poll_seconds=0,
-                                  scale_timeout_seconds=1)
+                                  scale_timeout_seconds=0.01)
     started_monotonic = time.monotonic()
     started_at = time.time()
     cluster_names = _provider_cluster_names('gcp', 100)
@@ -3926,24 +5789,21 @@ def test_scale_observes_provider_with_incomplete_replica_occupancy(tmp_path):
                 (name, 'us-central1-a') for name in cluster_names)),
         provider=_cross_cloud_provider_state(gcp_running_count=100,
                                              aws_running_count=0),
-        load_balancer=_load_balancer_state(demand_units=800,
-                                           unique_job_arrivals_60s=800,
-                                           unique_job_arrivals_300s=800))
-    telemetry = qualifier.request_telemetry_from_summary(
-        {
-            'request_telemetry_observed_at': started_at,
-            'request_telemetry_state': 'fresh',
-            'request_telemetry_reason': 'in_flight_incomplete',
-            'request_telemetry_compatibility_complete': True,
-            'request_queue_depth': 762,
-            'in_flight_requests': None,
-            'processing_requests': None,
-            'confirmed_in_flight_requests': 38,
-            'confirmed_processing_requests': 16,
-        }, {
-            'ACCEPTED': 38,
-            'SUCCEEDED': 418,
-        })
+        load_balancer=_load_balancer_state(demand_units=400,
+                                           unique_job_arrivals_60s=400,
+                                           unique_job_arrivals_300s=400))
+    telemetry = qualifier.request_telemetry_from_summary({
+        'request_telemetry_observed_at': started_at,
+        'request_telemetry_state': 'fresh',
+        'request_telemetry_reason': 'in_flight_incomplete',
+        'request_telemetry_compatibility_complete': True,
+        'request_queue_depth': 762,
+        'in_flight_requests': None,
+        'http_in_flight_requests': 38,
+        'processing_requests': None,
+        'confirmed_in_flight_requests': 38,
+        'confirmed_processing_requests': 16,
+    })
 
     class Observer:
 
@@ -3951,10 +5811,13 @@ def test_scale_observes_provider_with_incomplete_replica_occupancy(tmp_path):
             self.provider_reads = 0
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             return telemetry
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             self.provider_reads += 1
             return observation
@@ -3969,14 +5832,16 @@ def test_scale_observes_provider_with_incomplete_replica_occupancy(tmp_path):
             receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
                                         service_name='paid-e2e',
                                         profile=profile)
-            await qualifier._wait_for_scale(observer=observer,
-                                            profile=profile,
-                                            progress=progress,
-                                            receipt=receipt,
-                                            traffic=traffic,
-                                            baseline=_request_telemetry(),
-                                            campaign_progress=await
-                                            _campaign_progress(profile,
+            with pytest.raises(qualifier.QualificationError,
+                               match='did not reach'):
+                await qualifier._wait_for_scale(
+                    observer=observer,
+                    profile=profile,
+                    progress=progress,
+                    receipt=receipt,
+                    traffic=traffic,
+                    baseline=_request_telemetry(),
+                    campaign_progress=await _campaign_progress(profile,
                                                                turnover=418))
             return observer, progress, receipt
         finally:
@@ -3984,14 +5849,10 @@ def test_scale_observes_provider_with_incomplete_replica_occupancy(tmp_path):
             await asyncio.gather(traffic, return_exceptions=True)
 
     observer, progress, receipt = asyncio.run(exercise())
-    assert observer.provider_reads == 1
-    assert progress.peak_running == 100
-    assert progress.scale_reached_monotonic == started_monotonic + 1
-    sample = receipt._payload['request_telemetry_samples'][0]
-    assert sample['reason'] == 'in_flight_incomplete'
-    assert sample['queue_depth'] == 762
-    assert sample['in_flight_requests'] is None
-    assert sample['ledger_active'] == 38
+    assert observer.provider_reads == 0
+    assert progress.peak_running == 0
+    assert progress.scale_reached_monotonic is None
+    assert receipt._payload['request_telemetry_samples'] == []
 
 
 def test_scale_does_not_publish_provider_success_after_campaign_pressure_stops(
@@ -4013,9 +5874,9 @@ def test_scale_does_not_publish_provider_success_after_campaign_pressure_stops(
                 (name, 'us-central1-a') for name in cluster_names)),
         provider=_cross_cloud_provider_state(gcp_running_count=100,
                                              aws_running_count=0),
-        load_balancer=_load_balancer_state(demand_units=800,
-                                           unique_job_arrivals_60s=800,
-                                           unique_job_arrivals_300s=800))
+        load_balancer=_load_balancer_state(demand_units=400,
+                                           unique_job_arrivals_60s=400,
+                                           unique_job_arrivals_300s=400))
 
     class Observer:
 
@@ -4023,10 +5884,13 @@ def test_scale_does_not_publish_provider_success_after_campaign_pressure_stops(
             self.provider_reads = 0
 
         @staticmethod
-        async def request_telemetry():
-            return _request_telemetry(queue_depth=800)
+        async def request_telemetry(_deadline):
+            return _request_telemetry(queue_depth=400)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             self.provider_reads += 1
             return observation
@@ -4039,7 +5903,7 @@ def test_scale_does_not_publish_provider_success_after_campaign_pressure_stops(
         async def snapshot(self):
             self.calls += 1
             return qualifier.ExactRequestCampaignCounters(
-                offered=800, succeeded=0, accepting_offers=self.calls == 1)
+                offered=400, succeeded=0, accepting_offers=self.calls == 1)
 
     async def exercise():
         observer = Observer()
@@ -4080,7 +5944,7 @@ def test_scale_wait_allows_attributed_arrivals_to_age_out(tmp_path):
     aws_names = _provider_cluster_names('aws', 50)
     database = _database_state(
         paid_debit_units=100,
-        demand_units=800,
+        demand_units=qualifier.scale_stimulus_count(profile),
         bound_cluster_zones=tuple(
             (name, 'us-central1-a') for name in gcp_names),
         aws_provider_identities=tuple(
@@ -4096,8 +5960,8 @@ def test_scale_wait_allows_attributed_arrivals_to_age_out(tmp_path):
                                                           aws_running_count=50),
                      load_balancer=_load_balancer_state(
                          demand_units=800,
-                         unique_job_arrivals_60s=800,
-                         unique_job_arrivals_300s=800)),
+                         unique_job_arrivals_60s=400,
+                         unique_job_arrivals_300s=400)),
         _observation(observed_at=started_at + 301,
                      observed_monotonic=started_monotonic + 301,
                      database=database,
@@ -4112,10 +5976,13 @@ def test_scale_wait_allows_attributed_arrivals_to_age_out(tmp_path):
     class Observer:
 
         @staticmethod
-        async def request_telemetry():
-            return _request_telemetry(queue_depth=800)
+        async def request_telemetry(_deadline):
+            return _request_telemetry(queue_depth=400)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             return observations.pop(0)
 
@@ -4145,7 +6012,7 @@ def test_scale_wait_allows_attributed_arrivals_to_age_out(tmp_path):
     assert [
         sample['lb_unique_job_arrivals_300s']
         for sample in receipt._payload['samples']
-    ] == [800, 0]
+    ] == [400, 0]
 
 
 def test_scale_wait_allows_bounded_arrivals_from_sliding_turnover(tmp_path):
@@ -4170,8 +6037,8 @@ def test_scale_wait_allows_bounded_arrivals_from_sliding_turnover(tmp_path):
                                                           aws_running_count=50),
                      load_balancer=_load_balancer_state(
                          demand_units=800,
-                         unique_job_arrivals_60s=800,
-                         unique_job_arrivals_300s=800)),
+                         unique_job_arrivals_60s=400,
+                         unique_job_arrivals_300s=400)),
         _observation(observed_at=started_at + 301,
                      observed_monotonic=started_monotonic + 301,
                      database=database,
@@ -4195,10 +6062,13 @@ def test_scale_wait_allows_bounded_arrivals_from_sliding_turnover(tmp_path):
     class Observer:
 
         @staticmethod
-        async def request_telemetry():
-            return _request_telemetry(queue_depth=800)
+        async def request_telemetry(_deadline):
+            return _request_telemetry(queue_depth=400)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             return observations.pop(0)
 
@@ -4229,7 +6099,7 @@ def test_scale_wait_allows_bounded_arrivals_from_sliding_turnover(tmp_path):
 
 
 def test_scale_wait_retries_transient_request_projection_skew(tmp_path):
-    """LB demand and exact-ledger publications need not become visible together."""
+    """Provider proof waits for one coherent ordinary-HTTP projection."""
     profile = dataclasses.replace(qualifier.PROFILES['scale'],
                                   exact_requests=8,
                                   request_concurrency=8,
@@ -4255,16 +6125,12 @@ def test_scale_wait_retries_transient_request_projection_skew(tmp_path):
                                            unique_job_arrivals_60s=8,
                                            unique_job_arrivals_300s=8))
     telemetry = [
-        # The ledger bind committed after the last LB demand report.
-        _request_telemetry(queue_depth=8,
-                           state_counts={'DISPATCH_MAY_HAVE_OCCURRED': 1}),
-        # The next LB report captured in-flight work before its ledger bind.
-        _request_telemetry(queue_depth=7, in_flight=1, processing=0),
+        # The source reduction has not yet joined the HTTP gauge.
+        _request_telemetry(queue_depth=8, http_in_flight=1),
+        # The next report has not confirmed its HTTP in-flight request.
+        _request_telemetry(queue_depth=7, in_flight=1, http_in_flight=0),
         # Eventual exact evidence is the only sample paired to provider state.
-        _request_telemetry(queue_depth=7,
-                           in_flight=1,
-                           processing=1,
-                           state_counts={'ACCEPTED': 1}),
+        _request_telemetry(queue_depth=7, in_flight=1),
     ]
 
     class Observer:
@@ -4272,10 +6138,13 @@ def test_scale_wait_retries_transient_request_projection_skew(tmp_path):
         def __init__(self):
             self.provider_reads = 0
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             return telemetry.pop(0)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             self.provider_reads += 1
             return observation
@@ -4329,10 +6198,13 @@ def test_scale_wait_treats_refill_gap_as_non_qualifying(tmp_path):
         def __init__(self):
             self.provider_reads = 0
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             return telemetry.pop(0)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             self.provider_reads += 1
             return _observation(
@@ -4397,13 +6269,16 @@ def test_scale_and_positive_gates_accept_fully_dispatched_cohort_concurrently(
             self.provider_reads = 0
 
         @staticmethod
-        async def request_telemetry():
-            return _request_telemetry(queue_depth=0,
-                                      in_flight=800,
-                                      processing=100,
-                                      state_counts={'ACCEPTED': 800})
+        async def request_telemetry(_deadline):
+            return _request_telemetry(
+                queue_depth=0,
+                in_flight=qualifier.scale_stimulus_count(profile),
+                processing=0)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             self.provider_reads += 1
             running = 99 if self.provider_reads == 1 else 100
@@ -4415,9 +6290,11 @@ def test_scale_and_positive_gates_accept_fully_dispatched_cohort_concurrently(
                 provider=_cross_cloud_provider_state(
                     gcp_running_count=gcp_running, aws_running_count=50),
                 load_balancer=_load_balancer_state(
-                    demand_units=800,
-                    unique_job_arrivals_60s=800,
-                    unique_job_arrivals_300s=800))
+                    demand_units=qualifier.scale_stimulus_count(profile),
+                    unique_job_arrivals_60s=qualifier.scale_stimulus_count(
+                        profile),
+                    unique_job_arrivals_300s=qualifier.scale_stimulus_count(
+                        profile)))
             if running == 99:
                 await asyncio.sleep(0)
             return observation
@@ -4430,7 +6307,7 @@ def test_scale_and_positive_gates_accept_fully_dispatched_cohort_concurrently(
                                     service_name='paid-e2e',
                                     profile=profile)
         receipt.request_telemetry('scale-stimulus',
-                                  _request_telemetry(queue_depth=800))
+                                  _request_telemetry(queue_depth=400))
         traffic = asyncio.create_task(asyncio.Event().wait())
         try:
             await qualifier._wait_for_scale_and_positive_request_telemetry(
@@ -4462,12 +6339,14 @@ def test_scale_and_positive_gates_accept_fully_dispatched_cohort_concurrently(
         sample for sample in receipt._payload['request_telemetry_samples']
         if sample['phase'] == 'positive')
     assert positive['queue_depth'] == 0
-    assert positive['in_flight_requests'] == 800
-    assert positive['processing_requests'] == 100
+    assert positive['in_flight_requests'] == 400
+    assert positive['http_in_flight_requests'] == 400
+    assert positive['processing_requests'] == 0
 
 
-def test_scale_sliding_window_finishes_before_delayed_provider_proof(tmp_path):
-    """Provider observation cannot hold real work or its terminal callback."""
+def test_synchronous_sliding_window_stays_resident_until_provider_proof(
+        tmp_path):
+    """A fixed worker cohort turns over without creating 10k tasks."""
     profile = dataclasses.replace(qualifier.PROFILES['scale'],
                                   max_replicas=2,
                                   max_units=2,
@@ -4477,87 +6356,56 @@ def test_scale_sliding_window_finishes_before_delayed_provider_proof(tmp_path):
                                   poll_seconds=0,
                                   scale_timeout_seconds=2)
     offered: set[str] = set()
-    accepted: set[str] = set()
-    processing: set[str] = set()
+    active: set[str] = set()
     succeeded: set[str] = set()
-    processing_tasks: set[asyncio.Task[None]] = set()
     peak_resident = 0
-    completed_at_provider_threshold: int | None = None
+    both_active = asyncio.Event()
     names = _provider_cluster_names('gcp', 2)
-
-    def receipt_headers(request_id, *, state, revision):
-        return {
-            qualifier.serve_constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: '1',
-            qualifier.serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: 'incarnation',
-            qualifier.serve_constants.LB_ASYNC_ATTEMPT_ID_HEADER: str(
-                uuid.uuid5(uuid.NAMESPACE_URL, request_id)),
-            qualifier.serve_constants.LB_ASYNC_ATTEMPT_NO_HEADER: '1',
-            qualifier.serve_constants.LB_ASYNC_LEDGER_REVISION_HEADER:
-                str(revision),
-            qualifier.serve_constants.LB_ASYNC_LEDGER_STATE_HEADER: state,
-        }
 
     async def predict(request):
         nonlocal peak_resident
+        assert request.headers[qualifier._AUTH_HEADER] == 'Bearer secret'
+        assert request.headers[qualifier._ACCELERATORS_HEADER] == 'L4'
+        assert request.headers[qualifier._PRIORITY_HEADER] == str(
+            qualifier._REQUEST_PRIORITY)
         payload = await request.json()
         request_id = payload['request_id']
-        duration = payload['payload']['duration_seconds']
+        assert set(payload) == {'duration_seconds', 'request_id'}
         assert request_id not in offered
         offered.add(request_id)
-        accepted.add(request_id)
-        processing.add(request_id)
-        peak_resident = max(peak_resident, len(processing))
-
-        async def finish_processing():
-            await asyncio.sleep(duration)
-            processing.remove(request_id)
-
-        task = asyncio.create_task(finish_processing())
-        processing_tasks.add(task)
-        task.add_done_callback(processing_tasks.discard)
-        return aiohttp.web.json_response(
-            {
-                'request_id': request_id,
-                'status': 'accepted',
-            },
-            status=202,
-            headers=receipt_headers(request_id, state='ACCEPTED', revision=2))
-
-    async def complete(request):
-        payload = await request.json()
-        request_id = payload['request_id']
-        while request_id in processing:
-            await asyncio.sleep(0)
-        assert request_id in accepted
-        accepted.remove(request_id)
+        active.add(request_id)
+        peak_resident = max(peak_resident, len(active))
+        if len(active) == 2:
+            both_active.set()
+        try:
+            await asyncio.sleep(payload['duration_seconds'])
+        finally:
+            active.remove(request_id)
         succeeded.add(request_id)
-        return aiohttp.web.Response(status=204,
-                                    headers=receipt_headers(request_id,
-                                                            state='SUCCEEDED',
-                                                            revision=3))
+        return aiohttp.web.json_response({
+            'request_id': request_id,
+            'status': 'ok',
+        })
 
     class Observer:
 
-        async def request_telemetry(self):
-            # This is the production reduction: real asynchronous occupancy
-            # must equal active exact-ledger attempts at every accepted sample.
-            while processing != accepted:
-                await asyncio.sleep(0)
-            return _request_telemetry(queue_depth=0,
-                                      in_flight=len(processing),
-                                      processing=len(processing),
-                                      state_counts={
-                                          'ACCEPTED': len(accepted),
-                                          'SUCCEEDED': len(succeeded),
-                                      },
+        def __init__(self):
+            self.provider_reads = 0
+
+        async def request_telemetry(self, _deadline):
+            await both_active.wait()
+            return _request_telemetry(in_flight=len(active),
                                       observed_at=time.time())
 
-        async def snapshot(self, *, require_complete_demand_report=True):
-            nonlocal completed_at_provider_threshold
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
-            running = 2 if len(succeeded) >= 2 else 1
-            if running == 2 and completed_at_provider_threshold is None:
-                completed_at_provider_threshold = len(succeeded)
+            self.provider_reads += 1
+            if self.provider_reads == 1:
+                await asyncio.sleep(0.025)
+            running = min(2, self.provider_reads)
             return _observation(
                 observed_at=time.time(),
                 observed_monotonic=time.monotonic(),
@@ -4576,53 +6424,37 @@ def test_scale_sliding_window_finishes_before_delayed_provider_proof(tmp_path):
     async def exercise():
         app = aiohttp.web.Application()
         app.router.add_post('/v1/models/model:predict', predict)
-        app.router.add_post(
-            qualifier.serve_constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
-            complete)
         runner = aiohttp.web.AppRunner(app)
         await runner.setup()
         site = aiohttp.web.TCPSite(runner, '127.0.0.1', 0)
         await site.start()
         assert site._server is not None
         endpoint = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
-        observer = Observer()
-        receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
-                                    service_name='paid-e2e',
-                                    profile=profile)
         progress = qualifier.Progress()
         progress.start_scale()
-        assert progress.scale_started_monotonic is not None
         campaign_progress = qualifier.ExactRequestCampaignProgress(
             total_count=profile.exact_requests,
             window_size=qualifier.scale_stimulus_count(profile))
         traffic = asyncio.create_task(
-            qualifier.send_exact_async_requests(
+            qualifier.send_synchronous_requests(
                 endpoint=endpoint,
                 token='secret',
-                service_hash='incarnation',
                 prefix='sliding',
                 count=profile.exact_requests,
-                concurrency=qualifier.scale_stimulus_count(profile),
-                hold_requests=profile.exact_requests,
-                hold_seconds=0.02,
+                resident_window=qualifier.scale_stimulus_count(profile),
+                request_concurrency=profile.request_concurrency,
+                hold_seconds=0.05,
                 timeout_seconds=2,
                 request_queue_timeout_seconds=2,
-                terminal_timeout_seconds=2,
                 campaign_progress=campaign_progress))
         try:
-            await qualifier._wait_for_scale_stimulus(
-                observer=observer,
-                profile=profile,
-                receipt=receipt,
-                traffic=traffic,
-                baseline=_request_telemetry(observed_at=time.time() - 1),
-                expected_resident=qualifier.scale_stimulus_count(profile),
-                deadline_monotonic=time.monotonic() + 1)
             await qualifier._wait_for_scale_and_positive_request_telemetry(
-                observer=observer,
+                observer=Observer(),
                 profile=profile,
                 progress=progress,
-                receipt=receipt,
+                receipt=qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                          service_name='paid-e2e',
+                                          profile=profile),
                 traffic=traffic,
                 baseline=_request_telemetry(observed_at=time.time() - 1),
                 campaign_progress=campaign_progress,
@@ -4630,17 +6462,15 @@ def test_scale_sliding_window_finishes_before_delayed_provider_proof(tmp_path):
                 positive_deadline_monotonic=time.monotonic() + 1)
             assert await traffic == profile.exact_requests
         finally:
-            traffic.cancel()
-            await asyncio.gather(traffic, return_exceptions=True)
-            if processing_tasks:
-                await asyncio.gather(*processing_tasks)
+            if not traffic.done():
+                traffic.cancel()
+                await asyncio.gather(traffic, return_exceptions=True)
             await runner.cleanup()
 
     asyncio.run(exercise())
-    assert completed_at_provider_threshold is not None
-    assert completed_at_provider_threshold >= 2
-    assert len(offered) == len(succeeded) == profile.exact_requests
-    assert peak_resident <= qualifier.scale_stimulus_count(profile)
+    assert offered == succeeded
+    assert len(succeeded) == profile.exact_requests
+    assert peak_resident == qualifier.scale_stimulus_count(profile)
 
 
 def test_generated_concurrent_receipt_passes_aggregate_gate(tmp_path):
@@ -4714,8 +6544,9 @@ def test_generated_concurrent_receipt_passes_aggregate_gate(tmp_path):
                        baseline_pair_observed_at=observed_at)
     receipt.request_telemetry(
         'scale-stimulus',
-        _request_telemetry(queue_depth=canonical_profile.max_units,
-                           observed_at=5.0))
+        _request_telemetry(
+            queue_depth=qualifier.scale_stimulus_count(canonical_profile),
+            observed_at=5.0))
 
     class Observer:
         """Yield positive demand before the second physical scale sample."""
@@ -4724,16 +6555,18 @@ def test_generated_concurrent_receipt_passes_aggregate_gate(tmp_path):
             self.request_reads = 0
             self.provider_reads = 0
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             self.request_reads += 1
             return _request_telemetry(
                 queue_depth=0,
-                in_flight=canonical_profile.max_units,
-                processing=100,
-                state_counts={'ACCEPTED': canonical_profile.max_units},
+                in_flight=qualifier.scale_stimulus_count(canonical_profile),
+                processing=0,
                 observed_at=100.0 + 10.0 * self.request_reads)
 
-        async def snapshot(self, *, require_complete_demand_report=True):
+        async def snapshot(self,
+                           *,
+                           require_complete_demand_report=True,
+                           **_kwargs):
             assert not require_complete_demand_report
             self.provider_reads += 1
             running = 99 if self.provider_reads == 1 else 100
@@ -4762,9 +6595,12 @@ def test_generated_concurrent_receipt_passes_aggregate_gate(tmp_path):
                 provider=provider,
                 load_balancer=_load_balancer_state(
                     service_hash=scope.service_hash,
-                    demand_units=canonical_profile.max_units,
-                    unique_job_arrivals_60s=canonical_profile.max_units,
-                    unique_job_arrivals_300s=canonical_profile.max_units))
+                    demand_units=qualifier.scale_stimulus_count(
+                        canonical_profile),
+                    unique_job_arrivals_60s=qualifier.scale_stimulus_count(
+                        canonical_profile),
+                    unique_job_arrivals_300s=qualifier.scale_stimulus_count(
+                        canonical_profile)))
 
     async def generate_concurrent_proof():
         traffic = asyncio.create_task(asyncio.Event().wait())
@@ -4784,9 +6620,8 @@ def test_generated_concurrent_receipt_passes_aggregate_gate(tmp_path):
             await asyncio.gather(traffic, return_exceptions=True)
 
     asyncio.run(generate_concurrent_proof())
-    final = _request_telemetry(state_counts={'SUCCEEDED': 10_000},
-                               observed_at=500.0)
-    receipt.bind_campaign_terminal_membership(
+    final = _request_telemetry(observed_at=500.0)
+    receipt.bind_campaign_success_manifest(
         qualifier._campaign_manifest_sha256(campaign_prefix, 10_000))
     receipt.request_telemetry('final', final)
     for observed_at in (1000.0, 1180.0, 1360.0):
@@ -4796,10 +6631,7 @@ def test_generated_concurrent_receipt_passes_aggregate_gate(tmp_path):
                          database=zero_database,
                          load_balancer=_load_balancer_state(
                              service_hash=scope.service_hash)))
-    receipt.finish(progress=progress,
-                   exact_request_successes=10_000,
-                   ledger_baseline=baseline,
-                   ledger_final=final)
+    receipt.finish(progress=progress, exact_request_successes=10_000)
 
     cleanup_path = tmp_path / 'generated-economic-cleanup.json'
     _write_aggregate_cleanup(cleanup_path,
@@ -4838,22 +6670,43 @@ def test_scale_and_positive_proof_failure_cancels_sibling():
     async def exercise():
         campaign_progress = qualifier.ExactRequestCampaignProgress(
             total_count=1, window_size=1)
-
-        async def wait_for_stop():
-            while (await campaign_progress.snapshot()).accepting_offers:
-                await asyncio.sleep(0)
-            return 0
-
-        traffic = asyncio.create_task(wait_for_stop())
         with pytest.raises(qualifier.QualificationError,
                            match='physical gate failed'):
-            await qualifier._join_independent_proofs(
-                fail_scale(),
-                wait_positive(),
-                traffic=traffic,
-                campaign_progress=campaign_progress)
+            await qualifier._join_independent_proofs(fail_scale(),
+                                                     wait_positive())
         assert sibling_cancelled.is_set()
-        assert traffic.result() == 0
+        assert (await campaign_progress.snapshot()).accepting_offers
+
+    asyncio.run(exercise())
+
+
+def test_proof_join_repeated_cancellation_reaps_siblings_and_preserves_error():
+    sibling_started = asyncio.Event()
+    sibling_reaping = asyncio.Event()
+    release_sibling = asyncio.Event()
+
+    async def proof():
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_reaping.set()
+            await release_sibling.wait()
+
+    async def exercise():
+        joined = asyncio.create_task(
+            qualifier._join_independent_proofs(proof(), proof()))
+        await sibling_started.wait()
+        joined.cancel('primary cancellation')
+        await sibling_reaping.wait()
+        for _ in range(5):
+            joined.cancel('later cancellation')
+            await asyncio.sleep(0)
+        assert not joined.done()
+        release_sibling.set()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await joined
+        assert cancelled.value.args == ('primary cancellation',)
 
     asyncio.run(exercise())
 
@@ -4870,110 +6723,6 @@ def test_proof_consumers_receive_only_read_only_campaign_evidence():
     assert typing.get_type_hints(
         qualifier._wait_for_scale)['campaign_progress'] == (
             qualifier.ExactRequestCampaignEvidence | None)
-
-
-def test_observer_failure_before_202_drains_offered_request_before_exit():
-    offered: list[str] = []
-    completed: list[str] = []
-    post_received = asyncio.Event()
-    release_acceptance = asyncio.Event()
-    progress = qualifier.ExactRequestCampaignProgress(total_count=3,
-                                                      window_size=1)
-
-    def receipt_headers(request_id, *, state, revision):
-        return {
-            qualifier.serve_constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: '1',
-            qualifier.serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: 'incarnation',
-            qualifier.serve_constants.LB_ASYNC_ATTEMPT_ID_HEADER: str(
-                uuid.uuid5(uuid.NAMESPACE_URL, request_id)),
-            qualifier.serve_constants.LB_ASYNC_ATTEMPT_NO_HEADER: '1',
-            qualifier.serve_constants.LB_ASYNC_LEDGER_REVISION_HEADER:
-                str(revision),
-            qualifier.serve_constants.LB_ASYNC_LEDGER_STATE_HEADER: state,
-        }
-
-    async def predict(request):
-        payload = await request.json()
-        request_id = payload['request_id']
-        offered.append(request_id)
-        post_received.set()
-        await release_acceptance.wait()
-        return aiohttp.web.json_response(
-            {
-                'request_id': request_id,
-                'status': 'accepted',
-            },
-            status=202,
-            headers=receipt_headers(request_id, state='ACCEPTED', revision=2))
-
-    async def complete(request):
-        payload = await request.json()
-        request_id = payload['request_id']
-        completed.append(request_id)
-        return aiohttp.web.Response(status=204,
-                                    headers=receipt_headers(request_id,
-                                                            state='SUCCEEDED',
-                                                            revision=3))
-
-    async def exercise():
-        app = aiohttp.web.Application()
-        app.router.add_post('/v1/models/model:predict', predict)
-        app.router.add_post(
-            qualifier.serve_constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
-            complete)
-        runner = aiohttp.web.AppRunner(app)
-        await runner.setup()
-        site = aiohttp.web.TCPSite(runner, '127.0.0.1', 0)
-        await site.start()
-        assert site._server is not None
-        endpoint = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
-        traffic = asyncio.create_task(
-            qualifier.send_exact_async_requests(endpoint=endpoint,
-                                                token='secret',
-                                                service_hash='incarnation',
-                                                prefix='observer-failure',
-                                                count=3,
-                                                concurrency=1,
-                                                hold_requests=3,
-                                                hold_seconds=0.01,
-                                                timeout_seconds=2,
-                                                request_queue_timeout_seconds=2,
-                                                terminal_timeout_seconds=2,
-                                                campaign_progress=progress))
-
-        async def fail_observer():
-            await post_received.wait()
-            raise qualifier.QualificationError('observer failed')
-
-        async def sibling_observer():
-            try:
-                await asyncio.Event().wait()
-            finally:
-                # The proof coordinator must close only future offers before
-                # releasing an in-flight POST to receive its 202 obligation.
-                assert not (await progress.snapshot()).accepting_offers
-                release_acceptance.set()
-
-        try:
-            with pytest.raises(qualifier.QualificationError,
-                               match='observer failed'):
-                await qualifier._join_independent_proofs(
-                    fail_observer(),
-                    sibling_observer(),
-                    traffic=traffic,
-                    campaign_progress=progress)
-            return await progress.snapshot()
-        finally:
-            if not traffic.done():
-                traffic.cancel()
-                await asyncio.gather(traffic, return_exceptions=True)
-            await runner.cleanup()
-
-    snapshot = asyncio.run(exercise())
-    assert offered == completed
-    assert len(completed) == 1
-    assert snapshot == qualifier.ExactRequestCampaignCounters(
-        offered=1, succeeded=1, accepting_offers=False)
 
 
 def test_scale_wait_accepts_provider_convergence_after_diagnostic_slo(tmp_path):
@@ -5004,7 +6753,7 @@ def test_scale_wait_accepts_provider_convergence_after_diagnostic_slo(tmp_path):
         def __init__(self):
             self.telemetry_reads = 0
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             self.telemetry_reads += 1
             return _request_telemetry(queue_depth=100)
 
@@ -5048,7 +6797,7 @@ def test_scale_wait_stops_at_absolute_qualification_timeout(tmp_path):
         def __init__(self):
             self.telemetry_reads = 0
 
-        async def request_telemetry(self):
+        async def request_telemetry(self, _deadline):
             self.telemetry_reads += 1
             raise AssertionError('polled after the qualification timeout')
 
@@ -5112,7 +6861,7 @@ def test_aggregate_accepts_queued_only_physical_scale_before_positive(tmp_path):
         if sample['phase'] == 'scale')
     request_scale.update(
         _request_evidence_sample(phase='scale',
-                                 queue_depth=800,
+                                 queue_depth=400,
                                  in_flight=0,
                                  processing=0,
                                  observed_at=249.0,
@@ -5150,12 +6899,11 @@ def test_scale_never_accepts_unattributed_mixed_demand(tmp_path):
         """Expose demand that cannot belong solely to the campaign."""
 
         @staticmethod
-        async def request_telemetry():
-            # Three demand-bearing requests but only two exact ledger rows.
+        async def request_telemetry(_deadline):
+            # The confirmed in-flight total disagrees with the HTTP gauge.
             return _request_telemetry(queue_depth=2,
                                       in_flight=1,
-                                      processing=1,
-                                      state_counts={'ACCEPTED': 2})
+                                      http_in_flight=0)
 
         @staticmethod
         async def snapshot(**_kwargs):
@@ -5185,12 +6933,13 @@ def test_scale_never_accepts_unattributed_mixed_demand(tmp_path):
 
 def test_scale_stimulus_requires_only_the_bounded_resident_cohort(tmp_path):
     profile = dataclasses.replace(qualifier.PROFILES['scale'], poll_seconds=0)
-    stimulus = _request_telemetry(queue_depth=800)
+    expected_resident = qualifier.scale_stimulus_count(profile)
+    stimulus = _request_telemetry(queue_depth=expected_resident)
 
     class Observer:
 
         @staticmethod
-        async def request_telemetry():
+        async def request_telemetry(_deadline):
             return stimulus
 
     async def exercise():
@@ -5207,7 +6956,7 @@ def test_scale_stimulus_requires_only_the_bounded_resident_cohort(tmp_path):
                 receipt=receipt,
                 traffic=traffic,
                 baseline=_request_telemetry(),
-                expected_resident=800,
+                expected_resident=expected_resident,
                 deadline_monotonic=deadline)
             return observed_stimulus, receipt
         finally:
@@ -5222,1169 +6971,147 @@ def test_scale_stimulus_requires_only_the_bounded_resident_cohort(tmp_path):
     ] == ['scale-stimulus']
 
 
-def test_exact_async_request_uses_canonical_acceptance_and_completion():
-    attempt_id = '11111111-1111-4111-8111-111111111111'
+def test_synchronous_campaign_completes_10k_ids_with_400_workers(monkeypatch):
+    request_ids: set[str] = set()
+    active = 0
+    peak_active = 0
+    initial_cohort = asyncio.Event()
 
-    class Response:
-        """Minimal exact protocol response."""
+    async def one_request(*_args, request_id, **_kwargs):
+        nonlocal active, peak_active
+        assert request_id not in request_ids
+        active += 1
+        peak_active = max(peak_active, active)
+        if active == 400:
+            initial_cohort.set()
+        await initial_cohort.wait()
+        request_ids.add(request_id)
+        active -= 1
 
-        def __init__(self, status, body, state, revision):
-            self.status = status
-            self._body = body
-            self.headers = {
-                'X-SkyServe-Async-Ledger-Protocol': '1',
-                'X-SkyServe-Service-Incarnation': 'incarnation-a',
-                'X-SkyServe-Async-Attempt-Id': attempt_id,
-                'X-SkyServe-Async-Attempt-No': '1',
-                'X-SkyServe-Async-Ledger-Revision': str(revision),
-                'X-SkyServe-Async-Ledger-State': state,
-            }
+    monkeypatch.setattr(qualifier, '_one_synchronous_request', one_request)
 
-        async def __aenter__(self):
-            return self
+    successes = asyncio.run(
+        qualifier.send_synchronous_requests(endpoint='https://unused.test',
+                                            token='secret',
+                                            prefix='ten-thousand',
+                                            count=10_000,
+                                            resident_window=400,
+                                            request_concurrency=400,
+                                            hold_seconds=1,
+                                            timeout_seconds=10,
+                                            request_queue_timeout_seconds=1))
 
-        async def __aexit__(self, *_args):
-            return False
-
-        async def read(self):
-            return self._body
-
-    class Session:
-        """Return one durable ACCEPTED receipt and its terminal callback."""
-
-        def __init__(self):
-            self.calls = []
-            self.responses = [
-                Response(
-                    202,
-                    json.dumps({
-                        'request_id': 'execution-1',
-                        'status': 'accepted',
-                    }).encode(), 'ACCEPTED', 2),
-                Response(204, b'', 'SUCCEEDED', 3),
-            ]
-
-        def post(self, url, **kwargs):
-            self.calls.append((url, kwargs))
-            return self.responses.pop(0)
-
-    session = Session()
-    asyncio.run(
-        qualifier._one_exact_async_request(
-            session,
-            endpoint='https://service.test',
-            token='secret',
-            service_hash='incarnation-a',
-            request_id='execution-1',
-            stable_job_id='job-1',
-            duration_seconds=0,
-            admission_deadline=(qualifier.time.monotonic() + 2),
-            terminal_timeout_seconds=2))
-
-    assert len(session.calls) == 2
-    submit_url, submit = session.calls[0]
-    assert submit_url.endswith('/v1/models/model:predict')
-    assert submit['data'] == qualifier.rfc8785.dumps({
-        'action': 'async_predict',
-        'payload': {
-            'duration_seconds': 0,
-        },
-        'request_id': 'execution-1',
-    })
-    assert submit['headers']['X-SkyServe-Job-Id'] == 'job-1'
-    callback_url, callback = session.calls[1]
-    assert callback_url.endswith('/_lb/prediction-completed')
-    assert callback['json']['attempt_id'] == attempt_id
-    assert callback['json']['expected_revision'] == 2
-    assert callback['json']['status'] == 'SUCCEEDED'
-
-
-class _ExactAdmissionResponse:
-    """Scripted response from the public exact-admission protocol."""
-
-    def __init__(self,
-                 status,
-                 *,
-                 state=None,
-                 revision=None,
-                 attempt_id='11111111-1111-4111-8111-111111111111',
-                 attempt_no=1,
-                 body=b'{}',
-                 exact_fence=True):
-        self.status = status
-        self._body = body
-        self.headers = {'Retry-After': '0.1'}
-        if exact_fence:
-            self.headers.update({
-                'X-SkyServe-Async-Ledger-Protocol': '1',
-                'X-SkyServe-Service-Incarnation': 'incarnation-a',
-            })
-        if state is not None:
-            assert revision is not None
-            self.headers.update({
-                'X-SkyServe-Async-Attempt-Id': attempt_id,
-                'X-SkyServe-Async-Attempt-No': str(attempt_no),
-                'X-SkyServe-Async-Ledger-Revision': str(revision),
-                'X-SkyServe-Async-Ledger-State': state,
-            })
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_args):
-        return False
-
-    async def read(self):
-        if isinstance(self._body, BaseException):
-            raise self._body
-        return self._body
-
-
-class _ExactAdmissionSession:
-    """Script exact admission and read-only receipt lookup outcomes."""
-
-    def __init__(self, outcomes):
-        self.outcomes = list(outcomes)
-        self.calls = []
-
-    def post(self, url, **kwargs):
-        self.calls.append((url, kwargs))
-        outcome = self.outcomes.pop(0)
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
-
-
-def _accepted_exact_response(*,
-                             status=202,
-                             state='ACCEPTED',
-                             revision=2,
-                             attempt_id=('11111111-1111-4111-8111-'
-                                         '111111111111'),
-                             attempt_no=1):
-    body = json.dumps({
-        'request_id': 'execution-1',
-        'status': 'accepted',
-    }).encode()
-    return _ExactAdmissionResponse(status,
-                                   state=state,
-                                   revision=revision,
-                                   attempt_id=attempt_id,
-                                   attempt_no=attempt_no,
-                                   body=body)
-
-
-def _submit_exact_with_session(session):
-    admission = asyncio.run(
-        qualifier._submit_exact_async_request(
-            session,
-            endpoint='https://service.test',
-            token='secret',
-            service_hash='incarnation-a',
-            request_id='execution-1',
-            stable_job_id='job-1',
-            duration_seconds=0,
-            deadline=qualifier.time.monotonic() + 2))
-    return admission.receipt, admission.intent_sha256
-
-
-async def _skip_exact_retry_delay(_delay):
-    return None
-
-
-_EXACT_SUBMIT_URL = 'https://service.test/v1/models/model:predict'
-_EXACT_RECEIPT_URL = 'https://service.test/_lb/async-request-receipt'
-
-
-def test_exact_async_request_recovers_lost_response_via_lookup_before_replay(
-        monkeypatch):
-    """A lookup-proven miss permits replay of only the immutable exact POST."""
-    session = _ExactAdmissionSession([
-        qualifier.aiohttp.ServerDisconnectedError('lost response'),
-        _ExactAdmissionResponse(404),
-        _accepted_exact_response(),
-    ])
-    monkeypatch.setattr(qualifier.asyncio, 'sleep', _skip_exact_retry_delay)
-
-    receipt, _ = _submit_exact_with_session(session)
-
-    assert receipt.state == 'ACCEPTED'
-    assert [call[0] for call in session.calls] == [
-        _EXACT_SUBMIT_URL,
-        _EXACT_RECEIPT_URL,
-        _EXACT_SUBMIT_URL,
-    ]
-    first_submit = session.calls[0][1]
-    replay = session.calls[2][1]
-    assert replay == first_submit
-    assert session.calls[1][1]['json'] == {
-        'ledger_protocol_version': 1,
-        'request_id': 'execution-1',
-        'intent_sha256': first_submit['headers']
-                         ['X-SkyServe-Async-Intent-Sha256'],
-    }
-    assert session.calls[1][1]['headers'] == {
-        'X-SkyPilot-Serve-Authorization': 'Bearer secret',
-        'Content-Type': 'application/json',
-        'X-SkyServe-Service-Incarnation': 'incarnation-a',
+    assert successes == 10_000
+    assert len(request_ids) == 10_000
+    assert peak_active == 400
+    assert request_ids == {
+        qualifier._campaign_request_id('ten-thousand', index)
+        for index in range(10_000)
     }
 
 
-def test_exact_async_request_recovers_truncated_response_body_via_lookup(
-        monkeypatch):
-    """Headers without a complete body do not strand the exact campaign."""
-    session = _ExactAdmissionSession([
-        _ExactAdmissionResponse(
-            202,
-            state='ACCEPTED',
-            revision=2,
-            body=qualifier.aiohttp.ClientPayloadError('truncated body')),
-        _ExactAdmissionResponse(200, state='ACCEPTED', revision=2),
-    ])
-    monkeypatch.setattr(qualifier.asyncio, 'sleep', _skip_exact_retry_delay)
-
-    receipt, _ = _submit_exact_with_session(session)
-
-    assert receipt.state == 'ACCEPTED'
-    assert [call[0] for call in session.calls] == [
-        _EXACT_SUBMIT_URL,
-        _EXACT_RECEIPT_URL,
-    ]
-
-
-@pytest.mark.parametrize(('hop', 'tail', 'state', 'expected_urls'), [
-    (_ExactAdmissionResponse(
-        200,
-        state='DISPATCH_MAY_HAVE_OCCURRED',
-        revision=1,
-        attempt_id='22222222-2222-4222-8222-222222222222',
-        attempt_no=2), [
-            _ExactAdmissionResponse(
-                200,
-                state='ACCEPTED',
-                revision=2,
-                attempt_id='22222222-2222-4222-8222-222222222222',
-                attempt_no=2)
-        ], 'ACCEPTED', [
-            _EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_RECEIPT_URL,
-            _EXACT_RECEIPT_URL
-        ]),
-    (_ExactAdmissionResponse(200,
-                             state='ACCEPTED',
-                             revision=2,
-                             attempt_id='22222222-2222-4222-8222-222222222222',
-                             attempt_no=2), [], 'ACCEPTED',
-     [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_RECEIPT_URL]),
-    (_ExactAdmissionResponse(200,
-                             state='ACCEPTED',
-                             revision=2,
-                             attempt_id='44444444-4444-4444-8444-444444444444',
-                             attempt_no=4), [], 'ACCEPTED',
-     [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_RECEIPT_URL]),
-    (_ExactAdmissionResponse(200,
-                             state='SUCCEEDED',
-                             revision=2,
-                             attempt_id='22222222-2222-4222-8222-222222222222',
-                             attempt_no=2), [], 'SUCCEEDED',
-     [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_RECEIPT_URL]),
-    (_ExactAdmissionResponse(
-        200,
-        state='REJECTED_PRE_DISPATCH',
-        revision=2,
-        attempt_id='22222222-2222-4222-8222-222222222222',
-        attempt_no=2), [
-            _accepted_exact_response(
-                attempt_id='33333333-3333-4333-8333-333333333333', attempt_no=3)
-        ], 'ACCEPTED', [
-            _EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_RECEIPT_URL,
-            _EXACT_SUBMIT_URL
-        ]),
-],
-                         ids=[
-                             'dispatch', 'accepted', 'multiple-rebinds',
-                             'succeeded', 'rejected'
-                         ])
-def test_exact_async_request_accepts_internal_rebinds_after_dispatch(
-        monkeypatch, hop, tail, state, expected_urls):
-    """Pre-send failures may durably reject N and internally bind N+k."""
-    first_dispatch = _ExactAdmissionResponse(200,
-                                             state='DISPATCH_MAY_HAVE_OCCURRED',
-                                             revision=1)
-    session = _ExactAdmissionSession([
-        qualifier.aiohttp.ClientConnectionError('lost response'),
-        first_dispatch,
-        hop,
-        *tail,
-    ])
-    monkeypatch.setattr(qualifier.asyncio, 'sleep', _skip_exact_retry_delay)
-
-    receipt, _ = _submit_exact_with_session(session)
-
-    assert receipt.state == state
-    assert [call[0] for call in session.calls] == expected_urls
-
-
-@pytest.mark.parametrize(
-    ('pending', 'current'), [
-        (qualifier.ExactAsyncReceipt(
-            attempt_id='11111111-1111-4111-8111-111111111111',
-            attempt_no=1,
-            state='DISPATCH_MAY_HAVE_OCCURRED',
-            revision=1),
-         qualifier.ExactAsyncReceipt(
-             attempt_id='11111111-1111-4111-8111-111111111111',
-             attempt_no=1,
-             state='REJECTED_PRE_DISPATCH',
-             revision=1)),
-        (qualifier.ExactAsyncReceipt(
-            attempt_id='11111111-1111-4111-8111-111111111111',
-            attempt_no=1,
-            state='DISPATCH_MAY_HAVE_OCCURRED',
-            revision=1),
-         qualifier.ExactAsyncReceipt(
-             attempt_id='11111111-1111-4111-8111-111111111111',
-             attempt_no=1,
-             state='ACCEPTED',
-             revision=3)),
-        (qualifier.ExactAsyncReceipt(
-            attempt_id='22222222-2222-4222-8222-222222222222',
-            attempt_no=2,
-            state='DISPATCH_MAY_HAVE_OCCURRED',
-            revision=1),
-         qualifier.ExactAsyncReceipt(
-             attempt_id='11111111-1111-4111-8111-111111111111',
-             attempt_no=1,
-             state='ACCEPTED',
-             revision=2)),
-    ],
-    ids=['same-rejection-revision-one', 'same-invalid-revision', 'backwards'])
-def test_exact_recovery_rejects_invalid_internal_rebind_hop(pending, current):
-    """Recovery rejects malformed same-attempt and backwards observations."""
-    with pytest.raises(qualifier.QualificationError,
-                       match='conflicting receipt transition'):
-        qualifier._validate_recovered_submission_receipt(
-            current,
-            request_id='execution-1',
-            previous_rejection=None,
-            pending_dispatch=pending)
-
-
-@pytest.mark.parametrize(('outcomes', 'expected_urls', 'state'), [
-    ([
-        qualifier.aiohttp.ClientConnectionError('lost response'),
-        _ExactAdmissionResponse(200, state='ACCEPTED', revision=2)
-    ], [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL], 'ACCEPTED'),
-    ([
-        qualifier.aiohttp.ClientConnectionError('lost response'),
-        _ExactAdmissionResponse(200, state='SUCCEEDED', revision=3)
-    ], [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL], 'SUCCEEDED'),
-    ([_ExactAdmissionResponse(409, state='ACCEPTED', revision=2)
-     ], [_EXACT_SUBMIT_URL], 'ACCEPTED'),
-    ([_ExactAdmissionResponse(409, state='SUCCEEDED', revision=3)
-     ], [_EXACT_SUBMIT_URL], 'SUCCEEDED'),
-    ([
-        qualifier.aiohttp.ClientConnectionError('lost response'),
-        _ExactAdmissionResponse(
-            200, state='DISPATCH_MAY_HAVE_OCCURRED', revision=1),
-        _ExactAdmissionResponse(200, state='ACCEPTED', revision=2)
-    ], [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_RECEIPT_URL], 'ACCEPTED'),
-    ([
-        _ExactAdmissionResponse(
-            409, state='DISPATCH_MAY_HAVE_OCCURRED', revision=1),
-        _ExactAdmissionResponse(200, state='ACCEPTED', revision=2)
-    ], [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL], 'ACCEPTED'),
-],
-                         ids=[
-                             'lost-accepted', 'lost-succeeded',
-                             'duplicate-accepted', 'duplicate-succeeded',
-                             'lost-dispatch-poll', 'duplicate-dispatch-poll'
-                         ])
-def test_exact_async_request_recovers_durable_success_without_redispatch(
-        monkeypatch, outcomes, expected_urls, state):
-    """Lookup and complete 409 receipts share one read-only recovery path."""
-    monkeypatch.setattr(qualifier.asyncio, 'sleep', _skip_exact_retry_delay)
-    session = _ExactAdmissionSession(outcomes)
-
-    receipt, _ = _submit_exact_with_session(session)
-
-    assert receipt.state == state
-    assert [call[0] for call in session.calls] == expected_urls
-
-
-@pytest.mark.parametrize(('initial_outcomes', 'expected_urls'), [
-    ([
-        qualifier.aiohttp.ClientConnectionError('lost response'),
-        _ExactAdmissionResponse(200, state='REJECTED_PRE_DISPATCH', revision=2)
-    ], [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_SUBMIT_URL]),
-    ([_ExactAdmissionResponse(409, state='REJECTED_PRE_DISPATCH', revision=2)
-     ], [_EXACT_SUBMIT_URL, _EXACT_SUBMIT_URL]),
-],
-                         ids=['lookup-rejection', 'duplicate-rejection'])
-def test_exact_async_request_retries_only_after_durable_predispatch_rejection(
-        monkeypatch, initial_outcomes, expected_urls):
-    """A durable pre-dispatch rejection alone authorizes a later attempt."""
-    successor = '22222222-2222-4222-8222-222222222222'
-    session = _ExactAdmissionSession([
-        *initial_outcomes,
-        _accepted_exact_response(attempt_id=successor, attempt_no=2),
-    ])
-    monkeypatch.setattr(qualifier.asyncio, 'sleep', _skip_exact_retry_delay)
-
-    receipt, _ = _submit_exact_with_session(session)
-
-    assert receipt.attempt_id == successor
-    assert [call[0] for call in session.calls] == expected_urls
-    submit_calls = [
-        kwargs for url, kwargs in session.calls if url == _EXACT_SUBMIT_URL
-    ]
-    assert len({call['data'] for call in submit_calls}) == 1
-
-
-@pytest.mark.parametrize('via_lookup', [True, False],
-                         ids=['lookup', 'duplicate-post'])
-@pytest.mark.parametrize('state',
-                         ['AMBIGUOUS', 'FAILED', 'CANCELLED', 'EXPIRED'])
-def test_exact_async_request_fails_closed_on_non_success_durable_receipt(
-        monkeypatch, state, via_lookup):
-    """Ambiguous or non-success terminal attempts can never be replayed."""
-    outcomes = [
-        _ExactAdmissionResponse(200 if via_lookup else 409,
-                                state=state,
-                                revision=2)
-    ]
-    if via_lookup:
-        outcomes.insert(
-            0, qualifier.aiohttp.ClientConnectionError('lost response'))
-    session = _ExactAdmissionSession(outcomes)
-    monkeypatch.setattr(qualifier.asyncio, 'sleep', _skip_exact_retry_delay)
-
-    with pytest.raises(qualifier.QualificationError, match=state):
-        _submit_exact_with_session(session)
-
-    assert [call[0] for call in session.calls].count(_EXACT_SUBMIT_URL) == 1
-
-
-def test_exact_async_request_does_not_trust_unfenced_lookup_miss(monkeypatch):
-    """Only an exact endpoint 404, not a generic proxy miss, permits replay."""
-    session = _ExactAdmissionSession([
-        qualifier.aiohttp.ClientConnectionError('lost response'),
-        _ExactAdmissionResponse(404, exact_fence=False),
-    ])
-    monkeypatch.setattr(qualifier.asyncio, 'sleep', _skip_exact_retry_delay)
-
-    with pytest.raises(qualifier.QualificationError,
-                       match='Async-Ledger-Protocol'):
-        _submit_exact_with_session(session)
-
-    assert len(session.calls) == 2
-
-
-@pytest.mark.parametrize(('outcomes', 'expected_urls'), [
-    ([
-        qualifier.aiohttp.ClientConnectionError('lost response'),
-        _ExactAdmissionResponse(
-            200, state='DISPATCH_MAY_HAVE_OCCURRED', revision=1),
-        _ExactAdmissionResponse(404)
-    ], [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_RECEIPT_URL]),
-    ([
-        _ExactAdmissionResponse(
-            202,
-            state='ACCEPTED',
-            revision=2,
-            body=qualifier.aiohttp.ClientPayloadError('truncated body')),
-        _ExactAdmissionResponse(404)
-    ], [_EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL]),
-    ([
-        qualifier.aiohttp.ClientConnectionError('lost response'),
-        _ExactAdmissionResponse(200, state='REJECTED_PRE_DISPATCH', revision=2),
-        qualifier.aiohttp.ClientConnectionError('lost successor response'),
-        _ExactAdmissionResponse(404)
-    ], [
-        _EXACT_SUBMIT_URL, _EXACT_RECEIPT_URL, _EXACT_SUBMIT_URL,
-        _EXACT_RECEIPT_URL
-    ]),
-],
-                         ids=[
-                             'pending-dispatch', 'truncated-acceptance',
-                             'previous-rejection'
-                         ])
-def test_exact_async_request_fails_closed_if_durable_receipt_disappears(
-        monkeypatch, outcomes, expected_urls):
-    """A 404 cannot erase already observed durable attempt evidence."""
-    session = _ExactAdmissionSession(outcomes)
-    monkeypatch.setattr(qualifier.asyncio, 'sleep', _skip_exact_retry_delay)
-
-    with pytest.raises(qualifier.QualificationError,
-                       match='lost a previously durable exact admission'):
-        _submit_exact_with_session(session)
-
-    assert [call[0] for call in session.calls] == expected_urls
-
-
-def test_exact_async_request_bounds_unreadable_receipt_recovery(monkeypatch):
-    """Transport loss polls read-only until the shared deadline, never POSTs."""
-
-    class Session:
-
-        def __init__(self):
-            self.calls = []
-
-        def post(self, url, **kwargs):
-            self.calls.append((url, kwargs))
-            raise qualifier.aiohttp.ClientConnectionError('unreadable')
-
-    ticks = iter([0.0, 0.5, 1.0])
-    monkeypatch.setattr(qualifier, 'time',
-                        types.SimpleNamespace(monotonic=lambda: next(ticks)))
-
-    async def fake_sleep(_delay):
-        return None
-
-    monkeypatch.setattr(qualifier.asyncio, 'sleep', fake_sleep)
-    session = Session()
-    with pytest.raises(qualifier.QualificationError,
-                       match='exhausted its exact admission deadline'):
-        asyncio.run(
-            qualifier._submit_exact_async_request(
-                session,
-                endpoint='https://service.test',
-                token='secret',
-                service_hash='incarnation-a',
-                request_id='execution-1',
-                stable_job_id='job-1',
-                duration_seconds=0,
-                deadline=1.0))
-
-    assert [call[0] for call in session.calls] == [
-        'https://service.test/v1/models/model:predict',
-        'https://service.test/_lb/async-request-receipt',
-    ]
-
-
-def test_exact_async_request_retries_429_503_with_stable_identity_and_jitter(
-        monkeypatch):
-    rejected_attempt_id = '11111111-1111-4111-8111-111111111111'
-    accepted_attempt_id = '22222222-2222-4222-8222-222222222222'
-
-    class Response:
-        """One exact async admission response."""
-
-        def __init__(self,
-                     status,
-                     state,
-                     revision,
-                     body=b'{}',
-                     *,
-                     attempt_id=rejected_attempt_id,
-                     attempt_no=1):
-            self.status = status
-            self._body = body
-            self.headers = {
-                'Retry-After': '1',
-                'X-SkyServe-Async-Ledger-Protocol': '1',
-                'X-SkyServe-Service-Incarnation': 'incarnation-a',
-                'X-SkyServe-Async-Attempt-Id': attempt_id,
-                'X-SkyServe-Async-Attempt-No': str(attempt_no),
-                'X-SkyServe-Async-Ledger-Revision': str(revision),
-                'X-SkyServe-Async-Ledger-State': state,
-            }
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return False
-
-        async def read(self):
-            return self._body
-
-    class Session:
-        """Return two pre-dispatch rejections and one acceptance."""
-
-        def __init__(self):
-            accepted = json.dumps({
-                'request_id': 'execution-1',
-                'status': 'accepted',
-            }).encode()
-            self.responses = [
-                Response(429, 'REJECTED_PRE_DISPATCH', 1),
-                Response(503, 'REJECTED_PRE_DISPATCH', 1),
-                Response(202,
-                         'ACCEPTED',
-                         2,
-                         accepted,
-                         attempt_id=accepted_attempt_id,
-                         attempt_no=2),
-            ]
-            self.calls = []
-
-        def post(self, url, **kwargs):
-            self.calls.append((url, kwargs))
-            return self.responses.pop(0)
-
-    delays = []
-
-    async def fake_sleep(delay):
-        delays.append(delay)
-
-    monkeypatch.setattr(qualifier.asyncio, 'sleep', fake_sleep)
-    session = Session()
-    admission = asyncio.run(
-        qualifier._submit_exact_async_request(
-            session,
-            endpoint='https://service.test',
-            token='secret',
-            service_hash='incarnation-a',
-            request_id='execution-1',
-            stable_job_id='job-1',
-            duration_seconds=0,
-            deadline=qualifier.time.monotonic() + 2))
-    receipt = admission.receipt
-
-    assert receipt.attempt_id == accepted_attempt_id
-    assert receipt.attempt_no == 2
-    assert len(session.calls) == 3
-    assert len({call[1]['data'] for call in session.calls}) == 1
-    assert {call[1]['headers']['X-SkyServe-Job-Id'] for call in session.calls
-           } == {'job-1'}
-    assert len(delays) == 2
-    assert 0.1 <= delays[0] <= 10
-    assert 0.1 <= delays[1] <= 10
-    assert delays[0] != delays[1]
-    assert (qualifier._bounded_retry_delay('1',
-                                           attempt=0,
-                                           request_id='execution-1')
-            != qualifier._bounded_retry_delay('1',
-                                              attempt=0,
-                                              request_id='execution-2'))
-
-
-@pytest.mark.parametrize(
-    ('previous', 'current', 'accepted_response', 'valid'), [
-        (None, ('accepted', 1, 'ACCEPTED', 2), True, True),
-        (None, ('accepted', 1, 'SUCCEEDED', 2), True, True),
-        (None, ('accepted', 1, 'SUCCEEDED', 3), True, True),
-        (None, ('accepted', 1, 'ACCEPTED', 1), True, False),
-        (None, ('accepted', 1, 'ACCEPTED', 99), True, False),
-        (None, ('accepted', 1, 'SUCCEEDED', 99), True, False),
-        (None, ('rejected', 1, 'REJECTED_PRE_DISPATCH', 1), False, True),
-        (None, ('rejected', 1, 'REJECTED_PRE_DISPATCH', 2), False, True),
-        (None, ('rejected', 2, 'REJECTED_PRE_DISPATCH', 1), False, False),
-        (None, ('rejected', 2, 'REJECTED_PRE_DISPATCH', 2), False, True),
-        (None, ('rejected', 2, 'REJECTED_PRE_DISPATCH', 99), False, False),
-        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
-         ('rejected', 1, 'REJECTED_PRE_DISPATCH', 1), False, True),
-        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
-         ('rejected', 1, 'REJECTED_PRE_DISPATCH', 2), False, False),
-        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
-         ('successor', 2, 'REJECTED_PRE_DISPATCH', 1), False, False),
-        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
-         ('successor', 2, 'REJECTED_PRE_DISPATCH', 2), False, True),
-        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
-         ('successor', 3, 'ACCEPTED', 2), True, True),
-        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
-         ('successor', 4, 'SUCCEEDED', 3), True, True),
-        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
-         ('successor', 2, 'REJECTED_PRE_DISPATCH', 99), False, False),
-        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
-         ('successor', 2, 'ACCEPTED', 99), True, False),
-        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
-         ('successor', 2, 'SUCCEEDED', 99), True, False),
-        (('rejected', 1, 'REJECTED_PRE_DISPATCH', 1),
-         ('rejected', 1, 'ACCEPTED', 2), True, False),
-        (None, ('accepted', 1, 'FAILED', 2), True, False),
-    ])
-def test_exact_async_submission_receipt_state_machine(previous, current,
-                                                      accepted_response, valid):
-    """Only ledger-reachable submission receipts qualify the campaign."""
-
-    def receipt(fields):
-        if fields is None:
-            return None
-        attempt_id, attempt_no, state, revision = fields
-        attempt_ids = {
-            'rejected': '11111111-1111-4111-8111-111111111111',
-            'accepted': '22222222-2222-4222-8222-222222222222',
-            'successor': '33333333-3333-4333-8333-333333333333',
-        }
-        return qualifier.ExactAsyncReceipt(attempt_id=attempt_ids[attempt_id],
-                                           attempt_no=attempt_no,
-                                           state=state,
-                                           revision=revision)
-
-    previous_receipt = receipt(previous)
-    current_receipt = receipt(current)
-    assert current_receipt is not None
-    if valid:
-        qualifier._validate_submission_receipt(
-            current_receipt,
-            previous_rejection=previous_receipt,
-            accepted_response=accepted_response)
-    else:
-        with pytest.raises(qualifier.QualificationError,
-                           match='conflicting receipt transition'):
-            qualifier._validate_submission_receipt(
-                current_receipt,
-                previous_rejection=previous_receipt,
-                accepted_response=accepted_response)
-
-
-@pytest.mark.parametrize(('current_revision', 'valid'), [(3, True),
-                                                         (99, False)])
-def test_exact_async_completion_receipt_revision(current_revision, valid):
-    """Terminal success advances the accepted attempt exactly once."""
-    attempt_id = '11111111-1111-4111-8111-111111111111'
-    accepted = qualifier.ExactAsyncReceipt(attempt_id=attempt_id,
-                                           attempt_no=1,
-                                           state='ACCEPTED',
-                                           revision=2)
-    current = qualifier.ExactAsyncReceipt(attempt_id=attempt_id,
-                                          attempt_no=1,
-                                          state='SUCCEEDED',
-                                          revision=current_revision)
-    if valid:
-        qualifier._validate_completion_receipt(accepted, current)
-    else:
-        with pytest.raises(qualifier.QualificationError,
-                           match='conflicting receipt transition'):
-            qualifier._validate_completion_receipt(accepted, current)
-
-
-def test_exact_async_request_accepts_terminal_success_race():
-    attempt_id = '11111111-1111-4111-8111-111111111111'
-
-    class Response:
-
-        status = 202
-        headers = {
-            'X-SkyServe-Async-Ledger-Protocol': '1',
-            'X-SkyServe-Service-Incarnation': 'incarnation-a',
-            'X-SkyServe-Async-Attempt-Id': attempt_id,
-            'X-SkyServe-Async-Attempt-No': '1',
-            'X-SkyServe-Async-Ledger-Revision': '2',
-            'X-SkyServe-Async-Ledger-State': 'SUCCEEDED',
-        }
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return False
-
-        @staticmethod
-        async def read():
-            return json.dumps({
-                'request_id': 'execution-1',
-                'status': 'accepted',
-            }).encode()
-
-    class Session:
-
-        def __init__(self):
-            self.calls = 0
-
-        def post(self, _url, **_kwargs):
-            self.calls += 1
-            return Response()
-
-    session = Session()
-    asyncio.run(
-        qualifier._one_exact_async_request(
-            session,
-            endpoint='https://service.test',
-            token='secret',
-            service_hash='incarnation-a',
-            request_id='execution-1',
-            stable_job_id='job-1',
-            duration_seconds=0,
-            admission_deadline=(qualifier.time.monotonic() + 2),
-            terminal_timeout_seconds=2))
-    assert session.calls == 1
-
-
-def test_exact_async_request_rejects_non_successor_after_typed_rejection(
-        monkeypatch):
-    attempt_id = '11111111-1111-4111-8111-111111111111'
-
-    class Response:
-
-        def __init__(self, status, state, revision, body=b'{}'):
-            self.status = status
-            self._body = body
-            self.headers = {
-                'Retry-After': '0.1',
-                'X-SkyServe-Async-Ledger-Protocol': '1',
-                'X-SkyServe-Service-Incarnation': 'incarnation-a',
-                'X-SkyServe-Async-Attempt-Id': attempt_id,
-                'X-SkyServe-Async-Attempt-No': '1',
-                'X-SkyServe-Async-Ledger-Revision': str(revision),
-                'X-SkyServe-Async-Ledger-State': state,
-            }
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return False
-
-        async def read(self):
-            return self._body
-
-    class Session:
-
-        def __init__(self):
-            accepted = json.dumps({
-                'request_id': 'execution-1',
-                'status': 'accepted',
-            }).encode()
-            self.responses = [
-                Response(503, 'REJECTED_PRE_DISPATCH', 1),
-                # A rejected attempt cannot itself become accepted. The
-                # ledger must authorize a distinct successor attempt.
-                Response(202, 'ACCEPTED', 2, accepted),
-            ]
-
-        def post(self, _url, **_kwargs):
-            return self.responses.pop(0)
-
-    async def fake_sleep(_delay):
-        return None
-
-    monkeypatch.setattr(qualifier.asyncio, 'sleep', fake_sleep)
-    with pytest.raises(qualifier.QualificationError,
-                       match='conflicting receipt transition'):
-        asyncio.run(
-            qualifier._submit_exact_async_request(
-                Session(),
-                endpoint='https://service.test',
-                token='secret',
-                service_hash='incarnation-a',
-                request_id='execution-1',
-                stable_job_id='job-1',
-                duration_seconds=0,
-                deadline=qualifier.time.monotonic() + 2))
-
-
-def test_exact_completion_retries_with_stable_exponential_jitter(monkeypatch):
-    attempt_id = '11111111-1111-4111-8111-111111111111'
-
-    class Response:
-
-        def __init__(self, status, *, terminal=False):
-            self.status = status
-            self.headers = {'Retry-After': '0.5'}
-            if terminal:
-                self.headers.update({
-                    'X-SkyServe-Async-Ledger-Protocol': '1',
-                    'X-SkyServe-Service-Incarnation': 'incarnation-a',
-                    'X-SkyServe-Async-Attempt-Id': attempt_id,
-                    'X-SkyServe-Async-Attempt-No': '1',
-                    'X-SkyServe-Async-Ledger-Revision': '3',
-                    'X-SkyServe-Async-Ledger-State': 'SUCCEEDED',
-                })
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return False
-
-        @staticmethod
-        async def read():
-            return b''
-
-    class Session:
-
-        def __init__(self):
-            self.responses = [
-                Response(503),
-                Response(409),
-                Response(204, terminal=True),
-            ]
-            self.calls = []
-
-        def post(self, url, **kwargs):
-            self.calls.append((url, kwargs))
-            return self.responses.pop(0)
-
-    delays = []
-
-    async def fake_sleep(delay):
-        delays.append(delay)
-
-    monkeypatch.setattr(qualifier.asyncio, 'sleep', fake_sleep)
-    session = Session()
-    accepted = qualifier.ExactAsyncReceipt(attempt_id=attempt_id,
-                                           attempt_no=1,
-                                           state='ACCEPTED',
-                                           revision=2)
-    asyncio.run(
-        qualifier._complete_exact_async_request(
-            session,
-            endpoint='https://service.test',
-            token='secret',
-            service_hash='incarnation-a',
-            request_id='execution-1',
-            intent_sha256='a' * 64,
-            accepted=accepted,
-            processing_time_us=10,
-            deadline=qualifier.time.monotonic() + 2))
-
-    assert len(session.calls) == 3
-    assert len({
-        json.dumps(call[1]['json'], sort_keys=True) for call in session.calls
-    }) == 1
-    assert delays == [
-        qualifier._bounded_retry_delay('0.5',
-                                       attempt=attempt,
-                                       request_id='execution-1')
-        for attempt in (0, 1)
-    ]
-
-
-def test_exact_async_request_publishes_terminal_after_declared_work():
-    """A request's terminal callback is not controlled by an observer."""
-    admitted: set[str] = set()
-    completed: set[str] = set()
-    active_requests = 0
-    peak_active_requests = 0
-
-    def receipt_headers(request_id, *, state, revision):
-        attempt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, request_id))
-        return {
-            qualifier.serve_constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: '1',
-            qualifier.serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: 'incarnation-a',
-            qualifier.serve_constants.LB_ASYNC_ATTEMPT_ID_HEADER: attempt_id,
-            qualifier.serve_constants.LB_ASYNC_ATTEMPT_NO_HEADER: '1',
-            qualifier.serve_constants.LB_ASYNC_LEDGER_REVISION_HEADER:
-                str(revision),
-            qualifier.serve_constants.LB_ASYNC_LEDGER_STATE_HEADER: state,
-        }
+@pytest.mark.parametrize(('status', 'body', 'message'), [
+    (503, {
+        'error': 'not ready'
+    }, 'HTTP 503'),
+    (200, {
+        'request_id': 'wrong',
+        'status': 'ok'
+    }, 'conflicting backend ID'),
+])
+def test_synchronous_campaign_fails_without_replaying_work(
+        status, body, message):
+    calls = 0
 
     async def predict(request):
-        nonlocal active_requests, peak_active_requests
-        active_requests += 1
-        peak_active_requests = max(peak_active_requests, active_requests)
-        try:
-            payload = await request.json()
-            request_id = payload['request_id']
-            await asyncio.sleep(0.002)
-            assert request_id not in admitted
-            admitted.add(request_id)
-            return aiohttp.web.json_response(
-                {
-                    'request_id': request_id,
-                    'status': 'accepted',
-                },
-                status=202,
-                headers=receipt_headers(request_id,
-                                        state='ACCEPTED',
-                                        revision=2))
-        finally:
-            active_requests -= 1
-
-    async def complete(request):
-        payload = await request.json()
-        request_id = payload['request_id']
-        assert request_id in admitted
-        assert request_id not in completed
-        completed.add(request_id)
-        return aiohttp.web.Response(status=204,
-                                    headers=receipt_headers(request_id,
-                                                            state='SUCCEEDED',
-                                                            revision=3))
+        nonlocal calls
+        calls += 1
+        assert request.headers[qualifier._AUTH_HEADER] == 'Bearer secret'
+        assert request.headers[qualifier._JOB_ID_HEADER] == 'one-job-00000'
+        assert request.headers[qualifier._ACCELERATORS_HEADER] == 'L4'
+        assert request.headers[qualifier._PRIORITY_HEADER] == str(
+            qualifier._REQUEST_PRIORITY)
+        assert await request.json() == {
+            'duration_seconds': 0.01,
+            'request_id': 'one-execution-00000',
+        }
+        return aiohttp.web.json_response(body, status=status)
 
     async def exercise():
         app = aiohttp.web.Application()
         app.router.add_post('/v1/models/model:predict', predict)
-        app.router.add_post(
-            qualifier.serve_constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
-            complete)
         runner = aiohttp.web.AppRunner(app)
         await runner.setup()
         site = aiohttp.web.TCPSite(runner, '127.0.0.1', 0)
         await site.start()
         assert site._server is not None
         endpoint = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
-        traffic = asyncio.create_task(
-            qualifier.send_exact_async_requests(endpoint=endpoint,
-                                                token='secret',
-                                                service_hash='incarnation-a',
-                                                prefix='held',
-                                                count=24,
-                                                concurrency=24,
-                                                hold_requests=24,
-                                                hold_seconds=0.01,
-                                                timeout_seconds=5,
-                                                request_queue_timeout_seconds=5,
-                                                terminal_timeout_seconds=5))
         try:
-            assert await asyncio.wait_for(traffic, timeout=3) == 24
+            with pytest.raises(qualifier.QualificationError, match=message):
+                await qualifier.send_synchronous_requests(
+                    endpoint=endpoint,
+                    token='secret',
+                    prefix='one',
+                    count=1,
+                    resident_window=1,
+                    request_concurrency=1,
+                    hold_seconds=0.01,
+                    timeout_seconds=1,
+                    request_queue_timeout_seconds=1)
         finally:
-            traffic.cancel()
-            await asyncio.gather(traffic, return_exceptions=True)
             await runner.cleanup()
 
     asyncio.run(exercise())
-    assert completed == admitted
-    assert peak_active_requests <= 24
+    assert calls == 1
 
 
-def _aiohttp_exact_receipt_headers(request_id, *, state, revision):
-    return {
-        qualifier.serve_constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: '1',
-        qualifier.serve_constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: 'incarnation-a',
-        qualifier.serve_constants.LB_ASYNC_ATTEMPT_ID_HEADER: str(
-            uuid.uuid5(uuid.NAMESPACE_URL, request_id)),
-        qualifier.serve_constants.LB_ASYNC_ATTEMPT_NO_HEADER: '1',
-        qualifier.serve_constants.LB_ASYNC_LEDGER_REVISION_HEADER:
-            str(revision),
-        qualifier.serve_constants.LB_ASYNC_LEDGER_STATE_HEADER: state,
-    }
-
-
-async def _start_exact_protocol_server(predict, complete):
-    app = aiohttp.web.Application()
-    app.router.add_post('/v1/models/model:predict', predict)
-    app.router.add_post(
-        qualifier.serve_constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
-        complete)
-    runner = aiohttp.web.AppRunner(app)
-    await runner.setup()
-    site = aiohttp.web.TCPSite(runner, '127.0.0.1', 0)
-    await site.start()
-    assert site._server is not None
-    endpoint = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
-    return runner, endpoint
-
-
-def test_exact_campaign_worker_failure_drains_accepted_sibling():
-    """One pre-admission failure cannot strand two accepted siblings."""
-    offered = []
-    terminalized = []
-    accepted_siblings = 0
-    both_siblings_accepted = asyncio.Event()
-
-    async def predict(request):
-        nonlocal accepted_siblings
-        payload = await request.json()
-        request_id = payload['request_id']
-        offered.append(request_id)
-        if request_id.endswith('00000'):
-            await both_siblings_accepted.wait()
-            return aiohttp.web.Response(status=400)
-        accepted_siblings += 1
-        if accepted_siblings == 2:
-            both_siblings_accepted.set()
-        return aiohttp.web.json_response(
-            {
-                'request_id': request_id,
-                'status': 'accepted',
-            },
-            status=202,
-            headers=_aiohttp_exact_receipt_headers(request_id,
-                                                   state='ACCEPTED',
-                                                   revision=2))
-
-    async def complete(request):
-        payload = await request.json()
-        request_id = payload['request_id']
-        terminalized.append(request_id)
-        return aiohttp.web.Response(status=204,
-                                    headers=_aiohttp_exact_receipt_headers(
-                                        request_id,
-                                        state='SUCCEEDED',
-                                        revision=3))
-
-    async def exercise():
-        runner, endpoint = await _start_exact_protocol_server(predict, complete)
-        progress = qualifier.ExactRequestCampaignProgress(total_count=4,
-                                                          window_size=3)
-        try:
-            with pytest.raises(qualifier.QualificationError,
-                               match='00000 returned HTTP 400'):
-                await qualifier.send_exact_async_requests(
-                    endpoint=endpoint,
-                    token='secret',
-                    service_hash='incarnation-a',
-                    prefix='worker-failure',
-                    count=4,
-                    concurrency=3,
-                    hold_requests=4,
-                    hold_seconds=0.02,
-                    timeout_seconds=2,
-                    request_queue_timeout_seconds=2,
-                    terminal_timeout_seconds=2,
-                    campaign_progress=progress)
-            return await progress.snapshot()
-        finally:
-            await asyncio.sleep(0.05)
-            await runner.cleanup()
-
-    snapshot = asyncio.run(exercise())
-    assert len(offered) == 3
-    assert set(
-        terminalized) == set(offered) - {'worker-failure-execution-00000'}
-    assert snapshot == qualifier.ExactRequestCampaignCounters(
-        offered=3, succeeded=2, accepting_offers=False)
-
-
-def test_exact_campaign_caller_cancellation_drains_accepted_workers():
-    """Caller cancellation stops admission but cannot cancel accepted work."""
-    offered = []
-    terminalized = []
-    both_accepted = asyncio.Event()
+def test_synchronous_campaign_cancellation_drains_only_offered_work():
+    offered: list[str] = []
+    release = asyncio.Event()
+    both_offered = asyncio.Event()
 
     async def predict(request):
         payload = await request.json()
-        request_id = payload['request_id']
-        offered.append(request_id)
+        offered.append(payload['request_id'])
         if len(offered) == 2:
-            both_accepted.set()
-        return aiohttp.web.json_response(
-            {
-                'request_id': request_id,
-                'status': 'accepted',
-            },
-            status=202,
-            headers=_aiohttp_exact_receipt_headers(request_id,
-                                                   state='ACCEPTED',
-                                                   revision=2))
-
-    async def complete(request):
-        payload = await request.json()
-        request_id = payload['request_id']
-        terminalized.append(request_id)
-        return aiohttp.web.Response(status=204,
-                                    headers=_aiohttp_exact_receipt_headers(
-                                        request_id,
-                                        state='SUCCEEDED',
-                                        revision=3))
+            both_offered.set()
+        await release.wait()
+        return aiohttp.web.json_response({
+            'request_id': payload['request_id'],
+            'status': 'ok',
+        })
 
     async def exercise():
-        runner, endpoint = await _start_exact_protocol_server(predict, complete)
+        app = aiohttp.web.Application()
+        app.router.add_post('/v1/models/model:predict', predict)
+        runner = aiohttp.web.AppRunner(app)
+        await runner.setup()
+        site = aiohttp.web.TCPSite(runner, '127.0.0.1', 0)
+        await site.start()
+        assert site._server is not None
+        endpoint = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
         progress = qualifier.ExactRequestCampaignProgress(total_count=3,
                                                           window_size=2)
         traffic = asyncio.create_task(
-            qualifier.send_exact_async_requests(endpoint=endpoint,
+            qualifier.send_synchronous_requests(endpoint=endpoint,
                                                 token='secret',
-                                                service_hash='incarnation-a',
-                                                prefix='caller-cancel',
+                                                prefix='cancel',
                                                 count=3,
-                                                concurrency=2,
-                                                hold_requests=3,
-                                                hold_seconds=0.02,
-                                                timeout_seconds=2,
-                                                request_queue_timeout_seconds=2,
-                                                terminal_timeout_seconds=2,
+                                                resident_window=2,
+                                                request_concurrency=2,
+                                                hold_seconds=0.01,
+                                                timeout_seconds=1,
+                                                request_queue_timeout_seconds=1,
                                                 campaign_progress=progress))
         try:
-            await both_accepted.wait()
-            traffic.cancel()
+            await both_offered.wait()
+            traffic.cancel('stop qualification')
+            release.set()
             with pytest.raises(asyncio.CancelledError):
                 await traffic
             return await progress.snapshot()
         finally:
+            release.set()
             if not traffic.done():
                 traffic.cancel()
                 await asyncio.gather(traffic, return_exceptions=True)
@@ -6392,200 +7119,8 @@ def test_exact_campaign_caller_cancellation_drains_accepted_workers():
 
     snapshot = asyncio.run(exercise())
     assert len(offered) == 2
-    assert set(terminalized) == set(offered)
     assert snapshot == qualifier.ExactRequestCampaignCounters(
         offered=2, succeeded=2, accepting_offers=False)
-
-
-def test_late_exact_acceptance_gets_a_fresh_terminal_deadline():
-    """A valid late 202 has callback budget independent of admission cutoff."""
-    terminalized = []
-
-    async def predict(request):
-        payload = await request.json()
-        request_id = payload['request_id']
-        await asyncio.sleep(0.08)
-        return aiohttp.web.json_response(
-            {
-                'request_id': request_id,
-                'status': 'accepted',
-            },
-            status=202,
-            headers=_aiohttp_exact_receipt_headers(request_id,
-                                                   state='ACCEPTED',
-                                                   revision=2))
-
-    async def complete(request):
-        payload = await request.json()
-        request_id = payload['request_id']
-        terminalized.append(request_id)
-        return aiohttp.web.Response(status=204,
-                                    headers=_aiohttp_exact_receipt_headers(
-                                        request_id,
-                                        state='SUCCEEDED',
-                                        revision=3))
-
-    async def exercise():
-        runner, endpoint = await _start_exact_protocol_server(predict, complete)
-        try:
-            return await qualifier.send_exact_async_requests(
-                endpoint=endpoint,
-                token='secret',
-                service_hash='incarnation-a',
-                prefix='late-acceptance',
-                count=1,
-                concurrency=1,
-                hold_requests=1,
-                hold_seconds=0,
-                timeout_seconds=0.05,
-                request_queue_timeout_seconds=0.2,
-                terminal_timeout_seconds=0.2)
-        finally:
-            await runner.cleanup()
-
-    assert asyncio.run(exercise()) == 1
-    assert terminalized == ['late-acceptance-execution-00000']
-
-
-def test_malformed_accepted_body_terminalizes_before_protocol_error():
-    """Accepted headers own a callback even when the 202 body is malformed."""
-    terminalized = []
-
-    async def predict(request):
-        payload = await request.json()
-        request_id = payload['request_id']
-        return aiohttp.web.Response(body=b'{malformed',
-                                    status=202,
-                                    headers=_aiohttp_exact_receipt_headers(
-                                        request_id,
-                                        state='ACCEPTED',
-                                        revision=2))
-
-    async def complete(request):
-        payload = await request.json()
-        request_id = payload['request_id']
-        terminalized.append(request_id)
-        return aiohttp.web.Response(status=204,
-                                    headers=_aiohttp_exact_receipt_headers(
-                                        request_id,
-                                        state='SUCCEEDED',
-                                        revision=3))
-
-    async def exercise():
-        runner, endpoint = await _start_exact_protocol_server(predict, complete)
-        progress = qualifier.ExactRequestCampaignProgress(total_count=1,
-                                                          window_size=1)
-        try:
-            with pytest.raises(qualifier.QualificationError,
-                               match='returned invalid JSON'):
-                await qualifier.send_exact_async_requests(
-                    endpoint=endpoint,
-                    token='secret',
-                    service_hash='incarnation-a',
-                    prefix='malformed-acceptance',
-                    count=1,
-                    concurrency=1,
-                    hold_requests=1,
-                    hold_seconds=0,
-                    timeout_seconds=1,
-                    request_queue_timeout_seconds=1,
-                    terminal_timeout_seconds=1,
-                    campaign_progress=progress)
-            return await progress.snapshot()
-        finally:
-            await runner.cleanup()
-
-    snapshot = asyncio.run(exercise())
-    assert terminalized == ['malformed-acceptance-execution-00000']
-    assert snapshot == qualifier.ExactRequestCampaignCounters(
-        offered=1, succeeded=1, accepting_offers=False)
-
-
-def test_request_telemetry_requires_exact_positive_and_terminal_delta(tmp_path):
-    baseline = _request_telemetry()
-    positive = _request_telemetry(queue_depth=7,
-                                  in_flight=5,
-                                  processing=3,
-                                  state_counts={'ACCEPTED': 5})
-    final = _request_telemetry(state_counts={'SUCCEEDED': 16})
-    assert baseline.is_exact_zero()
-    assert positive.is_fresh_complete()
-    assert not positive.is_exact_zero()
-    assert final.is_exact_zero()
-    assert final.ledger_succeeded - baseline.ledger_succeeded == 16
-
-    class Observer:
-
-        def __init__(self, values):
-            self.values = list(values)
-
-        async def request_telemetry(self):
-            return self.values.pop(0)
-
-        @staticmethod
-        async def campaign_terminal_membership(prefix, count):
-            return qualifier._campaign_manifest_sha256(prefix, count)
-
-    async def exercise():
-        profile = dataclasses.replace(qualifier.PROFILES['small'],
-                                      poll_seconds=0)
-        receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
-                                    service_name='paid-e2e',
-                                    profile=profile)
-        receipt.bind_campaign_manifest('terminal-proof', 16)
-        held = asyncio.create_task(asyncio.Event().wait())
-        try:
-            observed_positive = await (
-                qualifier._wait_for_positive_request_telemetry(
-                    observer=Observer([positive]),
-                    profile=profile,
-                    receipt=receipt,
-                    traffic=held,
-                    baseline=baseline,
-                    deadline_monotonic=time.monotonic() + 1))
-            observed_final = await qualifier._wait_for_final_request_telemetry(
-                observer=Observer([final]),
-                profile=profile,
-                receipt=receipt,
-                baseline=baseline,
-                expected_succeeded_delta=16,
-                campaign_prefix='terminal-proof')
-            return observed_positive, observed_final, receipt
-        finally:
-            held.cancel()
-            await asyncio.gather(held, return_exceptions=True)
-
-    observed_positive, observed_final, receipt = asyncio.run(exercise())
-    assert observed_positive == positive
-    assert observed_final == final
-    assert [
-        sample['phase']
-        for sample in receipt._payload['request_telemetry_samples']
-    ] == ['positive', 'final']
-    assert receipt._payload['campaign_terminal_membership_sha256'] == (
-        qualifier._campaign_manifest_sha256('terminal-proof', 16))
-
-
-def test_campaign_terminal_membership_rejects_equal_count_substitution():
-    prefix = 'exact-membership'
-    keys = qualifier._campaign_request_key_sha256s(prefix, 3)
-    expected_digest = qualifier._campaign_manifest_sha256(prefix, 3)
-    rows = [{
-        'request_key_sha256': key,
-        'state': 'SUCCEEDED',
-    } for key in keys]
-
-    assert qualifier._validate_campaign_terminal_rows(
-        prefix=prefix, count=3, rows=rows) == expected_digest
-    rows[-1] = {
-        'request_key_sha256': hashlib.sha256(b'unrelated').hexdigest(),
-        'state': 'SUCCEEDED',
-    }
-    with pytest.raises(qualifier.QualificationError,
-                       match='exact campaign membership'):
-        qualifier._validate_campaign_terminal_rows(prefix=prefix,
-                                                   count=3,
-                                                   rows=rows)
 
 
 def _request_evidence_sample(*,
@@ -6593,16 +7128,11 @@ def _request_evidence_sample(*,
                              queue_depth,
                              in_flight,
                              processing,
-                             accepted=0,
-                             succeeded=0,
+                             http_in_flight=None,
                              observed_at=1000.0,
                              **extra):
-    values = {
-        'ACCEPTED': accepted,
-        'SUCCEEDED': succeeded,
-    }
-    counts = [[state.value, values.get(state.value, 0)]
-              for state in qualifier.async_request_ledger.AsyncRequestState]
+    if http_in_flight is None:
+        http_in_flight = in_flight
     return {
         'phase': phase,
         'observed_at': observed_at,
@@ -6611,13 +7141,10 @@ def _request_evidence_sample(*,
         'compatibility_complete': True,
         'queue_depth': queue_depth,
         'in_flight_requests': in_flight,
+        'http_in_flight_requests': http_in_flight,
         'processing_requests': processing,
         'confirmed_in_flight_requests': in_flight,
         'confirmed_processing_requests': processing,
-        'ledger_state_counts': counts,
-        'ledger_active': accepted,
-        'ledger_succeeded': succeeded,
-        'ledger_total': accepted + succeeded,
         **extra,
     }
 
@@ -6710,9 +7237,8 @@ def _write_aggregate_qualification(path,
         campaign_prefix, count)
     stimulus = qualifier.scale_stimulus_count(profile)
     in_flight = min(128, stimulus) if economic else 1
-    active = in_flight
     queue_depth = stimulus - in_flight if economic else 0
-    processing = max(1, in_flight // 2)
+    processing = 0
     provider_projection = _qualification_provider_projection(peaks)
     scale_started_at = 4.0
     scale_observed_at = 250.0 if economic else 130.0
@@ -6754,7 +7280,7 @@ def _write_aggregate_qualification(path,
         } if economic else {}),
     }
     payload = {
-        'schema_version': 13,
+        'schema_version': 15,
         'service_name': service_name,
         'service_hash': f'{service_name}-hash',
         'lifecycle_epoch': 1,
@@ -6773,6 +7299,7 @@ def _write_aggregate_qualification(path,
         'expectation_kind': kind,
         'expected_providers': providers,
         'request_priority': qualifier._REQUEST_PRIORITY,
+        'request_queue_timeout_seconds': profile.request_queue_timeout_seconds,
         'max_units': profile.max_units,
         'minimum_running': 100 if economic else 1,
         'peak_running': sum(peaks.values()),
@@ -6794,13 +7321,11 @@ def _write_aggregate_qualification(path,
         'baseline_qualified_observed_at': 3.0,
         'exact_request_count': count,
         'exact_request_successes': count,
-        'terminal_publication_timeout_seconds':
-            profile.terminal_publication_timeout_seconds,
+        'request_completion_timeout_seconds':
+            profile.request_completion_timeout_seconds,
         'campaign_prefix': campaign_prefix,
         'campaign_manifest_sha256': campaign_manifest_sha256,
-        'campaign_terminal_membership_sha256': campaign_manifest_sha256,
-        'ledger_request_delta': count,
-        'ledger_succeeded_delta': count,
+        'campaign_success_manifest_sha256': campaign_manifest_sha256,
         'samples': [
             _zero_qualification_sample(1.0, phase='baseline', iteration_id=1),
             _zero_qualification_sample(2.0, phase='baseline', iteration_id=2),
@@ -6833,7 +7358,6 @@ def _write_aggregate_qualification(path,
                 queue_depth=(stimulus if economic else queue_depth),
                 in_flight=(0 if economic else in_flight),
                 processing=(0 if economic else processing),
-                accepted=(0 if economic else active),
                 observed_at=(249.0 if economic else 129.0)) | {
                     'scale_iteration_id': 1,
                 },
@@ -6842,18 +7366,19 @@ def _write_aggregate_qualification(path,
                                          queue_depth=queue_depth,
                                          in_flight=in_flight,
                                          processing=processing,
-                                         accepted=active,
                                          observed_at=251.0)
             ] if economic else []),
             _request_evidence_sample(phase='final',
                                      queue_depth=0,
                                      in_flight=0,
                                      processing=0,
-                                     succeeded=count,
                                      observed_at=500.0),
         ],
         'finished_at': 1400.0,
         'outcome': 'passed',
+        'cleanup_scope': {
+            'cluster_identities': [],
+        },
     }
     if not economic:
         payload['authorized_economic_receipt_sha256'] = (
@@ -6870,16 +7395,24 @@ def _write_aggregate_cleanup(path,
                              outcome='passed'):
     qualification = json.loads(qualification_path.read_text(encoding='utf-8'))
 
-    def zero(index):
+    def zero(index, observed_at, zero_hold_elapsed_seconds):
         return {
-            'observed_at': float(index),
+            'observed_at': observed_at,
             'exact_zero': True,
             'zero_samples': index,
+            'zero_hold_elapsed_seconds': zero_hold_elapsed_seconds,
             'cleanup_claims': 0,
+            'cleanup_cluster_records': 0,
             'cleanup_debit_units': 0,
+            'cleanup_effect_capable_associations': 0,
+            'cleanup_blocking_requests': 0,
+            'cleanup_queue_deliveries': 0,
+            'cleanup_retention_pins': 0,
             'cleanup_provider_disks': 0,
             'cleanup_provider_instances': 0,
             'cleanup_provider_operations': 0,
+            'cleanup_replicas': 0,
+            'cleanup_service_rows': 0,
             'cleanup_waiters': 0,
             'cleanup_provider_by_cloud': {
                 cloud: {
@@ -6896,7 +7429,7 @@ def _write_aggregate_cleanup(path,
         }
 
     payload = {
-        'schema_version': 2,
+        'schema_version': 4,
         'service_name': service_name,
         'service_hash': service_hash or f'{service_name}-hash',
         'lifecycle_epoch': 1,
@@ -6912,9 +7445,17 @@ def _write_aggregate_cleanup(path,
             qualification['qualification_projection_sha256'],
         'qualification_receipt_sha256': hashlib.sha256(
             qualification_path.read_bytes()).hexdigest(),
+        'started_at': 1.0,
+        'finished_at': 362.0,
         'outcome': outcome,
         'zero_samples': 3,
-        'samples': [zero(1), zero(2), zero(3)],
+        'zero_hold_required_seconds': 360.0,
+        'zero_hold_elapsed_seconds': 360.0,
+        'samples': [
+            zero(1, 1.0, 0.0),
+            zero(2, 181.0, 180.0),
+            zero(3, 361.0, 360.0),
+        ],
     }
     path.write_text(json.dumps(payload), encoding='utf-8')
 
@@ -7050,9 +7591,8 @@ def test_schema_eleven_accepts_positive_after_queue_fully_dispatches(tmp_path):
     positive.update(
         _request_evidence_sample(phase='positive',
                                  queue_depth=0,
-                                 in_flight=800,
-                                 processing=100,
-                                 accepted=800,
+                                 in_flight=400,
+                                 processing=0,
                                  observed_at=200.0))
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
@@ -7060,9 +7600,8 @@ def test_schema_eleven_accepts_positive_after_queue_fully_dispatches(tmp_path):
                                            qualifier.ExpectationKind.ECONOMIC)
 
 
-def test_schema_thirteen_accepts_attributed_resident_scale_with_incomplete_occupancy(
-        tmp_path):
-    """Offline verification applies the same partial-observation capability."""
+def test_receipt_rejects_scale_with_incomplete_http_occupancy(tmp_path):
+    """Offline verification requires one complete synchronous projection."""
     args = _aggregate_args(tmp_path)
     receipt = pathlib.Path(args.economic_receipt)
     payload = json.loads(receipt.read_text(encoding='utf-8'))
@@ -7081,10 +7620,10 @@ def test_schema_thirteen_accepts_attributed_resident_scale_with_incomplete_occup
                                  scale_iteration_id=1))
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
-    evidence = qualifier._read_qualification_evidence(
-        receipt, qualifier.ExpectationKind.ECONOMIC)
-
-    assert evidence.scale_elapsed_seconds == 246.0
+    with pytest.raises(qualifier.QualificationError,
+                       match='unattributed scale demand'):
+        qualifier._read_qualification_evidence(
+            receipt, qualifier.ExpectationKind.ECONOMIC)
 
 
 @pytest.mark.parametrize(
@@ -7115,7 +7654,7 @@ def test_schema_thirteen_rejects_invalid_incomplete_occupancy_scale_evidence(
     with pytest.raises(qualifier.QualificationError,
                        match='unattributed scale demand'):
         qualifier._validate_request_evidence(
-            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+            payload, profile=qualifier.PROFILES['scale'])
 
 
 def test_schema_thirteen_rejects_partial_scale_without_current_demand(tmp_path):
@@ -7138,7 +7677,7 @@ def test_schema_thirteen_rejects_partial_scale_without_current_demand(tmp_path):
     with pytest.raises(qualifier.QualificationError,
                        match='unattributed scale demand'):
         qualifier._validate_request_evidence(
-            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+            payload, profile=qualifier.PROFILES['scale'])
 
 
 @pytest.mark.parametrize(
@@ -7184,7 +7723,7 @@ def test_request_scale_iteration_ids_are_contiguous_in_receipt_order(
 
     with pytest.raises(qualifier.QualificationError, match='contiguous'):
         qualifier._validate_request_evidence(
-            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+            payload, profile=qualifier.PROFILES['scale'])
 
 
 def test_request_scale_timestamps_are_strictly_increasing(tmp_path):
@@ -7202,7 +7741,7 @@ def test_request_scale_timestamps_are_strictly_increasing(tmp_path):
     with pytest.raises(qualifier.QualificationError,
                        match='scale timestamps.*strictly increasing'):
         qualifier._validate_request_evidence(
-            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+            payload, profile=qualifier.PROFILES['scale'])
 
 
 def test_request_evidence_requires_canonical_phase_order(tmp_path):
@@ -7217,7 +7756,7 @@ def test_request_evidence_requires_canonical_phase_order(tmp_path):
     with pytest.raises(qualifier.QualificationError,
                        match='canonical request phase order'):
         qualifier._validate_request_evidence(
-            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+            payload, profile=qualifier.PROFILES['scale'])
 
 
 @pytest.mark.parametrize(
@@ -7240,7 +7779,7 @@ def test_malformed_request_scale_fields_raise_qualification_error(
     with pytest.raises(qualifier.QualificationError,
                        match='request telemetry|scale demand'):
         qualifier._validate_request_evidence(
-            payload, profile=qualifier.PROFILES['scale'], exact_count=10_000)
+            payload, profile=qualifier.PROFILES['scale'])
 
 
 def test_provider_scale_must_precede_terminal_request_evidence(tmp_path):
@@ -7325,8 +7864,8 @@ def test_qualification_receipt_binds_exact_request_priority(
             receipt, qualifier.ExpectationKind.ECONOMIC)
 
 
-@pytest.mark.parametrize('mutation', ('prefix', 'manifest', 'terminal'))
-def test_qualification_receipt_rejects_substituted_campaign_membership(
+@pytest.mark.parametrize('mutation', ('prefix', 'manifest', 'success'))
+def test_qualification_receipt_rejects_substituted_campaign_manifest(
         tmp_path, mutation):
     args = _aggregate_args(tmp_path)
     receipt = pathlib.Path(args.economic_receipt)
@@ -7336,7 +7875,7 @@ def test_qualification_receipt_rejects_substituted_campaign_membership(
     elif mutation == 'manifest':
         payload['campaign_manifest_sha256'] = '0' * 64
     else:
-        payload['campaign_terminal_membership_sha256'] = '0' * 64
+        payload['campaign_success_manifest_sha256'] = '0' * 64
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
     with pytest.raises(qualifier.QualificationError, match='malformed'):
@@ -7691,7 +8230,7 @@ def test_aggregate_accepts_arrivals_after_terminal_success_frontier(tmp_path):
         'provider_running_gpu_units': 100,
     })
     _move_scale_observation(increased_scale, 351.0)
-    _set_scale_campaign_frontier(increased_scale, offered=801, succeeded=1)
+    _set_scale_campaign_frontier(increased_scale, offered=401, succeeded=1)
     increased_gcp = increased_scale['provider_by_cloud']['gcp']
     increased_gcp['running'] = 50
     increased_gcp['running_gpu_units'] = 50
@@ -7739,9 +8278,9 @@ def test_aggregate_rejects_arrivals_ahead_of_terminal_success_frontier(
     payload = json.loads(receipt.read_text(encoding='utf-8'))
     scale = next(
         sample for sample in payload['samples'] if sample['phase'] == 'scale')
-    scale['lb_unique_job_arrivals_60s'] = 802
-    scale['lb_unique_job_arrivals_300s'] = 802
-    _set_scale_campaign_frontier(scale, offered=801, succeeded=1)
+    scale['lb_unique_job_arrivals_60s'] = 402
+    scale['lb_unique_job_arrivals_300s'] = 402
+    _set_scale_campaign_frontier(scale, offered=401, succeeded=1)
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
     with pytest.raises(qualifier.QualificationError,
@@ -7863,15 +8402,14 @@ def test_aggregate_rejects_nonzero_telemetry_baseline_before_zero(tmp_path):
         qualifier.aggregate_evidence(args)
 
 
-def test_aggregate_rejects_noncanonical_ledger_state_projection(tmp_path):
+def test_aggregate_rejects_incoherent_http_request_projection(tmp_path):
     args = _aggregate_args(tmp_path)
     receipt = pathlib.Path(args.economic_receipt)
     payload = json.loads(receipt.read_text(encoding='utf-8'))
-    del payload['request_telemetry_samples'][0]['ledger_state_counts'][0]
+    payload['request_telemetry_samples'][0]['http_in_flight_requests'] = 1
     receipt.write_text(json.dumps(payload), encoding='utf-8')
 
-    with pytest.raises(qualifier.QualificationError,
-                       match='telemetry evidence is malformed'):
+    with pytest.raises(qualifier.QualificationError, match='request baseline'):
         qualifier.aggregate_evidence(args)
 
 
@@ -7983,95 +8521,42 @@ def test_aggregate_rejects_replayed_or_incomplete_cleanup_samples(
         qualifier.aggregate_evidence(args)
 
 
-@pytest.mark.parametrize('gpu_units', (1, 4))
-def test_worker_exposes_exact_multi_gpu_capacity(gpu_units):
-    config = yaml.safe_load(
-        (_FIXTURE_DIR / 'service.yaml').read_text(encoding='utf-8'))
-    with socket.socket() as port_socket:
-        port_socket.bind(('127.0.0.1', 0))
-        port = port_socket.getsockname()[1]
-    process = subprocess.Popen(
-        ['bash', '-c', config['run']],
-        env={
-            **os.environ,
-            'PORT': str(port),
-            'SKYPILOT_NUM_GPUS_PER_NODE': str(gpu_units),
-        },
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True)
-    endpoint = f'http://127.0.0.1:{port}'
+@pytest.mark.parametrize('mutation', ['policy', 'elapsed', 'sample_elapsed'])
+def test_aggregate_rejects_cleanup_without_full_quiescence_hold(
+        tmp_path, mutation):
+    args = _aggregate_args(tmp_path)
+    cleanup_path = pathlib.Path(args.economic_cleanup_receipt)
+    payload = json.loads(cleanup_path.read_text(encoding='utf-8'))
+    if mutation == 'policy':
+        payload['zero_hold_required_seconds'] = 1
+    elif mutation == 'elapsed':
+        payload['zero_hold_elapsed_seconds'] = 359
+        payload['samples'][-1]['zero_hold_elapsed_seconds'] = 359
+    else:
+        payload['samples'][-1]['zero_hold_elapsed_seconds'] = 359
+    cleanup_path.write_text(json.dumps(payload), encoding='utf-8')
 
-    def exact_request(index: int, duration: float) -> urllib.request.Request:
-        request_id = f'exact-execution-{index}'
-        body, intent = qualifier._canonical_exact_request(request_id, duration)
-        return urllib.request.Request(
-            f'{endpoint}/v1/models/model:predict',
-            data=body,
-            headers={
-                'Content-Type': 'application/json',
-                'X-SkyServe-Async-Ledger-Protocol': '1',
-                'X-SkyServe-Service-Incarnation': 'incarnation-a',
-                'X-SkyServe-Async-Intent-Sha256': intent,
-                'X-SkyServe-Execution-Request-Id': request_id,
-                'X-SkyServe-Async-Attempt-Id': str(uuid.UUID(int=index + 1)),
-                'X-SkyServe-Async-Attempt-No': '1',
-                'X-SkyServe-Async-Ledger-Revision': '1',
-            },
-            method='POST')
+    with pytest.raises(qualifier.QualificationError):
+        qualifier.aggregate_evidence(args)
 
-    capacity_request = urllib.request.Request(
-        f'{endpoint}/v1/models/model:predict',
-        data=json.dumps({
-            'action': 'async_capacity'
-        }).encode(),
-        headers={'Content-Type': 'application/json'},
-        method='POST')
-    try:
-        deadline = time.monotonic() + 5
-        while True:
-            try:
-                with urllib.request.urlopen(f'{endpoint}/health',
-                                            timeout=1) as response:
-                    assert json.load(response) == {'status': 'ok'}
-                break
-            except urllib.error.URLError:
-                if process.poll() is not None:
-                    _, stderr = process.communicate(timeout=1)
-                    pytest.fail(f'Inline worker exited early: {stderr}')
-                if time.monotonic() >= deadline:
-                    pytest.fail('Inline worker did not become healthy.')
-                time.sleep(0.05)
 
-        with urllib.request.urlopen(capacity_request, timeout=2) as response:
-            capacity = json.load(response)
-        assert capacity['running_count'] == 0
-        assert capacity['predict_concurrency'] == gpu_units
-        assert capacity['max_workers'] == gpu_units
+@pytest.mark.parametrize('field', [
+    'cleanup_cluster_records', 'cleanup_replicas', 'cleanup_service_rows',
+    'cleanup_effect_capable_associations', 'cleanup_blocking_requests',
+    'cleanup_queue_deliveries', 'cleanup_retention_pins'
+])
+@pytest.mark.parametrize('mutation', ['missing', 'nonzero'])
+def test_aggregate_requires_complete_zero_database_cleanup_graph(
+        tmp_path, field, mutation):
+    args = _aggregate_args(tmp_path)
+    cleanup_path = pathlib.Path(args.economic_cleanup_receipt)
+    payload = json.loads(cleanup_path.read_text(encoding='utf-8'))
+    if mutation == 'missing':
+        del payload['samples'][-1][field]
+    else:
+        payload['samples'][-1][field] = 1
+    cleanup_path.write_text(json.dumps(payload), encoding='utf-8')
 
-        for index in range(gpu_units):
-            with urllib.request.urlopen(exact_request(index, 0.75),
-                                        timeout=2) as response:
-                assert response.status == 202
-                assert json.load(response) == {
-                    'request_id': f'exact-execution-{index}',
-                    'status': 'accepted',
-                }
-        with urllib.request.urlopen(capacity_request, timeout=2) as response:
-            assert json.load(response)['running_count'] == gpu_units
-
-        with pytest.raises(urllib.error.HTTPError) as rejected:
-            urllib.request.urlopen(exact_request(gpu_units, 0.75), timeout=2)
-        assert rejected.value.code == 429
-        assert json.load(rejected.value) == {'error': 'worker capacity full'}
-
-        time.sleep(0.85)
-        with urllib.request.urlopen(capacity_request, timeout=2) as response:
-            assert json.load(response)['running_count'] == 0
-    finally:
-        process.terminate()
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=2)
+    with pytest.raises(qualifier.QualificationError,
+                       match='sustained exact zero'):
+        qualifier.aggregate_evidence(args)

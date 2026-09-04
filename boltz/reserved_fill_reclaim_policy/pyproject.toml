@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "boltz-skypilot-reserved-fill-reclaim-policy"
 version = "0.0.0"
 description = "Boltz deployment policy for SkyServe reserved-capacity reclaim"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 
 [project.entry-points."skypilot.reserved_fill_reclaim_policy"]
 boltz = "boltz_reserved_fill_reclaim_policy.policy:BoltzReservedFillReclaimPolicy"

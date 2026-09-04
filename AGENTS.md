@@ -82,34 +82,31 @@ skypilot/
 
 ### Supported Python Runtime
 
-- CPython 3.14 or newer is the only supported runtime.
-- Python 3.13 and older are not a compatibility target. Do not add new
-  compatibility branches, tests, packaging metadata, or CI gates for those
-  versions.
-- The deployed hub image still runs CPython 3.10: `boltz/Dockerfile.overlay`
-  builds on the upstream `berkeleyskypilot/skypilot-nightly` base, and every
-  role (API server, controller, executor) reported Python 3.10.19 on
-  2026-09-02. The repository `Dockerfile` (`python:3.14.5-slim`) is not that
-  image. Until the overlay base moves to Python 3.14, deployed code paths must
-  keep working on 3.10: keep the compatibility they already rely on, and keep
-  changes that need Python 3.11+ syntax, stdlib, or behavior undeployed.
-- Existing controller, worker, packaging, or CI pins below Python 3.14 are
-  migration debt rather than a compatibility contract; retire them together
-  with the overlay base image, not piecemeal.
+- CPython 3.14 or newer is the only supported development and control-plane
+  runtime. Python 3.13 and older are not client, API-server, controller, or CI
+  compatibility targets; do not add compatibility branches or gates for them.
+- The generic wheel is temporarily also installed into SkyPilot's managed VM
+  worker environment on Python 3.10 because the remote runtime pins Ray 2.9.3,
+  whose wheels stop at CPython 3.11. This is a named deployment dependency, not
+  permission to broaden old-Python compatibility elsewhere. Retire the Ray
+  pin, worker bootstrap, generic wheel floor, syntax floor, and worker tests in
+  one coordinated Python 3.14 migration; do not change only the metadata or
+  pretend the old worker is already 3.14-compatible.
 
 ### Environment Setup
 
 ```bash
-# Create virtual environment with uv (Python 3.14, the target runtime; the
-# deployed hub image still runs 3.10, see "Supported Python Runtime")
+# Create virtual environment with uv (Python 3.14, matching production)
 # --seed is required to ensure pip is installed (needed for building wheels)
 uv venv --seed --python 3.14
 source .venv/bin/activate
 
-# Install in editable mode with all cloud support
-uv pip install -e ".[all]"
-# Or specific clouds only:
-# uv pip install -e ".[aws,gcp,kubernetes]"
+# Install the production control-plane cloud set. It resolves without
+# prerelease dependencies on Python 3.14.
+uv pip install -e ".[aws,gcp,kubernetes]"
+# The broad development image may request every provider; Azure CLI currently
+# requires prerelease dependency resolution:
+# uv pip install --prerelease allow -e ".[all]"
 
 # Install development dependencies
 uv pip install -r requirements-dev.txt
@@ -231,6 +228,22 @@ those effects; success or failure of the verifier must not determine when the
 observed work finishes or when its terminal state is published. A failed proof
 may stop future, never-offered stimulus, but the driver must drain already-
 offered work through its real terminal-publication path before it exits.
+
+For workflows whose backend cannot call the terminal reducer directly, keep a
+transport-only reporter distinct from both backend and verifier. The backend
+must author one immutable terminal envelope; the reporter may validate and
+relay those exact bytes only to a configuration-owned, same-service endpoint.
+It must not construct terminal fields, select an authority from request data or
+``Host``, receive an edge credential at the backend, or turn missing backend
+output into success. Test the complete middleware/proxy/reporter boundary and
+include structural negatives proving that credentials and callback authority
+cannot cross into the backend.
+
+Treat an HTTP admission response and its streamed terminal body as two protocol
+phases with separate absolute deadlines. The admission/queue deadline ends
+when exact accepted headers arrive; subsequent backend work and terminal-body
+delivery use the terminal deadline. Never let a near-deadline valid admission
+inherit only the few milliseconds left in its queue budget.
 
 Concurrent stimulus drivers that acquire a terminal-publication obligation
 must use one structured, all-results worker cohort. The first failure closes
@@ -441,6 +454,14 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
   queued submissions and retained payload bytes, nested SDK pools and
   connections, nested fan-out, and child processes. Give the shared owner one
   explicit aggregate budget and make internal lanes sum to that budget.
+- Match connection lifetime to useful database work and process reuse. A
+  daemon that serves many operations may own one explicitly bounded reusable
+  pool. A disposable process must not retain idle sessions across unrelated
+  provider or application work: use transient connections, or explicitly
+  dispose a bounded pool as soon as its last database phase ends. Test this
+  through the real spawned-process wrapper; a safe-looking per-process limit
+  can still multiply into hundreds of retained sessions when many long-lived
+  children overlap.
 - Regression tests must exercise sibling producers concurrently through the
   production scheduling interface and assert aggregate active work, workers,
   bounded queued work, cancellation, terminal shutdown, and progress under
@@ -465,8 +486,19 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
   completion.
 - Exercise the production proof coordinator with injected observer failure,
   timeout, and caller cancellation. These cases must drain all already-offered
-  work, publish terminal evidence, run the scope-fenced finalizer exactly once,
-  and preserve the original proof verdict without leaking provider resources.
+  work, publish terminal evidence, invoke one scope-fenced finalizer while its
+  process survives, and preserve the original proof verdict without leaking
+  provider resources.
+- A billable harness must name separate bounds for proof collection, accepted-
+  work settlement, finalizer start, provider cleanup, and the total billable
+  horizon. A local ``finally`` block guarantees cleanup only while its process
+  and event loop survive; do not call it durable or guaranteed across
+  ``SIGKILL``, pod loss, or node loss without an external lease owner/reaper.
+  Otherwise persist an explicit operator-escalation receipt for owner loss.
+- A local HTTP/CLI timeout or client death never proves remote mutation
+  absence. Give every billable mutation a preassigned durable idempotency
+  identity, retry until admission is observed, then require exact terminal
+  execution quiescence before proving absence.
 - Model provider mutation submission and provider-state observation as separate
   phases with separate bounded capacity. A scarce mutation slot may cover the
   exact native submit call, but must never remain occupied while polling for
@@ -477,6 +509,18 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
 - Releasing a mutation slot is not permission to release economic identity.
   Retain claims, debits, associations, pointers, and request-retention pins
   until exact provider evidence authorizes their atomic settlement.
+- Logical settlement is not physical or graph completion. Define the full
+  cleanup DAG and its ordered durable receipts before writing a finalizer, then
+  make the terminal gate observe every live vertex: provider resources and
+  operations, service/replica rows, claims, all retained waiters (not only
+  fresh heartbeats), effect-capable associations, unquiesced request roots,
+  queue deliveries, retention pins, and exact auxiliary records. Historical
+  associations and requests may remain only after the production classifier
+  proves them terminal and execution-quiesced. Freeze every discovered exact
+  provider/auxiliary name-and-UUID identity monotonically: history GC must
+  never shrink later absence scope. A debit reaching zero must never hide a
+  still-retained replica or global cluster record. Fence every read to the
+  original lifecycle and treat same-name reincarnation as a conflict.
 - Never run synchronous database, provider, filesystem, subprocess, or DNS I/O
   on an event loop that owns request liveness, leases, deadlines, cancellation,
   or safety heartbeats. Move it behind one bounded single-flight interface and
@@ -490,6 +534,22 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
   regressions must include a slow observation and a shifted synthetic clock
   origin so dependency latency cannot become an accidental extra interval or
   an effectively unbounded sleep.
+- A loop deadline does not bound an awaited operation by itself. Apply the
+  remaining absolute monotonic phase budget to every provider, database, HTTP,
+  subprocess, and composite-observer await before it starts; never reset a
+  relative timeout on retry. Tests must stall each facet and prove bounded exit,
+  preserved cancellation semantics, accepted-work drain, and single in-process
+  finalizer invocation. Remember that canceling `asyncio.to_thread()` does not stop its
+  synchronous body. Native connect/read/retry timeouts are sufficient only
+  when they bound the entire synchronous operation, including pagination and
+  SDK retries. Otherwise run the adapter in a single-flight child process or
+  persistent dependency/client-lifetime child session. Separate same-pod
+  children and filtered environments are defense in depth, not security
+  sandboxes or least-privilege boundaries, unless OS/runtime isolation proves
+  otherwise. On timeout or cancellation,
+  terminate its whole process group, wait a bounded grace period, kill if
+  necessary, and prove all descendants extinct before returning. Explicitly
+  close and reap persistent sessions before their owner exits.
 - Cancellation, owner loss, and interrupted observation mean ``UNKNOWN``; they
   are not negative provider or health evidence. A canceled operation must not
   increment failure counters, revoke capacity, or publish a failed receipt.

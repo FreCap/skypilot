@@ -758,18 +758,20 @@ def test_paid_provider_teardown_with_live_cluster_submits_without_core_down():
         replica_id=context.replica_id,
         paid_capacity_pool_key=(_canonical_paid_pool_key()),
         status_property=status)
+    persisted = types.SimpleNamespace(status_property=types.SimpleNamespace(
+        sky_down_status=common_utils.ProcessStatus.FAILED))
     submission = types.SimpleNamespace(disposition=types.SimpleNamespace(
         value='accepted'))
-
-    def _submit(*_args, **_kwargs):
-        status.sky_down_status = common_utils.ProcessStatus.FAILED
-        return submission
 
     with mock.patch.object(replica_managers, 'terminate_cluster') as down, \
          mock.patch.object(
              replica_managers.non_pool_launch_reconciliation,
-             'submit_paid_provider_teardown',
-             side_effect=_submit) as submit:
+             'submit_aws_paid_provider_teardown',
+             return_value=submission) as submit, \
+         mock.patch.object(
+             replica_managers.non_pool_launch_reconciliation.request_postgres,
+             'mark_bound_non_pool_provider_teardown_observation_pending',
+             return_value=persisted) as mark_pending:
         replica_managers.terminate_bound_non_pool_provider_present_cluster(
             context,
             info,
@@ -785,9 +787,45 @@ def test_paid_provider_teardown_with_live_cluster_submits_without_core_down():
                                    info,
                                    authority,
                                    continue_guard=mock.ANY)
+    mark_pending.assert_called_once_with(context, authority)
+    assert ordinary_launch_binding.provider_present_teardown_phase(
+        persisted) is (ordinary_launch_binding.ProviderPresentTeardownPhase.
+                       ABSENCE_OBSERVATION_PENDING)
     assert ordinary_launch_binding.provider_present_teardown_phase(info) is (
-        ordinary_launch_binding.ProviderPresentTeardownPhase.
-        ABSENCE_OBSERVATION_PENDING)
+        ordinary_launch_binding.ProviderPresentTeardownPhase.SUBMISSION_RUNNING)
+
+
+def test_paid_provider_teardown_rejects_noop_durable_pending_transition():
+    context = _bound_non_pool_context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    authority = _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    info = types.SimpleNamespace(
+        replica_id=context.replica_id,
+        paid_capacity_pool_key=(_canonical_paid_pool_key()),
+        status_property=types.SimpleNamespace(
+            sky_down_status=common_utils.ProcessStatus.RUNNING))
+    submission = types.SimpleNamespace(disposition=types.SimpleNamespace(
+        value='accepted'))
+
+    with mock.patch.object(replica_managers, 'terminate_cluster') as down, \
+         mock.patch.object(
+             replica_managers.non_pool_launch_reconciliation,
+             'submit_aws_paid_provider_teardown',
+             return_value=submission) as submit, \
+         mock.patch.object(
+             replica_managers.non_pool_launch_reconciliation.request_postgres,
+             'mark_bound_non_pool_provider_teardown_observation_pending',
+             return_value=info) as mark_pending, \
+         pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='did not durably reach observation pending'):
+        replica_managers.terminate_bound_non_pool_provider_present_cluster(
+            context, info, authority, mock.Mock(), 'svc-3')
+
+    down.assert_not_called()
+    submit.assert_called_once()
+    mark_pending.assert_called_once_with(context, authority)
 
 
 def test_kueue_absence_projection_runs_only_after_fenced_down():
@@ -1283,12 +1321,19 @@ class TestBackgroundDutyOwnershipLifecycle:
 
     def test_stopped_prober_does_not_start_new_round(self):
         mgr = self._stopped_manager()
+        mgr._manager_daemon_stop = threading.Event()
         mgr._probe_all_replicas = mock.Mock()
         mgr._service_name = 'svc'
         mgr._update_mode = None
         mgr._tick_version_spec_cache = {}
         mgr._db_fence_kwargs = mock.Mock(return_value={})
         mgr._get_endpoint_probe_interval_seconds = mock.Mock(return_value=1)
+        shutdown_order = []
+        lane = mock.Mock()
+        lane.close.side_effect = lambda: shutdown_order.append('provider-lane')
+        mgr._non_pool_reconciliation_lane = lane
+        mgr._shutdown_remote_io_executor = mock.Mock(
+            side_effect=lambda: shutdown_order.append('remote-io'))
 
         with mock.patch.object(
                 replica_managers.serve_utils,
@@ -1300,6 +1345,9 @@ class TestBackgroundDutyOwnershipLifecycle:
             mgr._replica_prober()
 
         mgr._probe_all_replicas.assert_not_called()
+        lane.close.assert_called_once_with()
+        mgr._shutdown_remote_io_executor.assert_called_once_with()
+        assert shutdown_order == ['provider-lane', 'remote-io']
 
     def test_ownership_loss_after_probe_skips_interval_spec_read(self):
         mgr = self._stopped_manager()
@@ -3178,6 +3226,14 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         if reserved_fill:
             for field, value in reserved_values.items():
                 setattr(info, field, value)
+        resource_identity = None
+        if not reserved_fill:
+            resource_identity = (
+                ordinary_launch_binding.
+                derive_fresh_ordinary_paid_resource_action_identity(
+                    replica_id=context.replica_id,
+                    replica_record_id=context.replica_record_id,
+                    cluster_name='svc-3'))
         return {
             'association_id': context.association_id,
             'request_id': context.request_id,
@@ -3238,6 +3294,14 @@ class TestBoundOrdinaryLaunchManagerIntegration:
             '_replica_version': 1,
             '_replica_cluster_name': 'svc-3',
             '_replica_paid_pool_key': paid_pool_key,
+            '_replica_incarnation': (None if resource_identity is None else
+                                     resource_identity.replica_incarnation),
+            '_replica_desired_generation':
+                (None if resource_identity is None else
+                 resource_identity.desired_generation),
+            '_replica_sky_cluster_record_uuid':
+                (None if resource_identity is None else
+                 resource_identity.sky_cluster_record_uuid),
             '_request_status': 'PENDING',
             '_request_generation': 0,
             '_request_claim_token': None,
@@ -4550,7 +4614,7 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         finish.assert_not_called()
         provider_down.assert_not_called()
 
-    def test_projected_paid_absence_cleanup_is_database_only(self):
+    def test_projected_paid_absence_cleanup_uses_exact_finalizer(self):
         manager = _make_manager()
         runtime = manager._legacy_mutation_runtime_state()
         info = _fake_replica_info(
@@ -4575,16 +4639,66 @@ class TestBoundOrdinaryLaunchManagerIntegration:
                                'get_replica_info_from_id',
                                return_value=info), \
              mock.patch.object(
-                 replica_managers.request_postgres,
-                 'retire_bound_non_pool_projected_paid_provider_absence',
-                 return_value=True) as retire, \
+                 replica_managers,
+                 'finalize_projected_paid_provider_absence',
+                 return_value=True) as finalize, \
              mock.patch.object(replica_managers, 'terminate_cluster') \
                  as provider_down:
             assert manager._finalize_projected_provider_absence_cleanup(3)
 
-        retire.assert_called_once_with('svc', 3, info.replica_record_id)
+        finalize.assert_called_once_with(
+            'svc',
+            3,
+            info.replica_record_id,
+            info.cluster_name,
+            provider_operation_deadline_monotonic=None,
+            continue_guard=None)
         manager._handle_sky_down_finish.assert_not_called()
         provider_down.assert_not_called()
+
+    def test_projected_paid_auxiliary_finalization_uses_bounded_lane(self):
+        manager = _make_manager()
+        info = _fake_replica_info(
+            3, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.replica_record_id = str(
+            uuid.UUID('22222222-2222-4222-8222-222222222222'))
+        info.reserved_fill = False
+        info.is_zero_cost = False
+        info.is_spot = True
+        info.paid_capacity_pool_key = _canonical_paid_pool_key()
+        info.status_property.sky_launch_status = common_utils.ProcessStatus.FAILED
+        info.status_property.sky_down_status = common_utils.ProcessStatus.SUCCEEDED
+        info.status_property.failed_spot_availability = True
+        lane = mock.Mock()
+        lane.contains.return_value = False
+        lane.schedule.return_value = True
+        manager._non_pool_reconciliation_lane = lane
+
+        with mock.patch.object(
+                manager,
+                '_finalize_projected_provider_absence_cleanup',
+                return_value=True) as finalize, \
+             mock.patch.object(manager, '_terminate_replica') as terminate:
+            manager._reconcile_failed_cleanup([info])
+
+            finalize.assert_not_called()
+            lane.schedule.assert_called_once()
+            key, operation = lane.schedule.call_args.args
+            assert key == (info.replica_id, info.replica_record_id)
+            result = operation()
+
+        assert result == replica_managers._ProjectedPaidAbsenceFinalization(
+            replica_id=info.replica_id,
+            replica_record_id=info.replica_record_id)
+        call = finalize.call_args
+        assert call.args == (info.replica_id,)
+        deadline = call.kwargs['provider_operation_deadline_monotonic']
+        assert (time.monotonic() < deadline <= time.monotonic() +
+                replica_managers._PAID_PROVIDER_FINALIZATION_TIMEOUT_SECONDS)
+        continue_guard = call.kwargs['continue_guard']
+        assert callable(continue_guard)
+        assert continue_guard()
+        terminate.assert_not_called()
 
     @pytest.mark.parametrize('down_status', [
         common_utils.ProcessStatus.SCHEDULED,

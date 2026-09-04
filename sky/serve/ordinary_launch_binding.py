@@ -106,6 +106,12 @@ NON_POOL_CAPABILITY_COHORT_EPOCH = (
 # a later tokenized retry.
 ORDINARY_PAID_AWS_CLIENT_TOKEN_COHORT_FLOOR = 11
 ORDINARY_PAID_AWS_REPLACEMENT_CREATE_COHORT_FLOOR = 13
+# Cohort 16 is the first cohort whose fresh ordinary-paid admission commits a
+# resource-action identity with the executable request and whose executor uses
+# that identity for the global cluster record.  Keep this floor stable: older
+# rows may be retained for cleanup but cannot safely acquire a UUID after the
+# provider effect has started.
+ORDINARY_PAID_RESOURCE_ACTION_IDENTITY_COHORT_FLOOR = 16
 ORDINARY_PAID_AWS_ABSENCE_SETTLE_SECONDS = 60
 # Cohort 12 is the first cohort whose GCP create timeout preserves the zone
 # operation record and whose provider reconciliation reads VM, disk, and
@@ -122,8 +128,17 @@ _ASSOCIATION_NAMESPACE = uuid.UUID('5ab85493-af88-4e82-bdda-8cbe1a8b15ea')
 _REQUEST_NAMESPACE = uuid.UUID('f77cfdf5-95c4-4882-a768-30496fd23c97')
 _ORDINARY_LAUNCH_SUBMISSION_NAMESPACE = uuid.UUID(
     '58a82cb0-534c-5a5d-bb5d-681759e60469')
+_ORDINARY_PAID_REPLICA_INCARNATION_NAMESPACE = uuid.UUID(
+    '1fa8f58e-acde-49fb-b545-cd53c6ce5cab')
+_ORDINARY_PAID_CLUSTER_RECORD_NAMESPACE = uuid.UUID(
+    'e1cffd21-1c9d-4545-962c-95693f0a80b3')
 _LEGACY_SCOPE_NAMESPACE = uuid.UUID('85efcb78-8e08-4d18-bc25-c9de88377399')
 _LEGACY_EVENT_NAMESPACE = uuid.UUID('1daed865-c0b3-40e0-bd33-e65f752df996')
+_FRESH_PAID_RESOURCE_ACTION_COLUMNS = (
+    'replica_incarnation',
+    'desired_generation',
+    'sky_cluster_record_uuid',
+)
 
 
 class EffectPhase(str, enum.Enum):
@@ -1377,6 +1392,7 @@ class PreparedFreshOrdinaryPaidMember:
     request_id: str
     paid_capacity_pool_key: str
     profile: NonPoolLaunchProfile
+    resource_action_identity: serve_state.ReplicaResourceActionIdentity
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1902,6 +1918,58 @@ def derive_ordinary_launch_submission_id(
     material = (f'{service_name}\0{replica_id}\0{replica_record_id}\0'
                 f'{launch_generation}')
     return uuid.uuid5(_ORDINARY_LAUNCH_SUBMISSION_NAMESPACE, material)
+
+
+def derive_fresh_ordinary_paid_resource_action_identity(
+    *,
+    replica_id: int,
+    replica_record_id: uuid.UUID | str,
+    cluster_name: str,
+) -> serve_state.ReplicaResourceActionIdentity:
+    """Derive one initial paid replica's action identity without state.
+
+    ``replica_record_id`` is the immutable row incarnation already carried by
+    the bound request.  Separate UUID namespaces keep the replica incarnation
+    and global cluster-record identity semantically distinct without adding a
+    second wire representation that could drift.
+    """
+    replica_id = _positive_int(replica_id, 'replica_id')
+    replica_record_id = _canonical_uuid(replica_record_id, 'replica_record_id')
+    cluster_name = _nonempty(cluster_name, 'cluster_name')
+    material = str(replica_record_id)
+    return serve_state.ReplicaResourceActionIdentity(
+        replica_id=replica_id,
+        cluster_name=cluster_name,
+        replica_incarnation=uuid.uuid5(
+            _ORDINARY_PAID_REPLICA_INCARNATION_NAMESPACE, material),
+        desired_generation=1,
+        sky_cluster_record_uuid=uuid.uuid5(
+            _ORDINARY_PAID_CLUSTER_RECORD_NAMESPACE, material))
+
+
+def fresh_ordinary_paid_resource_action_identity_from_launch_context(
+    launch_context: Mapping[str, Any],
+    cluster_name: str,
+) -> serve_state.ReplicaResourceActionIdentity | None:
+    """Decode the cohort-gated action identity used by cluster persistence."""
+    if (not isinstance(launch_context, Mapping) or
+            BINDING_PROTOCOL_VERSION_KEY not in launch_context):
+        return None
+    context = parse_bound_non_pool_launch_context(launch_context)
+    if context.profile.kind is not NonPoolLaunchProfileKind.ORDINARY_PAID:
+        return None
+    if (context.capability_cohort_epoch
+            < ORDINARY_PAID_RESOURCE_ACTION_IDENTITY_COHORT_FLOOR):
+        return None
+    if (context.capability_cohort_epoch > NON_POOL_CAPABILITY_COHORT_EPOCH or
+            context.launch_generation != 1):
+        raise OrdinaryLaunchBindingConflict(
+            'Fresh ordinary-paid launch has no supported resource-action '
+            'identity cohort or generation.')
+    return derive_fresh_ordinary_paid_resource_action_identity(
+        replica_id=context.replica_id,
+        replica_record_id=context.replica_record_id,
+        cluster_name=cluster_name)
 
 
 def build_binding_identity(
@@ -4453,6 +4521,12 @@ def prepare_fresh_ordinary_paid_batch_in_connection(
         if replica['ordinary_launch_association_id'] is not None:
             raise OrdinaryLaunchBindingConflict(
                 'Fresh paid batch replica already has a launch association.')
+        if any(
+                replica.get(column) is not None
+                for column in _FRESH_PAID_RESOURCE_ACTION_COLUMNS):
+            raise OrdinaryLaunchBindingConflict(
+                'Fresh paid batch replica already has a resource-action '
+                'identity.')
         info = _locked_replica_info(replica)
         snapshot = {
             'replica_id': target.replica_id,
@@ -4535,13 +4609,20 @@ def prepare_fresh_ordinary_paid_batch_in_connection(
             1)
         association_id, request_id = derive_binding_ids(
             tenant_scope, authority.service_workspace, submission_id)
+        resource_action_identity = (
+            derive_fresh_ordinary_paid_resource_action_identity(
+                replica_id=target.replica_id,
+                replica_record_id=target.replica_record_id,
+                cluster_name=target.cluster_name))
         prepared_members.append(
-            PreparedFreshOrdinaryPaidMember(target=target,
-                                            submission_id=submission_id,
-                                            association_id=association_id,
-                                            request_id=request_id,
-                                            paid_capacity_pool_key=pool_key,
-                                            profile=profile))
+            PreparedFreshOrdinaryPaidMember(
+                target=target,
+                submission_id=submission_id,
+                association_id=association_id,
+                request_id=request_id,
+                paid_capacity_pool_key=pool_key,
+                profile=profile,
+                resource_action_identity=(resource_action_identity)))
 
     association_ids = tuple(
         member.association_id for member in prepared_members)
@@ -4626,6 +4707,15 @@ def commit_prepared_fresh_ordinary_paid_batch_in_connection(
         if identity != expected:
             raise OrdinaryLaunchBindingConflict(
                 'Fresh paid request identity differs from its prepared row.')
+        expected_resource_identity = (
+            derive_fresh_ordinary_paid_resource_action_identity(
+                replica_id=target.replica_id,
+                replica_record_id=target.replica_record_id,
+                cluster_name=target.cluster_name))
+        if member.resource_action_identity != expected_resource_identity:
+            raise OrdinaryLaunchBindingConflict(
+                'Fresh paid resource-action identity differs from its '
+                'prepared row.')
         row = _identity_values(
             identity, 1, paid_capacity_pool_key=member.paid_capacity_pool_key)
         row.update({
@@ -4654,16 +4744,32 @@ def commit_prepared_fresh_ordinary_paid_batch_in_connection(
     pointer_values = sqlalchemy.values(
         sqlalchemy.column('replica_id', sqlalchemy.Integer),
         sqlalchemy.column('association_id', sqlalchemy.Uuid(as_uuid=True)),
-        name='fresh_paid_associations').data([(identity.replica_id,
-                                               identity.association_id)
-                                              for identity in identities])
+        sqlalchemy.column('replica_incarnation', sqlalchemy.Uuid(as_uuid=True)),
+        sqlalchemy.column('desired_generation', sqlalchemy.Integer),
+        sqlalchemy.column('sky_cluster_record_uuid',
+                          sqlalchemy.Uuid(as_uuid=True)),
+        name='fresh_paid_associations').data([
+            (identity.replica_id, identity.association_id,
+             member.resource_action_identity.replica_incarnation,
+             member.resource_action_identity.desired_generation,
+             member.resource_action_identity.sky_cluster_record_uuid)
+            for member, identity in zip(
+                prepared.members, identities, strict=True)
+        ])
     replicas = serve_state_schema.replicas_table
     pointed = connection.execute(
         sqlalchemy.update(replicas).where(
             replicas.c.service_name == authority.service_name,
             replicas.c.replica_id == pointer_values.c.replica_id,
-            replicas.c.ordinary_launch_association_id.is_(None)).values(
-                ordinary_launch_association_id=pointer_values.c.association_id))
+            replicas.c.ordinary_launch_association_id.is_(None),
+            replicas.c.replica_incarnation.is_(None),
+            replicas.c.desired_generation.is_(None),
+            replicas.c.sky_cluster_record_uuid.is_(None)).values(
+                ordinary_launch_association_id=pointer_values.c.association_id,
+                replica_incarnation=pointer_values.c.replica_incarnation,
+                desired_generation=pointer_values.c.desired_generation,
+                sky_cluster_record_uuid=(
+                    pointer_values.c.sky_cluster_record_uuid)))
     if pointed.rowcount != len(identities):
         raise OrdinaryLaunchBindingConflict(
             'Fresh paid replica pointer set changed during admission.')
@@ -5272,6 +5378,36 @@ def _validate_effect_rows(
           != context.receipt_protocol_version))):
         raise OrdinaryLaunchBindingConflict(
             'Bound request profile or capability cohort changed.')
+    if (isinstance(context, BoundNonPoolLaunchContext) and
+            context.profile.kind is NonPoolLaunchProfileKind.ORDINARY_PAID and
+            context.capability_cohort_epoch
+            >= ORDINARY_PAID_RESOURCE_ACTION_IDENTITY_COHORT_FLOOR):
+        if context.launch_generation != 1:
+            raise OrdinaryLaunchBindingConflict(
+                'Fresh paid resource-action identity has a different launch '
+                'generation.')
+        try:
+            expected_resource_identity = (
+                derive_fresh_ordinary_paid_resource_action_identity(
+                    replica_id=context.replica_id,
+                    replica_record_id=context.replica_record_id,
+                    cluster_name=_nonempty(replica.get('cluster_name'),
+                                           'cluster_name')))
+        except (TypeError, ValueError) as error:
+            raise OrdinaryLaunchBindingConflict(
+                'Fresh paid resource-action identity is malformed.') from error
+        observed_resource_identity = (
+            replica.get('replica_incarnation'),
+            replica.get('desired_generation'),
+            replica.get('sky_cluster_record_uuid'),
+        )
+        if observed_resource_identity != (
+                expected_resource_identity.replica_incarnation,
+                expected_resource_identity.desired_generation,
+                expected_resource_identity.sky_cluster_record_uuid):
+            raise OrdinaryLaunchBindingConflict(
+                'Fresh paid resource-action identity changed before provider '
+                'I/O.')
     if (replica['ordinary_launch_association_id'] != context.association_id or
             not _replica_snapshot_matches_association(
                 replica,
@@ -8709,8 +8845,11 @@ def projected_provider_absence_retirement_authority_in_connection(
     so the live reduction validator cannot address it.  This history readback
     accepts only a protocol-v2 reserved-fill physical-absence tombstone or an
     ordinary-paid exact create-rejection tombstone whose canonical provider
-    ABSENT proof postdates executor quiescence. It grants replica-row retirement
-    validation only; no provider operation can be authorized from this state.
+    ABSENT proof postdates executor quiescence. By itself it grants only
+    provider-free replica-row retirement. A caller may derive the distinct
+    current-cohort paid auxiliary authority only by additionally proving the
+    deterministic resource-action identity and closed provider scope in the
+    same locked transaction.
     """
     _require_postgres(connection)
     service_name = _nonempty(service_name, 'service_name')

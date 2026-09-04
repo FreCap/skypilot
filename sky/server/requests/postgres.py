@@ -62,6 +62,7 @@ if typing.TYPE_CHECKING:
     from sky.serve import ordinary_launch_binding as ordinary_launch_binding_lib
     from sky.serve import paid_capacity as paid_capacity_lib
     from sky.serve import replica_managers
+    from sky.serve import serve_state as serve_state_lib
 
 logger = sky_logging.init_logger(__name__)
 ordinary_launch_binding = adaptors_common.LazyImport(
@@ -207,6 +208,64 @@ class BoundAwsProviderCensusScope:
             raise ValueError('AWS provider census scope is malformed.')
         object.__setattr__(self, 'provider_identity',
                            dict(self.provider_identity))
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ProjectedPaidProviderAbsenceCleanupScope:
+    """Provider leaf input retained after paid claim settlement.
+
+    This value describes the provider resource only.  It is not authority to
+    perform provider cleanup; production obtains that authority from
+    :class:`ProjectedPaidAuxiliaryCleanupAuthority`.
+    """
+
+    cloud: str
+    provider_identity: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if (self.cloud not in ('aws', 'gcp') or
+                not isinstance(self.provider_identity, Mapping) or
+                not self.provider_identity):
+            raise ValueError(
+                'Projected paid provider cleanup scope is malformed.')
+        object.__setattr__(self, 'provider_identity',
+                           dict(self.provider_identity))
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ProjectedPaidAuxiliaryCleanupAuthority:
+    """Exact Cohort-16 action and provider scope for auxiliary cleanup."""
+
+    service_name: str
+    replica_record_id: uuid.UUID
+    resource_action_identity: serve_state_lib.ReplicaResourceActionIdentity
+    cleanup_scope: ProjectedPaidProviderAbsenceCleanupScope
+
+    def __post_init__(self) -> None:
+        identity = self.resource_action_identity
+        if (not isinstance(self.service_name, str) or not self.service_name or
+                not isinstance(self.replica_record_id, uuid.UUID) or
+                not isinstance(identity,
+                               serve_state.ReplicaResourceActionIdentity) or
+                type(identity.replica_id) is not int or
+                identity.replica_id < 1 or
+                not isinstance(identity.cluster_name, str) or
+                not identity.cluster_name or
+                not isinstance(identity.replica_incarnation, uuid.UUID) or
+                identity.desired_generation != 1 or
+                not isinstance(identity.sky_cluster_record_uuid, uuid.UUID) or
+                not isinstance(self.cleanup_scope,
+                               ProjectedPaidProviderAbsenceCleanupScope)):
+            raise ValueError(
+                'Projected paid auxiliary cleanup authority is malformed.')
+
+    @property
+    def cloud(self) -> str:
+        return self.cleanup_scope.cloud
+
+    @property
+    def provider_identity(self) -> Mapping[str, Any]:
+        return self.cleanup_scope.provider_identity
 
 
 def _canonical_evidence_sha256(value: Mapping[str, Any]) -> str:
@@ -3906,6 +3965,10 @@ def read_bound_non_pool_active_snapshot(
         replica.c.version.label('_replica_version'),
         replica.c.cluster_name.label('_replica_cluster_name'),
         replica.c.paid_capacity_pool_key.label('_replica_paid_pool_key'),
+        replica.c.replica_incarnation.label('_replica_incarnation'),
+        replica.c.desired_generation.label('_replica_desired_generation'),
+        replica.c.sky_cluster_record_uuid.label(
+            '_replica_sky_cluster_record_uuid'),
         REQUESTS.c.status.label('_request_status'),
         REQUESTS.c.execution_generation.label('_request_generation'),
         REQUESTS.c.claim_token.label('_request_claim_token'),
@@ -4031,6 +4094,9 @@ def read_bound_non_pool_active_snapshot(
         'cluster_name': row['_replica_cluster_name'],
         'paid_capacity_pool_key': row['_replica_paid_pool_key'],
         'ordinary_launch_association_id': context.association_id,
+        'replica_incarnation': row['_replica_incarnation'],
+        'desired_generation': row['_replica_desired_generation'],
+        'sky_cluster_record_uuid': row['_replica_sky_cluster_record_uuid'],
     }
     if not ordinary_launch_binding.retained_reduction_snapshot_matches(
             lifecycle_snapshot, service_snapshot, replica_snapshot, row,
@@ -5984,6 +6050,52 @@ def project_bound_non_pool_provider_absence(
     return True
 
 
+def _bound_non_pool_projected_provider_absence_retirement_authority_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> tuple[dict[str, Any], Any] | None:
+    """Return provider-free retirement history under caller transaction."""
+    association, info = (
+        ordinary_launch_binding.
+        projected_provider_absence_cleanup_authority_in_connection(
+            connection, service_name, replica_id, replica_record_id))
+    context = _bound_context_from_association(association)
+    if not isinstance(context,
+                      ordinary_launch_binding.BoundNonPoolLaunchContext):
+        return None
+    facts, _, queue_row, pin_row = _lock_bound_request_evidence(
+        connection, context)
+    paid_profile = (
+        ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            context.profile.kind))
+    claim_state_is_closed = (_paid_capacity_claim_is_released(
+        connection, association)
+                             if paid_profile else _paid_capacity_claim_is_exact(
+                                 connection, association))
+    if (queue_row is not None or pin_row is not None or
+            facts.retention_pin_active or not claim_state_is_closed):
+        return None
+    if facts.exists:
+        request_status = facts.status
+        terminal_cause = facts.terminal_cause
+        if (request_status is None or request_status
+                not in requests_lib.RequestStatus.finished_status() or
+                terminal_cause is None or
+                request_status.value != association['terminal_status'] or
+                terminal_cause.value != association['terminal_cause'] or
+                facts.execution_generation
+                != association['terminal_execution_generation'] or
+                facts.execution_quiescence_required is not True or
+                facts.execution_quiesced_generation
+                != association['execution_quiesced_generation'] or
+                facts.execution_quiesced_at
+                != association['execution_quiesced_at'] or not facts.quiescent):
+            return None
+    return dict(association), info
+
+
 def bound_non_pool_projected_provider_absence_is_authorized(
     service_name: str,
     replica_id: int,
@@ -5995,46 +6107,125 @@ def bound_non_pool_projected_provider_absence_is_authorized(
         return False
     try:
         with engine.begin() as connection:
-            association, _ = (
-                ordinary_launch_binding.
-                projected_provider_absence_cleanup_authority_in_connection(
-                    connection, service_name, replica_id, replica_record_id))
-            context = _bound_context_from_association(association)
-            if not isinstance(
-                    context, ordinary_launch_binding.BoundNonPoolLaunchContext):
-                return False
-            facts, _, queue_row, pin_row = _lock_bound_request_evidence(
-                connection, context)
-            paid_profile = (
-                ordinary_launch_binding.is_paid_provider_reconciliation_profile(
-                    context.profile.kind))
-            claim_state_is_closed = (_paid_capacity_claim_is_released(
-                connection, association) if paid_profile else
-                                     _paid_capacity_claim_is_exact(
-                                         connection, association))
-            if (queue_row is not None or pin_row is not None or
-                    facts.retention_pin_active or not claim_state_is_closed):
-                return False
-            if facts.exists:
-                request_status = facts.status
-                terminal_cause = facts.terminal_cause
-                if (request_status is None or request_status
-                        not in requests_lib.RequestStatus.finished_status() or
-                        terminal_cause is None or request_status.value
-                        != association['terminal_status'] or
-                        terminal_cause.value != association['terminal_cause'] or
-                        facts.execution_generation
-                        != association['terminal_execution_generation'] or
-                        facts.execution_quiescence_required is not True or
-                        facts.execution_quiesced_generation
-                        != association['execution_quiesced_generation'] or
-                        facts.execution_quiesced_at
-                        != association['execution_quiesced_at'] or
-                        not facts.quiescent):
-                    return False
-            return True
+            return (
+                _bound_non_pool_projected_provider_absence_retirement_authority_in_connection(
+                    connection, service_name, replica_id,
+                    replica_record_id) is not None)
     except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
         return False
+
+
+def bound_non_pool_projected_paid_provider_absence_cleanup_scope(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> ProjectedPaidAuxiliaryCleanupAuthority | None:
+    """Return current ordinary-paid authority for provider auxiliary cleanup."""
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return None
+    try:
+        record_uuid = uuid.UUID(replica_record_id)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if str(record_uuid) != replica_record_id:
+        return None
+    try:
+        with engine.begin() as connection:
+            retirement_authority = (
+                _bound_non_pool_projected_provider_absence_retirement_authority_in_connection(
+                    connection, service_name, replica_id, replica_record_id))
+            if retirement_authority is None:
+                return None
+            association, info = retirement_authority
+            try:
+                profile = ordinary_launch_binding.NonPoolLaunchProfileKind(
+                    str(association['profile_kind']))
+            except (KeyError, ValueError):
+                return None
+            if (profile is not ordinary_launch_binding.NonPoolLaunchProfileKind.
+                    ORDINARY_PAID or association.get('capability_cohort_epoch')
+                    != ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+                    or association.get('capability_cohort_epoch')
+                    < ordinary_launch_binding.
+                    ORDINARY_PAID_RESOURCE_ACTION_IDENTITY_COHORT_FLOOR or
+                    association.get('launch_generation') != 1):
+                return None
+            expected_resource_identity = (
+                ordinary_launch_binding.
+                derive_fresh_ordinary_paid_resource_action_identity(
+                    replica_id=replica_id,
+                    replica_record_id=replica_record_id,
+                    cluster_name=info.cluster_name))
+            replica = serve_state_schema.replicas_table
+            resource_identity_row = connection.execute(
+                sqlalchemy.select(
+                    replica.c.cluster_name,
+                    replica.c.replica_incarnation,
+                    replica.c.desired_generation,
+                    replica.c.sky_cluster_record_uuid,
+                ).where(replica.c.service_name == service_name,
+                        replica.c.replica_id ==
+                        replica_id).with_for_update()).mappings().one_or_none()
+            if resource_identity_row is None:
+                return None
+            observed_resource_identity = (
+                resource_identity_row['replica_incarnation'],
+                resource_identity_row['desired_generation'],
+                resource_identity_row['sky_cluster_record_uuid'],
+            )
+            if (resource_identity_row['cluster_name'] != info.cluster_name or
+                    observed_resource_identity
+                    != (expected_resource_identity.replica_incarnation,
+                        expected_resource_identity.desired_generation,
+                        expected_resource_identity.sky_cluster_record_uuid)):
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Projected paid auxiliary cleanup lost its deterministic '
+                    'resource-action identity.')
+            pool_identity = paid_capacity.pool_key_payload(
+                str(association.get('paid_capacity_pool_key')))
+            evidence_payload = association.get('provider_evidence_payload')
+            provider_identity = (evidence_payload.get('provider_identity')
+                                 if isinstance(evidence_payload, Mapping) else
+                                 None)
+            cloud = (pool_identity.get('cloud') if isinstance(
+                pool_identity, Mapping) else None)
+            # A RunInstances negative acknowledgement proves that AWS created
+            # no instance, so its canonical evidence has no provider census
+            # identity.  Reconstruct the closed handle-validation identity
+            # only from the already-validated receipt and immutable pool key.
+            # No AWS API call is authorized by this scope.
+            if (cloud == 'aws' and provider_identity is None and
+                    isinstance(evidence_payload, Mapping) and
+                    evidence_payload.get('probe_contract')
+                    == 'aws-run-instances-negative-ack-v1'):
+                receipt = evidence_payload.get('receipt')
+                if isinstance(receipt, Mapping) and isinstance(
+                        pool_identity, Mapping):
+                    provider_identity = {
+                        'aws_account_id': receipt.get('aws_account_id'),
+                        'client_token': receipt.get('client_token'),
+                        'cluster_name_on_cloud':
+                            receipt.get('cluster_name_on_cloud'),
+                        'credential_profile': None,
+                        'instance_type': receipt.get('instance_type'),
+                        'num_nodes': receipt.get('requested_count'),
+                        'region': receipt.get('region'),
+                        'use_spot': True,
+                        'workspace': pool_identity.get('workspace'),
+                        'zone': receipt.get('availability_zone'),
+                    }
+            if (cloud not in ('aws', 'gcp') or
+                    not isinstance(provider_identity, Mapping)):
+                return None
+            return ProjectedPaidAuxiliaryCleanupAuthority(
+                service_name=service_name,
+                replica_record_id=record_uuid,
+                resource_action_identity=expected_resource_identity,
+                cleanup_scope=ProjectedPaidProviderAbsenceCleanupScope(
+                    cloud=cloud, provider_identity=provider_identity))
+    except (ordinary_launch_binding.OrdinaryLaunchBindingConflict, ValueError):
+        return None
 
 
 def retire_bound_non_pool_projected_paid_provider_absence(

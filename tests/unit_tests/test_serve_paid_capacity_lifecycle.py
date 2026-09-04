@@ -3,8 +3,10 @@
 
 import argparse
 import asyncio
+import hashlib
 import importlib
 import json
+import os
 import pathlib
 import shlex
 import sys
@@ -50,7 +52,7 @@ class _FakeLifecycle:
 
 def _args(tmp_path):
     return argparse.Namespace(
-        profile='small',
+        profile='provider-canary',
         provider=None,
         service_name='paid-e2e-unit',
         artifacts_dir=str(tmp_path),
@@ -62,7 +64,8 @@ def _args(tmp_path):
         endpoint_timeout_seconds=60,
         scope_timeout_seconds=60,
         down_timeout_seconds=60,
-        cleanup_timeout_seconds=60,
+        cleanup_timeout_seconds=600,
+        cleanup_zero_hold_seconds=360,
         poll_seconds=1,
         endpoint_mode=(lifecycle_module.EndpointMode.PUBLISHED),
         auth_token_env='TOKEN',
@@ -105,18 +108,88 @@ def _provider_scope(**overrides):
     return lifecycle_module.qualify.ProviderScope(**values)
 
 
+def _exact_zero_cleanup_payload(*, service_name, scope, qualification_receipt):
+
+    def _sample(index, observed_at, elapsed):
+        return {
+            'observed_at': observed_at,
+            'exact_zero': True,
+            'zero_samples': index,
+            'zero_hold_elapsed_seconds': elapsed,
+            'cleanup_claims': 0,
+            'cleanup_cluster_records': 0,
+            'cleanup_debit_units': 0,
+            'cleanup_effect_capable_associations': 0,
+            'cleanup_blocking_requests': 0,
+            'cleanup_queue_deliveries': 0,
+            'cleanup_retention_pins': 0,
+            'cleanup_provider_disks': 0,
+            'cleanup_provider_instances': 0,
+            'cleanup_provider_operations': 0,
+            'cleanup_replicas': 0,
+            'cleanup_service_rows': 0,
+            'cleanup_waiters': 0,
+            'cleanup_provider_by_cloud': {
+                cloud: {
+                    'cloud': cloud,
+                    'instance_count': 0,
+                    'running_count': 0,
+                    'gpu_units': 0,
+                    'running_gpu_units': 0,
+                    'disk_count': 0,
+                    'inflight_operation_count': 0,
+                    'shapes': [],
+                } for cloud in ('aws', 'gcp')
+            },
+        }
+
+    hold = lifecycle_module.qualify.PROFILES[
+        scope.qualification_profile].zero_hold_seconds
+    return {
+        'schema_version':
+            lifecycle_module.qualify._CLEANUP_RECEIPT_SCHEMA_VERSION,
+        'service_name': service_name,
+        'service_hash': scope.service_hash,
+        'lifecycle_epoch': scope.lifecycle_epoch,
+        'service_version': scope.service_version,
+        'controller_config_digest': scope.controller_config_digest,
+        'controller_config_snapshot_id': scope.controller_config_snapshot_id,
+        'expected_providers': list(scope.providers),
+        'service_yaml_sha256': scope.service_yaml_sha256,
+        'qualification_profile': scope.qualification_profile,
+        'qualification_source_sha256': scope.qualification_source_sha256,
+        'qualification_projection_sha256':
+            scope.qualification_projection_sha256,
+        'qualification_receipt_sha256': hashlib.sha256(
+            qualification_receipt.read_bytes()).hexdigest(),
+        'started_at': 1.0,
+        'finished_at': hold + 2.0,
+        'outcome': 'passed',
+        'zero_samples': 3,
+        'zero_hold_required_seconds': hold,
+        'zero_hold_elapsed_seconds': hold,
+        'samples': [
+            _sample(1, 1.0, 0.0),
+            _sample(2, 1.0 + hold / 2, hold / 2),
+            _sample(3, 1.0 + hold, hold),
+        ],
+    }
+
+
 def _install_operations(monkeypatch,
                         events,
                         *,
                         freeze_error=None,
+                        cleanup_scope_error=None,
                         qualification_error=None,
-                        cleanup_error=None):
+                        cleanup_error=None,
+                        cleanup_receipt_mutator=None):
 
     def render(args):
         events.append(('render', args.profile))
         pathlib.Path(args.output).write_text('rendered\n', encoding='utf-8')
 
-    def freeze(args):
+    async def freeze(args):
         events.append(('freeze', args.service_name))
         if freeze_error is not None:
             raise freeze_error
@@ -130,11 +203,27 @@ def _install_operations(monkeypatch,
         if qualification_error is not None:
             raise qualification_error
 
+    async def freeze_cleanup_scope(args):
+        events.append(('freeze-cleanup-scope', args.service_name))
+        if cleanup_scope_error is not None:
+            raise cleanup_scope_error
+        receipt_path = pathlib.Path(args.receipt)
+        if not receipt_path.exists():
+            receipt_path.write_text('{}\n', encoding='utf-8')
+
     async def cleanup(args):
         events.append(('cleanup', args.service_name))
         if not pathlib.Path(args.scope).exists():
             raise FileNotFoundError(args.scope)
-        pathlib.Path(args.output).write_text('{"outcome":"passed"}\n',
+        scope = lifecycle_module.qualify.read_provider_scope(
+            pathlib.Path(args.scope), args.service_name)
+        payload = _exact_zero_cleanup_payload(
+            service_name=args.service_name,
+            scope=scope,
+            qualification_receipt=pathlib.Path(args.receipt))
+        if cleanup_receipt_mutator is not None:
+            cleanup_receipt_mutator(payload)
+        pathlib.Path(args.output).write_text(json.dumps(payload) + '\n',
                                              encoding='utf-8')
         if cleanup_error is not None:
             raise cleanup_error
@@ -143,6 +232,8 @@ def _install_operations(monkeypatch,
     monkeypatch.setattr(lifecycle_module.qualify, 'freeze_provider_scope',
                         freeze)
     monkeypatch.setattr(lifecycle_module.qualify, 'qualify', qualify)
+    monkeypatch.setattr(lifecycle_module.qualify, 'freeze_cleanup_scope',
+                        freeze_cleanup_scope)
     monkeypatch.setattr(lifecycle_module.qualify, 'wait_for_cleanup', cleanup)
 
 
@@ -199,6 +290,120 @@ def test_sky_cli_lifecycle_pins_workspace_at_command_boundary(
     assert commands == [('sky', 'serve', 'up', '-n', 'paid-e2e', '-y',
                          str(tmp_path / 'service.yaml'), '--config',
                          'active_workspace=mt_hybrid')]
+
+
+def test_sky_cli_down_returns_after_durable_teardown_admission():
+    calls = []
+    lifecycle = lifecycle_module.SkyCliLifecycle(executable='sky',
+                                                 command_timeout_seconds=900,
+                                                 endpoint_timeout_seconds=900,
+                                                 down_timeout_seconds=300,
+                                                 poll_seconds=10,
+                                                 workspace=None)
+
+    async def run(*arguments, capture, phase_deadline):
+        calls.append((arguments, capture, phase_deadline.remaining()))
+        return lifecycle_module.CommandResult(returncode=0, stdout='')
+
+    lifecycle._run = run
+
+    asyncio.run(lifecycle.down('paid-e2e'))
+
+    assert len(calls) == 1
+    assert calls[0][0] == ('serve', 'down', '-y', 'paid-e2e')
+    assert calls[0][1] is False
+    assert 299 < calls[0][2] <= 300
+
+
+def test_sky_cli_command_communicate_uses_remaining_phase_deadline(monkeypatch):
+    monkeypatch.setattr(lifecycle_module, '_LIFECYCLE_REAP_GRACE_SECONDS', 0.05)
+    lifecycle = lifecycle_module.SkyCliLifecycle(executable=sys.executable,
+                                                 command_timeout_seconds=60,
+                                                 endpoint_timeout_seconds=60,
+                                                 down_timeout_seconds=60,
+                                                 poll_seconds=1,
+                                                 workspace=None)
+
+    async def exercise():
+        started = time.monotonic()
+        with pytest.raises(asyncio.TimeoutError):
+            await lifecycle._run(
+                '-c',
+                'import time; time.sleep(60)',
+                capture=True,
+                phase_deadline=(
+                    lifecycle_module.qualify.AbsoluteDeadline.after(0.05)))
+        assert time.monotonic() - started < 1
+
+    asyncio.run(exercise())
+
+
+def test_sky_cli_command_spawn_uses_remaining_phase_deadline(monkeypatch):
+    spawn_cancelled = False
+
+    async def create_subprocess_exec(*_command, **_kwargs):
+        nonlocal spawn_cancelled
+        try:
+            await asyncio.Future()
+        finally:
+            spawn_cancelled = True
+
+    monkeypatch.setattr(lifecycle_module.asyncio, 'create_subprocess_exec',
+                        create_subprocess_exec)
+    lifecycle = lifecycle_module.SkyCliLifecycle(executable='sky',
+                                                 command_timeout_seconds=60,
+                                                 endpoint_timeout_seconds=60,
+                                                 down_timeout_seconds=60,
+                                                 poll_seconds=1,
+                                                 workspace=None)
+
+    async def exercise():
+        started = time.monotonic()
+        with pytest.raises(asyncio.TimeoutError):
+            await lifecycle._run(
+                'serve',
+                'status',
+                capture=True,
+                phase_deadline=(
+                    lifecycle_module.qualify.AbsoluteDeadline.after(0.02)))
+        assert time.monotonic() - started < 1
+
+    asyncio.run(exercise())
+    assert spawn_cancelled
+
+
+def test_sky_cli_success_reaps_stubborn_process_group_descendant(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(lifecycle_module, '_LIFECYCLE_REAP_GRACE_SECONDS', 0.05)
+    pid_path = tmp_path / 'descendant.pid'
+    child_source = textwrap.dedent(f'''\
+        import pathlib
+        import signal
+        import subprocess
+        import sys
+        descendant = subprocess.Popen([
+            sys.executable, '-c',
+            'import signal, time; signal.signal(signal.SIGTERM, '
+            'signal.SIG_IGN); time.sleep(60)',
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+           stderr=subprocess.DEVNULL, close_fds=True)
+        pathlib.Path({str(pid_path)!r}).write_text(str(descendant.pid),
+                                                   encoding='utf-8')
+        print('complete')
+    ''')
+    lifecycle = lifecycle_module.SkyCliLifecycle(executable=sys.executable,
+                                                 command_timeout_seconds=2,
+                                                 endpoint_timeout_seconds=2,
+                                                 down_timeout_seconds=2,
+                                                 poll_seconds=0.1,
+                                                 workspace=None)
+
+    result = asyncio.run(lifecycle._run('-c', child_source, capture=True))
+
+    pid = int(pid_path.read_text(encoding='utf-8'))
+    assert result.stdout == 'complete'
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 def test_in_cluster_endpoint_uses_frozen_resource_scope(tmp_path):
@@ -290,6 +495,7 @@ def test_parser_defaults_to_published_endpoint():
     ])
 
     assert args.endpoint_mode is lifecycle_module.EndpointMode.PUBLISHED
+    assert args.cleanup_zero_hold_seconds >= 6 * 60
 
 
 def test_lifecycle_success_owns_normal_down_and_exact_cleanup(
@@ -301,24 +507,104 @@ def test_lifecycle_success_owns_normal_down_and_exact_cleanup(
         lifecycle_module.run_lifecycle(_args(tmp_path), _FakeLifecycle(events)))
 
     assert [event[0] for event in events] == [
-        'render', 'absent', 'up', 'freeze', 'endpoint', 'qualify', 'down',
-        'cleanup'
+        'render', 'absent', 'up', 'freeze', 'endpoint', 'qualify',
+        'freeze-cleanup-scope', 'down', 'cleanup'
     ]
     receipt = _receipt(tmp_path)
     assert receipt['outcome'] == 'passed'
     assert receipt['exact_cleanup_proven'] is True
+    assert receipt['serve_up_acknowledged'] is True
     assert receipt['cleanup_receipt_sha256'] is not None
     assert receipt['operator_escalation_required'] is False
     assert receipt['emergency_provider_cleanup'] == 'not_performed'
 
 
-@pytest.mark.parametrize('error', [
-    RuntimeError('failed'),
-    KeyboardInterrupt(),
-    asyncio.CancelledError(),
+@pytest.mark.parametrize('corruption', [
+    'malformed',
+    'wrong-identity',
+    'failed-outcome',
+    'partial-hold',
+])
+def test_lifecycle_rejects_unproven_cleanup_receipt(monkeypatch, tmp_path,
+                                                    corruption):
+    events = []
+
+    def corrupt(payload):
+        if corruption == 'malformed':
+            payload.pop('schema_version')
+        elif corruption == 'wrong-identity':
+            payload['service_hash'] = 'wrong-service-hash'
+        elif corruption == 'failed-outcome':
+            payload['outcome'] = 'failed'
+        else:
+            payload['zero_hold_elapsed_seconds'] = 359
+            payload['samples'][-1]['zero_hold_elapsed_seconds'] = 359
+            payload['samples'][-1]['observed_at'] = 360
+
+    _install_operations(monkeypatch, events, cleanup_receipt_mutator=corrupt)
+
+    with pytest.raises(lifecycle_module.LifecycleError,
+                       match='lacks exact-zero cleanup evidence'):
+        asyncio.run(
+            lifecycle_module.run_lifecycle(_args(tmp_path),
+                                           _FakeLifecycle(events)))
+
+    receipt = _receipt(tmp_path)
+    stages = {stage['name']: stage for stage in receipt['stages']}
+    assert stages['wait-cleanup']['outcome'] == 'passed'
+    assert stages['validate-cleanup']['outcome'] == 'failed'
+    assert receipt['cleanup_evidence_error_type'] == 'QualificationError'
+    assert receipt['cleanup_receipt_sha256'] is None
+    assert receipt['exact_cleanup_proven'] is False
+    assert receipt['operator_escalation_required'] is True
+
+
+def test_lifecycle_rejects_cleanup_hold_below_profile_before_mutation(
+        monkeypatch, tmp_path):
+    events = []
+    _install_operations(monkeypatch, events)
+    args = _args(tmp_path)
+    args.cleanup_zero_hold_seconds = 1
+
+    with pytest.raises(lifecycle_module.LifecycleError,
+                       match='must equal the qualification profile'):
+        asyncio.run(lifecycle_module.run_lifecycle(args,
+                                                   _FakeLifecycle(events)))
+
+    assert not events
+
+
+def test_pre_down_cleanup_scope_failure_cannot_publish_exact_cleanup(
+        monkeypatch, tmp_path):
+    events = []
+    _install_operations(
+        monkeypatch,
+        events,
+        cleanup_scope_error=RuntimeError('first database observation failed'))
+
+    with pytest.raises(lifecycle_module.LifecycleError,
+                       match='cleanup identity scope was not frozen'):
+        asyncio.run(
+            lifecycle_module.run_lifecycle(_args(tmp_path),
+                                           _FakeLifecycle(events)))
+
+    names = [event[0] for event in events]
+    assert names.index('freeze-cleanup-scope') < names.index('down')
+    assert names[-2:] == ['down', 'cleanup']
+    receipt = _receipt(tmp_path)
+    assert receipt['cleanup_scope_freeze_error_type'] == 'RuntimeError'
+    assert receipt['exact_cleanup_proven'] is False
+    assert receipt['operator_escalation_required'] is True
+
+
+@pytest.mark.parametrize(('error', 'expected_outcome'), [
+    (RuntimeError('failed'), 'failed'),
+    (KeyboardInterrupt(), 'interrupted'),
+    (asyncio.CancelledError(), 'interrupted'),
 ])
 def test_lifecycle_failure_or_interrupt_still_finalizes(monkeypatch, tmp_path,
-                                                        error):
+                                                        error,
+                                                        expected_outcome):
     events = []
     _install_operations(monkeypatch, events, qualification_error=error)
 
@@ -329,7 +615,7 @@ def test_lifecycle_failure_or_interrupt_still_finalizes(monkeypatch, tmp_path,
 
     assert [event[0] for event in events][-2:] == ['down', 'cleanup']
     receipt = _receipt(tmp_path)
-    assert receipt['outcome'] == 'failed'
+    assert receipt['outcome'] == expected_outcome
     assert receipt['cleanup_evidence_error_type'] is None
     assert receipt['exact_cleanup_proven'] is True
     assert receipt['cleanup_receipt_sha256'] is not None
@@ -372,6 +658,7 @@ def test_lifecycle_cleanup_starts_after_qualifier_terminal_drain(
     names = [event[0] for event in events]
     assert names.index('accepted') < names.index('terminal') < names.index(
         'down')
+    assert names.count('down') == names.count('cleanup') == 1
 
 
 def test_repeated_cancellation_cannot_interrupt_owned_finalizer(
@@ -413,7 +700,9 @@ def test_repeated_cancellation_cannot_interrupt_owned_finalizer(
 
     asyncio.run(scenario())
 
-    assert [event[0] for event in events][-2:] == ['down', 'cleanup']
+    names = [event[0] for event in events]
+    assert names[-2:] == ['down', 'cleanup']
+    assert names.count('down') == names.count('cleanup') == 1
     stages = {stage['name']: stage for stage in _receipt(tmp_path)['stages']}
     assert stages['serve-down']['outcome'] == 'passed'
     assert stages['wait-cleanup']['outcome'] == 'passed'
@@ -467,8 +756,10 @@ def test_lost_up_acknowledgement_still_finalizes(monkeypatch, tmp_path):
                 _FakeLifecycle(events,
                                up_error=RuntimeError('lost acknowledgement'))))
 
-    assert [event[0] for event in events
-           ] == ['render', 'absent', 'up', 'freeze', 'down', 'cleanup']
+    assert [event[0] for event in events] == [
+        'render', 'absent', 'up', 'freeze', 'freeze-cleanup-scope', 'down',
+        'cleanup'
+    ]
     receipt = _receipt(tmp_path)
     stages = {stage['name']: stage for stage in receipt['stages']}
     assert stages['serve-up']['outcome'] == 'failed'
@@ -476,7 +767,9 @@ def test_lost_up_acknowledgement_still_finalizes(monkeypatch, tmp_path):
     assert stages['serve-down']['outcome'] == 'passed'
     assert stages['wait-cleanup']['outcome'] == 'passed'
     assert receipt['cleanup_receipt_sha256'] is not None
-    assert receipt['operator_escalation_required'] is False
+    assert receipt['serve_up_acknowledged'] is False
+    assert receipt['exact_cleanup_proven'] is False
+    assert receipt['operator_escalation_required'] is True
 
 
 def test_lost_up_ack_without_recoverable_scope_never_fabricates_one(

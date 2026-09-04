@@ -382,6 +382,121 @@ def test_logical_queue_size_uses_plan_but_dispatch_requires_observation():
     assert lb._request_queue_limits() == (0, 12)
 
 
+def test_synchronous_logical_queue_uses_planned_gpu_slots():
+    lb = _make_lb(min_size=0,
+                  size_per_replica=3,
+                  max_size=3000,
+                  max_concurrency_per_replica=8,
+                  use_async_occupancy=False)
+    one_gpu = 'http://one-gpu:8000'
+    four_gpu = 'http://four-gpu:8000'
+    missing_width = 'http://missing-width:8000'
+    lb._load_balancing_policy.set_ready_replicas(
+        [one_gpu, four_gpu, missing_width])
+    lb._capacity_hint = {
+        'replica_unit': 'logical_slot',
+        'planned_capacity_by_url': {
+            one_gpu: 1,
+            four_gpu: 4,
+        },
+    }
+
+    assert lb._request_queue_limits() == (5, 15)
+    lb._request_queue_config = {
+        **(lb._request_queue_config or {}),
+        'max_concurrency_per_replica': 2,
+    }
+    assert lb._request_queue_limits() == (3, 9)
+
+
+def test_synchronous_logical_card_slots_use_planned_gpu_width():
+    lb = _make_lb(min_size=0,
+                  max_concurrency_per_replica=8,
+                  use_async_occupancy=False)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(
+            min_size=0,
+            max_concurrency_per_replica=8,
+            use_async_occupancy=False),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4'],
+    })
+    one_gpu = 'http://one-gpu:8000'
+    four_gpu = 'http://four-gpu:8000'
+    missing_width = 'http://missing-width:8000'
+    urls = [one_gpu, four_gpu, missing_width]
+    lb._load_balancing_policy.set_ready_replicas(urls)
+    lb._replica_info_by_url = {
+        url: {
+            'gpu_type': 'L4',
+            'is_zero_cost': 'false',
+        }
+        for url in urls
+    }
+    lb._capacity_hint = {
+        'replica_unit': 'logical_slot',
+        'planned_capacity_by_url': {
+            one_gpu: 1,
+            four_gpu: 4,
+        },
+    }
+    narrow_token = lb._load_balancing_policy.pre_execute_hook(
+        one_gpu, _request())
+    wide_token = lb._load_balancing_policy.pre_execute_hook(
+        four_gpu, _request())
+
+    assert lb._request_queue_accelerator_slots_locked() == ({
+        'L4': 3,
+    }, {
+        'L4': 0,
+    })
+
+    lb._load_balancing_policy.post_execute_hook(one_gpu, _request(),
+                                                 narrow_token)
+    lb._load_balancing_policy.post_execute_hook(four_gpu, _request(), wide_token)
+
+
+def test_synchronous_logical_route_excludes_full_narrow_backend():
+
+    async def _run():
+        lb = _make_lb(min_size=0,
+                      max_concurrency_per_replica=8,
+                      max_concurrency=8,
+                      use_async_occupancy=False)
+        one_gpu = 'http://one-gpu:8000'
+        four_gpu = 'http://four-gpu:8000'
+        lb._load_balancing_policy.set_ready_replicas([one_gpu, four_gpu])
+        lb._capacity_hint = {
+            'replica_unit': 'logical_slot',
+            'planned_capacity_by_url': {
+                one_gpu: 1,
+                four_gpu: 4,
+            },
+        }
+        # Least-load would choose the narrow backend (load 1 versus 2) unless
+        # logical capacity is a strict eligibility fence.
+        lb._load_balancing_policy.pre_execute_hook(one_gpu, _request())
+        lb._load_balancing_policy.pre_execute_hook(four_gpu, _request())
+        lb._load_balancing_policy.pre_execute_hook(four_gpu, _request())
+        selected = None
+
+        async def _proxy(url, request):
+            nonlocal selected
+            del request
+            selected = url
+            return fastapi.responses.Response(status_code=200)
+
+        lb._proxy_request_to = _proxy
+        request = _request()
+        setattr(request, '_skyserve_compatible_accelerators', None)
+        response = await lb._proxy_with_retries_inner(request)
+
+        assert response.status_code == 200
+        assert selected == four_gpu
+
+    asyncio.run(_run())
+
+
 def test_fast_ack_multi_slot_reservations_fill_and_resume_exactly():
     """Collected local E2E for one URL backed by four async workers."""
 

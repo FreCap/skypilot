@@ -869,8 +869,13 @@ def test_build_wheels(_isolated_bundle_cache):
     start = time.time()
     wheel_path, _ = wheel_utils.build_sky_wheel()
     assert wheel_path.exists()
+    built_wheel = next(wheel_path.glob('skypilot-*.whl'))
+    with zipfile.ZipFile(built_wheel) as wheel:
+        metadata_name = next(name for name in wheel.namelist()
+                             if name.endswith('.dist-info/METADATA'))
+        metadata = wheel.read(metadata_name).decode('utf-8')
+        assert 'Requires-Python: >=3.10\n' in metadata
     if sky.__build__ is not None:
-        built_wheel = next(wheel_path.glob('skypilot-*.whl'))
         with zipfile.ZipFile(built_wheel) as wheel:
             init_content = wheel.read('sky/__init__.py').decode('utf-8')
         assert (f"_SKYPILOT_COMMIT_COUNT = '{sky.__build__}'" in init_content)
