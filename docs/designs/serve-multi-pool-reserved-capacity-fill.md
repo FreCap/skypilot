@@ -9,12 +9,35 @@ are production-proven. Receipt schema 12's single sliding campaign,
 terminal-frontier, exact campaign-membership proof, and cancellation-resistant
 lifecycle finalizer are merged and deployed in release 1.1.1664. Its first
 current-writer run reached 172 provider-``RUNNING`` AWS Spot VMs, proving that
-provider scale is healthy, but exposed two independent open gates: provider
-qualification was unreachable while replica occupancy was partially observed,
-and row-by-row paid admission held the service row long enough to starve route
-and demand-report transactions. Schema 13's evidence-capability correction is
-source-qualified but not yet deployed. Multi-wave current-writer traffic,
-drain, and exact-zero requalification therefore remain open.**
+provider scale is healthy, and qualified the provider gate at 131. It exposed
+one production liveness gate: all 172 launch graphs reached
+``SERVICE_JOB_RECORDED``, but readiness was published once for replicas 1--38
+and never again, pinning the fleet at 38 ``READY`` and 134 ``PROVISIONING``
+replicas for 38 minutes. The row-by-row paid transaction performed 5,915 SQL
+statements for one 100-member/552-pool wave. Retained native Aurora logs prove
+the immediate shared-row starvation mechanism: the old controller produced
+1,495 PostgreSQL lock-timeout cancellations from 02:19:31 through 03:08:04 UTC;
+1,361 targeted this service's ``services`` row and 134 targeted its
+``service_lifecycle_fences`` row. PostgreSQL recorded tuple-lock contexts for
+both relations, and the continuous 02:33--03:07 timeout interval exactly spans
+the 38-minute readiness freeze. The exact holding PID and statement were not
+retained because Performance Insights, enhanced monitoring, ``log_lock_waits``,
+and a pre-down ``pg_stat_activity`` capture were unavailable. The 5,915-
+statement capacity-admission transaction is therefore the strongest identified
+holder mechanism, and the set-based rewrite is necessary; only a live rerun can
+prove it is sufficient. The same investigation found an independent latent qualifier bug:
+partial queue and ledger observations had been combined as if they shared one
+transactional cut. Schema 13's evidence-capability correction is source-
+qualified but not yet deployed. Set-based paid admission, multi-wave current-
+writer traffic, drain, and exact-zero requalification therefore remain open.**
+The failed qualification did not leak billable state. Its cancellation-safe
+finalizer retained the exact service scope while normal controller teardown
+reduced 172 AWS Spot VMs to zero, then recorded three consecutive joined
+exact-zero observations for PostgreSQL debits, claims and waiters, AWS/GCP
+instances, provider disks, and in-flight provider operations. The cleanup
+phase completed in 1,716.2 seconds without manual row deletion or provider
+intervention; its immutable receipt SHA-256 is
+``9cb2b65b25004630a576cd9fc215e06dd4812a0a8d9eadc3426c9bc198df5ec9``.
 Campaign `paid-e2e-1643a` committed the first 100 complete paid
 launch graphs in 8.4 seconds and produced 90 provider-`RUNNING` AWS Spot VMs;
 the other ten requests ended in exact AWS capacity failures. Thirteen provider
@@ -111,6 +134,16 @@ round trips while the service row is held. It is not a readiness barrier or a
 reason to delay the next eligible wave. Lock duration is a tested contract:
 route publication, replica observation, load-balancer role, and demand-report
 writers must retain time to commit within their unchanged freshness horizons.
+
+The deterministic PostgreSQL contention gate exercises this boundary through
+the production repositories. It holds a 552-pool/100-member paid-admission
+generation after acquiring service authority, proves that a concurrent replica
+observation fails closed at its bounded lock timeout without publishing
+``READY``, releases admission, and then proves the unchanged observer retry
+publishes ``READY`` without deadlock. The admitted wave remains within the
+96-statement whole-transaction budget. This gate makes one bounded collision
+and recovery deterministic; the billable successor campaign remains the proof
+that repeated production reconciliations no longer starve later readiness.
 
 Release ``1.1.1657`` exposed a separate PostgreSQL liveness coupling during a
 successor paid wave. Routine capacity admission held ``FOR UPDATE`` locks on
@@ -279,23 +312,34 @@ because its first occupancy sample has not arrived yet.
 
 | Evidence capability | Construction | Consumers |
 |---|---|---|
-| Attributed resident demand | Fresh compatible queue depth plus the exact PostgreSQL active-ledger delta and immutable campaign frontier; total replica occupancy may be unknown | Initial scale stimulus and provider-``RUNNING`` scale proof |
+| Exact initial resident demand | One complete current reporter census whose queue plus in-flight total is 800 and whose in-flight total equals the active-ledger delta | Initial scale-stimulus proof only |
+| Current demand presence | A fresh compatible observation with positive current queue or active-ledger work; partial occupancy contributes only confirmed lower bounds and is never added to another independently timed projection | Provider-``RUNNING`` scale proof |
+| Sustained campaign pressure | Driver-owned frontiers immediately before and after the provider census both have ``offered - succeeded == 800``, monotonic counters, open admission, and live traffic | Brackets each accepted provider-scale observation without freezing request progress |
 | Confirmed positive processing | Positive confirmed in-flight and processing lower bounds from current reporters | Independent processing/UI evidence only; it cannot prove an exact total |
 | Exact occupancy | Complete current reporter census whose in-flight count equals the active-ledger delta | Exact request-total/UI qualification |
 | Exact zero | Exact occupancy with zero queue and active ledger, joined to zero claims, replicas, provider objects, disks, and operations | Natural drain and final cleanup only |
+
+Temporal consistency is part of each capability. Load-balancer queue reports
+and PostgreSQL ledger counts do not share a publication cut, so a partial
+``queue(T1) + active(T2)`` sum is never an exact count even when it happens to
+equal 800. The driver frontiers and their timestamps are persisted on both
+sides of the provider census. The complete composite is validated before it
+may update scale progress, append an accepted receipt sample, stop traffic, or
+publish a passed verdict.
 
 The campaign freezes all 10,000 stable identities once. At most 800 are active
 at a time. The first exact 800-resident observation proves the cold scale
 stimulus, then every natural completion immediately admits the next
 never-before-offered identity while work remains. Thus the member set in the
 active window may advance, but its bound cannot: queued plus in-flight is never
-greater than 800. Every provider-paired sample requires queue depth plus the
-exact active-ledger delta to equal the immutable 800-member frontier, positive
-PostgreSQL and load-balancer demand, zero headerless arrivals, unsaturated
-arrival tracking, and an offered-identity count bounded by the initial window
-plus exact ``SUCCEEDED`` transitions. Complete per-replica occupancy is an
-independent telemetry proof and is not a prerequisite for provider census.
-The stimulus driver owns a lock-consistent typed
+greater than 800. The initial scale stimulus requires one complete exact
+800-resident observation. Every later provider-paired sample requires positive
+current service demand plus full driver frontiers before and after the census,
+positive PostgreSQL and load-balancer observations, zero headerless arrivals,
+unsaturated arrival tracking, and an offered-identity count bounded by the
+initial window plus exact ``SUCCEEDED`` transitions. Complete per-replica
+occupancy is an independent telemetry proof and is not a prerequisite for
+provider census. The stimulus driver owns a lock-consistent typed
 ``(offered, succeeded)`` projection: it advances ``offered`` immediately before
 the first POST of a new identity and ``succeeded`` only after that identity's
 terminal 204 receipt. Each paired provider sample persists both counters;
@@ -659,11 +703,11 @@ most 800 of them concurrently. It first proves one exact 800-resident window.
 Each request then finishes its declared backend work and publishes its terminal
 callback immediately, independent of either observer; the next never-before-
 offered identity replaces it while campaign work remains. Every provider-paired
-scale sample requires a refilled exact 800-member window measured as current
-queue depth plus the exact PostgreSQL active-ledger delta, positive
-same-observation PostgreSQL and load-balancer demand, and zero headerless or
-saturated arrival tracking. Per-replica occupancy may be temporarily partial;
-the independent request/UI proof still requires one complete exact occupancy
+scale sample requires positive current demand and full driver frontiers that
+bracket the provider census, plus positive same-observation PostgreSQL and
+load-balancer evidence and zero headerless or saturated arrival tracking.
+Queue and ledger projections are never summed when occupancy is partial. The
+independent request/UI proof still requires one complete exact occupancy
 sample. Rolling stable-job
 arrival counts may now advance or age as the window turns over, but cannot
 exceed the 10,000-ID manifest or the number made reachable by exact terminal
@@ -4015,8 +4059,15 @@ missing telemetry.
     plan bound to the causally covering settled
     allocation may actuate. The witness is read from the current PostgreSQL
     plan head with exact service/version/semantic-fingerprint/TTL ownership;
-    its no-effect horizon covers the slower reserved poll and settlement cycle,
-    while fresh-zero revokes it immediately. There is no mutable demand mirror.
+   its no-effect horizon covers the slower reserved poll and settlement cycle,
+   while fresh-zero revokes it immediately. There is no mutable demand mirror.
+25. **Bounded relational work:** while holding shared correctness rows, SQL
+    statement count scales with the fixed graph/table topology, not with the
+    number of catalog pools, claims, waiters, replicas, or wave members. Read,
+    arbitration, and persistence operate on locked set snapshots and bulk DML;
+    no per-pool or per-member query loop may enter the canonical path. A real-
+    PostgreSQL maximum-catalog/maximum-wave query budget is a required
+    regression gate, alongside semantic-equivalence and rollback tests.
 25. **Durable reservation capacity is not overlay headroom:** the sequenced
     broker never subtracts the installed autoscaler target from the service
     maximum. Its claim is bounded by immutable service policy and the durable
@@ -4518,14 +4569,14 @@ proves exactly 800 resident scale-stimulus identities, with no
 unattributed/headerless arrivals. Each natural terminal success then admits the
 next never-before-offered campaign identity, preserving a strict maximum of 800
 active identities without extending backend work or ledger lifetime. Every
-provider scale sample must itself see an exact refilled 800-member window from
-queue depth plus the PostgreSQL active-ledger delta, positive PostgreSQL and
-load-balancer demand, and rolling arrivals bounded by the immutable manifest
-and terminal-success frontier. Per-replica occupancy may be incomplete during
-scale; its confirmed lower bounds remain visible but are not needed to count
-resident demand. Before any replica is ready, the active-ledger delta may be
-zero while all 800 identities remain queued; that state is valid physical-scale
-evidence. The physical proof
+provider scale sample must itself be bracketed by full, open, monotonic driver
+frontiers and see positive current demand, positive PostgreSQL and load-balancer
+evidence, and rolling arrivals bounded by the immutable manifest and terminal-
+success frontier. Per-replica occupancy may be incomplete during scale; its
+confirmed lower bounds remain visible but are not treated as an exact resident
+count. Before any replica is ready, the initial complete observation may show
+all 800 identities queued and no active-ledger rows; that is valid physical-
+scale stimulus evidence. The physical proof
 and a separate fresh request proof run concurrently after the stimulus is
 established. The request proof requires positive in-flight, processing,
 confirmed occupancy, and active-ledger attribution. It may complete before or

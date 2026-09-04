@@ -5788,44 +5788,6 @@ def set_service_cost_rebalance_state(
         require_launch_allowed=True)
 
 
-def _valid_paid_capacity_claims_in_session(
-    session: orm.Session, pool_key: str
-) -> tuple[list[tuple[str, str, int]], list[tuple[str, str, int]]]:
-    """Return valid and stale claim identities for one locked pool."""
-    rows = session.execute(
-        sqlalchemy.select(
-            paid_capacity_claims_table.c.service_name,
-            paid_capacity_claims_table.c.service_hash,
-            paid_capacity_claims_table.c.replica_id,
-            services_table.c.hash,
-            replicas_table.c.status,
-            replicas_table.c.paid_capacity_pool_key,
-            replicas_table.c.ordinary_launch_association_id,
-        ).select_from(
-            paid_capacity_claims_table.outerjoin(
-                services_table, services_table.c.name ==
-                paid_capacity_claims_table.c.service_name).outerjoin(
-                    replicas_table,
-                    sqlalchemy.and_(
-                        replicas_table.c.service_name ==
-                        paid_capacity_claims_table.c.service_name,
-                        replicas_table.c.replica_id ==
-                        paid_capacity_claims_table.c.replica_id))).
-        where(paid_capacity_claims_table.c.pool_key == pool_key)).fetchall()
-    valid = []
-    stale = []
-    for (service_name, service_hash, replica_id, current_hash, status, row_pool,
-         association_id) in rows:
-        identity = (service_name, service_hash, replica_id)
-        if (current_hash == service_hash and
-            (status in _PAID_CAPACITY_UNRESOLVED_STATUSES or
-             association_id is not None) and row_pool == pool_key):
-            valid.append(identity)
-        else:
-            stale.append(identity)
-    return valid, stale
-
-
 def _valid_paid_capacity_service_claims_in_session(
     session: orm.Session,
     service_name: str,
@@ -5873,52 +5835,6 @@ def _delete_paid_capacity_claims_in_session(
                 paid_capacity_claims_table.c.replica_id).in_(identities)))
 
 
-def _withdraw_ineligible_frontier_waiters_in_session(
-    session: orm.Session,
-    service_name: str,
-    service_hash: str,
-    service_claims: list[tuple[int, str]],
-    frontier_limit: int,
-    frontier_limits_by_key: dict[paid_capacity.FrontierKey, int] | None = None,
-) -> None:
-    """Remove waiters on every card whose exploration frontier is full."""
-    owned_by_frontier: dict[paid_capacity.FrontierKey,
-                            set[str]] = collections.defaultdict(set)
-    unknown_owned_pool_keys = set()
-    for _, pool_key in service_claims:
-        parsed = paid_capacity.frontier_key_from_pool_key(pool_key)
-        if parsed is None:
-            unknown_owned_pool_keys.add(pool_key)
-        else:
-            owned_by_frontier[parsed].add(pool_key)
-    waiter_pool_keys = session.execute(
-        sqlalchemy.select(paid_capacity_waiters_table.c.pool_key).where(
-            paid_capacity_waiters_table.c.service_name == service_name,
-            paid_capacity_waiters_table.c.service_hash ==
-            service_hash)).scalars().all()
-    withdraw = []
-    for pool_key in waiter_pool_keys:
-        parsed = paid_capacity.frontier_key_from_pool_key(pool_key)
-        if parsed is None:
-            owned_pool_keys = unknown_owned_pool_keys
-        else:
-            owned_pool_keys = (owned_by_frontier.get(parsed, set()) |
-                               unknown_owned_pool_keys)
-        effective_limit = frontier_limit
-        if parsed is not None and frontier_limits_by_key is not None:
-            effective_limit = frontier_limits_by_key.get(
-                parsed, effective_limit)
-        if (pool_key not in owned_pool_keys and
-                len(owned_pool_keys) >= effective_limit):
-            withdraw.append(pool_key)
-    if withdraw:
-        session.execute(
-            sqlalchemy.delete(paid_capacity_waiters_table).where(
-                paid_capacity_waiters_table.c.service_name == service_name,
-                paid_capacity_waiters_table.c.service_hash == service_hash,
-                paid_capacity_waiters_table.c.pool_key.in_(withdraw)))
-
-
 def _withdraw_all_paid_capacity_waiters_in_session(
     session: orm.Session,
     service_name: str,
@@ -5935,28 +5851,146 @@ def _ensure_paid_capacity_pool_in_session(session: orm.Session,
                                           engine: sqlalchemy.engine.Engine,
                                           pool_key: str, base_limit: int,
                                           now: float | None) -> None:
-    updated_at = now
-    if updated_at is None:
-        updated_at = sqlalchemy.extract('epoch',
-                                        sqlalchemy.func.clock_timestamp())
+    _ensure_paid_capacity_pools_in_session(session, engine, (pool_key,),
+                                           base_limit, now)
+
+
+def _ensure_paid_capacity_pools_in_session(
+    session: orm.Session,
+    engine: sqlalchemy.engine.Engine,
+    pool_keys: Iterable[str],
+    base_limit: int,
+    now: float | None,
+) -> None:
+    """Create the complete sorted pool set in one statement."""
+    distinct_pool_keys = sorted(set(pool_keys))
+    if not distinct_pool_keys:
+        return
+    updated_at = (sqlalchemy.extract('epoch', sqlalchemy.func.clock_timestamp())
+                  if now is None else now)
+    values = [{
+        'pool_key': pool_key,
+        'current_limit': base_limit,
+        'successes_since_resize': 0,
+        'updated_at': updated_at,
+    } for pool_key in distinct_pool_keys]
     insert_stmt = _upsert_insert_func(engine)(paid_capacity_pools_table).values(
-        pool_key=pool_key,
-        current_limit=base_limit,
-        successes_since_resize=0,
-        updated_at=updated_at)
+        values)
     session.execute(
         insert_stmt.on_conflict_do_nothing(index_elements=['pool_key']))
 
 
 def _paid_capacity_pool_row_for_update(session: orm.Session,
                                        pool_key: str) -> Any:
-    row = session.execute(
+    return _paid_capacity_pool_rows_for_update(session, (pool_key,))[pool_key]
+
+
+def _paid_capacity_pool_rows_for_update(
+    session: orm.Session,
+    pool_keys: Iterable[str],
+) -> dict[str, Any]:
+    """Lock the complete exact-pool union in one canonical ordered query."""
+    distinct_pool_keys = sorted(set(pool_keys))
+    if not distinct_pool_keys:
+        return {}
+    rows = session.execute(
         sqlalchemy.select(paid_capacity_pools_table).where(
-            paid_capacity_pools_table.c.pool_key ==
-            pool_key).with_for_update()).fetchone()
-    if row is None:
+            paid_capacity_pools_table.c.pool_key.in_(distinct_pool_keys)).
+        order_by(paid_capacity_pools_table.c.pool_key).with_for_update()).all()
+    result = {row.pool_key: row for row in rows}
+    if set(result) != set(distinct_pool_keys):
         raise RuntimeError('Paid-capacity pool disappeared while locked.')
-    return row
+    return result
+
+
+def _delete_invisible_paid_capacity_claims_in_session(
+    session: orm.Session,
+    pool_keys: Iterable[str],
+) -> None:
+    """Delete claims invalid at one server-side visibility cut.
+
+    The exact-pool rows are already locked.  Keeping service/replica
+    visibility inside this statement avoids both an unbounded identity
+    parameter list and any downstream lock-order inversion.  A claim that is
+    valid at this cut may become invalid immediately afterward and remain
+    conservatively charged until the next reconciliation; a claim deleted as
+    invalid cannot be resurrected by a later replica transition.
+    """
+    distinct_pool_keys = sorted(set(pool_keys))
+    if not distinct_pool_keys:
+        return
+    current_incarnation_exists = sqlalchemy.exists().where(
+        services_table.c.name == paid_capacity_claims_table.c.service_name,
+        services_table.c.hash == paid_capacity_claims_table.c.service_hash)
+    valid_replica_exists = sqlalchemy.exists().where(
+        replicas_table.c.service_name ==
+        paid_capacity_claims_table.c.service_name,
+        replicas_table.c.replica_id == paid_capacity_claims_table.c.replica_id,
+        replicas_table.c.paid_capacity_pool_key ==
+        paid_capacity_claims_table.c.pool_key,
+        sqlalchemy.or_(
+            replicas_table.c.status.in_(_PAID_CAPACITY_UNRESOLVED_STATUSES),
+            replicas_table.c.ordinary_launch_association_id.isnot(None)))
+    session.execute(
+        sqlalchemy.delete(paid_capacity_claims_table).where(
+            paid_capacity_claims_table.c.pool_key.in_(distinct_pool_keys),
+            sqlalchemy.or_(sqlalchemy.not_(current_incarnation_exists),
+                           sqlalchemy.not_(valid_replica_exists))))
+
+
+def _locked_paid_capacity_claim_rows_in_session(
+    session: orm.Session,
+    pool_keys: Iterable[str],
+) -> tuple[Mapping[str, Any], ...]:
+    """Lock claims surviving the server-side visibility cut."""
+    distinct_pool_keys = sorted(set(pool_keys))
+    if not distinct_pool_keys:
+        return ()
+    statement = sqlalchemy.select(paid_capacity_claims_table).where(
+        paid_capacity_claims_table.c.pool_key.in_(distinct_pool_keys)).order_by(
+            paid_capacity_claims_table.c.pool_key,
+            paid_capacity_claims_table.c.service_name,
+            paid_capacity_claims_table.c.service_hash,
+            paid_capacity_claims_table.c.replica_id).with_for_update()
+    return tuple(session.execute(statement).mappings())
+
+
+def _delete_invisible_paid_capacity_waiters_in_session(
+    session: orm.Session,
+    pool_keys: Iterable[str],
+    *,
+    heartbeat_cutoff: float,
+) -> None:
+    """Delete stale waiters at one server-side visibility cut."""
+    distinct_pool_keys = sorted(set(pool_keys))
+    if not distinct_pool_keys:
+        return
+    current_incarnation_exists = sqlalchemy.exists().where(
+        services_table.c.name == paid_capacity_waiters_table.c.service_name,
+        services_table.c.hash == paid_capacity_waiters_table.c.service_hash)
+    session.execute(
+        sqlalchemy.delete(paid_capacity_waiters_table).where(
+            paid_capacity_waiters_table.c.pool_key.in_(distinct_pool_keys),
+            sqlalchemy.or_(
+                paid_capacity_waiters_table.c.heartbeat_at < heartbeat_cutoff,
+                sqlalchemy.not_(current_incarnation_exists))))
+
+
+def _locked_paid_capacity_waiter_rows_in_session(
+    session: orm.Session,
+    pool_keys: Iterable[str],
+) -> tuple[Mapping[str, Any], ...]:
+    """Lock waiters surviving the server-side visibility cut."""
+    distinct_pool_keys = sorted(set(pool_keys))
+    if not distinct_pool_keys:
+        return ()
+    statement = sqlalchemy.select(paid_capacity_waiters_table).where(
+        paid_capacity_waiters_table.c.pool_key.in_(
+            distinct_pool_keys)).order_by(
+                paid_capacity_waiters_table.c.pool_key,
+                paid_capacity_waiters_table.c.service_name,
+                paid_capacity_waiters_table.c.service_hash).with_for_update()
+    return tuple(session.execute(statement).mappings())
 
 
 def _paid_capacity_clock_timestamp(session: orm.Session,
@@ -6227,6 +6261,8 @@ class _LockedPaidCapacityAdmissionContext:
     upstream: _PaidCapacityAdmissionUpstreamContext
     census: _PaidCapacityAdmissionCensus
     pool_rows: Mapping[str, Any]
+    claim_rows: tuple[Mapping[str, Any], ...]
+    waiter_rows: tuple[Mapping[str, Any], ...]
     transaction_now: float
 
 
@@ -6467,6 +6503,7 @@ def _lock_paid_capacity_admission_context_in_session(
     census: _PaidCapacityAdmissionCensus,
     base_limit: int,
     now: float | None,
+    waiter_ttl_seconds: float | None = None,
 ) -> _LockedPaidCapacityAdmissionContext:
     """Lock only paid pools/claims/waiters after upstream rows are locked.
 
@@ -6476,62 +6513,129 @@ def _lock_paid_capacity_admission_context_in_session(
     """
     if upstream.service_hash == '':
         raise ValueError('Locked paid admission service hash is empty.')
-    retained_service_pool_keys = set(
+    retained_pool_keys = set(
         session.execute(
-            sqlalchemy.select(paid_capacity_claims_table.c.pool_key).where(
-                paid_capacity_claims_table.c.service_name ==
-                service_name)).scalars())
-    retained_waiter_pool_keys = set(
-        session.execute(
-            sqlalchemy.select(paid_capacity_waiters_table.c.pool_key).where(
-                paid_capacity_waiters_table.c.service_name ==
-                service_name)).scalars())
+            sqlalchemy.union(
+                sqlalchemy.select(paid_capacity_claims_table.c.pool_key).where(
+                    paid_capacity_claims_table.c.service_name == service_name),
+                sqlalchemy.select(paid_capacity_waiters_table.c.pool_key).where(
+                    paid_capacity_waiters_table.c.service_name ==
+                    service_name))).scalars())
     candidate_keys = set(candidate_pool_keys)
     if any(not isinstance(pool_key, str) or not pool_key
            for pool_key in candidate_keys):
         raise ValueError('Paid admission candidate pool keys are malformed.')
     if {spec.pool_key for spec in persistence_specs} - candidate_keys:
         raise ValueError('Paid admission spec names an unlocked pool.')
-    distinct_pool_keys = sorted(candidate_keys | retained_service_pool_keys |
-                                retained_waiter_pool_keys)
-    for pool_key in distinct_pool_keys:
-        _ensure_paid_capacity_pool_in_session(session, engine, pool_key,
-                                              base_limit, now)
-    pool_rows = {
-        pool_key: _paid_capacity_pool_row_for_update(session, pool_key)
-        for pool_key in distinct_pool_keys
-    }
+    distinct_pool_keys = sorted(candidate_keys | retained_pool_keys)
+    _ensure_paid_capacity_pools_in_session(session, engine, distinct_pool_keys,
+                                           base_limit, now)
+    pool_rows = _paid_capacity_pool_rows_for_update(session, distinct_pool_keys)
+    transaction_now = _paid_capacity_clock_timestamp(session, now)
+    if waiter_ttl_seconds is None:
+        waiter_ttl_seconds = paid_capacity.waiter_ttl_seconds()
 
     # Existing dependent rows are locked only after the complete sorted pool
-    # union. New rows acquire ordinary DML locks when the predeclared identity
-    # is inserted later in this same transaction.
+    # union. Visibility cleanup is evaluated by PostgreSQL without locking the
+    # upstream service/replica rows after a pool lock. New rows acquire
+    # ordinary DML locks when the predeclared identity is inserted later in
+    # this same transaction.
+    _delete_invisible_paid_capacity_claims_in_session(session,
+                                                      distinct_pool_keys)
+    claim_rows = _locked_paid_capacity_claim_rows_in_session(
+        session, distinct_pool_keys)
+    _delete_invisible_paid_capacity_waiters_in_session(
+        session,
+        distinct_pool_keys,
+        heartbeat_cutoff=transaction_now - waiter_ttl_seconds)
+    waiter_rows = _locked_paid_capacity_waiter_rows_in_session(
+        session, distinct_pool_keys)
+    return _LockedPaidCapacityAdmissionContext(upstream=upstream,
+                                               census=census,
+                                               pool_rows=pool_rows,
+                                               claim_rows=claim_rows,
+                                               waiter_rows=waiter_rows,
+                                               transaction_now=transaction_now)
+
+
+def _group_locked_paid_capacity_claims(
+    claim_rows: Iterable[Mapping[str, Any]],
+    pool_keys: Iterable[str],
+) -> dict[str, set[tuple[str, str, int]]]:
+    """Group claims that survived the server-side visibility cut."""
+    valid_by_pool: dict[str, set[tuple[str, str, int]]] = {
+        pool_key: set() for pool_key in pool_keys
+    }
+    for row in claim_rows:
+        identity = (str(row['service_name']), str(row['service_hash']),
+                    int(row['replica_id']))
+        pool_key = str(row['pool_key'])
+        valid_by_pool[pool_key].add(identity)
+    return valid_by_pool
+
+
+def _upsert_paid_capacity_pool_updates_in_session(
+    session: orm.Session,
+    engine: sqlalchemy.engine.Engine,
+    rows: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Apply heterogeneous locked-pool updates with one set statement."""
+    if not rows:
+        return
+    values = []
+    for pool_key in sorted(rows):
+        value = dict(rows[pool_key])
+        value['pool_key'] = pool_key
+        values.append(value)
+    insert_stmt = _upsert_insert_func(engine)(paid_capacity_pools_table).values(
+        values)
     session.execute(
-        sqlalchemy.select(
-            paid_capacity_claims_table.c.service_name,
-            paid_capacity_claims_table.c.service_hash,
-            paid_capacity_claims_table.c.replica_id).where(
-                paid_capacity_claims_table.c.pool_key.in_(distinct_pool_keys)).
-        order_by(
-            paid_capacity_claims_table.c.pool_key,
-            paid_capacity_claims_table.c.service_name,
-            paid_capacity_claims_table.c.service_hash,
-            paid_capacity_claims_table.c.replica_id).with_for_update()).all()
-    session.execute(
-        sqlalchemy.select(
-            paid_capacity_waiters_table.c.pool_key,
-            paid_capacity_waiters_table.c.service_name,
-            paid_capacity_waiters_table.c.service_hash).where(
-                paid_capacity_waiters_table.c.pool_key.in_(
-                    distinct_pool_keys)).order_by(
-                        paid_capacity_waiters_table.c.pool_key,
-                        paid_capacity_waiters_table.c.service_name,
-                        paid_capacity_waiters_table.c.service_hash).
-        with_for_update()).all()
-    return _LockedPaidCapacityAdmissionContext(
-        upstream=upstream,
-        census=census,
-        pool_rows=pool_rows,
-        transaction_now=_paid_capacity_clock_timestamp(session, now))
+        insert_stmt.on_conflict_do_update(
+            index_elements=['pool_key'],
+            set_={
+                column.name: getattr(insert_stmt.excluded, column.name)
+                for column in paid_capacity_pools_table.c
+                if column.name != 'pool_key'
+            }))
+
+
+def _persist_paid_capacity_waiter_snapshot_in_session(
+    session: orm.Session,
+    engine: sqlalchemy.engine.Engine,
+    service_name: str,
+    service_hash: str,
+    pool_keys: Iterable[str],
+    waiters_by_pool: Mapping[str, Mapping[tuple[str, str], tuple[int, float,
+                                                                 float]]],
+) -> None:
+    """Replace this service's waiter projection across the locked pool set."""
+    distinct_pool_keys = sorted(set(pool_keys))
+    if distinct_pool_keys:
+        session.execute(
+            sqlalchemy.delete(paid_capacity_waiters_table).where(
+                paid_capacity_waiters_table.c.pool_key.in_(distinct_pool_keys),
+                paid_capacity_waiters_table.c.service_name == service_name,
+                paid_capacity_waiters_table.c.service_hash == service_hash))
+
+    service_identity = (service_name, service_hash)
+    values = []
+    for pool_key in sorted(waiters_by_pool):
+        waiter = waiters_by_pool[pool_key].get(service_identity)
+        if waiter is None:
+            continue
+        priority, first_wait_at, heartbeat_at = waiter
+        values.append({
+            'pool_key': pool_key,
+            'service_name': service_name,
+            'service_hash': service_hash,
+            'priority': priority,
+            'first_wait_at': first_wait_at,
+            'heartbeat_at': heartbeat_at,
+        })
+    if values:
+        session.execute(
+            _upsert_insert_func(engine)(paid_capacity_waiters_table).values(
+                values))
 
 
 def _admit_replicas_with_paid_capacity_claims_in_session(
@@ -6580,23 +6684,21 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
                 raise ValueError('Paid plan debit contradicts its exact '
                                  'candidate shape.')
 
-    retained_service_pool_keys = set(
-        session.execute(
-            sqlalchemy.select(paid_capacity_claims_table.c.pool_key).where(
-                paid_capacity_claims_table.c.service_name == service_name,
-                paid_capacity_claims_table.c.service_hash ==
-                service_hash)).scalars())
+    valid_claims_by_pool = _group_locked_paid_capacity_claims(
+        locked_context.claim_rows, pool_rows)
+    service_claims = sorted(
+        (replica_id, pool_key)
+        for pool_key, claims in valid_claims_by_pool.items()
+        for claim_service_name, claim_service_hash, replica_id in claims
+        if (claim_service_name, claim_service_hash) == (service_name,
+                                                        service_hash))
+    retained_service_pool_keys = {pool_key for _, pool_key in service_claims}
     required_pool_keys = ({spec.pool_key for spec in persistence_specs} |
                           retained_service_pool_keys)
     if not required_pool_keys <= set(pool_rows):
         raise RuntimeError('Paid admission did not prelock every pool key.')
     distinct_pool_keys = sorted(pool_rows)
 
-    # Claim-row cleanup is deliberately after every named exact-pool lock.
-    service_claims, stale_service_claims = (
-        _valid_paid_capacity_service_claims_in_session(session, service_name,
-                                                       service_hash))
-    _delete_paid_capacity_claims_in_session(session, stale_service_claims)
     service_claim_by_replica_id = dict(service_claims)
     existing_replica_ids_at_start = set(service_claim_by_replica_id)
     for spec in persistence_specs:
@@ -6608,9 +6710,9 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
                 'A paid-capacity replica claim cannot move between exact '
                 'provider pools during a recovery re-drive.')
 
-    valid_claims_by_pool = {}
     effective_limit_by_pool = {}
     learned_limit_valid_until_by_pool: dict[str, float] = {}
+    pool_updates: dict[str, dict[str, Any]] = {}
     for pool_key in distinct_pool_keys:
         pool = pool_rows[pool_key]
         if pool.last_failure_at is None:
@@ -6622,15 +6724,15 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
                 now=transaction_now,
                 ttl_seconds=success_ttl_seconds)
             if reset or effective_limit != pool.current_limit:
-                session.execute(
-                    sqlalchemy.update(paid_capacity_pools_table).where(
-                        paid_capacity_pools_table.c.pool_key == pool_key).
-                    values(current_limit=effective_limit,
-                           successes_since_resize=(0 if reset else
-                                                   pool.successes_since_resize),
-                           last_success_at=(None
-                                            if reset else pool.last_success_at),
-                           updated_at=transaction_now))
+                pool_updates[pool_key] = {
+                    'current_limit': effective_limit,
+                    'successes_since_resize':
+                        (0 if reset else pool.successes_since_resize),
+                    'last_success_at':
+                        (None if reset else pool.last_success_at),
+                    'last_failure_at': pool.last_failure_at,
+                    'updated_at': transaction_now,
+                }
             if (effective_limit > base_limit and
                     pool.last_success_at is not None):
                 learned_limit_valid_until_by_pool[pool_key] = (
@@ -6647,10 +6749,17 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
                 failure_cooldown=failure_cooldown_seconds)
             effective_limit = admission.limit
         effective_limit_by_pool[pool_key] = effective_limit
-        valid_claims, stale_claims = _valid_paid_capacity_claims_in_session(
-            session, pool_key)
-        _delete_paid_capacity_claims_in_session(session, stale_claims)
-        valid_claims_by_pool[pool_key] = set(valid_claims)
+
+    waiters_by_pool: dict[str,
+                          dict[tuple[str, str],
+                               tuple[int, float,
+                                     float]]] = collections.defaultdict(dict)
+    for row in locked_context.waiter_rows:
+        waiter_identity = (str(row['pool_key']), str(row['service_name']),
+                           str(row['service_hash']))
+        waiters_by_pool[waiter_identity[0]][waiter_identity[1:]] = (int(
+            row['priority']), float(
+                row['first_wait_at']), float(row['heartbeat_at']))
 
     owned_by_frontier: dict[paid_capacity.FrontierKey,
                             set[str]] = collections.defaultdict(set)
@@ -6675,32 +6784,18 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
     positive_authority_horizons: list[float] = []
 
     def _refresh_waiter(pool_key: str, priority: int) -> None:
-        session.execute(
-            sqlalchemy.delete(paid_capacity_waiters_table).where(
-                paid_capacity_waiters_table.c.pool_key == pool_key,
-                paid_capacity_waiters_table.c.heartbeat_at
-                < transaction_now - waiter_ttl_seconds))
-        current_service_incarnation = sqlalchemy.exists().where(
-            services_table.c.name == paid_capacity_waiters_table.c.service_name,
-            services_table.c.hash == paid_capacity_waiters_table.c.service_hash)
-        session.execute(
-            sqlalchemy.delete(paid_capacity_waiters_table).where(
-                paid_capacity_waiters_table.c.pool_key == pool_key,
-                sqlalchemy.not_(current_service_incarnation)))
-        waiter_insert = _upsert_insert_func(engine)(
-            paid_capacity_waiters_table).values(pool_key=pool_key,
-                                                service_name=service_name,
-                                                service_hash=service_hash,
-                                                priority=priority,
-                                                first_wait_at=transaction_now,
-                                                heartbeat_at=transaction_now)
-        session.execute(
-            waiter_insert.on_conflict_do_update(
-                index_elements=['pool_key', 'service_name', 'service_hash'],
-                set_={
-                    'priority': priority,
-                    'heartbeat_at': transaction_now,
-                }))
+        existing = waiters_by_pool[pool_key].get(service_identity)
+        first_wait_at = (transaction_now if existing is None else existing[1])
+        waiters_by_pool[pool_key][service_identity] = (priority, first_wait_at,
+                                                       transaction_now)
+
+    def _best_waiter(pool_key: str) -> tuple[str, str] | None:
+        waiters = waiters_by_pool[pool_key]
+        if not waiters:
+            return None
+        return min(waiters,
+                   key=lambda identity:
+                   (-waiters[identity][0], waiters[identity][1], identity[0]))
 
     for index, spec in enumerate(persistence_specs):
         candidate = spec.candidate
@@ -6765,16 +6860,7 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
             continue
 
         _refresh_waiter(spec.pool_key, priority)
-        best_waiter = session.execute(
-            sqlalchemy.select(
-                paid_capacity_waiters_table.c.service_name,
-                paid_capacity_waiters_table.c.service_hash).where(
-                    paid_capacity_waiters_table.c.pool_key ==
-                    spec.pool_key).order_by(
-                        paid_capacity_waiters_table.c.priority.desc(),
-                        paid_capacity_waiters_table.c.first_wait_at,
-                        paid_capacity_waiters_table.c.service_name).limit(
-                            1)).fetchone()
+        best_waiter = _best_waiter(spec.pool_key)
         if best_waiter is None:
             raise RuntimeError(
                 'Paid-capacity waiter disappeared during admission.')
@@ -6782,8 +6868,7 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
                 >= effective_limit_by_pool[spec.pool_key]):
             results[index] = paid_capacity.ClaimResult.SATURATED
             continue
-        if (best_waiter.service_name,
-                best_waiter.service_hash) != service_identity:
+        if best_waiter != service_identity:
             results[index] = paid_capacity.ClaimResult.HIGHER_PRIORITY_WAITING
             stopped_frontiers[spec.frontier_key] = (
                 paid_capacity.ClaimResult.HIGHER_PRIORITY_WAITING)
@@ -6799,13 +6884,13 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
             positive_authority_horizons.append(learned_horizon)
         positive_authority_horizons.append(transaction_now + waiter_ttl_seconds)
         if pool.last_failure_at is not None:
-            session.execute(
-                sqlalchemy.update(paid_capacity_pools_table).where(
-                    paid_capacity_pools_table.c.pool_key ==
-                    spec.pool_key).values(current_limit=1,
-                                          successes_since_resize=0,
-                                          last_success_at=None,
-                                          updated_at=transaction_now))
+            pool_updates[spec.pool_key] = {
+                'current_limit': 1,
+                'successes_since_resize': 0,
+                'last_success_at': None,
+                'last_failure_at': pool.last_failure_at,
+                'updated_at': transaction_now,
+            }
         valid_claims_by_pool[spec.pool_key].add(identity)
         service_claim_by_replica_id[replica_id] = spec.pool_key
         service_claims.append((replica_id, spec.pool_key))
@@ -6817,11 +6902,7 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
         owned_by_frontier[spec.frontier_key].add(spec.pool_key)
         accepted_indices.append(index)
         results[index] = paid_capacity.ClaimResult.ACQUIRED
-        session.execute(
-            sqlalchemy.delete(paid_capacity_waiters_table).where(
-                paid_capacity_waiters_table.c.pool_key == spec.pool_key,
-                paid_capacity_waiters_table.c.service_name == service_name,
-                paid_capacity_waiters_table.c.service_hash == service_hash))
+        waiters_by_pool[spec.pool_key].pop(service_identity, None)
         if service_limit is not None and service_claim_count >= service_limit:
             reconcile_waiters = True
         if (len(owned_by_frontier[spec.frontier_key] | unknown_owned_pool_keys)
@@ -6835,29 +6916,15 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
         }
         if filled_groups:
             filled_frontiers = {(group,) for group in filled_groups}
-            waiter_pool_keys = session.execute(
-                sqlalchemy.select(paid_capacity_waiters_table.c.pool_key).where(
-                    paid_capacity_waiters_table.c.service_name == service_name,
-                    paid_capacity_waiters_table.c.service_hash ==
-                    service_hash)).scalars().all()
-            filled_pool_keys = [
-                pool_key for pool_key in waiter_pool_keys
-                if paid_capacity.frontier_key_from_pool_key(pool_key) in
-                filled_frontiers
-            ]
-            if filled_pool_keys:
-                session.execute(
-                    sqlalchemy.delete(paid_capacity_waiters_table).where(
-                        paid_capacity_waiters_table.c.service_name ==
-                        service_name, paid_capacity_waiters_table.c.service_hash
-                        == service_hash,
-                        paid_capacity_waiters_table.c.pool_key.in_(
-                            filled_pool_keys)))
+            for pool_key, waiters in waiters_by_pool.items():
+                if (paid_capacity.frontier_key_from_pool_key(pool_key)
+                        in filled_frontiers):
+                    waiters.pop(service_identity, None)
 
     if reconcile_waiters:
         if service_limit is not None and service_claim_count >= service_limit:
-            _withdraw_all_paid_capacity_waiters_in_session(
-                session, service_name, service_hash)
+            for waiters in waiters_by_pool.values():
+                waiters.pop(service_identity, None)
         else:
             effective_frontier_default = frontier_default_limit
             if effective_frontier_default is None and persistence_specs:
@@ -6868,38 +6935,42 @@ def _admit_replicas_with_paid_capacity_claims_in_session(
                 effective_frontier_limits[spec.frontier_key] = (
                     spec.frontier_limit)
             if effective_frontier_default is not None:
-                _withdraw_ineligible_frontier_waiters_in_session(
-                    session, service_name, service_hash, service_claims,
-                    effective_frontier_default, effective_frontier_limits)
+                for pool_key, waiters in waiters_by_pool.items():
+                    if service_identity not in waiters:
+                        continue
+                    parsed = paid_capacity.frontier_key_from_pool_key(pool_key)
+                    if parsed is None:
+                        owned_pool_keys = unknown_owned_pool_keys
+                    else:
+                        owned_pool_keys = (owned_by_frontier.get(parsed, set())
+                                           | unknown_owned_pool_keys)
+                    effective_limit = effective_frontier_default
+                    if parsed is not None:
+                        effective_limit = effective_frontier_limits.get(
+                            parsed, effective_limit)
+                    if (pool_key not in owned_pool_keys and
+                            len(owned_pool_keys) >= effective_limit):
+                        waiters.pop(service_identity, None)
             max_live_paid_gpu_units = (
                 locked_context.upstream.max_live_paid_gpu_units)
             if max_live_paid_gpu_units is not None:
                 remaining_gpu_units = max(
                     0, max_live_paid_gpu_units - live_paid_gpu_units)
-                waiter_pool_keys = session.execute(
-                    sqlalchemy.select(
-                        paid_capacity_waiters_table.c.pool_key).where(
-                            paid_capacity_waiters_table.c.service_name ==
-                            service_name,
-                            paid_capacity_waiters_table.c.service_hash ==
-                            service_hash)).scalars().all()
-                oversized_pool_keys = []
-                for pool_key in waiter_pool_keys:
+                for pool_key, waiters in waiters_by_pool.items():
+                    if service_identity not in waiters:
+                        continue
                     try:
                         width = paid_capacity.paid_pool_gpu_units(pool_key)
                     except paid_capacity.PaidGPUAttributionError:
                         width = remaining_gpu_units + 1
                     if width > remaining_gpu_units:
-                        oversized_pool_keys.append(pool_key)
-                if oversized_pool_keys:
-                    session.execute(
-                        sqlalchemy.delete(paid_capacity_waiters_table).where(
-                            paid_capacity_waiters_table.c.service_name ==
-                            service_name,
-                            paid_capacity_waiters_table.c.service_hash ==
-                            service_hash,
-                            paid_capacity_waiters_table.c.pool_key.in_(
-                                oversized_pool_keys)))
+                        waiters.pop(service_identity, None)
+
+    _upsert_paid_capacity_pool_updates_in_session(session, engine, pool_updates)
+    _persist_paid_capacity_waiter_snapshot_in_session(session, engine,
+                                                      service_name,
+                                                      service_hash, pool_rows,
+                                                      waiters_by_pool)
 
     assert all(result is not None for result in results)
     accepted_index_set = set(accepted_indices)
@@ -7095,6 +7166,13 @@ def _persist_paid_capacity_admission_in_session(
         # use the dedicated replica bookkeeping paths after launch.
 
     existing_index_set = set(decision.existing_indices)
+    replica_values = []
+    claim_values = []
+
+    def _rectangular(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        columns = sorted(set().union(*(row.keys() for row in rows)))
+        return [{column: row.get(column) for column in columns} for row in rows]
+
     for index in decision.accepted_indices:
         spec = persistence_specs[index]
         candidate = spec.candidate
@@ -7103,11 +7181,11 @@ def _persist_paid_capacity_admission_in_session(
             # An exact recovery re-drive validates the immutable replica and
             # claim receipt but must not rewrite either row.
             continue
-        replica_insert = _upsert_insert_func(engine)(replicas_table).values(
-            **_initial_replica_row_values(engine, service_name, candidate.
-                                          replica_id, transaction_infos[index]))
-        session.execute(replica_insert)
-        claim_values = {
+        replica_values.append(
+            _initial_replica_row_values(engine, service_name,
+                                        candidate.replica_id,
+                                        transaction_infos[index]))
+        claim_values.append({
             'service_name': service_name,
             'service_hash': locked_context.upstream.service_hash,
             'replica_id': candidate.replica_id,
@@ -7115,10 +7193,15 @@ def _persist_paid_capacity_admission_in_session(
             'priority': candidate.priority,
             'claimed_at': locked_context.transaction_now,
             **dict(capacity_plan_claims_by_replica_id[candidate.replica_id]),
-        }
-        claim_insert = _upsert_insert_func(engine)(
-            paid_capacity_claims_table).values(**claim_values)
-        session.execute(claim_insert)
+        })
+    if replica_values:
+        session.execute(
+            _upsert_insert_func(engine)(replicas_table).values(
+                _rectangular(replica_values)))
+    if claim_values:
+        session.execute(
+            _upsert_insert_func(engine)(paid_capacity_claims_table).values(
+                _rectangular(claim_values)))
     return True
 
 
@@ -7225,7 +7308,8 @@ def try_add_replicas_with_paid_capacity_claims(
             upstream=upstream,
             census=census,
             base_limit=base_limit,
-            now=now)
+            now=now,
+            waiter_ttl_seconds=waiter_ttl_seconds)
         decision = _admit_replicas_with_paid_capacity_claims_in_session(
             session,
             engine,

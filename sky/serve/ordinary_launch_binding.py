@@ -120,6 +120,8 @@ MAX_GC_BATCH_SIZE = 500
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
 _ASSOCIATION_NAMESPACE = uuid.UUID('5ab85493-af88-4e82-bdda-8cbe1a8b15ea')
 _REQUEST_NAMESPACE = uuid.UUID('f77cfdf5-95c4-4882-a768-30496fd23c97')
+_ORDINARY_LAUNCH_SUBMISSION_NAMESPACE = uuid.UUID(
+    '58a82cb0-534c-5a5d-bb5d-681759e60469')
 _LEGACY_SCOPE_NAMESPACE = uuid.UUID('85efcb78-8e08-4d18-bc25-c9de88377399')
 _LEGACY_EVENT_NAMESPACE = uuid.UUID('1daed865-c0b3-40e0-bd33-e65f752df996')
 
@@ -1355,6 +1357,50 @@ class BindingAdmission:
         return self.resolution in UNSETTLED_RESOLUTIONS
 
 
+@dataclasses.dataclass(frozen=True)
+class FreshOrdinaryPaidTarget:
+    """Exact planner row expected in one newly accepted paid wave."""
+
+    replica_id: int
+    replica_record_id: uuid.UUID
+    service_version: int
+    cluster_name: str
+
+
+@dataclasses.dataclass(frozen=True)
+class PreparedFreshOrdinaryPaidMember:
+    """Validated immutable material for one transaction-local batch member."""
+
+    target: FreshOrdinaryPaidTarget
+    submission_id: uuid.UUID
+    association_id: uuid.UUID
+    request_id: str
+    paid_capacity_pool_key: str
+    profile: NonPoolLaunchProfile
+
+
+@dataclasses.dataclass(frozen=True)
+class PreparedFreshOrdinaryPaidBatch:
+    """Transaction-scoped proof consumed by the set-based graph writer.
+
+    This is an internal capability for the fused paid-wave caller.  The caller
+    may perform pure request construction after preparation, but must execute
+    no database statement before passing the proof to the commit half.
+    """
+
+    tenant_scope: str
+    authority: ControllerBindingAuthority
+    members: tuple[PreparedFreshOrdinaryPaidMember, ...]
+    _connection: sqlalchemy.engine.Connection = dataclasses.field(repr=False,
+                                                                  compare=False)
+    _transaction: Any = dataclasses.field(repr=False, compare=False)
+
+    def belongs_to(self, connection: sqlalchemy.engine.Connection) -> bool:
+        """Return whether this proof still belongs to the active transaction."""
+        return (self._connection is connection and
+                self._transaction is connection.get_transaction())
+
+
 # Compatibility name used by the endpoint while the stack is rebased.
 BindingReservation = BindingAdmission
 
@@ -1840,6 +1886,22 @@ def derive_binding_ids(tenant_scope: str, service_workspace: str,
     association_id = uuid.uuid5(_ASSOCIATION_NAMESPACE, key)
     request_id = str(uuid.uuid5(_REQUEST_NAMESPACE, key))
     return association_id, request_id
+
+
+def derive_ordinary_launch_submission_id(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: uuid.UUID | str,
+    launch_generation: int,
+) -> uuid.UUID:
+    """Derive the established generation-stable ordinary submission UUID."""
+    service_name = _nonempty(service_name, 'service_name')
+    replica_id = _positive_int(replica_id, 'replica_id')
+    replica_record_id = _canonical_uuid(replica_record_id, 'replica_record_id')
+    launch_generation = _positive_int(launch_generation, 'launch_generation')
+    material = (f'{service_name}\0{replica_id}\0{replica_record_id}\0'
+                f'{launch_generation}')
+    return uuid.uuid5(_ORDINARY_LAUNCH_SUBMISSION_NAMESPACE, material)
 
 
 def build_binding_identity(
@@ -2649,19 +2711,13 @@ def _replacement_planner_authorization(
     return raw, predecessor_info
 
 
-def _paid_claim_payload(
-    connection: sqlalchemy.engine.Connection,
+def _paid_claim_payload_from_rows(
     service: Mapping[str, Any],
     replica: Mapping[str, Any],
     info: Any,
+    rows: Sequence[Mapping[str, Any]],
 ) -> tuple[str | None, dict[str, Any] | None]:
-    """Read the exact paid claim, if any, for a locked replica row."""
-    rows = connection.execute(
-        sqlalchemy.select(serve_state_schema.paid_capacity_claims_table).where(
-            serve_state_schema.paid_capacity_claims_table.c.service_name ==
-            service['name'],
-            serve_state_schema.paid_capacity_claims_table.c.replica_id ==
-            replica['replica_id'])).mappings().all()
+    """Validate and project already-read exact paid-claim rows."""
     pool_key = replica.get('paid_capacity_pool_key')
     if pool_key is None:
         if rows:
@@ -2697,6 +2753,22 @@ def _paid_claim_payload(
             'capacity_plan_units': row['capacity_plan_units'],
         })
     return pool_key, payload
+
+
+def _paid_claim_payload(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    info: Any,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Read the exact paid claim, if any, for a locked replica row."""
+    rows = connection.execute(
+        sqlalchemy.select(serve_state_schema.paid_capacity_claims_table).where(
+            serve_state_schema.paid_capacity_claims_table.c.service_name ==
+            service['name'],
+            serve_state_schema.paid_capacity_claims_table.c.replica_id ==
+            replica['replica_id'])).mappings().all()
+    return _paid_claim_payload_from_rows(service, replica, info, rows)
 
 
 def _zero_cost_sequence_payload(
@@ -4258,6 +4330,353 @@ def _admission_from_row(row: Mapping[str, Any],
         resolution=Resolution(str(row['resolution'])),
         effect_phase=EffectPhase(str(row['effect_phase'])),
     )
+
+
+def prepare_fresh_ordinary_paid_batch_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service: Mapping[str, Any],
+    authority: ControllerBindingAuthority,
+    tenant_scope: str,
+    targets: Sequence[FreshOrdinaryPaidTarget],
+) -> PreparedFreshOrdinaryPaidBatch:
+    """Lock and validate one fresh paid wave with a bounded query set.
+
+    The caller must already own the protocol, lifecycle, and service locks in
+    the capacity-admission order.  This is the read half of one
+    transaction-local protocol: it validates every member row, claim, history,
+    and authority before returning immutable material to the request builder.
+    The matching commit function accepts the proof only on this exact
+    connection and transaction.  No database statement may run between the
+    returned proof and that commit; the production caller performs only pure
+    request-body construction in that interval.
+    """
+    _require_postgres(connection)
+    transaction = connection.get_transaction()
+    if transaction is None:
+        raise OrdinaryLaunchBindingUnavailable(
+            'Fresh paid batch preparation requires an active transaction.')
+    if (not isinstance(service, Mapping) or
+            not isinstance(authority, ControllerBindingAuthority) or
+            not authority.generic_launches_required):
+        raise OrdinaryLaunchBindingConflict(
+            'Fresh paid batch authority is malformed or stale.')
+    tenant_scope = _nonempty(tenant_scope, 'tenant_scope')
+    targets = tuple(targets)
+    if (not targets or len(targets)
+            > paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS or not all(
+                isinstance(target, FreshOrdinaryPaidTarget)
+                for target in targets)):
+        raise OrdinaryLaunchBindingConflict(
+            'Fresh paid batch must be nonempty, bounded, and typed.')
+    if (len({target.replica_id for target in targets}) != len(targets) or len(
+        {target.replica_record_id for target in targets}) != len(targets)):
+        raise OrdinaryLaunchBindingConflict(
+            'Fresh paid batch member identities must be unique.')
+    for target in targets:
+        _positive_int(target.replica_id, 'replica_id')
+        _canonical_uuid(target.replica_record_id, 'replica_record_id')
+        _positive_int(target.service_version, 'service_version')
+        _nonempty(target.cluster_name, 'cluster_name')
+
+    if (service.get('name') != authority.service_name or
+            service.get('hash') != authority.service_hash or
+            service.get('workspace') != authority.service_workspace or
+            service.get('lifecycle_epoch') != authority.service_lifecycle_epoch
+            or service.get('ordinary_launch_binding_mode')
+            != BindingMode.BOUND.value or
+            service.get('ordinary_launch_binding_epoch')
+            != authority.binding_epoch or
+            service.get('ordinary_launch_binding_capable') is not True or
+            service.get('controller_incarnation')
+            != authority.controller_incarnation or
+            service.get('controller_owner_epoch')
+            != authority.controller_owner_epoch or service.get('pool') != 0):
+        raise OrdinaryLaunchBindingConflict(
+            'Fresh paid batch service authority is stale.')
+    try:
+        service_status = serve_statuses.ServiceStatus[str(service['status'])]
+    except (KeyError, TypeError) as error:
+        raise OrdinaryLaunchBindingConflict(
+            'Fresh paid batch service status is malformed.') from error
+    if service_status in (
+            serve_statuses.ServiceStatus.replica_launch_blocking_statuses()):
+        raise OrdinaryLaunchBindingConflict(
+            'Service no longer authorizes fresh paid launches.')
+    service_version = targets[0].service_version
+    if (any(target.service_version != service_version for target in targets) or
+            service.get('current_version') != service_version or
+            _elected_recovery_version_in_connection(
+                connection, authority.service_name) != service_version):
+        raise OrdinaryLaunchBindingConflict(
+            'Fresh paid batch does not target the elected service version.')
+    _validate_generic_capability(
+        service,
+        capability_cohort_epoch=authority.non_pool_capability_cohort_epoch,
+        capability_profile_set_digest=authority.non_pool_profile_set_digest,
+        receipt_protocol_version=authority.non_pool_receipt_protocol_version)
+    _require_current_non_pool_worker_projection_in_connection(
+        connection, authority.service_name, service_version)
+
+    replica_ids = tuple(sorted(target.replica_id for target in targets))
+    replica_rows = connection.execute(
+        sqlalchemy.select(serve_state_schema.replicas_table).where(
+            serve_state_schema.replicas_table.c.service_name ==
+            authority.service_name,
+            serve_state_schema.replicas_table.c.replica_id.in_(
+                replica_ids)).order_by(
+                    serve_state_schema.replicas_table.c.replica_id).
+        with_for_update()).mappings().all()
+    replicas_by_id = {int(row['replica_id']): row for row in replica_rows}
+    if len(replicas_by_id) != len(targets):
+        raise OrdinaryLaunchBindingConflict(
+            'Fresh paid batch lost one or more replica rows.')
+
+    claim_rows = connection.execute(
+        sqlalchemy.select(serve_state_schema.paid_capacity_claims_table).where(
+            serve_state_schema.paid_capacity_claims_table.c.service_name ==
+            authority.service_name,
+            serve_state_schema.paid_capacity_claims_table.c.replica_id.in_(
+                replica_ids)).order_by(
+                    serve_state_schema.paid_capacity_claims_table.c.replica_id).
+        with_for_update()).mappings().all()
+    claims_by_id: dict[int, list[Mapping[str, Any]]] = {}
+    for row in claim_rows:
+        claims_by_id.setdefault(int(row['replica_id']), []).append(row)
+
+    infos: dict[int, Any] = {}
+    claim_payloads: dict[int, tuple[str, dict[str, Any]]] = {}
+    validation_by_card: dict[str, list[tuple[Mapping[str, Any], int, str]]] = {}
+    plan_authority: tuple[Any, ...] | None = None
+    for target in targets:
+        replica = replicas_by_id[target.replica_id]
+        if replica['ordinary_launch_association_id'] is not None:
+            raise OrdinaryLaunchBindingConflict(
+                'Fresh paid batch replica already has a launch association.')
+        info = _locked_replica_info(replica)
+        snapshot = {
+            'replica_id': target.replica_id,
+            'replica_record_id': target.replica_record_id,
+            'service_version': target.service_version,
+            'cluster_name': target.cluster_name,
+            'paid_capacity_pool_key': replica.get('paid_capacity_pool_key'),
+            'profile_kind': NonPoolLaunchProfileKind.ORDINARY_PAID.value,
+        }
+        if not _replica_snapshot_matches_association(
+                replica, snapshot, require_launch_authorized=True):
+            raise OrdinaryLaunchBindingConflict(
+                'Fresh paid batch replica identity or state changed.')
+        pool_key, claim_payload = _paid_claim_payload_from_rows(
+            service, replica, info, claims_by_id.get(target.replica_id, ()))
+        if pool_key is None or claim_payload is None:
+            raise OrdinaryLaunchBindingConflict(
+                'Fresh paid batch member has no exact paid claim.')
+        claim = claims_by_id[target.replica_id][0]
+        card = claim.get('capacity_plan_accelerator')
+        units = claim.get('capacity_plan_units')
+        if (not isinstance(card, str) or not card or isinstance(units, bool) or
+                not isinstance(units, int) or units < 1):
+            raise OrdinaryLaunchBindingConflict(
+                'Fresh paid batch claim has a malformed plan debit.')
+        validation_claim = dict(claim)
+        validation_claim['paid_capacity_pool_key'] = pool_key
+        member_plan_authority = tuple(
+            claim.get(field) for field in (
+                'capacity_plan_generation',
+                'capacity_plan_sha256',
+                'demand_feed_generation',
+                'demand_source_epoch',
+            ))
+        if any(value is None for value in member_plan_authority):
+            raise OrdinaryLaunchBindingConflict(
+                'Fresh paid batch has no complete capacity-plan authority.')
+        if plan_authority is None:
+            plan_authority = member_plan_authority
+        elif member_plan_authority != plan_authority:
+            raise OrdinaryLaunchBindingConflict(
+                'Fresh paid batch spans multiple capacity-plan authorities.')
+        validation_by_card.setdefault(card, []).append(
+            (validation_claim, units, pool_key))
+        infos[target.replica_id] = info
+        claim_payloads[target.replica_id] = (pool_key, claim_payload)
+
+    for card in sorted(validation_by_card):
+        members = validation_by_card[card]
+        aggregate_claim = dict(members[0][0])
+        aggregate_claim['capacity_plan_units'] = sum(
+            item[1] for item in members)
+        capacity_admission.validate_paid_claim_in_connection(
+            connection,
+            service,
+            aggregate_claim,
+            prospective=False,
+            require_planner=True,
+            protocol_and_service_prelocked=True,
+            _batch_member_units=tuple(item[1] for item in members),
+            _batch_member_pool_keys=tuple(item[2] for item in members))
+
+    prepared_members = []
+    for target in targets:
+        info = infos[target.replica_id]
+        pool_key, claim_payload = claim_payloads[target.replica_id]
+        record_id = _nonempty(str(info.replica_record_id), 'replica_record_id')
+        profile = NonPoolLaunchProfile.create(
+            NonPoolLaunchProfileKind.ORDINARY_PAID,
+            authorization_reference=(
+                f'paid-capacity:{service["hash"]}:{record_id}:'
+                f'{pool_key}'),
+            authorization_generation=0,
+            authorization_payload={
+                'claim': claim_payload,
+                'placement': _replica_placement_payload(info),
+            })
+        submission_id = derive_ordinary_launch_submission_id(
+            authority.service_name, target.replica_id, target.replica_record_id,
+            1)
+        association_id, request_id = derive_binding_ids(
+            tenant_scope, authority.service_workspace, submission_id)
+        prepared_members.append(
+            PreparedFreshOrdinaryPaidMember(target=target,
+                                            submission_id=submission_id,
+                                            association_id=association_id,
+                                            request_id=request_id,
+                                            paid_capacity_pool_key=pool_key,
+                                            profile=profile))
+
+    association_ids = tuple(
+        member.association_id for member in prepared_members)
+    replica_keys = tuple(
+        (member.target.replica_id, member.target.replica_record_id)
+        for member in prepared_members)
+    replica_record_ids = tuple(
+        member.target.replica_record_id for member in prepared_members)
+    collisions = connection.execute(
+        sqlalchemy.select(
+            ordinary_launch_associations_table.c.association_id).where(
+                sqlalchemy.or_(
+                    ordinary_launch_associations_table.c.association_id.in_(
+                        association_ids),
+                    sqlalchemy.and_(
+                        ordinary_launch_associations_table.c.service_name ==
+                        authority.service_name,
+                        sqlalchemy.or_(
+                            ordinary_launch_associations_table.c.
+                            replica_record_id.in_(replica_record_ids),
+                            sqlalchemy.tuple_(
+                                ordinary_launch_associations_table.c.replica_id,
+                                ordinary_launch_associations_table.c.
+                                replica_record_id).in_(
+                                    replica_keys))))).with_for_update()).all()
+    if collisions:
+        raise OrdinaryLaunchBindingConflict(
+            'Fresh paid batch collided with existing association history.')
+
+    return PreparedFreshOrdinaryPaidBatch(tenant_scope=tenant_scope,
+                                          authority=authority,
+                                          members=tuple(prepared_members),
+                                          _connection=connection,
+                                          _transaction=transaction)
+
+
+def commit_prepared_fresh_ordinary_paid_batch_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    prepared: PreparedFreshOrdinaryPaidBatch,
+    identities: Sequence[NonPoolBindingIdentity],
+) -> tuple[BindingAdmission, ...]:
+    """Set-insert associations and replica pointers for a prepared wave."""
+    _require_postgres(connection)
+    identities = tuple(identities)
+    if (not isinstance(prepared, PreparedFreshOrdinaryPaidBatch) or
+            not prepared.belongs_to(connection) or
+            len(identities) != len(prepared.members)):
+        raise OrdinaryLaunchBindingConflict(
+            'Fresh paid batch proof is absent or belongs to another '
+            'transaction.')
+
+    values = []
+    authority = prepared.authority
+    for member, identity in zip(prepared.members, identities, strict=True):
+        target = member.target
+        if not isinstance(identity, NonPoolBindingIdentity):
+            raise OrdinaryLaunchBindingConflict(
+                'Fresh paid request identity is not a generic binding.')
+        expected = build_non_pool_binding_identity(
+            BindingIntent(
+                service_name=authority.service_name,
+                service_hash=authority.service_hash,
+                service_version=target.service_version,
+                replica_id=target.replica_id,
+                replica_record_id=target.replica_record_id,
+                lifecycle_epoch=authority.service_lifecycle_epoch,
+                binding_epoch=authority.binding_epoch,
+                controller_incarnation=authority.controller_incarnation,
+                controller_owner_epoch=authority.controller_owner_epoch,
+                controller_pid=authority.controller_pid,
+                controller_ip=authority.controller_ip),
+            submission_id=member.submission_id,
+            tenant_scope=prepared.tenant_scope,
+            service_workspace=authority.service_workspace,
+            cluster_name=target.cluster_name,
+            input_digest=identity.input_digest,
+            profile=member.profile,
+            capability_cohort_epoch=NON_POOL_CAPABILITY_COHORT_EPOCH,
+            capability_profile_set_digest=supported_non_pool_profile_set_digest(
+            ),
+            receipt_protocol_version=NON_POOL_RECEIPT_PROTOCOL_VERSION)
+        if identity != expected:
+            raise OrdinaryLaunchBindingConflict(
+                'Fresh paid request identity differs from its prepared row.')
+        row = _identity_values(
+            identity, 1, paid_capacity_pool_key=member.paid_capacity_pool_key)
+        row.update({
+            'owner_controller_incarnation': identity.controller_incarnation,
+            'owner_controller_epoch': identity.controller_owner_epoch,
+            'owner_revision': 1,
+            'effect_phase': EffectPhase.NOT_STARTED.value,
+            'resolution': Resolution.BOUND.value,
+            'reconciliation_outcome': ReconciliationOutcome.ACTIVE_ADOPT.value,
+            'provider_evidence': ProviderEvidence.NOT_QUERIED.value,
+        })
+        values.append(row)
+
+    inserted = set(
+        connection.execute(
+            sqlalchemy.insert(ordinary_launch_associations_table).returning(
+                ordinary_launch_associations_table.c.association_id),
+            values).scalars())
+    expected_association_ids = {
+        identity.association_id for identity in identities
+    }
+    if inserted != expected_association_ids:
+        raise OrdinaryLaunchBindingConflict(
+            'Fresh paid association set was not inserted exactly once.')
+
+    pointer_values = sqlalchemy.values(
+        sqlalchemy.column('replica_id', sqlalchemy.Integer),
+        sqlalchemy.column('association_id', sqlalchemy.Uuid(as_uuid=True)),
+        name='fresh_paid_associations').data([(identity.replica_id,
+                                               identity.association_id)
+                                              for identity in identities])
+    replicas = serve_state_schema.replicas_table
+    pointed = connection.execute(
+        sqlalchemy.update(replicas).where(
+            replicas.c.service_name == authority.service_name,
+            replicas.c.replica_id == pointer_values.c.replica_id,
+            replicas.c.ordinary_launch_association_id.is_(None)).values(
+                ordinary_launch_association_id=pointer_values.c.association_id))
+    if pointed.rowcount != len(identities):
+        raise OrdinaryLaunchBindingConflict(
+            'Fresh paid replica pointer set changed during admission.')
+
+    return tuple(
+        BindingAdmission(disposition=AdmissionDisposition.CREATE,
+                         association_id=str(identity.association_id),
+                         request_id=identity.request_id,
+                         launch_generation=1,
+                         owner_revision=1,
+                         resolution=Resolution.BOUND,
+                         effect_phase=EffectPhase.NOT_STARTED)
+        for identity in identities)
 
 
 def insert_or_get_locked(

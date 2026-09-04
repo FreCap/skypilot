@@ -234,7 +234,13 @@ def materialize_paid_launch_request(
             payload.get('cluster_name') != _CLUSTER_NAME_TEMPLATE or
             payload.get('extra_launch_context') != {}):
         raise ValueError('Paid launch body template changed before binding.')
-    payload['task'] = task.replace(_REPLICA_ID_TEMPLATE_TOKEN, str(replica_id))
+    # ``Task.to_yaml_config()`` quotes digit-only strings so the replica ID
+    # remains a string when YAML is parsed again.  Preserve those canonical
+    # bytes: replacing the opaque token with bare digits would silently change
+    # its YAML type and make templated construction diverge from the direct
+    # builder.
+    payload['task'] = task.replace(_REPLICA_ID_TEMPLATE_TOKEN,
+                                   f"'{replica_id}'")
     payload['cluster_name'] = cluster_name
     payload['extra_launch_context'] = dict(launch_fence)
     return sdk.PreparedLaunchRequest(

@@ -949,6 +949,19 @@ def test_deterministic_ids_include_tenant_workspace_and_submission() -> None:
     assert all(uuid.UUID(str(value)) for value in first)
 
 
+def test_ordinary_submission_id_preserves_established_namespace() -> None:
+    record_id = uuid.UUID('12345678-1234-5678-1234-567812345678')
+
+    assert str(
+        binding.derive_ordinary_launch_submission_id(
+            'service-a', 7, record_id,
+            1)) == 'd26b1500-3f35-5faf-8035-50ce21f11c21'
+    assert binding.derive_ordinary_launch_submission_id(
+        'service-a', 7, record_id,
+        1) != binding.derive_ordinary_launch_submission_id(
+            'service-a', 7, record_id, 2)
+
+
 def test_digest_excludes_mutable_owner_and_server_binding_fields() -> None:
     body = _body()
     digest = binding.canonical_launch_digest(body)

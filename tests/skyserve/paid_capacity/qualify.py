@@ -297,6 +297,30 @@ class ExactRequestCampaignProgress:
                 accepting_offers=(self._accepting_offers))
 
 
+def _has_full_campaign_pressure(counters: ExactRequestCampaignCounters, *,
+                                window_size: int, total_count: int) -> bool:
+    """Return whether one driver frontier has a full live bounded window."""
+    return (counters.accepting_offers and
+            0 <= counters.succeeded <= counters.offered <= total_count and
+            counters.offered - counters.succeeded == window_size)
+
+
+def _campaign_pressure_brackets_observation(
+    before: ExactRequestCampaignCounters,
+    after: ExactRequestCampaignCounters,
+    *,
+    window_size: int,
+    total_count: int,
+) -> bool:
+    """Prove full campaign pressure before and after a provider census."""
+    return (_has_full_campaign_pressure(
+        before, window_size=window_size, total_count=total_count) and
+            _has_full_campaign_pressure(
+                after, window_size=window_size, total_count=total_count) and
+            before.offered <= after.offered and
+            before.succeeded <= after.succeeded)
+
+
 def _campaign_request_id(prefix: str, index: int) -> str:
     return f'{prefix}-execution-{index:05d}'
 
@@ -4152,6 +4176,7 @@ class Receipt:
         if expectation is None:
             expectation = provider_expectation(profile, None)
         self._path = path
+        self._expectation_kind = expectation.kind
         self._payload: dict[str, Any] = {
             'schema_version': _QUALIFICATION_RECEIPT_SCHEMA_VERSION,
             'service_name': service_name,
@@ -4242,10 +4267,16 @@ class Receipt:
             sample['scale_iteration_id'] = scale_iteration_id
         self._payload['samples'].append(sample)
 
-    def bind_scale_campaign_counters(
-            self, *, scale_iteration_id: int,
-            counters: ExactRequestCampaignCounters) -> None:
-        """Bind one atomic driver frontier to its just-recorded scale sample."""
+    def bind_scale_campaign_interval(
+        self,
+        *,
+        scale_iteration_id: int,
+        before: ExactRequestCampaignCounters,
+        before_observed_at: float,
+        after: ExactRequestCampaignCounters,
+        after_observed_at: float,
+    ) -> None:
+        """Bind driver frontiers bracketing the recorded provider census."""
         if not self._payload['samples']:
             raise QualificationError(
                 'Scale sample is unavailable for campaign attribution.')
@@ -4255,8 +4286,20 @@ class Receipt:
                 'campaign_offered' in sample or 'campaign_succeeded' in sample):
             raise QualificationError(
                 'Scale sample has conflicting campaign attribution.')
-        sample['campaign_offered'] = counters.offered
-        sample['campaign_succeeded'] = counters.succeeded
+        sample.update({
+            # The unprefixed fields remain the canonical arrival-attribution
+            # frontier and intentionally name the later observation.
+            'campaign_offered': after.offered,
+            'campaign_succeeded': after.succeeded,
+            'campaign_before_offered': before.offered,
+            'campaign_before_succeeded': before.succeeded,
+            'campaign_before_accepting_offers': before.accepting_offers,
+            'campaign_before_observed_at': before_observed_at,
+            'campaign_after_offered': after.offered,
+            'campaign_after_succeeded': after.succeeded,
+            'campaign_after_accepting_offers': after.accepting_offers,
+            'campaign_after_observed_at': after_observed_at,
+        })
 
     def request_telemetry(
             self,
@@ -4333,9 +4376,30 @@ class Receipt:
             # contain an endpoint or credential-bearing connection string.
             self._payload['error_type'] = type(error).__name__
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
-            json.dumps(self._payload, indent=2, sort_keys=True) + '\n',
-            encoding='utf-8')
+        serialized = json.dumps(self._payload, indent=2, sort_keys=True) + '\n'
+        if error is not None:
+            self._path.write_text(serialized, encoding='utf-8')
+            return
+
+        # A canonical ``passed`` path is itself an externally consumable
+        # verdict.  Validate the complete composite at an unpublished sibling
+        # path first, then atomically promote it.  The lifecycle finalizer may
+        # still read a failed canonical receipt if self-validation rejects the
+        # candidate.
+        candidate_path = self._path.with_name(
+            f'.{self._path.name}.{uuid.uuid4().hex}.candidate')
+        try:
+            candidate_path.write_text(serialized, encoding='utf-8')
+            _read_qualification_evidence(candidate_path, self._expectation_kind)
+            os.replace(candidate_path, self._path)
+        except BaseException as validation_error:
+            candidate_path.unlink(missing_ok=True)
+            self._payload['outcome'] = 'failed'
+            self._payload['error_type'] = type(validation_error).__name__
+            self._path.write_text(
+                json.dumps(self._payload, indent=2, sort_keys=True) + '\n',
+                encoding='utf-8')
+            raise
 
 
 def read_aws_volume_ids_receipt(
@@ -5042,16 +5106,31 @@ def _has_exact_campaign_demand(telemetry: RequestTelemetry,
             telemetry.queue_depth + telemetry.in_flight_requests > 0)
 
 
-def _attributed_resident_campaign_size(
-        telemetry: RequestTelemetry, baseline: RequestTelemetry) -> int | None:
-    """Return exact resident demand without requiring complete occupancy.
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class CampaignDemandEvidence:
+    """Capabilities exposed by one validated request observation."""
 
-    Queue depth and the PostgreSQL active-ledger delta are closed-world counts
-    for this isolated campaign.  Replica occupancy is a separate projection:
-    when some replica probes are unavailable, its confirmed gauges are only
-    lower bounds and its aggregate gauges must be absent.  Such a sample can
-    prove that demand remains resident while scaling, but cannot prove exact
-    processing or zero; those gates continue to require ``reason=complete``.
+    queue_depth: int
+    active_ledger_delta: int
+    confirmed_in_flight_requests: int
+    confirmed_processing_requests: int
+    exact_resident: int | None
+
+    @property
+    def has_resident_demand(self) -> bool:
+        return self.queue_depth > 0 or self.active_ledger_delta > 0
+
+
+def _campaign_demand_evidence(
+        telemetry: RequestTelemetry,
+        baseline: RequestTelemetry) -> CampaignDemandEvidence | None:
+    """Classify presence versus exact-total capabilities.
+
+    Queue reports and async-ledger counts do not share a publication cut.  A
+    partial occupancy sample may therefore prove only that demand exists; it
+    must never derive a total by adding those independently timed projections.
+    A complete occupancy report whose in-flight total equals the active-ledger
+    delta may additionally prove an exact resident count.
     """
     if (not baseline.is_exact_zero() or
             not math.isfinite(telemetry.observed_at) or
@@ -5066,6 +5145,7 @@ def _attributed_resident_campaign_size(
             > telemetry.confirmed_in_flight_requests or
             telemetry.confirmed_in_flight_requests > active_delta):
         return None
+    exact_resident = None
     if telemetry.reason == 'complete':
         if (telemetry.in_flight_requests is None or
                 telemetry.processing_requests is None or
@@ -5076,6 +5156,7 @@ def _attributed_resident_campaign_size(
                 telemetry.processing_requests > telemetry.in_flight_requests or
                 active_delta != telemetry.in_flight_requests):
             return None
+        exact_resident = (telemetry.queue_depth + telemetry.in_flight_requests)
     elif telemetry.reason == 'in_flight_incomplete':
         # A partial projection must not masquerade lower bounds as totals.
         if (telemetry.in_flight_requests is not None or
@@ -5083,7 +5164,12 @@ def _attributed_resident_campaign_size(
             return None
     else:
         return None
-    return telemetry.queue_depth + active_delta
+    return CampaignDemandEvidence(
+        queue_depth=telemetry.queue_depth,
+        active_ledger_delta=active_delta,
+        confirmed_in_flight_requests=telemetry.confirmed_in_flight_requests,
+        confirmed_processing_requests=telemetry.confirmed_processing_requests,
+        exact_resident=exact_resident)
 
 
 async def _wait_for_scale_stimulus(
@@ -5113,9 +5199,9 @@ async def _wait_for_scale_stimulus(
         except Exception:  # pylint: disable=broad-except
             await asyncio.sleep(profile.poll_seconds)
             continue
-        resident = _attributed_resident_campaign_size(telemetry, baseline)
-        if (_has_exact_campaign_demand(telemetry, baseline) and
-                resident is not None and resident > expected_resident):
+        evidence = _campaign_demand_evidence(telemetry, baseline)
+        resident = None if evidence is None else evidence.exact_resident
+        if resident is not None and resident > expected_resident:
             raise QualificationError(
                 'Held campaign prefix contains unattributed demand.')
         if resident == expected_resident:
@@ -5151,8 +5237,9 @@ async def _wait_for_positive_request_telemetry(
         except Exception:  # pylint: disable=broad-except
             await asyncio.sleep(profile.poll_seconds)
             continue
+        evidence = _campaign_demand_evidence(telemetry, baseline)
         if (_has_exact_campaign_demand(telemetry, baseline) and
-                telemetry.queue_depth is not None and
+                evidence is not None and telemetry.queue_depth is not None and
             (profile.name == 'scale' or telemetry.queue_depth > 0) and
                 telemetry.in_flight_requests is not None and
                 telemetry.in_flight_requests > 0 and
@@ -5164,8 +5251,8 @@ async def _wait_for_positive_request_telemetry(
                 telemetry.confirmed_processing_requests > 0 and
                 telemetry.ledger_total > baseline.ledger_total and
                 telemetry.ledger_count('ACCEPTED') > 0 and
-            (profile.name != 'scale' or _attributed_resident_campaign_size(
-                telemetry, baseline) == scale_stimulus_count(profile))):
+            (profile.name != 'scale' or
+             evidence.exact_resident == scale_stimulus_count(profile))):
             receipt.request_telemetry('positive', telemetry)
             return telemetry
         await asyncio.sleep(profile.poll_seconds)
@@ -5209,6 +5296,19 @@ async def _wait_for_final_request_telemetry(
         'and current-work zero.')
 
 
+async def _read_validated_observation(
+        *,
+        observer: Observer,
+        profile: Profile,
+        phase: str,
+        expectation: ProviderExpectation | None = None) -> Observation:
+    """Read and validate an observation before publishing any proof state."""
+    observation = await observer.snapshot(
+        require_complete_demand_report=phase != 'scale')
+    validate_observation(observation, profile, expectation)
+    return observation
+
+
 async def _validated_sample(
         *,
         observer: Observer,
@@ -5218,11 +5318,12 @@ async def _validated_sample(
         phase: str,
         expectation: ProviderExpectation | None = None,
         scale_iteration_id: int | None = None) -> Observation | None:
-    """Collect one sample without turning observer loss into launch control."""
+    """Collect and publish one complete non-composite observation."""
     try:
-        observation = await observer.snapshot(
-            require_complete_demand_report=phase != 'scale')
-        validate_observation(observation, profile, expectation)
+        observation = await _read_validated_observation(observer=observer,
+                                                        profile=profile,
+                                                        phase=phase,
+                                                        expectation=expectation)
     except GuardViolation:
         # Market, card, cap, and durable provider-identity guards are the only
         # evidence failures authoritative enough to stop offered traffic.
@@ -5280,55 +5381,87 @@ async def _wait_for_scale(
         if active_delta < 0 or active_delta > expectation.exact_request_count:
             raise QualificationError(
                 'Scale demand has contradictory exact dispatched identities.')
-        resident = _attributed_resident_campaign_size(telemetry, baseline)
-        if resident is None:
+        evidence = _campaign_demand_evidence(telemetry, baseline)
+        if evidence is None or not evidence.has_resident_demand:
             # The LB demand report and request ledger are independent durable
             # publications.  A queue-to-dispatch handoff can therefore be
-            # visible in either projection first.  Such a sample proves
-            # nothing, but it is not evidence of corruption; only eventual
-            # exact samples are paired with provider observations below.
+            # visible in either projection first. Partial evidence proves only
+            # current presence; campaign pressure is independently bracketed
+            # around the provider census below.
             await asyncio.sleep(profile.poll_seconds)
             continue
         stimulus = (scale_stimulus_count(profile)
                     if profile.name == 'scale' else 1)
-        if (_has_exact_campaign_demand(telemetry, baseline) and
-                resident > stimulus):
-            raise QualificationError(
-                'Scale demand exceeds the bounded sliding window.')
-        if resident < stimulus:
-            # A truthful terminal callback precedes offering the next
-            # immutable identity.  The small refill gap is not a provider
-            # sample; wait for the exact window without delaying either
-            # transition.
-            await asyncio.sleep(profile.poll_seconds)
-            continue
-        scale_iteration_id += 1
-        receipt.request_telemetry('scale',
-                                  telemetry,
-                                  scale_iteration_id=scale_iteration_id)
-        observation = await _validated_sample(
-            observer=observer,
-            profile=profile,
-            progress=progress,
-            receipt=receipt,
-            phase='scale',
-            expectation=expectation,
-            scale_iteration_id=(scale_iteration_id))
-        if observation is None:
-            await asyncio.sleep(profile.poll_seconds)
-            continue
-        if (observation.database.demand_units <= 0 or
-                observation.load_balancer.demand_units <= 0):
-            raise QualificationError(
-                'Provider scale sample has no same-observation demand.')
+        if profile.name == 'scale' and evidence.exact_resident is not None:
+            if evidence.exact_resident > stimulus:
+                raise QualificationError(
+                    'Scale demand exceeds the bounded sliding window.')
+            if evidence.exact_resident < stimulus:
+                await asyncio.sleep(profile.poll_seconds)
+                continue
+        before: ExactRequestCampaignCounters | None = None
+        before_observed_at: float | None = None
+        after: ExactRequestCampaignCounters | None = None
+        after_observed_at: float | None = None
         if profile.name == 'scale':
             if campaign_progress is None:
                 raise QualificationError(
                     'Scale campaign has no exact progress projection.')
-            campaign_counters = await campaign_progress.snapshot()
-            receipt.bind_scale_campaign_counters(
-                scale_iteration_id=scale_iteration_id,
-                counters=campaign_counters)
+            before = await campaign_progress.snapshot()
+            if not _has_full_campaign_pressure(
+                    before,
+                    window_size=stimulus,
+                    total_count=expectation.exact_request_count):
+                await asyncio.sleep(profile.poll_seconds)
+                continue
+        else:
+            resident = evidence.exact_resident
+            if resident is None or resident < stimulus:
+                await asyncio.sleep(profile.poll_seconds)
+                continue
+            if resident > stimulus:
+                raise QualificationError(
+                    'Provider-canary demand exceeds its exact request set.')
+
+        candidate_iteration_id = scale_iteration_id + 1
+        try:
+            observation = await _read_validated_observation(
+                observer=observer,
+                profile=profile,
+                phase='scale',
+                expectation=expectation)
+        except GuardViolation:
+            raise
+        except Exception as error:  # pylint: disable=broad-except
+            scale_iteration_id = candidate_iteration_id
+            receipt.request_telemetry('scale',
+                                      telemetry,
+                                      scale_iteration_id=scale_iteration_id)
+            receipt.miss('scale', error, scale_iteration_id=scale_iteration_id)
+            await asyncio.sleep(profile.poll_seconds)
+            continue
+        if (observation.database.demand_units <= 0 or
+                observation.load_balancer.demand_units <= 0):
+            await _sleep_after_observation(observation, profile.poll_seconds)
+            continue
+        if profile.name == 'scale':
+            assert campaign_progress is not None
+            assert before is not None
+            after = await campaign_progress.snapshot()
+            # These reads occur immediately outside the provider census. Bind
+            # their proven coverage to the census boundaries instead of
+            # introducing a second wall-clock domain into the receipt.
+            before_observed_at = observation.observed_started_at
+            after_observed_at = observation.observed_at
+            if (not _campaign_pressure_brackets_observation(
+                    before,
+                    after,
+                    window_size=stimulus,
+                    total_count=expectation.exact_request_count) or
+                    traffic.done()):
+                await _sleep_after_observation(observation,
+                                               profile.poll_seconds)
+                continue
             arrivals = observation.load_balancer
             next_arrival_attribution = _next_scale_arrival_attribution_state(
                 previous=arrival_attribution,
@@ -5340,8 +5473,8 @@ async def _wait_for_scale(
                     arrivals.offered_arrival_tracking_saturated),
                 initial_arrivals=scale_stimulus_count(profile),
                 maximum_arrivals=expectation.exact_request_count,
-                campaign_offered=campaign_counters.offered,
-                campaign_succeeded=campaign_counters.succeeded)
+                campaign_offered=after.offered,
+                campaign_succeeded=after.succeeded)
             if next_arrival_attribution is None:
                 raise QualificationError(
                     'Scale stimulus contains unattributed offered arrivals.')
@@ -5349,6 +5482,25 @@ async def _wait_for_scale(
             # fall as prior arrivals age out; the atomic driver frontier binds
             # either projection to this immutable campaign.
             arrival_attribution = next_arrival_attribution
+        scale_iteration_id = candidate_iteration_id
+        receipt.request_telemetry('scale',
+                                  telemetry,
+                                  scale_iteration_id=scale_iteration_id)
+        progress.observe(observation, profile, expectation)
+        receipt.sample('scale',
+                       observation,
+                       scale_iteration_id=scale_iteration_id)
+        if profile.name == 'scale':
+            assert before is not None
+            assert before_observed_at is not None
+            assert after is not None
+            assert after_observed_at is not None
+            receipt.bind_scale_campaign_interval(
+                scale_iteration_id=scale_iteration_id,
+                before=before,
+                before_observed_at=before_observed_at,
+                after=after,
+                after_observed_at=after_observed_at)
         if progress.scale_reached_monotonic is not None:
             if progress.scale_qualified_iteration_id is not None:
                 raise QualificationError(
@@ -5837,79 +5989,57 @@ def _ledger_counts(sample: collections.abc.Mapping[str, Any]) -> dict[str, int]:
     return counts
 
 
-def _telemetry_is_fresh_complete(
-        sample: collections.abc.Mapping[str, Any]) -> bool:
-    return (sample.get('state') == 'fresh' and
-            sample.get('reason') == 'complete' and
-            sample.get('compatibility_complete') is True and all(
-                type(sample.get(field)) is int and sample[field] >= 0
-                for field in ('queue_depth', 'in_flight_requests',
-                              'processing_requests',
-                              'confirmed_in_flight_requests',
-                              'confirmed_processing_requests')))
+def _request_telemetry_from_evidence(
+        sample: collections.abc.Mapping[str, Any]) -> RequestTelemetry | None:
+    """Parse a receipt sample into the same type consumed by live proof."""
+    counts = _ledger_counts(sample)
+    observed_at = sample.get('observed_at')
+    telemetry_state = sample.get('state')
+    reason = sample.get('reason')
+    compatibility_complete = sample.get('compatibility_complete')
+    fields = ('queue_depth', 'in_flight_requests', 'processing_requests',
+              'confirmed_in_flight_requests', 'confirmed_processing_requests')
+    values = {field: sample.get(field) for field in fields}
+    if (not isinstance(observed_at, (int, float)) or
+            isinstance(observed_at, bool) or not math.isfinite(observed_at) or
+            observed_at <= 0 or not isinstance(telemetry_state, str) or
+            not isinstance(reason, str) or
+            type(compatibility_complete) is not bool or
+            any(value is not None and (type(value) is not int or value < 0)
+                for value in values.values())):
+        return None
+    telemetry = RequestTelemetry(
+        observed_at=float(observed_at),
+        state=telemetry_state,
+        reason=reason,
+        compatibility_complete=compatibility_complete,
+        queue_depth=values['queue_depth'],
+        in_flight_requests=values['in_flight_requests'],
+        processing_requests=values['processing_requests'],
+        confirmed_in_flight_requests=values['confirmed_in_flight_requests'],
+        confirmed_processing_requests=values['confirmed_processing_requests'],
+        ledger_state_counts=tuple(
+            (ledger_state.value, counts[ledger_state.value])
+            for ledger_state in async_request_ledger.AsyncRequestState))
+    if (sample.get('ledger_active') != telemetry.ledger_active or
+            sample.get('ledger_total') != telemetry.ledger_total or
+            sample.get('ledger_succeeded') != telemetry.ledger_succeeded):
+        return None
+    return telemetry
 
 
 def _telemetry_is_exactly_attributed(sample: collections.abc.Mapping[str, Any],
                                      baseline_active: int) -> bool:
-    if not _telemetry_is_fresh_complete(sample):
+    telemetry = _request_telemetry_from_evidence(sample)
+    if telemetry is None or not telemetry.is_fresh_complete():
         return False
-    counts = _ledger_counts(sample)
-    ledger_active = sum(counts.get(state, 0) for state in _ASYNC_ACTIVE_STATES)
-    ledger_total = sum(counts.values())
-    return (sample.get('ledger_active') == ledger_active and
-            sample.get('ledger_total') == ledger_total and
-            sample.get('ledger_succeeded') == counts.get('SUCCEEDED', 0) and
-            sample['confirmed_in_flight_requests']
-            == sample['in_flight_requests'] and
-            sample['confirmed_processing_requests']
-            == sample['processing_requests'] and
-            sample['processing_requests'] <= sample['in_flight_requests'] and
-            ledger_active - baseline_active == sample['in_flight_requests'])
-
-
-def _telemetry_attributed_resident_size(sample: collections.abc.Mapping[str,
-                                                                        Any],
-                                        baseline_active: int) -> int | None:
-    """Reduce serialized scale evidence using the production capability rule."""
-    if (sample.get('state') != 'fresh' or
-            sample.get('compatibility_complete') is not True or
-            type(sample.get('queue_depth')) is not int or
-            sample['queue_depth'] < 0 or
-            type(sample.get('confirmed_in_flight_requests')) is not int or
-            sample['confirmed_in_flight_requests'] < 0 or
-            type(sample.get('confirmed_processing_requests')) is not int or
-            sample['confirmed_processing_requests'] < 0):
-        return None
-    counts = _ledger_counts(sample)
-    ledger_active = sum(counts.get(state, 0) for state in _ASYNC_ACTIVE_STATES)
-    ledger_total = sum(counts.values())
-    if (sample.get('ledger_active') != ledger_active or
-            sample.get('ledger_total') != ledger_total or
-            sample.get('ledger_succeeded') != counts.get('SUCCEEDED', 0)):
-        return None
-    active_delta = ledger_active - baseline_active
-    confirmed_in_flight = sample['confirmed_in_flight_requests']
-    confirmed_processing = sample['confirmed_processing_requests']
-    if (active_delta < 0 or confirmed_processing > confirmed_in_flight or
-            confirmed_in_flight > active_delta):
-        return None
-    reason = sample.get('reason')
-    if reason == 'complete':
-        in_flight = sample.get('in_flight_requests')
-        processing = sample.get('processing_requests')
-        if (type(in_flight) is not int or in_flight < 0 or
-                type(processing) is not int or processing < 0 or
-                confirmed_in_flight != in_flight or
-                confirmed_processing != processing or processing > in_flight or
-                active_delta != in_flight):
-            return None
-    elif reason == 'in_flight_incomplete':
-        if (sample.get('in_flight_requests') is not None or
-                sample.get('processing_requests') is not None):
-            return None
-    else:
-        return None
-    return sample['queue_depth'] + active_delta
+    return (telemetry.confirmed_in_flight_requests
+            == telemetry.in_flight_requests and
+            telemetry.confirmed_processing_requests
+            == telemetry.processing_requests and
+            telemetry.processing_requests <= telemetry.in_flight_requests and
+            telemetry.ledger_active - baseline_active
+            == telemetry.in_flight_requests)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -6002,6 +6132,10 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
     baseline_counts = _ledger_counts(baseline)
     baseline_active = sum(
         baseline_counts.get(state, 0) for state in _ASYNC_ACTIVE_STATES)
+    baseline_telemetry = _request_telemetry_from_evidence(baseline)
+    if baseline_telemetry is None:
+        raise QualificationError(
+            'Qualification receipt has malformed request baseline evidence.')
 
     scale_stimulus_observed_at: float | None = None
     scale_stimulus = [
@@ -6013,7 +6147,11 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
             raise QualificationError(
                 'Qualification receipt lacks exact scale-stimulus evidence.')
         stimulus = scale_stimulus[0]
-        if (_telemetry_attributed_resident_size(stimulus, baseline_active)
+        stimulus_telemetry = _request_telemetry_from_evidence(stimulus)
+        stimulus_evidence = (None if stimulus_telemetry is None
+                             else _campaign_demand_evidence(
+                                 stimulus_telemetry, baseline_telemetry))
+        if (stimulus_evidence is None or stimulus_evidence.exact_resident
                 != scale_stimulus_count(profile)):
             raise QualificationError(
                 'Qualification receipt has an incomplete scale stimulus.')
@@ -6035,12 +6173,21 @@ def _validate_request_evidence(payload: collections.abc.Mapping[str, Any], *,
             raise QualificationError(
                 'Qualification receipt scale iterations are not contiguous '
                 'in request evidence order.')
-        resident = _telemetry_attributed_resident_size(sample, baseline_active)
-        if resident is None:
+        scale_telemetry = _request_telemetry_from_evidence(sample)
+        if scale_telemetry is None:
             raise QualificationError(
                 'Qualification receipt contains unattributed scale demand.')
-        if resident != (scale_stimulus_count(profile)
-                        if profile.name == 'scale' else 1):
+        scale_evidence = _campaign_demand_evidence(scale_telemetry,
+                                                   baseline_telemetry)
+        if scale_evidence is None or not scale_evidence.has_resident_demand:
+            raise QualificationError(
+                'Qualification receipt contains unattributed scale demand.')
+        if (profile.name == 'scale' and
+                scale_evidence.exact_resident is not None and
+                scale_evidence.exact_resident != scale_stimulus_count(profile)):
+            raise QualificationError(
+                'Qualification receipt contains unattributed scale demand.')
+        if (profile.name != 'scale' and scale_evidence.exact_resident != 1):
             raise QualificationError(
                 'Qualification receipt contains unattributed scale demand.')
         scale_iteration_ids.add(iteration_id)
@@ -6231,6 +6378,50 @@ def _complete_provider_sample(
     return totals, cloud_totals
 
 
+def _validated_campaign_pressure_interval(
+    sample: collections.abc.Mapping[str, Any],
+    *,
+    profile: Profile,
+) -> ExactRequestCampaignCounters:
+    """Validate driver frontiers that bracket one provider observation."""
+
+    def _frontier(prefix: str) -> ExactRequestCampaignCounters | None:
+        offered = sample.get(f'campaign_{prefix}_offered')
+        succeeded = sample.get(f'campaign_{prefix}_succeeded')
+        accepting = sample.get(f'campaign_{prefix}_accepting_offers')
+        if (type(offered) is not int or type(succeeded) is not int or
+                type(accepting) is not bool):
+            return None
+        return ExactRequestCampaignCounters(offered=offered,
+                                            succeeded=succeeded,
+                                            accepting_offers=accepting)
+
+    before = _frontier('before')
+    after = _frontier('after')
+    before_at = _strict_timestamp(
+        {'observed_at': sample.get('campaign_before_observed_at')})
+    after_at = _strict_timestamp(
+        {'observed_at': sample.get('campaign_after_observed_at')})
+    observation_started_at = _strict_timestamp(
+        {'observed_at': sample.get('observation_started_at')})
+    observation_finished_at = _strict_timestamp(
+        {'observed_at': sample.get('observation_finished_at')})
+    if (before is None or after is None or
+            not _campaign_pressure_brackets_observation(
+                before,
+                after,
+                window_size=scale_stimulus_count(profile),
+                total_count=profile.exact_requests) or
+            before_at != observation_started_at or
+            after_at != observation_finished_at or
+            observation_finished_at != sample.get('observed_at') or
+            sample.get('campaign_offered') != after.offered or
+            sample.get('campaign_succeeded') != after.succeeded):
+        raise QualificationError(
+            'Provider scale sample lacks sustained campaign pressure.')
+    return after
+
+
 def _validate_provider_scale_samples(
         payload: collections.abc.Mapping[str, Any], *,
         providers: tuple[str, ...], profile: Profile,
@@ -6354,6 +6545,8 @@ def _validate_provider_scale_samples(
             raise QualificationError(
                 'Provider scale sample has no same-observation demand.')
         if profile.name == 'scale':
+            campaign_counters = _validated_campaign_pressure_interval(
+                sample, profile=profile)
             next_arrival_attribution = _next_scale_arrival_attribution_state(
                 previous=arrival_attribution,
                 unique_job_arrivals_60s=sample.get(
@@ -6368,8 +6561,8 @@ def _validate_provider_scale_samples(
                     'lb_offered_arrival_tracking_saturated'),
                 initial_arrivals=scale_stimulus_count(profile),
                 maximum_arrivals=profile.exact_requests,
-                campaign_offered=sample.get('campaign_offered'),
-                campaign_succeeded=sample.get('campaign_succeeded'))
+                campaign_offered=campaign_counters.offered,
+                campaign_succeeded=campaign_counters.succeeded)
             if next_arrival_attribution is None:
                 raise QualificationError(
                     'Provider scale sample has unattributed offered arrivals.')

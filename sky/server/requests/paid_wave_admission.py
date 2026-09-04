@@ -15,7 +15,6 @@ from sky import global_user_state_schema
 from sky.client import sdk
 from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
-from sky.serve import serve_state_schema
 from sky.server import constants as server_constants
 from sky.server.requests import non_pool_admission
 from sky.server.requests import postgres as request_postgres
@@ -147,15 +146,9 @@ def bind_accepted_in_transaction(
             'Fused paid launch binding requires an active PostgreSQL '
             'transaction.')
     accepted = tuple(accepted)
-    if (not authority.generic_launches_required or
-            service.get('name') != authority.service_name or
-            service.get('hash') != authority.service_hash or
-            service.get('workspace') != authority.service_workspace or
-            service.get('lifecycle_epoch')
-            != authority.service_lifecycle_epoch):
-        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-            'Fused paid launch authority is stale.')
-    if accepted and not request_postgres.non_pool_launch_binding_fleet_capable(
+    if not accepted:
+        return ()
+    if not request_postgres.non_pool_launch_binding_fleet_capable(
             connection=connection):
         raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
             'The generic request fleet is not yet capable.')
@@ -171,7 +164,7 @@ def bind_accepted_in_transaction(
         receipt_protocol_version=(
             ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
 
-    receipts = []
+    targets = []
     for member, spec in accepted:
         if ((member.replica_id, member.replica_record_id, member.pool_key,
              member.accelerator, member.physical_gpu_units)
@@ -179,34 +172,33 @@ def bind_accepted_in_transaction(
                     spec.accelerator, spec.physical_gpu_units)):
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                 'Paid receipt and executable candidate disagree.')
+        targets.append(
+            ordinary_launch_binding.FreshOrdinaryPaidTarget(
+                replica_id=spec.replica_id,
+                replica_record_id=uuid.UUID(spec.replica_record_id),
+                service_version=spec.service_version,
+                cluster_name=spec.cluster_name_seed))
+
+    prepared_batch = (
+        ordinary_launch_binding.prepare_fresh_ordinary_paid_batch_in_connection(
+            connection,
+            service=service,
+            authority=authority,
+            tenant_scope=tenant_id,
+            targets=targets))
+
+    built_admissions = []
+    for (_, spec), prepared_member in zip(accepted,
+                                          prepared_batch.members,
+                                          strict=True):
         body = _prepared_body(spec, authority)
         body.env_vars[skylet_constants.USER_ID_ENV_VAR] = tenant_id
         body.env_vars[skylet_constants.USER_ENV_VAR] = creator_name
         body.client_api_version = server_constants.API_VERSION
-        submission_id = uuid.UUID(
-            request_postgres.
-            stable_bound_ordinary_launch_submission_id_in_connection(
-                connection, spec.service_name, spec.replica_id,
-                spec.replica_record_id))
-        replica = connection.execute(
-            sqlalchemy.select(serve_state_schema.replicas_table).where(
-                serve_state_schema.replicas_table.c.service_name ==
-                spec.service_name,
-                serve_state_schema.replicas_table.c.replica_id ==
-                spec.replica_id)).mappings().one_or_none()
-        if replica is None:
-            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                'Accepted paid launch lost its replica row.')
-        profile = ordinary_launch_binding.resolve_non_pool_launch_profile_in_connection(
-            connection, service, replica, protocol_and_service_prelocked=True)
-        if profile.kind is not (
-                ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
-            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                'Accepted paid launch resolved a non-paid profile.')
         built = non_pool_admission.build(
             body,
-            submission_id,
-            profile,
+            prepared_member.submission_id,
+            prepared_member.profile,
             admission_authority,
             auth_user=None,
             client_api_version=server_constants.API_VERSION)
@@ -214,9 +206,18 @@ def bind_accepted_in_transaction(
                 built.request.request_body) != built.identity.input_digest:
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                 'Fused paid request body does not match its canonical digest.')
-        admission = non_pool_admission.bind_in_transaction(connection,
-                                                           built,
-                                                           runtime=runtime)
+        built_admissions.append(built)
+
+    admissions = (request_postgres.
+                  bind_and_enqueue_fresh_ordinary_paid_batch_in_transaction(
+                      connection,
+                      tuple(built.request for built in built_admissions),
+                      tuple(built.identity for built in built_admissions),
+                      prepared=prepared_batch,
+                      runtime=runtime))
+    receipts = []
+    for built, admission in zip(built_admissions, admissions, strict=True):
+        non_pool_admission.validate_result(admission, built)
         if not admission.created:
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                 'Fresh paid capacity resolved an existing launch request.')
@@ -224,9 +225,9 @@ def bind_accepted_in_transaction(
             built.request.request_body.extra_launch_context)
         receipts.append(
             FusedBindingReceiptMember(
-                replica_id=member.replica_id,
-                replica_record_id=member.replica_record_id,
-                submission_id=submission_id,
+                replica_id=built.identity.replica_id,
+                replica_record_id=str(built.identity.replica_record_id),
+                submission_id=built.identity.submission_id,
                 association_id=admission.association_id,
                 request_id=admission.request_id,
                 launch_generation=admission.launch_generation,
