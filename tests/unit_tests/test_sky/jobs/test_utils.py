@@ -1760,3 +1760,56 @@ class TestIsRelayedStatusPayloadLine:
     def test_plain_log_line_not_detected(self):
         assert jobs_utils._is_relayed_status_payload_line(
             'Preparing SkyPilot runtime (1/3)\n') is False
+
+
+class TestControllerLogGuidance:
+    """Tests for capability-aware controller-log guidance."""
+
+    def test_waiting_hint_includes_controller_logs_when_supported(self):
+        formatted = jobs_utils._JOB_WAITING_STATUS_MESSAGE.format(
+            status_str='',
+            provision_str='',
+            controller_hint=jobs_utils.controller_log_waiting_hint(7),
+            job_id=7)
+
+        assert 'sky jobs logs --controller 7' in formatted
+
+    def test_waiting_hint_is_hidden_in_guarded_ha(self, monkeypatch):
+        monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'postgres')
+        monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'api')
+        monkeypatch.setenv('SKYPILOT_API_SERVER_STORAGE_ENABLED', 'false')
+
+        formatted = jobs_utils._JOB_WAITING_STATUS_MESSAGE.format(
+            status_str='',
+            provision_str='',
+            controller_hint=jobs_utils.controller_log_waiting_hint(7),
+            job_id=7)
+
+        assert 'View controller logs' not in formatted
+        assert 'sky jobs logs --controller 7' not in formatted
+
+    def test_render_stopped_snapshot_logs_reports_unavailable_logs_in_guarded_ha(
+            self, monkeypatch):
+        monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'postgres')
+        monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'api')
+        monkeypatch.setenv('SKYPILOT_API_SERVER_STORAGE_ENABLED', 'false')
+        monkeypatch.setattr(jobs_utils.managed_job_state, 'get_failure_reason',
+                            lambda job_id: f'job {job_id} failed')
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state,
+            'get_all_task_ids_names_statuses_logs',
+            lambda job_id: [(0, 'task', managed_job_state.ManagedJobStatus.
+                             FAILED_SETUP, None, None)])
+
+        msg, exit_code = jobs_utils.managed_job_log_streaming._render_stopped_snapshot_logs(
+            7,
+            managed_job_state.ManagedJobStatus.FAILED_SETUP,
+            task_filter=None,
+            filtered_task_id=None,
+            tail=None,
+            tail_offset=None,
+            num_tasks=None)
+
+        assert exit_code == exceptions.JobExitCode.FAILED
+        assert 'sky jobs logs --controller 7' not in msg
+        assert 'Controller logs are unavailable in PostgreSQL guarded HA' in msg

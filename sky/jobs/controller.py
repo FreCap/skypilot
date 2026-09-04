@@ -1270,9 +1270,9 @@ class JobController:
                                             task_id, handle,
                                             job_id_on_pool_cluster)
 
-                    failure_reason = (
-                        'To see the details, run: '
-                        f'sky jobs logs --controller {self._job_id}')
+                    failure_reason = managed_job_utils.controller_log_guidance(
+                        self._job_id,
+                        available_prefix='To see the details, run: ')
 
                     managed_job_status = (
                         managed_job_state.ManagedJobStatus.FAILED)
@@ -1338,8 +1338,9 @@ class JobController:
                     # unknown new state that we do not handle.
                     logger.error(f'Unknown job status: {job_status}')
                     failure_reason = (
-                        f'Unknown job status {job_status}. To see the details, '
-                        f'run: sky jobs logs --controller {self._job_id}')
+                        f'Unknown job status {job_status}. '
+                        f'{managed_job_utils.controller_log_guidance(self._job_id, available_prefix="To see the details, run: ")}'
+                    )
                     await managed_job_state.set_failed_async(
                         self._job_id,
                         task_id,
@@ -3109,9 +3110,11 @@ class ControllerManager:
                         task_id=None,
                         failure_type=managed_job_state.ManagedJobStatus.
                         FAILED_CONTROLLER,
-                        failure_reason=(
-                            'Unexpected error occurred. For details, '
-                            f'run: sky jobs logs --controller {job_id}'))
+                        failure_reason=managed_job_utils.
+                        controller_log_guidance(
+                            job_id,
+                            available_prefix=
+                            'Unexpected error occurred. For details, run: '))
 
                 try:
                     await asyncio.to_thread(
