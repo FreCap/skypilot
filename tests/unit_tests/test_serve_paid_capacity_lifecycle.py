@@ -455,6 +455,7 @@ def test_first_cancellation_during_normal_finalizer_is_deferred(
     assert stages['wait-cleanup']['outcome'] == 'passed'
     assert _receipt(tmp_path)['exact_cleanup_proven'] is True
 
+
 def test_lost_up_acknowledgement_still_finalizes(monkeypatch, tmp_path):
     events = []
     _install_operations(monkeypatch, events)
