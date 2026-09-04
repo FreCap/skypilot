@@ -6279,26 +6279,6 @@ class CapacityAdmissionRepository:
             if paid_census.live_paid_gpu_units != charged_paid:
                 raise CapacityAdmissionConflict(
                     'Planner and paid arbitration GPU censuses disagree.')
-            paid_context = serve_state._lock_paid_capacity_admission_context_in_session(  # pylint: disable=protected-access
-                connection,
-                self.engine,
-                service_name, [],
-                candidate_pool_keys={
-                    template.pool_key for template in prepared_templates
-                },
-                upstream=upstream,
-                census=paid_census,
-                base_limit=serve_paid_capacity.base_limit(),
-                now=None,
-                waiter_ttl_seconds=serve_paid_capacity.waiter_ttl_seconds())
-
-            raw_claim_rows = connection.execute(
-                sqlalchemy.select(
-                    _CLAIMS.c.replica_id, _CLAIMS.c.service_hash).where(
-                        _CLAIMS.c.service_name == service_name)).all()
-            raw_waiter_rows = connection.execute(
-                sqlalchemy.select(_PAID_WAITERS.c.service_hash).where(
-                    _PAID_WAITERS.c.service_name == service_name)).all()
             validated_policy_head = _resolve_validated_format_6_head(
                 history=locked_history,
                 config=fill_config,
@@ -6318,6 +6298,50 @@ class CapacityAdmissionRepository:
                 prior_candidate = None
             else:
                 prior_policy_state, prior_candidate = validated_policy_head
+            paid_context = serve_state._lock_paid_capacity_admission_context_in_session(  # pylint: disable=protected-access
+                connection,
+                self.engine,
+                service_name, [],
+                candidate_pool_keys={
+                    template.pool_key for template in prepared_templates
+                },
+                upstream=upstream,
+                census=paid_census,
+                base_limit=serve_paid_capacity.base_limit(),
+                now=None,
+                waiter_ttl_seconds=serve_paid_capacity.waiter_ttl_seconds(),
+                capture_raw_service_census=not has_validated_format_6_head)
+
+            if has_validated_format_6_head:
+                service_claim_rows = tuple(
+                    (int(row['replica_id']), str(row['service_hash']))
+                    for row in paid_context.claim_rows
+                    if str(row['service_name']) == service_name)
+                service_waiter_hashes = tuple(
+                    str(row['service_hash'])
+                    for row in paid_context.waiter_rows
+                    if str(row['service_name']) == service_name)
+                service_claim_count = len(service_claim_rows)
+                service_waiter_count = len(service_waiter_hashes)
+                service_claim_highwater = max(
+                    (replica_id for replica_id, _ in service_claim_rows),
+                    default=None)
+                has_foreign_paid_incarnation = (
+                    any(claim_hash != service_hash
+                        for _, claim_hash in service_claim_rows) or
+                    any(waiter_hash != service_hash
+                        for waiter_hash in service_waiter_hashes))
+            else:
+                raw_service_census = paid_context.raw_service_census
+                if raw_service_census is None:
+                    raise RuntimeError(
+                        'Headless paid admission omitted its raw census.')
+                service_claim_count = raw_service_census.claim_count
+                service_waiter_count = raw_service_census.waiter_count
+                service_claim_highwater = (
+                    raw_service_census.claim_replica_id_highwater)
+                has_foreign_paid_incarnation = (
+                    raw_service_census.has_foreign_incarnation)
 
             dependent_graph = _lock_association_authority_graph(
                 connection,
@@ -6332,11 +6356,9 @@ class CapacityAdmissionRepository:
                 locked_capacity=locked_capacity,
                 lane_projection=lane_projection)
             active_effect_rows = dependent_graph.active_association_rows
-            if (any(str(row[1]) != service_hash for row in raw_claim_rows) or
-                    any(str(row[0]) != service_hash for row in raw_waiter_rows)
-                    or any(
-                        str(row['service_hash']) != service_hash
-                        for row in active_effect_rows)):
+            if (has_foreign_paid_incarnation or any(
+                    str(row['service_hash']) != service_hash
+                    for row in active_effect_rows)):
                 raise CapacityAdmissionConflict(
                     'A retained authority graph belongs to another service '
                     'incarnation.')
@@ -6349,7 +6371,8 @@ class CapacityAdmissionRepository:
             identity_baseline = [
                 int(row['replica_id']) for row in locked_capacity.replica_rows
             ]
-            identity_baseline.extend(int(row[0]) for row in raw_claim_rows)
+            if service_claim_highwater is not None:
+                identity_baseline.append(service_claim_highwater)
             identity_baseline.extend(
                 int(row['replica_id'])
                 for row in locked_capacity.intent_rows
@@ -6376,8 +6399,8 @@ class CapacityAdmissionRepository:
                         locked_capacity=locked_capacity,
                         lane_projection=lane_projection,
                         allocation_reserved=allocation_reserved,
-                        raw_claim_count=len(raw_claim_rows),
-                        raw_waiter_count=len(raw_waiter_rows),
+                        raw_claim_count=service_claim_count,
+                        raw_waiter_count=service_waiter_count,
                         dependent_effect_count=(
                             len(active_effect_rows) +
                             dependent_graph.blocking_request_count +
@@ -6533,13 +6556,8 @@ class CapacityAdmissionRepository:
                 paid_gpu_units_by_index=tuple(
                     item.physical_gpu_units for item in paid_candidates),
                 live_paid_gpu_units=paid_census.live_paid_gpu_units)
-            candidate_context = serve_state._LockedPaidCapacityAdmissionContext(  # pylint: disable=protected-access
-                upstream=paid_context.upstream,
-                census=candidate_census,
-                pool_rows=paid_context.pool_rows,
-                claim_rows=paid_context.claim_rows,
-                waiter_rows=paid_context.waiter_rows,
-                transaction_now=paid_context.transaction_now)
+            candidate_context = dataclasses.replace(paid_context,
+                                                    census=candidate_census)
             candidate_persistence_specs = [
                 item.persistence_spec for item in paid_candidates
             ]
