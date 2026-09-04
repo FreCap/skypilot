@@ -608,7 +608,7 @@ def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
                            'uuid4',
                            return_value=colliding_record_id), pytest.raises(
                                capacity_admission.CapacityAdmissionConflict,
-                               match='settled planner record'):
+                               match='existing association history'):
         _reconcile(engine, 1, prepared_templates=(template,))
 
     # Every supported association/request-root creator first acquires the same
