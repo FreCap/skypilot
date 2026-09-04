@@ -446,8 +446,9 @@ def test_disposable_process_does_not_retain_namespaced_database_connections(
 
 @pytest.fixture
 def bound_request_database(request_database, monkeypatch):
-    """Request and Serve binding schemas on one central PostgreSQL database."""
+    """Request, global-state, and Serve schemas on one central PostgreSQL DB."""
     engine, backend = request_database
+    global_user_state_schema.cluster_table.create(engine, checkfirst=True)
     config = migration_utils.get_alembic_config(engine,
                                                 migration_utils.SERVE_DB_NAME)
     # Bound launch reduction acquires the global zero-cost event sequencer
@@ -455,6 +456,7 @@ def bound_request_database(request_database, monkeypatch):
     # current additive-stack schema boundary even while the reconciliation
     # gate remains in legacy mode.
     alembic_command.upgrade(config, migration_utils.SERVE_VERSION)
+    monkeypatch.setattr(global_user_state._db_manager, '_engine', engine)
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine', engine)
     controller_config = b'''\
 active_workspace: workspace-a
@@ -2181,6 +2183,11 @@ def test_generic_binding_atomically_commits_exact_profile_request_queue_and_pin(
     pool_key = _gc_paid_pool_key()
     info = replica_managers.ReplicaInfo.from_storage_dict(_gc_replica_state())
     info.paid_capacity_pool_key = pool_key
+    resource_identity = (ordinary_launch_binding.
+                         derive_fresh_ordinary_paid_resource_action_identity(
+                             replica_id=3,
+                             replica_record_id=_GC_REPLICA_RECORD_ID,
+                             cluster_name='gc-service-3'))
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.replicas_table).where(
@@ -2210,6 +2217,10 @@ def test_generic_binding_atomically_commits_exact_profile_request_queue_and_pin(
                 serve_state_schema.replicas_table.c.replica_id == 3).values(
                     status='PROVISIONING',
                     paid_capacity_pool_key=pool_key,
+                    replica_incarnation=(resource_identity.replica_incarnation),
+                    desired_generation=resource_identity.desired_generation,
+                    sky_cluster_record_uuid=(
+                        resource_identity.sky_cluster_record_uuid),
                     replica_state=info.to_storage_dict()))
         connection.execute(
             sqlalchemy.insert(
