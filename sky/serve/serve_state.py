@@ -6255,12 +6255,23 @@ class _PaidCapacityAdmissionCensus:
 
 
 @dataclasses.dataclass(frozen=True)
+class _PaidCapacityAdmissionRawServiceCensus:
+    """Service evidence captured before destructive visibility cleanup."""
+
+    claim_count: int
+    waiter_count: int
+    claim_replica_id_highwater: int | None
+    has_foreign_incarnation: bool
+
+
+@dataclasses.dataclass(frozen=True)
 class _LockedPaidCapacityAdmissionContext:
     """Downstream paid rows locked in canonical order for one transaction."""
 
     upstream: _PaidCapacityAdmissionUpstreamContext
     census: _PaidCapacityAdmissionCensus
     pool_rows: Mapping[str, Any]
+    raw_service_census: _PaidCapacityAdmissionRawServiceCensus | None
     claim_rows: tuple[Mapping[str, Any], ...]
     waiter_rows: tuple[Mapping[str, Any], ...]
     transaction_now: float
@@ -6504,6 +6515,7 @@ def _lock_paid_capacity_admission_context_in_session(
     base_limit: int,
     now: float | None,
     waiter_ttl_seconds: float | None = None,
+    capture_raw_service_census: bool = False,
 ) -> _LockedPaidCapacityAdmissionContext:
     """Lock only paid pools/claims/waiters after upstream rows are locked.
 
@@ -6540,22 +6552,73 @@ def _lock_paid_capacity_admission_context_in_session(
     # upstream service/replica rows after a pool lock. New rows acquire
     # ordinary DML locks when the predeclared identity is inserted later in
     # this same transaction.
+    #
+    # Headless policy validation needs the exhaustive service evidence before
+    # either destructive cleanup.  The upstream service-owner lock stabilizes
+    # same-service membership; each captured row is then DELETE-locked or
+    # survivor-locked below before the caller validates the census.
+    raw_service_claim_count = 0
+    raw_service_claim_highwater = None
+    raw_service_claim_has_foreign_incarnation = False
+    if capture_raw_service_census:
+        claim_census = session.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count().label('claim_count'),
+                sqlalchemy.func.max(
+                    paid_capacity_claims_table.c.replica_id).label(
+                        'replica_id_highwater'),
+                sqlalchemy.func.count().filter(
+                    paid_capacity_claims_table.c.service_hash !=
+                    upstream.service_hash).label('foreign_count')).where(
+                        paid_capacity_claims_table.c.service_name ==
+                        service_name)).mappings().one()
+        raw_service_claim_count = int(claim_census['claim_count'])
+        raw_service_claim_highwater = claim_census['replica_id_highwater']
+        if raw_service_claim_highwater is not None:
+            raw_service_claim_highwater = int(raw_service_claim_highwater)
+        raw_service_claim_has_foreign_incarnation = bool(
+            claim_census['foreign_count'])
     _delete_invisible_paid_capacity_claims_in_session(session,
                                                       distinct_pool_keys)
     claim_rows = _locked_paid_capacity_claim_rows_in_session(
         session, distinct_pool_keys)
+    raw_service_waiter_count = 0
+    raw_service_waiter_has_foreign_incarnation = False
+    if capture_raw_service_census:
+        waiter_census = session.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count().label('waiter_count'),
+                sqlalchemy.func.count().filter(
+                    paid_capacity_waiters_table.c.service_hash !=
+                    upstream.service_hash).label('foreign_count')).where(
+                        paid_capacity_waiters_table.c.service_name ==
+                        service_name)).mappings().one()
+        raw_service_waiter_count = int(waiter_census['waiter_count'])
+        raw_service_waiter_has_foreign_incarnation = bool(
+            waiter_census['foreign_count'])
     _delete_invisible_paid_capacity_waiters_in_session(
         session,
         distinct_pool_keys,
         heartbeat_cutoff=transaction_now - waiter_ttl_seconds)
     waiter_rows = _locked_paid_capacity_waiter_rows_in_session(
         session, distinct_pool_keys)
-    return _LockedPaidCapacityAdmissionContext(upstream=upstream,
-                                               census=census,
-                                               pool_rows=pool_rows,
-                                               claim_rows=claim_rows,
-                                               waiter_rows=waiter_rows,
-                                               transaction_now=transaction_now)
+    raw_service_census = None
+    if capture_raw_service_census:
+        raw_service_census = _PaidCapacityAdmissionRawServiceCensus(
+            claim_count=raw_service_claim_count,
+            waiter_count=raw_service_waiter_count,
+            claim_replica_id_highwater=raw_service_claim_highwater,
+            has_foreign_incarnation=(
+                raw_service_claim_has_foreign_incarnation or
+                raw_service_waiter_has_foreign_incarnation))
+    return _LockedPaidCapacityAdmissionContext(
+        upstream=upstream,
+        census=census,
+        pool_rows=pool_rows,
+        raw_service_census=raw_service_census,
+        claim_rows=claim_rows,
+        waiter_rows=waiter_rows,
+        transaction_now=transaction_now)
 
 
 def _group_locked_paid_capacity_claims(

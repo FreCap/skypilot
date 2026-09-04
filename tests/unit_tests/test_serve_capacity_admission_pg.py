@@ -5790,6 +5790,159 @@ def test_current_planner_empty_wave_fails_closed_on_old_incarnation_graph(
                                            planner=planner)
 
     planner.assert_not_called()
+    if retained_kind == 'association':
+        retained_table = (
+            ordinary_launch_binding.ordinary_launch_associations_table)
+    elif retained_kind == 'claim':
+        retained_table = serve_state_schema.paid_capacity_claims_table
+    else:
+        retained_table = serve_state_schema.paid_capacity_waiters_table
+    with engine.connect() as connection:
+        retained = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(retained_table).where(
+                    retained_table.c.service_name == 'svc',
+                    retained_table.c.service_hash ==
+                    'retained-old-hash')).scalar_one()
+    assert retained == 1
+
+
+@pytest.mark.parametrize('retained_kind', ['claim', 'waiter'])
+def test_current_planner_headless_current_paid_authority_fails_closed(
+        capacity_database, retained_kind):
+    """Visibility cleanup cannot relabel paid evidence as clean genesis."""
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    pool_key = _paid_pool_key()
+    now = time.time()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.paid_capacity_pools_table).values(
+                    pool_key=pool_key,
+                    current_limit=4,
+                    successes_since_resize=0,
+                    updated_at=now))
+        if retained_kind == 'claim':
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_claims_table).values(
+                        service_name='svc',
+                        service_hash='svc-hash',
+                        replica_id=140,
+                        pool_key=pool_key,
+                        priority=50,
+                        claimed_at=now))
+            retained_table = serve_state_schema.paid_capacity_claims_table
+        else:
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_waiters_table).values(
+                        pool_key=pool_key,
+                        service_name='svc',
+                        service_hash='svc-hash',
+                        priority=50,
+                        first_wait_at=1,
+                        heartbeat_at=1))
+            retained_table = serve_state_schema.paid_capacity_waiters_table
+    planner = mock.Mock()
+
+    with pytest.raises(
+            capacity_admission.CapacityAdmissionConflict,
+            match='Missing capacity policy beside a retained authority graph'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_admit_current(**_current_owner_kwargs(engine),
+                                           service_name='svc',
+                                           service_hash='svc-hash',
+                                           service_lifecycle_epoch=3,
+                                           service_version=1,
+                                           accounting_cards={'l4': 1},
+                                           backend_num_nodes=1,
+                                           sequenced_reserved_fill=False,
+                                           planner=planner)
+
+    planner.assert_not_called()
+    with engine.connect() as connection:
+        retained = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(retained_table).where(
+                    retained_table.c.service_name == 'svc',
+                    retained_table.c.service_hash == 'svc-hash')).scalar_one()
+    assert retained == 1
+    plan_count, head_count, _, _ = _paid_write_counts(engine)
+    assert (plan_count, head_count) == (0, 0)
+
+
+@pytest.mark.parametrize('retained_kind', ['claim', 'waiter'])
+def test_current_planner_with_head_prunes_old_incarnation_paid_rows(
+        capacity_database, retained_kind):
+    """A strict policy head keeps destructive visibility cleanup safe."""
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    first = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 1},
+        backend_num_nodes=1,
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 0))
+    pool_key = _paid_pool_key()
+    now = time.time()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.paid_capacity_pools_table).values(
+                    pool_key=pool_key,
+                    current_limit=4,
+                    successes_since_resize=0,
+                    updated_at=now))
+        if retained_kind == 'claim':
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_claims_table).values(
+                        service_name='svc',
+                        service_hash='retained-old-hash',
+                        replica_id=140,
+                        pool_key=pool_key,
+                        priority=50,
+                        claimed_at=now))
+            retained_table = serve_state_schema.paid_capacity_claims_table
+        else:
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_waiters_table).values(
+                        pool_key=pool_key,
+                        service_name='svc',
+                        service_hash='retained-old-hash',
+                        priority=50,
+                        first_wait_at=now,
+                        heartbeat_at=now))
+            retained_table = serve_state_schema.paid_capacity_waiters_table
+
+    successor = repository.plan_and_admit_current(
+        **_current_owner_kwargs(engine),
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 1},
+        backend_num_nodes=1,
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 0))
+
+    assert successor.authority.generation == first.authority.generation + 1
+    with engine.connect() as connection:
+        retained = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(retained_table).where(
+                    retained_table.c.service_name == 'svc',
+                    retained_table.c.service_hash ==
+                    'retained-old-hash')).scalar_one()
+    assert retained == 0
 
 
 def test_current_planner_clean_recreation_ignores_detached_old_tombstone(
