@@ -3729,6 +3729,10 @@ local exact artifacts, global cluster row, then replica.  Cleanup evidence
 therefore independently proves VM, disk, and create-operation absence plus the
 PostgreSQL graph's exact zero.  It does not claim to independently detect an
 out-of-band firewall recreation after finalization.
+The shared cluster-row mutation primitive enforces this ordering: any row with
+a non-null action UUID rejects name-only and legacy cluster-hash removal, even
+when the hash still matches.  Only the exact UUID plus byte-identical persisted
+handle may delete that receipt; an identity conflict retains the row.
 
 Reserved-first uses the planner's existing typed projections and introduces no
 component-state abstraction. If the candidate proposes any new compatible

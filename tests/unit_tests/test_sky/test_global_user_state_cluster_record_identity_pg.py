@@ -384,6 +384,47 @@ def test_expected_identity_removal_exactly_deletes_and_adopts_absence(
     assert replay is global_user_state.ClusterRecordRemovalOutcome.ALREADY_ABSENT
 
 
+def test_action_aware_row_rejects_every_legacy_removal_shape(
+        full_state_database) -> None:
+    """Only exact action identity may consume the cluster-row receipt."""
+    assert full_state_database is not None
+    handle = _MinimalHandle('receipt')
+    cluster_hash = global_user_state.add_or_update_cluster(
+        'receipt-row',
+        handle,
+        requested_resources=set(),
+        ready=True,
+        cluster_record_uuid=_RECORD_UUID,
+    )
+
+    for terminate in (False, True):
+        legacy_removals = (
+            {},
+            {
+                'existing_cluster_hash': cluster_hash
+            },
+        )
+        for removal_kwargs in legacy_removals:
+            with pytest.raises(
+                    global_user_state.ClusterRecordIdentityConflictError,
+                    match='action-aware.*exact cluster-record UUID and handle'):
+                global_user_state.remove_cluster('receipt-row',
+                                                 terminate=terminate,
+                                                 **removal_kwargs)
+            retained = global_user_state.get_cluster_record_identity_snapshot(
+                'receipt-row', _RECORD_UUID)
+            assert retained is not None
+            assert retained.handle.marker == 'receipt'
+
+    outcome = global_user_state.remove_cluster(
+        'receipt-row',
+        terminate=True,
+        expected_cluster_record_uuid=_RECORD_UUID,
+        expected_cluster_handle=handle,
+    )
+    assert outcome is global_user_state.ClusterRecordRemovalOutcome.REMOVED_EXACT
+
+
 def test_expected_identity_removal_rejects_handle_or_identity_replacement(
         full_state_database) -> None:
     assert full_state_database is not None

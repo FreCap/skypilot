@@ -1395,6 +1395,8 @@ def remove_cluster(
     absent), and compares a present row's exact persisted handle bytes before
     deletion.  A missing row is an idempotent ``ALREADY_ABSENT`` result; a
     legacy/null, differently identified, or byte-different row is a conflict.
+    A row carrying an action-aware UUID rejects every name-only or legacy-hash
+    mutation, so only the exact UUID-and-handle path can consume that row.
     """
     engine = _db_manager.get_engine()
     parsed_cluster_record_uuid = (
@@ -1437,6 +1439,11 @@ def remove_cluster(
         row = query.with_for_update().first()
         if row is None and existing_cluster_hash is not None:
             return None
+        if (row is not None and row.cluster_record_uuid is not None and
+                parsed_cluster_record_uuid is None):
+            raise ClusterRecordIdentityConflictError(
+                f'Cluster {cluster_name!r} is action-aware and requires its '
+                'exact cluster-record UUID and handle for mutation.')
         if parsed_cluster_record_uuid is not None:
             if row is None:
                 session.commit()
