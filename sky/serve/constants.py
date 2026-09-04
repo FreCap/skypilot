@@ -606,14 +606,22 @@ CONTROLLER_PLACEMENT_ENDPOINT_PATH = '/controller/placement'
 # page so a large fallback catalog cannot monopolize the API worker or cross
 # the controller transport deadline.
 # Version 1 pages used location identity order. Version 2 pages use normalized
-# catalog cost with location identity only as an equal-cost display tie-break,
-# and require a full-catalog generation token on every noninitial page. The API
-# transport accepts both during rolling upgrades and preserves the controller's
-# version so callers can reject appends across different orders.
+# catalog cost with location identity as the equal-cost tie-break. Version 3
+# keeps normalized cost primary, groups equal-cost entries by exact accelerator
+# shape and purchase market, then uses location identity. Versions 2 and 3
+# require a full-catalog generation token on every noninitial page. The API
+# transport preserves the controller's version so callers reject appends across
+# different orders during rolling upgrades.
 PLACEMENT_STATE_LEGACY_PAGINATION_VERSION = 1
-PLACEMENT_STATE_PAGINATION_VERSION = 2
+PLACEMENT_STATE_PREVIOUS_PAGINATION_VERSION = 2
+PLACEMENT_STATE_PAGINATION_VERSION = 3
 PLACEMENT_STATE_COMPATIBLE_PAGINATION_VERSIONS = (
     PLACEMENT_STATE_LEGACY_PAGINATION_VERSION,
+    PLACEMENT_STATE_PREVIOUS_PAGINATION_VERSION,
+    PLACEMENT_STATE_PAGINATION_VERSION,
+)
+PLACEMENT_STATE_GENERATION_FENCED_PAGINATION_VERSIONS = (
+    PLACEMENT_STATE_PREVIOUS_PAGINATION_VERSION,
     PLACEMENT_STATE_PAGINATION_VERSION,
 )
 PLACEMENT_STATE_DEFAULT_PAGE_SIZE = 100

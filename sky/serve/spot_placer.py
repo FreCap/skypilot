@@ -69,7 +69,7 @@ _PLACEMENT_CATALOG_SCHEMA_VERSION = 1
 PLACEMENT_CATALOG_SCHEMA_VERSION = _PLACEMENT_CATALOG_SCHEMA_VERSION
 _PLACEMENT_CATALOG_MAX_LOCATIONS = 100_000
 _PLACEMENT_SNAPSHOT_ORDER_SEMANTICS = (
-    'catalog_normalized_cost_then_location_identity')
+    'catalog_normalized_cost_then_exact_backend_market_then_location_identity')
 
 
 def encode_resources_override(
@@ -594,6 +594,72 @@ class LocationStatus(enum.Enum):
     PREEMPTED = 'PREEMPTED'
 
 
+@dataclasses.dataclass(frozen=True, order=True)
+class ExactBackendBalancingIdentity:
+    """Canonical equal-cost grouping identity within one placement catalog.
+
+    ``num_nodes`` is immutable for the whole catalog, so only the varying
+    exact accelerator shape and purchase market belong in this identity.
+    Location remains the final deterministic tie-break within one group.
+    """
+
+    accelerator_shape: tuple[tuple[str, int | float], ...]
+    use_spot: bool
+
+    def __post_init__(self) -> None:
+        if (type(self.use_spot) is not bool or self.accelerator_shape != tuple(
+                sorted(self.accelerator_shape)) or
+                any(not isinstance(card, str) or not card or
+                    card != card.casefold() or
+                    not isinstance(width, (int, float)) or isinstance(
+                        width, bool) or not math.isfinite(width) or width <= 0
+                    for card, width in self.accelerator_shape)):
+            raise ValueError('Exact backend balancing identity is malformed.')
+
+
+def exact_backend_balancing_identity(
+        location: Location) -> ExactBackendBalancingIdentity:
+    """Return the exact catalog dimensions that bound equal-cost fairness."""
+    if not isinstance(location, Location) or type(
+            location.use_spot) is not bool:
+        raise ValueError('Placement catalog location is malformed.')
+    accelerators = location.accelerators
+    if accelerators is None:
+        shape: tuple[tuple[str, int | float], ...] = ()
+    elif not isinstance(accelerators, dict):
+        raise ValueError('Placement catalog accelerator shape is malformed.')
+    else:
+        canonical = []
+        seen = set()
+        for raw_card, width in accelerators.items():
+            if (not isinstance(raw_card, str) or not raw_card or
+                    not isinstance(width,
+                                   (int, float)) or isinstance(width, bool) or
+                    not math.isfinite(width) or width <= 0):
+                raise ValueError(
+                    'Placement catalog accelerator shape is malformed.')
+            card = raw_card.casefold()
+            if card in seen:
+                raise ValueError(
+                    'Placement catalog accelerator shape is malformed.')
+            seen.add(card)
+            canonical.append((card, width))
+        shape = tuple(sorted(canonical))
+    return ExactBackendBalancingIdentity(accelerator_shape=shape,
+                                         use_spot=location.use_spot)
+
+
+def _placement_catalog_order_key(
+    contract: placement_policy.PlacementContract,
+    location: Location,
+    hourly_cost: float,
+) -> tuple[float, ExactBackendBalancingIdentity, tuple[str, str, str, str,
+                                                       bool]]:
+    """Return the one canonical economic and equal-cost catalog order."""
+    return (_normalized_hourly_cost(contract, location, hourly_cost),
+            exact_backend_balancing_identity(location), location.sort_key())
+
+
 @dataclasses.dataclass(frozen=True)
 class PlacementCatalog:
     """Complete immutable placement candidates and their nominal costs."""
@@ -809,8 +875,8 @@ class PlacementCatalog:
     ) -> tuple['RankedPlacementCatalogEntry', ...]:
         """Return the immutable catalog in the selector's canonical order."""
         ranked = sorted(self.entries,
-                        key=lambda item: (_normalized_hourly_cost(
-                            contract, item[0], item[1]), item[0].sort_key()))
+                        key=lambda item: _placement_catalog_order_key(
+                            contract, item[0], item[1]))
         return tuple(
             RankedPlacementCatalogEntry(
                 rank=rank,
@@ -1343,9 +1409,8 @@ class SpotPlacer:
 
         This is an observation-only counterpart to repeated
         select_next_location calls over paid candidates. A stable sort uses
-        the exact normalized-cost key used by launch selection, preserving
-        catalog insertion order for ties while avoiding repeated minimum
-        scans of a large catalog.
+        the exact normalized-cost/backend-tier/location key used by launch
+        selection while avoiding repeated minimum scans of a large catalog.
         """
         active_locations = set(self.active_locations())
         return [
@@ -1593,8 +1658,17 @@ class SpotPlacer:
             self.placement_contract, location,
             self.location2cost.get(location, float('inf')))
 
+    def _location_order_key(
+        self, location: Location
+    ) -> tuple[float, ExactBackendBalancingIdentity, tuple[str, str, str, str,
+                                                           bool]]:
+        """Return the same immutable key used by the persisted catalog."""
+        return _placement_catalog_order_key(
+            self.placement_contract, location,
+            self.location2cost.get(location, float('inf')))
+
     def _min_cost_location(self, locations: list[Location]) -> Location:
-        return min(locations, key=self._normalized_location_cost)
+        return min(locations, key=self._location_order_key)
 
     def _effective_status(self, location: Location) -> LocationStatus:
         """Status with TTL decay: an expired PREEMPTED mark counts ACTIVE.
@@ -1790,14 +1864,13 @@ class SpotPlacer:
         eligible_locations = self._workspace_eligible_locations()
         # This is catalog display order, not a promise that the selector will
         # attempt every preceding row. Runtime selection additionally applies
-        # ACTIVE/card/zero-cost/admission/frontier gates. The identity key
-        # makes equal-price display order stable across restarts and page reads;
-        # eligibility stays on each row so a benched candidate is explained.
-        locations = sorted(
-            (location for location in self.location2status
-             if location in eligible_locations),
-            key=lambda location:
-            (self._normalized_location_cost(location), location.sort_key()))
+        # ACTIVE/card/zero-cost/admission/frontier gates. Exact backend/market
+        # groups make equal-price balancing tiers contiguous; location identity
+        # makes each group stable across restarts and page reads. Eligibility
+        # stays on each row so a benched candidate is explained.
+        locations = sorted((location for location in self.location2status
+                            if location in eligible_locations),
+                           key=self._location_order_key)
         # Workspace policy is re-read for every request. Bind later pages to
         # this complete ordered catalog so a policy/cost change cannot shift
         # offsets and silently duplicate or omit rows in the caller's view.

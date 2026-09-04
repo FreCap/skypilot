@@ -3523,6 +3523,140 @@ def test_manager_prepared_heterogeneous_wave_cannot_starve_a100_at_global_cap(
            }] * 4
 
 
+def test_generated_equal_cost_multiwidth_templates_validate_in_catalog_order(
+        capacity_database, monkeypatch):
+    """The production logical catalog keeps exact equal-cost tiers contiguous."""
+    engine, incarnation, _ = capacity_database
+    monkeypatch.setattr(clouds.GCP, 'get_vcpus_mem_from_instance_type',
+                        lambda *_args, **_kwargs: (4, 16.0))
+    monkeypatch.setattr(paid_capacity, 'base_limit', lambda: 4)
+    monkeypatch.setattr(paid_capacity, 'max_limit', lambda: 4)
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           max_replicas=64,
+                           replica_unit='logical',
+                           max_live_paid_gpu_units=64)
+
+    locations = []
+    for region, width in (('us-central1-a', 4), ('us-central1-b', 8),
+                          ('us-central1-c', 4)):
+        location = make_location(region, {'L4': width},
+                                 cloud_name='GCP',
+                                 instance_type={
+                                     4: 'g2-standard-48',
+                                     8: 'g2-standard-96',
+                                 }[width])
+        location.image_id = {None: 'skypilot:test-regionless-image'}
+        location.cloud.get_vcpus_mem_from_instance_type.return_value = (4, 16.0)
+        locations.append(location)
+    service = serve_state.get_spec('svc', 1)
+    assert service is not None
+    placer = make_placer(
+        {location: float(location.accelerators['L4']) for location in locations},
+        service.placement_contract)
+    assert [
+        location.accelerators['L4']
+        for location, _ in placer.placement_catalog.entries
+    ] == [4, 8, 4]
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    placement_catalog=placer.placement_catalog.to_dict()))
+
+    authority = ordinary_launch_binding.ControllerBindingAuthority(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_workspace='workspace-a',
+        service_lifecycle_epoch=3,
+        controller_pid=123,
+        controller_ip='10.0.0.5',
+        controller_incarnation=incarnation,
+        controller_owner_epoch=4,
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        binding_epoch=3,
+        non_pool_capable=True,
+        non_pool_binding_protocol_version=(
+            ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+        non_pool_profile_set_digest=(
+            ordinary_launch_binding.supported_non_pool_profile_set_digest()),
+        non_pool_capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+        non_pool_receipt_protocol_version=(
+            ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager.lock = threading.RLock()
+    manager._update_recovery_required = False
+    manager._is_pool = False
+    manager._service_name = 'svc'
+    manager._service_hash = 'svc-hash'
+    manager._resource_scope = 'svc-hash'
+    manager._workspace = 'workspace-a'
+    manager._ordinary_launch_binding_authority = authority
+    manager._spot_placer = placer
+    manager._next_replica_id = 2100
+    manager.latest_version = 1
+    manager._version_specs = {1: service}
+    manager.yaml_content = _PAID_LAUNCH_YAML
+    manager._uses_logical_replicas = True
+
+    version_authority = serve_state.get_paid_launch_version_authority('svc', 1)
+    assert version_authority is not None
+    budget = paid_capacity.build_launch_budget(
+        placer,
+        workspace='workspace-a',
+        existing_replica_infos=[],
+        globally_managed=True,
+        service_name='svc',
+        service_hash='svc-hash',
+        requested_frontier_keys={('l4',)},
+        max_live_paid_gpu_units=64,
+        gcp_project_id_by_location={
+            location: 'test-project' for location in locations
+        },
+        prospective_backend_claims_by_accelerator={'l4': 64})
+    prepared = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'l4': 1},
+        version_authority=version_authority,
+        paid_location_launch_budget=budget)
+
+    assert [template.gpu_units_per_node for template in prepared] == [4, 4, 8]
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_admit_current(
+            **_current_owner_kwargs(engine),
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 1},
+            backend_num_nodes=1,
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot,
+                supply,
+                64,
+                capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+                planning_capacity_quantum_by_accelerator={'l4': 1},
+                max_live_paid_gpu_units=64),
+            prepared_paid_launch_templates=prepared)
+
+    specs = committed.paid_launch_specs
+    assert len(specs) == 12
+    assert [spec.gpu_units_per_node for spec in specs] == [4] * 8 + [8] * 4
+    assert [
+        spec.catalog_evidence.catalog_rank for spec in specs
+    ] == ([prepared[0].catalog_rank] * 4 + [prepared[1].catalog_rank] * 4 +
+          [prepared[2].catalog_rank] * 4)
+    assert sum(member.plan_units
+               for member in committed.paid_launch_receipt.members) == 64
+    assert sum(member.physical_gpu_units
+               for member in committed.paid_launch_receipt.members) == 64
+
+
 def test_current_planner_scans_third_pool_until_accepted_target(
         capacity_database, monkeypatch):
     """A probe-limited middle pool cannot truncate a bounded candidate wave."""
@@ -4933,16 +5067,35 @@ def _equal_cost_shape_specs(
                               pool_rank=rank,
                               pool_occurrence=occurrences[rank]))
         occurrences[rank] += 1
-    return tuple(specs)
+    raw_specs = tuple(specs)
+    templates = {
+        template.pool_key: template
+        for template in _paid_launch_templates_from_specs(raw_specs)
+    }
+    materialized = []
+    for spec in raw_specs:
+        submitted = json.loads(spec.prepared_launch_request)
+        request = paid_launch_request.materialize_paid_launch_request(
+            paid_launch_request.PaidLaunchBodyTemplate(
+                submitted_bytes=templates[
+                    spec.pool_key].prepared_launch_body_template),
+            replica_id=spec.replica_id,
+            cluster_name=spec.cluster_name_seed,
+            launch_fence=submitted['extra_launch_context'])
+        materialized.append(
+            dataclasses.replace(
+                spec, prepared_launch_request=request.submitted_bytes))
+    return tuple(materialized)
 
 
-@pytest.mark.parametrize('card_order', [('l4', 'l4', 'a100', 'a100'),
-                                        ('a100', 'a100', 'l4', 'l4')])
-def test_paid_launch_validator_accepts_contiguous_same_cost_tier_blocks(
-        capacity_database, card_order):
+def test_paid_launch_validator_accepts_canonical_same_cost_tier_blocks(
+        capacity_database):
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
     ranks = _install_equal_cost_shape_catalog(engine)
+    card_order = tuple(
+        card for card, _ in sorted(ranks.items(), key=lambda item: item[1])
+        for _ in range(2))
     specs = _equal_cost_shape_specs(engine,
                                     ranks,
                                     card_order,
@@ -4961,7 +5114,7 @@ def test_paid_launch_validator_accepts_contiguous_same_cost_tier_blocks(
     assert _paid_write_counts(engine) == before
 
 
-def test_paid_launch_validator_rejects_cross_shape_tier_resume(
+def test_paid_launch_validator_rejects_cross_card_tier_resume(
         capacity_database):
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
@@ -4972,7 +5125,7 @@ def test_paid_launch_validator_rejects_cross_shape_tier_resume(
     before = _paid_write_counts(engine)
 
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                       match='stale or noncanonical'):
+                       match='noncanonical'):
         _validate_prepared_paid_specs(engine,
                                       specs,
                                       accounting_cards={

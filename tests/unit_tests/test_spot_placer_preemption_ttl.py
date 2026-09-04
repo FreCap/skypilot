@@ -223,7 +223,8 @@ class TestPreemptionTtlRetry:
         assert prices == {'seoul': 1.0, 'oregon': 2.0, 'iowa': 3.0}
         assert snapshot['cost_unit'] == 'machine_hour'
         assert snapshot['order_semantics'] == (
-            'catalog_normalized_cost_then_location_identity')
+            'catalog_normalized_cost_then_exact_backend_market_then_location_identity'
+        )
         assert {
             item['region']: item['normalized_hourly_cost']
             for item in snapshot['locations']
@@ -309,7 +310,7 @@ class TestPreemptionTtlRetry:
         assert second['order_generation'] != first['order_generation']
         assert 'locations' not in second
 
-    def test_snapshot_breaks_equal_cost_ties_by_location_identity(self):
+    def test_snapshot_breaks_equal_cost_backend_ties_by_location_identity(self):
         later = make_location('zeta', cloud_name='AWS')
         earlier = make_location('alpha', cloud_name='AWS')
         placer = make_placer({later: 1.0, earlier: 1.0})

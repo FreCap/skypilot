@@ -1832,10 +1832,22 @@ def equal_cost_balancing_tier(
     if type(location.use_spot) is not bool:  # pylint: disable=unidiomatic-typecheck
         raise PaidGPUAttributionError(
             'Equal-cost balancing requires an exact purchase market.')
+    try:
+        identity = spot_placer.exact_backend_balancing_identity(location)
+    except ValueError as error:
+        raise PaidGPUAttributionError(
+            'Equal-cost balancing requires an exact catalog location.') \
+            from error
+    if len(identity.accelerator_shape) != 1:
+        raise PaidGPUAttributionError(
+            'Equal-cost balancing requires one exact accelerator shape.')
     card, width = _exact_whole_gpu_shape(location.accelerators,
                                          field='equal-cost balancing location')
+    if identity.accelerator_shape != ((card, width),):
+        raise PaidGPUAttributionError(
+            'Equal-cost balancing requires one exact accelerator shape.')
     return EqualCostBalancingTier(normalized_cost=normalized_cost,
-                                  use_spot=location.use_spot,
+                                  use_spot=identity.use_spot,
                                   physical_backend_shape=PhysicalBackendShape(
                                       accelerator=card,
                                       gpu_units_per_node=width,

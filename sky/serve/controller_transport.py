@@ -241,14 +241,16 @@ def _is_placement_order_generation(value: Any) -> bool:
 def _normalize_placement_page(payload: dict[str, Any], *, limit: int,
                               offset: int) -> dict[str, Any]:
     """Normalize paged and rolling-upgrade placement responses."""
+    generation_fenced_versions = (
+        constants.PLACEMENT_STATE_GENERATION_FENCED_PAGINATION_VERSIONS)
     locations = payload.get('locations')
     if locations is None:
         if payload.get('available') is not False:
             raise ValueError(
                 'Available placement-state response must include locations.')
         if payload.get('reason') == 'catalog_order_changed':
-            if (payload.get('pagination_version')
-                    != constants.PLACEMENT_STATE_PAGINATION_VERSION):
+            if payload.get(
+                    'pagination_version') not in generation_fenced_versions:
                 raise ValueError(
                     'Changed placement catalog has an invalid version.')
             order_generation = payload.get('order_generation')
@@ -262,8 +264,8 @@ def _normalize_placement_page(payload: dict[str, Any], *, limit: int,
     pagination_version = payload.get('pagination_version')
     if pagination_version in (
             constants.PLACEMENT_STATE_COMPATIBLE_PAGINATION_VERSIONS):
-        if (pagination_version == constants.PLACEMENT_STATE_PAGINATION_VERSION
-                and payload.get('enabled') is not False):
+        if (pagination_version in generation_fenced_versions and
+                payload.get('enabled') is not False):
             order_generation = payload.get('order_generation')
             if not _is_placement_order_generation(order_generation):
                 raise ValueError('Placement-state order generation is invalid.')

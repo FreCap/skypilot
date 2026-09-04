@@ -43,10 +43,11 @@ const placement = {
     available: true,
     enabled: true,
     retrySeconds: 600,
-    paginationVersion: 2,
+    paginationVersion: 3,
     pageOffset: 0,
     costUnit: 'gpu_slot_hour',
-    orderSemantics: 'catalog_normalized_cost_then_location_identity',
+    orderSemantics:
+      'catalog_normalized_cost_then_exact_backend_market_then_location_identity',
     orderGeneration: ORDER_GENERATION_A,
     locations: [
       {
@@ -233,6 +234,23 @@ it('does not claim cost ordering for an older controller response', async () => 
   ).toBeTruthy();
   expect(screen.getAllByText('Order price unavailable')).toHaveLength(4);
   expect(screen.getByText('Maximum machine price')).toBeTruthy();
+});
+
+it('describes the previous generation-fenced equal-price order', async () => {
+  getServicePlacement.mockResolvedValueOnce({
+    ...placement,
+    placerState: {
+      ...placement.placerState,
+      paginationVersion: 2,
+      orderSemantics: 'catalog_normalized_cost_then_location_identity',
+    },
+  });
+
+  render(<ServicePlacement serviceName="svc" />);
+
+  expect(
+    await screen.findByText(/equal-price display order uses location identity/)
+  ).toBeTruthy();
 });
 
 it('loads once on mount and only refreshes manually', async () => {
