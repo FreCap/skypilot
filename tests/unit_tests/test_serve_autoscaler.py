@@ -10,6 +10,7 @@ from sky.serve import autoscalers
 from sky.serve import constants
 from sky.serve import controller as serve_controller
 from sky.serve import kueue_lane_capacity
+from sky.serve import placement_policy
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -1490,6 +1491,13 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         return autoscalers.InstanceAwareRequestRateAutoscaler(
             'svc', self._spec(**kwargs), version=1)
 
+    def _physical_spot_placer(self):
+        placer = mock.Mock()
+        placer.placement_contract = placement_policy.resolve_fresh_contract(
+            placement_policy.SPOT_HEDGE_PLACER, pool=False)
+        placer.num_nodes = 1
+        return placer
+
     def _profiles(self, priority, cards, count=60):
         now = time.time()
         return [{
@@ -2050,7 +2058,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
         l4_location = mock.Mock(accelerators={'L4': 1})
         a100_location = mock.Mock(accelerators={'A100': 1})
-        placer = mock.Mock()
+        placer = self._physical_spot_placer()
         # L4 is currently benched, but it remains the nominal cheapest cold
         # card. Warm A100 stays compatible; its availability is not permission
         # to cold-launch an A100 for flexible demand.
@@ -2071,7 +2079,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
     def test_zero_cost_only_card_does_not_precede_paid_fallback(self):
         a100_location = mock.Mock(accelerators={'A100': 1})
         l4_location = mock.Mock(accelerators={'L4': 1})
-        placer = mock.Mock()
+        placer = self._physical_spot_placer()
         placer.known_location_costs.return_value = {
             a100_location: 0.0,
             l4_location: 1.0,
@@ -2102,7 +2110,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
         l4_location = mock.Mock(accelerators={'L4': 1})
         a100_location = mock.Mock(accelerators={'A100': 1})
-        placer = mock.Mock()
+        placer = self._physical_spot_placer()
         placer.known_location_costs.return_value = {
             l4_location: float('inf'),
             a100_location: 2.0,

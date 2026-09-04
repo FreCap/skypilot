@@ -4,6 +4,7 @@
 import datetime
 import json
 import time
+from unittest import mock
 import uuid
 
 import pytest
@@ -13,7 +14,7 @@ from test_serve_capacity_admission_pg import _current_owner_kwargs
 from test_serve_capacity_admission_pg import _demand_report
 from test_serve_capacity_admission_pg import _enable_durable_intent
 from test_serve_capacity_admission_pg import _kueue_intent_values
-from test_serve_capacity_admission_pg import _paid_launch_spec
+from test_serve_capacity_admission_pg import _paid_launch_template
 from test_serve_capacity_admission_pg import _publish_successor_route
 from test_serve_capacity_admission_pg import _replica_values
 from test_serve_capacity_admission_pg import capacity_database
@@ -26,6 +27,7 @@ from sky.serve import capacity_planning
 from sky.serve import demand_state
 from sky.serve import kueue_lane_capacity
 from sky.serve import ordinary_launch_binding
+from sky.serve import paid_capacity
 from sky.serve import serve_state_schema
 from sky.serve import zero_cost_actuation_schema
 
@@ -168,7 +170,8 @@ def _insert_terminal_intent_history(engine: sqlalchemy.engine.Engine,
 def _reconcile(engine: sqlalchemy.engine.Engine,
                target: int = 0,
                *,
-               prepared_specs=(),
+               prepared_templates: tuple[paid_capacity.PaidLaunchTemplate,
+                                         ...] = (),
                capacity_unit: capacity_planning.
                CapacityUnit = capacity_planning.CapacityUnit.LOGICAL_GPU):
     return capacity_admission.CapacityAdmissionRepository(
@@ -183,7 +186,7 @@ def _reconcile(engine: sqlalchemy.engine.Engine,
             sequenced_reserved_fill=False,
             planner=lambda snapshot, supply: _current_decision(
                 snapshot, supply, target, capacity_unit=capacity_unit),
-            prepared_paid_launch_specs=prepared_specs)
+            prepared_paid_launch_templates=prepared_templates)
 
 
 def _postgres_plan_nodes(document) -> list[dict]:
@@ -349,11 +352,11 @@ def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
     sqlalchemy.event.listen(engine, 'after_cursor_execute', _capture)
     try:
         _reconcile(engine)
-        # Replica numbers are lifecycle-local.  Reusing a number from a settled
-        # old incarnation must not collide, while the UUID selector must reach
-        # psycopg as a native UUID bind.
-        numeric_reuse = _paid_launch_spec(engine, 0, 10000)
-        reused = _reconcile(engine, 0, prepared_specs=(numeric_reuse,))
+        # Templates carry no replica identity.  A target-zero plan therefore
+        # materializes no candidate UUID selector; both ticks retain only the
+        # indexed unresolved-authority scan.
+        identity_free = _paid_launch_template(engine, pool_rank=0)
+        reused = _reconcile(engine, 0, prepared_templates=(identity_free,))
     finally:
         sqlalchemy.event.remove(engine, 'after_cursor_execute', _capture)
     assert not reused.paid_launch_receipt.members
@@ -370,45 +373,40 @@ def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
     assert retained == _HISTORY_SIZE
     assert retained_terminal_intents == _HISTORY_SIZE
     assert len(observed) == 2
-    statement, parameters, locked_count = observed[0]
-    assert 'resolution IN' in statement
-    assert len(parameters) < 20
-    assert locked_count == 0
-    with engine.connect() as connection:
-        plan_document = connection.exec_driver_sql(
-            f'EXPLAIN (FORMAT JSON) {statement}', parameters).scalar_one()
-    plan_nodes = _postgres_plan_nodes(plan_document)
-    assert not any(
-        node.get('Node Type') == 'Seq Scan' and
-        node.get('Relation Name') == 'serve_ordinary_launch_associations'
-        for node in plan_nodes)
-    assert any(
-        node.get('Index Name') == 'uq_serve_ordinary_binding_unsettled'
-        for node in plan_nodes)
-    candidate_statement, candidate_parameters, candidate_locked_count = (
-        observed[1])
-    assert 'replica_record_id IN' in candidate_statement
-    assert candidate_locked_count == 0
-    assert uuid.UUID(numeric_reuse.replica_record_id) in set(
-        candidate_parameters.values())
+    for statement, parameters, locked_count in observed:
+        assert 'resolution IN' in statement
+        assert 'replica_record_id IN' not in statement
+        assert len(parameters) < 20
+        assert locked_count == 0
+        with engine.connect() as connection:
+            plan_document = connection.exec_driver_sql(
+                f'EXPLAIN (FORMAT JSON) {statement}', parameters).scalar_one()
+        plan_nodes = _postgres_plan_nodes(plan_document)
+        assert not any(
+            node.get('Node Type') == 'Seq Scan' and
+            node.get('Relation Name') == 'serve_ordinary_launch_associations'
+            for node in plan_nodes)
+        assert any(
+            node.get('Index Name') == 'uq_serve_ordinary_binding_unsettled'
+            for node in plan_nodes)
     assert len(observed_intents) == 2
-    intent_statement, intent_parameters, intent_locked_count = (
-        observed_intents[0])
-    assert 'state IN' in intent_statement
-    assert len(intent_parameters) < 10
-    assert intent_locked_count == 0
-    with engine.connect() as connection:
-        intent_plan_document = connection.exec_driver_sql(
-            f'EXPLAIN (FORMAT JSON) {intent_statement}',
-            intent_parameters).scalar_one()
-    intent_plan_nodes = _postgres_plan_nodes(intent_plan_document)
-    assert not any(
-        node.get('Node Type') == 'Seq Scan' and
-        node.get('Relation Name') == 'serve_zero_cost_actuation_intents'
-        for node in intent_plan_nodes)
-    assert any(
-        node.get('Index Name') == 'ix_serve052_zero_cost_intent_service'
-        for node in intent_plan_nodes)
+    for intent_statement, intent_parameters, intent_locked_count in (
+            observed_intents):
+        assert 'state IN' in intent_statement
+        assert len(intent_parameters) < 10
+        assert intent_locked_count == 0
+        with engine.connect() as connection:
+            intent_plan_document = connection.exec_driver_sql(
+                f'EXPLAIN (FORMAT JSON) {intent_statement}',
+                intent_parameters).scalar_one()
+        intent_plan_nodes = _postgres_plan_nodes(intent_plan_document)
+        assert not any(
+            node.get('Node Type') == 'Seq Scan' and
+            node.get('Relation Name') == 'serve_zero_cost_actuation_intents'
+            for node in intent_plan_nodes)
+        assert any(
+            node.get('Index Name') == 'ix_serve052_zero_cost_intent_service'
+            for node in intent_plan_nodes)
 
     # The read-only autoscaler snapshot uses the same bounded intent-state
     # contract; retained terminal campaigns must not reappear on that path.
@@ -600,14 +598,18 @@ def test_validated_head_bounds_nine_thousand_tombstone_lock(capacity_database):
     # Exact UUID collision scope is cross-incarnation; lifecycle-local numeric
     # replica IDs are intentionally not.
     _refresh_authority(engine, incarnation, 9)
-    spec = _paid_launch_spec(engine, 0, 420)
+    template = _paid_launch_template(engine, pool_rank=0)
+    colliding_record_id = uuid.UUID('22222222-2222-4222-8222-222222222222')
     _insert_old_history(engine,
                         1,
                         start_ordinal=_HISTORY_SIZE + 2,
-                        replica_record_id=uuid.UUID(spec.replica_record_id))
-    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                       match='belongs to another service incarnation'):
-        _reconcile(engine, 1, prepared_specs=(spec,))
+                        replica_record_id=colliding_record_id)
+    with mock.patch.object(capacity_admission.uuid,
+                           'uuid4',
+                           return_value=colliding_record_id), pytest.raises(
+                               capacity_admission.CapacityAdmissionConflict,
+                               match='existing association history'):
+        _reconcile(engine, 1, prepared_templates=(template,))
 
     # Every supported association/request-root creator first acquires the same
     # service row that the planner holds.  Prove the real insert entry point

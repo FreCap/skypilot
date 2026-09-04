@@ -387,6 +387,21 @@ def _proof_session_count(engine: sqlalchemy.engine.Engine) -> int:
             """)).scalar_one()
 
 
+def _wait_for_no_proof_session(engine: sqlalchemy.engine.Engine,
+                               timeout: float = 1) -> bool:
+    """Wait briefly for PostgreSQL to reap a disconnected proof backend.
+
+    The one-second bound stays below the nine-second server-side idle
+    transaction timeout, so a retained proof connection still fails the test.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _proof_session_count(engine) == 0:
+            return True
+        time.sleep(0.05)
+    return _proof_session_count(engine) == 0
+
+
 def _wait_for_no_thread(prefix: str, timeout: float = 1) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1243,7 +1258,7 @@ def test_slow_database_read_is_bounded_and_reaps_launch_workers(
     assert time.monotonic() - started < 2
     provider_job.assert_not_called()
     assert _wait_for_no_thread('boltz-reclaim-launch')
-    assert _proof_session_count(proof_engine) == 0
+    assert _wait_for_no_proof_session(proof_engine)
     with proof_engine.connect() as connection:
         assert connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
@@ -1280,7 +1295,7 @@ def test_blackholed_connect_is_single_attempt_reaps_workers_and_recovers(
     assert elapsed < 3
     provider_job.assert_not_called()
     assert _wait_for_no_thread('boltz-reclaim-launch')
-    assert _proof_session_count(proof_engine) == 0
+    assert _wait_for_no_proof_session(proof_engine)
     with proof_engine.connect() as connection:
         assert connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
@@ -1386,7 +1401,7 @@ def test_slow_leader_reread_is_bounded_before_provider(proof_engine,
     assert time.monotonic() - started < 2
     assert statement_count == 2
     provider.assert_not_called()
-    assert _proof_session_count(proof_engine) == 0
+    assert _wait_for_no_proof_session(proof_engine)
 
 
 def test_slow_publication_rolls_back_and_closes_transaction(proof_engine):
@@ -1418,7 +1433,7 @@ def test_slow_publication_rolls_back_and_closes_transaction(proof_engine):
 
     assert time.monotonic() - started < 2
     provider.assert_called_once()
-    assert _proof_session_count(proof_engine) == 0
+    assert _wait_for_no_proof_session(proof_engine)
     with proof_engine.connect() as connection:
         assert connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
@@ -1453,7 +1468,7 @@ def test_provider_does_not_begin_without_publication_reserve(
     provider.assert_not_called()
     assert read_count == 2
     assert time.monotonic() - started < 1.8
-    assert _proof_session_count(proof_engine) == 0
+    assert _wait_for_no_proof_session(proof_engine)
 
 
 def test_disposable_boundary_kills_stalled_proof_family(proof_engine):
@@ -1506,7 +1521,7 @@ def test_disposable_boundary_kills_stalled_proof_family(proof_engine):
         executor.shutdown()
 
     assert elapsed < 8
-    assert _proof_session_count(proof_engine) == 0
+    assert _wait_for_no_proof_session(proof_engine)
     with proof_engine.connect() as connection:
         calls = dict(
             connection.execute(
@@ -1574,7 +1589,7 @@ def test_claim_boundary_repeatedly_drains_never_returning_libpq(
             assert marker.exists()
             handler_pid = int(marker.read_text(encoding='utf-8'))
             assert not pathlib.Path(f'/proc/{handler_pid}').exists()
-            assert _proof_session_count(proof_engine) == 0
+            assert _wait_for_no_proof_session(proof_engine)
 
         assert execute_boundary(executor, str, ('healthy',), 5) == 'healthy'
     finally:
@@ -2755,7 +2770,7 @@ def test_leader_transaction_uses_live_idle_timeout_and_holds_xact_lock(
 
     assert transaction_read_count == 2
     assert len(receipt.reference.receipt_nonce) == 64
-    assert _proof_session_count(proof_engine) == 0
+    assert _wait_for_no_proof_session(proof_engine)
 
 
 def test_waiter_timeout_does_not_cancel_leader(proof_engine):
