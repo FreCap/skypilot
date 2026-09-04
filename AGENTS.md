@@ -82,34 +82,31 @@ skypilot/
 
 ### Supported Python Runtime
 
-- CPython 3.14 or newer is the only supported runtime.
-- Python 3.13 and older are not a compatibility target. Do not add new
-  compatibility branches, tests, packaging metadata, or CI gates for those
-  versions.
-- The deployed hub image still runs CPython 3.10: `boltz/Dockerfile.overlay`
-  builds on the upstream `berkeleyskypilot/skypilot-nightly` base, and every
-  role (API server, controller, executor) reported Python 3.10.19 on
-  2026-09-02. The repository `Dockerfile` (`python:3.14.5-slim`) is not that
-  image. Until the overlay base moves to Python 3.14, deployed code paths must
-  keep working on 3.10: keep the compatibility they already rely on, and keep
-  changes that need Python 3.11+ syntax, stdlib, or behavior undeployed.
-- Existing controller, worker, packaging, or CI pins below Python 3.14 are
-  migration debt rather than a compatibility contract; retire them together
-  with the overlay base image, not piecemeal.
+- CPython 3.14 or newer is the only supported development and control-plane
+  runtime. Python 3.13 and older are not client, API-server, controller, or CI
+  compatibility targets; do not add compatibility branches or gates for them.
+- The generic wheel is temporarily also installed into SkyPilot's managed VM
+  worker environment on Python 3.10 because the remote runtime pins Ray 2.9.3,
+  whose wheels stop at CPython 3.11. This is a named deployment dependency, not
+  permission to broaden old-Python compatibility elsewhere. Retire the Ray
+  pin, worker bootstrap, generic wheel floor, syntax floor, and worker tests in
+  one coordinated Python 3.14 migration; do not change only the metadata or
+  pretend the old worker is already 3.14-compatible.
 
 ### Environment Setup
 
 ```bash
-# Create virtual environment with uv (Python 3.14, the target runtime; the
-# deployed hub image still runs 3.10, see "Supported Python Runtime")
+# Create virtual environment with uv (Python 3.14, matching production)
 # --seed is required to ensure pip is installed (needed for building wheels)
 uv venv --seed --python 3.14
 source .venv/bin/activate
 
-# Install in editable mode with all cloud support
-uv pip install -e ".[all]"
-# Or specific clouds only:
-# uv pip install -e ".[aws,gcp,kubernetes]"
+# Install the production control-plane cloud set. It resolves without
+# prerelease dependencies on Python 3.14.
+uv pip install -e ".[aws,gcp,kubernetes]"
+# The broad development image may request every provider; Azure CLI currently
+# requires prerelease dependency resolution:
+# uv pip install --prerelease allow -e ".[all]"
 
 # Install development dependencies
 uv pip install -r requirements-dev.txt
@@ -231,6 +228,22 @@ those effects; success or failure of the verifier must not determine when the
 observed work finishes or when its terminal state is published. A failed proof
 may stop future, never-offered stimulus, but the driver must drain already-
 offered work through its real terminal-publication path before it exits.
+
+For workflows whose backend cannot call the terminal reducer directly, keep a
+transport-only reporter distinct from both backend and verifier. The backend
+must author one immutable terminal envelope; the reporter may validate and
+relay those exact bytes only to a configuration-owned, same-service endpoint.
+It must not construct terminal fields, select an authority from request data or
+``Host``, receive an edge credential at the backend, or turn missing backend
+output into success. Test the complete middleware/proxy/reporter boundary and
+include structural negatives proving that credentials and callback authority
+cannot cross into the backend.
+
+Treat an HTTP admission response and its streamed terminal body as two protocol
+phases with separate absolute deadlines. The admission/queue deadline ends
+when exact accepted headers arrive; subsequent backend work and terminal-body
+delivery use the terminal deadline. Never let a near-deadline valid admission
+inherit only the few milliseconds left in its queue budget.
 
 Concurrent stimulus drivers that acquire a terminal-publication obligation
 must use one structured, all-results worker cohort. The first failure closes
