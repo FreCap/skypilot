@@ -146,6 +146,14 @@ _DEFAULT_LAUNCH_MAX_RETRY = 3
 _DEFAULT_DRAIN_SECONDS = 120
 # Poll cadence for the in-flight-aware drain wait during replica retirement.
 _DRAIN_POLL_SECONDS = 2
+# Paid planning and authenticated request routing share the same exact-card
+# catalog.  One atomic wave may need a different pool for every member, so the
+# largest useful identity-free preflight is one wave per advertised card.
+_MAX_PAID_LAUNCH_TEMPLATE_CARDS = (
+    serve_constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS)
+_MAX_PAID_LAUNCH_TEMPLATES = (
+    _MAX_PAID_LAUNCH_TEMPLATE_CARDS *
+    paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4260,13 +4268,15 @@ class SkyPilotReplicaManager(ReplicaManager):
         version_authority: paid_capacity.PaidLaunchVersionAuthority,
         paid_location_launch_budget: paid_capacity.LaunchBudget,
     ) -> tuple[paid_capacity.PaidLaunchTemplate, ...]:
-        """Freeze one identity-free template for every eligible Spot pool.
+        """Freeze the cheapest bounded identity-free Spot pool prefixes.
 
         The launch budget is an optimistic PostgreSQL observation built before
-        this manager lock, but only its immutable provider/pool identities are
-        consumed here.  Remaining capacity, candidate cardinality, replica IDs,
-        UUIDs, and executable request bytes are all derived later from the
-        repository-locked graph.
+        this manager lock.  Its per-pool headroom only bounds how much catalog
+        authority is worth preparing: final capacity, replica IDs, UUIDs, and
+        executable request bytes are all derived later from the
+        repository-locked graph.  Each card keeps the minimum globally
+        cost-ordered pool prefix whose advisory backend headroom covers one
+        maximum atomic wave.
 
         The only mutable inputs consulted under ``self.lock`` are the elected
         manager configuration and its already-materialized placement catalog.
@@ -4284,12 +4294,19 @@ class SkyPilotReplicaManager(ReplicaManager):
             shapes[card] = raw_width
         if not shapes:
             return ()
+        if len(shapes) > _MAX_PAID_LAUNCH_TEMPLATE_CARDS:
+            raise ValueError(
+                'Paid launch templates exceed the eight-card routing catalog.')
         if not isinstance(version_authority,
                           paid_capacity.PaidLaunchVersionAuthority):
             raise ValueError('Paid launch version authority is malformed.')
         if (not isinstance(paid_location_launch_budget,
                            paid_capacity.LaunchBudget) or
-                not paid_location_launch_budget.globally_managed):
+                not paid_location_launch_budget.globally_managed or
+                not isinstance(
+                    paid_location_launch_budget.remaining_by_location, Mapping)
+                or not isinstance(
+                    paid_location_launch_budget.pool_key_by_location, Mapping)):
             raise ValueError('Paid launch budget is malformed.')
         launch_runtime = paid_launch_request.capture_replica_launch_runtime()
         with self.lock:
@@ -4331,8 +4348,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             catalog_entries = {
                 entry.location: entry for entry in placer.ranked_catalog_entries
             }
-            templates = []
+            templates: list[paid_capacity.PaidLaunchTemplate] = []
             seen_pool_keys = set()
+            covered_headroom = {card: 0 for card in shapes}
             for location in placer.ranked_active_locations():
                 cloud = str(location.cloud).casefold()
                 accelerators = location.accelerators
@@ -4346,6 +4364,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                 card = str(raw_card).casefold()
                 if (card not in shapes or type(raw_width) is not int or  # pylint: disable=unidiomatic-typecheck
                         raw_width != shapes[card]):
+                    continue
+                if (covered_headroom[card] >=
+                        paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS):
+                    continue
+                advisory_headroom = (
+                    paid_location_launch_budget.remaining_by_location.get(
+                        location, 0))
+                if type(advisory_headroom) is not int:  # pylint: disable=unidiomatic-typecheck
+                    raise ValueError(
+                        'Paid launch advisory headroom is malformed.')
+                if advisory_headroom <= 0:
                     continue
                 catalog_entry = catalog_entries.get(location)
                 if (catalog_entry is None or
@@ -4365,6 +4394,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                     continue
                 if exact_pool_key in seen_pool_keys:
                     continue
+                if len(templates) >= _MAX_PAID_LAUNCH_TEMPLATES:
+                    raise ValueError(
+                        'Paid launch template catalog exceeds its total bound.')
                 seen_pool_keys.add(exact_pool_key)
                 runtime_override = location.to_dict()
                 canonical_storage_override = dict(runtime_override)
@@ -4418,6 +4450,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                         placement_catalog_sha256=placement_catalog_sha256,
                         catalog_rank=catalog_entry.rank,
                         version_authority=version_authority))
+                covered_headroom[card] = min(
+                    paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS,
+                    covered_headroom[card] + advisory_headroom)
+                if all(headroom >=
+                       paid_capacity.MAX_ATOMIC_PAID_ADMISSION_WAVE_MEMBERS
+                       for headroom in covered_headroom.values()):
+                    break
             return tuple(templates)
 
     def _prepare_paid_launch_adopter_postcommit(
