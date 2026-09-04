@@ -94,6 +94,35 @@ def _provider_candidate() -> executor.queue_base.ProviderMutationCandidate:
               BOUND_ORDINARY_LAUNCH))
 
 
+def test_disposable_request_process_uses_transient_database_connections(
+        monkeypatch):
+    """One-request children must not retain a pool for a long provider call."""
+    configured_limits = []
+    monkeypatch.setattr(executor.db_utils, 'set_max_connections',
+                        configured_limits.append)
+    monkeypatch.setattr(executor.signal, 'signal', lambda *_: None)
+    monkeypatch.setattr(executor.placement_history, 'reset_request_buffer',
+                        lambda: None)
+    monkeypatch.setattr(executor.placement_history, 'flush_request_buffer',
+                        lambda: None)
+    monkeypatch.setattr(executor.common_utils, 'release_memory', lambda: None)
+
+    def interrupt_before_request_read(_request_id):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(executor.api_requests, 'get_request',
+                        interrupt_before_request_read)
+
+    executor._request_execution_wrapper(
+        'transient-database-connections',
+        ignore_return_value=False,
+        # The reusable parent process may have a QueuePool. The disposable
+        # child must not inherit it for its single, potentially long request.
+        num_db_connections_per_worker=7)
+
+    assert configured_limits == [0]
+
+
 def test_drain_marker_stops_dispatch_before_reserving_worker(monkeypatch):
     monkeypatch.setattr(executor.request_storage, 'role_is_draining',
                         lambda: True)

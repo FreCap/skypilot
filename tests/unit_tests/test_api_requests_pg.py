@@ -97,6 +97,34 @@ _GC_REPLICA_RECORD_ID = uuid.UUID('22222222-2222-4222-8222-222222222222')
 _GC_CONTROLLER_ID = uuid.UUID('33333333-3333-4333-8333-333333333333')
 
 
+def _hold_disposable_process_after_database_operations(
+        database_url: str, application_name: str, ready_path: str,
+        release_path: str) -> None:
+    """Exercise two production-shaped engine namespaces, then stay alive."""
+    configured_url = sqlalchemy.engine.make_url(database_url).update_query_dict(
+        {'application_name': application_name})
+    os.environ[constants.ENV_VAR_IS_SKYPILOT_SERVER] = '1'
+    os.environ[constants.ENV_VAR_DB_CONNECTION_URI] = (
+        configured_url.render_as_string(hide_password=False))
+    # Recreate the production regression inside this fresh spawned process:
+    # the old wrapper selected its reusable parent policy before any request
+    # database engine was created.
+    db_utils.set_max_connections(7)
+    executor._configure_disposable_request_database(7)
+    assert db_utils.get_max_connections() == 0
+    for namespace in ('request-control', None):
+        engine = db_utils.get_engine(None, engine_namespace=namespace)
+        assert isinstance(engine.pool, sqlalchemy.pool.NullPool)
+        with engine.connect() as connection:
+            connection.execute(sqlalchemy.text('SELECT 1'))
+    pathlib.Path(ready_path).touch()
+    deadline = time.monotonic() + 20
+    while not pathlib.Path(release_path).exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Disposable database probe was not released.')
+        time.sleep(0.01)
+
+
 def _gc_replica_state() -> dict[str, object]:
     info = replica_managers.ReplicaInfo(replica_id=3,
                                         cluster_name='gc-service-3',
@@ -376,6 +404,44 @@ def request_database(postgres_engine, monkeypatch):
     backend = request_postgres.PostgresRequestBackend()
     yield postgres_engine, backend
     asyncio.run(async_engine.dispose())
+
+
+def test_disposable_process_does_not_retain_namespaced_database_connections(
+        postgres_engine, tmp_path):
+    """A live one-request child retains no idle connection after each query."""
+    database_url = postgres_engine.url.render_as_string(hide_password=False)
+    application_name = f'skypilot-disposable-test-{uuid.uuid4().hex}'
+    ready = tmp_path / 'database-operations-finished'
+    release = tmp_path / 'release-process'
+    boundary = executor.process.DisposableExecutor(max_workers=1)
+    future = boundary.submit(_hold_disposable_process_after_database_operations,
+                             database_url, application_name, str(ready),
+                             str(release))
+    try:
+        deadline = time.monotonic() + 15
+        while not ready.exists() and not future.done():
+            if time.monotonic() >= deadline:
+                pytest.fail('Disposable database probe did not become ready.')
+            time.sleep(0.01)
+        if future.done():
+            future.result(timeout=1)
+        with postgres_engine.connect() as connection:
+            retained = connection.execute(
+                sqlalchemy.text("""
+                    SELECT count(*)
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND application_name = :application_name
+                """), {
+                    'application_name': application_name
+                }).scalar_one()
+        assert retained == 0
+    finally:
+        release.touch()
+        try:
+            future.result(timeout=10)
+        finally:
+            boundary.shutdown()
 
 
 @pytest.fixture
