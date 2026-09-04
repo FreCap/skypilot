@@ -348,6 +348,22 @@ async def _record_stage(receipt: LifecycleReceipt, name: str,
     return result
 
 
+async def _complete_cancellation_resistant(
+        operation: Awaitable[_T]) -> tuple[_T, asyncio.CancelledError | None]:
+    """Finish one owned finalizer while deferring caller cancellation."""
+    task = asyncio.create_task(operation)
+    deferred_cancellation = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            return result, deferred_cancellation
+        except asyncio.CancelledError as error:
+            if deferred_cancellation is None:
+                deferred_cancellation = error
+            if task.done():
+                return task.result(), deferred_cancellation
+
+
 async def run_lifecycle(args: argparse.Namespace,
                         lifecycle: ServiceLifecycle | None = None) -> None:
     """Run one disposable service and always execute its normal finalizer."""
@@ -434,41 +450,54 @@ async def run_lifecycle(args: argparse.Namespace,
     except BaseException as error:  # pylint: disable=broad-exception-caught
         primary_error = error
     finally:
-        if lifecycle_owned:
-            # A successful create followed by a lost acknowledgement reaches
-            # this finalizer before the normal freeze stage.  Recover exact
-            # provider authority while the service still exists; never invent
-            # a scope merely to make cleanup appear successful.
-            if not artifacts.provider_scope.exists():
+
+        async def _finalize_owned_lifecycle() -> None:
+            nonlocal scope_recovery_error
+            nonlocal serve_down_error
+            nonlocal cleanup_evidence_error
+            if lifecycle_owned:
+                # A successful create followed by a lost acknowledgement
+                # reaches this finalizer before the normal freeze stage.
+                # Recover exact provider authority while the service still
+                # exists; never invent a scope merely to make cleanup appear
+                # successful.
+                if not artifacts.provider_scope.exists():
+                    try:
+                        await _record_stage(
+                            receipt, 'freeze-scope-recovery',
+                            lambda: asyncio.to_thread(
+                                qualify.freeze_provider_scope, scope_args))
+                    except BaseException as error:  # pylint: disable=broad-exception-caught
+                        scope_recovery_error = error
                 try:
                     await _record_stage(
-                        receipt,
-                        'freeze-scope-recovery', lambda: asyncio.to_thread(
-                            qualify.freeze_provider_scope, scope_args))
+                        receipt, 'serve-down',
+                        lambda: lifecycle.down(args.service_name))
                 except BaseException as error:  # pylint: disable=broad-exception-caught
-                    scope_recovery_error = error
-            try:
-                await _record_stage(receipt, 'serve-down',
-                                    lambda: lifecycle.down(args.service_name))
-            except BaseException as error:  # pylint: disable=broad-exception-caught
-                serve_down_error = error
-            try:
-                await _record_stage(
-                    receipt, 'wait-cleanup', lambda: qualify.wait_for_cleanup(
-                        argparse.Namespace(
-                            service_name=args.service_name,
-                            scope=str(artifacts.provider_scope),
-                            receipt=str(artifacts.qualification_receipt),
-                            output=str(artifacts.cleanup_receipt),
-                            timeout_seconds=args.cleanup_timeout_seconds,
-                            poll_seconds=args.poll_seconds,
-                            postgres_url_env=args.postgres_url_env)))
-            except BaseException as error:  # pylint: disable=broad-exception-caught
-                cleanup_evidence_error = error
-            if (cleanup_evidence_error is None and
-                    not artifacts.cleanup_receipt.is_file()):
-                cleanup_evidence_error = LifecycleError(
-                    'Cleanup returned without a durable evidence receipt.')
+                    serve_down_error = error
+                try:
+                    await _record_stage(
+                        receipt, 'wait-cleanup',
+                        lambda: qualify.wait_for_cleanup(
+                            argparse.Namespace(
+                                service_name=args.service_name,
+                                scope=str(artifacts.provider_scope),
+                                receipt=str(artifacts.qualification_receipt),
+                                output=str(artifacts.cleanup_receipt),
+                                timeout_seconds=args.cleanup_timeout_seconds,
+                                poll_seconds=args.poll_seconds,
+                                postgres_url_env=args.postgres_url_env)))
+                except BaseException as error:  # pylint: disable=broad-exception-caught
+                    cleanup_evidence_error = error
+                if (cleanup_evidence_error is None and
+                        not artifacts.cleanup_receipt.is_file()):
+                    cleanup_evidence_error = LifecycleError(
+                        'Cleanup returned without a durable evidence receipt.')
+
+        _, deferred_cancellation = await _complete_cancellation_resistant(
+            _finalize_owned_lifecycle())
+        if primary_error is None and deferred_cancellation is not None:
+            primary_error = deferred_cancellation
         receipt.finish(primary_error=primary_error,
                        scope_recovery_error=scope_recovery_error,
                        serve_down_error=serve_down_error,
