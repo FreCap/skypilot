@@ -5313,287 +5313,79 @@ def _terminate_failed_services_locked(
         return _purge_ownership_failure(
             service_name, 'ownership lost after load balancer cleanup')
 
-    remaining_replica_clusters: list[str] = []
-    # The controller is dead (CONTROLLER_FAILED / FAILED_CLEANUP / zombie
-    # SHUTTING_DOWN), so no down thread will ever run for these replicas:
-    # terminate their clusters here, BEFORE dropping the DB rows. Deleting
-    # the rows first (the old behavior) permanently orphaned any cluster
-    # that still existed -- nothing referenced it anymore, so it kept
-    # billing until manually downed.
-    try:
-        existing_cluster_names = get_existing_replica_cluster_names(
-            replica_infos)
-    except Exception as e:  # pylint: disable=broad-except
-        logger.error(f'Failed to prove replica cluster inventory for failed '
-                     f'service {service_name!r}: '
-                     f'{common_utils.format_exception(e)}')
-        return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
-                'could not be purged because its replica cluster inventory '
-                'could not be verified; durable cleanup inventory was '
-                f'retained for retry.{colorama.Style.RESET_ALL}')
-    if not _still_owns():
-        return _purge_ownership_failure(
-            service_name, 'ownership lost after cluster inventory snapshot')
+    # The controller is gone, but cleanup semantics must stay identical to the
+    # normal owner-driven path.  In particular, paid PRESENT teardown includes
+    # a bounded ABSENT observation and projected paid absence includes exact
+    # action-owned auxiliary/cluster-record finalization before row retirement.
+    # Keep that protocol in one implementation rather than allowing failed
+    # purge to drift into a second teardown state machine.
     # Local to break service -> serve_utils at module import time.
     # pylint: disable=import-outside-toplevel,protected-access
     from sky.serve import service as service_lib
 
+    cleanup_pid = owner.get('controller_pid')
+    cleanup_ip = owner.get('controller_ip')
+    if (type(cleanup_pid) is not int or cleanup_pid <= 0 or
+        (cleanup_ip is not None and
+         (not isinstance(cleanup_ip, str) or not cleanup_ip))):
+        return _purge_ownership_failure(service_name,
+                                        'cleanup owner identity is malformed')
+    cleanup_owner = (cleanup_pid, cleanup_ip)
     try:
-        preparation = service_lib._prepare_provider_present_cleanup(
-            service_name, bound_authority, replica_infos,
-            existing_cluster_names, provider_present_cleanup_contexts)
+        cleanup_failed = service_lib._cleanup(
+            service_name,
+            pool,
+            expected_service_hash,
+            cleanup_owner[0],
+            cleanup_owner[1],
+            lifecycle_lock,
+            resource_scope,
+            binding_authority=bound_authority,
+            provider_present_cleanup_contexts=(
+                provider_present_cleanup_contexts),
+            provider_reconciliation_failures=(provider_reconciliation_failures))
+    except service_lib.ServiceOwnershipLostError:
+        return _purge_ownership_failure(
+            service_name, 'ownership lost during canonical replica cleanup')
     except Exception as error:  # pylint: disable=broad-except
         logger.error(
-            'Retaining failed service %r because its exact provider cleanup '
-            'inventory could not be prepared (%s).', service_name,
+            'Canonical cleanup failed for failed service %r; retaining its '
+            'durable cleanup inventory: %s', service_name,
             common_utils.format_exception(error))
-        return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
-                'could not be purged because its exact provider cleanup '
-                'inventory could not be prepared; durable cleanup inventory '
-                f'was retained for retry.{colorama.Style.RESET_ALL}')
+        cleanup_failed = True
     # pylint: enable=import-outside-toplevel,protected-access
-    provider_present_cleanup_contexts = preparation.contexts
-    replica_keys = {
-        (info.replica_id, info.replica_record_id) for info in replica_infos
-    }
-    extra_failure_keys = provider_reconciliation_failures.keys() - replica_keys
-    overlapping_failure_keys = (provider_reconciliation_failures.keys() &
-                                provider_present_cleanup_contexts.keys())
-    if extra_failure_keys or overlapping_failure_keys:
-        return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
-                'could not be purged because exact provider reconciliation '
-                'lost its replica inventory; durable cleanup inventory was '
-                f'retained for retry.{colorama.Style.RESET_ALL}')
-    cleanup_failures = dict(preparation.failures)
-    cleanup_failures.update(provider_reconciliation_failures)
-    for cleanup_key, reason in cleanup_failures.items():
-        logger.warning(
-            'Retaining exact failed-service cleanup target %r for %r: %s.',
-            cleanup_key, service_name, reason)
-    remaining_replica_clusters.extend(
-        info.cluster_name
-        for info in replica_infos
-        if (info.replica_id, info.replica_record_id) in cleanup_failures)
-    skipped_cleanup_keys = (set(cleanup_failures) |
-                            set(preparation.projected_absence_keys))
-    partition_infos = [
-        info for info in replica_infos
-        if (info.replica_id, info.replica_record_id) not in skipped_cleanup_keys
-    ]
-    # This remains the failed-service purge submission owner.  The retired
-    # action-authority proposal does not replace it.
-    to_terminate, unresolved_cluster_names = (
-        _partition_replica_cleanup_targets(
-            partition_infos,
-            existing_cluster_names,
-            live_service_name=service_name,
-            live_service_hash=(expected_service_hash),
-            live_lifecycle_epoch=lifecycle_epoch,
-            live_controller_owner=(owner.get('controller_pid'),
-                                   owner.get('controller_ip'))))
-    cleanup_targets: list[tuple[Any, Any, Any | None]] = []
-    for info, cleanup_fence in to_terminate:
-        try:
-            # pylint: disable=protected-access
-            cleanup_context = service_lib._provider_present_cleanup_context(
-                info, bound_authority, provider_present_cleanup_contexts)
-            # pylint: enable=protected-access
-        except Exception as error:  # pylint: disable=broad-except
-            logger.error(
-                'Retaining replica cluster %r because its provider-present '
-                'cleanup marker lost exact bound association authority (%s).',
-                info.cluster_name, common_utils.format_exception(error))
-            unresolved_cluster_names.append(info.cluster_name)
-            continue
-        cleanup_targets.append((info, cleanup_fence, cleanup_context))
-    remaining_replica_clusters.extend(unresolved_cluster_names)
-    if cleanup_targets:
-        try:
-            teardown_identities = (
-                serve_state.get_replica_resource_action_identities(
-                    service_name,
-                    [info.replica_id for info, _, _ in cleanup_targets]))
-            if set(teardown_identities) != {
-                    info.replica_id for info, _, _ in cleanup_targets
-            }:
-                raise RuntimeError(
-                    'Replica inventory changed while snapshotting teardown '
-                    'identities.')
-        except Exception as e:  # pylint: disable=broad-except
-            logger.error(
-                f'Failed to prove replica teardown identities for service '
-                f'{service_name!r}: {common_utils.format_exception(e)}')
-            return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
-                    'could not be purged because its durable replica teardown '
-                    'identities could not be verified; cleanup inventory was '
-                    f'retained for retry.{colorama.Style.RESET_ALL}')
-        # Imported here to break the circular dependency: replica_managers
-        # imports serve_utils at module load.
-        # pylint: disable=import-outside-toplevel
-        from sky.serve import replica_managers
-
-        # DistributedLock's PostgreSQL liveness probe uses the lock-owning
-        # connection.  Multiple replica workers must not use that connection
-        # concurrently: psycopg connections/cursors are not a thread-safe
-        # ownership oracle.  Serialize guard probes while keeping the actual
-        # cluster termination requests parallel.
-        ownership_guard_lock = threading.Lock()
-
-        def _worker_still_owns() -> bool:
-            with ownership_guard_lock:
-                return _still_owns()
-
-        cleanup_target_by_identity = {
-            (info.replica_id, info.replica_record_id):
-                (cleanup_fence, cleanup_context)
-            for info, cleanup_fence, cleanup_context in cleanup_targets
-        }
-
-        def _terminate_replica_cluster(
-                info: 'replica_managers.ReplicaInfo') -> None:
-            # Reuse the canonical direct core.down path with retries.
-            cleanup_fence, cleanup_context = cleanup_target_by_identity[(
-                info.replica_id, info.replica_record_id)]
-            identity = teardown_identities[info.replica_id]
-            terminate_kwargs: dict[str, Any] = {
-                'continue_guard': _worker_still_owns,
-                'expected_cluster_record_uuid':
-                    (str(identity.sky_cluster_record_uuid)
-                     if identity is not None else None),
-            }
-            if cleanup_fence is not None:
-                terminate_kwargs['cleanup_fence'] = cleanup_fence
-            # pylint: disable=protected-access
-            service_lib._terminate_replica_cluster_for_service_cleanup(
-                service_name, info, cleanup_context, bound_authority,
-                info.cluster_name, **terminate_kwargs)
-            # pylint: enable=protected-access
-
-        cleanup_owner = (owner.get('controller_pid'),
-                         owner.get('controller_ip'))
-
-        def _persist_cleanup(info: 'replica_managers.ReplicaInfo') -> None:
-            persisted = serve_state.add_or_update_replica(
-                service_name,
-                info.replica_id,
-                info,
-                expected_service_hash=expected_service_hash,
-                expected_lifecycle_epoch=lifecycle_epoch,
-                expected_controller_owner=cleanup_owner,
-                expected_replica_exists=True,
-                guard_launch_exclusion=(
-                    serve_state.replica_info_has_binding_excluded_profile(info)
-                ))
-            if not persisted:
-                raise RuntimeError('Failed service cleanup lost exact replica '
-                                   f'{info.replica_id} ownership.')
-
-        def _cleanup_succeeded(info: 'replica_managers.ReplicaInfo') -> None:
-            info.status_property.sky_down_status = (
-                common_utils.ProcessStatus.SUCCEEDED)
-            _persist_cleanup(info)
-
-        def _cleanup_failed(info: 'replica_managers.ReplicaInfo',
-                            reason: str | None) -> None:
-            info.status_property.sky_down_status = (
-                common_utils.ProcessStatus.FAILED)
-            _persist_cleanup(info)
-            remaining_replica_clusters.append(info.cluster_name)
-            suffix = '' if reason is None else f': {reason}'
-            logger.error(
-                'Failed to terminate replica cluster %s of failed '
-                'service %r%s', info.cluster_name, service_name, suffix)
-
-        def _reserve_failed_cleanup(
-            infos: list['replica_managers.ReplicaInfo'],
-            termination_limit: int,
-        ) -> Mapping[int, 'replica_managers.ReplicaInfo']:
-            return serve_state.reserve_replica_teardowns_running_if_capacity(
-                service_name,
-                [(info.replica_id, info.replica_record_id) for info in infos],
-                termination_limit=termination_limit,
-                expected_service_hash=expected_service_hash,
-                expected_lifecycle_epoch=lifecycle_epoch,
-                expected_controller_owner=cleanup_owner)
-
-        def _restore_failed_cleanup(
-            info: 'replica_managers.ReplicaInfo',
-        ) -> 'replica_managers.ReplicaInfo | None':
-            return (
-                serve_state.restore_never_started_replica_teardown_to_scheduled(
-                    service_name,
-                    info.replica_id,
-                    info.replica_record_id,
-                    expected_service_hash=expected_service_hash,
-                    expected_lifecycle_epoch=lifecycle_epoch,
-                    expected_controller_owner=cleanup_owner))
-
-        cleanup_work: list[Any] = []
-        for target in cleanup_targets:
-            info = target[0]
-            if (info.status_property.sky_down_status
-                    != common_utils.ProcessStatus.RUNNING):
-                info.status_property.sky_down_status = (
-                    common_utils.ProcessStatus.SCHEDULED)
-            _persist_cleanup(info)
-            cleanup_work.append(info)
-        try:
-            run_bounded_serve_teardown_threads(
-                cleanup_work,
-                make_worker=lambda info: thread_utils.SafeThread(
-                    target=_terminate_replica_cluster, args=(info,)),
-                pool=pool,
-                reserve_running=_reserve_failed_cleanup,
-                restore_never_started=_restore_failed_cleanup,
-                handle_success=_cleanup_succeeded,
-                handle_failure=_cleanup_failed,
-                continue_guard=_still_owns,
-                max_concurrent_per_service=(
-                    replica_managers.MAX_CONCURRENT_DOWNS_PER_SERVICE))
-        except Exception as error:  # pylint: disable=broad-except
-            logger.error(
-                'Failed-service replica teardown admission failed '
-                'closed for %r: %s', service_name,
-                common_utils.format_exception(error))
-            return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
-                    'could not be purged because bounded provider cleanup '
-                    'admission failed; durable cleanup inventory was retained '
-                    f'for retry.{colorama.Style.RESET_ALL}')
 
     if not _still_owns():
         return _purge_ownership_failure(service_name,
                                         'ownership lost after replica cleanup')
 
-    if remaining_replica_clusters:
-        # Keep every durable row/file and the name even though new replica
-        # names are incarnation-scoped.  This preserves an authoritative,
-        # retryable inventory for any billable cluster that survived down.
+    if cleanup_failed:
+        # Keep every durable row/file and the name.  The same canonical
+        # cleanup function will resume exact paid observation/finalization,
+        # reserved-fill fencing, and storage cleanup on the next purge.
         if not serve_state.set_service_status_and_active_versions_if_owner(
                 service_name,
                 expected_service_hash,
-                owner.get('controller_pid'),
-                owner.get('controller_ip'),
+                cleanup_owner[0],
+                cleanup_owner[1],
                 serve_state.ServiceStatus.FAILED_CLEANUP,
                 expected_status=serve_state.ServiceStatus.SHUTTING_DOWN,
                 expected_lifecycle_epoch=lifecycle_epoch):
             return _purge_ownership_failure(
                 service_name, 'ownership lost while retaining failed cleanup')
-        remaining_identity = ', '.join(
-            repr(name) for name in remaining_replica_clusters)
+        remaining_infos = serve_state.get_replica_infos(service_name)
+        remaining_names = [info.cluster_name for info in remaining_infos]
+        if remaining_names:
+            remaining_identity = ', '.join(
+                repr(name) for name in remaining_names)
+            return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
+                    'could not be purged because some replica clusters could '
+                    'not be terminated. The service name and cleanup metadata '
+                    'remain reserved; retry purge after checking: '
+                    f'{remaining_identity}{colorama.Style.RESET_ALL}')
         return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
-                'could not be purged because some replica clusters could not '
-                'be terminated. The service name and cleanup metadata remain '
-                'reserved; retry purge after checking: '
-                f'{remaining_identity}{colorama.Style.RESET_ALL}')
-
-    # Version rows may already have been retired while this service was live;
-    # consume the separate durable generation manifests only after every
-    # replica is confirmed gone and before the final DB removal.
-    if not service_lib.cleanup_storage_intents(service_name, resource_scope,
-                                               _still_owns):
-        return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
-                'could not be purged because scoped storage cleanup failed; '
-                'durable cleanup inventory was retained for retry.'
+                'could not be purged because canonical scoped cleanup did not '
+                'complete; durable cleanup inventory was retained for retry.'
                 f'{colorama.Style.RESET_ALL}')
 
     service_dir = os.path.expanduser(
@@ -5607,6 +5399,7 @@ def _terminate_failed_services_locked(
     removed = serve_state.remove_service_completely(
         service_name,
         expected_service_hash,
+        expected_controller_owner=cleanup_owner,
         expected_lifecycle_epoch=lifecycle_epoch)
     if not removed:
         return _purge_ownership_failure(

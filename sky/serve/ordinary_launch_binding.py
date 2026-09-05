@@ -7138,6 +7138,14 @@ def _lock_and_validate_retained_terminal_absence_authority(
                 not replica_has_projected_provider_absence_cleanup_marker(info)
            ):
             return None
+        if (policy is _TerminalCensusPolicy.FINAL_DELETION and
+                candidate.get('paid_capacity_pool_key') is not None):
+            # Provider ABSENT releases the paid debit, but it does not prove
+            # the action-owned SkyPilot cluster row or GCP auxiliary has been
+            # retired.  The exact per-row finalizer owns those effects and
+            # removes the replica before whole-service deletion.  N-2 name
+            # transfer remains non-mutating and may retain this graph.
+            return None
     if provider_clean_by_replica:
         return None
     return RetainedAuthorityCensus(tuple(associations))
@@ -8674,10 +8682,15 @@ def replica_has_projected_provider_absence_cleanup_marker(
         # post-quiescence ABSENT evidence before retirement. The removal path
         # independently revalidates its owner, record, and Kueue fences.
         return True
-    # A later generic purge can persist SUCCEEDED after this provider-ABSENT
-    # shape committed. Consumers still revalidate the exact settled evidence.
+    # Failed purge may observe no local cluster row (and therefore leave down
+    # unset), persist SUCCEEDED after an idempotent down, or persist FAILED
+    # when exact auxiliary finalization must be retried.  This is only a
+    # candidate shape: every consumer independently locks and validates the
+    # exact settled association, canonical post-quiescence ABSENT evidence,
+    # released pin/claim, record identity, and lifecycle authority.
     paid_absence_down_status = status.sky_down_status in (
-        None, common_utils.ProcessStatus.SUCCEEDED)
+        None, common_utils.ProcessStatus.FAILED,
+        common_utils.ProcessStatus.SUCCEEDED)
     return bool(
         getattr(replica_info, 'reserved_fill', None) is False and
         getattr(replica_info, 'is_zero_cost', None) is False and
@@ -8687,7 +8700,8 @@ def replica_has_projected_provider_absence_cleanup_marker(
         status.sky_launch_status == common_utils.ProcessStatus.FAILED and
         paid_absence_down_status and status.service_ready_now is False and
         status.is_scale_down is False and status.preempted is False and
-        status.purged is False and status.failed_spot_availability is True and
+        status.purged is False and
+        type(status.failed_spot_availability) is bool and
         status.wait_for_idle_before_termination is False and
         status.drain_cap_seconds is None and status.drain_started_at is None and
         status.logical_retirement_version is None and

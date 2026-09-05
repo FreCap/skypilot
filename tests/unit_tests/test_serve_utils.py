@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 from unittest import mock
 import uuid
@@ -29,11 +30,12 @@ from sky.serve import controller_transport
 from sky.serve import demand_state
 from sky.serve import maintenance
 from sky.serve import ordinary_launch_binding
+from sky.serve import paid_capacity
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
-from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import spot_placer
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import requests as api_requests
 from sky.skylet import constants as skylet_constants
@@ -5161,9 +5163,14 @@ class TestTerminateFailedServices:
              bound_authority=None,
              bound_settle_side_effect=None,
              quiesce_side_effect=None,
-             exact_absence=False):
+             exact_absence=False,
+             projected_cleanup_preparation=None,
+             projected_finalization_result=True,
+             actual_cleanup=False,
+             canonical_cleanup_result=False):
         terminated = []
         self.termination_kwargs = []
+        self.cleanup_events = []
 
         def _terminate(cluster_name, **kwargs):
             terminated.append(cluster_name)
@@ -5186,6 +5193,24 @@ class TestTerminateFailedServices:
 
         def _terminate_exact(*args, **kwargs):
             self.exact_terminations.append((args, kwargs))
+
+        def _finalize_projected(*_args, **_kwargs):
+            self.cleanup_events.append('projected-finalize')
+            if isinstance(projected_finalization_result, BaseException):
+                raise projected_finalization_result
+            return projected_finalization_result
+
+        def _remove_service(*_args, **_kwargs):
+            self.cleanup_events.append('remove-service')
+            return True
+
+        def _canonical_cleanup(*_args, **_kwargs):
+            self.cleanup_events.append('canonical-cleanup')
+            if isinstance(canonical_cleanup_result, BaseException):
+                raise canonical_cleanup_result
+            if callable(canonical_cleanup_result):
+                return canonical_cleanup_result(*_args, **_kwargs)
+            return canonical_cleanup_result
 
         self.cluster_snapshot_calls = []
 
@@ -5231,6 +5256,17 @@ class TestTerminateFailedServices:
                     return_value=types.SimpleNamespace(
                         provider_present_cleanup_contexts={},
                         provider_reconciliation_failures={})))
+            if projected_cleanup_preparation is not None:
+                stack.enter_context(
+                    mock.patch(
+                        'sky.serve.service.'
+                        '_prepare_provider_present_cleanup',
+                        return_value=projected_cleanup_preparation))
+            canonical_cleanup = None
+            if not actual_cleanup:
+                canonical_cleanup = stack.enter_context(
+                    mock.patch('sky.serve.service._cleanup',
+                               side_effect=_canonical_cleanup))
             stack.enter_context(
                 mock.patch(
                     'sky.serve.serve_utils.global_user_state.'
@@ -5251,6 +5287,11 @@ class TestTerminateFailedServices:
                     'sky.serve.replica_managers.'
                     'terminate_bound_non_pool_provider_present_cluster',
                     side_effect=_terminate_exact))
+            self.projected_finalizer = stack.enter_context(
+                mock.patch(
+                    'sky.serve.replica_managers.'
+                    'finalize_projected_paid_provider_absence',
+                    side_effect=_finalize_projected))
             stack.enter_context(
                 mock.patch('sky.serve.serve_utils.get_service_lifecycle_lock',
                            return_value=lifecycle_lock))
@@ -5306,7 +5347,7 @@ class TestTerminateFailedServices:
                 mock.patch(
                     'sky.serve.serve_utils.serve_state.'
                     'remove_service_completely',
-                    return_value=True))
+                    side_effect=_remove_service))
             remove_directory = stack.enter_context(
                 mock.patch('sky.serve.serve_utils.remove_service_directory'))
             stack.enter_context(
@@ -5321,6 +5362,7 @@ class TestTerminateFailedServices:
         self.settle_bound = settle_bound
         self.persist_replica = persist
         self.exact_absence_probe = exact_probe
+        self.canonical_cleanup = canonical_cleanup
         return (terminated, remove_service, delete_lb, result.message,
                 set_owner_status, remove_directory)
 
@@ -5332,18 +5374,115 @@ class TestTerminateFailedServices:
         info.cluster_name = cluster_name
         return info
 
-    def test_existing_clusters_are_terminated_before_row_removal(self):
+    def test_failed_purge_delegates_to_canonical_cleanup_before_row_removal(
+            self):
         infos = [self._replica(1, 'svc-1'), self._replica(2, 'svc-2')]
         terminated, remove_service, _, message, _, _ = self._run(
             infos, exists=lambda name: name == 'svc-1')
-        # Only the still-existing cluster is downed; both rows are removed
-        # and the service row is cleared.
-        assert terminated == ['svc-1']
-        assert self.cluster_snapshot_calls == [['svc-1', 'svc-2']]
-        remove_service.assert_called_once_with('svc',
-                                               'incarnation-a',
-                                               expected_lifecycle_epoch=17)
+        assert not terminated
+        self.canonical_cleanup.assert_called_once_with(
+            'svc',
+            False,
+            'incarnation-a',
+            101,
+            '10.0.0.1',
+            mock.ANY,
+            None,
+            binding_authority=None,
+            provider_present_cleanup_contexts={},
+            provider_reconciliation_failures={})
+        remove_service.assert_called_once_with(
+            'svc',
+            'incarnation-a',
+            expected_controller_owner=(101, '10.0.0.1'),
+            expected_lifecycle_epoch=17)
+        assert self.cleanup_events == ['canonical-cleanup', 'remove-service']
         assert message is None
+
+    def test_projected_paid_absence_is_finalized_before_service_delete(self):
+        status = types.SimpleNamespace(
+            sky_launch_status=common_utils.ProcessStatus.FAILED,
+            sky_down_status=None,
+            service_ready_now=False,
+            is_scale_down=False,
+            preempted=False,
+            purged=False,
+            failed_spot_availability=False,
+            wait_for_idle_before_termination=False,
+            drain_cap_seconds=None,
+            drain_started_at=None,
+            logical_retirement_version=None,
+            logical_retirement_controller_epoch=None,
+            logical_retirement_generation=None,
+            logical_retirement_target_capacity=None,
+            logical_retirement_confirmed_generation=None,
+            logical_retirement_bounded_deadline=False,
+            logical_retirement_committed=False)
+        record_id = str(uuid.UUID(int=1))
+        location = spot_placer.Location(cloud=clouds.AWS(),
+                                        region='us-east-1',
+                                        zone='us-east-1a',
+                                        accelerators={'L4': 1},
+                                        use_spot=True,
+                                        instance_type='g6.xlarge')
+        paid_pool_key = paid_capacity.pool_key(location,
+                                               workspace='default',
+                                               num_nodes=1,
+                                               aws_account_id='123456789012')
+        info = types.SimpleNamespace(replica_id=1,
+                                     replica_record_id=record_id,
+                                     cluster_name='svc-1',
+                                     reserved_fill=False,
+                                     is_zero_cost=False,
+                                     is_spot=True,
+                                     service_job_id=None,
+                                     paid_capacity_pool_key=paid_pool_key,
+                                     zero_cost_materialization_sequence=None,
+                                     status_property=status)
+        key = (info.replica_id, info.replica_record_id)
+        preparation = types.SimpleNamespace(contexts={},
+                                            projected_absence_keys=frozenset(
+                                                {key}),
+                                            failures={})
+
+        terminated, remove_service, _, message, set_owner_status, _ = self._run(
+            [info],
+            exists=lambda _name: True,
+            projected_cleanup_preparation=preparation,
+            projected_finalization_result=False,
+            actual_cleanup=True)
+
+        self.projected_finalizer.assert_called_once()
+        assert self.projected_finalizer.call_args.args == ('svc', 1, record_id,
+                                                           'svc-1')
+        assert callable(
+            self.projected_finalizer.call_args.kwargs['continue_guard'])
+        assert self.projected_finalizer.call_args.kwargs[
+            'provider_operation_deadline_monotonic'] > time.monotonic()
+        assert message is not None
+        assert 'could not be purged' in message
+        assert self.cleanup_events == ['projected-finalize']
+        assert not terminated
+        assert status.sky_down_status is common_utils.ProcessStatus.FAILED
+        remove_service.assert_not_called()
+        set_owner_status.assert_called_once()
+
+        # The persisted FAILED status is an exact-finalizer retry marker, not
+        # authority for generic name-based teardown.  A subsequent purge must
+        # re-enter the same per-action finalizer and only then delete the
+        # service.
+        terminated, remove_service, _, message, set_owner_status, _ = self._run(
+            [info],
+            exists=lambda _name: True,
+            projected_cleanup_preparation=preparation,
+            projected_finalization_result=True,
+            actual_cleanup=True)
+        self.projected_finalizer.assert_called_once()
+        assert not terminated
+        assert message is None
+        assert self.cleanup_events == ['projected-finalize', 'remove-service']
+        remove_service.assert_called_once()
+        set_owner_status.assert_not_called()
 
     def test_bound_launches_settle_before_generic_quiescence(self):
         events = []
@@ -5374,140 +5513,6 @@ class TestTerminateFailedServices:
         ]
         remove_service.assert_called_once()
 
-    def test_provider_present_marker_uses_exact_failed_purge_path(self):
-        authority = ordinary_launch_binding.ControllerBindingAuthority(
-            service_name='svc',
-            service_hash='incarnation-a',
-            service_workspace='default',
-            service_lifecycle_epoch=17,
-            controller_pid=123,
-            controller_ip='10.0.0.2',
-            controller_incarnation=uuid.UUID(
-                '00000000-0000-4000-8000-000000000123'),
-            controller_owner_epoch=7,
-            capable=True,
-            binding_mode=ordinary_launch_binding.BindingMode.BOUND,
-            binding_epoch=2,
-            non_pool_capable=True,
-            non_pool_binding_protocol_version=(
-                ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
-            non_pool_profile_set_digest=(
-                ordinary_launch_binding.supported_non_pool_profile_set_digest()
-            ),
-            non_pool_capability_cohort_epoch=(
-                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
-            non_pool_receipt_protocol_version=(
-                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
-        physical_uid = 'physical-cluster-a'
-        kubernetes_context = 'on-prem-a'
-        pool_key = reserved_capacity_broker.make_pool_key(
-            kubernetes_context,
-            'L4',
-            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
-            physical_cluster_uid=physical_uid)
-        status = types.SimpleNamespace(
-            sky_launch_status=(
-                serve_utils.common_utils.ProcessStatus.INTERRUPTED),
-            sky_down_status=serve_utils.common_utils.ProcessStatus.SCHEDULED,
-            service_ready_now=False,
-            is_scale_down=True,
-            preempted=False,
-            purged=False,
-            failed_spot_availability=False,
-            wait_for_idle_before_termination=False,
-            drain_cap_seconds=0,
-            drain_started_at=None,
-            logical_retirement_version=None,
-            logical_retirement_controller_epoch=None,
-            logical_retirement_generation=None,
-            logical_retirement_target_capacity=None,
-            logical_retirement_confirmed_generation=None,
-            logical_retirement_bounded_deadline=False,
-            logical_retirement_committed=False)
-        record_uuid = uuid.UUID('22222222-2222-4222-8222-222222222222')
-        record_id = str(record_uuid)
-        profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
-            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
-            authorization_reference='reserved-fill:test',
-            authorization_generation=7,
-            authorization_payload={'pool_key': pool_key})
-        context = ordinary_launch_binding.BoundNonPoolLaunchContext(
-            association_id=uuid.UUID('11111111-1111-4111-8111-111111111111'),
-            request_id='request-1',
-            service_name='svc',
-            replica_id=3,
-            replica_record_id=record_uuid,
-            launch_generation=1,
-            input_digest='a' * 64,
-            profile=profile,
-            capability_cohort_epoch=(
-                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
-            capability_profile_set_digest=(
-                ordinary_launch_binding.supported_non_pool_profile_set_digest()
-            ),
-            receipt_protocol_version=(
-                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
-        info = types.SimpleNamespace(
-            replica_id=3,
-            replica_record_id=record_id,
-            cluster_name='svc-3',
-            reserved_fill=True,
-            reserved_fill_pool_key=pool_key,
-            reserved_fill_service_generation=7,
-            reserved_fill_physical_cluster_uid=physical_uid,
-            reserved_fill_kubernetes_context=kubernetes_context,
-            location={
-                'cloud': 'Kubernetes',
-                'region': kubernetes_context,
-                'accelerators': {
-                    'L4': 1,
-                },
-            },
-            resources_override={
-                'cloud': 'Kubernetes',
-                'region': kubernetes_context,
-                'accelerators': {
-                    'L4': 1,
-                },
-            },
-            is_zero_cost=True,
-            service_job_id=None,
-            paid_capacity_pool_key=None,
-            zero_cost_materialization_sequence=None,
-            status_property=status)
-        assert (
-            ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
-                info, require_scheduled=True))
-
-        def _settle(_authority, _infos):
-            return types.SimpleNamespace(provider_present_cleanup_contexts={
-                (info.replica_id, info.replica_record_id): context
-            },
-                                         provider_reconciliation_failures={})
-
-        with mock.patch(
-                'sky.serve.service.request_postgres.'
-                'bound_non_pool_provider_present_cleanup_is_authorized',
-                return_value=True):
-            terminated, remove_service, _, message, _, _ = self._run(
-                [info],
-                exists=lambda _name: True,
-                bound_authority=authority,
-                bound_settle_side_effect=_settle)
-
-        assert message is None
-        assert not terminated
-        assert len(self.exact_terminations) == 1
-        args, kwargs = self.exact_terminations[0]
-        assert args[:3] == (context, info, authority)
-        assert callable(args[3])
-        assert args[4] == info.cluster_name
-        assert kwargs['cleanup_fence'] == (
-            reserved_capacity.ProtocolV2CleanupFence(
-                kubernetes_context=kubernetes_context,
-                physical_cluster_uid=physical_uid))
-        remove_service.assert_called_once()
-
     def test_bound_settlement_failure_retains_all_cleanup_rows(self):
         authority = object()
         info = self._replica(1, 'svc-1')
@@ -5523,78 +5528,6 @@ class TestTerminateFailedServices:
         self.quiesce.assert_not_called()
         delete_lb.assert_not_called()
         remove_service.assert_not_called()
-
-    def test_provider_reconciliation_failure_isolated_from_peer_cleanup(self):
-        authority = object()
-        failed_info = self._replica(1, 'svc-1')
-        healthy_info = self._replica(2, 'svc-2')
-        failed_key = (failed_info.replica_id, failed_info.replica_record_id)
-
-        def _settle(_authority, _infos):
-            return types.SimpleNamespace(
-                provider_present_cleanup_contexts={},
-                provider_reconciliation_failures={
-                    failed_key: 'AWS census remains unproven'
-                })
-
-        terminated, remove_service, _, message, _, _ = self._run(
-            [failed_info, healthy_info],
-            exists=lambda _name: True,
-            bound_authority=authority,
-            bound_settle_side_effect=_settle)
-
-        assert terminated == ['svc-2']
-        assert message is not None and 'some replica clusters' in message
-        remove_service.assert_not_called()
-
-    def test_action_owned_cluster_termination_uses_exact_record_uuid(self):
-        info = self._replica(1, 'svc-1')
-        cluster_record_uuid = uuid.UUID('33333333-3333-4333-8333-333333333333')
-        identity = serve_state.ReplicaResourceActionIdentity(
-            replica_id=1,
-            cluster_name='svc-1',
-            replica_incarnation=uuid.UUID(
-                '11111111-1111-4111-8111-111111111111'),
-            desired_generation=2,
-            sky_cluster_record_uuid=cluster_record_uuid)
-
-        _, _, _, message, _, _ = self._run([info],
-                                           exists=lambda _name: True,
-                                           teardown_identities={1: identity})
-
-        assert message is None
-        assert self.termination_kwargs == [{
-            'continue_guard': mock.ANY,
-            'expected_cluster_record_uuid': str(cluster_record_uuid),
-        }]
-
-    def test_large_absent_inventory_uses_one_cluster_snapshot(self):
-        infos = [
-            self._replica(replica_id, f'svc-{replica_id}')
-            for replica_id in range(2159)
-        ]
-        terminated, remove_service, _, message, _, _ = self._run(
-            infos, exists=lambda _name: False)
-
-        assert not terminated
-        assert self.cluster_snapshot_calls == [[
-            info.cluster_name for info in infos
-        ]]
-        remove_service.assert_called_once()
-        assert message is None
-
-    def test_cluster_inventory_uncertainty_retains_cleanup_rows(self):
-
-        def _inventory_failure(_name):
-            raise RuntimeError('cluster DB unavailable')
-
-        infos = [self._replica(1, 'svc-1')]
-        terminated, remove_service, _, message, _, _ = self._run(
-            infos, exists=_inventory_failure)
-
-        assert not terminated
-        remove_service.assert_not_called()
-        assert message is not None and 'could not be verified' in message
 
     def test_unquiesced_launch_keeps_rows_and_clusters_for_retry(self):
         info = self._replica(1, 'svc-1')
@@ -5648,44 +5581,34 @@ class TestTerminateFailedServices:
         def _lb_deleted(*_args, **_kwargs):
             events.append('lb-deleted')
 
-        def _replica_terminated(_cluster_name):
-            events.append('replica-terminated')
+        def _canonical_cleanup(*_args, **_kwargs):
+            events.append('canonical-cleanup')
+            return False
 
         _, _, _, message, _, _ = self._run(
             infos,
             exists=lambda name: True,
-            terminate_side_effect=_replica_terminated,
-            lb_side_effect=_lb_deleted)
+            lb_side_effect=_lb_deleted,
+            canonical_cleanup_result=_canonical_cleanup)
         assert message is None
-        assert events == ['lb-deleted', 'replica-terminated']
+        assert events == ['lb-deleted', 'canonical-cleanup']
 
     def test_termination_failure_retains_name_and_cleanup_metadata(self):
         infos = [self._replica(1, 'svc-1'), self._replica(2, 'svc-2')]
 
-        def _fail_svc_2(cluster_name):
-            if cluster_name == 'svc-2':
-                raise RuntimeError('down failed')
-
         terminated, remove_service, _, message, _, _ = self._run(
-            infos, exists=lambda name: True, terminate_side_effect=_fail_svc_2)
-        assert sorted(terminated) == ['svc-1', 'svc-2']
+            infos, exists=lambda name: True, canonical_cleanup_result=True)
+        assert not terminated
+        self.canonical_cleanup.assert_called_once()
         remove_service.assert_not_called()
         assert message is not None and 'could not be purged' in message
 
     def test_cluster_down_failure_blocks_name_until_retry_succeeds(self):
         infos = [self._replica(1, 'svc-1')]
-        attempts = 0
-
-        def _fail_once(_cluster_name):
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                raise RuntimeError('down failed')
-
         (_, first_remove, first_lb, first_message, first_status,
          first_remove_directory) = self._run(infos,
                                              exists=lambda name: True,
-                                             terminate_side_effect=_fail_once)
+                                             canonical_cleanup_result=True)
         assert first_message is not None and 'could not be purged' in (
             first_message)
         first_remove.assert_not_called()
@@ -5705,103 +5628,16 @@ class TestTerminateFailedServices:
         (_, second_remove, _, second_message, _,
          second_remove_directory) = self._run(infos,
                                               exists=lambda name: True,
-                                              terminate_side_effect=_fail_once)
+                                              canonical_cleanup_result=False)
         assert second_message is None
-        second_remove.assert_called_once_with('svc',
-                                              'incarnation-a',
-                                              expected_lifecycle_epoch=17)
+        second_remove.assert_called_once_with(
+            'svc',
+            'incarnation-a',
+            expected_controller_owner=(101, '10.0.0.1'),
+            expected_lifecycle_epoch=17)
         # Legacy NULL-scope directories are intentionally retained: their
         # lossy name mapping cannot prove exclusive ownership.
         second_remove_directory.assert_not_called()
-
-    def test_no_existing_clusters_skips_termination(self):
-        infos = [self._replica(1, 'svc-1')]
-        terminated, remove_service, _, message, _, _ = self._run(
-            infos, exists=lambda name: False)
-        assert not terminated
-        remove_service.assert_called_once_with('svc',
-                                               'incarnation-a',
-                                               expected_lifecycle_epoch=17)
-        assert message is None
-
-    def test_protocol_v2_unproven_absence_retains_parent_and_history_barrier(
-            self):
-        info = self._replica(1, 'svc-1')
-        cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
-                                              physical_cluster_uid='phx-uid')
-        with mock.patch(
-                'sky.serve.reserved_capacity.'
-                'parse_protocol_v2_cleanup_fence',
-                return_value=cleanup_fence), \
-             mock.patch(
-                 'sky.serve.reserved_capacity.'
-                 'probe_physical_replica_presence',
-                 return_value=(reserved_capacity.
-                               PhysicalReplicaPresence.UNPROVEN)):
-            (terminated, remove_service, _, message, set_owner_status,
-             _) = self._run([info], exists=lambda _name: False)
-
-        assert not terminated
-        remove_service.assert_not_called()
-        assert message is not None and 'could not be purged' in message
-        assert set_owner_status.call_args.args[4] == (
-            serve_state.ServiceStatus.FAILED_CLEANUP)
-        assert self.quiesce.call_args.kwargs['include_terminal_history'] is True
-
-    def test_protocol_v2_provider_absence_removes_parent_and_rows(self):
-        info = self._replica(1, 'svc-1')
-        cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
-                                              physical_cluster_uid='phx-uid')
-        with mock.patch(
-                'sky.serve.reserved_capacity.'
-                'parse_protocol_v2_cleanup_fence',
-                return_value=cleanup_fence), \
-             mock.patch(
-                 'sky.serve.reserved_capacity.'
-                 'probe_physical_replica_presence',
-                 return_value=(reserved_capacity.
-                               PhysicalReplicaPresence.ABSENT)) as probe:
-            (terminated, remove_service, _, message, set_owner_status,
-             _) = self._run([info], exists=lambda _name: False)
-
-        assert not terminated
-        probe.assert_called_once_with(cleanup_fence, info.cluster_name)
-        remove_service.assert_called_once_with('svc',
-                                               'incarnation-a',
-                                               expected_lifecycle_epoch=17)
-        set_owner_status.assert_not_called()
-        assert message is None
-        assert self.quiesce.call_args.kwargs['include_terminal_history'] is True
-
-    def test_protocol_v2_exact_admitted_pod_absence_skips_name_census(self):
-        info = self._replica(1, 'svc-1')
-        info.replica_record_id = '00000000-0000-4000-8000-000000000001'
-        info.status_property = types.SimpleNamespace(sky_down_status=None)
-        cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
-                                              physical_cluster_uid='phx-uid')
-        with mock.patch(
-                'sky.serve.reserved_capacity.'
-                'parse_protocol_v2_cleanup_fence',
-                return_value=cleanup_fence), \
-             mock.patch(
-                 'sky.serve.reserved_capacity.'
-                 'probe_physical_replica_presence') as census:
-            _, remove_service, _, message, _, _ = self._run(
-                [info], exists=lambda _name: False, exact_absence=True)
-
-        assert message is None
-        census.assert_not_called()
-        self.exact_absence_probe.assert_called_once_with(
-            'svc', info.replica_id, info.replica_record_id)
-        self.persist_replica.assert_called_once_with(
-            'svc',
-            info.replica_id,
-            info,
-            expected_service_hash='incarnation-a',
-            expected_lifecycle_epoch=17,
-            expected_controller_owner=(101, '10.0.0.1'),
-            expected_replica_exists=True)
-        remove_service.assert_called_once()
 
     def test_orphan_child_partition_keeps_legacy_census_without_service_row(
             self):
@@ -5827,26 +5663,6 @@ class TestTerminateFailedServices:
         assert unresolved == []
         census.assert_called_once_with(cleanup_fence, info.cluster_name)
         exact_probe.assert_not_called()
-
-    def test_protocol_v2_present_cluster_forwards_exact_cleanup_fence(self):
-        info = self._replica(1, 'svc-1')
-        cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
-                                              physical_cluster_uid='phx-uid')
-        with mock.patch(
-                'sky.serve.reserved_capacity.'
-                'parse_protocol_v2_cleanup_fence',
-                return_value=cleanup_fence):
-            _, remove_service, _, message, _, _ = self._run(
-                [info], exists=lambda _name: True)
-
-        assert message is None
-        remove_service.assert_called_once()
-        assert self.termination_kwargs == [{
-            'continue_guard': mock.ANY,
-            'expected_cluster_record_uuid': None,
-            'cleanup_fence': cleanup_fence,
-        }]
-        assert self.quiesce.call_args.kwargs['include_terminal_history'] is True
 
     def test_failed_final_cas_never_restores_over_successor(self, tmp_path):
         incarnation_a = tmp_path / 'svc-inc-a'
@@ -5985,9 +5801,11 @@ class TestTerminateFailedServices:
         assert second is None
         claim.assert_called_once()
         assert delete_lb.call_count == 2
-        remove_service.assert_called_once_with('svc',
-                                               'incarnation-a',
-                                               expected_lifecycle_epoch=17)
+        remove_service.assert_called_once_with(
+            'svc',
+            'incarnation-a',
+            expected_controller_owner=(os.getpid(), os.environ.get('POD_IP')),
+            expected_lifecycle_epoch=17)
 
     def test_recovery_preclaim_none_port_is_not_teardown_ack(self):
         # HA recovery deliberately clears controller_port before the new
