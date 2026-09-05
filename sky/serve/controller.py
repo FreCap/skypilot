@@ -7255,7 +7255,10 @@ class SkyServeController:
                         # immediately derive the successor from durable state.
                         self._notify_scale_reconcile()
                     retirement_changed = False
-                    if (fresh_aggregate_zero and
+                    # This manager operation retires every paid row. Preserve
+                    # any exact-card floor owned by the committed planner.
+                    if (fresh_aggregate_zero and committed_capacity_plan.
+                            retirement_floor_target.total() == 0 and
                             durable_snapshot.reconcile_authority.
                             deadline_monotonic > time.monotonic()):
                         retirement_changed = (
