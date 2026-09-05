@@ -4810,11 +4810,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise ValueError('Paid launch YAML construction is malformed.')
         # The atomic admission transaction already derived and validated the
         # ingress port from this exact immutable version before inserting the
-        # pristine row.  Re-parsing the complete service task once per receipt
-        # member turns a 100-member database wave into minutes of controller
-        # CPU and blocks the successor wave.  This optional process-local
-        # materializer may therefore validate the committed row from its
-        # transaction-owned port; PostgreSQL remains the handoff authority.
+        # pristine row. This optional process-local materializer trusts that
+        # transaction-owned port rather than independently re-parsing the same
+        # task for each member; PostgreSQL remains the handoff authority.
         replica_port = info.replica_port
         expected_state = paid_capacity.build_pristine_paid_replica_state(
             spec,
@@ -5573,16 +5571,23 @@ class SkyPilotReplicaManager(ReplicaManager):
         *,
         yaml_content: str | None = None,
         spec: 'service_spec.SkyServiceSpec | None' = None,
+        acquire_task_cache_lock: bool = False,
     ) -> '_ReplicaLaunchThread':
-        """Reconstruct the exact durable-request adopter for one replica."""
+        """Reconstruct the exact durable-request adopter for one replica.
+
+        Legacy callers already own ``self.lock``. Off-lock recovery requests
+        cache locking explicitly; repository reads and waiter construction
+        remain outside that short critical section.
+        """
         # Current bound non-pool launches persist their exact placer-selected
         # backend in resources_override.  An adopter only waits for/reduces the
         # already-enqueued request, so rebuilding the full launch Task merely to
-        # recover its cloud is both redundant and extremely expensive at fleet
-        # scale.  Retain task reconstruction solely for legacy rows that lack
+        # recover its cloud is redundant work per fleet member. Retain task
+        # reconstruction solely for legacy rows that lack
         # the exact persisted location.
         location = spot_placer.Location.from_resources_override(
             _decode_replica_resource_state(info.resources_override))
+        recovery_cloud: clouds.Cloud | None
         if location is not None:
             recovery_cloud = location.cloud
         else:
@@ -5601,8 +5606,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             if spec is None:
                 raise ValueError('service spec not found for bound launch '
                                  f'recovery of version {info.version}')
-            task_template = self._task_template_for_version(
-                info.version, yaml_content, spec)
+            with (self.lock
+                  if acquire_task_cache_lock else contextlib.nullcontext()):
+                task_template = self._task_template_for_version(
+                    info.version, yaml_content, spec)
             recovery_task = _build_replica_launch_task(
                 yaml_content,
                 info.replica_id,
@@ -5768,7 +5775,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     replica_id in runtime.launch_thread_pool or
                     replica_id in runtime.down_thread_pool):
                 return False
-        launch_thread = self._build_bound_launch_adopter(info, bound_context)
+        launch_thread = self._build_bound_launch_adopter(
+            info, bound_context, acquire_task_cache_lock=True)
         with self.lock:
             runtime = self._legacy_mutation_runtime_state()
             if (self._update_recovery_required or
