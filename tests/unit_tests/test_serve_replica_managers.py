@@ -392,7 +392,7 @@ def test_live_reconciliation_retires_pointerless_pre_effect_fill(monkeypatch):
     manager._non_pool_reconciliation_retry_at = {}
     manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
     manager._notify_scale_reconciliation = mock.Mock()
-    manager._install_bound_launch_adopter = mock.Mock()
+    manager._queue_bound_launch_adopter = mock.Mock()
     monkeypatch.setattr(
         ordinary_launch_binding, 'classify_non_pool_launch_profile', lambda
         _info: ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
@@ -408,12 +408,12 @@ def test_live_reconciliation_retires_pointerless_pre_effect_fill(monkeypatch):
              ordinary_launch_binding,
              'retire_pre_admission_non_pool_launch_intent',
              return_value=retirement) as retire:
-        manager._reconcile_unowned_bound_non_pool_launches([info])
+        manager._adopt_unowned_bound_non_pool_launches([info])
 
     inspect.assert_called_once_with('svc', 3, info.replica_record_id)
     retire.assert_called_once_with(authority, 3, info.replica_record_id)
     manager._notify_scale_reconciliation.assert_called_once_with()
-    manager._install_bound_launch_adopter.assert_not_called()
+    manager._queue_bound_launch_adopter.assert_not_called()
 
 
 def test_live_reconciliation_adopts_association_race(monkeypatch):
@@ -435,7 +435,7 @@ def test_live_reconciliation_adopts_association_race(monkeypatch):
     manager._non_pool_reconciliation_retry_at = {}
     manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
     manager._notify_scale_reconciliation = mock.Mock()
-    manager._install_bound_launch_adopter = mock.Mock()
+    manager._queue_bound_launch_adopter = mock.Mock()
     monkeypatch.setattr(
         ordinary_launch_binding, 'classify_non_pool_launch_profile', lambda
         _info: ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
@@ -454,11 +454,11 @@ def test_live_reconciliation_adopts_association_race(monkeypatch):
          mock.patch.object(replica_managers,
                            '_bound_projection_classification',
                            return_value='ADOPT_ACTIVE'):
-        manager._reconcile_unowned_bound_non_pool_launches([info])
+        manager._adopt_unowned_bound_non_pool_launches([info])
 
     assert inspect.call_count == 2
-    manager._install_bound_launch_adopter.assert_called_once_with(
-        info, reduction.context, start=True)
+    manager._queue_bound_launch_adopter.assert_called_once_with(
+        info, reduction.context)
     manager._notify_scale_reconciliation.assert_not_called()
 
 
@@ -2798,6 +2798,48 @@ def _fused_paid_binding(
         context=context)
 
 
+def test_prepare_paid_adopter_uses_committed_port_without_task_reparse():
+    """Post-commit materialization trusts the atomically validated row port."""
+    manager, cheap, _ = _provider_free_paid_manager()
+    templates = manager.prepare_paid_launch_templates(
+        accelerator_shapes={'l4': 1},
+        version_authority=_paid_version_authority(manager),
+        paid_location_launch_budget=_provider_free_paid_budget(
+            manager, {cheap: 1}, service_remaining=1))
+    spec = _materialize_test_paid_launch_specs(manager, templates)[0]
+    member = paid_capacity.PaidLaunchReceiptMember(
+        replica_id=spec.replica_id,
+        replica_record_id=spec.replica_record_id,
+        pool_key=spec.pool_key,
+        priority=50,
+        accelerator=spec.accelerator,
+        plan_units=1,
+        physical_gpu_units=1)
+    binding = _fused_paid_binding(spec, member)
+    state = paid_capacity.build_pristine_paid_replica_state(spec,
+                                                            replica_port='8080',
+                                                            planned_capacity=1,
+                                                            created_at=123.0)
+    info = replica_managers.ReplicaInfo.from_storage_dict(state)
+
+    with mock.patch.object(
+            replica_managers,
+            'load_task_with_service_spec',
+            side_effect=AssertionError('post-commit task reparse')) as load_task, \
+         mock.patch.object(
+             replica_managers,
+             '_get_resources_ports',
+             side_effect=AssertionError('post-commit port recompute')) as get_port:
+        prepared = manager._prepare_paid_launch_adopter_postcommit(
+            spec, member, binding, info)
+
+    assert prepared.info is info
+    assert prepared.binding is binding
+    assert prepared.location == cheap
+    load_task.assert_not_called()
+    get_port.assert_not_called()
+
+
 def test_materialize_paid_launch_receipt_builds_only_sparse_members():
     manager, _, _ = _provider_free_paid_manager()
     templates = manager.prepare_paid_launch_templates(
@@ -2915,8 +2957,8 @@ def _committed_paid_member_for_adoption():
                                               capacity_unit='physical-backend',
                                               members=(member,))
     binding = _fused_paid_binding(spec, member)
-    # PROVISIONING carries a RUNNING launch slot, so scanner adoption starts
-    # the adopter without a database reservation.
+    # PROVISIONING carries a RUNNING launch slot, so scanner adoption queues the
+    # adopter for the ordinary refresher without a second database reservation.
     info = _fake_replica_info(
         spec.replica_id,
         replica_managers.serve_state.ReplicaStatus.PROVISIONING)
@@ -2959,13 +3001,121 @@ def _scanner_adopts_committed_member(manager, binding, info):
          mock.patch.object(manager,
                            '_build_bound_launch_adopter',
                            return_value=scanner_worker):
-        manager._reconcile_unowned_bound_non_pool_launches([info])
+        manager._adopt_unowned_bound_non_pool_launches([info])
     inspect.assert_called_once_with('svc', info.replica_id,
                                     info.replica_record_id)
     retire.assert_not_called()
-    scanner_worker.start.assert_called_once_with()
+    scanner_worker.start.assert_not_called()
     assert manager._launch_thread_pool == {info.replica_id: scanner_worker}
     return scanner_worker
+
+
+def test_unowned_paid_wave_queues_400_without_per_row_admission_or_task_build(
+        monkeypatch):
+    """Recovery publishes cheap adopters; the normal batch owns admission."""
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'svc'
+    manager._service_hash = 'hash'
+    manager._resource_scope = None
+    manager.latest_version = 1
+    manager.yaml_content = 'resources: {}'
+    manager._version_specs[1] = mock.Mock(spec=service_spec.SkyServiceSpec)
+    manager._ordinary_launch_binding_authority = _binding_authority(
+        ordinary_launch_binding.BindingMode.BOUND,
+        binding_epoch=2,
+        generic=True)
+    base_context = _bound_non_pool_context()
+    location = make_location('us-central1', {'L4': 1}, cloud_name='GCP')
+    infos = []
+    reductions = {}
+    for replica_id in range(1, 401):
+        record_id = uuid.uuid5(uuid.NAMESPACE_URL, f'bulk-adopter-{replica_id}')
+        info = _fake_replica_info(
+            replica_id, replica_managers.serve_state.ReplicaStatus.PENDING)
+        info.replica_record_id = str(record_id)
+        info.resources_override = location.to_dict()
+        infos.append(info)
+        context = dataclasses.replace(base_context,
+                                      association_id=uuid.uuid5(
+                                          uuid.NAMESPACE_OID,
+                                          f'bulk-adopter-{replica_id}'),
+                                      request_id=f'paid-request-{replica_id}',
+                                      replica_id=replica_id,
+                                      replica_record_id=record_id)
+        reductions[replica_id] = types.SimpleNamespace(context=context)
+
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'list_provider_reconciliation_contexts',
+                        lambda _authority: [])
+    fallback_resource = mock.Mock(cloud=location.cloud)
+    fallback_task = mock.Mock(resources={fallback_resource})
+    with mock.patch.object(
+            request_postgres,
+            'inspect_bound_ordinary_launch',
+            side_effect=lambda _service_name, replica_id, _record_id:
+            reductions[replica_id]), \
+         mock.patch.object(replica_managers,
+                           '_bound_projection_classification',
+                           return_value='ADOPT_ACTIVE'), \
+         mock.patch.object(manager,
+                           '_task_template_for_version') as task_template, \
+         mock.patch.object(replica_managers,
+                           '_build_replica_launch_task',
+                           return_value=fallback_task) as rebuild_task, \
+         mock.patch.object(
+             replica_managers.serve_state,
+             'reserve_replica_launch_running_if_capacity',
+             return_value=None) as reserve_one:
+        manager._adopt_unowned_bound_non_pool_launches(infos)
+
+    workers = list(manager._launch_thread_pool.values())
+    assert len(manager._launch_thread_pool) == 400
+    assert len(workers) == 400
+    assert all(worker.ident is None for worker in workers)
+    reserve_one.assert_not_called()
+    task_template.assert_not_called()
+    rebuild_task.assert_not_called()
+
+
+def test_refresh_keeps_route_snapshot_lock_available_during_adopter_hydration(
+        monkeypatch):
+    """A slow committed-wave hydrate cannot age out route publication."""
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'svc'
+    manager._update_recovery_required = False
+    manager._refresh_legacy_mutation_runtime = mock.Mock()
+    manager._prune_superseded_failed_replicas = mock.Mock()
+    infos = [mock.sentinel.committed_replica]
+    adoption_started = threading.Event()
+    release_adoption = threading.Event()
+
+    def _slow_adoption(actual_infos):
+        assert actual_infos == infos
+        adoption_started.set()
+        assert release_adoption.wait(timeout=5)
+
+    manager._adopt_unowned_bound_non_pool_launches = mock.Mock(
+        side_effect=_slow_adoption)
+    monkeypatch.setattr(
+        replica_managers.serve_state, 'get_replica_infos',
+        lambda service_name: infos if service_name == 'svc' else None)
+    refresher = threading.Thread(target=manager._refresh_thread_pool)
+    refresher.start()
+    assert adoption_started.wait(timeout=2)
+
+    # The readiness prober needs this mutex for its opening and publication
+    # snapshots.  Keeping it available lets route authority renew even while a
+    # large committed paid wave is being hydrated.
+    route_snapshot_can_publish = manager.lock.acquire(timeout=1)
+    if route_snapshot_can_publish:
+        manager.lock.release()
+    release_adoption.set()
+    refresher.join(timeout=5)
+
+    assert route_snapshot_can_publish
+    assert not refresher.is_alive()
 
 
 def test_scanner_adoption_before_paid_publication_is_idempotent():
@@ -3002,7 +3152,7 @@ def test_scanner_adoption_before_paid_publication_is_idempotent():
     assert manager._launch_thread_pool == {info.replica_id: scanner_worker}
     assert runtime.replica_to_request_id[info.replica_id] == binding.request_id
     publication_worker.start.assert_not_called()
-    scanner_worker.start.assert_called_once_with()
+    scanner_worker.start.assert_not_called()
     with manager._paid_phase_a_recovery_lock:
         assert not manager._paid_phase_a_recoveries
 
@@ -3011,7 +3161,7 @@ def test_scanner_adoption_before_paid_publication_is_idempotent():
          mock.patch.object(ordinary_launch_binding,
                            'retire_pre_admission_non_pool_launch_intent'
                           ) as retire:
-        manager._reconcile_unowned_bound_non_pool_launches([info])
+        manager._adopt_unowned_bound_non_pool_launches([info])
     inspect.assert_not_called()
     retire.assert_not_called()
 
