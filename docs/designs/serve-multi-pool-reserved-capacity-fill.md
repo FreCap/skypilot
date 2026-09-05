@@ -22,7 +22,13 @@ The campaign requested service teardown after qualification failed. At
 02:27 UTC its cleanup observation deadline expired, with zero qualified
 exact-zero samples and `operator_escalation_required: true`. Accepted
 `serve-down` is neither a natural scale-down pass nor proof that billing
-stopped. The exact cleanup receipt and provider absence remain required.
+stopped. A subsequent read-only recheck completed at 02:58:56 UTC: 16
+consecutive joined samples held exact AWS/GCP instance, disk and operation
+absence, plus zero live PostgreSQL service, replica, claim, request and
+association ownership, for 378.3 seconds. Its separate `cleanup-recheck.json`
+receipt closes the eventual cleanup gate without rewriting the failed original
+deadline or claiming a natural scale-down pass. Evidence is retained at
+`/tmp/codex-paid-1680-artifacts.r8wrDx/cleanup-recheck-1955/` on the operator host.
 Subsequent source fixes, deployments, and campaigns must update
 this section with their own evidence rather than inherit the older result.
 
@@ -35,6 +41,16 @@ concurrency and component tests, 43 subtests, and four real-PostgreSQL admission
 regressions pass on Python 3.14. It preserves retention across serialized
 policy handoffs without reviving paid launch authority. Deployment and a
 fresh combined paid lifecycle remain separate open gates.
+
+PR #1953 moves recovery repository reads outside the replica-manager mutex and
+queues exact committed adopters for the existing bulk admission boundary. Its
+follow-up component regression runs the actual scanner, post-commit
+materializer and bulk selector with a 100-member committed wave, pausing an
+adjacent repository read. Publication and readiness-lock access must continue;
+one bulk reservation replaces per-member reservations. This is component
+evidence, not a PostgreSQL/controller/provider E2E pass. A short lock protects
+only the legacy task-template cache when reconstruction runs outside the main
+mutex; existing locked callers must not acquire the non-reentrant lock twice.
 
 ## Previous verification snapshot (September 4; historical)
 
@@ -3269,7 +3285,7 @@ source qualification and deployment must be recorded separately.
 |---|---|---|
 | Cold demand and queue deadlines | Public HTTP remains responsive, reports demand, rejects before dispatch, and safely retries exact rejected requests | `test_lb_cold_queue_component.py` runs the real LB with simulated adjacent processes; component evidence only. |
 | Burst, brief idle, rebound, sustained idle | Production durable planner preserves cooldown and eventually lowers targets; test more than one configured delay and multi-GPU width | `test_serve_demand_hysteresis_component.py` uses `plan_durable_capacity_reconcile` and a serialized policy handoff with a new autoscaler each tick; this does not exercise cloud effects. |
-| Large launch cohort | Multiple committed waves become executing requests while route reads remain responsive; count real database round trips as well as CPU | Unit assertions about an adopter helper alone do not prove the whole controller boundary. |
+| Large launch cohort | Multiple committed waves become executing requests while route reads remain responsive; count real database round trips as well as CPU | `test_serve_paid_adopter_publication_component.py` exercises the real scanner/materializer and a 100-member bulk reservation against an adjacent in-memory repository. It rejects the old lock convoy, but does not prove executor/provider throughput. |
 | Provider exhaustion and lost acknowledgement | Original typed failure or unresolved exact ownership survives; no duplicate create and no name-only cleanup | Exact identity and PostgreSQL component tests supplement, but do not replace, the process journey. |
 | Restart and delayed deletion | Retain ownership while state is unknown/present, recover on restart, then settle on exact absence | `test_serve_shutdown_reconciliation_component.py` uses PostgreSQL and a delayed AWS network adapter; component evidence only. |
 | Provider substitution across restart | Fake state survives process replacement and production uses the registered facet | `test_serve_provider_plugin_restart.py` proves inventory integration, not the full API/controller/executor journey. |
