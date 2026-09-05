@@ -199,7 +199,7 @@ def _finalize(
         continue_guard=continue_guard)
 
 
-def test_gcp_ports_cleanup_precedes_exact_database_retirement(
+def test_retained_failed_launch_allows_ordered_gcp_auxiliary_finalization(
         monkeypatch: pytest.MonkeyPatch) -> None:
     yaml_path = str(
         pathlib.Path(constants.SKY_USER_FILE_PATH).expanduser().resolve() /
@@ -209,6 +209,19 @@ def test_gcp_ports_cleanup_precedes_exact_database_retirement(
     installed = _install_common(monkeypatch,
                                 _identity(),
                                 snapshot=SimpleNamespace(handle=handle))
+    bound_identity = mock.Mock(return_value={
+        'cluster_record_uuid': _CLUSTER_RECORD_UUID,
+    })
+    monkeypatch.setattr(cloud_vm_ray_backend,
+                        '_bound_paid_cluster_record_identity_kwargs',
+                        bound_identity)
+
+    cloud_vm_ray_backend._remove_legacy_failed_provision_cluster_record(  # pylint: disable=protected-access
+        _CLUSTER_NAME, 'generation-hash', {})
+
+    bound_identity.assert_called_once_with({}, _CLUSTER_NAME)
+    installed.read.assert_not_called()
+    installed.remove.assert_not_called()
     installed.authorize.side_effect = lambda *_args: calls.append('authorize'
                                                                  ) or _scope()
     installed.delete_firewall.side_effect = lambda *_args: calls.append(

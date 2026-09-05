@@ -1,6 +1,7 @@
 """Generation-fence regressions for provisioning failure state cleanup."""
 
 from unittest.mock import MagicMock
+import uuid
 
 import pytest
 
@@ -14,7 +15,8 @@ class TestProvisionFailureStateFence:
     def _run_failed_provision(monkeypatch,
                               cluster_hash,
                               *,
-                              retry_until_up=False):
+                              retry_until_up=False,
+                              cluster_record_uuid=None):
         backend = cloud_vm_ray_backend.CloudVmRayBackend()
         backend.log_dir = '/tmp/sky-test'
         to_provision_config = MagicMock(
@@ -52,6 +54,14 @@ class TestProvisionFailureStateFence:
                             'add_cluster_event', add_event)
         monkeypatch.setattr(cloud_vm_ray_backend.global_user_state,
                             'remove_cluster', remove_cluster)
+        get_record = MagicMock()
+        monkeypatch.setattr(cloud_vm_ray_backend.global_user_state,
+                            'get_cluster_record_identity_snapshot', get_record)
+        monkeypatch.setattr(
+            cloud_vm_ray_backend, '_bound_paid_cluster_record_identity_kwargs',
+            MagicMock(return_value=({} if cluster_record_uuid is None else {
+                'cluster_record_uuid': cluster_record_uuid,
+            })))
 
         task_obj = MagicMock(num_nodes=1,
                              resources={MagicMock()},
@@ -60,7 +70,7 @@ class TestProvisionFailureStateFence:
             cloud_vm_ray_backend.exceptions.ExecutionRetryableError
             if retry_until_up else
             cloud_vm_ray_backend.exceptions.ResourcesUnavailableError)
-        with pytest.raises(expected_error):
+        with pytest.raises(expected_error) as exc_info:
             backend._locked_provision(  # pylint: disable=protected-access
                 'lock-id',
                 task_obj,
@@ -69,11 +79,11 @@ class TestProvisionFailureStateFence:
                 False,
                 'test-cluster',
                 retry_until_up=retry_until_up)
-        return add_event, remove_cluster
+        return add_event, remove_cluster, get_record, exc_info.value
 
     def test_terminal_failure_cleanup_is_fenced_by_generation(
             self, monkeypatch):
-        add_event, remove_cluster = self._run_failed_provision(
+        add_event, remove_cluster, get_record, _ = self._run_failed_provision(
             monkeypatch, 'generation-hash')
 
         assert add_event.call_args.kwargs['existing_cluster_hash'] == (
@@ -82,19 +92,39 @@ class TestProvisionFailureStateFence:
             'test-cluster',
             terminate=True,
             existing_cluster_hash='generation-hash')
+        get_record.assert_not_called()
 
     def test_retry_event_is_fenced_by_generation(self, monkeypatch):
-        add_event, remove_cluster = self._run_failed_provision(
+        add_event, remove_cluster, get_record, _ = self._run_failed_provision(
             monkeypatch, 'generation-hash', retry_until_up=True)
 
         assert add_event.call_args.kwargs['existing_cluster_hash'] == (
             'generation-hash')
         remove_cluster.assert_not_called()
+        get_record.assert_not_called()
 
     def test_failure_before_generation_skips_name_based_cleanup(
             self, monkeypatch):
-        add_event, remove_cluster = self._run_failed_provision(
+        add_event, remove_cluster, get_record, _ = self._run_failed_provision(
             monkeypatch, None)
 
         add_event.assert_not_called()
+        remove_cluster.assert_not_called()
+        get_record.assert_not_called()
+
+    def test_action_aware_failure_retains_row_for_durable_finalization(
+            self, monkeypatch):
+        record_uuid = uuid.UUID('11111111-1111-4111-8111-111111111111')
+
+        add_event, remove_cluster, get_record, error = (
+            self._run_failed_provision(monkeypatch,
+                                       'generation-hash',
+                                       cluster_record_uuid=record_uuid))
+
+        assert isinstance(
+            error, cloud_vm_ray_backend.exceptions.ResourcesUnavailableError)
+        assert 'capacity unavailable' in str(error)
+        assert add_event.call_args.kwargs['existing_cluster_hash'] == (
+            'generation-hash')
+        get_record.assert_not_called()
         remove_cluster.assert_not_called()

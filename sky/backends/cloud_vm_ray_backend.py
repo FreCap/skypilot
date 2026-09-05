@@ -200,6 +200,19 @@ def _bound_paid_cluster_record_identity_kwargs(
     return {'cluster_record_uuid': identity.sky_cluster_record_uuid}
 
 
+def _remove_legacy_failed_provision_cluster_record(
+    cluster_name: str,
+    cluster_hash: str,
+    launch_context: Mapping[str, Any],
+) -> None:
+    """Remove legacy failure state; action-aware state has a finalizer."""
+    if _bound_paid_cluster_record_identity_kwargs(launch_context, cluster_name):
+        return
+    global_user_state.remove_cluster(cluster_name,
+                                     terminate=True,
+                                     existing_cluster_hash=cluster_hash)
+
+
 def _configure_paid_aws_create_authority(
     *,
     cloud: clouds.Cloud,
@@ -5056,10 +5069,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                                 STATUS_CHANGE,
                                 nop_if_duplicate=True,
                                 existing_cluster_hash=failed_cluster_hash)
-                            global_user_state.remove_cluster(
-                                cluster_name,
-                                terminate=True,
-                                existing_cluster_hash=failed_cluster_hash)
+                            _remove_legacy_failed_provision_cluster_record(
+                                cluster_name, failed_cluster_hash,
+                                self._extra_launch_context)
                         usage_lib.messages.usage.update_final_cluster_status(
                             None)
                     logger.error(
