@@ -311,6 +311,8 @@ class ExactRequestCampaignProgress:
     _drain_task: asyncio.Task[int] | None = dataclasses.field(default=None,
                                                               init=False,
                                                               repr=False)
+    _stop_safe_retries: asyncio.Event = dataclasses.field(
+        default_factory=asyncio.Event, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if (type(self.total_count) is not int or self.total_count < 1 or
@@ -322,6 +324,7 @@ class ExactRequestCampaignProgress:
         if self._first_error is None:
             self._first_error = error
         self._accepting_offers = False
+        self._stop_safe_retries.set()
 
     async def mark_offered(
         self,
@@ -381,6 +384,7 @@ class ExactRequestCampaignProgress:
         """Close admission and await the cohort if its driver was started."""
         async with self._lock:
             self._accepting_offers = False
+            self._stop_safe_retries.set()
             if self._worker_cohort is None:
                 return self._succeeded
             if self._drain_task is None:
@@ -1242,6 +1246,8 @@ def _validate_qualification_service_config(
                                                                dict) else None
     stream_timeout = (load_balancer.get('stream_timeout_seconds') if isinstance(
         load_balancer, dict) else None)
+    retriable_status_codes = (load_balancer.get('retriable_status_codes')
+                              if isinstance(load_balancer, dict) else None)
     graceful_drain_async_occupancy = service.get(
         'graceful_drain_async_occupancy')
     use_async_occupancy = (queue.get('use_async_occupancy') if isinstance(
@@ -1292,7 +1298,8 @@ def _validate_qualification_service_config(
             per_replica_concurrency < 1 or
             not isinstance(stream_timeout,
                            (int, float)) or isinstance(stream_timeout, bool) or
-            stream_timeout <= 0 or graceful_drain_async_occupancy is not True or
+            stream_timeout <= 0 or retriable_status_codes != [429] or
+            graceful_drain_async_occupancy is not True or
             use_async_occupancy is not False or not canonical_resources):
         raise ValueError('service YAML is not generic whole-L4 Spot')
     return QualificationServiceContract(
@@ -5982,6 +5989,59 @@ async def _bounded_response_body(response: aiohttp.ClientResponse) -> bytes:
     raise QualificationError('Synchronous backend response is too large.')
 
 
+def _has_retry_safe_rejection_marker(
+        response: aiohttp.ClientResponse) -> bool:
+    """Accept only one exact LB-authored safe-rejection marker."""
+    get_all = getattr(response.headers, 'getall', None)
+    if not callable(get_all):
+        return False
+    values = get_all(serve_constants.LB_REQUEST_RETRY_SAFETY_HEADER, [])
+    return (len(values) == 1 and
+            values[0] == serve_constants.LB_REQUEST_RETRY_SAFE_REJECTION)
+
+
+def _bounded_synchronous_retry_delay(retry_after: object, *, attempt: int,
+                                     request_id: str) -> float:
+    """Return a finite capped backoff with stable per-request staggering."""
+    try:
+        base = float(retry_after)
+    except (TypeError, ValueError):
+        base = 1.0
+    if not math.isfinite(base) or base < 0:
+        base = 1.0
+    base = min(30.0, max(0.1, base))
+    exponential = base * 2**min(max(attempt, 0), 4)
+    digest = hashlib.sha256(f'{request_id}:{attempt}'.encode()).digest()
+    fraction = int.from_bytes(digest[:8], 'big') / float(2**64 - 1)
+    return min(30.0, exponential * (1.0 + 0.25 * fraction))
+
+
+async def _wait_for_synchronous_safe_retry(
+    *,
+    campaign_deadline: AbsoluteDeadline,
+    stop_safe_retries: asyncio.Event,
+    delay_seconds: float,
+) -> bool:
+    """Wait within the shared deadline, waking when campaign drain begins."""
+    if stop_safe_retries.is_set():
+        return False
+    remaining = campaign_deadline.remaining()
+    if remaining <= 0:
+        raise QualificationError(
+            'Synchronous request campaign deadline expired during a safe '
+            'rejection retry.')
+    try:
+        await asyncio.wait_for(stop_safe_retries.wait(),
+                               timeout=min(delay_seconds, remaining))
+        return False
+    except TimeoutError:
+        if campaign_deadline.expired():
+            raise QualificationError(
+                'Synchronous request campaign deadline expired during a safe '
+                'rejection retry.') from None
+        return True
+
+
 async def _one_synchronous_request(
     session: aiohttp.ClientSession,
     *,
@@ -5992,8 +6052,9 @@ async def _one_synchronous_request(
     duration_seconds: float,
     campaign_deadline: AbsoluteDeadline,
     attempt_timeout_seconds: float,
-) -> None:
-    """Require one ordinary request to return its exact backend-authored ID."""
+    stop_safe_retries: asyncio.Event,
+) -> bool:
+    """Return exact success, or stop only after a proven-safe rejection."""
     url = endpoint.rstrip('/') + '/v1/models/model:predict'
     headers = {
         _AUTH_HEADER: f'Bearer {token}',
@@ -6006,37 +6067,61 @@ async def _one_synchronous_request(
         'duration_seconds': duration_seconds,
         'request_id': request_id,
     }
-    attempt_deadline = campaign_deadline.capped_after(attempt_timeout_seconds)
-    try:
-        async with session.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=attempt_deadline.http_timeout()) as response:
-            body = await _bounded_response_body(response)
-            if response.status != 200:
-                raise QualificationError(
-                    f'{request_id} returned HTTP {response.status}.')
-            try:
-                decoded = json.loads(body,
-                                     object_pairs_hook=_unique_json_object,
-                                     parse_constant=_invalid_json_constant)
-            except (UnicodeDecodeError, ValueError, TypeError,
-                    RecursionError) as error:
-                raise QualificationError(
-                    f'{request_id} returned malformed backend JSON.') from error
-            if decoded != {
-                    'request_id': request_id,
-                    'status': 'ok',
-            }:
-                raise QualificationError(
-                    f'{request_id} returned a conflicting backend ID.')
-    except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError,
-            asyncio.TimeoutError) as error:
-        # Once a POST has begun, any transport failure has an ambiguous worker
-        # outcome. Fail the run instead of replaying synthetic work.
-        raise QualificationError(
-            f'{request_id} has an ambiguous synchronous outcome.') from error
+    retry_attempt = 0
+    while True:
+        if stop_safe_retries.is_set():
+            return False
+        if campaign_deadline.expired():
+            raise QualificationError(
+                f'{request_id} exceeded the shared campaign deadline.')
+        attempt_deadline = campaign_deadline.capped_after(
+            attempt_timeout_seconds)
+        try:
+            async with session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=attempt_deadline.http_timeout()) as response:
+                body = await _bounded_response_body(response)
+                if response.status == 200:
+                    try:
+                        decoded = json.loads(
+                            body,
+                            object_pairs_hook=_unique_json_object,
+                            parse_constant=_invalid_json_constant)
+                    except (UnicodeDecodeError, ValueError, TypeError,
+                            RecursionError) as error:
+                        raise QualificationError(
+                            f'{request_id} returned malformed backend JSON.') \
+                            from error
+                    if decoded != {
+                            'request_id': request_id,
+                            'status': 'ok',
+                    }:
+                        raise QualificationError(
+                            f'{request_id} returned a conflicting backend ID.')
+                    return True
+                if (response.status != 503 or
+                        not _has_retry_safe_rejection_marker(response)):
+                    raise QualificationError(
+                        f'{request_id} returned HTTP {response.status}.')
+                delay = _bounded_synchronous_retry_delay(
+                    response.headers.get('Retry-After'),
+                    attempt=retry_attempt,
+                    request_id=request_id)
+                retry_attempt += 1
+        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError,
+                asyncio.TimeoutError) as error:
+            # Once a POST has begun, any transport failure has an ambiguous
+            # worker outcome. Only a complete typed response authorizes replay.
+            raise QualificationError(
+                f'{request_id} has an ambiguous synchronous outcome.') \
+                from error
+        if not await _wait_for_synchronous_safe_retry(
+                campaign_deadline=campaign_deadline,
+                stop_safe_retries=stop_safe_retries,
+                delay_seconds=delay):
+            return False
 
 
 async def send_synchronous_requests(
@@ -6090,7 +6175,7 @@ async def send_synchronous_requests(
                 if not await campaign_progress.mark_offered(
                         admission_deadline=campaign_deadline.monotonic):
                     return
-                await _one_synchronous_request(
+                succeeded = await _one_synchronous_request(
                     session,
                     endpoint=endpoint,
                     token=token,
@@ -6098,7 +6183,10 @@ async def send_synchronous_requests(
                     stable_job_id=f'{prefix}-job-{index:05d}',
                     duration_seconds=hold_seconds,
                     campaign_deadline=campaign_deadline,
-                    attempt_timeout_seconds=attempt_timeout_seconds)
+                    attempt_timeout_seconds=attempt_timeout_seconds,
+                    stop_safe_retries=campaign_progress._stop_safe_retries)
+                if not succeeded:
+                    return
                 await campaign_progress.mark_succeeded()
             except BaseException as error:
                 await campaign_progress.record_error(error)

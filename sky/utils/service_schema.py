@@ -87,9 +87,12 @@ def get_service_schema():
                         'type': 'number',
                     },
                     # Replica responses with these statuses are re-routed
-                    # to another replica like transport failures. Only
-                    # sensible for idempotent services and "not now"
-                    # statuses (503 while warming, 429 shedding).
+                    # to another replica like transport failures. Configuring
+                    # a status is an explicit service contract that the
+                    # response is retry-safe/idempotent, including for POST or
+                    # PATCH. Use only for "not now" responses emitted before
+                    # work begins (for example, 503 while warming or 429
+                    # shedding) or for an idempotent application operation.
                     'retriable_status_codes': {
                         'type': 'array',
                         'items': {

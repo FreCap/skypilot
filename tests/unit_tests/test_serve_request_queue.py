@@ -2031,6 +2031,9 @@ def test_timeout_and_cancellation_remove_waiters():
         with pytest.raises(fastapi.HTTPException) as exc:
             await lb._acquire_request_slot(request)
         assert exc.value.status_code == 503
+        assert exc.value.headers[
+            constants.LB_REQUEST_RETRY_SAFETY_HEADER] == (
+                constants.LB_REQUEST_RETRY_SAFE_REJECTION)
         assert lb._waiting_request_count == 0
         history = lb._request_aggregator.request_history_snapshot()
         assert history is not None

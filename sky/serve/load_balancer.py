@@ -1967,6 +1967,8 @@ class SkyServeLoadBalancer:
             detail='Load balancer is draining; retry another endpoint.',
             headers={
                 'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS),
+                constants.LB_REQUEST_RETRY_SAFETY_HEADER:
+                    constants.LB_REQUEST_RETRY_SAFE_REJECTION,
                 # A persistent connection may still be pinned to this pod
                 # after the Service selector has moved to the standby. Close
                 # it after the rejection so the retry reaches the new active
@@ -1979,7 +1981,11 @@ class SkyServeLoadBalancer:
         return fastapi.HTTPException(
             status_code=503,
             detail='Timed out waiting in the load balancer request queue.',
-            headers={'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)})
+            headers={
+                'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS),
+                constants.LB_REQUEST_RETRY_SAFETY_HEADER:
+                    constants.LB_REQUEST_RETRY_SAFE_REJECTION,
+            })
 
     @staticmethod
     def _queue_disconnect_error() -> fastapi.HTTPException:
@@ -2087,7 +2093,9 @@ class SkyServeLoadBalancer:
                                 f'({queue_size} waiting request(s)).'),
                         headers={
                             'Retry-After': str(
-                                constants.LB_503_RETRY_AFTER_SECONDS)
+                                constants.LB_503_RETRY_AFTER_SECONDS),
+                            constants.LB_REQUEST_RETRY_SAFETY_HEADER:
+                                constants.LB_REQUEST_RETRY_SAFE_REJECTION,
                         })
                 sequence = self._request_queue_sequence
                 self._request_queue_sequence += 1
@@ -2309,7 +2317,11 @@ class SkyServeLoadBalancer:
 
     def _inactive_role_request_error(self) -> fastapi.HTTPException:
         role = self._lb_role
-        headers = {'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)}
+        headers = {
+            'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS),
+            constants.LB_REQUEST_RETRY_SAFETY_HEADER:
+                constants.LB_REQUEST_RETRY_SAFE_REJECTION,
+        }
         if role is lb_ha.LbRole.DRAINING:
             # Role-driven cutovers can fence the old active slot before its
             # process receives SIGTERM. Release persistent clients in that
@@ -5973,6 +5985,15 @@ class SkyServeLoadBalancer:
             upstream_raw_headers = getattr(proxy_response.headers, 'raw', None)
             if upstream_raw_headers is not None:
                 response.raw_headers = list(upstream_raw_headers)
+            # Retry authorization is LB-owned. An upstream application cannot
+            # make an ordinary response look like a proven-safe rejection.
+            retry_safety_header = (
+                constants.LB_REQUEST_RETRY_SAFETY_HEADER.lower().encode(
+                    'ascii'))
+            response.raw_headers = [
+                (name, value) for name, value in response.raw_headers
+                if name.lower() != retry_safety_header
+            ]
             if ledger_receipt is not None:
                 service_incarnation = self._service_hash
                 assert service_incarnation is not None
@@ -6265,7 +6286,9 @@ class SkyServeLoadBalancer:
                 status_code=503,
                 detail=detail,
                 headers={
-                    'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
+                    'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS),
+                    constants.LB_REQUEST_RETRY_SAFETY_HEADER:
+                        constants.LB_REQUEST_RETRY_SAFE_REJECTION,
                 })
 
         while True:

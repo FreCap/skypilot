@@ -20,8 +20,10 @@ class _RetriableStatusError(Exception):
     Returned from _proxy_request_to like transport errors so
     _proxy_with_retries re-routes the request to another replica. Only
     statuses listed in the service's
-    load_balancer.retriable_status_codes take this path — everything
-    else streams to the client verbatim.
+    load_balancer.retriable_status_codes take this path. Configuring a status
+    is the operator's explicit guarantee that such a response is replay-safe,
+    even for a non-idempotent HTTP method; everything else streams to the
+    client verbatim.
     """
 
     def __init__(self, status_code: int, url: str) -> None:

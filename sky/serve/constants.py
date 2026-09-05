@@ -787,6 +787,14 @@ LB_REJECT_WINDOW_SECONDS = 360
 # (documented raw-count over-estimation; the platform sends the header).
 LB_JOB_ID_HEADER = 'X-SkyServe-Job-Id'
 
+# A response carrying this exact marker proves the request can be submitted
+# again under the service's retry contract. The load balancer emits it only for
+# failures before dispatch or for a configured retriable replica status, whose
+# explicit service contract guarantees retry safety/idempotency. Generic
+# backend responses and ambiguous proxy outcomes never receive the marker.
+LB_REQUEST_RETRY_SAFETY_HEADER = 'X-SkyServe-Request-Retry-Safety'
+LB_REQUEST_RETRY_SAFE_REJECTION = 'retry-safe-rejection-v1'
+
 # Per-request scheduling priority consumed by the load balancer. Higher values
 # are dispatched first; equal values retain arrival order. The header is never
 # forwarded to replicas.
