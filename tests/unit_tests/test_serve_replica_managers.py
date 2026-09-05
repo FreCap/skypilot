@@ -3078,6 +3078,54 @@ def test_unowned_paid_wave_queues_400_without_per_row_admission_or_task_build(
     rebuild_task.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ('cloud_name', 'cloud_type', 'region', 'use_spot', 'instance_type'), [
+        ('AWS', clouds.AWS, 'us-east-1', True, 'g6.xlarge'),
+        ('GCP', clouds.GCP, 'us-central1', True, 'g2-standard-4'),
+        ('Kubernetes', clouds.Kubernetes, 'test-context', False, None),
+    ])
+def test_bound_adopter_recovers_cloud_from_json_resources_override(
+        cloud_name, cloud_type, region, use_spot, instance_type):
+    """Exact AWS/GCP/Kubernetes pins survive the PostgreSQL JSON boundary."""
+    manager = _make_manager()
+    manager._ordinary_launch_binding_authority = _binding_authority(
+        ordinary_launch_binding.BindingMode.BOUND,
+        binding_epoch=2,
+        generic=True)
+    location = make_location(region, {'L4': 1},
+                             cloud_name=cloud_name,
+                             use_spot=use_spot,
+                             instance_type=instance_type)
+    location.cloud = cloud_type()
+    info = _fake_replica_info(
+        3, replica_managers.serve_state.ReplicaStatus.PENDING)
+    info.resources_override = json.loads(json.dumps(location.to_pickleable()))
+    context = dataclasses.replace(_bound_non_pool_context(),
+                                  replica_record_id=uuid.UUID(
+                                      info.replica_record_id))
+
+    with mock.patch.object(
+            manager,
+            '_bound_ordinary_launch_callbacks',
+            return_value=(mock.Mock(), mock.Mock(), mock.Mock())) as callbacks, \
+         mock.patch.object(
+             manager,
+             '_task_template_for_version',
+             side_effect=AssertionError('exact row rebuilt service task')) as task, \
+         mock.patch.object(
+             replica_managers,
+             '_build_replica_launch_task',
+             side_effect=AssertionError('exact row rebuilt launch task')) as build:
+        worker = manager._build_bound_launch_adopter(info, context)
+
+    assert isinstance(worker, replica_managers._ReplicaLaunchThread)
+    callbacks.assert_called_once()
+    assert callbacks.call_args.args[0] is info
+    assert isinstance(callbacks.call_args.args[1], cloud_type)
+    task.assert_not_called()
+    build.assert_not_called()
+
+
 def test_refresh_keeps_route_snapshot_lock_available_during_adopter_hydration(
         monkeypatch):
     """A slow committed-wave hydrate cannot age out route publication."""
@@ -11655,6 +11703,120 @@ class TestLaunchOwnershipFence:
         worker.start.assert_called_once_with()
         logical_fence_holds.assert_not_called()
         assert 1 not in mgr._replica_to_logical_launch_fence
+
+    @pytest.mark.parametrize('profile_kind', [
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+    ])
+    def test_committed_adopter_survives_bench_until_bulk_admission(
+            self, profile_kind):
+        """Fresh placement policy cannot delete a committed request."""
+        mgr = self._owned_manager()
+        mgr._is_pool = False
+        mgr._uses_logical_replicas = True
+        mgr._ordinary_launch_binding_authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=2,
+            generic=True)
+        reserved_fill = (
+            profile_kind
+            is ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+        cloud_name = 'Kubernetes' if reserved_fill else 'GCP'
+        region = 'test-context' if reserved_fill else 'us-central1-a'
+        location = make_location(
+            region, {'L4': 1},
+            cloud_name=cloud_name,
+            use_spot=not reserved_fill,
+            instance_type=(None if reserved_fill else 'g2-standard-4'))
+        location.cloud = (clouds.Kubernetes()
+                          if reserved_fill else clouds.GCP())
+        info = _fake_replica_info(
+            1, replica_managers.serve_state.ReplicaStatus.PENDING)
+        info.is_spot = not reserved_fill
+        info.reserved_fill = reserved_fill
+        info.is_zero_cost = reserved_fill
+        info.location = location.to_pickleable()
+        info.resources_override = json.loads(
+            json.dumps(location.to_pickleable()))
+        info.paid_capacity_pool_key = (None if reserved_fill else
+                                       _canonical_gcp_paid_pool_key())
+        context = dataclasses.replace(
+            _bound_non_pool_context(profile_kind),
+            association_id=uuid.uuid5(uuid.NAMESPACE_URL,
+                                      'benched-committed-adopter'),
+            request_id='benched-committed-request',
+            replica_id=info.replica_id,
+            replica_record_id=uuid.UUID(info.replica_record_id))
+        reduction = types.SimpleNamespace(context=context)
+        worker = self._launch_worker(mgr,
+                                     info,
+                                     bound_ordinary_launch=True,
+                                     adopts_existing_bound_request=True)
+        placer = mock.Mock()
+        placer.resolve_location.return_value = location
+        placer.is_launch_admissible.return_value = False
+        mgr._spot_placer = placer
+
+        def _reserve(_service_name, candidates, **_kwargs):
+            assert candidates == [(1, info.replica_record_id, True)]
+            worker.start.assert_not_called()
+            info.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.RUNNING)
+            return {1: info}
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                side_effect=lambda _service, ids: ({
+                    1: info
+                } if ids else {})), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=reduction), \
+             mock.patch.object(replica_managers,
+                               '_bound_projection_classification',
+                               return_value='ADOPT_ACTIVE'), \
+             mock.patch.object(
+                 replica_managers,
+                 '_bound_ordinary_paid_claim_owns_provider_effect',
+                 return_value=not reserved_fill), \
+             mock.patch.object(mgr,
+                               '_build_bound_launch_adopter',
+                               return_value=worker), \
+             mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=True), \
+             mock.patch.object(
+                 mgr,
+                 '_logical_pending_launch_admission',
+                 return_value=(True, None, set())), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'reserve_replica_launches_running_if_capacity',
+                 side_effect=_reserve) as reserve, \
+             mock.patch.object(mgr,
+                               '_reconcile_unowned_bound_non_pool_launches'), \
+             mock.patch.object(mgr,
+                               '_persist_spot_placement_state_if_dirty'), \
+             mock.patch.object(mgr, '_remove_replica') as remove, \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_thread_pool()
+            assert mgr._launch_thread_pool == {1: worker}
+            worker.start.assert_not_called()
+            reserve.assert_not_called()
+            remove.assert_not_called()
+
+            mgr._refresh_thread_pool()
+
+        reserve.assert_called_once()
+        worker.start.assert_called_once_with()
+        remove.assert_not_called()
+        placer.is_launch_admissible.assert_not_called()
+        placer.resolve_location.assert_not_called()
 
     @pytest.mark.parametrize('profile',
                              ['canonical-no-receipt', 'malformed', 'zero-cost'])
@@ -22599,7 +22761,7 @@ class TestRecoveryRetryAndIsolation:
              mock.patch.object(mgr, '_launch_replica') as launch:
             mgr._recover_replica_operations()
 
-        worker.start.assert_called_once_with()
+        worker.start.assert_not_called()
         launch.assert_not_called()
         frozen_guard = launch_thread.call_args.kwargs['kwargs'][
             'supersession_guard']
@@ -22650,7 +22812,7 @@ class TestRecoveryRetryAndIsolation:
             mgr._recover_replica_operations()
 
         assert inspect.call_count == 2
-        worker.start.assert_called_once_with()
+        worker.start.assert_not_called()
         assert mgr._launch_thread_pool[1] is worker
         assert mgr._replica_to_request_id[1] == 'request-after-retry'
 
@@ -22689,7 +22851,7 @@ class TestRecoveryRetryAndIsolation:
         assert [call.args[1] for call in inspect.call_args_list] == [1, 2]
         adopt.assert_called_once()
         assert adopt.call_args.args[:2] == (healthy, healthy_context)
-        assert adopt.call_args.kwargs['start'] is True
+        assert adopt.call_args.kwargs['start'] is False
 
     def test_pointerless_old_version_recovery_enters_teardown(self):
         mgr = _make_manager()

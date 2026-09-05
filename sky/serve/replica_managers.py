@@ -7743,7 +7743,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         self._install_bound_launch_adopter(
                             replica_info,
                             bound_reduction.context,
-                            start=True,
+                            start=False,
                             yaml_content=prior_yaml_content,
                             spec=recovery_spec)
                         continue
@@ -15660,6 +15660,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                     _bound_ordinary_paid_claim_owns_provider_effect(
                         info, launch_thread=t) if isinstance(
                             t, _ReplicaLaunchThread) else False)
+                committed_bound_adopter = bool(
+                    isinstance(t, _ReplicaLaunchThread) and
+                    t.bound_ordinary_launch and t.adopts_existing_bound_request)
                 if (logical_admission_applies and not special_logical_launch and
                         not paid_claim_owns_effect):
                     if logical_target_fence is None:
@@ -15687,7 +15690,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 is_scale_down=True,
                                 in_flight_drain_cap_seconds=0)
                         continue
-                if self._spot_placer is not None:
+                if (self._spot_placer is not None and
+                        not committed_bound_adopter):
+                    # A committed adopter already owns one exact request
+                    # generation. Fresh placement policy may bench only
+                    # never-committed candidates; the adopter's executor and
+                    # bulk PostgreSQL reservation retain final authority.
                     location = info.get_spot_location()
                     resolved_location = (
                         self._spot_placer.resolve_location(location)
