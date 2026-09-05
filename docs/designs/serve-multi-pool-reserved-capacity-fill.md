@@ -3722,10 +3722,19 @@ The repository returns one explicit transaction disposition:
 - ``GATE_ACQUISITION`` commits only the acquisition witness and non-null copied
   policy state, with no capacity-effect row or consumed demand generation/paid
   window;
-- ``FRESH_ZERO`` commits an authenticated complete zero head, resets
-  hysteresis and the paid window, inserts no paid rows, applies the defined
-  zero/downscale transition, and revokes every uncommitted positive launch
-  fence;
+- ``FRESH_ZERO`` commits an authenticated complete zero demand head, resets
+  the paid window, inserts no paid rows, and revokes every uncommitted positive
+  launch fence. Existing-capacity retention remains a separate projection:
+  its configured downscale cooldown and wave state survive in the committed
+  policy and candidate. Successive zero observations must reduce that retained
+  target, not reinterpret the zero demand head as an already-drained fleet.
+  A rebound ending the downscale episode resets its cooldown; sustained idle
+  eventually retires each bounded wave. The durable clock is PostgreSQL's
+  planning/decision epoch, not a process-local monotonic timestamp. Retained
+  actuation includes configured overprovision padding exactly once; nonzero
+  padding can retain that many existing slots at idle, without authorizing
+  replacement launches. True scale-to-zero requires zero minimum and
+  overprovision floors and no ungated static fill;
 - ``ABORT_RETRY`` covers stale/incomplete/malformed evidence, route mismatch,
   prepared immutable-template identity or shape, owner/policy drift, and
   transient SQL conflict. It rolls back every successor write and preserves the
