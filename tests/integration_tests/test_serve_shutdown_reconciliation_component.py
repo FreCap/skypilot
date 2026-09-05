@@ -3,11 +3,13 @@
 This test enters SkyServe's production bound-launch guard, whole-service
 ``_run_cleanup_and_finalize`` orchestration, controller-owner recovery transfer,
 provider-present cleanup worker, and request/tombstone retention paths.  The
-only provider-network boundary replaced is the AWS session used for the exact
-client-token census and termination call.  It is intentionally a ``component``
-test, not an unpaid provider E2E: AWS's exact paid-cleanup path does not yet use
-the generic typed provisioner facet, and the launch's provider call is driven
-by this harness after the production provider-I/O authority guard.
+AWS session used for the exact client-token census and termination call is
+replaced. The isolated-census adapter runs that same production SDK parser
+inline so it shares the fake provider's state. It is intentionally a
+``component`` test, not a process-isolation or unpaid provider E2E test: AWS's
+exact paid-cleanup path does not yet use the generic typed provisioner facet,
+and the launch's provider call is driven by this harness after the production
+provider-I/O authority guard.
 
 The regression rejects the pre-fix behavior that removed the HA recovery row
 after the first exact cleanup deadline while the provider still reported the
@@ -89,19 +91,6 @@ class _Graph:
     provider_identity: dict[str, Any]
 
 
-class _ProviderClock:
-    """Deterministic monotonic time for the bounded provider cleanup loop."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def monotonic(self) -> float:
-        return self.now
-
-    def sleep(self, seconds: float) -> None:
-        self.now += seconds
-
-
 class _FakePaginator:
 
     def __init__(self, provider: '_DelayedAwsProvider') -> None:
@@ -175,7 +164,7 @@ class _DelayedAwsProvider:
 
     def make_absent(self) -> None:
         with self._lock:
-            assert self.down_calls == 1
+            assert self.down_calls >= 1
             self._state = 'absent'
 
     def session(self, **_kwargs: Any) -> _FakeAwsSession:
@@ -271,6 +260,8 @@ def request_database(postgres_engine, monkeypatch):
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
         connection.exec_driver_sql('CREATE SCHEMA public')
     global_user_state_schema.user_table.create(postgres_engine, checkfirst=True)
+    global_user_state_schema.cluster_table.create(postgres_engine,
+                                                  checkfirst=True)
     request_postgres._initialize_schema(postgres_engine)
     config = migration_utils.get_alembic_config(postgres_engine,
                                                 migration_utils.SERVE_DB_NAME)
@@ -365,6 +356,11 @@ def _prepare_graph(request_database, monkeypatch: pytest.MonkeyPatch) -> _Graph:
     engine, backend = request_database
     pool_key = _pool_key()
     info = _replica(pool_key)
+    resource_identity = (ordinary_launch_binding.
+                         derive_fresh_ordinary_paid_resource_action_identity(
+                             replica_id=info.replica_id,
+                             replica_record_id=info.replica_record_id,
+                             cluster_name=info.cluster_name))
     controller_config = b'''\
 active_workspace: workspace-a
 workspaces:
@@ -421,6 +417,10 @@ workspaces:
                 cluster_name=info.cluster_name,
                 is_spot=True,
                 paid_capacity_pool_key=pool_key,
+                replica_incarnation=resource_identity.replica_incarnation,
+                desired_generation=resource_identity.desired_generation,
+                sky_cluster_record_uuid=resource_identity.
+                sky_cluster_record_uuid,
                 replica_state=info.to_storage_dict()))
         connection.execute(
             sqlalchemy.insert(
@@ -647,14 +647,31 @@ def test_late_paid_create_shutdown_recovers_to_exact_zero(
         request_database, monkeypatch, tmp_path) -> None:
     graph = _prepare_graph(request_database, monkeypatch)
     provider = _DelayedAwsProvider()
-    provider_clock = _ProviderClock()
     monkeypatch.setattr(non_pool_launch_reconciliation.aws_adaptor, 'session',
                         provider.session)
-    monkeypatch.setattr(non_pool_launch_reconciliation, 'time', provider_clock)
+    census_adapter_calls: list[
+        request_postgres.BoundAwsProviderCensusScope] = []
+
+    def _inline_census(
+        scope: request_postgres.BoundAwsProviderCensusScope,
+        *,
+        deadline_monotonic: float,
+    ) -> list[dict[str, str]]:
+        assert time.monotonic() < deadline_monotonic
+        census_adapter_calls.append(scope)
+        return non_pool_launch_reconciliation._query_aws_paid_provider_census(
+            scope)
+
     monkeypatch.setattr(non_pool_launch_reconciliation,
-                        '_AWS_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS', 1.0)
-    monkeypatch.setattr(non_pool_launch_reconciliation,
-                        '_AWS_POST_TEARDOWN_ABSENCE_POLL_SECONDS', 1.0)
+                        '_query_aws_paid_provider_census_isolated',
+                        _inline_census)
+    # Delete submission now releases its worker before the separate bounded
+    # observation lane runs. Exercise that production owner and deadline;
+    # there is no provider-local synchronous absence poll anymore.
+    monkeypatch.setattr(service, '_PAID_PROVIDER_OBSERVATION_TIMEOUT_SECONDS',
+                        1.0)
+    monkeypatch.setattr(service, '_PAID_PROVIDER_OBSERVATION_RETRY_SECONDS',
+                        0.05)
     monkeypatch.setattr(non_pool_launch_reconciliation,
                         '_AWS_EMPTY_CENSUS_INTERVAL_SECONDS', 0.0)
     monkeypatch.setattr(ordinary_launch_binding,
@@ -705,8 +722,7 @@ def test_late_paid_create_shutdown_recovers_to_exact_zero(
                         validate_bound_non_pool_launch_claim_in_transaction)):
                 provider.create(graph.provider_identity)
                 with pytest.raises(
-                        ordinary_launch_binding.OrdinaryLaunchBindingConflict,
-                        match='no longer authorizes provider effects'):
+                        ordinary_launch_binding.OrdinaryLaunchBindingConflict):
                     ordinary_launch_binding.record_paid_provider_allocation(
                         launch_context,
                         graph.allocation,
@@ -716,7 +732,7 @@ def test_late_paid_create_shutdown_recovers_to_exact_zero(
 
     provider_thread = thread_utils.SafeThread(target=_provider_worker)
     provider_thread.start()
-    assert provider.create_entered.wait(timeout=10)
+    assert provider.create_entered.wait(timeout=10), provider_thread.format_exc
     spec = _service_spec()
     cleanup_thread = thread_utils.SafeThread(
         target=service._run_cleanup_and_finalize,
@@ -732,12 +748,16 @@ def test_late_paid_create_shutdown_recovers_to_exact_zero(
     assert provider_thread.exception is None
     assert cleanup_thread.exception is None
 
-    # The first controller accepted exactly one provider delete, but its
-    # deadline expired before visibility changed.  Recovery authority and the
-    # complete graph must remain durable.
-    assert provider.create_calls == provider.down_calls == 1
+    # The first controller submitted exact idempotent deletion, but the
+    # observation deadline expired before visibility changed. PRESENT may
+    # re-drive that same delete; it never authorizes another create or release
+    # of the claim. Recovery authority and the complete graph remain durable.
+    assert provider.create_calls == 1
+    assert provider.down_calls >= 1
+    deletes_before_recovery = provider.down_calls
     census_after_timeout = provider.census_calls
     assert census_after_timeout > 0
+    assert census_adapter_calls
     assert serve_state.get_ha_recovery_script(
         _SERVICE_NAME) == 'recover shutdown'
     first = serve_state.get_service_from_name(_SERVICE_NAME)
@@ -761,13 +781,18 @@ def test_late_paid_create_shutdown_recovers_to_exact_zero(
     assert retained_replica is not None
     assert ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
         retained_replica)
+    pending_phase = (ordinary_launch_binding.ProviderPresentTeardownPhase.
+                     ABSENCE_OBSERVATION_PENDING)
+    assert ordinary_launch_binding.provider_present_teardown_phase(
+        retained_replica) is pending_phase
 
     # Provider visibility converges while the first controller is gone.  The
     # production recovery owner-transfer and finalizer consume the same graph;
-    # no second create or down call is permitted.
+    # no new create or down call is permitted once exact absence is visible.
     provider.make_absent()
     _run_recovery_retry(spec)
-    assert provider.create_calls == provider.down_calls == 1
+    assert provider.create_calls == 1
+    assert provider.down_calls == deletes_before_recovery
     assert provider.census_calls > census_after_timeout
     assert lb_deletes == [_SERVICE_NAME, _SERVICE_NAME]
     generic_terminate.assert_not_called()

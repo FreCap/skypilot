@@ -5267,6 +5267,155 @@ def test_route_authority_must_be_fresh_and_match_lifecycle():
         })
 
 
+@pytest.mark.parametrize(('changes', 'reason'), [
+    ({
+        'route_generation': None
+    }, 'route_generation_invalid'),
+    ({
+        'route_fresh': False
+    }, 'route_stale'),
+    ({
+        'route_lifecycle_epoch': 6
+    }, 'route_lifecycle_mismatch'),
+])
+def test_observation_miss_has_closed_route_diagnostic(tmp_path, changes,
+                                                      reason):
+    authority = {
+        'service_hash': 'secret-incarnation',
+        'service_lifecycle_epoch': 7,
+        'route_generation': 11,
+        'route_fresh': True,
+        'route_service_hash': 'secret-incarnation',
+        'route_lifecycle_epoch': 7,
+        **changes,
+    }
+    receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                service_name='paid-e2e',
+                                profile=qualifier.PROFILES['scale'])
+    with pytest.raises(qualifier.QualificationError) as failure:
+        qualifier.validate_route_authority(authority)
+    receipt.miss('scale', failure.value, scale_iteration_id=1)
+
+    sample = receipt._payload['samples'][0]
+    assert sample['observation_error_facet'] == 'postgres'
+    assert sample['observation_error_reason'] == reason
+    assert 'secret-incarnation' not in json.dumps(sample)
+    assert 'provider_running' not in sample
+
+
+def test_unknown_observation_error_never_leaks_message(tmp_path):
+    receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                service_name='paid-e2e',
+                                profile=qualifier.PROFILES['scale'])
+    receipt.miss('scale', RuntimeError('signed-url-bearer-secret'))
+    sample = receipt._payload['samples'][0]
+    assert sample['observation_error_facet'] == 'unclassified'
+    assert sample['observation_error_reason'] == 'dependency_error'
+    assert 'signed-url-bearer-secret' not in json.dumps(sample)
+
+
+@pytest.mark.parametrize('kind', ['guard', 'timeout', 'cancelled', 'unknown'])
+def test_observation_facet_preserves_control_flow(kind):
+    errors = {
+        'guard': qualifier.GuardViolation('identity changed'),
+        'timeout': qualifier.ObservationTimeoutError('deadline'),
+        'cancelled': asyncio.CancelledError(),
+        'unknown': RuntimeError('credential material'),
+    }
+    error = errors[kind]
+
+    async def fail():
+        raise error
+
+    async def exercise():
+        expected_type = (qualifier.QualificationError
+                         if kind == 'unknown' else type(error))
+        with pytest.raises(expected_type) as failure:
+            await qualifier._observe_facet(qualifier.ObservationFacet.PROVIDER,
+                                           fail())
+        if kind != 'unknown':
+            assert failure.value is error
+        if kind in ('unknown', 'timeout'):
+            fields = qualifier._observation_failure_fields(failure.value)
+            assert fields['observation_error_facet'] == 'provider'
+            assert fields['observation_error_reason'] == ('dependency_error' if
+                                                          kind == 'unknown' else
+                                                          'deadline_exhausted')
+            assert 'credential material' not in json.dumps(fields)
+
+    asyncio.run(exercise())
+
+
+def test_composite_observer_does_not_accept_partial_provider_scale(tmp_path):
+    """A positive provider census cannot bypass failed route evidence."""
+    calls = []
+
+    class ProviderSession:
+
+        async def request(self, kind, _arguments, _deadline):
+            calls.append(kind)
+            return {
+                'gcp_census': None,
+                'aws_census': json.loads(
+                    json.dumps(
+                        dataclasses.asdict(
+                            qualifier.AwsProviderCensus(
+                                service_instances=(_aws_instance(),),
+                                service_volumes=(_aws_volume(),))))),
+                'retained_volume_ids_by_region': {
+                    'us-east-2': ['vol-new']
+                },
+            }
+
+    class PostgresSession:
+
+        async def request(self, kind, _arguments, _deadline):
+            calls.append(kind)
+            qualifier.validate_route_authority({
+                'service_hash': 'incarnation',
+                'service_lifecycle_epoch': 7,
+                'route_generation': 11,
+                'route_fresh': False,
+                'route_service_hash': 'incarnation',
+                'route_lifecycle_epoch': 7,
+            })
+
+    class Http:
+
+        async def snapshot(self):
+            return _observation().load_balancer
+
+    observer = qualifier.Observer(database_url='postgresql://unused',
+                                  http=Http(),
+                                  service_name='paid-e2e',
+                                  scope=_provider_scope(),
+                                  profile=qualifier.PROFILES['scale'],
+                                  provider_session=ProviderSession(),
+                                  postgres_session=PostgresSession())
+    progress = qualifier.Progress()
+    receipt = qualifier.Receipt(path=tmp_path / 'receipt.json',
+                                service_name='paid-e2e',
+                                profile=qualifier.PROFILES['scale'])
+
+    async def exercise():
+        with pytest.raises(qualifier.QualificationError) as failure:
+            observation = await observer.snapshot(
+                deadline_monotonic=time.monotonic() + 1)
+            progress.observe(observation, qualifier.PROFILES['scale'])
+        receipt.miss('scale', failure.value, scale_iteration_id=1)
+
+    asyncio.run(exercise())
+    assert calls == [
+        qualifier.IsolatedObservationKind.PROVIDER_CENSUS,
+        qualifier.IsolatedObservationKind.POSTGRES
+    ]
+    assert progress.peak_running == 0
+    assert progress.scale_reached_monotonic is None
+    sample = receipt._payload['samples'][0]
+    assert sample['observation_error_facet'] == 'postgres'
+    assert sample['observation_error_reason'] == 'route_stale'
+
+
 def test_progress_records_scale_slo_and_sustained_exact_zero():
     profile = qualifier.PROFILES['small']
     gcp_name = _provider_cluster_names('gcp', 1)[0]

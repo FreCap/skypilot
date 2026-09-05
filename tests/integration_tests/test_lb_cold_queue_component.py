@@ -638,9 +638,15 @@ async def _run_exact_deadline_test(controller_port: int, worker_port: int,
         assert all(operation['intent_sha256'] == intent_sha256
                    for operation in operations)
 
+        # The accepted ledger receipt clears rejected demand before the ASGI
+        # response finalizer releases the transport slot. Receiving the body
+        # does not synchronize with that server-side finalizer. Observe both
+        # independent effects through the public capacity endpoint, with a
+        # fixed bound; a leaked slot must still fail this component test.
         cleared_capacity = await _wait_for_json_value(
             session, f'{lb_base}/_lb/capacity',
-            lambda value: value.get('rejected_in_window') == 0, 2)
+            lambda value: value.get('rejected_in_window') == 0 and value.get(
+                'local_in_flight') == 0, 2)
         assert cleared_capacity['request_queue_depth'] == 0
         assert cleared_capacity['local_in_flight'] == 0
 

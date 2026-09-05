@@ -88,6 +88,13 @@ aws_adaptor = adaptors_common.LazyImport('sky.adaptors.aws')
 class QualificationError(RuntimeError):
     """A qualification invariant failed."""
 
+    def __init__(self,
+                 message: str,
+                 *,
+                 diagnostic: 'ObservationDiagnostic | None' = None) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
 
 class GuardViolation(QualificationError):
     """An authoritative market, card, cap, or identity guard failed."""
@@ -95,6 +102,62 @@ class GuardViolation(QualificationError):
 
 class ObservationTimeoutError(QualificationError):
     """A read-only observation exhausted its owning phase deadline."""
+
+
+class ObservationFacet(enum.Enum):
+    """Read-only dependency whose evidence could not be joined."""
+
+    PROVIDER = 'provider'
+    HTTP = 'http'
+    POSTGRES = 'postgres'
+    UNCLASSIFIED = 'unclassified'
+
+
+class ObservationFailureReason(enum.Enum):
+    """Closed, credential-free explanations; never exception text."""
+
+    ROUTE_AUTHORITY_MISSING = 'route_authority_missing'
+    ROUTE_GENERATION_INVALID = 'route_generation_invalid'
+    ROUTE_STALE = 'route_stale'
+    ROUTE_LIFECYCLE_MISMATCH = 'route_lifecycle_mismatch'
+    INCOMPLETE_EVIDENCE = 'incomplete_evidence'
+    DEADLINE_EXHAUSTED = 'deadline_exhausted'
+    DEPENDENCY_ERROR = 'dependency_error'
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ObservationDiagnostic:
+    """A bounded observation failure that is safe to persist in receipts."""
+
+    facet: ObservationFacet
+    reason: ObservationFailureReason
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.facet, ObservationFacet) or
+                not isinstance(self.reason, ObservationFailureReason)):
+            raise ValueError('Observation diagnostic must use closed enums.')
+
+
+def _observation_diagnostic(error: Exception) -> ObservationDiagnostic:
+    if isinstance(error, QualificationError) and error.diagnostic is not None:
+        return error.diagnostic
+    if isinstance(error, ObservationTimeoutError):
+        reason = ObservationFailureReason.DEADLINE_EXHAUSTED
+    elif isinstance(error, QualificationError):
+        reason = ObservationFailureReason.INCOMPLETE_EVIDENCE
+    else:
+        reason = ObservationFailureReason.DEPENDENCY_ERROR
+    return ObservationDiagnostic(facet=ObservationFacet.UNCLASSIFIED,
+                                 reason=reason)
+
+
+def _observation_failure_fields(error: Exception) -> dict[str, str]:
+    diagnostic = _observation_diagnostic(error)
+    return {
+        'observation_error_type': type(error).__name__,
+        'observation_error_facet': diagnostic.facet.value,
+        'observation_error_reason': diagnostic.reason.value,
+    }
 
 
 def _receipt_outcome(error: BaseException | None) -> str:
@@ -106,6 +169,30 @@ def _receipt_outcome(error: BaseException | None) -> str:
 
 
 _ObservationResultT = typing.TypeVar('_ObservationResultT')
+
+
+async def _observe_facet(
+    facet: ObservationFacet,
+    operation: typing.Awaitable[_ObservationResultT],
+) -> _ObservationResultT:
+    """Attribute a failed read without changing guard or timeout behavior."""
+    try:
+        return await operation
+    except GuardViolation:
+        raise
+    except asyncio.TimeoutError:
+        # The owning absolute-deadline wrapper classifies timeouts. Do not
+        # turn them into retryable incomplete observations.
+        raise
+    except Exception as error:
+        diagnostic = _observation_diagnostic(error)
+        if diagnostic.facet is ObservationFacet.UNCLASSIFIED:
+            diagnostic = dataclasses.replace(diagnostic, facet=facet)
+        if isinstance(error, QualificationError):
+            error.diagnostic = diagnostic
+            raise
+        raise QualificationError('Observation dependency failed.',
+                                 diagnostic=diagnostic) from error
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -3531,19 +3618,34 @@ def aws_identity_from_retained_request(
 def validate_route_authority(authority: object) -> tuple[str, int]:
     """Validate only live route/lifecycle authority, never a plan head."""
     if not isinstance(authority, collections.abc.Mapping):
-        raise QualificationError('Service has no durable incarnation.')
+        raise QualificationError(
+            'Service has no durable incarnation.',
+            diagnostic=ObservationDiagnostic(
+                facet=ObservationFacet.POSTGRES,
+                reason=ObservationFailureReason.ROUTE_AUTHORITY_MISSING))
     service_hash = authority.get('service_hash')
     lifecycle_epoch = authority.get('service_lifecycle_epoch')
     route_generation = authority.get('route_generation')
     if not isinstance(service_hash, str) or not service_hash:
-        raise QualificationError('Service has no durable incarnation.')
-    if (type(lifecycle_epoch) is not int or lifecycle_epoch < 1 or
-            type(route_generation) is not int or route_generation < 1 or
-            authority.get('route_fresh') is not True or
-            authority.get('route_service_hash') != service_hash or
-            authority.get('route_lifecycle_epoch') != lifecycle_epoch):
         raise QualificationError(
-            'Service lacks fresh route/lifecycle authority.')
+            'Service has no durable incarnation.',
+            diagnostic=ObservationDiagnostic(
+                facet=ObservationFacet.POSTGRES,
+                reason=ObservationFailureReason.ROUTE_AUTHORITY_MISSING))
+    reason = None
+    if type(route_generation) is not int or route_generation < 1:
+        reason = ObservationFailureReason.ROUTE_GENERATION_INVALID
+    elif (type(lifecycle_epoch) is not int or lifecycle_epoch < 1 or
+          authority.get('route_service_hash') != service_hash or
+          authority.get('route_lifecycle_epoch') != lifecycle_epoch):
+        reason = ObservationFailureReason.ROUTE_LIFECYCLE_MISMATCH
+    elif authority.get('route_fresh') is not True:
+        reason = ObservationFailureReason.ROUTE_STALE
+    if reason is not None:
+        raise QualificationError(
+            'Service lacks fresh route/lifecycle authority.',
+            diagnostic=ObservationDiagnostic(facet=ObservationFacet.POSTGRES,
+                                             reason=reason))
     return service_hash, lifecycle_epoch
 
 
@@ -4799,6 +4901,11 @@ def _isolated_observer_response(
             'error_kind': error_kind,
             'message': (str(error) if isinstance(error, QualificationError) else
                         type(error).__name__),
+            'diagnostic': ({
+                'facet': error.diagnostic.facet.value,
+                'reason': error.diagnostic.reason.value,
+            } if isinstance(error, QualificationError) and
+                           error.diagnostic is not None else None),
         }
 
 
@@ -5184,7 +5291,22 @@ class IsolatedObserverSession:
                     message = 'Isolated observation failed.'
                 if response.get('error_kind') == 'guard':
                     raise GuardViolation(message)
-                raise QualificationError(message)
+                diagnostic = None
+                raw_diagnostic = response.get('diagnostic')
+                if raw_diagnostic is not None:
+                    try:
+                        if (not isinstance(raw_diagnostic, dict) or
+                                set(raw_diagnostic) != {'facet', 'reason'}):
+                            raise ValueError('Malformed diagnostic.')
+                        diagnostic = ObservationDiagnostic(
+                            facet=ObservationFacet(raw_diagnostic['facet']),
+                            reason=ObservationFailureReason(
+                                raw_diagnostic['reason']))
+                    except (TypeError, ValueError):
+                        raise QualificationError(
+                            'Isolated observation diagnostic is malformed.') \
+                            from None
+                raise QualificationError(message, diagnostic=diagnostic)
             result = response.get('result')
             if not isinstance(result, dict):
                 await self._retire_locked()
@@ -5406,10 +5528,12 @@ class Observer:
 
     async def request_telemetry(self,
                                 deadline_monotonic: float) -> RequestTelemetry:
-        result = await self._postgres_session.request(
-            IsolatedObservationKind.POSTGRES,
-            self._postgres_arguments(projection='telemetry'),
-            deadline_monotonic)
+        result = await _observe_facet(
+            ObservationFacet.POSTGRES,
+            self._postgres_session.request(
+                IsolatedObservationKind.POSTGRES,
+                self._postgres_arguments(projection='telemetry'),
+                deadline_monotonic))
         payload = result.get('telemetry')
         if not isinstance(payload, dict):
             raise QualificationError('Isolated request telemetry is malformed.')
@@ -5427,9 +5551,11 @@ class Observer:
         # to classify it.  Since a binding commit precedes its provider effect,
         # this avoids both logical-name prefix guesses and an old-DB/new-VM
         # ordering manufactured by the observer itself.
-        provider_result = await self._provider_session.request(
-            IsolatedObservationKind.PROVIDER_CENSUS, self._provider_arguments(),
-            deadline_monotonic)
+        provider_result = await _observe_facet(
+            ObservationFacet.PROVIDER,
+            self._provider_session.request(
+                IsolatedObservationKind.PROVIDER_CENSUS,
+                self._provider_arguments(), deadline_monotonic))
         gcp_payload = provider_result.get('gcp_census')
         aws_payload = provider_result.get('aws_census')
         gcp_census = (None if gcp_payload is None else ProviderCensus(
@@ -5441,23 +5567,32 @@ class Observer:
         remaining = deadline_monotonic - time.monotonic()
         if remaining <= 0:
             raise ObservationTimeoutError(
-                'Load-balancer observation exhausted its phase deadline.')
+                'Load-balancer observation exhausted its phase deadline.',
+                diagnostic=ObservationDiagnostic(
+                    facet=ObservationFacet.HTTP,
+                    reason=ObservationFailureReason.DEADLINE_EXHAUSTED))
         try:
-            load_balancer = await asyncio.wait_for(self._http.snapshot(),
-                                                   timeout=remaining)
+            load_balancer = await _observe_facet(
+                ObservationFacet.HTTP,
+                asyncio.wait_for(self._http.snapshot(), timeout=remaining))
         except asyncio.TimeoutError as error:
             if time.monotonic() < deadline_monotonic:
                 raise
             raise ObservationTimeoutError(
-                'Load-balancer observation exhausted its phase deadline.') \
+                'Load-balancer observation exhausted its phase deadline.',
+                diagnostic=ObservationDiagnostic(
+                    facet=ObservationFacet.HTTP,
+                    reason=ObservationFailureReason.DEADLINE_EXHAUSTED)) \
                 from error
-        database_result = await self._postgres_session.request(
-            IsolatedObservationKind.POSTGRES,
-            self._postgres_arguments(
-                projection='snapshot',
-                load_balancer=dataclasses.asdict(load_balancer),
-                require_complete_demand_report=require_complete_demand_report),
-            deadline_monotonic)
+        database_result = await _observe_facet(
+            ObservationFacet.POSTGRES,
+            self._postgres_session.request(
+                IsolatedObservationKind.POSTGRES,
+                self._postgres_arguments(
+                    projection='snapshot',
+                    load_balancer=dataclasses.asdict(load_balancer),
+                    require_complete_demand_report=require_complete_demand_report
+                ), deadline_monotonic))
         database_payload = database_result.get('database')
         if not isinstance(database_payload, dict):
             raise QualificationError('Isolated database state is malformed.')
@@ -5743,7 +5878,7 @@ class Receipt:
         sample = {
             'phase': phase,
             'observed_at': time.time(),
-            'observation_error_type': type(error).__name__,
+            **_observation_failure_fields(error),
         }
         if scale_iteration_id is not None:
             sample['scale_iteration_id'] = scale_iteration_id
@@ -7047,8 +7182,8 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
                 raise
             except Exception as error:  # pylint: disable=broad-except
                 # An unavailable observer proves neither zero nor nonzero. Keep
-                # only its safe type, break any partial zero streak, and retry
-                # until the original cleanup deadline. Persistent loss still
+                # only its closed diagnostic, break any partial zero streak,
+                # and retry until the original cleanup deadline. Persistent loss
                 # reaches the fail-closed timeout below.
                 consecutive_zero = 0
                 zero_since_monotonic = None
@@ -7062,7 +7197,7 @@ async def wait_for_cleanup(args: argparse.Namespace) -> None:
                         (observation_finished_monotonic -
                          observation_started_monotonic),
                     'observed_at': observation_finished_at,
-                    'observation_error_type': type(error).__name__,
+                    **_observation_failure_fields(error),
                     'exact_zero': False,
                     'zero_samples': consecutive_zero,
                     'zero_hold_elapsed_seconds': zero_hold_elapsed_seconds,
