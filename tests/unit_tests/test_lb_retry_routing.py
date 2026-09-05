@@ -503,7 +503,8 @@ class TestRetriableStatusCodes(unittest.TestCase):
                           status_code,
                           body=b'',
                           content_encoding='identity',
-                          chunks=None):
+                          chunks=None,
+                          extra_headers=None):
         client = mock.MagicMock()
         setattr(client, lb_module._INFLIGHT_ATTR, 0)
         client.build_request = mock.Mock(return_value=mock.Mock())
@@ -515,6 +516,7 @@ class TestRetriableStatusCodes(unittest.TestCase):
         }
         if content_encoding:
             headers['content-encoding'] = content_encoding
+        headers.update(extra_headers or {})
         response.headers = httpx.Headers(headers)
         closed = {'v': False}
 
@@ -562,6 +564,22 @@ class TestRetriableStatusCodes(unittest.TestCase):
         result = asyncio.run(
             balancer._proxy_request_to('http://a:8080', _request()))
         self.assertNotIsInstance(result, Exception)
+
+    def test_backend_cannot_spoof_retry_safe_rejection_marker(self):
+        marker = lb_module.constants.LB_REQUEST_RETRY_SAFETY_HEADER
+        client, _ = self._client_returning(
+            503,
+            extra_headers={
+                marker:
+                    lb_module.constants.LB_REQUEST_RETRY_SAFE_REJECTION,
+            })
+        balancer = self._balancer([], client)
+
+        result = asyncio.run(
+            balancer._proxy_request_to('http://a:8080', _request()))
+
+        self.assertEqual(result.status_code, 503)
+        self.assertNotIn(marker, result.headers)
 
     @staticmethod
     def _install_ledger_request(request,
@@ -929,6 +947,10 @@ class TestRetryTuning(unittest.TestCase):
         self.assertIn('not dispatched', exc.detail)
         self.assertEqual(exc.headers['Retry-After'],
                          str(lb_module.constants.LB_503_RETRY_AFTER_SECONDS))
+        self.assertEqual(
+            exc.headers[
+                lb_module.constants.LB_REQUEST_RETRY_SAFETY_HEADER],
+            lb_module.constants.LB_REQUEST_RETRY_SAFE_REJECTION)
 
     def test_default_max_retries_unchanged(self):
         attempts, _ = self._run_all_failing(self._balancer())
@@ -1365,6 +1387,10 @@ class TestRetryShortCircuit(unittest.TestCase):
         self.assertEqual(len(sleeps), 1)
         self.assertEqual(exc.status_code, 503)
         self.assertIn('Retry-After', exc.headers)
+        self.assertEqual(
+            exc.headers[
+                lb_module.constants.LB_REQUEST_RETRY_SAFETY_HEADER],
+            lb_module.constants.LB_REQUEST_RETRY_SAFE_REJECTION)
         balancer._request_aggregator.add_request_classification.assert_called_once_with(
             rejected=True)
 
@@ -1388,6 +1414,10 @@ class TestRetryShortCircuit(unittest.TestCase):
         self.assertIn('configured retriable', exc.detail)
         self.assertEqual(exc.headers['Retry-After'],
                          str(lb_module.constants.LB_503_RETRY_AFTER_SECONDS))
+        self.assertEqual(
+            exc.headers[
+                lb_module.constants.LB_REQUEST_RETRY_SAFETY_HEADER],
+            lb_module.constants.LB_REQUEST_RETRY_SAFE_REJECTION)
         self.assertEqual(balancer._rejected_in_window(), 1)
 
     def test_transport_failures_keep_fallback_attempts(self):

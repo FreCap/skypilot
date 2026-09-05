@@ -6,6 +6,8 @@ service:
   graceful_drain_async_occupancy: true
   load_balancer:
     stream_timeout_seconds: 600
+    # This fixture's 429 is emitted before its execution counter is acquired.
+    retriable_status_codes: [429]
     request_queue:
       min_size: 4
       size_per_replica: 1

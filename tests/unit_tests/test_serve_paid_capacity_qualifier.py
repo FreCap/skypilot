@@ -2,6 +2,7 @@
 # pylint: disable=missing-class-docstring,protected-access
 
 import asyncio
+import contextlib
 import copy
 import dataclasses
 import datetime
@@ -43,6 +44,38 @@ def _load_module(name: str, path: pathlib.Path):
 
 _FIXTURE_DIR = pathlib.Path(__file__).parents[1] / 'skyserve' / 'paid_capacity'
 qualifier = _load_module('paid_capacity_qualifier', _FIXTURE_DIR / 'qualify.py')
+
+
+@contextlib.asynccontextmanager
+async def _prediction_endpoint(handler):
+    """Serve one real local HTTP prediction endpoint for unpaid E2E tests."""
+    app = aiohttp.web.Application()
+    app.router.add_post('/v1/models/model:predict', handler)
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, '127.0.0.1', 0)
+    await site.start()
+    assert site._server is not None
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        yield f'http://127.0.0.1:{port}'
+    finally:
+        await runner.cleanup()
+
+
+async def _run_one_request_campaign(handler, *, timeout_seconds=1,
+                                    prefix='one'):
+    async with _prediction_endpoint(handler) as endpoint:
+        return await qualifier.send_synchronous_requests(
+            endpoint=endpoint,
+            token='secret',
+            prefix=prefix,
+            count=1,
+            resident_window=1,
+            request_concurrency=1,
+            hold_seconds=0.01,
+            timeout_seconds=timeout_seconds,
+            request_queue_timeout_seconds=1)
 
 
 class _HttpResponseContext:
@@ -569,7 +602,9 @@ def test_render_profiles_share_one_spot_only_service(tmp_path):
         assert policy['scale_up_rate_period_seconds'] == expected_period
         assert policy['spot_placer'] == 'dynamic_fallback_per_gpu'
         assert policy['cost_rebalance'] is False
-        queue = config['service']['load_balancer']['request_queue']
+        load_balancer_config = config['service']['load_balancer']
+        assert load_balancer_config['retriable_status_codes'] == [429]
+        queue = load_balancer_config['request_queue']
         profile = qualifier.PROFILES[name]
         projection = qualifier._profile_projection(profile)
         assert queue['min_size'] == projection['request_queue_min_size']
@@ -7323,6 +7358,7 @@ def test_synchronous_campaign_completes_10k_ids_with_400_workers(monkeypatch):
         await initial_cohort.wait()
         request_ids.add(request_id)
         active -= 1
+        return True
 
     monkeypatch.setattr(qualifier, '_one_synchronous_request', one_request)
 
@@ -7346,10 +7382,50 @@ def test_synchronous_campaign_completes_10k_ids_with_400_workers(monkeypatch):
     }
 
 
+def test_synchronous_campaign_retries_typed_rejection_with_same_identity():
+    calls = []
+
+    async def predict(request):
+        calls.append((dict(request.headers), await request.json()))
+        if len(calls) < 3:
+            return aiohttp.web.json_response(
+                {'detail': 'retry safely'},
+                status=503,
+                headers={
+                    qualifier.serve_constants.LB_REQUEST_RETRY_SAFETY_HEADER:
+                        qualifier.serve_constants.
+                        LB_REQUEST_RETRY_SAFE_REJECTION,
+                    'Retry-After': '0',
+                })
+        return aiohttp.web.json_response({
+            'request_id': 'one-execution-00000',
+            'status': 'ok',
+        })
+
+    assert asyncio.run(
+        _run_one_request_campaign(predict, timeout_seconds=2)) == 1
+    assert len(calls) == 3
+    assert {headers[qualifier._JOB_ID_HEADER]
+            for headers, _ in calls} == {'one-job-00000'}
+    assert [payload for _, payload in calls] == [{
+        'duration_seconds': 0.01,
+        'request_id': 'one-execution-00000',
+    }] * 3
+
+
 @pytest.mark.parametrize(('status', 'body', 'message'), [
+    (429, {
+        'error': 'worker capacity full'
+    }, 'HTTP 429'),
+    (502, {
+        'detail': 'upstream outcome unknown'
+    }, 'HTTP 502'),
     (503, {
         'error': 'not ready'
     }, 'HTTP 503'),
+    (504, {
+        'error': 'gateway timeout'
+    }, 'HTTP 504'),
     (200, {
         'request_id': 'wrong',
         'status': 'ok'
@@ -7373,32 +7449,114 @@ def test_synchronous_campaign_fails_without_replaying_work(
         }
         return aiohttp.web.json_response(body, status=status)
 
+    with pytest.raises(qualifier.QualificationError, match=message):
+        asyncio.run(_run_one_request_campaign(predict))
+    assert calls == 1
+
+
+def test_synchronous_campaign_does_not_replay_ambiguous_transport_outcome():
+    calls = 0
+
+    async def predict(request):
+        nonlocal calls
+        calls += 1
+        await request.read()
+        assert request.transport is not None
+        request.transport.close()
+        return aiohttp.web.Response(status=204)
+
+    with pytest.raises(qualifier.QualificationError,
+                       match='ambiguous synchronous outcome'):
+        asyncio.run(_run_one_request_campaign(predict))
+    assert calls == 1
+
+
+def test_synchronous_retry_backoff_is_bounded_stable_and_staggered():
+    first = qualifier._bounded_synchronous_retry_delay(
+        '10', attempt=0, request_id='request-a')
+    assert first == qualifier._bounded_synchronous_retry_delay(
+        '10', attempt=0, request_id='request-a')
+    assert 10 <= first <= 12.5
+    assert first != qualifier._bounded_synchronous_retry_delay(
+        '10', attempt=0, request_id='request-b')
+    assert qualifier._bounded_synchronous_retry_delay(
+        '1000000', attempt=100, request_id='request-a') == 30
+
+
+def test_synchronous_safe_retry_stops_at_shared_campaign_deadline():
+    calls = 0
+
+    async def predict(_request):
+        nonlocal calls
+        calls += 1
+        return aiohttp.web.json_response(
+            {'detail': 'retry safely'},
+            status=503,
+            headers={
+                qualifier.serve_constants.LB_REQUEST_RETRY_SAFETY_HEADER:
+                    qualifier.serve_constants.LB_REQUEST_RETRY_SAFE_REJECTION,
+                'Retry-After': '60',
+            })
+
+    started = time.monotonic()
+    with pytest.raises(qualifier.QualificationError,
+                       match='campaign deadline'):
+        asyncio.run(
+            _run_one_request_campaign(predict,
+                                      timeout_seconds=0.05,
+                                      prefix='deadline'))
+    assert time.monotonic() - started < 0.5
+    assert calls == 1
+
+
+def test_synchronous_campaign_cancellation_stops_safe_retry_before_replay():
+    calls = 0
+    rejected = asyncio.Event()
+
+    async def predict(_request):
+        nonlocal calls
+        calls += 1
+        rejected.set()
+        return aiohttp.web.json_response(
+            {'detail': 'retry safely'},
+            status=503,
+            headers={
+                qualifier.serve_constants.LB_REQUEST_RETRY_SAFETY_HEADER:
+                    qualifier.serve_constants.LB_REQUEST_RETRY_SAFE_REJECTION,
+                'Retry-After': '60',
+            })
+
     async def exercise():
-        app = aiohttp.web.Application()
-        app.router.add_post('/v1/models/model:predict', predict)
-        runner = aiohttp.web.AppRunner(app)
-        await runner.setup()
-        site = aiohttp.web.TCPSite(runner, '127.0.0.1', 0)
-        await site.start()
-        assert site._server is not None
-        endpoint = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
-        try:
-            with pytest.raises(qualifier.QualificationError, match=message):
-                await qualifier.send_synchronous_requests(
+        async with _prediction_endpoint(predict) as endpoint:
+            progress = qualifier.ExactRequestCampaignProgress(total_count=1,
+                                                              window_size=1)
+            traffic = asyncio.create_task(
+                qualifier.send_synchronous_requests(
                     endpoint=endpoint,
                     token='secret',
-                    prefix='one',
+                    prefix='cancel-retry',
                     count=1,
                     resident_window=1,
                     request_concurrency=1,
                     hold_seconds=0.01,
-                    timeout_seconds=1,
-                    request_queue_timeout_seconds=1)
-        finally:
-            await runner.cleanup()
+                    timeout_seconds=120,
+                    request_queue_timeout_seconds=1,
+                    campaign_progress=progress))
+            try:
+                await asyncio.wait_for(rejected.wait(), timeout=1)
+                traffic.cancel('stop qualification')
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(traffic, timeout=1)
+                return await progress.snapshot()
+            finally:
+                if not traffic.done():
+                    traffic.cancel()
+                    await asyncio.gather(traffic, return_exceptions=True)
 
-    asyncio.run(exercise())
+    snapshot = asyncio.run(exercise())
     assert calls == 1
+    assert snapshot == qualifier.ExactRequestCampaignCounters(
+        offered=1, succeeded=0, accepting_offers=False)
 
 
 def test_synchronous_campaign_cancellation_drains_only_offered_work():
