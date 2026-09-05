@@ -7387,6 +7387,97 @@ class TestAutoscalerRuntimeSnapshot:
             route_generation=4)
         ctrl._replica_manager.scale_up_batch.assert_not_called()
 
+    def test_fresh_zero_paid_retirement_waits_for_committed_retention_floor(
+            self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler(0)
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        published_before_retirement = []
+
+        def _retire(*_args):
+            published_before_retirement.append(
+                ctrl._replica_manager.publish_logical_reconcile_state.call_count
+            )
+            return False
+
+        ctrl._replica_manager.reconcile_fresh_zero_paid_retirements.side_effect = (  # pylint: disable=line-too-long
+            _retire)
+
+        def _plan(_replica_infos, request_information, reservation_input, *,
+                  source_fingerprint, fresh_zero, **_kwargs):
+            generation = request_information['reconcile_generation']
+            plan = self._durable_reconcile_plan(
+                scaler,
+                reservation_input,
+                source_fingerprint=source_fingerprint,
+                fresh_zero=fresh_zero,
+                generation=generation)
+            if generation not in (3, 4):
+                return plan
+            one_l4 = capacity_planning.AcceleratorCapacity.from_mapping(
+                {'L4': 1})
+            target = autoscalers.LogicalCapacityTarget(
+                version=1,
+                generation=generation,
+                target_capacity=1,
+                target_capacity_by_accelerator=(('L4', 1),),
+                accelerator_shapes=(('L4', 1),))
+            if generation == 4:
+                snapshot = dataclasses.replace(plan.envelope.snapshot,
+                                               retirement_shelter_target=one_l4)
+                candidate = capacity_planning.plan_capacity(snapshot)
+                assert candidate.retained_existing_target.total() == 0
+                assert candidate.retirement_floor_target == one_l4
+                envelope = dataclasses.replace(plan.envelope,
+                                               snapshot=snapshot,
+                                               candidate=candidate)
+                shelter = reserved_fill_planner.SequencedRetirementShelter(
+                    service_version=1,
+                    target_capacity=1,
+                    target_capacity_by_accelerator=(('L4', 1),),
+                    accelerator_shapes=(('L4', 1),),
+                    allocation_identity=None)
+                return dataclasses.replace(plan,
+                                           envelope=envelope,
+                                           logical_retirement_floor=target,
+                                           retirement_shelter=shelter)
+            candidate = dataclasses.replace(
+                plan.envelope.candidate,
+                retained_existing_target=one_l4,
+                wave_limited_actuation_target=one_l4,
+                supply_aware_actuation_target=one_l4,
+                retirement_floor_target=one_l4)
+            envelope = dataclasses.replace(plan.envelope, candidate=candidate)
+            return dataclasses.replace(plan,
+                                       envelope=envelope,
+                                       logical_target=target,
+                                       logical_retirement_floor=target)
+
+        scaler.plan_durable_capacity_reconcile.side_effect = _plan
+        snapshots = [
+            self._durable_snapshot(generation=3, fresh_aggregate_zero=True),
+            self._durable_snapshot(generation=4, fresh_aggregate_zero=True),
+            self._durable_snapshot(generation=5, fresh_aggregate_zero=True),
+        ]
+
+        repository = self._run_promoted_reconciles(ctrl, snapshots)
+
+        assert repository.plan_and_admit_current.call_count == 3
+        assert published_before_retirement == [2]
+        published_targets = [
+            call.args[0].target_capacity for call in
+            ctrl._replica_manager.publish_logical_reconcile_state.call_args_list
+        ]
+        assert published_targets == [1, 0, 0]
+        published_retirement_floors = [
+            call.args[2].target_capacity for call in
+            ctrl._replica_manager.publish_logical_reconcile_state.call_args_list
+        ]
+        assert published_retirement_floors == [1, 1, 0]
+
     def test_additive_route_zero_cannot_retire_paid_capacity(self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
