@@ -4,49 +4,40 @@ Last updated: 2026-09-04
 
 Status: **the PostgreSQL-authoritative reservation-aware planner, exact-card
 compatibility, bounded Spot-only paid admission, historical at-least-100 Spot
-scale, 10,000-request transport, and current-writer provider-native teardown
-are production-proven independently. Release 1.1.1665 deployed the set-based
-paid-admission rewrite and receipt schema 13's evidence-capability correction.
-The current source-qualified successor writes qualification receipt schema 15,
-cleanup receipt schema 4, and lifecycle envelope schema 1. Commits
-``45ef17f2d`` and ``8e1e434bf`` are not yet deployed or production-proven.
-Its current-writer campaign reached 104 provider-``RUNNING`` AWS Spot VMs and
-later peaked at 125, so unpinned provider scale still works, but it first crossed
-100 after about 21 minutes and therefore missed the 900-second correctness gate.
-The campaign did not prove 10,000 successes. Aurora reached its configured eight
-ACU maximum, 100% CPU, and about 837 sessions while long-running disposable
-``sky.launch`` invocation processes each retained reusable, namespaced
-``QueuePool`` sessions for their entire provider call. That process/database
-lifecycle mismatch is the immediate production liveness blocker; the
-set-based admission transaction itself is no longer the observed bottleneck.
-The qualifier also exposed an independent test-plane liveness defect: its loop
-deadlines did not cap an already-awaited provider, PostgreSQL, load-balancer, or
-telemetry observation, so the nominal 900-second proof did not return at its
-deadline. A second source correction closes a false-green evidence boundary:
-the paid qualifier no longer impersonates the production asynchronous request
-protocol. It sends ordinary authenticated synchronous requests, the selected
-synthetic backend performs the bounded work, and only that backend returns the
-exact request ID in an HTTP 200 response. The client cannot manufacture a
-completion, and it never replays an ambiguous POST. The 10,000-success gate
-therefore represents 10,000 exact backend responses without coupling Spot
-provider qualification to the asynchronous ledger. The current source
-checkpoint moves synchronous provider and
-PostgreSQL observation behind two persistent, single-flight child process
-groups, one per dependency/client-lifetime authority domain. Cross-domain
-commands are rejected and unnecessary environment credentials are removed as
-defense in depth, but the children share the pod UID, ServiceAccount, mounts,
-and network and are not security sandboxes. Their JSON-lines commands consume
-the proof's remaining absolute phase budget; timeout or cancellation kills and
-reaps the whole group before control returns. This amortizes interpreter and
-client startup without weakening physical cancellation. It
-still requires deterministic regression gates, a homogeneous deployment, and
-a fresh current-writer ≥100/10,000/drain/exact-zero campaign. At 08:32--08:34
-UTC, supported sequential normal ``sky down`` removed exact cohort-15 rows
-121--136; the controller projected all 16 associations to
-``ABSENT/PROJECTED``, and services, replicas, claims, waiters, clusters, AWS
-``eu-south-2`` instances, and EBS volumes all reached and retained exact zero.
-This closes the prior database-settlement gate; scale latency and the complete
-10,000-success campaign remain open.**
+scale, 10,000-request transport, and provider-native teardown are
+production-proven independently. Production is homogeneous on release
+``1.1.1673`` at Helm revision 772. The fresh ``paid-e2e-scale2`` qualification
+did not close the combined current-writer gate: it committed 300 claims and
+planned 400 logical slots, but reached only 30 provider-``RUNNING`` AWS Spot
+VMs before the run was stopped. Thirty-seven other exact ``g6.4xlarge`` pools
+had already been admitted by the PostgreSQL catalog authority, then failed
+before provider I/O because the executor re-ran its process-local optimizer and
+rejected those locations. This is a duplicate-decision-path defect, not Spot
+scarcity. A source-qualified correction restores the exact bound task resource
+after request serialization and bypasses the outer optimizer, the under-lock
+planner, and the VM provisioner's cross-pool retry optimizer; the
+provider-effect fence remains the final launch authority.
+
+The finalizer returned AWS instances and EBS volumes to exact provider zero, so
+the failed run has no billable compute tail. Formal cleanup nevertheless left
+22 provider-absent ``INIT`` cluster/replica rows. Their UUID-fenced down request
+entered the general mutating status refresher; confirmed provider absence made
+that refresher invoke name-only ``post_teardown_cleanup()``, which correctly
+rejected the action-aware row. The corrective boundary is narrower: an
+identity-fenced teardown bypasses the generic mutating status refresher,
+repeatedly revalidates the exact cluster-record UUID, serialized handle, and
+continuation guard, and invokes the idempotent provider terminator whenever a
+provider YAML is present. A missing provider YAML is not interpreted as an
+empty provider inventory: for the current action-aware cohort it is the audited
+checkpoint written only after provider and auxiliary teardown, so cleanup may
+finish by removing that exact UUID-and-handle row. No name-only mutation or raw
+inventory observation receives action authority.
+
+Both corrections require merge, one homogeneous Helm deployment, supported
+retirement of the 22 retained rows, and a fresh AWS/GCP campaign proving at
+least 100 provider-running Spot VMs, 10,000 exact bounded-batch HTTP successes,
+and natural exact-zero shutdown. Only then can ``boltz-l4-fleet`` be recreated
+and qualified against the unchanged Kueue policy.**
 The failed qualification did not leak billable provider state. Its
 cancellation-safe finalizer retained the exact service scope while normal
 controller teardown reduced the campaign's scoped AWS Spot VMs to zero.

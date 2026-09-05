@@ -388,6 +388,72 @@ def _finalize_reserved_fill_resources(
     task.best_resources = launchable
 
 
+def _finalize_bound_ordinary_paid_resources(
+    task: 'sky.Task',
+    launch_context: dict[str, Any],
+) -> bool:
+    """Recover one PostgreSQL-admitted paid placement without re-planning.
+
+    The exact catalog member, request body, paid claim, and replica association
+    are committed atomically before this executor sees the request.  A local
+    optimizer has neither the same snapshot nor authority to replace that
+    decision.  It may have a stale catalog and reject a valid persisted pool.
+
+    This function only restores the concrete ``best_resources`` erased by task
+    serialization.  The ordinary provider-effect guard still validates the
+    active claim and its planner-owned authorization transactionally before
+    any cloud I/O, and the provider path still produces typed capacity
+    evidence.
+    """
+    if ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY not in (
+            launch_context):
+        return False
+    context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+        launch_context)
+    if (context.profile.kind is not ordinary_launch_binding.
+            NonPoolLaunchProfileKind.ORDINARY_PAID):
+        return False
+    pool = ordinary_launch_binding.ordinary_paid_pool_identity(context)
+
+    candidates = tuple(task.resources)
+    if len(candidates) != 1:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Bound ordinary-paid launch does not contain one exact resource.')
+    if task.num_nodes != pool.num_nodes:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Bound ordinary-paid launch node count disagrees with its exact '
+            'paid pool.')
+    candidate = candidates[0]
+    accelerators = candidate.accelerators
+    normalized_accelerators: list[list[str | int]] | None = None
+    if (isinstance(accelerators, dict) and all(
+            isinstance(name, str) and name and type(count) is int and count > 0
+            for name, count in accelerators.items())):
+        normalized_accelerators = sorted(
+            [[str(name).casefold(), count]
+             for name, count in accelerators.items()],
+            key=lambda item: item[0])
+    exact_resource = bool(candidate.cloud is not None and
+                          str(candidate.cloud).casefold() == pool.cloud and
+                          candidate.region == pool.region and
+                          candidate.zone == pool.zone and
+                          candidate.instance_type == pool.instance_type and
+                          candidate.use_spot is True and normalized_accelerators
+                          == [[pool.accelerator, pool.gpu_units_per_node]])
+    if not exact_resource:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Bound ordinary-paid launch resource disagrees with its exact '
+            'paid pool.')
+    try:
+        launchable = candidate.assert_launchable()
+    except AssertionError as error:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Bound ordinary-paid launch does not contain a finalized '
+            'launchable resource.') from error
+    task.best_resources = launchable
+    return True
+
+
 @contextlib.contextmanager
 def _reserved_fill_effect_epoch(
         launch_context: dict[str, Any]) -> typing.Iterator[None]:
@@ -779,6 +845,7 @@ def _execute_dag_under_provider_fence(
     assert len(dag) == 1, f'We support 1 task for now. {dag}'
     task = dag.tasks[0]
     reserved_fill_launch_fence = _reserved_fill_launch_fence
+    bound_ordinary_paid = False
     if reserved_fill_launch_fence is not None:
         # Server policy has already returned the final task.  Protocol-v2
         # carries one exact controller-selected resource in that task, so
@@ -786,6 +853,9 @@ def _execute_dag_under_provider_fence(
         # this attempt.  This is deterministic for both first execution and a
         # replay after a partial provider effect.
         _finalize_reserved_fill_resources(task, reserved_fill_launch_fence)
+    else:
+        bound_ordinary_paid = _finalize_bound_ordinary_paid_resources(
+            task, _extra_launch_context)
 
     if any(r.job_recovery is not None for r in task.resources):
         job_logger.warning(
@@ -972,7 +1042,7 @@ def _execute_dag_under_provider_fence(
     # into the backend, we inject a small planner the backend can call under
     # the lock only when no reusable snapshot and no caller plan exist.
     planner: Callable[[sky.Task], resources_lib.Resources] | None = None
-    if (reserved_fill_launch_fence is None and
+    if (reserved_fill_launch_fence is None and not bound_ordinary_paid and
             isinstance(backend, backends.CloudVmRayBackend) and
             Stage.OPTIMIZE in stages):
 
@@ -1062,6 +1132,7 @@ def _execute_dag_under_provider_fence(
     if isinstance(backend, backends.CloudVmRayBackend):
         kueue_registration = {
             'kueue_admission_runtime': kueue_admission_runtime,
+            'exact_ordinary_paid_placement': bound_ordinary_paid,
         }
 
     backend.register_info(
