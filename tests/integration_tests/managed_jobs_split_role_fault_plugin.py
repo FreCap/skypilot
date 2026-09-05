@@ -10,8 +10,11 @@ import typing
 import fastapi
 from starlette import responses as starlette_responses
 
+from sky import check as sky_check
 from sky import core as sky_core
+from sky import exceptions
 from sky.backends import cloud_vm_ray_backend
+from sky.clouds import cloud as sky_cloud
 from sky.jobs import controller as managed_job_controller
 from sky.jobs import managed_job_refresh_thread
 from sky.jobs import utils as managed_job_utils
@@ -174,6 +177,32 @@ class ManagedJobsSplitRoleFaultPlugin(plugins.BasePlugin):
             # cloud provider, even if the empty-task shortcut regresses.
             setattr(cloud_vm_ray_backend.CloudVmRayBackend, '_provision',
                     _block_billable_provisioning)
+
+            # This is an unpaid process harness, so cloud capability discovery
+            # is outside its contract too. Empty discovery results are not
+            # cached in production and otherwise make the four nested request
+            # paths depend on provider CLIs and network timing.
+            def hermetic_cloud_discovery(
+                capability: sky_cloud.CloudCapability,
+                raise_if_no_cloud_access: bool = False,
+            ) -> list[typing.Any]:
+                if capability not in (sky_cloud.CloudCapability.COMPUTE,
+                                      sky_cloud.CloudCapability.STORAGE):
+                    raise AssertionError(
+                        f'Unexpected cloud capability probe: {capability!r}')
+
+                def record_probe(state: dict[str, typing.Any]) -> None:
+                    state['cloud_discovery_calls_stubbed'] = int(
+                        state.get('cloud_discovery_calls_stubbed', 0)) + 1
+
+                _mutate_state(self._state_path, record_probe)
+                if raise_if_no_cloud_access:
+                    raise exceptions.NoCloudAccessError(
+                        'Cloud access is disabled by the unpaid E2E harness.')
+                return []
+
+            sky_check.get_cached_enabled_clouds_or_refresh = (
+                hermetic_cloud_discovery)
             if os.environ.get('SKYPILOT_API_SERVER_ROLE') == 'controller':
                 original_down = sky_core.down
 
@@ -186,6 +215,8 @@ class ManagedJobsSplitRoleFaultPlugin(plugins.BasePlugin):
 
                 def record_executor_guard(state: dict[str, typing.Any]) -> None:
                     state['controller_executor_provision_guard_installed'] = 1
+                    state[
+                        'controller_executor_cloud_discovery_stub_installed'] = 1
 
                 _mutate_state(self._state_path, record_executor_guard)
             return

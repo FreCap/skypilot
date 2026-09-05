@@ -337,6 +337,8 @@ def test_managed_job_nested_requests_survive_two_controller_successors(
         'recovery_paused': 0,
         'nonloopback_auth_installed': 0,
         'controller_executor_provision_guard_installed': 0,
+        'controller_executor_cloud_discovery_stub_installed': 0,
+        'cloud_discovery_calls_stubbed': 0,
         'result_fault_controller_instance_id': _C1_ID,
         'c1_down_request_id': '',
         'c1_last_down_handler_request_id': '',
@@ -433,6 +435,10 @@ def test_managed_job_nested_requests_survive_two_controller_successors(
             lambda: _read_fault_state(fault_state).get(
                 'controller_executor_provision_guard_installed') == 1,
             'controller executor fail-closed provisioning guard')
+        _wait_for(lambda: _read_fault_state(fault_state).get(
+            'controller_executor_cloud_discovery_stub_installed') == 1,
+                  'controller executor hermetic cloud discovery stub',
+                  timeout=10)
 
         response = requests.post(f'{api_url}/jobs/launch',
                                  headers={
@@ -452,9 +458,18 @@ def test_managed_job_nested_requests_survive_two_controller_successors(
         response.raise_for_status()
         assert response.headers.get('X-Skypilot-Request-ID')
 
-        _wait_for(
-            lambda: _read_fault_state(fault_state).get('cleanup_paused') == 1,
-            'C1 cleanup barrier')
+        def c1_cleanup_barrier():
+            current_fault_state = _read_fault_state(fault_state)
+            if current_fault_state.get('cleanup_paused') == 1:
+                return True
+            raise RuntimeError(
+                'C1 has not reached cleanup; '
+                f'fault_state={json.dumps(current_fault_state, sort_keys=True)}; '
+                f'process_returncode={c1.process.poll()}')
+
+        _wait_for(c1_cleanup_barrier, 'C1 cleanup barrier')
+        assert _read_fault_state(
+            fault_state)['cloud_discovery_calls_stubbed'] >= 4
         c1_job = typing.cast(dict[str, typing.Any], _job_row(engine))
         job_id = int(c1_job['spot_job_id'])
         assert c1_job['task_status'] == 'SUCCEEDED'

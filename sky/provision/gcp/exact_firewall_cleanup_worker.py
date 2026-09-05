@@ -22,9 +22,13 @@ def main(argv: list[str]) -> int:
             project_id,
             cluster_name_on_cloud,
             deadline_monotonic=deadline_monotonic)
-    except BaseException as error:  # pylint: disable=broad-except
+    # This synchronous one-shot child translates every Python failure,
+    # including SystemExit(0), into a non-success exit. Its parent owns
+    # cancellation and descendant extinction through bounded process-group
+    # termination and reaping.
+    except BaseException as error:  # noqa: ASYNC103  # pylint: disable=broad-except
         print(f'{type(error).__name__}: {error}', file=sys.stderr, flush=True)
-        return 1
+        return 1  # noqa: ASYNC104
     return (
         0 if deleted else instance._EXACT_FIREWALL_ALREADY_ABSENT_RETURN_CODE)  # pylint: disable=protected-access
 

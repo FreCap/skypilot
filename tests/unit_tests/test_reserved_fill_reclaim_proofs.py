@@ -743,9 +743,21 @@ def test_admission_readiness_requires_exact_receipt_and_renewal_reserve(
         assert not ready(connection)
 
 
-def test_one_renewal_serves_100_concurrent_consumers_without_provider_io(
-        proof_engine):
+@pytest.mark.parametrize(
+    ('consumer_count', 'consumer_worker_count'),
+    ((1, 1),
+     pytest.param(100,
+                  31,
+                  marks=pytest.mark.serve054_process_pressure,
+                  id='100-consumers-31-read-lanes')))
+def test_one_renewal_serves_receipt_consumers_without_provider_io(
+        proof_engine, consumer_count, consumer_worker_count):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    # This test-only watchdog admits the complete eight-second renewal
+    # contract plus one two-second read result handoff. Each consumer still
+    # owns the unchanged production two-second database-read deadline.
+    watchdog_seconds = (reclaim.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS +
+                        reclaim.PROVIDER_PROOF_READ_TIMEOUT_SECONDS)
     provider_calls = 0
     renewal_started = threading.Event()
     release_renewal = threading.Event()
@@ -755,7 +767,7 @@ def test_one_renewal_serves_100_concurrent_consumers_without_provider_io(
         provider_calls += 1
         if provider_calls == 2:
             renewal_started.set()
-            assert release_renewal.wait(timeout=5)
+            assert release_renewal.wait(timeout=watchdog_seconds)
         return _proof_candidate()
 
     seeded = _renew_receipt(repository, prove)
@@ -775,14 +787,24 @@ def test_one_renewal_serves_100_concurrent_consumers_without_provider_io(
                         reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS + 1)
             })
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=consumer_worker_count + 1) as executor, \
+            contextlib.ExitStack() as renewal_cleanup:
+        # ExitStack closes before the executor, so an assertion cannot strand
+        # the renewal owner while ThreadPoolExecutor waits for its worker.
+        renewal_cleanup.callback(release_renewal.set)
         renewing = executor.submit(_renew_receipt, repository, prove)
-        assert renewal_started.wait(timeout=5)
+        assert renewal_started.wait(timeout=watchdog_seconds)
         reads = tuple(
-            executor.submit(_read_receipt, repository) for _ in range(100))
-        read_receipts = tuple(future.result(timeout=5) for future in reads)
+            executor.submit(_read_receipt, repository)
+            for _ in range(consumer_count))
+        _, pending = concurrent.futures.wait(
+            reads, timeout=reclaim.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
+        assert not pending, (
+            f'{len(pending)} receipt consumers outlived the renewal horizon.')
+        read_receipts = tuple(future.result() for future in reads)
         release_renewal.set()
-        renewed = renewing.result(timeout=5)
+        renewed = renewing.result(timeout=watchdog_seconds)
 
     assert provider_calls == 2
     assert renewed.publication_observed
@@ -2187,27 +2209,44 @@ def test_multiprocess_renewers_share_receipt_and_launch_reads(
 
 
 def test_aged_identical_receipt_refreshes_once_without_revoking_reference(
-        proof_engine):
+        proof_engine, monkeypatch):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    worker_count = 8
+    publication_barrier = threading.Barrier(worker_count)
     calls = 0
     calls_lock = threading.Lock()
+    original_wait = repository._wait_for_published_receipt
 
     def prove():
         nonlocal calls
         with calls_lock:
             calls += 1
-        time.sleep(0.1)
+            call_number = calls
+        # The seed is call one. Hold the refresh owner until every other
+        # contender has lost election and physically entered receipt polling.
+        if call_number == 2:
+            publication_barrier.wait(
+                timeout=reclaim.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
         return _proof_candidate()
+
+    def wait_after_losing_election(**wait_kwargs):
+        publication_barrier.wait(
+            timeout=reclaim.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
+        return original_wait(**wait_kwargs)
+
+    monkeypatch.setattr(repository, '_wait_for_published_receipt',
+                        wait_after_losing_election)
 
     kwargs = {
         'identity': _identity(),
         'gate_generation': _GATE_GENERATION,
         'kubernetes_context': _CONTEXT,
-        'deadline_monotonic': time.monotonic() + 5,
         'prove': prove,
         'validate': _accept_payload,
     }
-    first = repository.renew(**kwargs)
+    first = repository.renew(
+        **kwargs,
+        deadline_monotonic=reclaim.new_provider_proof_operation_deadline())
     assert first.publication_observed
     with proof_engine.begin() as connection:
         connection.execute(
@@ -2222,13 +2261,18 @@ def test_aged_identical_receipt_refreshes_once_without_revoking_reference(
             })
 
     def refresh():
-        return repository.renew(**{
+        return repository.renew(
             **kwargs,
-            'deadline_monotonic': time.monotonic() + 5,
-        })
+            deadline_monotonic=reclaim.new_provider_proof_operation_deadline())
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        refreshed = tuple(executor.map(lambda _: refresh(), range(8)))
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=worker_count) as executor, contextlib.ExitStack(
+            ) as barrier_cleanup:
+        # ExitStack closes before the executor, so a failed assertion cannot
+        # strand workers at the test-only barrier during executor shutdown.
+        barrier_cleanup.callback(publication_barrier.abort)
+        refreshed = tuple(executor.map(lambda _: refresh(),
+                                       range(worker_count)))
     assert calls == 2
     assert any(item.publication_observed for item in refreshed)
     refreshed_nonces = {item.reference.receipt_nonce for item in refreshed}

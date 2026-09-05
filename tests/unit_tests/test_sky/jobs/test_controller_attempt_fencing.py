@@ -1,4 +1,5 @@
 """Exact-attempt fencing tests for managed-job task mutations."""
+# pylint: disable=protected-access,redefined-outer-name,use-implicit-booleaness-not-comparison
 
 import asyncio
 import contextlib
@@ -175,6 +176,185 @@ def test_stale_attempt_cannot_mutate_task_or_emit_event(managed_jobs_db,
     assert status == state.ManagedJobStatus.STARTING.value
     assert events == []
     assert callbacks == []
+
+
+def test_stale_local_parent_cannot_claim_pure_backlog(managed_jobs_db,
+                                                      monkeypatch):
+    """A detached local slot fails closed after its exact parent is gone."""
+    job_id = 42
+    with orm.Session(managed_jobs_db) as session:
+        session.execute(state.job_info_table.insert().values(
+            spot_job_id=job_id,
+            name='local-backlog',
+            schedule_state=state.ManagedJobScheduleState.WAITING.value))
+        session.execute(state.spot_table.insert().values(
+            spot_job_id=job_id,
+            task_id=0,
+            task_name='task-0',
+            status=state.ManagedJobStatus.PENDING.value))
+        session.commit()
+
+    _publish_local_slot(monkeypatch, _CURRENT_ATTEMPT)
+    current_ticks = int(
+        os.environ[managed_job_constants.CONTROLLER_OWNER_START_TICKS_ENV_VAR])
+    monkeypatch.setenv(
+        managed_job_constants.CONTROLLER_OWNER_START_TICKS_ENV_VAR,
+        str(current_ticks + 1))
+
+    assert state.has_jobs_requiring_recovery_grace_wait() is False
+    with pytest.raises(controller_fencing.ControllerLeadershipLostError,
+                       match='local runtime owner is no longer current'):
+        asyncio.run(
+            state.get_waiting_job_async(
+                pid=os.getpid(),
+                pid_started_at=time.monotonic(),
+                controller_slot_id=_SLOT_ID,
+                controller_slot_attempt=_CURRENT_ATTEMPT))
+
+    with orm.Session(managed_jobs_db) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                state.job_info_table.c.schedule_state,
+                state.job_info_table.c.controller_pid,
+                state.job_info_table.c.controller_instance_id,
+                state.job_info_table.c.controller_generation,
+            ).where(state.job_info_table.c.spot_job_id == job_id)).one()
+    assert tuple(row) == (
+        state.ManagedJobScheduleState.WAITING.value,
+        None,
+        None,
+        None,
+    )
+
+
+def test_local_parent_loss_after_validation_rolls_back_backlog_claim(
+        managed_jobs_db, monkeypatch):
+    """Successor recovery cannot be followed by one stale local claim."""
+    job_id = 43
+    with orm.Session(managed_jobs_db) as session:
+        session.execute(state.job_info_table.insert().values(
+            spot_job_id=job_id,
+            name='local-handoff-backlog',
+            schedule_state=state.ManagedJobScheduleState.WAITING.value))
+        session.execute(state.spot_table.insert().values(
+            spot_job_id=job_id,
+            task_id=0,
+            task_name='task-0',
+            status=state.ManagedJobStatus.PENDING.value))
+        session.commit()
+
+    _publish_local_slot(monkeypatch, _CURRENT_ATTEMPT)
+    initial_owner_validated = threading.Event()
+    release_stale_claim = threading.Event()
+    real_lock_owner = state._lock_current_controller_owner_async
+    owner_checks = []
+
+    async def pause_after_initial_owner_check(session, owner):
+        owner_checks.append(owner)
+        check_number = len(owner_checks)
+        await real_lock_owner(session, owner)
+        if check_number == 1:
+            initial_owner_validated.set()
+            assert release_stale_claim.wait(timeout=5)
+
+    monkeypatch.setattr(state, '_lock_current_controller_owner_async',
+                        pause_after_initial_owner_check)
+    claim_result = {}
+
+    def claim_waiting_job():
+        try:
+            claim_result['value'] = asyncio.run(
+                state.get_waiting_job_async(
+                    pid=os.getpid(),
+                    pid_started_at=time.monotonic(),
+                    controller_slot_id=_SLOT_ID,
+                    controller_slot_attempt=_CURRENT_ATTEMPT))
+        except BaseException as error:  # pylint: disable=broad-except
+            claim_result['error'] = error
+
+    claim_thread = threading.Thread(target=claim_waiting_job)
+    claim_thread.start()
+    try:
+        assert initial_owner_validated.wait(timeout=5)
+
+        successor = ('87654321-4321-4234-8234-cba987654321', 18)
+        monkeypatch.setenv(
+            managed_job_constants.CONTROLLER_OWNER_INSTANCE_ID_ENV_VAR,
+            successor[0])
+        monkeypatch.setenv(
+            managed_job_constants.CONTROLLER_OWNER_GENERATION_ENV_VAR,
+            str(successor[1]))
+        monkeypatch.delenv(managed_job_constants.CONTROLLER_SLOT_ID_ENV_VAR)
+        monkeypatch.delenv(
+            managed_job_constants.CONTROLLER_SLOT_ATTEMPT_ENV_VAR)
+
+        def quiesce_stale_requests(owner):
+            assert owner == successor
+            with orm.Session(managed_jobs_db) as session:
+                result = session.execute(
+                    sqlalchemy.update(state.job_info_table).where(
+                        state.job_info_table.c.spot_job_id == job_id).values(
+                            controller_slot_quiescing=True))
+                session.commit()
+            assert result.rowcount == 1
+            return 1
+
+        monkeypatch.setattr(state.api_requests,
+                            'quiesce_stale_managed_job_requests',
+                            quiesce_stale_requests)
+        assert state.reset_stale_jobs_for_current_controller() == 1
+
+        with orm.Session(managed_jobs_db) as session:
+            recovered = session.execute(
+                sqlalchemy.select(
+                    state.job_info_table.c.schedule_state,
+                    state.job_info_table.c.controller_instance_id,
+                    state.job_info_table.c.controller_generation,
+                    state.job_info_table.c.controller_slot_quiescing,
+                ).where(state.job_info_table.c.spot_job_id == job_id)).one()
+        assert tuple(recovered) == (
+            state.ManagedJobScheduleState.WAITING.value,
+            None,
+            None,
+            False,
+        )
+
+        # Resume the already validated old slot only after its exact parent
+        # proof has become stale. A post-write owner check must roll back its
+        # LAUNCHING update while it still holds SQLite's writer lock.
+        _publish_local_slot(monkeypatch, _CURRENT_ATTEMPT)
+        current_ticks = int(os.environ[
+            managed_job_constants.CONTROLLER_OWNER_START_TICKS_ENV_VAR])
+        monkeypatch.setenv(
+            managed_job_constants.CONTROLLER_OWNER_START_TICKS_ENV_VAR,
+            str(current_ticks + 1))
+        release_stale_claim.set()
+        claim_thread.join(timeout=5)
+        assert not claim_thread.is_alive()
+    finally:
+        release_stale_claim.set()
+        claim_thread.join(timeout=5)
+
+    assert 'value' not in claim_result
+    claim_error = claim_result.get('error')
+    assert isinstance(claim_error,
+                      controller_fencing.ControllerLeadershipLostError)
+    assert 'local runtime owner is no longer current' in str(claim_error)
+    assert owner_checks == [_OWNER, _OWNER]
+    with orm.Session(managed_jobs_db) as session:
+        final_row = session.execute(
+            sqlalchemy.select(
+                state.job_info_table.c.schedule_state,
+                state.job_info_table.c.controller_pid,
+                state.job_info_table.c.controller_instance_id,
+                state.job_info_table.c.controller_generation,
+            ).where(state.job_info_table.c.spot_job_id == job_id)).one()
+    assert tuple(final_row) == (
+        state.ManagedJobScheduleState.WAITING.value,
+        None,
+        None,
+        None,
+    )
 
 
 def test_current_attempt_commits_status_and_event_together(

@@ -147,8 +147,8 @@ def test_fresh_paid_resource_action_identity_is_pure_and_domain_separated(
     assert first.desired_generation == 1
     assert first.replica_incarnation != first.sky_cluster_record_uuid
     assert other_record.replica_incarnation != first.replica_incarnation
-    assert (other_record.sky_cluster_record_uuid !=
-            first.sky_cluster_record_uuid)
+    assert (other_record.sky_cluster_record_uuid
+            != first.sky_cluster_record_uuid)
 
 
 def test_fresh_paid_resource_action_identity_from_context_is_cohort_gated(

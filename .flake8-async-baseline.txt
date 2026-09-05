@@ -3,34 +3,34 @@ sky/client/interactive_utils.py:92:31: ASYNC231 Sync call os.fdopen in async fun
 sky/client/interactive_utils.py:108:24: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/jobs/controller.py:1961:28: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/jobs/controller.py:2079:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/serve/replica_managers.py:5332:21: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:5335:17: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:5501:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:9026:41: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:9029:37: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:9131:21: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:9143:29: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:9149:29: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:9150:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:9159:21: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:9173:21: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:9185:21: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:9893:21: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:10369:37: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:10390:29: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:10401:16: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
-sky/serve/replica_managers.py:10418:24: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
-sky/serve/replica_managers.py:10420:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:10466:24: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
-sky/serve/replica_managers.py:10469:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:15687:28: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
-sky/serve/replica_managers.py:15699:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:15711:28: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
-sky/serve/replica_managers.py:15743:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:15752:28: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
-sky/serve/replica_managers.py:15763:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/serve/replica_managers.py:15778:28: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
-sky/serve/replica_managers.py:15818:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:5559:21: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:5562:17: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:5728:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:9313:41: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:9316:37: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:9418:21: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:9430:29: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:9436:29: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:9437:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:9446:21: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:9460:21: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:9472:21: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:10180:21: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:10656:37: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:10677:29: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:10688:16: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
+sky/serve/replica_managers.py:10705:24: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
+sky/serve/replica_managers.py:10707:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:10753:24: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
+sky/serve/replica_managers.py:10756:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:15988:28: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
+sky/serve/replica_managers.py:16000:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:16012:28: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
+sky/serve/replica_managers.py:16044:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:16053:28: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
+sky/serve/replica_managers.py:16064:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/serve/replica_managers.py:16079:28: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
+sky/serve/replica_managers.py:16119:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
 sky/serve/reserved_capacity_broker.py:1695:17: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
 sky/serve/serve_state.py:4291:25: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
 sky/serve/serve_state.py:4305:17: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.

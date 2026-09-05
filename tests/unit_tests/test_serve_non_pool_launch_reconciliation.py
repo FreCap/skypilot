@@ -29,6 +29,18 @@ from sky.serve import resource_actions
 from sky.utils import subprocess_utils
 
 
+def test_empty_observation_lane_close_does_not_consume_a_deadline(monkeypatch):
+    """A lane without workers has no join or process-reap horizon."""
+    lane = reconciliation.OneShotProviderObservationLane()
+    monotonic = mock.Mock(side_effect=AssertionError('clock must not be read'))
+    monkeypatch.setattr(reconciliation.time, 'monotonic', monotonic)
+
+    lane.close()
+
+    monotonic.assert_not_called()
+    assert not lane.mutation_is_allowed
+
+
 def test_one_shot_provider_observation_lane_is_bounded() -> None:
     lane = reconciliation.OneShotProviderObservationLane()
     release = threading.Event()

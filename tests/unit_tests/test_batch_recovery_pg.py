@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import datetime
 import importlib
+import multiprocessing
 import os
 import shutil
 import threading
@@ -397,6 +398,19 @@ def _seed_waiting_pending_job(engine, job_id):
 @contextlib.contextmanager
 def _live_controller_generation(engine, instance_id: str, generation: int):
     """Publish one leadership row backed by both exact advisory locks."""
+    lock_connection = _publish_live_controller_generation(
+        engine, instance_id, generation)
+    try:
+        yield
+    finally:
+        with engine.begin() as connection:
+            connection.execute(request_postgres.CONTROLLER_LEADERSHIP.delete())
+        lock_connection.invalidate()
+
+
+def _publish_live_controller_generation(engine, instance_id: str,
+                                        generation: int):
+    """Return one physical session holding an exact controller generation."""
     request_postgres.CONTROLLER_LEADERSHIP.create(engine, checkfirst=True)
     election_key = locks.postgres_lock_key('skypilot:api-controller-leader:v1')
     generation_key = locks.postgres_lock_key(
@@ -421,15 +435,47 @@ def _live_controller_generation(engine, instance_id: str, generation: int):
                     acquired_at=sqlalchemy.func.clock_timestamp(),
                     heartbeat_at=sqlalchemy.func.clock_timestamp(),
                     released_at=None))
-        yield
+        return lock_connection
+    except BaseException:
+        lock_connection.invalidate()
+        raise
     finally:
-        with engine.begin() as connection:
-            connection.execute(request_postgres.CONTROLLER_LEADERSHIP.delete())
-        cursor.execute('SELECT pg_advisory_unlock(%s)', (generation_key,))
-        cursor.execute('SELECT pg_advisory_unlock(%s)', (election_key,))
-        lock_connection.commit()
         cursor.close()
-        lock_connection.close()
+
+
+def _claim_waiting_job_process(postgres_url, instance_id, generation,
+                               slot_attempt, ready, release, result_queue):
+    """Claim from an isolated scheduler process under one outer owner."""
+    sync_engine = sqlalchemy.create_engine(postgres_url,
+                                           poolclass=sqlalchemy.pool.NullPool)
+    async_engine = sqlalchemy_async.create_async_engine(
+        sync_engine.url.set(drivername='postgresql+asyncpg'),
+        poolclass=sqlalchemy.pool.NullPool)
+    state._db_manager._engine = sync_engine
+    state._db_manager._engine_async = async_engine
+    try:
+        controller_fencing.publish_owner(
+            (instance_id, generation),
+            mode=controller_fencing.POSTGRES_OWNER_MODE)
+        os.environ[jobs_constants.CONTROLLER_SLOT_ID_ENV_VAR] = str(
+            _CONTROLLER_SLOT_ID)
+        os.environ[jobs_constants.CONTROLLER_SLOT_ATTEMPT_ENV_VAR] = (
+            slot_attempt)
+        ready.set()
+        if not release.wait(timeout=10):
+            raise RuntimeError('test timed out before releasing scheduler')
+        claimed = asyncio.run(
+            state.get_waiting_job_async(pid=os.getpid(),
+                                        pid_started_at=time.monotonic(),
+                                        controller_slot_id=_CONTROLLER_SLOT_ID,
+                                        controller_slot_attempt=slot_attempt))
+        result_queue.put(('claimed', claimed))
+    except BaseException as e:  # pylint: disable=broad-except
+        ready.set()
+        result_queue.put(('error', type(e).__name__, str(e)))
+    finally:
+        asyncio.run(async_engine.dispose())
+        sync_engine.dispose()
 
 
 def test_managed_job_claim_serializes_with_controller_generation_handoff(
@@ -545,6 +591,158 @@ def test_managed_job_claim_serializes_with_controller_generation_handoff(
                 state.spot_table.c.spot_job_id.in_(job_ids)))
             connection.execute(state.job_info_table.delete().where(
                 state.job_info_table.c.spot_job_id.in_(job_ids)))
+
+
+def test_postgres_handoff_fences_late_backlog_claim_without_grace(
+        postgres_engine, monkeypatch):
+    """Handoff-first ordering fences an old process before immediate recovery."""
+    monkeypatch.setattr(state._db_manager, '_engine', postgres_engine)
+    job_id = 4106
+    old_owner = ('3c97d5af-31f9-4a63-a84a-ec1493842297', 31)
+    new_owner = ('6d6a2f13-b3bb-4a2f-a7d6-025751412918', 32)
+    old_slot_attempt = '12345678-1234-4234-8234-123456789abc'
+    new_slot_attempt = '87654321-4321-4234-8234-cba987654321'
+    postgres_url = postgres_engine.url.render_as_string(hide_password=False)
+    process_context = multiprocessing.get_context('spawn')
+    processes = []
+    events = []
+    result_queues = []
+    authority = None
+    _seed_waiting_pending_job(postgres_engine, job_id)
+
+    def start_claim(owner, slot_attempt):
+        ready = process_context.Event()
+        release = process_context.Event()
+        result_queue = process_context.Queue()
+        process = process_context.Process(target=_claim_waiting_job_process,
+                                          args=(postgres_url, owner[0],
+                                                owner[1], slot_attempt, ready,
+                                                release, result_queue))
+        process.start()
+        processes.append(process)
+        events.append(release)
+        result_queues.append(result_queue)
+        assert ready.wait(timeout=10)
+        return process, release, result_queue
+
+    try:
+        authority = _publish_live_controller_generation(postgres_engine,
+                                                        old_owner[0],
+                                                        old_owner[1])
+        old_process, release_old, old_results = start_claim(
+            old_owner, old_slot_attempt)
+
+        # The old scheduler has inherited generation 31 but is paused before
+        # its claim. The row is still pure backlog with no PID or owner.
+        assert state.has_jobs_requiring_recovery_grace_wait() is False
+
+        # Model old-leader death and exact successor election before releasing
+        # the detached scheduler. This is the ordering for which a timing drain
+        # cannot establish correctness.
+        authority.invalidate()
+        authority = _publish_live_controller_generation(postgres_engine,
+                                                        new_owner[0],
+                                                        new_owner[1])
+        assert state.has_jobs_requiring_recovery_grace_wait() is False
+
+        # Recovery owns scheduler admission after handoff. Exercise its real
+        # stale-row reset before either the detached old process or the
+        # successor slot may claim. Request quiescence is a separately tested
+        # subsystem boundary; model only its durable admission-close write.
+        _publish_controller_attempt(monkeypatch,
+                                    new_owner[0],
+                                    new_owner[1],
+                                    postgres=True)
+
+        def close_stale_admission(owner):
+            assert owner == new_owner
+            with postgres_engine.begin() as connection:
+                result = connection.execute(
+                    sqlalchemy.update(state.job_info_table).where(
+                        state.job_info_table.c.spot_job_id == job_id).values(
+                            controller_slot_quiescing=True))
+            assert result.rowcount == 1
+            return 1
+
+        monkeypatch.setattr(state.api_requests,
+                            'quiesce_stale_managed_job_requests',
+                            close_stale_admission)
+        assert state.reset_stale_jobs_for_current_controller() == 1
+        with postgres_engine.connect() as connection:
+            recovered = connection.execute(
+                sqlalchemy.select(
+                    state.job_info_table.c.schedule_state,
+                    state.job_info_table.c.controller_pid,
+                    state.job_info_table.c.controller_instance_id,
+                    state.job_info_table.c.controller_generation,
+                    state.job_info_table.c.controller_slot_quiescing,
+                ).where(state.job_info_table.c.spot_job_id == job_id)).one()
+        assert tuple(recovered) == (
+            state.ManagedJobScheduleState.WAITING.value,
+            None,
+            None,
+            None,
+            False,
+        )
+
+        release_old.set()
+        old_process.join(timeout=15)
+        assert not old_process.is_alive()
+        assert old_process.exitcode == 0
+        old_result = old_results.get(timeout=5)
+        assert old_result[:2] == ('error', 'ControllerLeadershipLostError')
+
+        new_process, release_new, new_results = start_claim(
+            new_owner, new_slot_attempt)
+        release_new.set()
+        new_process.join(timeout=15)
+        assert not new_process.is_alive()
+        assert new_process.exitcode == 0
+        assert new_results.get(timeout=5) == ('claimed', {
+            'job_id': job_id,
+            'pool': None,
+            'cleanup_only': False,
+        })
+
+        with postgres_engine.connect() as connection:
+            row = connection.execute(
+                sqlalchemy.select(
+                    state.job_info_table.c.schedule_state,
+                    state.job_info_table.c.controller_pid,
+                    state.job_info_table.c.controller_instance_id,
+                    state.job_info_table.c.controller_generation,
+                    state.spot_table.c.status,
+                ).select_from(
+                    state.job_info_table.join(
+                        state.spot_table, state.spot_table.c.spot_job_id ==
+                        state.job_info_table.c.spot_job_id)).
+                where(state.job_info_table.c.spot_job_id == job_id)).one()
+        assert row.schedule_state == state.ManagedJobScheduleState.LAUNCHING.value
+        assert row.controller_pid == new_process.pid
+        assert tuple(row)[2:] == (
+            new_owner[0],
+            new_owner[1],
+            state.ManagedJobStatus.PENDING.value,
+        )
+    finally:
+        for event in events:
+            event.set()
+        for process in processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        for result_queue in result_queues:
+            result_queue.close()
+            result_queue.join_thread()
+        if authority is not None:
+            authority.invalidate()
+        with postgres_engine.begin() as connection:
+            connection.execute(request_postgres.CONTROLLER_LEADERSHIP.delete())
+            connection.execute(state.spot_table.delete().where(
+                state.spot_table.c.spot_job_id == job_id))
+            connection.execute(state.job_info_table.delete().where(
+                state.job_info_table.c.spot_job_id == job_id))
 
 
 def test_postgres_pending_cancel_finalizes_in_one_transaction(

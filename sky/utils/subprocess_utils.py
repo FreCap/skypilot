@@ -149,6 +149,8 @@ def terminate_and_reap_process_groups(
     _validate_process_group_grace(reap_grace_seconds, 'reap grace')
     unique_by_pid = {process.pid: process for process in processes}
     owned = tuple(unique_by_pid[pid] for pid in sorted(unique_by_pid))
+    if not owned:
+        return
     for process in owned:
         _signal_process_group(process, signal.SIGTERM)
     term_deadline = time.monotonic() + term_grace_seconds

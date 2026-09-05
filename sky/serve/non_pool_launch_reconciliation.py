@@ -196,10 +196,11 @@ class OneShotProviderObservationLane:
         self._process_registry.close(
             term_grace_seconds=_PROVIDER_CENSUS_WORKER_TERM_GRACE_SECONDS,
             reap_grace_seconds=_PROVIDER_CENSUS_WORKER_REAP_GRACE_SECONDS)
-        join_deadline = (time.monotonic() +
-                         _PROVIDER_CENSUS_WORKER_REAP_GRACE_SECONDS)
-        for worker in workers:
-            worker.join(timeout=max(0, join_deadline - time.monotonic()))
+        if workers:
+            join_deadline = (time.monotonic() +
+                             _PROVIDER_CENSUS_WORKER_REAP_GRACE_SECONDS)
+            for worker in workers:
+                worker.join(timeout=max(0, join_deadline - time.monotonic()))
         self.take_completed()
         with self._state_lock:
             if self._process_registry.process_count:
@@ -336,7 +337,10 @@ def _provider_census_worker_main() -> int:
                 'operations': operations,
             }
         response = {'ok': True, 'result': result}
-    except BaseException as error:  # pylint: disable=broad-except
+    # This synchronous one-shot child translates every Python failure into one
+    # closed protocol response. Its parent owns cancellation and descendant
+    # extinction through bounded process-group termination and reaping.
+    except BaseException as error:  # noqa: ASYNC103  # pylint: disable=broad-except
         response = {
             'ok': False,
             'result': {

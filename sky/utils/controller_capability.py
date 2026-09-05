@@ -33,6 +33,9 @@ _LOCAL_AUTHORITY_KEYS = frozenset({
 })
 _PR_SET_DUMPABLE = 4
 _PR_GET_DUMPABLE = 3
+# Linux keeps procfs birth identity for zombies (Z) and dead tasks (X/x).
+# Those terminal tasks cannot exercise controller authority.
+_TERMINAL_PROCESS_STATES = frozenset({'Z', 'X', 'x'})
 
 # The raw value is deliberately bound to the exact process that consumed its
 # one-shot transport.  A forked user hook therefore cannot turn the inherited
@@ -171,7 +174,10 @@ def local_authority_path(instance_id: str) -> str:
                         f'{canonical_instance_id}.json')
 
 
-def _read_process_start_time_ticks(pid: int) -> int:
+def read_live_process_start_time_ticks(pid: int) -> int:
+    """Return one live Linux process birth identity, excluding terminal tasks."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise ValueError('Controller authority process PID is invalid.')
     with open(f'/proc/{pid}/stat', encoding='utf-8') as stream:
         content = stream.read()
     comm_end = content.rfind(')')
@@ -180,6 +186,12 @@ def _read_process_start_time_ticks(pid: int) -> int:
     fields_after_comm = content[comm_end + 1:].split()
     if len(fields_after_comm) <= 19:
         raise ValueError('Malformed controller authority process identity.')
+    state = fields_after_comm[0]
+    if len(state) != 1:
+        raise ValueError('Malformed controller authority process state.')
+    if state in _TERMINAL_PROCESS_STATES:
+        raise ProcessLookupError(
+            'Controller authority process is no longer live.')
     value = int(fields_after_comm[19])
     if value <= 0:
         raise ValueError('Invalid controller authority process identity.')
@@ -255,7 +267,7 @@ def _local_authority_is_current(
         process_stat = os.stat(f'/proc/{owner_pid}')
         if process_stat.st_uid != os.geteuid():
             return False
-        if _read_process_start_time_ticks(owner_pid) != owner_start_ticks:
+        if read_live_process_start_time_ticks(owner_pid) != owner_start_ticks:
             return False
         return (expected_digest is None or
                 hmac.compare_digest(stored_digest, expected_digest))

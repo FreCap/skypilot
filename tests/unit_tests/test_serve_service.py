@@ -2100,10 +2100,9 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination(
         if not reserved_fill and persist_paid_transition:
             assert binding.provider_present_teardown_phase(info) is (
                 binding.ProviderPresentTeardownPhase.SUBMISSION_RUNNING)
-            assert binding.provider_present_teardown_phase(
-                persisted_info) is (
-                    binding.ProviderPresentTeardownPhase.
-                    ABSENCE_OBSERVATION_PENDING)
+            assert binding.provider_present_teardown_phase(persisted_info) is (
+                binding.ProviderPresentTeardownPhase.ABSENCE_OBSERVATION_PENDING
+            )
 
     reconciliation = service.non_pool_launch_reconciliation
     settled_absent = reconciliation.PaidTeardownObservationStep(

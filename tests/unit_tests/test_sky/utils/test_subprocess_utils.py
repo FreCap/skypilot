@@ -78,6 +78,18 @@ def test_run_in_parallel_copies_context_per_item():
     assert marker.get() == 'parent'
 
 
+def test_empty_process_group_cleanup_does_not_consume_a_deadline(monkeypatch):
+    """No owned process means there is no TERM or reap horizon to measure."""
+    monotonic = mock.Mock(side_effect=AssertionError('clock must not be read'))
+    monkeypatch.setattr(subprocess_utils.time, 'monotonic', monotonic)
+
+    subprocess_utils.terminate_and_reap_process_groups((),
+                                                       term_grace_seconds=1.0,
+                                                       reap_grace_seconds=1.0)
+
+    monotonic.assert_not_called()
+
+
 def test_ssh_thread_pool_executor_copies_context(monkeypatch):
     monkeypatch.setattr(subprocess_utils, 'kill_children_processes',
                         lambda: None)

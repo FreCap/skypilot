@@ -55,8 +55,10 @@ def test_get_kubernetes_nodes():
             utils.get_kubernetes_nodes(context='test')
 
 
-def test_get_kubernetes_node_info():
+def test_get_kubernetes_node_info(monkeypatch):
     """Tests get_kubernetes_node_info function."""
+    monkeypatch.setattr(utils, 'get_gpu_resource_key',
+                        lambda _: 'nvidia.com/gpu')
     # Mock node and pod objects
     mock_gpu_node_1 = mock.MagicMock()
     mock_gpu_node_1.metadata.name = 'node-1'

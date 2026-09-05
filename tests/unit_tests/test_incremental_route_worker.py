@@ -205,6 +205,9 @@ def test_blocked_compose_does_not_block_refresh_or_http_progress():
                 assert await worker._run_tick(mock.Mock(), tasks)
                 await asyncio.sleep(0)
 
+            # Event-loop yields progress probes but do not guarantee that the
+            # independent target-reader thread has entered its submitted call.
+            await _wait_for_call(worker._target_refresh)
             assert probe_count >= 3
             assert repository.list_probe_targets.call_count >= 2
             # Repeated ticks coalesce behind the sole running composition.
