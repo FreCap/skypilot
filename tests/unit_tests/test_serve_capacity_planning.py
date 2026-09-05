@@ -2395,6 +2395,56 @@ def test_fresh_zero_retention_and_ungated_prefill_are_orthogonal() -> None:
     assert plan.reserved_packing_padding_target.as_dict() == {'A100': 8}
 
 
+def test_static_prefill_preserves_independent_zero_retention_cooldown() -> None:
+    state = _policy_state()
+    prior = _prior_candidate(state, target=5)
+    for generation, epoch in ((7, 100.0), (8, 130.0)):
+        snapshot = _snapshot(
+            source_generation=generation,
+            maximum_capacity=20,
+            demand_profiles=(),
+            explicit_demand_profiles=(),
+            paid_demand_profiles=(),
+            minimum_capacity=0,
+            paid_minimum_capacity=0,
+            ready=_capacity(L4=5),
+            planning_purpose=(
+                capacity_planning.CapacityPlanningPurpose.FRESH_ZERO_RETENTION),
+            prior_policy_state=state,
+            prior_candidate=prior,
+            policy_input=_policy_input(
+                planning_db_epoch=epoch,
+                downscale_delay_seconds=300,
+                latest_committed_capacity=5,
+                latest_committed_by_accelerator=_capacity(L4=5)),
+            reservation=_reservation(
+                gate_policy=capacity_planning.ReservationGatePolicy.UNGATED,
+                evidence_state=(capacity_planning.ReservationEvidenceState.
+                                AUTHENTICATED_SETTLED),
+                authenticated=_capacity(A100=3),
+                eligible=_capacity(A100=3),
+                existing_paid=_capacity(L4=5)))
+        plan = capacity_planning.plan_capacity(snapshot)
+        assert plan.kind is capacity_planning.CapacityPlanKind.STATIC_PREFILL
+        # Unmaterialized static prefill cannot substitute for the warm
+        # backends protected by the independently configured cooldown.
+        assert plan.retained_existing_target.as_dict() == {'L4': 5}
+        assert plan.static_prefill_target.as_dict() == {'A100': 3}
+        assert plan.paid_launch_target.total() == 0
+        assert plan.next_policy_state is not None
+        assert plan.next_policy_state.downscale_started_db_epoch == 70
+        finalized = capacity_planning.finalize_capacity_plan(
+            snapshot,
+            plan,
+            accepted_paid_plan_units=_capacity(),
+            accepted_paid_gpu_units=0,
+            decision_db_epoch=epoch)
+        _, prior = capacity_planning.decode_planner_envelope(
+            capacity_planning.planner_envelope(snapshot, finalized))
+        assert prior.next_policy_state is not None
+        state = prior.next_policy_state
+
+
 def test_gate_on_fresh_zero_never_prefills_uncommitted_headroom() -> None:
     plan = capacity_planning.plan_capacity(
         _snapshot(

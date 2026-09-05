@@ -30,6 +30,12 @@ The immediate scope is timely request-driven scale-up and reliable scale-down
 after configurable hysteresis. It does not require instant teardown on an
 empty queue, another cooldown mechanism, or changes to shared Kueue policy.
 
+The fresh-zero cooldown correction is source-qualified: 508 focused planner,
+concurrency and component tests, 43 subtests, and four real-PostgreSQL admission
+regressions pass on Python 3.14. It preserves retention across serialized
+policy handoffs without reviving paid launch authority. Deployment and a
+fresh combined paid lifecycle remain separate open gates.
+
 ## Previous verification snapshot (September 4; historical)
 
 Status: **the PostgreSQL-authoritative reservation-aware planner, exact-card
@@ -3262,7 +3268,7 @@ source qualification and deployment must be recorded separately.
 | Scenario | Evidence required | Current coverage boundary |
 |---|---|---|
 | Cold demand and queue deadlines | Public HTTP remains responsive, reports demand, rejects before dispatch, and safely retries exact rejected requests | `test_lb_cold_queue_component.py` runs the real LB with simulated adjacent processes; component evidence only. |
-| Burst, brief idle, rebound, sustained idle | Production durable planner preserves cooldown and eventually lowers targets; test more than one configured delay and multi-GPU width | A regression must use `plan_durable_capacity_reconcile`, the deployed paid logical path, not only the older local decision helper. |
+| Burst, brief idle, rebound, sustained idle | Production durable planner preserves cooldown and eventually lowers targets; test more than one configured delay and multi-GPU width | `test_serve_demand_hysteresis_component.py` uses `plan_durable_capacity_reconcile` and a serialized policy handoff with a new autoscaler each tick; this does not exercise cloud effects. |
 | Large launch cohort | Multiple committed waves become executing requests while route reads remain responsive; count real database round trips as well as CPU | Unit assertions about an adopter helper alone do not prove the whole controller boundary. |
 | Provider exhaustion and lost acknowledgement | Original typed failure or unresolved exact ownership survives; no duplicate create and no name-only cleanup | Exact identity and PostgreSQL component tests supplement, but do not replace, the process journey. |
 | Restart and delayed deletion | Retain ownership while state is unknown/present, recover on restart, then settle on exact absence | `test_serve_shutdown_reconciliation_component.py` uses PostgreSQL and a delayed AWS network adapter; component evidence only. |
@@ -3722,10 +3728,19 @@ The repository returns one explicit transaction disposition:
 - ``GATE_ACQUISITION`` commits only the acquisition witness and non-null copied
   policy state, with no capacity-effect row or consumed demand generation/paid
   window;
-- ``FRESH_ZERO`` commits an authenticated complete zero head, resets
-  hysteresis and the paid window, inserts no paid rows, applies the defined
-  zero/downscale transition, and revokes every uncommitted positive launch
-  fence;
+- ``FRESH_ZERO`` commits an authenticated complete zero demand head, resets
+  the paid window, inserts no paid rows, and revokes every uncommitted positive
+  launch fence. Existing-capacity retention remains a separate projection:
+  its configured downscale cooldown and wave state survive in the committed
+  policy and candidate. Successive zero observations must reduce that retained
+  target, not reinterpret the zero demand head as an already-drained fleet.
+  A rebound ending the downscale episode resets its cooldown; sustained idle
+  eventually retires each bounded wave. The durable clock is PostgreSQL's
+  planning/decision epoch, not a process-local monotonic timestamp. Retained
+  actuation includes configured overprovision padding exactly once; nonzero
+  padding can retain that many existing slots at idle, without authorizing
+  replacement launches. True scale-to-zero requires zero minimum and
+  overprovision floors and no ungated static fill;
 - ``ABORT_RETRY`` covers stale/incomplete/malformed evidence, route mismatch,
   prepared immutable-template identity or shape, owner/policy drift, and
   transient SQL conflict. It rolls back every successor write and preserves the

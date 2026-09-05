@@ -3203,6 +3203,18 @@ def _reduce_capacity_policy(
         old_map = prior_candidate.demand_attribution
         old_explicit = prior_candidate.explicit_demand_attribution
         old_paid = prior_candidate.paid_demand_attribution
+    if prior_candidate.retained_existing_target.total() > 0:
+        # Fresh zero revokes demand and every cold-launch authority, not the
+        # configured retention episode. Its zero demand head cannot be the
+        # next tick's hysteresis baseline: that would drop a warm fleet on the
+        # second zero observation, regardless of the configured delay.
+        old_map = prior_candidate.retained_existing_target
+        # The retained map is an actuation projection, so it already includes
+        # the configured overprovision padding. Recover its policy base before
+        # the ordinary actuation projection adds that padding exactly once.
+        # Retention may coexist with STATIC_PREFILL; the typed projection,
+        # rather than the candidate kind, owns this history.
+        old_total = max(0, old_map.total() - policy.overprovision_capacity)
     if (prior.snap_target_on_next_recompute and
             prior.adopt_total_capacity_on_next_recompute):
         old_total = max(
@@ -3649,7 +3661,9 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
             fixed_work_by_accelerator=fixed.as_dict(),
             ready_zero_cost=ready_zero_cost,
             committed_zero_cost=existing_zero_cost,
-            free_reserved=free_reserved,
+            # A fresh-zero retention target can reuse only existing backends;
+            # unrelated ungated static prefill is projected separately below.
+            free_reserved={} if fresh_zero else free_reserved,
             ready_paid=ready_paid,
             committed_paid=committed_paid,
             supply_preference=(
@@ -3894,6 +3908,16 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
     }
     static_prefill: dict[str, int] = {}
     if fresh_zero:
+        # Retention is permission to keep already-committed backends, never
+        # permission to materialize the unfilled part of a prior demand wave.
+        # Bind its exact-card projection to current supply before carrying it
+        # into the next tick's hysteresis baseline.
+        actuation = AcceleratorCapacity.from_mapping({
+            card: min(count,
+                      ready.get(card, 0) + provisioning.get(card, 0))
+            for card, count in actuation.entries
+            if ready.get(card, 0) + provisioning.get(card, 0) > 0
+        })
         padding_target = AcceleratorCapacity()
         retained_target = actuation
     else:
@@ -4003,38 +4027,25 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
         last_reduced_generation = prior.last_reduced_demand_generation
         if policy.fresh_demand:
             last_reduced_generation = snapshot.source_generation
+        next_policy_state = dataclasses.replace(
+            prior,
+            service_version=snapshot.service_version,
+            last_reduced_demand_generation=last_reduced_generation,
+            upscale_observations=reduction.upscale_observations,
+            downscale_started_db_epoch=reduction.downscale_started_db_epoch,
+            downscale_veto_streak=reduction.downscale_veto_streak,
+            snap_target_on_next_recompute=(
+                reduction.snap_target_on_next_recompute),
+            adopt_total_capacity_on_next_recompute=(
+                reduction.adopt_total_capacity_on_next_recompute),
+            pending_retention_floor=reduction.pending_retention_floor,
+            pending_capacity_at_adoption=reduction.pending_capacity_at_adoption,
+            pending_budget_spent=reduction.pending_budget_spent)
         if fresh_zero:
             next_policy_state = dataclasses.replace(
-                prior,
-                service_version=snapshot.service_version,
-                last_reduced_demand_generation=last_reduced_generation,
-                upscale_observations=0,
-                downscale_started_db_epoch=None,
-                downscale_veto_streak=0,
-                snap_target_on_next_recompute=False,
-                adopt_total_capacity_on_next_recompute=False,
-                pending_retention_floor=None,
-                pending_capacity_at_adoption=0,
-                pending_budget_spent=0,
+                next_policy_state,
                 paid_window_started_db_epoch=None,
                 paid_window_ceiling_by_accelerator=AcceleratorCapacity())
-        else:
-            next_policy_state = dataclasses.replace(
-                prior,
-                service_version=snapshot.service_version,
-                last_reduced_demand_generation=last_reduced_generation,
-                upscale_observations=reduction.upscale_observations,
-                downscale_started_db_epoch=(
-                    reduction.downscale_started_db_epoch),
-                downscale_veto_streak=reduction.downscale_veto_streak,
-                snap_target_on_next_recompute=(
-                    reduction.snap_target_on_next_recompute),
-                adopt_total_capacity_on_next_recompute=(
-                    reduction.adopt_total_capacity_on_next_recompute),
-                pending_retention_floor=reduction.pending_retention_floor,
-                pending_capacity_at_adoption=(
-                    reduction.pending_capacity_at_adoption),
-                pending_budget_spent=reduction.pending_budget_spent)
     retirement_floor = _compose_retirement_floor(snapshot,
                                                  wave_limited_actuation)
     return CapacityPlanCandidate(
