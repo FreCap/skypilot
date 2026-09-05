@@ -800,6 +800,12 @@ kebab-case filename such as
 
 ## Pull Request Guidelines
 
+Concurrent chats and agents must use separate worktrees and branches. Preserve
+one another's uncommitted work. After related changes merge, fetch and merge
+`origin/improvements` into the working branch and rerun the affected integration
+gates before the next checkpoint. Separate worktrees do not isolate a shared
+deployment: serialize Helm operations and verify the live revision first.
+
 ### Transitional Feature PR Stacks
 
 When a feature introduces temporary transition, compatibility, dual-write,
