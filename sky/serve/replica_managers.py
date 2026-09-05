@@ -4808,10 +4808,14 @@ class SkyPilotReplicaManager(ReplicaManager):
         launch_yaml_content = worker['launch_yaml_content']
         if not isinstance(launch_yaml_content, str):
             raise ValueError('Paid launch YAML construction is malformed.')
-        task_template = load_task_with_service_spec(launch_yaml_content,
-                                                    launch_spec)
-        replica_port = _get_resources_ports(launch_yaml_content, launch_spec,
-                                            task_template)
+        # The atomic admission transaction already derived and validated the
+        # ingress port from this exact immutable version before inserting the
+        # pristine row.  Re-parsing the complete service task once per receipt
+        # member turns a 100-member database wave into minutes of controller
+        # CPU and blocks the successor wave.  This optional process-local
+        # materializer may therefore validate the committed row from its
+        # transaction-owned port; PostgreSQL remains the handoff authority.
+        replica_port = info.replica_port
         expected_state = paid_capacity.build_pristine_paid_replica_state(
             spec,
             replica_port=replica_port,
@@ -5571,31 +5575,43 @@ class SkyPilotReplicaManager(ReplicaManager):
         spec: 'service_spec.SkyServiceSpec | None' = None,
     ) -> '_ReplicaLaunchThread':
         """Reconstruct the exact durable-request adopter for one replica."""
-        if yaml_content is None:
-            yaml_content = (
-                self.yaml_content if info.version == self.latest_version else
-                serve_state.get_yaml_content(self._service_name, info.version))
-        if yaml_content is None:
-            raise ValueError('yaml content not found for bound launch '
-                             f'recovery of version {info.version}')
-        if spec is None:
-            spec = self._version_specs.get(info.version)
-        if spec is None:
-            spec = serve_state.get_spec(self._service_name, info.version)
-        if spec is None:
-            raise ValueError('service spec not found for bound launch '
-                             f'recovery of version {info.version}')
-        task_template = self._task_template_for_version(info.version,
-                                                        yaml_content, spec)
-        recovery_task = _build_replica_launch_task(
-            yaml_content,
-            info.replica_id,
-            info.resources_override,
-            exact_resources_override=info.get_spot_location() is not None,
-            authoritative_service_spec=spec,
-            service_name=self._service_name,
-            task_template=task_template)
-        recovery_cloud = next(iter(recovery_task.resources)).cloud
+        # Current bound non-pool launches persist their exact placer-selected
+        # backend in resources_override.  An adopter only waits for/reduces the
+        # already-enqueued request, so rebuilding the full launch Task merely to
+        # recover its cloud is both redundant and extremely expensive at fleet
+        # scale.  Retain task reconstruction solely for legacy rows that lack
+        # the exact persisted location.
+        location = spot_placer.Location.from_resources_override(
+            _decode_replica_resource_state(info.resources_override))
+        if location is not None:
+            recovery_cloud = location.cloud
+        else:
+            if yaml_content is None:
+                yaml_content = (self.yaml_content
+                                if info.version == self.latest_version else
+                                serve_state.get_yaml_content(
+                                    self._service_name, info.version))
+            if yaml_content is None:
+                raise ValueError('yaml content not found for bound launch '
+                                 f'recovery of version {info.version}')
+            if spec is None:
+                spec = self._version_specs.get(info.version)
+            if spec is None:
+                spec = serve_state.get_spec(self._service_name, info.version)
+            if spec is None:
+                raise ValueError('service spec not found for bound launch '
+                                 f'recovery of version {info.version}')
+            task_template = self._task_template_for_version(
+                info.version, yaml_content, spec)
+            recovery_task = _build_replica_launch_task(
+                yaml_content,
+                info.replica_id,
+                info.resources_override,
+                exact_resources_override=info.get_spot_location() is not None,
+                authoritative_service_spec=spec,
+                service_name=self._service_name,
+                task_template=task_template)
+            recovery_cloud = next(iter(recovery_task.resources)).cloud
         _, reduce_bound, cancel_bound = self._bound_ordinary_launch_callbacks(
             info, recovery_cloud, initial_context=bound_context)
         log_file = serve_utils.generate_replica_launch_log_file_name(
@@ -5732,6 +5748,40 @@ class SkyPilotReplicaManager(ReplicaManager):
                     request_id, info.replica_id)
         return True
 
+    def _queue_bound_launch_adopter(
+        self,
+        info: ReplicaInfo,
+        bound_context: 'BoundLaunchContext',
+    ) -> bool:
+        """Publish one cheap adopter for the normal bulk launch admission.
+
+        Durable queue visibility, not a process-local Thread, owns the launch.
+        Build outside the replica mutation mutex so readiness snapshots remain
+        publishable, then register under a short identity check.  The next
+        refresher pass reserves all available launch slots in one PostgreSQL
+        call and starts the admitted subset.
+        """
+        replica_id = info.replica_id
+        with self.lock:
+            runtime = self._legacy_mutation_runtime_state()
+            if (self._update_recovery_required or
+                    replica_id in runtime.launch_thread_pool or
+                    replica_id in runtime.down_thread_pool):
+                return False
+        launch_thread = self._build_bound_launch_adopter(info, bound_context)
+        with self.lock:
+            runtime = self._legacy_mutation_runtime_state()
+            if (self._update_recovery_required or
+                    replica_id in runtime.launch_thread_pool or
+                    replica_id in runtime.down_thread_pool):
+                return False
+            self._register_bound_launch_adopter(info, bound_context.request_id,
+                                                launch_thread)
+            runtime.launch_completion_event.set()
+        logger.info('Queued exact bound ordinary launch %s for replica %s.',
+                    bound_context.request_id, replica_id)
+        return True
+
     def _schedule_non_pool_provider_reconciliation(
         self,
         info: ReplicaInfo,
@@ -5858,9 +5908,9 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         return lane.schedule(key, _finalize_once)
 
-    def _reconcile_unowned_bound_non_pool_launches(
+    def _adopt_unowned_bound_non_pool_launches(
             self, replica_infos: list[ReplicaInfo]) -> None:
-        """Adopt active requests and reconcile effects from durable state."""
+        """Queue unowned active requests without holding the manager mutex."""
         authority = self._ordinary_launch_binding_authority
         if (authority is None or
                 not authority.retained_non_pool_settlement_allowed):
@@ -5906,13 +5956,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if (reduction is not None and
                         _bound_projection_classification(reduction)
                         in ('ADOPT_ACTIVE', 'WAIT_QUIESCENCE')):
-                    self._install_bound_launch_adopter(info,
-                                                       reduction.context,
-                                                       start=True)
+                    self._queue_bound_launch_adopter(info, reduction.context)
             except Exception as error:  # pylint: disable=broad-except
                 logger.warning(
                     'Unable to adopt durable launch for replica %s: %s',
                     info.replica_id, common_utils.format_exception(error))
+
+    def _reconcile_unowned_bound_non_pool_launches(
+            self, replica_infos: list[ReplicaInfo]) -> None:
+        """Reconcile provider effects for bound requests without local owners."""
+        authority = self._ordinary_launch_binding_authority
+        if (authority is None or
+                not authority.retained_non_pool_settlement_allowed):
+            return
+        runtime = self._legacy_mutation_runtime_state()
         try:
             contexts = (ordinary_launch_binding.
                         list_provider_reconciliation_contexts(authority))
@@ -14799,14 +14856,21 @@ class SkyPilotReplicaManager(ReplicaManager):
             f'the replica table in one batch (versions '
             f'{superseded_versions!r} superseded by {latest_version}).')
 
-    @with_lock
     def _refresh_thread_pool(self) -> None:
-        """Route mutation completion through the current mutation runtime."""
-        if self._update_recovery_required:
-            return
-        self._legacy_mutation_runtime_state().refresh(
-            self._refresh_legacy_mutation_runtime)
-        self._prune_superseded_failed_replicas()
+        """Refresh mutations, then hydrate durable adopters off the mutex."""
+        with self.lock:
+            if self._update_recovery_required:
+                return
+            self._legacy_mutation_runtime_state().refresh(
+                self._refresh_legacy_mutation_runtime)
+            self._prune_superseded_failed_replicas()
+        # A large committed wave can require hundreds of PostgreSQL inspections
+        # and local waiter objects.  None mutates a replica row or grants a
+        # provider effect, so keep it outside the mutex needed by readiness and
+        # route-publication snapshots.  Each adopter is registered under its own
+        # short identity check and wakes this refresher for bulk admission.
+        replica_infos = serve_state.get_replica_infos(self._service_name)
+        self._adopt_unowned_bound_non_pool_launches(replica_infos)
 
     def _refresh_legacy_mutation_runtime(self) -> None:
         """Refresh the launch/down thread pool.
@@ -15252,7 +15316,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     '(%s).', replica_id,
                                     remaining_classification)
                         # If construction failed, leave the dead marker detached
-                        # so _reconcile_unowned_bound_non_pool_launches() can
+                        # so _adopt_unowned_bound_non_pool_launches() can
                         # retry from the same durable pointer in this refresh or
                         # a later one.
                         continue

@@ -6450,8 +6450,11 @@ class TestFillLaunchPath(unittest.TestCase):
             # in-memory retry registry participates, including when
             # the request terminalized before this scan. Model a
             # saturated provider-launch budget and a newly benched
-            # location: this observer is not provider admission and
-            # must start immediately without either gate or deletion.
+            # location: this observer is not provider admission and must queue
+            # the exact adopter without either gate or deletion.  The ordinary
+            # refresher owns all worker starts; because this committed row is
+            # already RUNNING, its next pass starts the adopter without taking
+            # a second launch-budget debit.
             placer.reset_mock()
             placer.is_launch_admissible.return_value = False
             with mock.patch.object(
@@ -6462,14 +6465,13 @@ class TestFillLaunchPath(unittest.TestCase):
                      as redirect_log, \
                  mock.patch.object(manager,
                                    '_remove_replica') as remove:
-                manager._reconcile_unowned_bound_non_pool_launches(
+                manager._adopt_unowned_bound_non_pool_launches(
                     [admitted_info[0]])
                 adopter = manager._launch_thread_pool[7]
-                adopter.join(timeout=2)
-                self.assertFalse(adopter.is_alive())
-                self.assertIsNone(adopter.exception)
+                self.assertIsNone(adopter.ident)
             self.assertEqual(manager._replica_to_request_id[7], 'request-id')
-            reduce_bound.assert_called_once_with(None, None)
+            reduce_bound.assert_not_called()
+            self.assertTrue(manager._launch_completion_event.is_set())
             redirect_log.assert_not_called()
             remove.assert_not_called()
             placer.is_launch_admissible.assert_not_called()
