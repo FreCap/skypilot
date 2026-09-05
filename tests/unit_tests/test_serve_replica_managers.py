@@ -4656,6 +4656,42 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         manager._handle_sky_down_finish.assert_not_called()
         provider_down.assert_not_called()
 
+    def test_projected_paid_census_absence_accepts_retryable_non_shortage_states(
+            self):
+        """Provider cleanup success is independent from capacity feedback."""
+        info = _fake_replica_info(
+            3, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.is_spot = True
+        info.paid_capacity_pool_key = _canonical_paid_pool_key()
+        status = info.status_property
+        status.sky_launch_status = common_utils.ProcessStatus.FAILED
+        status.sky_down_status = common_utils.ProcessStatus.SUCCEEDED
+        # An exact AWS census reports OTHER_FAILURE so the capacity model is
+        # not poisoned.  The settled association remains the cleanup
+        # authority; this scalar is deliberately not a Spot-shortage marker.
+        status.failed_spot_availability = False
+
+        assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+            info)
+
+        # The marker is only a candidate.  An already-absent SkyPilot cluster
+        # row never receives a redundant down transition, so the exact
+        # association/evidence validator remains the deletion authority.
+        status.sky_down_status = None
+        assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+            info)
+
+        # A transient exact-finalizer failure is persisted for visibility and
+        # must remain retryable by the next canonical cleanup pass.
+        status.sky_down_status = common_utils.ProcessStatus.FAILED
+        assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+            info)
+
+        # Keep malformed legacy scalar state outside the candidate set.
+        status.failed_spot_availability = None
+        assert not ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+            info)
+
     def test_projected_paid_auxiliary_finalization_uses_bounded_lane(self):
         manager = _make_manager()
         info = _fake_replica_info(
@@ -4703,7 +4739,6 @@ class TestBoundOrdinaryLaunchManagerIntegration:
     @pytest.mark.parametrize('down_status', [
         common_utils.ProcessStatus.SCHEDULED,
         common_utils.ProcessStatus.RUNNING,
-        common_utils.ProcessStatus.FAILED,
         common_utils.ProcessStatus.INTERRUPTED,
     ])
     def test_projected_paid_absence_rejects_inexact_down_marker(

@@ -2643,6 +2643,64 @@ def test_cleanup_routes_provider_absent_paid_replica_to_exact_finalizer(
     provider_down.assert_not_called()
 
 
+def test_cleanup_routes_completed_paid_census_to_exact_finalizer():
+    """The post-down census shape must still clean action-owned auxiliaries."""
+    info = _provider_absent_paid_cleanup_info()
+    status = info.status_property
+    status.sky_launch_status = service.common_utils.ProcessStatus.FAILED
+    status.sky_down_status = service.common_utils.ProcessStatus.SUCCEEDED
+    status.is_scale_down = False
+    status.failed_spot_availability = False
+    status.drain_cap_seconds = None
+    lifecycle_lock = mock.Mock(epoch=31)
+    expected_owner = (4242, '10.4.7.7')
+
+    with mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=[info]), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(service.serve_utils,
+                           'get_existing_replica_cluster_names',
+                           return_value={info.cluster_name}), \
+         mock.patch.object(
+             service.request_postgres,
+             'bound_non_pool_projected_provider_absence_is_authorized',
+             return_value=True) as authorize, \
+         mock.patch.object(
+             service.replica_managers,
+             'finalize_projected_paid_provider_absence',
+             return_value=True) as exact_finalize, \
+         mock.patch.object(serve_state,
+                           'add_or_update_replica', return_value=True) \
+             as persist, \
+         mock.patch.object(service.reserved_capacity,
+                           'parse_protocol_v2_cleanup_fence') as parse_fence, \
+         mock.patch.object(service.replica_managers,
+                           'terminate_cluster') as provider_down, \
+         mock.patch.object(service,
+                           'cleanup_storage_intents', return_value=True):
+        assert not service._cleanup('svc', False, 'incarnation-a',
+                                    expected_owner[0], expected_owner[1],
+                                    lifecycle_lock)
+
+    authorize.assert_called_once_with('svc', 3, info.replica_record_id)
+    exact_finalize.assert_called_once()
+    assert exact_finalize.call_args.args == ('svc', 3, info.replica_record_id,
+                                             info.cluster_name)
+    assert exact_finalize.call_args.kwargs[
+        'provider_operation_deadline_monotonic'] > time.monotonic()
+    assert callable(exact_finalize.call_args.kwargs['continue_guard'])
+    persist.assert_not_called()
+    parse_fence.assert_not_called()
+    provider_down.assert_not_called()
+
+
 def test_cleanup_retains_replica_when_teardown_identity_snapshot_changes():
     status_property = mock.Mock(
         sky_launch_status=service.common_utils.ProcessStatus.SUCCEEDED)

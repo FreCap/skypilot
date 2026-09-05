@@ -3463,6 +3463,100 @@ def test_aws_paid_infrastructure_terminal_census_reaches_exact_cleanup(
     assert pin_count == expected_pins
 
 
+@pytest.mark.parametrize('down_status',
+                         [None, common_utils.ProcessStatus.SUCCEEDED])
+def test_aws_paid_census_absence_requires_exact_finalization_before_service_delete(
+        bound_request_database, monkeypatch, down_status) -> None:
+    """Exact finalization, not a scalar shortage bit, authorizes deletion."""
+    graph = _prepare_paid_provider_absence_graph(bound_request_database,
+                                                 monkeypatch)
+    scope = request_postgres.bound_non_pool_aws_provider_census_scope(
+        graph.context, graph.authority)
+    assert scope is not None
+    payload = {
+        'association_id': str(graph.context.association_id),
+        'cluster_name': 'gc-service-3',
+        'instances': [],
+        'probe_contract': 'aws-client-token-instance-presence-v1',
+        'profile_kind': 'ORDINARY_PAID',
+        'provider_identity': scope.provider_identity,
+        'replica_record_id': str(_GC_REPLICA_RECORD_ID),
+        'result': 'ABSENT',
+    }
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, graph.authority,
+        ordinary_launch_binding.ProviderEvidence.ABSENT, payload)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    manager._ordinary_launch_binding_authority = graph.authority
+    assert request_postgres.project_bound_non_pool_provider_absence(
+        graph.context,
+        graph.authority,
+        project_replica_result=lambda connection, projection: manager.
+        _project_bound_ordinary_launch(None, connection, projection))
+
+    info = serve_state.get_replica_info_from_id('gc-service', 3)
+    assert info is not None
+    status = info.status_property
+    assert status.sky_launch_status is common_utils.ProcessStatus.FAILED
+    assert status.sky_down_status is None
+    assert status.failed_spot_availability is False
+    assert status.is_scale_down is False
+    if down_status is not None:
+        # UUID-fenced core.down on a no-YAML cluster record completed.  Its
+        # normal result projection persists this monotonic terminal status
+        # without manufacturing Spot-shortage feedback.
+        status.sky_down_status = down_status
+        assert serve_state.add_or_update_replica(
+            'gc-service',
+            3,
+            info,
+            expected_service_hash='gc-service-hash',
+            expected_lifecycle_epoch=4,
+            expected_controller_owner=(123, '10.0.0.2'),
+            expected_replica_exists=True)
+    assert serve_state.set_service_status_and_active_versions_if_owner(
+        'gc-service',
+        'gc-service-hash',
+        123,
+        '10.0.0.2',
+        serve_state.ServiceStatus.SHUTTING_DOWN,
+        active_versions=[],
+        expected_lifecycle_epoch=4)
+
+    # Whole-service deletion may never bypass the per-action auxiliary and
+    # cluster-record finalizer, even when its candidate scalar shape is exact.
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='retains unresolved authority'):
+        serve_state.remove_service_completely(
+            'gc-service',
+            'gc-service-hash',
+            expected_controller_owner=(123, '10.0.0.2'),
+            expected_lifecycle_epoch=4)
+    monkeypatch.setattr(replica_managers.global_user_state,
+                        'get_cluster_record_identity_snapshot',
+                        lambda *_args: None)
+    assert replica_managers.finalize_projected_paid_provider_absence(
+        'gc-service', 3, str(_GC_REPLICA_RECORD_ID), 'gc-service-3')
+    assert serve_state.remove_service_completely(
+        'gc-service',
+        'gc-service-hash',
+        expected_controller_owner=(123, '10.0.0.2'),
+        expected_lifecycle_epoch=4)
+    with graph.engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    'gc-service')).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    'gc-service')).scalar_one() == 0
+
+
 @pytest.mark.parametrize(
     ('terminal_status', 'terminal_cause'),
     ((requests.RequestStatus.FAILED,
@@ -4476,6 +4570,16 @@ def test_gcp_v2_paid_terminal_present_then_absent_retires_atomically(
                 'gc-service').values(status='SHUTTING_DOWN'))
     assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
         info)
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='retains unresolved authority'):
+        serve_state.remove_service_completely('gc-service',
+                                              'gc-service-hash',
+                                              expected_lifecycle_epoch=4)
+    monkeypatch.setattr(replica_managers.global_user_state,
+                        'get_cluster_record_identity_snapshot',
+                        lambda *_args: None)
+    assert replica_managers.finalize_projected_paid_provider_absence(
+        'gc-service', 3, str(_GC_REPLICA_RECORD_ID), 'gc-service-3')
     assert serve_state.remove_service_completely('gc-service',
                                                  'gc-service-hash',
                                                  expected_lifecycle_epoch=4)
