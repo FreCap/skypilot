@@ -1,6 +1,36 @@
 # SkyServe multi-pool reserved-capacity admission
 
-Last updated: 2026-09-04
+Last updated: 2026-09-05
+
+## Current verification status
+
+The combined request-driven scale-up, request completion, and natural
+scale-down gate remains **open**. The earlier independent successes below are
+not proof that the current deployed writer passes that complete journey.
+
+At the September 5 inspection, Helm revision 775 is deployed with the
+release-1.1.1680 image. Campaign `paid-e2e-0905a` acquired 285 AWS Spot VMs,
+but its qualification receipt reports only 1,707 of 10,000 exact request
+successes and no accepted scale observation. Every scale sample failed a
+joined observation check; `peak_running: 0` in that receipt therefore does
+not mean the provider had zero running VMs. The receipt stores only the error
+class, so it cannot establish which observation boundary failed. A route
+authority failure observed after shutdown must not be retroactively treated
+as proof of the error while the service was active.
+
+The campaign requested service teardown after qualification failed. At
+02:27 UTC its cleanup observation deadline expired, with zero qualified
+exact-zero samples and `operator_escalation_required: true`. Accepted
+`serve-down` is neither a natural scale-down pass nor proof that billing
+stopped. The exact cleanup receipt and provider absence remain required.
+Subsequent source fixes, deployments, and campaigns must update
+this section with their own evidence rather than inherit the older result.
+
+The immediate scope is timely request-driven scale-up and reliable scale-down
+after configurable hysteresis. It does not require instant teardown on an
+empty queue, another cooldown mechanism, or changes to shared Kueue policy.
+
+## Previous verification snapshot (September 4; historical)
 
 Status: **the PostgreSQL-authoritative reservation-aware planner, exact-card
 compatibility, bounded Spot-only paid admission, historical at-least-100 Spot
@@ -3145,6 +3175,109 @@ sequences, not wall clocks or readiness guesses, prevent an observation from
 double-spending a Pod created while the read was in flight.
 
 ## Reconciliation architecture
+
+### Capacity lifecycle responsibilities
+
+This diagram describes ownership and handoffs, not a new implementation path.
+The routes/data-plane lane must remain responsive while launch and cleanup
+work proceeds. PostgreSQL is the authority for committed effects; an in-memory
+thread, a dashboard row, or a verifier verdict is not a substitute.
+
+```mermaid
+flowchart TD
+    Client[Client: request identity, compatibility, priority, deadline]
+    LB[Load balancer: queue, dispatch, occupancy, request outcomes]
+    Reports[Authenticated demand and route observations]
+    Planner[Controller planner: one snapshot, compatibility, reserved-first residual, hysteresis]
+    PG[(PostgreSQL: plan generation, launch ownership, claims, requests)]
+    Executor[Replica manager and executor: adopt committed work, bounded provider effects]
+    Provider[AWS / GCP / unchanged Kubernetes admission]
+    Routes[Readiness and route publisher: fresh eligible endpoints]
+    Drain[Drain owner: remove from routing, settle accepted work]
+    Delete[Teardown owner: exact idempotent delete submission]
+    Observe[Cleanup observer: exact provider absence and execution quiescence]
+    Proof[Read-only qualification: joined evidence and separate failure reasons]
+    Client --> LB
+    LB --> Reports
+    Reports --> Planner
+    Provider -->|observed supply| Planner
+    Planner -->|atomic fenced admission| PG
+    PG -->|postcommit adoption| Executor
+    Executor --> Provider
+    Provider -->|worker readiness probes, not VM RUNNING alone| Routes
+    Routes --> LB
+    PG -->|committed lower target after cooldown| Drain
+    LB -->|drain evidence| Drain
+    Drain --> Delete
+    Delete -->|submit, do not hold slot while polling| Provider
+    Provider --> Observe
+    PG -->|durable executor-quiescence receipt| Observe
+    Observe -->|settle exact economic ownership| PG
+    Reports -.-> Proof
+    PG -.-> Proof
+    Provider -.-> Proof
+```
+
+| Boundary | Responsible production modules | Required distinction |
+|---|---|---|
+| Request demand | `load_balancer.py`, `controller.py` | Queued, processing, transport in-flight, and completed are different counts. An empty standby report cannot erase active demand. |
+| Target and hysteresis | `capacity_planning.py`, `autoscalers.py`, `capacity_admission.py` | Demand attribution and supply-aware actuation share one snapshot; neither is the physical VM count. |
+| Durable launch handoff | `capacity_admission.py`, `ordinary_launch_binding.py`, `replica_managers.py` | A committed launch graph is not yet an executing request. Recovery adopts its exact identity rather than creating another graph. |
+| Provider execution | request executor, `cloud_vm_ray_backend.py`, provider adapters | Provider `RUNNING` is not application readiness. Preserve exact action identity through failures and retries. |
+| Routing | `controller.py`, `replica_managers.py`, `load_balancer.py` | A healthy backend is useful only after a fresh route publication. Bulk launch bookkeeping must not monopolize the routing lock. |
+| Retirement and cleanup | `replica_managers.py`, `service.py`, `non_pool_launch_reconciliation.py` | Desired zero, drain acknowledgement, delete submission, and confirmed absence are separate milestones. `SHUTTING_DOWN` does not prove billing stopped. |
+| Qualification | paid capacity lifecycle/qualifier tools | A failed joined observation must identify its boundary; it cannot erase independently observed provider state or count that partial state as a complete pass. |
+
+#### Configurable hysteresis, not immediate zero
+
+`service.replica_policy.downscale_delay_seconds` is the existing control.
+Durable logical planning uses PostgreSQL planning/decision timestamps and
+must carry the cooldown through its committed policy state; the older local
+path uses process monotonic time. `max_scale_down_rate_percentage` limits
+retirement waves. The generic fallback delay is 1,200 seconds; a service may
+explicitly choose a shorter hold, for example:
+
+```yaml
+service:
+  replica_policy:
+    downscale_delay_seconds: 300
+```
+
+This is a policy fragment, not a complete service specification. A brief
+demand dip must retain capacity; a renewed demand burst must be incorporated
+before accepting a lower target. Sustained idle must eventually reach the
+configured minimum after the hold and drain. Explicit `serve down`, research
+preemption, and genuine failures are not demand cooldown events. A shutdown
+test cannot establish that natural downscale hysteresis works.
+
+The September 5 production-boundary component regression exposed a violation
+of this contract: the first fresh-zero tick retained capacity, but the next
+tick used the committed zero demand target instead of the retained target and
+lost the cooldown episode. The fix must preserve existing-capacity retention
+and its timestamp without granting new paid launches for zero demand. Its
+source qualification and deployment must be recorded separately.
+
+#### Verification matrix and open gates
+
+| Scenario | Evidence required | Current coverage boundary |
+|---|---|---|
+| Cold demand and queue deadlines | Public HTTP remains responsive, reports demand, rejects before dispatch, and safely retries exact rejected requests | `test_lb_cold_queue_component.py` runs the real LB with simulated adjacent processes; component evidence only. |
+| Burst, brief idle, rebound, sustained idle | Production durable planner preserves cooldown and eventually lowers targets; test more than one configured delay and multi-GPU width | A regression must use `plan_durable_capacity_reconcile`, the deployed paid logical path, not only the older local decision helper. |
+| Large launch cohort | Multiple committed waves become executing requests while route reads remain responsive; count real database round trips as well as CPU | Unit assertions about an adopter helper alone do not prove the whole controller boundary. |
+| Provider exhaustion and lost acknowledgement | Original typed failure or unresolved exact ownership survives; no duplicate create and no name-only cleanup | Exact identity and PostgreSQL component tests supplement, but do not replace, the process journey. |
+| Restart and delayed deletion | Retain ownership while state is unknown/present, recover on restart, then settle on exact absence | `test_serve_shutdown_reconciliation_component.py` uses PostgreSQL and a delayed AWS network adapter; component evidence only. |
+| Provider substitution across restart | Fake state survives process replacement and production uses the registered facet | `test_serve_provider_plugin_restart.py` proves inventory integration, not the full API/controller/executor journey. |
+| Complete request-driven lifecycle | Real public API, PostgreSQL, controller and executor; substitute only provider effects; then run the same journey paid | Full unpaid Serve journey and the current combined paid gate remain open. Independent component passes must not be relabeled E2E. |
+
+Before another paid campaign, run the targeted component regressions for the
+actual changed owners and record any remaining full-journey gap explicitly.
+The paid acceptance sequence is: acquire at least 100 provider-running Spot
+VMs, observe application-ready routing, complete 10,000 exact requests in
+bounded batches, demonstrate retention during a short demand dip, and prove
+natural drain after sustained idle followed by exact provider/volume absence.
+Record provider-running and application-ready times separately. A five-minute
+target is diagnostic, not permission to call successful provisioning a
+failure merely because model/image initialization takes longer.
 
 The one-way flow is:
 

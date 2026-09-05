@@ -386,6 +386,15 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
 
 ### Critical-Path Complexity
 
+Keep the Serve capacity responsibility diagram in
+`docs/designs/serve-multi-pool-reserved-capacity-fill.md#capacity-lifecycle-responsibilities`
+current in the same change when an owner, handoff, or convergence contract
+changes. Before a cross-component scaling fix, locate the delayed transition
+on that diagram and choose a regression entering its production owner. Keep
+policy delay (configured downscale hysteresis) distinct from execution delay
+(launch, route publication, drain, and provider deletion). Do not add a second
+cooldown or weaken cleanup evidence to compensate for a stalled owner.
+
 - Treat request event loops, admission and dispatch, reconciliation ticks,
   provider effects, and teardown as critical paths. Include nested callbacks
   and retries when calculating their complexity.
