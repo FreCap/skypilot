@@ -3118,6 +3118,57 @@ def test_refresh_keeps_route_snapshot_lock_available_during_adopter_hydration(
     assert not refresher.is_alive()
 
 
+def test_unowned_legacy_adopter_locks_only_its_task_cache(monkeypatch):
+    """Legacy recovery protects the cache, not repository or waiter work."""
+    manager = _make_manager()
+    # Production uses a non-reentrant mutex; an RLock hides nested acquisition.
+    manager.lock = threading.Lock()
+    manager.latest_version = 2
+    info = _fake_replica_info(
+        1, replica_managers.serve_state.ReplicaStatus.PENDING)
+    bound_context = _bound_non_pool_context()
+    spec = service_spec.SkyServiceSpec.from_yaml_config({
+        'readiness_probe': '/health',
+        'replica_policy': {
+            'min_replicas': 0,
+            'max_replicas': 2,
+            'target_qps_per_replica': 1
+        },
+    })
+    manager._version_specs.clear()
+    yaml_content = 'resources: {ports: 8080}\nrun: echo ready'
+
+    def _get_yaml(*_args):
+        assert not manager.lock.locked()
+        return yaml_content
+
+    def _get_spec(*_args):
+        assert not manager.lock.locked()
+        return spec
+
+    parse_task = replica_managers.load_task_with_service_spec
+
+    def _parse_task(*args):
+        assert manager.lock.locked(), 'shared task cache must be locked'
+        return parse_task(*args)
+
+    def _callbacks(*_args, **_kwargs):
+        assert not manager.lock.locked()
+        return mock.Mock(), mock.Mock(), mock.Mock()
+
+    monkeypatch.setattr(replica_managers.serve_state, 'get_yaml_content',
+                        _get_yaml)
+    monkeypatch.setattr(replica_managers.serve_state, 'get_spec', _get_spec)
+    monkeypatch.setattr(replica_managers, 'load_task_with_service_spec',
+                        _parse_task)
+    monkeypatch.setattr(manager, '_bound_ordinary_launch_callbacks', _callbacks)
+
+    assert manager._queue_bound_launch_adopter(info, bound_context)
+    assert 1 in manager._version_task_templates
+    assert manager._launch_thread_pool[1].ident is None
+    assert not manager.lock.locked()
+
+
 def test_scanner_adoption_before_paid_publication_is_idempotent():
     """Queue visibility is the handoff: an early adopter is not a collision.
 
