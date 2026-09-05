@@ -1118,6 +1118,7 @@ class RetryingVmProvisioner:
             is_managed: bool | None = None,
             *,
             extra_launch_context: dict[str, Any],
+            exact_ordinary_paid_placement: bool = False,
             kueue_admission_runtime: (provision_common.KueuePodAdmissionRuntime
                                       | None) = None,
             is_launched_by_jobs_controller: bool = False,
@@ -1135,6 +1136,10 @@ class RetryingVmProvisioner:
         self._wheel_hash = wheel_hash
         self._is_managed = is_managed
         self._extra_launch_context: dict[str, Any] = extra_launch_context
+        if type(exact_ordinary_paid_placement) is not bool:
+            raise TypeError('Exact ordinary-paid placement authority must be '
+                            'a boolean.')
+        self._exact_ordinary_paid_placement = exact_ordinary_paid_placement
         self._kueue_admission_runtime = kueue_admission_runtime
         self._is_launched_by_jobs_controller = is_launched_by_jobs_controller
         self._workload_type = workload_type
@@ -2929,6 +2934,8 @@ class RetryingVmProvisioner:
             raise reserved_capacity.ReservedFillLaunchFenceError(
                 'Reserved-fill retry candidate changed its fenced '
                 'Kubernetes context or accelerator shape.') from error
+        exact_placement_authority = (protocol_v2_reserved_fill or
+                                     self._exact_ordinary_paid_placement)
         skip_if_config_hash_matches = (to_provision_config.prev_config_hash if
                                        skip_unnecessary_provisioning else None)
 
@@ -3112,11 +3119,12 @@ class RetryingVmProvisioner:
                     resources_lib.Resources(cloud=to_provision.cloud))
                 failover_history.append(e)
             except exceptions.ResourcesUnavailableError as e:
-                if protocol_v2_reserved_fill:
+                if exact_placement_authority:
                     # Preserve the exact nested provider evidence before the
                     # ordinary no-failover/unregistered paths can replace it
-                    # with this wrapper itself.  Protocol v2 returns this one
-                    # candidate failure to reserved-fill reconciliation.
+                    # with this wrapper itself. Exact reserved-fill and paid
+                    # launches return this one candidate failure to their
+                    # PostgreSQL reconciliation owner.
                     logger.warning(common_utils.format_exception(e))
                     raise
                 failover_history.append(e)
@@ -3135,13 +3143,13 @@ class RetryingVmProvisioner:
                 # Provisioning succeeded.
                 return config_dict
 
-            if protocol_v2_reserved_fill:
-                # One protocol-v2 request is durably bound to exactly one
-                # provider candidate.  A failed attempt must return control to
-                # reserved-fill reconciliation; re-running the optimizer here
-                # would turn that exact authority into ordinary failover. The
-                # ResourcesUnavailableError family already exited intact in
-                # its handler above; this tail terminates the remaining
+            if exact_placement_authority:
+                # One exact request is durably bound to one provider
+                # candidate. A failed attempt must return control to its
+                # PostgreSQL reconciliation owner; re-running the optimizer
+                # here would replace durable placement authority with stale
+                # process-local policy. The ResourcesUnavailableError family
+                # already exited intact above; this terminates the remaining
                 # exception families.
                 terminal_error = failover_history[-1]
                 raise terminal_error
@@ -4370,6 +4378,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self._dump_final_script = False
         self._is_managed = False
         self._extra_launch_context: dict[str, Any] = {}
+        self._exact_ordinary_paid_placement = False
         self._kueue_admission_runtime: (
             provision_common.KueuePodAdmissionRuntime | None) = None
         self._is_launched_by_jobs_controller = False
@@ -4438,6 +4447,12 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self._dump_final_script = kwargs.pop('dump_final_script', False)
         self._is_managed = kwargs.pop('is_managed', False)
         self._extra_launch_context = kwargs.pop('extra_launch_context', {})
+        exact_ordinary_paid_placement = kwargs.pop(
+            'exact_ordinary_paid_placement', False)
+        if type(exact_ordinary_paid_placement) is not bool:
+            raise TypeError('Exact ordinary-paid placement authority must be '
+                            'a boolean.')
+        self._exact_ordinary_paid_placement = exact_ordinary_paid_placement
         self._kueue_admission_runtime = kwargs.pop('kueue_admission_runtime',
                                                    None)
         try:
@@ -4970,6 +4985,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                         blocked_resources=task.blocked_resources,
                         is_managed=self._is_managed,
                         extra_launch_context=self._extra_launch_context,
+                        exact_ordinary_paid_placement=(
+                            self._exact_ordinary_paid_placement),
                         kueue_admission_runtime=self._kueue_admission_runtime,
                         is_launched_by_jobs_controller=(
                             self._is_launched_by_jobs_controller),
@@ -7114,6 +7131,13 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         Raises:
             RuntimeError: If the cluster fails to be terminated/stopped.
         """
+        if expected_cluster_record_uuid is not None:
+            if not terminate:
+                raise ValueError('Action-fenced teardown requires '
+                                 'terminate=True.')
+            if purge:
+                raise ValueError('Action-fenced teardown does not permit '
+                                 'purge=True.')
         # This method owns both cluster locks. Prove an internal cleanup's
         # exact durable generation before the first name-scoped effect below
         # (tunnel close, request cancellation, status refresh, or provider IO).
@@ -7153,7 +7177,17 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     'Failed to kill other launch requests for the '
                     f'cluster {handle.cluster_name}: '
                     f'{common_utils.format_exception(e, use_bracket=True)}')
-        if refresh_cluster_status:
+        if expected_cluster_record_uuid is not None:
+            # Action-aware cleanup already owns an immutable provider handle.
+            # The ordinary status refresher is deliberately excluded: it may
+            # write status or run name-scoped post-teardown cleanup, neither
+            # of which is authorized by an exact UUID-and-handle fence.  The
+            # provider teardown below is idempotent and remains the authority
+            # for proving that all provider resources are gone.
+            prev_cluster_status = (
+                global_user_state.get_status_from_cluster_name(
+                    handle.cluster_name))
+        elif refresh_cluster_status:
             try:
                 prev_cluster_status, refreshed_handle = (
                     backend_utils.refresh_cluster_status_handle(
@@ -7214,6 +7248,11 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             return
 
         if handle.cluster_yaml is None:
+            # Action-aware launch persists the provider YAML before provider
+            # I/O.  On UUID-fenced teardown, a missing YAML is therefore the
+            # durable checkpoint left after post-teardown provider and
+            # auxiliary cleanup, not an inference from an empty inventory.
+            # Finish only the exact UUID-and-handle row removal below.
             logger.warning(f'Cluster {handle.cluster_name!r} has no '
                            f'provision yaml so it '
                            'has not been provisioned. Skipped.')
@@ -7269,6 +7308,12 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                             'skip this.')
 
             try:
+                handle = self._validate_identity_fenced_teardown_handle(
+                    handle, expected_cluster_record_uuid, expected_cluster_hash)
+                if continue_guard is not None and not continue_guard():
+                    raise RuntimeError(
+                        'Teardown continuation guard rejected the operation '
+                        'before provider teardown.')
                 provisioner.teardown_cluster(repr(cloud),
                                              resources_utils.ClusterName(
                                                  cluster_name,
@@ -7286,6 +7331,12 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     raise
 
             if post_teardown_cleanup:
+                handle = self._validate_identity_fenced_teardown_handle(
+                    handle, expected_cluster_record_uuid, expected_cluster_hash)
+                if continue_guard is not None and not continue_guard():
+                    raise RuntimeError(
+                        'Teardown continuation guard rejected the operation '
+                        'before post-teardown cleanup.')
                 cleanup_kwargs: dict[str, Any] = {}
                 if expected_cluster_record_uuid is not None:
                     cleanup_kwargs['expected_cluster_record_uuid'] = (
@@ -7387,6 +7438,12 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # (i.e., prev_status is None), as the cleanup has already been done
         # if the cluster is removed from the status table.
         if post_teardown_cleanup:
+            handle = self._validate_identity_fenced_teardown_handle(
+                handle, expected_cluster_record_uuid, expected_cluster_hash)
+            if continue_guard is not None and not continue_guard():
+                raise RuntimeError(
+                    'Teardown continuation guard rejected the operation '
+                    'before post-teardown cleanup.')
             final_cleanup_kwargs: dict[str, Any] = {}
             if expected_cluster_record_uuid is not None:
                 final_cleanup_kwargs['expected_cluster_record_uuid'] = (

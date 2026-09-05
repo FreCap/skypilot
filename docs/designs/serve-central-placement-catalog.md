@@ -1,7 +1,8 @@
 # SkyServe centralized placement catalog
 
-_Status: implementation and local verification complete; pull request and
-production deployment pending. Created: 2026-07-24. Last updated: 2026-09-03._
+_Status: deployed; production qualification exposed an executor-side authority
+violation whose corrective rollout and requalification are pending. Created:
+2026-07-24. Last updated: 2026-09-04._
 
 ## Decision summary
 
@@ -9,8 +10,11 @@ SkyServe will materialize one complete placement catalog for each immutable
 service version and store it on that version's PostgreSQL row. A catalog
 contains every exact `Location` candidate and its nominal hourly cost. The
 service parent, controller child, replica manager, autoscaler, reserved-capacity
-poller, paid-capacity admission, and update preflight all consume that same
-versioned record.
+poller, paid-capacity admission, bound launch executor, and update preflight all
+consume that same versioned record. Once PostgreSQL admits an exact paid launch
+location, the executor validates the bound singleton against that identity and
+must not invoke an outer optimizer, install an under-lock re-planner, or enter
+cross-pool optimizer failover after a provider rejection.
 
 Catalog construction is allowed only before a new version is committed or
 while lazily backfilling a legacy committed version whose catalog is absent.
@@ -226,6 +230,10 @@ disagree about one version's placement identity.
 9. Rollback to an older binary remains possible because the new column is
    nullable and ignored by older code. The migration downgrade is intentionally
    non-destructive.
+10. A complete protocol-v2 ordinary-paid binding is the executor's exact launch
+    authority. The bound task must structurally match its catalog pool identity
+    and remain provider-launchable, but process-local catalog cache contents and
+    optimizer ordering cannot replace or reject that committed choice.
 
 ## Implementation phases
 
@@ -263,6 +271,10 @@ replica rows. Do not drop the column during emergency rollback.
 - Prove compare-and-set backfill cannot overwrite an existing catalog.
 - Prove update preflight returns one persisted placer and `update_version()`
   publishes it without a second `SpotPlacer.from_task()` call.
+- Round-trip an admitted exact ordinary-paid pool through the real request
+  serialization and execution boundary, then prove the executor neither runs
+  an optimizer nor installs a re-planner. Repeat with divergent process-local
+  catalog caches and require the same bound resources before any provider I/O.
 - Prove regionless AWS construction excludes a real VM offering when the exact
   default image tag is absent or a placeholder in that region, retains it when
   present for a container-backed VM, and does not apply the default-image check
@@ -336,13 +348,22 @@ gaps:
    asserts on the several regional rows of a region-agnostic tag; a
    region-agnostic `skypilot:` tag is valid again when any region has an AMI.
 
-No unresolved source/design divergence remains. Live AMI qualification and
-hosted publication remain explicit operational gates.
+The 2026-09-04 paid scale qualification exposed one further divergence. Thirty
+AWS VMs reached provider `RUNNING`, while 37 other PostgreSQL-admitted exact
+`g6.4xlarge` locations failed before provider I/O because the ordinary-paid
+executor re-ran its process-local optimizer. The reserved-fill path already
+reconstructed a frozen singleton before optimization; the ordinary-paid path
+did not. The corrective contract is invariant 10 above: validate the complete
+bound identity and bypass every redundant executor optimizer, including the VM
+provisioner's retry-path optimizer. This is a source and deployment gate until
+the production run is repeated successfully.
 
 ## Open gates
 
-- Pull-request review and CI.
-- Production deployment and post-deploy stability observation.
+- Merge and deploy the ordinary-paid executor authority correction.
+- Repeat the paid multi-region qualification and prove at least 100
+  provider-running Spot VMs, successful bounded-batch request completion, and
+  exact cleanup to zero.
 - Before activating a newly published AWS region, attest that its default AMI
   is public, available, architecture-compatible, and launchable from a separate
   account.

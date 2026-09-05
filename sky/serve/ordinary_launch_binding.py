@@ -1442,6 +1442,32 @@ class BoundNonPoolLaunchContext(BoundLaunchContext):
     receipt_protocol_version: int
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class OrdinaryPaidPoolIdentity:
+    """Exact provider placement committed for one ordinary-paid launch."""
+
+    cloud: str
+    region: str
+    zone: str
+    instance_type: str
+    accelerator: str
+    gpu_units_per_node: int
+    num_nodes: int
+
+    def __post_init__(self) -> None:
+        text_fields = (self.cloud, self.region, self.zone, self.instance_type,
+                       self.accelerator)
+        if (any(
+                type(value) is not str or not value  # pylint: disable=unidiomatic-typecheck
+                for value in text_fields) or self.cloud not in ('aws', 'gcp') or
+                self.accelerator != self.accelerator.casefold() or
+                type(self.gpu_units_per_node) is not int or  # pylint: disable=unidiomatic-typecheck
+                self.gpu_units_per_node < 1 or type(self.num_nodes) is not int
+                or  # pylint: disable=unidiomatic-typecheck
+                self.num_nodes < 1):
+            raise ValueError('Ordinary-paid pool identity is malformed.')
+
+
 class ExecutionClaim(Protocol):
     """Request-layer claim shape without importing the request subsystem."""
 
@@ -8089,6 +8115,71 @@ def ordinary_paid_gcp_project_id_from_pool_key(pool_key: object) -> str:
     return project_id
 
 
+def _ordinary_paid_pool_key(context: BoundNonPoolLaunchContext) -> str:
+    """Parse the exact paid pool named by one ordinary-paid authorization."""
+    if (not isinstance(context, BoundNonPoolLaunchContext) or
+            context.profile.kind is not NonPoolLaunchProfileKind.ORDINARY_PAID):
+        raise OrdinaryLaunchBindingConflict(
+            'Profile has no ordinary-paid pool authority.')
+    reference = context.profile.authorization_reference
+    prefix = 'paid-capacity:'
+    if not reference.startswith(prefix):
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid authorization reference is malformed.')
+    parts = reference[len(prefix):].split(':', 2)
+    if (len(parts) != 3 or not parts[0] or not parts[2] or
+            parts[1] != str(context.replica_record_id)):
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid authorization names a different replica.')
+    return parts[2]
+
+
+def ordinary_paid_pool_identity(
+        context: BoundNonPoolLaunchContext) -> OrdinaryPaidPoolIdentity:
+    """Decode the exact provider pool frozen into an ordinary-paid request."""
+    if (not isinstance(context, BoundNonPoolLaunchContext) or
+            context.profile.kind is not NonPoolLaunchProfileKind.ORDINARY_PAID
+            or context.capability_cohort_epoch
+            != NON_POOL_CAPABILITY_COHORT_EPOCH):
+        raise OrdinaryLaunchBindingConflict(
+            'Launch has no current ordinary-paid pool authority.')
+    pool_key = _ordinary_paid_pool_key(context)
+    identity = paid_capacity.pool_key_payload(pool_key)
+    if (not isinstance(identity, Mapping) or identity.get('version') != 2 or
+            identity.get('cloud') not in ('aws', 'gcp') or
+            identity.get('use_spot') is not True or
+            not isinstance(identity.get('region'), str) or
+            not identity['region'] or
+            not isinstance(identity.get('zone'), str) or not identity['zone'] or
+            not isinstance(identity.get('instance_type'), str) or
+            not identity['instance_type'] or
+            type(identity.get('num_nodes')) is not int or  # pylint: disable=unidiomatic-typecheck
+            identity['num_nodes'] < 1
+            or not isinstance(identity.get('accelerators'), list)
+            or len(identity['accelerators']) != 1):
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid authorization has no exact Spot pool.')
+    accelerator = identity['accelerators'][0]
+    if (not isinstance(accelerator, list) or len(accelerator) != 2 or
+            not isinstance(accelerator[0], str) or not accelerator[0] or
+            accelerator[0] != accelerator[0].casefold() or
+            type(accelerator[1]) is not int or  # pylint: disable=unidiomatic-typecheck
+            accelerator[1] < 1):
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid authorization has no exact GPU shape.')
+    try:
+        return OrdinaryPaidPoolIdentity(cloud=identity['cloud'],
+                                        region=identity['region'],
+                                        zone=identity['zone'],
+                                        instance_type=identity['instance_type'],
+                                        accelerator=accelerator[0],
+                                        gpu_units_per_node=accelerator[1],
+                                        num_nodes=identity['num_nodes'])
+    except ValueError as error:
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid authorization has no exact Spot pool.') from error
+
+
 def ordinary_paid_gcp_project_id(context: BoundNonPoolLaunchContext) -> str:
     """Decode the project frozen into one fresh paid GCP profile."""
     if (not isinstance(context, BoundNonPoolLaunchContext) or
@@ -8098,15 +8189,8 @@ def ordinary_paid_gcp_project_id(context: BoundNonPoolLaunchContext) -> str:
             'Launch has no current paid GCP project authority.')
     reference = context.profile.authorization_reference
     if context.profile.kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
-        prefix = 'paid-capacity:'
-        if not reference.startswith(prefix):
-            raise OrdinaryLaunchBindingConflict(
-                'Ordinary-paid authorization reference is malformed.')
-        parts = reference[len(prefix):].split(':', 2)
-        if len(parts) != 3 or parts[1] != str(context.replica_record_id):
-            raise OrdinaryLaunchBindingConflict(
-                'Ordinary-paid authorization names a different replica.')
-        return ordinary_paid_gcp_project_id_from_pool_key(parts[2])
+        return ordinary_paid_gcp_project_id_from_pool_key(
+            _ordinary_paid_pool_key(context))
     if (context.profile.kind
             is not NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT):
         raise OrdinaryLaunchBindingConflict(
@@ -8177,15 +8261,8 @@ def ordinary_paid_aws_account_id(context: BoundNonPoolLaunchContext) -> str:
     ordinary_paid_aws_client_token(context)
     reference = context.profile.authorization_reference
     if context.profile.kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
-        prefix = 'paid-capacity:'
-        if not reference.startswith(prefix):
-            raise OrdinaryLaunchBindingConflict(
-                'Ordinary-paid authorization reference is malformed.')
-        parts = reference[len(prefix):].split(':', 2)
-        if len(parts) != 3 or parts[1] != str(context.replica_record_id):
-            raise OrdinaryLaunchBindingConflict(
-                'Ordinary-paid authorization names a different replica.')
-        return ordinary_paid_aws_account_id_from_pool_key(parts[2])
+        return ordinary_paid_aws_account_id_from_pool_key(
+            _ordinary_paid_pool_key(context))
     if context.profile.kind is not NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT:
         raise OrdinaryLaunchBindingConflict(
             'Profile has no paid AWS account authority.')

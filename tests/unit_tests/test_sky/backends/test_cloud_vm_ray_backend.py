@@ -1771,7 +1771,8 @@ class TestCloudVmRayBackendTeardownNoLock:
     """Tests for CloudVmRayBackend.teardown_no_lock() guards."""
 
     @staticmethod
-    def _make_handle(cluster_name: str, cluster_yaml: str, has_ray: bool):
+    def _make_handle(cluster_name: str, cluster_yaml: str | None,
+                     has_ray: bool):
 
         class _FakeLaunchedResources:
 
@@ -1798,6 +1799,46 @@ class TestCloudVmRayBackendTeardownNoLock:
                 has_ray=has_ray))
         handle.close_skylet_ssh_tunnel = MagicMock()
         return handle
+
+    @pytest.mark.parametrize('terminate,purge,error_match',
+                             [(False, False, 'requires terminate=True'),
+                              (True, True, 'does not permit purge=True')])
+    def test_expected_uuid_rejects_stop_and_purge_before_effects(
+            self, terminate, purge, error_match):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = self._make_handle('action-invalid', '/tmp/exact.yaml', False)
+        record_uuid = '11111111-1111-4111-8111-111111111111'
+
+        with patch(
+                'sky.backends.cloud_vm_ray_backend.global_user_state.'
+                'get_cluster_record_identity_snapshot') as snapshot_reader, \
+             patch(
+                 'sky.backends.cloud_vm_ray_backend.requests_lib.'
+                 'kill_cluster_requests') as kill_requests, \
+             patch(
+                 'sky.backends.cloud_vm_ray_backend.backend_utils.'
+                 'refresh_cluster_status_handle') as refresh, \
+             patch(
+                 'sky.backends.cloud_vm_ray_backend.global_user_state.'
+                 'remove_cluster') as remove_cluster, \
+             patch(
+                 'sky.backends.cloud_vm_ray_backend.provisioner.'
+                 'teardown_cluster') as provider_teardown, \
+             patch.object(backend, 'post_teardown_cleanup') as cleanup:
+            with pytest.raises(ValueError, match=error_match):
+                backend.teardown_no_lock(
+                    handle,
+                    terminate=terminate,
+                    purge=purge,
+                    expected_cluster_record_uuid=record_uuid)
+
+        snapshot_reader.assert_not_called()
+        handle.close_skylet_ssh_tunnel.assert_not_called()
+        kill_requests.assert_not_called()
+        refresh.assert_not_called()
+        remove_cluster.assert_not_called()
+        provider_teardown.assert_not_called()
+        cleanup.assert_not_called()
 
     def test_uses_refreshed_handle_to_avoid_stale_metadata(self):
         backend = cloud_vm_ray_backend.CloudVmRayBackend()
@@ -1833,8 +1874,7 @@ class TestCloudVmRayBackendTeardownNoLock:
         mock_run_on_head.assert_not_called()
         mock_get_yaml.assert_called_once_with(refreshed_handle.cluster_yaml)
 
-    def test_expected_uuid_is_revalidated_after_refresh_before_provider_io(
-            self):
+    def test_expected_uuid_uses_exact_provider_and_cleanup_arguments(self):
         backend = cloud_vm_ray_backend.CloudVmRayBackend()
         handle = self._make_handle('action-fenced', '/tmp/exact.yaml', False)
         record_uuid = uuid.UUID('11111111-1111-4111-8111-111111111111')
@@ -1844,12 +1884,184 @@ class TestCloudVmRayBackendTeardownNoLock:
             serialized_handle=b'exact-handle',
             handle=handle)
 
+        with patch('sky.backends.cloud_vm_ray_backend.requests_lib.'
+                   'kill_cluster_requests'), patch(
+                       'sky.backends.cloud_vm_ray_backend.backend_utils.'
+                       'refresh_cluster_status_handle',
+                       side_effect=AssertionError(
+                           'action-fenced teardown must not mutate status')
+                   ), patch(
+                       'sky.backends.cloud_vm_ray_backend.'
+                       'global_user_state.get_status_from_cluster_name',
+                       return_value=status_lib.ClusterStatus.UP), patch(
+                           'sky.backends.cloud_vm_ray_backend.'
+                           'global_user_state.'
+                           'get_cluster_record_identity_snapshot',
+                           return_value=snapshot) as snapshot_reader, patch(
+                               'sky.backends.cloud_vm_ray_backend.pickle.dumps',
+                               return_value=b'exact-handle'), patch(
+                                   'sky.backends.cloud_vm_ray_backend.'
+                                   'global_user_state.get_cluster_yaml_dict',
+                                   return_value={'provider': {}}), patch(
+                                       'sky.backends.cloud_vm_ray_backend.'
+                                       'provisioner.teardown_cluster'
+                                   ) as provider_teardown, patch.object(
+                                       backend,
+                                       'post_teardown_cleanup') as cleanup:
+            backend.teardown_no_lock(
+                handle,
+                terminate=True,
+                expected_cluster_record_uuid=str(record_uuid))
+
+        assert snapshot_reader.call_args_list == [
+            call(handle.cluster_name, str(record_uuid)),
+            call(handle.cluster_name, str(record_uuid)),
+            call(handle.cluster_name, str(record_uuid)),
+            call(handle.cluster_name, str(record_uuid)),
+        ]
+        provider_teardown.assert_called_once_with(
+            repr(handle.launched_resources.cloud),
+            cloud_vm_ray_backend.resources_utils.ClusterName(
+                handle.cluster_name, handle.cluster_name_on_cloud),
+            terminate=True,
+            provider_config={})
+        cleanup.assert_called_once_with(
+            handle,
+            True,
+            False,
+            True,
+            expected_cluster_record_uuid=str(record_uuid))
+
+    def test_expected_uuid_provider_exception_preserves_exact_row(self):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = self._make_handle('action-provider-error', '/tmp/exact.yaml',
+                                   False)
+        record_uuid = uuid.UUID('11111111-1111-4111-8111-111111111111')
+        snapshot = global_user_state.ClusterRecordIdentitySnapshot(
+            cluster_name=handle.cluster_name,
+            cluster_record_uuid=record_uuid,
+            serialized_handle=b'exact-handle',
+            handle=handle)
+
         with patch(
-                'sky.backends.cloud_vm_ray_backend.requests_lib.'
-                'kill_cluster_requests'), patch(
-                    'sky.backends.cloud_vm_ray_backend.backend_utils.'
-                    'refresh_cluster_status_handle',
-                    return_value=(status_lib.ClusterStatus.UP, handle)), patch(
+                'sky.backends.cloud_vm_ray_backend.backend_utils.'
+                'refresh_cluster_status_handle',
+                side_effect=AssertionError(
+                    'action-fenced teardown must not mutate status')
+        ), patch(
+                'sky.backends.cloud_vm_ray_backend.'
+                'global_user_state.get_status_from_cluster_name',
+                return_value=status_lib.ClusterStatus.INIT), patch(
+                    'sky.backends.cloud_vm_ray_backend.'
+                    'global_user_state.'
+                    'get_cluster_record_identity_snapshot',
+                    return_value=snapshot) as snapshot_reader, patch(
+                        'sky.backends.cloud_vm_ray_backend.pickle.dumps',
+                        return_value=b'exact-handle'), patch(
+                            'sky.backends.cloud_vm_ray_backend.'
+                            'global_user_state.get_cluster_yaml_dict',
+                            return_value={'provider': {}}), patch(
+                                'sky.backends.cloud_vm_ray_backend.'
+                                'global_user_state.remove_cluster'
+                            ) as remove_cluster, patch(
+                                'sky.backends.cloud_vm_ray_backend.'
+                                'provisioner.teardown_cluster',
+                                side_effect=RuntimeError('provider failed')
+                            ) as provider_teardown, patch.object(
+                                backend, 'post_teardown_cleanup') as cleanup:
+            with pytest.raises(RuntimeError, match='provider failed'):
+                backend.teardown_no_lock(
+                    handle,
+                    terminate=True,
+                    expected_cluster_record_uuid=str(record_uuid))
+
+        assert snapshot_reader.call_args_list == [
+            call(handle.cluster_name, str(record_uuid)),
+            call(handle.cluster_name, str(record_uuid)),
+            call(handle.cluster_name, str(record_uuid)),
+        ]
+        provider_teardown.assert_called_once_with(
+            repr(handle.launched_resources.cloud),
+            cloud_vm_ray_backend.resources_utils.ClusterName(
+                handle.cluster_name, handle.cluster_name_on_cloud),
+            terminate=True,
+            provider_config={})
+        remove_cluster.assert_not_called()
+        cleanup.assert_not_called()
+
+    def test_expected_uuid_mutation_after_provider_blocks_cleanup(self):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = self._make_handle('action-mutated', '/tmp/exact.yaml', False)
+        record_uuid = uuid.UUID('11111111-1111-4111-8111-111111111111')
+        snapshot = global_user_state.ClusterRecordIdentitySnapshot(
+            cluster_name=handle.cluster_name,
+            cluster_record_uuid=record_uuid,
+            serialized_handle=b'exact-handle',
+            handle=handle)
+        conflict = global_user_state.ClusterRecordIdentityConflictError(
+            'record mutated after provider teardown')
+
+        with patch(
+                'sky.backends.cloud_vm_ray_backend.backend_utils.'
+                'refresh_cluster_status_handle',
+                side_effect=AssertionError(
+                    'action-fenced teardown must not mutate status')), patch(
+                        'sky.backends.cloud_vm_ray_backend.'
+                        'global_user_state.get_status_from_cluster_name',
+                        return_value=status_lib.ClusterStatus.INIT), patch(
+                            'sky.backends.cloud_vm_ray_backend.'
+                            'global_user_state.'
+                            'get_cluster_record_identity_snapshot',
+                            side_effect=[
+                                snapshot, snapshot, snapshot, conflict
+                            ]
+                        ) as snapshot_reader, patch(
+                            'sky.backends.cloud_vm_ray_backend.pickle.dumps',
+                            return_value=b'exact-handle'), patch(
+                                'sky.backends.cloud_vm_ray_backend.'
+                                'global_user_state.get_cluster_yaml_dict',
+                                return_value={'provider': {}}), patch(
+                                    'sky.backends.cloud_vm_ray_backend.'
+                                    'global_user_state.remove_cluster'
+                                ) as remove_cluster, patch(
+                                    'sky.backends.cloud_vm_ray_backend.'
+                                    'provisioner.teardown_cluster'
+                                ) as provider_teardown, patch.object(
+                                    backend,
+                                    'post_teardown_cleanup') as cleanup:
+            with pytest.raises(
+                    global_user_state.ClusterRecordIdentityConflictError,
+                    match='record mutated after provider teardown'):
+                backend.teardown_no_lock(
+                    handle,
+                    terminate=True,
+                    expected_cluster_record_uuid=str(record_uuid))
+
+        assert snapshot_reader.call_count == 4
+        provider_teardown.assert_called_once_with(
+            repr(handle.launched_resources.cloud),
+            cloud_vm_ray_backend.resources_utils.ClusterName(
+                handle.cluster_name, handle.cluster_name_on_cloud),
+            terminate=True,
+            provider_config={})
+        remove_cluster.assert_not_called()
+        cleanup.assert_not_called()
+
+    def test_expected_uuid_without_provider_yaml_removes_exactly(self):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = self._make_handle('action-no-yaml', None, False)
+        record_uuid = uuid.UUID('11111111-1111-4111-8111-111111111111')
+        snapshot = global_user_state.ClusterRecordIdentitySnapshot(
+            cluster_name=handle.cluster_name,
+            cluster_record_uuid=record_uuid,
+            serialized_handle=b'exact-handle',
+            handle=handle)
+
+        with patch(
+                'sky.backends.cloud_vm_ray_backend.backend_utils.'
+                'refresh_cluster_status_handle',
+                side_effect=AssertionError(
+                    'action-fenced teardown must not mutate status')), patch(
                         'sky.backends.cloud_vm_ray_backend.'
                         'global_user_state.'
                         'get_cluster_record_identity_snapshot',
@@ -1857,13 +2069,17 @@ class TestCloudVmRayBackendTeardownNoLock:
                             'sky.backends.cloud_vm_ray_backend.pickle.dumps',
                             return_value=b'exact-handle'), patch(
                                 'sky.backends.cloud_vm_ray_backend.'
-                                'global_user_state.get_cluster_yaml_dict',
-                                return_value={'provider': {}}), patch(
-                                    'sky.backends.cloud_vm_ray_backend.'
-                                    'provisioner.teardown_cluster'
-                                ) as provider_teardown, patch.object(
-                                    backend,
-                                    'post_teardown_cleanup') as cleanup:
+                                'global_user_state.'
+                                'get_status_from_cluster_name',
+                                return_value=status_lib.ClusterStatus.INIT
+                            ), patch('sky.backends.cloud_vm_ray_backend.'
+                                     'global_user_state.remove_cluster'
+                                    ) as remove_cluster, patch(
+                                        'sky.backends.cloud_vm_ray_backend.'
+                                        'provisioner.teardown_cluster'
+                                    ) as provider_teardown, patch.object(
+                                        backend,
+                                        'post_teardown_cleanup') as cleanup:
             backend.teardown_no_lock(
                 handle,
                 terminate=True,
@@ -1873,13 +2089,13 @@ class TestCloudVmRayBackendTeardownNoLock:
             call(handle.cluster_name, str(record_uuid)),
             call(handle.cluster_name, str(record_uuid)),
         ]
-        provider_teardown.assert_called_once()
-        cleanup.assert_called_once_with(
-            handle,
-            True,
-            False,
-            True,
-            expected_cluster_record_uuid=str(record_uuid))
+        remove_cluster.assert_called_once_with(
+            handle.cluster_name,
+            terminate=True,
+            expected_cluster_record_uuid=str(record_uuid),
+            expected_cluster_handle=handle)
+        provider_teardown.assert_not_called()
+        cleanup.assert_not_called()
 
     def test_expected_uuid_rejects_handle_change_before_provider_io(self):
         backend = cloud_vm_ray_backend.CloudVmRayBackend()
